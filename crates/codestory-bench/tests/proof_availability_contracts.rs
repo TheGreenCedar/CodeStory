@@ -712,15 +712,15 @@ fn task10a_refreeze_binds_methodology_thresholds_and_future_corpus() {
     assert_eq!(methodology_sha, thresholds.methodology_sha256);
     assert_eq!(
         methodology_sha,
-        "10b00e7073847b024ac23e07242b15f14c42b30d2da5839a7650b7f533dcc43a"
+        "ac628a158fb99e245781f012a69d9ee1a832e37d1a930e10a27ec0c878a910e7"
     );
     assert_eq!(
         format!("{:x}", Sha256::digest(threshold_bytes)),
-        "4cd6ce4e8cdd684ccb17b2b354a00fe424c1b7e773407631e52b678593fdc16a"
+        "e53517191a361287a7aa6eff810b8d3ed032494e8528d104e882e7b41635c99c"
     );
     assert_eq!(
         canonical_thresholds_sha256(&thresholds).unwrap(),
-        "0e2a174d93284670b7aefb7ce6f015d3e1adeda2f2d2b64c057e7e57a338c7a2"
+        "935f885e5d34cfbc63d7a6a717619bf0b6bc7b71e5d5a06bd758ef84028acd89"
     );
 
     let mut future = corpus();

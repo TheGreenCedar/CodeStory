@@ -42,6 +42,14 @@ target, complete caller body, and `no_direct_call` finding. These negatives may
 produce only `Unknown` in production because this corpus supplies audit truth,
 not extractor-completeness receipts.
 
+Positive specifications and both concrete negative mutations are converted to
+the product's unvalidated proof-contract types and must be accepted as
+`Validated` by the product `validate_contract` implementation and
+`clause_guard_v1`. The benchmark owns no separate material-token vocabulary.
+This keeps whole-input coverage, typed-field coverage, selector and path rules,
+UTF-8 spans, exact quotes, overlap, and every guard family on the same executable
+contract the product uses.
+
 `materialize --verify-only` may fetch the four fixed repositories into a new
 staging directory. It uses noninteractive exact-SHA fetches, detached clean
 checkouts, rejects `.gitmodules`, gitlinks, symlinks and untracked/non-regular
@@ -52,6 +60,14 @@ expression, receipt-line, and negative-audit range, and repeats the HEAD/clean
 fence after reads. It atomically installs the workspace and a bounded source
 environment descriptor, refuses overwrite, and never creates a cache, index,
 database, result, or proof artifact.
+
+Before any write, materialization resolves each destination through its real
+existing ancestor and native filesystem identity. It rejects non-root symlink
+components and overlap between workspace, cache, and output even when different
+spellings traverse a platform root alias. The workspace and output parent
+identities are revalidated before output staging, workspace installation, and
+descriptor persistence; a failed no-clobber persist removes only the workspace
+installed by that attempt.
 
 Corpus validation bijects four references to four loaded cohort roots and
 reconciles repository declarations, source trees, canonical hashes, counts,
