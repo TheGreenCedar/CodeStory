@@ -702,16 +702,14 @@ pub(crate) fn oracle_path_product_contract(
 
 pub(crate) fn negative_mutation_product_contract(
     path: &OraclePathV1,
-    mutation: &NegativeMutationV1,
+    mutation_id: &str,
 ) -> Result<product_proof::UnvalidatedCallPathContract> {
     path.validate()?;
-    if !path
+    let mutation = path
         .negative_mutations
         .iter()
-        .any(|candidate| candidate.mutation_id == mutation.mutation_id)
-    {
-        bail!("proof_availability_mutation_oracle_missing")
-    }
+        .find(|candidate| candidate.mutation_id == mutation_id)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_mutation_oracle_missing"))?;
     Ok(product_proof::UnvalidatedCallPathContract::new(
         &path.source_text,
         path.clauses

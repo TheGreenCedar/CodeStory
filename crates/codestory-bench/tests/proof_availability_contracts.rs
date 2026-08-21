@@ -1675,15 +1675,39 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         codestory_agent::proof_qualification_support::validate_contract(positive_input).unwrap(),
         codestory_agent::proof_qualification_support::ValidationOutcome::Validated { .. }
     ));
-    let negative_input = contracts::negative_mutation_product_contract(
-        oracle_path,
-        &oracle_path.negative_mutations[0],
-    )
-    .expect("negative product contract conversion");
-    assert!(matches!(
-        codestory_agent::proof_qualification_support::validate_contract(negative_input).unwrap(),
-        codestory_agent::proof_qualification_support::ValidationOutcome::Validated { .. }
-    ));
+    let mutation_id = &oracle_path.negative_mutations[0].mutation_id;
+    let negative_input = contracts::negative_mutation_product_contract(oracle_path, mutation_id)
+        .expect("negative product contract conversion");
+    let frozen_hashes =
+        match codestory_agent::proof_qualification_support::validate_contract(negative_input)
+            .unwrap()
+        {
+            codestory_agent::proof_qualification_support::ValidationOutcome::Validated {
+                hashes,
+                ..
+            } => hashes,
+            other => panic!("expected validated frozen negative mutation, got {other:?}"),
+        };
+    let mut caller_altered_row = oracle_path.negative_mutations[0].clone();
+    caller_altered_row.mutated_spec = oracle_path.spec.clone();
+    let resolved_by_id =
+        contracts::negative_mutation_product_contract(oracle_path, &caller_altered_row.mutation_id)
+            .expect("same ID resolves the frozen row, not the caller copy");
+    let resolved_hashes =
+        match codestory_agent::proof_qualification_support::validate_contract(resolved_by_id)
+            .unwrap()
+        {
+            codestory_agent::proof_qualification_support::ValidationOutcome::Validated {
+                hashes,
+                ..
+            } => hashes,
+            other => panic!("expected validated ID-resolved negative mutation, got {other:?}"),
+        };
+    assert_eq!(
+        frozen_hashes.contract_digest(),
+        resolved_hashes.contract_digest(),
+        "a same-ID caller object with an altered spec cannot alter the executed frozen row"
+    );
     let derived_comparison =
         contracts::compare_task6_receipt_to_oracle(0, &task6_receipt, &oracle_path.oracle_steps[0])
             .expect("receipt comparison");
