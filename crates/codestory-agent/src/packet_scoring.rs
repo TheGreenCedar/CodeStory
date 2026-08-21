@@ -146,13 +146,6 @@ pub fn packet_citation_rank(
     if path.contains("/server/") && !packet_terms_contain(terms, "server") {
         score -= 12.0;
     }
-    if path.contains("/collections/")
-        && terms
-            .iter()
-            .any(|term| term.contains("collection") || term.contains("payload"))
-    {
-        score += 4.0;
-    }
     #[cfg(any(test, feature = "test-support"))]
     {
         score = eval_citation_rank_adjustment(&normalized_display, &path, score);
@@ -190,7 +183,6 @@ pub fn packet_citation_rank(
             terms,
         );
         score += packet_runtime_formatting_core_symbol_rank_bonus(&normalized_display, terms);
-        score += packet_unrequested_python_source_rank_bonus(&path, terms);
         score +=
             packet_unrequested_windows_formatting_rank_bonus(&normalized_display, &path, terms);
         score += packet_unrequested_client_adapter_rank_bonus(&path, terms);
@@ -1183,17 +1175,6 @@ fn packet_keyframe_stem_is_named(citation: &AgentCitationDto, named_stems: &[Str
 fn packet_citation_is_markdown_source(citation: &AgentCitationDto) -> bool {
     let path = packet_citation_display_path(citation);
     path.ends_with(".md") || path.ends_with(".markdown") || path.ends_with(".mdx")
-}
-
-fn packet_unrequested_python_source_rank_bonus(path: &str, terms: &[String]) -> f32 {
-    if packet_question_wants_python(terms) {
-        return 0.0;
-    }
-    if path.ends_with(".py") || path.ends_with(".pyi") || path.ends_with(".pyx") {
-        -100.0
-    } else {
-        0.0
-    }
 }
 
 fn packet_runtime_formatting_core_symbol_rank_bonus(
@@ -2418,6 +2399,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn python_sources_are_not_globally_demoted_without_a_language_term() {
+        let terms = vec!["request".to_string(), "flow".to_string()];
+        let python = test_rank_citation("handle_request", "src/routes/request.py", 1.0);
+        let native = test_rank_citation("handle_request", "src/routes/request.rs", 1.0);
+
+        assert_eq!(
+            packet_citation_rank(&python, &terms, false),
+            packet_citation_rank(&native, &terms, false)
+        );
+    }
+
+    #[test]
+    fn collections_path_alone_has_no_rank_authority() {
+        let terms = vec!["payload".to_string()];
+        let collection = test_rank_citation("record", "src/collections/record.ts", 1.0);
+        let source = test_rank_citation("record", "src/content/record.ts", 1.0);
+
+        assert_eq!(
+            packet_citation_rank(&collection, &terms, false),
+            packet_citation_rank(&source, &terms, false)
+        );
+    }
+
     fn test_rank_citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
         AgentCitationDto {
             node_id: NodeId(display_name.to_string()),
@@ -3308,7 +3313,6 @@ mod tests {
                 &terms,
             ) < 0.0
         );
-        assert!(packet_unrequested_python_source_rank_bonus("docs/cli/docopt.py", &terms) < 0.0);
     }
 
     #[test]
