@@ -135,7 +135,7 @@ fn verify_only_with_registry(
         .validate_with_path_files_and_registry(&loaded.path_files, registry)?;
     let destinations = DestinationPlan::observe(arguments)?;
 
-    let staging = tempfile::Builder::new()
+    let mut staging = tempfile::Builder::new()
         .prefix(".codestory-proof-source-")
         .tempdir_in(&destinations.workspace_parent.real_path)?;
     let staged_workspaces = staging.path().join("workspaces");
@@ -212,13 +212,42 @@ fn verify_only_with_registry(
     output.as_file_mut().sync_all()?;
 
     destinations.revalidate(arguments)?;
-    fs::rename(&staged_workspaces, &destinations.workspace.real_path)?;
+    let installed_workspace_identity = workspace_path_identity(&staged_workspaces)?;
+    rename_directory_noreplace(&staged_workspaces, &destinations.workspace.real_path)?;
+    match workspace_path_identity(&destinations.workspace.real_path) {
+        Ok(identity) if identity == installed_workspace_identity => {}
+        Ok(_) => {
+            rollback_owned_workspace(
+                &destinations.workspace.real_path,
+                &installed_workspace_identity,
+                &mut staging,
+            )?;
+            bail!("proof_availability_materialize_installed_identity_mismatch")
+        }
+        Err(error) => {
+            rollback_owned_workspace(
+                &destinations.workspace.real_path,
+                &installed_workspace_identity,
+                &mut staging,
+            )?;
+            return Err(error.into());
+        }
+    }
     if let Err(error) = destinations.revalidate_output_parent() {
-        fs::remove_dir_all(&destinations.workspace.real_path)?;
+        rollback_owned_workspace(
+            &destinations.workspace.real_path,
+            &installed_workspace_identity,
+            &mut staging,
+        )?;
         return Err(error);
     }
     if let Err(error) = output.persist_noclobber(&destinations.out.real_path) {
-        fs::remove_dir_all(&destinations.workspace.real_path).with_context(|| {
+        rollback_owned_workspace(
+            &destinations.workspace.real_path,
+            &installed_workspace_identity,
+            &mut staging,
+        )
+        .with_context(|| {
             format!(
                 "remove newly installed source workspace {} after output failure",
                 destinations.workspace.real_path.display()
@@ -319,6 +348,120 @@ fn destinations_overlap(left: &ObservedDestination, right: &ObservedDestination)
         || (left.existing_ancestor_identity == right.existing_ancestor_identity
             && (left.suffix_identity.is_within(&right.suffix_identity)
                 || right.suffix_identity.is_within(&left.suffix_identity)))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_directory_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("rename source contains NUL"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("rename target contains NUL"))?;
+    // SAFETY: both paths are live NUL-terminated byte strings. RENAME_NOREPLACE
+    // makes destination nonexistence part of the atomic filesystem operation.
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_directory_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("rename source contains NUL"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("rename target contains NUL"))?;
+    // SAFETY: both paths are live NUL-terminated byte strings. RENAME_EXCL
+    // makes destination nonexistence part of the atomic filesystem operation.
+    if unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn rename_directory_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    // std::fs::rename uses MoveFileExW without MOVEFILE_REPLACE_EXISTING, so a
+    // destination that appears after observation makes the operation fail.
+    fs::rename(from, to)
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn rename_directory_noreplace(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace directory rename is unsupported on this platform",
+    ))
+}
+
+fn rollback_owned_workspace(
+    workspace: &Path,
+    expected_identity: &WorkspacePathIdentity,
+    staging: &mut tempfile::TempDir,
+) -> std::io::Result<()> {
+    rollback_owned_workspace_with_identity(
+        workspace,
+        expected_identity,
+        staging,
+        workspace_path_identity,
+    )
+}
+
+fn rollback_owned_workspace_with_identity(
+    workspace: &Path,
+    expected_identity: &WorkspacePathIdentity,
+    staging: &mut tempfile::TempDir,
+    observe_identity: impl FnOnce(&Path) -> std::io::Result<WorkspacePathIdentity>,
+) -> std::io::Result<()> {
+    let quarantine = staging.path().join("rollback-workspace");
+    rename_directory_noreplace(workspace, &quarantine)?;
+    let observed_identity = observe_identity(&quarantine);
+    let ownership_confirmed =
+        matches!(&observed_identity, Ok(identity) if identity == expected_identity);
+    if !ownership_confirmed {
+        if let Err(restore_error) = rename_directory_noreplace(&quarantine, workspace) {
+            // The quarantine may contain state another actor raced into the
+            // destination. Prevent TempDir drop from deleting it if restoring
+            // its original name also loses a no-replace race.
+            staging.disable_cleanup(true);
+            return Err(std::io::Error::other(format!(
+                "proof_availability_materialize_workspace_restore_failed: {restore_error}"
+            )));
+        }
+        return match observed_identity {
+            Ok(_) => Err(std::io::Error::other(
+                "proof_availability_materialize_workspace_ownership_lost",
+            )),
+            Err(error) => Err(std::io::Error::other(format!(
+                "proof_availability_materialize_workspace_identity_unavailable: {error}"
+            ))),
+        };
+    }
+    fs::remove_dir_all(quarantine)
 }
 
 fn stage_repository(
@@ -1165,6 +1308,92 @@ mod tests {
         );
         assert!(!workspace.exists());
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn workspace_publish_is_no_replace_and_cleanup_is_identity_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("staged-workspace");
+        let destination = root.path().join("workspace");
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("owned"), b"owned").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("raced"), b"raced").unwrap();
+
+        rename_directory_noreplace(&staged, &destination)
+            .expect_err("workspace publication must not replace a raced destination");
+        assert_eq!(fs::read(destination.join("raced")).unwrap(), b"raced");
+        assert_eq!(fs::read(staged.join("owned")).unwrap(), b"owned");
+
+        fs::remove_dir_all(&destination).unwrap();
+        let owned_identity = workspace_path_identity(&staged).unwrap();
+        rename_directory_noreplace(&staged, &destination).unwrap();
+        let mut owned_rollback = tempfile::tempdir_in(root.path()).unwrap();
+        rollback_owned_workspace(&destination, &owned_identity, &mut owned_rollback).unwrap();
+        assert!(!destination.exists());
+
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("owned"), b"owned").unwrap();
+        let owned_identity = workspace_path_identity(&staged).unwrap();
+        rename_directory_noreplace(&staged, &destination).unwrap();
+        let displaced = root.path().join("displaced-owned-workspace");
+        fs::rename(&destination, &displaced).unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("unrelated"), b"unrelated").unwrap();
+        let mut rollback = tempfile::tempdir_in(root.path()).unwrap();
+
+        rollback_owned_workspace(&destination, &owned_identity, &mut rollback)
+            .expect_err("cleanup must refuse a replacement workspace");
+        assert_eq!(
+            fs::read(destination.join("unrelated")).unwrap(),
+            b"unrelated"
+        );
+        assert_eq!(fs::read(displaced.join("owned")).unwrap(), b"owned");
+
+        fs::remove_dir_all(&destination).unwrap();
+        fs::create_dir(&staged).unwrap();
+        fs::write(staged.join("owned"), b"owned").unwrap();
+        let owned_identity = workspace_path_identity(&staged).unwrap();
+        rename_directory_noreplace(&staged, &destination).unwrap();
+        let mut unavailable_rollback = tempfile::tempdir_in(root.path()).unwrap();
+        rollback_owned_workspace_with_identity(
+            &destination,
+            &owned_identity,
+            &mut unavailable_rollback,
+            |_| Err(std::io::Error::other("identity unavailable")),
+        )
+        .expect_err("identity failure must restore rather than delete quarantine");
+        assert_eq!(fs::read(destination.join("owned")).unwrap(), b"owned");
+        assert!(
+            !unavailable_rollback
+                .path()
+                .join("rollback-workspace")
+                .exists()
+        );
+
+        let mut raced_rollback = tempfile::tempdir_in(root.path()).unwrap();
+        let raced_rollback_path = raced_rollback.path().to_path_buf();
+        rollback_owned_workspace_with_identity(
+            &destination,
+            &owned_identity,
+            &mut raced_rollback,
+            |_| {
+                fs::create_dir(&destination)?;
+                fs::write(destination.join("second-race"), b"second-race")?;
+                Err(std::io::Error::other("identity unavailable"))
+            },
+        )
+        .expect_err("failed restoration must preserve quarantined state");
+        assert_eq!(
+            fs::read(destination.join("second-race")).unwrap(),
+            b"second-race"
+        );
+        assert_eq!(
+            fs::read(raced_rollback_path.join("rollback-workspace/owned")).unwrap(),
+            b"owned"
+        );
+        fs::remove_dir_all(&destination).unwrap();
+        fs::remove_dir_all(&raced_rollback_path).unwrap();
     }
 
     #[test]

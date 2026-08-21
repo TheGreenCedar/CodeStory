@@ -66,8 +66,12 @@ existing ancestor and native filesystem identity. It rejects non-root symlink
 components and overlap between workspace, cache, and output even when different
 spellings traverse a platform root alias. The workspace and output parent
 identities are revalidated before output staging, workspace installation, and
-descriptor persistence; a failed no-clobber persist removes only the workspace
-installed by that attempt.
+descriptor persistence. Workspace publication uses an atomic no-replace rename.
+If descriptor persistence fails, rollback atomically moves the workspace into
+the private staging root, verifies the moved directory's native identity, and
+deletes only that owned quarantine. A raced replacement is restored without
+deletion; if restoration also loses a no-replace race, staging cleanup is
+disabled so the quarantined state is preserved for recovery.
 
 Corpus validation bijects four references to four loaded cohort roots and
 reconciles repository declarations, source trees, canonical hashes, counts,
