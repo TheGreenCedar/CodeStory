@@ -1,72 +1,118 @@
 {
   "$defs": {
-    "AutomaticThresholdsV1": {
-      "additionalProperties": false,
-      "properties": {
-        "minimum_proven_path_ratio_milli": {
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "minimum_proven_path_ratio_milli"
-      ],
-      "type": "object"
-    },
-    "ExperimentalThresholdsV1": {
-      "additionalProperties": false,
-      "properties": {
-        "minimum_actionable_partial_ratio_milli": {
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0,
-          "type": "integer"
-        },
-        "minimum_proven_step_ratio_milli": {
-          "format": "uint16",
-          "maximum": 65535,
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "minimum_proven_step_ratio_milli",
-        "minimum_actionable_partial_ratio_milli"
-      ],
-      "type": "object"
-    },
     "HardGatesV1": {
       "additionalProperties": false,
       "properties": {
-        "all_corpus_sources_materialized": {
+        "maximum_certified_absence": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_false_contract_proven": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_proof_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "require_complete_failure_funnel": {
           "type": "boolean"
         },
-        "all_oracle_ranges_verified": {
+        "require_complete_provenance": {
           "type": "boolean"
         },
-        "no_unclassified_failures": {
+        "require_each_cohort": {
+          "type": "boolean"
+        },
+        "require_exact_receipt_matches": {
+          "type": "boolean"
+        },
+        "require_product_disposition_match": {
           "type": "boolean"
         }
       },
       "required": [
-        "all_corpus_sources_materialized",
-        "all_oracle_ranges_verified",
-        "no_unclassified_failures"
+        "maximum_false_contract_proven",
+        "require_exact_receipt_matches",
+        "maximum_certified_absence",
+        "require_complete_failure_funnel",
+        "require_complete_provenance",
+        "maximum_proof_bytes",
+        "require_each_cohort",
+        "require_product_disposition_match"
       ],
       "type": "object"
     },
-    "StableExplicitThresholdsV1": {
+    "RoleThresholdsV1": {
       "additionalProperties": false,
       "properties": {
-        "minimum_proven_path_ratio_milli": {
+        "maximum_complete_response_p95_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_response_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_transport_p95_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_unknown_p95_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximum_unknown_response_p95_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_actionable_exact_gap_milli": {
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
           "type": "integer"
         },
-        "minimum_proven_step_ratio_milli": {
+        "minimum_cohort_wilson_lower_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_full_or_useful_partial_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_full_proof_wilson_lower_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_full_proofs": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_full_proofs_per_cohort": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimum_positive_step_recall_milli": {
           "format": "uint16",
           "maximum": 65535,
           "minimum": 0,
@@ -74,8 +120,18 @@
         }
       },
       "required": [
-        "minimum_proven_path_ratio_milli",
-        "minimum_proven_step_ratio_milli"
+        "minimum_full_proofs",
+        "minimum_full_proofs_per_cohort",
+        "minimum_full_proof_wilson_lower_milli",
+        "minimum_cohort_wilson_lower_milli",
+        "minimum_positive_step_recall_milli",
+        "minimum_full_or_useful_partial_milli",
+        "minimum_actionable_exact_gap_milli",
+        "maximum_unknown_p95_ms",
+        "maximum_transport_p95_ms",
+        "maximum_complete_response_p95_bytes",
+        "maximum_unknown_response_p95_bytes",
+        "maximum_response_bytes"
       ],
       "type": "object"
     }
@@ -85,35 +141,75 @@
   "additionalProperties": false,
   "properties": {
     "automatic": {
-      "$ref": "#/$defs/AutomaticThresholdsV1"
+      "$ref": "#/$defs/RoleThresholdsV1"
+    },
+    "corpus_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "expected_cohort_count": {
+      "format": "uint8",
+      "maximum": 255,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "expected_negative_requests": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "expected_positive_requests": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "expected_positive_steps": {
+      "format": "uint16",
+      "maximum": 65535,
+      "minimum": 0,
+      "type": "integer"
     },
     "experimental": {
-      "$ref": "#/$defs/ExperimentalThresholdsV1"
+      "$ref": "#/$defs/RoleThresholdsV1"
     },
     "hard_gates": {
       "$ref": "#/$defs/HardGatesV1"
     },
     "methodology_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
       "type": "string"
     },
     "schema": {
+      "const": "codestory.proof-availability-thresholds/v1",
       "type": "string"
     },
     "stable_explicit": {
-      "$ref": "#/$defs/StableExplicitThresholdsV1"
+      "$ref": "#/$defs/RoleThresholdsV1"
     },
     "thresholds_id": {
       "type": "string"
+    },
+    "wilson_z": {
+      "format": "double",
+      "type": "number"
     }
   },
   "required": [
     "schema",
     "thresholds_id",
+    "corpus_sha256",
+    "methodology_sha256",
+    "wilson_z",
+    "expected_cohort_count",
+    "expected_positive_requests",
+    "expected_positive_steps",
+    "expected_negative_requests",
     "hard_gates",
-    "experimental",
-    "stable_explicit",
     "automatic",
-    "methodology_sha256"
+    "stable_explicit",
+    "experimental"
   ],
   "title": "ThresholdsV1",
   "type": "object"

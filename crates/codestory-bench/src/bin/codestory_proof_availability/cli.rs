@@ -23,6 +23,12 @@ pub enum Command {
 pub struct MaterializeArgs {
     #[arg(long, value_name = "CORPUS_JSON")]
     pub corpus: PathBuf,
+    #[arg(long, value_name = "WORKSPACE_DIR")]
+    pub workspace: PathBuf,
+    #[arg(long, value_name = "CACHE_DIR")]
+    pub cache_root: PathBuf,
+    #[arg(long, value_name = "ENVIRONMENT_JSON")]
+    pub out: PathBuf,
     /// Validate corpus identities and oracle ranges without indexing or execution.
     #[arg(long)]
     pub verify_only: bool,
@@ -32,16 +38,16 @@ pub struct MaterializeArgs {
 pub struct RunArgs {
     #[arg(long, value_name = "CORPUS_JSON")]
     pub corpus: PathBuf,
-    #[arg(long, value_name = "THRESHOLDS_JSON")]
-    pub thresholds: PathBuf,
+    #[arg(long, value_name = "ENVIRONMENT_JSON")]
+    pub environment: PathBuf,
     #[arg(long, value_name = "OUTPUT_DIR")]
-    pub output: PathBuf,
+    pub out: PathBuf,
 }
 
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
-    #[arg(long, value_name = "CORPUS_JSON")]
-    pub corpus: PathBuf,
     #[arg(long, value_name = "THRESHOLDS_JSON")]
     pub thresholds: PathBuf,
+    #[arg(long, value_name = "RESULTS_DIR")]
+    pub results: PathBuf,
 }

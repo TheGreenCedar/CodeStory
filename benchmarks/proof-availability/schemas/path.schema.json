@@ -1,34 +1,143 @@
 {
   "$defs": {
-    "ExpectedPathOutcomeV1": {
-      "enum": [
-        "proven",
-        "partial",
-        "rejected"
-      ],
-      "type": "string"
-    },
-    "OracleStepV1": {
+    "CallPathSpecV1": {
       "additionalProperties": false,
       "properties": {
-        "selector": {
+        "expected_step_count": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
           "type": "string"
         },
-        "source_range": {
-          "$ref": "#/$defs/SourceRangeV1"
+        "targets": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "start",
+        "targets",
+        "expected_step_count"
+      ],
+      "type": "object"
+    },
+    "ClauseAnchorV1": {
+      "additionalProperties": false,
+      "properties": {
+        "clause_id": {
+          "type": "string"
         },
-        "step_id": {
+        "range": {
+          "$ref": "#/$defs/OracleSourceRangeV1"
+        },
+        "text": {
           "type": "string"
         }
       },
       "required": [
-        "step_id",
-        "selector",
-        "source_range"
+        "clause_id",
+        "text",
+        "range"
       ],
       "type": "object"
     },
-    "SourceRangeV1": {
+    "NegativeMutationKindV1": {
+      "enum": [
+        "remove_expected_relation",
+        "add_ambiguous_relation"
+      ],
+      "type": "string"
+    },
+    "NegativeMutationV1": {
+      "additionalProperties": false,
+      "properties": {
+        "caller": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/NegativeMutationKindV1"
+        },
+        "mutation_id": {
+          "type": "string"
+        },
+        "step_index": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mutation_id",
+        "kind",
+        "step_index",
+        "caller",
+        "target"
+      ],
+      "type": "object"
+    },
+    "OracleAuditV1": {
+      "additionalProperties": false,
+      "properties": {
+        "cohort_path_file": {
+          "type": "string"
+        },
+        "cohort_path_file_sha256": {
+          "type": "string"
+        },
+        "curator": {
+          "type": "string"
+        },
+        "review_date": {
+          "type": "string"
+        },
+        "reviewer": {
+          "type": "string"
+        },
+        "source_area": {
+          "type": "string"
+        },
+        "source_tree_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cohort_path_file",
+        "cohort_path_file_sha256",
+        "source_tree_sha256",
+        "source_area",
+        "curator",
+        "reviewer",
+        "review_date"
+      ],
+      "type": "object"
+    },
+    "OracleDeclarationV1": {
+      "additionalProperties": false,
+      "properties": {
+        "range": {
+          "$ref": "#/$defs/OracleSourceRangeV1"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "range"
+      ],
+      "type": "object"
+    },
+    "OracleSourceRangeV1": {
       "additionalProperties": false,
       "properties": {
         "end_byte": {
@@ -40,6 +149,7 @@
           "type": "string"
         },
         "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
         "start_byte": {
@@ -55,49 +165,86 @@
         "sha256"
       ],
       "type": "object"
+    },
+    "OracleStepV1": {
+      "additionalProperties": false,
+      "properties": {
+        "caller": {
+          "$ref": "#/$defs/OracleDeclarationV1"
+        },
+        "callsite": {
+          "$ref": "#/$defs/OracleSourceRangeV1"
+        },
+        "target": {
+          "$ref": "#/$defs/OracleDeclarationV1"
+        }
+      },
+      "required": [
+        "caller",
+        "callsite",
+        "target"
+      ],
+      "type": "object"
     }
   },
   "$id": "codestory.proof-availability-path/v1",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
-    "expected_outcome": {
-      "$ref": "#/$defs/ExpectedPathOutcomeV1"
+    "audit": {
+      "$ref": "#/$defs/OracleAuditV1"
     },
-    "expected_step_count": {
-      "format": "uint32",
-      "minimum": 0,
-      "type": "integer"
-    },
-    "notes": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "path_id": {
+    "case_id": {
       "type": "string"
     },
-    "schema": {
+    "clauses": {
+      "items": {
+        "$ref": "#/$defs/ClauseAnchorV1"
+      },
+      "type": "array"
+    },
+    "language": {
       "type": "string"
     },
-    "source_id": {
-      "type": "string"
+    "negative_mutations": {
+      "items": {
+        "$ref": "#/$defs/NegativeMutationV1"
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
     },
-    "steps": {
+    "oracle_steps": {
       "items": {
         "$ref": "#/$defs/OracleStepV1"
       },
       "type": "array"
+    },
+    "repository_id": {
+      "type": "string"
+    },
+    "schema": {
+      "const": "codestory.proof-availability-path/v1",
+      "type": "string"
+    },
+    "source_text": {
+      "type": "string"
+    },
+    "spec": {
+      "$ref": "#/$defs/CallPathSpecV1"
     }
   },
   "required": [
     "schema",
-    "path_id",
-    "source_id",
-    "expected_step_count",
-    "steps",
-    "expected_outcome"
+    "case_id",
+    "repository_id",
+    "language",
+    "source_text",
+    "clauses",
+    "spec",
+    "oracle_steps",
+    "negative_mutations",
+    "audit"
   ],
   "title": "OraclePathV1",
   "type": "object"

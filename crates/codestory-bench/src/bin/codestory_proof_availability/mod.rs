@@ -18,6 +18,7 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
             corpus
                 .validate()
                 .context("validate proof availability corpus")?;
+            util::refuse_existing_output(&arguments.out)?;
             if arguments.verify_only {
                 // Verification is deliberately parse-and-validate only until Task 10
                 // owns detached checkout materialization. In particular, no indexer
@@ -27,14 +28,10 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
             bail!("proof_availability_materialize_not_implemented")
         }
         cli::Command::Run(arguments) => {
-            util::refuse_existing_output(&arguments.output)?;
+            util::refuse_existing_output(&arguments.out)?;
             bail!("proof_availability_run_not_implemented")
         }
         cli::Command::Verify(arguments) => {
-            let corpus = corpus::load(&arguments.corpus)?;
-            corpus
-                .validate()
-                .context("validate proof availability corpus")?;
             let thresholds = corpus::load_thresholds(&arguments.thresholds)?;
             thresholds
                 .validate()

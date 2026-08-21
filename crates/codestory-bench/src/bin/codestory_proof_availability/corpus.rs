@@ -5,10 +5,14 @@ use std::path::Path;
 
 pub fn load(path: &Path) -> Result<CorpusV1> {
     let bytes = fs::read(path).with_context(|| format!("read corpus {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("parse proof availability corpus")
+    CorpusV1::from_json(
+        serde_json::from_slice(&bytes).context("parse proof availability corpus JSON")?,
+    )
 }
 
 pub fn load_thresholds(path: &Path) -> Result<ThresholdsV1> {
     let bytes = fs::read(path).with_context(|| format!("read thresholds {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("parse proof availability thresholds")
+    ThresholdsV1::from_json(
+        serde_json::from_slice(&bytes).context("parse proof availability thresholds JSON")?,
+    )
 }

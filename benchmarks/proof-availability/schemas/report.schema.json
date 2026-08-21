@@ -9,16 +9,19 @@
             "null"
           ]
         },
+        "failed_gates": {
+          "items": {
+            "$ref": "#/$defs/FailedGateV1"
+          },
+          "type": "array"
+        },
         "outcome": {
           "$ref": "#/$defs/ActivationOutcomeV1"
-        },
-        "rationale": {
-          "type": "string"
         }
       },
       "required": [
         "outcome",
-        "rationale"
+        "failed_gates"
       ],
       "type": "object"
     },
@@ -31,53 +34,117 @@
       ],
       "type": "string"
     },
-    "CaseDispositionV1": {
-      "enum": [
-        "passed",
-        "failed_hard_gate",
-        "failed_experimental",
-        "failed_stable",
-        "dependency_blocked"
-      ],
-      "type": "string"
-    },
     "CaseReportV1": {
       "additionalProperties": false,
       "properties": {
-        "case_id": {
-          "type": "string"
-        },
-        "disposition": {
-          "$ref": "#/$defs/CaseDispositionV1"
-        },
-        "measurement_bytes": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "source_id": {
-          "type": "string"
-        },
-        "trail": {
+        "actionable_exact_gap": {
           "anyOf": [
             {
-              "$ref": "#/$defs/TrailReportV1"
+              "$ref": "#/$defs/TypedGapV1"
             },
             {
               "type": "null"
             }
           ]
+        },
+        "authoritative_receipt_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "authoritative_receipt_evidence_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "case_id": {
+          "type": "string"
+        },
+        "complete_projection_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "diagnostic_candidate_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "first_failure": {
+          "$ref": "#/$defs/StepFailureV1"
+        },
+        "negative_mutations": {
+          "items": {
+            "$ref": "#/$defs/NegativeMutationResultV1"
+          },
+          "type": "array"
+        },
+        "oracle_receipts_exact": {
+          "type": "boolean"
+        },
+        "product_disposition": {
+          "$ref": "#/$defs/ProductDispositionV1"
+        },
+        "proven_prefix_length": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "proven_step_precision_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "proven_step_recall_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "stage_durations_ms": {
+          "$ref": "#/$defs/StageDurationsV1"
+        },
+        "tool_result_bytes": {
+          "$ref": "#/$defs/ToolResultBytesV1"
+        },
+        "warm_end_to_end_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
         "case_id",
-        "source_id",
-        "disposition"
+        "repository_id",
+        "product_disposition",
+        "authoritative_receipt_count",
+        "oracle_receipts_exact",
+        "proven_step_precision_milli",
+        "proven_step_recall_milli",
+        "proven_prefix_length",
+        "diagnostic_candidate_count",
+        "authoritative_receipt_evidence_count",
+        "warm_end_to_end_ms",
+        "stage_durations_ms",
+        "complete_projection_bytes",
+        "tool_result_bytes",
+        "negative_mutations",
+        "first_failure"
       ],
       "type": "object"
+    },
+    "ContainmentFailureV1": {
+      "enum": [
+        "edge_source_file_mismatch",
+        "missing",
+        "ambiguous"
+      ],
+      "type": "string"
     },
     "EnvironmentReportV1": {
       "additionalProperties": false,
@@ -85,10 +152,20 @@
         "architecture": {
           "type": "string"
         },
-        "codestory_version": {
+        "binary_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
-        "command_sha256": {
+        "core_generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "core_run_id": {
+          "type": "string"
+        },
+        "database_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
         "environment_id": {
@@ -96,140 +173,668 @@
         },
         "os": {
           "type": "string"
+        },
+        "rust_host": {
+          "type": "string"
         }
       },
       "required": [
         "environment_id",
         "os",
         "architecture",
-        "codestory_version",
-        "command_sha256"
+        "rust_host",
+        "binary_sha256",
+        "core_generation",
+        "core_run_id",
+        "database_sha256"
+      ],
+      "type": "object"
+    },
+    "FailedGateV1": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/QualificationGateKindV1"
+        }
+      },
+      "required": [
+        "kind",
+        "detail"
       ],
       "type": "object"
     },
     "FailureBucketV1": {
       "additionalProperties": false,
       "properties": {
-        "expected_steps": {
-          "format": "uint64",
+        "count": {
+          "format": "uint128",
           "minimum": 0,
           "type": "integer"
         },
-        "failed_steps": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "gate": {
-          "type": "string"
+        "failure": {
+          "$ref": "#/$defs/StepFailureV1"
         }
       },
       "required": [
-        "gate",
-        "expected_steps",
-        "failed_steps"
+        "failure",
+        "count"
       ],
       "type": "object"
     },
     "FailureFunnelReportV1": {
       "additionalProperties": false,
       "properties": {
+        "attempted_positive_steps": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
         "buckets": {
           "items": {
             "$ref": "#/$defs/FailureBucketV1"
           },
           "type": "array"
         },
-        "unclassified_failures": {
-          "format": "uint64",
+        "classified_positive_steps": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unclassified_positive_steps": {
+          "format": "uint16",
+          "maximum": 65535,
           "minimum": 0,
           "type": "integer"
         }
       },
       "required": [
-        "buckets",
-        "unclassified_failures"
+        "attempted_positive_steps",
+        "classified_positive_steps",
+        "unclassified_positive_steps",
+        "buckets"
       ],
       "type": "object"
+    },
+    "FailureHistogramV1": {
+      "additionalProperties": false,
+      "properties": {
+        "edge_ids": {
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "reason": {
+          "$ref": "#/$defs/RawAdmissionFailureV1"
+        }
+      },
+      "required": [
+        "reason",
+        "edge_ids"
+      ],
+      "type": "object"
+    },
+    "FinalizationFailureV1": {
+      "enum": [
+        "receipt_integration",
+        "receipt_budget",
+        "projection_budget"
+      ],
+      "type": "string"
     },
     "InventoryReportV1": {
       "additionalProperties": false,
       "properties": {
-        "observed_files": {
-          "format": "uint64",
+        "admitted_rows": {
+          "format": "uint128",
           "minimum": 0,
           "type": "integer"
         },
-        "source_hashes_verified": {
-          "format": "uint64",
+        "effective_endpoint_rows": {
+          "format": "uint128",
           "minimum": 0,
           "type": "integer"
         },
-        "source_id": {
+        "exact_resolved_rows": {
+          "format": "uint128",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repository_id": {
           "type": "string"
         },
-        "status": {
-          "$ref": "#/$defs/InventoryStatusV1"
+        "stored_call_rows": {
+          "format": "uint128",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unresolved_placeholder_rows": {
+          "format": "uint128",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
-        "source_id",
-        "status",
-        "observed_files",
-        "source_hashes_verified"
+        "repository_id",
+        "stored_call_rows",
+        "effective_endpoint_rows",
+        "exact_resolved_rows",
+        "admitted_rows",
+        "unresolved_placeholder_rows"
       ],
       "type": "object"
     },
-    "InventoryStatusV1": {
+    "NegativeMutationResultV1": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_proven": {
+          "type": "boolean"
+        },
+        "mutation_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mutation_id",
+        "contract_proven"
+      ],
+      "type": "object"
+    },
+    "ProductDispositionKindV1": {
       "enum": [
-        "complete",
-        "incomplete",
-        "unavailable"
+        "contract_proven",
+        "unknown",
+        "certified_absence",
+        "invalid"
       ],
       "type": "string"
     },
-    "TrailOutcomeV1": {
+    "ProductDispositionV1": {
+      "additionalProperties": false,
+      "properties": {
+        "gaps": {
+          "items": {
+            "$ref": "#/$defs/TypedGapV1"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/ProductDispositionKindV1"
+        }
+      },
+      "required": [
+        "kind",
+        "gaps"
+      ],
+      "type": "object"
+    },
+    "ProvenanceV1": {
+      "additionalProperties": false,
+      "properties": {
+        "binary_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "corpus_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "results_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "source_commit": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "source_tree": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "thresholds_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_commit",
+        "source_tree",
+        "binary_sha256",
+        "corpus_sha256",
+        "thresholds_sha256",
+        "results_sha256"
+      ],
+      "type": "object"
+    },
+    "QualificationGateKindV1": {
       "enum": [
-        "proven",
-        "partial",
-        "rejected",
-        "unavailable"
+        "false_contract_proven",
+        "receipt_mismatch",
+        "certified_absence",
+        "failure_funnel",
+        "provenance",
+        "response_size",
+        "cohort_failure",
+        "product_disposition_mismatch",
+        "automatic_threshold",
+        "stable_threshold",
+        "experimental_usefulness",
+        "integration_dependency"
       ],
       "type": "string"
+    },
+    "RawAdmissionFailureV1": {
+      "enum": [
+        "wrong_kind",
+        "certainty_absent",
+        "certainty_probable",
+        "certainty_uncertain",
+        "wrong_effective_source",
+        "wrong_effective_target",
+        "missing_exact_resolved_target",
+        "candidate_alternatives_retained",
+        "missing_file_node",
+        "missing_line",
+        "invalid_or_legacy_callsite_identity",
+        "callsite_file_mismatch",
+        "callsite_line_mismatch",
+        "callsite_raw_target_mismatch"
+      ],
+      "type": "string"
+    },
+    "SelectorFailureV1": {
+      "enum": [
+        "missing",
+        "ambiguous",
+        "non_callable"
+      ],
+      "type": "string"
+    },
+    "SourceBindingFailureV1": {
+      "enum": [
+        "file_incomplete",
+        "stored_hash_absent",
+        "working_tree_read_failed",
+        "working_tree_hash_mismatch",
+        "invalid_utf8",
+        "line_missing",
+        "line_over_limit"
+      ],
+      "type": "string"
+    },
+    "StageDurationsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "operation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "validation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "validation",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "StepFailureV1": {
+      "oneOf": [
+        {
+          "properties": {
+            "edge_ids": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FinalizationFailureV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "histogram": {
+              "items": {
+                "$ref": "#/$defs/FailureHistogramV1"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "admitted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "edge_ids",
+            "histogram"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "edge_ids": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FinalizationFailureV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "histogram": {
+              "items": {
+                "$ref": "#/$defs/FailureHistogramV1"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "selector",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/SelectorFailureV1"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "edge_ids",
+            "histogram"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "edge_ids": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FinalizationFailureV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "histogram": {
+              "items": {
+                "$ref": "#/$defs/FailureHistogramV1"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "raw_admission",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/RawAdmissionFailureV1"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "edge_ids",
+            "histogram"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "edge_ids": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FinalizationFailureV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "histogram": {
+              "items": {
+                "$ref": "#/$defs/FailureHistogramV1"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "containment",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/ContainmentFailureV1"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "edge_ids",
+            "histogram"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "edge_ids": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FinalizationFailureV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "histogram": {
+              "items": {
+                "$ref": "#/$defs/FailureHistogramV1"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "source_binding",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/SourceBindingFailureV1"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "edge_ids",
+            "histogram"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "edge_ids": {
+              "items": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "finalization": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FinalizationFailureV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "histogram": {
+              "items": {
+                "$ref": "#/$defs/FailureHistogramV1"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "finalization",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/FinalizationFailureV1"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "edge_ids",
+            "histogram"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ToolResultBytesV1": {
+      "additionalProperties": false,
+      "properties": {
+        "v2024_11_05": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "v2025_03_26": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "v2025_06_18": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "v2025_11_25": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "v2024_11_05",
+        "v2025_03_26",
+        "v2025_06_18",
+        "v2025_11_25"
+      ],
+      "type": "object"
+    },
+    "TrailLengthCountsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "effective_endpoint": {
+          "format": "uint128",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exact_resolved": {
+          "format": "uint128",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "length": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "strictly_admitted": {
+          "format": "uint128",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "length",
+        "effective_endpoint",
+        "exact_resolved",
+        "strictly_admitted"
+      ],
+      "type": "object"
     },
     "TrailReportV1": {
       "additionalProperties": false,
       "properties": {
-        "first_failure_gate": {
-          "type": [
-            "string",
-            "null"
-          ]
+        "lengths": {
+          "items": {
+            "$ref": "#/$defs/TrailLengthCountsV1"
+          },
+          "type": "array"
         },
-        "observed_step_count": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "outcome": {
-          "$ref": "#/$defs/TrailOutcomeV1"
-        },
-        "path_id": {
+        "repository_id": {
           "type": "string"
-        },
-        "proven_step_count": {
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
         }
       },
       "required": [
-        "path_id",
-        "outcome",
-        "proven_step_count",
-        "observed_step_count"
+        "repository_id",
+        "lengths"
       ],
       "type": "object"
+    },
+    "TypedGapV1": {
+      "enum": [
+        "selector_missing",
+        "selector_ambiguous",
+        "relation_missing",
+        "recursion",
+        "source_binding",
+        "projection_budget"
+      ],
+      "type": "string"
     }
   },
   "$id": "codestory.proof-availability-report/v1",
@@ -242,18 +847,8 @@
       },
       "type": "array"
     },
-    "corpus_sha256": {
-      "type": "string"
-    },
     "decision": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/ActivationDecisionV1"
-        },
-        {
-          "type": "null"
-        }
-      ]
+      "$ref": "#/$defs/ActivationDecisionV1"
     },
     "environment": {
       "$ref": "#/$defs/EnvironmentReportV1"
@@ -267,21 +862,33 @@
       },
       "type": "array"
     },
-    "schema": {
+    "provenance": {
+      "$ref": "#/$defs/ProvenanceV1"
+    },
+    "qualification_id": {
       "type": "string"
     },
-    "thresholds_sha256": {
+    "schema": {
+      "const": "codestory.proof-availability-report/v1",
       "type": "string"
+    },
+    "trails": {
+      "items": {
+        "$ref": "#/$defs/TrailReportV1"
+      },
+      "type": "array"
     }
   },
   "required": [
     "schema",
-    "corpus_sha256",
-    "thresholds_sha256",
+    "qualification_id",
+    "provenance",
     "environment",
     "inventory",
+    "trails",
     "cases",
-    "failure_funnel"
+    "failure_funnel",
+    "decision"
   ],
   "title": "QualificationSummaryV1",
   "type": "object"
