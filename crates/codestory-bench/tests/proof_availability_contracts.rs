@@ -9,7 +9,7 @@ use contracts::{
     FunnelOutcomeV1, MAX_CANDIDATE_EDGES_PER_STEP, MAX_OBSERVED_RECEIPTS_PER_CASE,
     ObservedReceiptV1, ProofQualificationTraceV1, QualificationSummaryV1,
     ReceiptOracleComparisonV1, SchemaDocument, SelectorGateOutcomeV1, ThresholdsV1,
-    TransportEvidenceV1, canonical_corpus_sha256,
+    TransportEvidenceV1, canonical_corpus_sha256, canonical_thresholds_sha256,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -77,8 +77,11 @@ fn corpus() -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let threshold_hash =
+        canonical_thresholds_sha256(&ThresholdsV1::from_json(thresholds()).expect("thresholds"))
+            .expect("canonical thresholds hash");
     json!({
-      "schema":"codestory.proof-availability-corpus/v1","corpus_id":"proof-availability-v1","thresholds_sha256":SHA,"methodology_sha256":SHA,"curator":"curator@example.invalid","reviewer":"reviewer@example.invalid","review_date":"2026-08-21",
+      "schema":"codestory.proof-availability-corpus/v1","corpus_id":"proof-availability-v1","thresholds_sha256":threshold_hash,"methodology_sha256":SHA,"curator":"curator@example.invalid","reviewer":"reviewer@example.invalid","review_date":"2026-08-21",
       "cohorts":ids.iter().map(|id|json!({"repository_id":id,"repository":format!("https://example.invalid/{id}.git"),"commit":COMMIT,"workspace":".","path_file":format!("paths/{id}.json"),"path_file_sha256":SHA,"source_tree_sha256":SHA,"path_count":30,"positive_step_count":78})).collect::<Vec<_>>(),
       "paths":paths,"positive_request_count":120,"positive_step_count":312,"negative_request_count":240
     })
@@ -100,11 +103,15 @@ fn role(
 }
 
 fn thresholds() -> Value {
-    json!({"schema":"codestory.proof-availability-thresholds/v1","thresholds_id":"proof-availability-v1","corpus_sha256":SHA,"methodology_sha256":SHA,"wilson_z":1.959963984540054,"expected_cohort_count":4,"expected_positive_requests":120,"expected_positive_steps":312,"expected_negative_requests":240,"hard_gates":{"maximum_false_contract_proven":0,"require_exact_receipt_matches":true,"maximum_certified_absence":0,"require_complete_failure_funnel":true,"require_complete_provenance":true,"maximum_invalid_results":0,"maximum_over_cap_results":0,"maximum_transport_errors":0,"maximum_proof_bytes":65536,"require_each_cohort":true,"require_product_disposition_match":true},"automatic":role(96,21,900,950,950,500,1500,32768,16384),"stable_explicit":role(60,12,750,800,900,1000,2000,32768,16384),"experimental":role(24,12,500,600,800,2000,3000,49152,24576)})
+    json!({"schema":"codestory.proof-availability-thresholds/v1","thresholds_id":"proof-availability-v1","methodology_sha256":SHA,"wilson_z":1.959963984540054,"expected_cohort_count":4,"expected_positive_requests":120,"expected_positive_steps":312,"expected_negative_requests":240,"hard_gates":{"maximum_false_contract_proven":0,"require_exact_receipt_matches":true,"maximum_certified_absence":0,"require_complete_failure_funnel":true,"require_complete_provenance":true,"maximum_invalid_results":0,"maximum_over_cap_results":0,"maximum_transport_errors":0,"maximum_proof_bytes":65536,"require_each_cohort":true,"require_product_disposition_match":true},"automatic":role(96,21,900,950,950,500,1500,32768,16384),"stable_explicit":role(60,12,750,800,900,1000,2000,32768,16384),"experimental":role(24,12,500,600,800,2000,3000,49152,24576)})
 }
 
 fn report() -> Value {
     let frozen = corpus();
+    let threshold_hash = frozen["thresholds_sha256"]
+        .as_str()
+        .expect("threshold hash")
+        .to_owned();
     let corpus_hash =
         canonical_corpus_sha256(&CorpusV1::from_json(frozen.clone()).expect("corpus"))
             .expect("canonical corpus hash");
@@ -213,10 +220,10 @@ fn report() -> Value {
                 "receipt_evidence":{"observed_receipts":observed_receipts,"missing_oracle_steps":[]},
                 "complete_projection_bytes":128,
                 "transport":{"kind":"measurements","measurements":{"measurements":[
-                    {"revision":"2024-11-05","actual_bytes":128},
-                    {"revision":"2025-03-26","actual_bytes":128},
-                    {"revision":"2025-06-18","actual_bytes":128},
-                    {"revision":"2025-11-25","actual_bytes":128}
+                    {"revision":"2024-11-05","actual_bytes":128,"elapsed_ns":11},
+                    {"revision":"2025-03-26","actual_bytes":128,"elapsed_ns":22},
+                    {"revision":"2025-06-18","actual_bytes":128,"elapsed_ns":33},
+                    {"revision":"2025-11-25","actual_bytes":128,"elapsed_ns":44}
                 ]}},
                 "negative_mutations":negative_mutations,
                 "proof_trace":{"selectors":selectors,"selector_early_return":false,"steps":steps,"finalization":{"kind":"complete","projection_bytes":128}}
@@ -225,7 +232,7 @@ fn report() -> Value {
         .collect::<Vec<_>>();
     json!({
       "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-0123456789ab",
-      "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":SHA,"results_sha256":SHA},
+      "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash,"results_sha256":SHA},
       "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"projects":cohort_ids.iter().map(|id|json!({"repository_id":id,"source_head":COMMIT,"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})).collect::<Vec<_>>()},
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
       "trails":cohort_ids.iter().map(|id|json!({"repository_id":id,"lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]})).collect::<Vec<_>>(),
@@ -307,6 +314,170 @@ fn frozen_thresholds_cover_all_role_and_hard_gate_semantics() {
         ThresholdsV1::from_json(tuned_after_results).is_err(),
         "in-range threshold tuning must not change the Section 8 freeze"
     );
+}
+
+#[test]
+fn threshold_identity_is_acyclic_canonical_and_rejects_legacy_corpus_binding() {
+    let parsed = ThresholdsV1::from_json(thresholds()).expect("thresholds");
+    let baseline = canonical_thresholds_sha256(&parsed).expect("threshold digest");
+
+    let mut legacy = thresholds();
+    legacy["corpus_sha256"] = json!(SHA);
+    ThresholdsV1::from_json(legacy).expect_err("legacy reverse corpus binding is forbidden");
+
+    let mut semantic_mutation = thresholds();
+    semantic_mutation["automatic"]["minimum_full_proofs"] = json!(95);
+    let mutated: ThresholdsV1 =
+        serde_json::from_value(semantic_mutation).expect("shape-only threshold mutation");
+    assert_ne!(
+        baseline,
+        canonical_thresholds_sha256(&mutated).expect("mutated threshold digest")
+    );
+
+    let reordered = serde_json::from_str::<Value>(
+        &serde_json::to_string_pretty(&thresholds()).expect("pretty thresholds"),
+    )
+    .expect("reordered/whitespace JSON");
+    let reordered = ThresholdsV1::from_json(reordered).expect("semantic thresholds");
+    assert_eq!(
+        baseline,
+        canonical_thresholds_sha256(&reordered).expect("canonical threshold digest")
+    );
+}
+
+#[test]
+fn threshold_corpus_summary_digest_dag_rejects_stale_or_mismatched_inputs() {
+    let threshold = ThresholdsV1::from_json(thresholds()).expect("thresholds");
+    let frozen_corpus = CorpusV1::from_json(corpus()).expect("corpus");
+    frozen_corpus
+        .validate_against_thresholds(&threshold)
+        .expect("one-way threshold binding");
+    QualificationSummaryV1::from_json(report())
+        .expect("summary")
+        .validate_against_inputs(&frozen_corpus, &threshold)
+        .expect("summary binds both accepted inputs");
+
+    let mut changed_thresholds = thresholds();
+    changed_thresholds["automatic"]["minimum_full_proofs"] = json!(95);
+    let changed_thresholds: ThresholdsV1 =
+        serde_json::from_value(changed_thresholds).expect("shape-only threshold mutation");
+    frozen_corpus
+        .validate_against_thresholds(&changed_thresholds)
+        .expect_err("changing thresholds invalidates the old corpus binding");
+
+    let old_corpus_hash = canonical_corpus_sha256(&frozen_corpus).expect("old corpus hash");
+    let mut rebound = corpus();
+    rebound["thresholds_sha256"] =
+        json!(canonical_thresholds_sha256(&changed_thresholds).expect("changed threshold hash"));
+    let rebound: CorpusV1 = serde_json::from_value(rebound).expect("shape-only rebound corpus");
+    assert_ne!(
+        old_corpus_hash,
+        canonical_corpus_sha256(&rebound).expect("rebound corpus hash")
+    );
+
+    let mut wrong_methodology = corpus();
+    wrong_methodology["methodology_sha256"] =
+        json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    CorpusV1::from_json(wrong_methodology)
+        .expect("valid corpus shape")
+        .validate_against_thresholds(&threshold)
+        .expect_err("methodology must agree");
+
+    let mut wrong_id = corpus();
+    wrong_id["corpus_id"] = json!("other-corpus");
+    CorpusV1::from_json(wrong_id)
+        .expect("valid corpus shape")
+        .validate_against_thresholds(&threshold)
+        .expect_err("threshold and corpus IDs must agree");
+
+    let mut wrong_count = thresholds();
+    wrong_count["expected_positive_steps"] = json!(311);
+    let wrong_count: ThresholdsV1 =
+        serde_json::from_value(wrong_count).expect("shape-only count mutation");
+    frozen_corpus
+        .validate_against_thresholds(&wrong_count)
+        .expect_err("declared counts must agree");
+
+    let mut altered_corpus = corpus();
+    altered_corpus["paths"][0]["source_text"] = json!("altered but valid source text");
+    let altered_corpus = CorpusV1::from_json(altered_corpus).expect("altered valid corpus");
+    QualificationSummaryV1::from_json(report())
+        .expect("summary")
+        .validate_against_inputs(&altered_corpus, &threshold)
+        .expect_err("summary corpus hash must bind exact corpus semantics");
+}
+
+#[test]
+fn transport_measurements_preserve_elapsed_ns_and_keep_errors_separate() {
+    let measured = TransportEvidenceV1::try_from(Ok(vec![
+        codestory_cli::proof_qualification_support::RevisionNativeToolResultMeasurement {
+            revision: "2024-11-05".into(),
+            call_tool_result_bytes: vec![1],
+            byte_length: 1,
+            elapsed_ns: 11,
+        },
+        codestory_cli::proof_qualification_support::RevisionNativeToolResultMeasurement {
+            revision: "2025-03-26".into(),
+            call_tool_result_bytes: vec![2],
+            byte_length: 2,
+            elapsed_ns: 22,
+        },
+        codestory_cli::proof_qualification_support::RevisionNativeToolResultMeasurement {
+            revision: "2025-06-18".into(),
+            call_tool_result_bytes: vec![3],
+            byte_length: 3,
+            elapsed_ns: 33,
+        },
+        codestory_cli::proof_qualification_support::RevisionNativeToolResultMeasurement {
+            revision: "2025-11-25".into(),
+            call_tool_result_bytes: vec![4],
+            byte_length: 4,
+            elapsed_ns: 44,
+        },
+    ]))
+    .expect("transport evidence");
+    let value = serde_json::to_value(measured).expect("transport JSON");
+    assert_eq!(
+        value["measurements"]["measurements"]
+            .as_array()
+            .expect("measurements")
+            .iter()
+            .map(|measurement| measurement["elapsed_ns"].as_u64().expect("elapsed"))
+            .collect::<Vec<_>>(),
+        vec![11, 22, 33, 44]
+    );
+
+    let error = TransportEvidenceV1::try_from(Err(
+        codestory_cli::proof_qualification_support::ProofQualificationTransportError::OutputSchemaViolation,
+    ))
+    .expect("typed transport error");
+    assert_eq!(
+        serde_json::to_value(error).expect("error JSON"),
+        json!({"kind":"error","error":{"kind":"output_schema_violation"}})
+    );
+
+    let mut independent = report();
+    independent["cases"][0]["warm_end_to_end_ms"] = json!(9_999);
+    let parsed = QualificationSummaryV1::from_json(independent).expect("independent timings");
+    let TransportEvidenceV1::Measurements { measurements } = &parsed.cases[0].transport else {
+        panic!("expected measurements")
+    };
+    assert_eq!(
+        measurements
+            .measurements
+            .iter()
+            .map(|measurement| measurement.elapsed_ns)
+            .collect::<Vec<_>>(),
+        vec![11, 22, 33, 44]
+    );
+
+    let mut wrong_order = report();
+    wrong_order["cases"][0]["transport"]["measurements"]["measurements"]
+        .as_array_mut()
+        .expect("measurements")
+        .swap(0, 1);
+    QualificationSummaryV1::from_json(wrong_order)
+        .expect_err("successful transport observations require canonical revision order");
 }
 
 #[test]
@@ -428,6 +599,13 @@ fn closed_contracts_reject_hostile_nested_shapes() {
         .unwrap()
         .pop();
     assert!(QualificationSummaryV1::from_json(missing_measurement).is_err());
+
+    let mut missing_elapsed = report();
+    missing_elapsed["cases"][0]["transport"]["measurements"]["measurements"][0]
+        .as_object_mut()
+        .expect("measurement")
+        .remove("elapsed_ns");
+    assert!(QualificationSummaryV1::from_json(missing_elapsed).is_err());
 
     let mut noncanonical_u128 = report();
     noncanonical_u128["inventory"][0]["stored_call_rows"] = json!("01");
@@ -709,6 +887,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
                 revision: revision.to_owned(),
                 call_tool_result_bytes: vec![0; 128],
                 byte_length: 128,
+                elapsed_ns: 1,
             }
         })
         .collect::<Vec<_>>();
@@ -977,6 +1156,17 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
             ["actual_bytes"]["maximum"],
         65536
     );
+    assert!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["TransportMeasurementV1"]
+            ["properties"]
+            .get("elapsed_ns")
+            .is_some()
+    );
+    assert!(
+        contracts::schema_json(SchemaDocument::Thresholds)["properties"]
+            .get("corpus_sha256")
+            .is_none()
+    );
     assert_eq!(
         contracts::schema_json(SchemaDocument::Report)["$defs"]["ProductDispositionV1"]["properties"]
             ["authoritative_receipts"]["maxItems"],
@@ -1083,6 +1273,8 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         cli::Cli::try_parse_from([
             "bin",
             "verify",
+            "--corpus",
+            "/tmp/c",
             "--thresholds",
             "/tmp/t",
             "--results",
@@ -1092,6 +1284,18 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         .command,
         cli::Command::Verify(_)
     ));
+    assert!(
+        cli::Cli::try_parse_from([
+            "bin",
+            "verify",
+            "--thresholds",
+            "/tmp/t",
+            "--results",
+            "/tmp/r"
+        ])
+        .is_err(),
+        "verify must receive the corpus whose identity it validates"
+    );
     assert!(
         cli::Cli::try_parse_from(["bin", "run", "--thresholds", "/tmp/t", "--output", "/tmp/o"])
             .is_err()

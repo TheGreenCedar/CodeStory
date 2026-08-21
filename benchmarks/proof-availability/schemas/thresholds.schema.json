@@ -168,10 +168,6 @@
     "automatic": {
       "$ref": "#/$defs/RoleThresholdsV1"
     },
-    "corpus_sha256": {
-      "pattern": "^[0-9a-f]{64}$",
-      "type": "string"
-    },
     "expected_cohort_count": {
       "const": 4,
       "format": "uint8",
@@ -228,7 +224,6 @@
   "required": [
     "schema",
     "thresholds_id",
-    "corpus_sha256",
     "methodology_sha256",
     "wilson_z",
     "expected_cohort_count",

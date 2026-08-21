@@ -1528,13 +1528,19 @@
           "minimum": 0,
           "type": "integer"
         },
+        "elapsed_ns": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "revision": {
           "$ref": "#/$defs/McpRevisionV1"
         }
       },
       "required": [
         "revision",
-        "actual_bytes"
+        "actual_bytes",
+        "elapsed_ns"
       ],
       "type": "object"
     },

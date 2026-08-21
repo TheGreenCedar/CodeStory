@@ -46,6 +46,8 @@ pub struct RunArgs {
 
 #[derive(Debug, Args)]
 pub struct VerifyArgs {
+    #[arg(long, value_name = "CORPUS_JSON")]
+    pub corpus: PathBuf,
     #[arg(long, value_name = "THRESHOLDS_JSON")]
     pub thresholds: PathBuf,
     #[arg(long, value_name = "RESULTS_DIR")]

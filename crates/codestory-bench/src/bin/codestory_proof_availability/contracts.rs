@@ -331,6 +331,22 @@ impl CorpusV1 {
         }
         Ok(())
     }
+
+    pub fn validate_against_thresholds(&self, thresholds: &ThresholdsV1) -> Result<()> {
+        self.validate()?;
+        thresholds.validate()?;
+        if self.thresholds_sha256 != canonical_thresholds_sha256(thresholds)?
+            || self.methodology_sha256 != thresholds.methodology_sha256
+            || self.corpus_id != thresholds.thresholds_id
+            || self.cohorts.len() != usize::from(thresholds.expected_cohort_count)
+            || self.positive_request_count != thresholds.expected_positive_requests
+            || self.positive_step_count != thresholds.expected_positive_steps
+            || self.negative_request_count != thresholds.expected_negative_requests
+        {
+            bail!("proof_availability_corpus_threshold_binding_invalid")
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -369,7 +385,6 @@ pub struct RoleThresholdsV1 {
 pub struct ThresholdsV1 {
     pub schema: String,
     pub thresholds_id: String,
-    pub corpus_sha256: String,
     pub methodology_sha256: String,
     pub wilson_z: f64,
     pub expected_cohort_count: u8,
@@ -390,7 +405,6 @@ impl ThresholdsV1 {
     pub fn validate(&self) -> Result<()> {
         if self.schema != THRESHOLDS_SCHEMA
             || empty(&self.thresholds_id)
-            || !hash(&self.corpus_sha256)
             || !hash(&self.methodology_sha256)
             || (self.wilson_z - 1.959963984540054).abs() > f64::EPSILON
             || self.expected_cohort_count != 4
@@ -980,6 +994,7 @@ pub struct StageDurationsV1 {
 pub struct TransportMeasurementV1 {
     pub revision: McpRevisionV1,
     pub actual_bytes: u64,
+    pub elapsed_ns: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1062,6 +1077,7 @@ impl
                                 actual_bytes: u64::try_from(measurement.byte_length).map_err(
                                     |_| anyhow::anyhow!("proof_availability_transport_bytes_overflow"),
                                 )?,
+                                elapsed_ns: measurement.elapsed_ns,
                             })
                         })
                         .collect::<Result<Vec<_>>>()?,
@@ -1991,11 +2007,70 @@ impl QualificationSummaryV1 {
         }
         Ok(())
     }
+
+    pub fn validate_against_inputs(
+        &self,
+        corpus: &CorpusV1,
+        thresholds: &ThresholdsV1,
+    ) -> Result<()> {
+        corpus.validate_against_thresholds(thresholds)?;
+        self.validate_against_corpus(corpus)?;
+        if self.provenance.thresholds_sha256 != canonical_thresholds_sha256(thresholds)? {
+            bail!("proof_availability_provenance_threshold_binding_invalid")
+        }
+        Ok(())
+    }
 }
 
 pub fn canonical_corpus_sha256(corpus: &CorpusV1) -> Result<String> {
-    let bytes = serde_json::to_vec(corpus)?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    canonical_artifact_sha256(b"codestory.proof-availability-corpus/v1\0", corpus)
+}
+
+pub fn canonical_thresholds_sha256(thresholds: &ThresholdsV1) -> Result<String> {
+    canonical_artifact_sha256(b"codestory.proof-availability-thresholds/v1\0", thresholds)
+}
+
+fn canonical_artifact_sha256<T: Serialize>(domain: &[u8], value: &T) -> Result<String> {
+    let value = serde_json::to_value(value)?;
+    let mut canonical = Vec::new();
+    write_canonical_json(&value, &mut canonical)?;
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(canonical);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<()> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_writer(output, value)?;
+        }
+        Value::Array(values) => {
+            output.push(b'[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(b']');
+        }
+        Value::Object(values) => {
+            output.push(b'{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(b',');
+                }
+                serde_json::to_writer(&mut *output, key)?;
+                output.push(b':');
+                write_canonical_json(value, output)?;
+            }
+            output.push(b'}');
+        }
+    }
+    Ok(())
 }
 
 fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {

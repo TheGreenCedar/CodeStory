@@ -49,6 +49,7 @@ pub mod proof_qualification_support {
         pub revision: String,
         pub call_tool_result_bytes: Vec<u8>,
         pub byte_length: usize,
+        pub elapsed_ns: u64,
     }
 
     /// Closed transport failures preserved from the revision-native builder.
@@ -98,6 +99,7 @@ pub mod proof_qualification_support {
                         revision: measurement.revision.as_str().to_owned(),
                         call_tool_result_bytes: measurement.call_tool_result_bytes,
                         byte_length: measurement.byte_length,
+                        elapsed_ns: measurement.elapsed_ns,
                     })
                     .collect()
             })
