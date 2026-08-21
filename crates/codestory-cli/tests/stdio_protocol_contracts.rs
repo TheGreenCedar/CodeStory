@@ -2441,6 +2441,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
         "references",
         "search",
         "snippet",
+        "status",
         "symbol",
         "symbols",
         "trace",
@@ -2478,11 +2479,27 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "context outputSchema should not expose answer/prompt DTO names: {tool}"
             );
         }
+        if name == "status" {
+            for field in ["failure", "retrieval_mode", "degraded_reason", "live_ready"] {
+                assert!(
+                    output_schema
+                        .get("properties")
+                        .and_then(Value::as_object)
+                        .is_some_and(|properties| properties.contains_key(field)),
+                    "status outputSchema should declare compact field {field}: {tool}"
+                );
+            }
+        }
         if name == "packet" {
             assert_eq!(
                 schema_property(output_schema, "packet_id")["type"],
                 "string",
                 "packet outputSchema should expose a stable packet id: {tool}"
+            );
+            assert_eq!(
+                schema_property(output_schema, "support")["type"],
+                "array",
+                "packet support is a list of compiled units, not an object: {tool}"
             );
             for field in [
                 "plan",
@@ -2548,6 +2565,13 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
             );
         }
         if name == "files" {
+            assert!(
+                output_schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|properties| properties.contains_key("coverage_gaps")),
+                "files outputSchema should declare coverage_gaps: {tool}"
+            );
             for field in [
                 "project_root",
                 "usable",
