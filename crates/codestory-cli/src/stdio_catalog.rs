@@ -2524,6 +2524,15 @@ pub(crate) fn tools_list_json() -> Value {
     })
 }
 
+/// Return the current declarative tool inputs to the test-only v3 projector.
+///
+/// The projector owns revision-native field selection; this accessor keeps it
+/// from copying the v2 schemas or reaching the live `tools/list` response.
+#[cfg(test)]
+pub(crate) fn v3_tool_source_json() -> Vec<Value> {
+    TOOLS.iter().map(|tool| tool.to_json()).collect()
+}
+
 /// Build the `resources/list` response.
 pub(crate) fn resources_list_json() -> Value {
     json!({

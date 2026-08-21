@@ -260,6 +260,62 @@ test("launcher classifies the runtime initialize contract fail-closed", () => {
   );
 });
 
+test("dark v3 launcher state rejects old new and wrong-v3 runtime identities without selecting it", () => {
+  const contracts = Object.fromEntries(
+    ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"].map((revision, index) => [
+      revision,
+      String(index + 1).repeat(64),
+    ]),
+  );
+  const session = launcherTest.darkV3LauncherSession("2025-06-18", contracts);
+  assert.deepEqual(session, {
+    requested: "2025-06-18",
+    negotiated: "2025-06-18",
+    discoveryContractSha256: contracts["2025-06-18"],
+    publicationSchemaVersion: 3,
+  });
+  const response = (revision, digest, schemaVersion = 3) => ({
+    jsonrpc: "2.0",
+    id: "initialize",
+    result: {
+      protocolVersion: revision,
+      _meta: {
+        codestory_protocol: { discovery_contract_sha256: digest },
+        codestory_publication: { schema_version: schemaVersion },
+      },
+    },
+  });
+  assert.equal(
+    launcherTest.darkV3RuntimeWireContractSkew(
+      response(session.negotiated, session.discoveryContractSha256),
+      session,
+    ),
+    null,
+  );
+  assert.equal(
+    launcherTest.darkV3RuntimeWireContractSkew(
+      response("2024-11-05", contracts["2024-11-05"]),
+      session,
+    ),
+    "protocol_version_skew",
+  );
+  assert.equal(
+    launcherTest.darkV3RuntimeWireContractSkew(
+      response(session.negotiated, "f".repeat(64)),
+      session,
+    ),
+    "discovery_contract_skew",
+  );
+  assert.equal(
+    launcherTest.darkV3RuntimeWireContractSkew(
+      response(session.negotiated, session.discoveryContractSha256, 4),
+      session,
+    ),
+    "publication_schema_skew",
+  );
+  assert.deepEqual(launcherTest.supportedMcpProtocolVersions, ["2024-11-05"]);
+});
+
 test("fail-open relay bounds hostile frames and survives null input and a missing catalog", async () => {
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const status = {

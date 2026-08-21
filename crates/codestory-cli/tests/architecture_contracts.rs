@@ -849,6 +849,98 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
 }
 
 #[test]
+fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
+    let cli_lib = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        cli_lib.contains("#[cfg(test)]\nmod stdio_v3;"),
+        "the revision-native transport facade must stay test-only until the sealed benchmark feature lands"
+    );
+
+    let facade = read_source_tree("crates/codestory-cli/src/stdio_v3");
+    for required in [
+        "measure_revision_native_proof_result_v3",
+        "RevisionNativeToolResultMeasurementV3",
+        "StdioV3InternalError",
+    ] {
+        assert!(
+            facade.contains(required),
+            "the dark stdio v3 facade lost its qualification seam via {required}"
+        );
+    }
+
+    let production_cli = read_source_tree_excluding_many(
+        "crates/codestory-cli/src",
+        &[
+            "stdio_v3/catalog.rs",
+            "stdio_v3/mod.rs",
+            "stdio_v3/profile.rs",
+            "stdio_v3/transport.rs",
+            "stdio_v3/diagnostics.rs",
+            "stdio_v3/discovery.rs",
+        ],
+    );
+    for forbidden in [
+        "measure_revision_native_proof_result_v3",
+        "RevisionNativeToolResultMeasurementV3",
+        "stdio_v3::",
+    ] {
+        assert!(
+            !production_cli.contains(forbidden),
+            "a production CLI module references the dark qualification seam via {forbidden}"
+        );
+    }
+
+    for surface in [
+        "crates/codestory-cli/Cargo.toml",
+        "crates/codestory-bench/Cargo.toml",
+        "crates/codestory-cli/src/args.rs",
+        "crates/codestory-cli/src/http_transport.rs",
+        "plugins/codestory/generated-mcp-catalog.json",
+        "plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md",
+    ] {
+        let source = read(surface);
+        for forbidden in [
+            "measure_revision_native_proof_result_v3",
+            "RevisionNativeToolResultMeasurementV3",
+            "proof-qualification-support",
+            "prove_call_path",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{surface} registers or exposes the dark transport seam via {forbidden}"
+            );
+        }
+    }
+
+    let launcher = read("plugins/codestory/scripts/codestory-mcp.cjs");
+    let live_launcher = source_between(
+        &launcher,
+        "async function main()",
+        "function runLauncherError",
+    );
+    assert!(
+        !live_launcher.contains("darkV3"),
+        "the live launcher route must not select the dark v3 handoff machinery"
+    );
+
+    let diagnostics = production_source(&read("crates/codestory-cli/src/stdio_v3/diagnostics.rs"));
+    for forbidden in [
+        "std::fs::",
+        "codestory_runtime::",
+        "ActivationService",
+        "active_publication(",
+        "status(",
+        "source_text",
+        "render(",
+    ] {
+        assert!(
+            !diagnostics.contains(forbidden),
+            "diagnostic capability reads must serve immutable registry bytes without live work via {forbidden}"
+        );
+    }
+}
+
+#[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
     let lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
@@ -924,7 +1016,17 @@ fn dark_call_path_release_surface_violations() -> Vec<String> {
     let mut surfaces = vec![
         (
             "cli command/dispatcher/ToolSpec/HTTP/serializer source",
-            read_source_tree("crates/codestory-cli/src"),
+            read_source_tree_excluding_many(
+                "crates/codestory-cli/src",
+                &[
+                    "stdio_v3/catalog.rs",
+                    "stdio_v3/diagnostics.rs",
+                    "stdio_v3/discovery.rs",
+                    "stdio_v3/mod.rs",
+                    "stdio_v3/profile.rs",
+                    "stdio_v3/transport.rs",
+                ],
+            ),
         ),
         (
             "public API DTO source",
