@@ -175,6 +175,21 @@ function pluginManifest(pluginSource) {
   return manifest;
 }
 
+function pinnedCliVersion(pluginSource) {
+  const versionPath = path.join(pluginSource, "cli-version.json");
+  directFile(versionPath, "cli_version");
+  let pin;
+  try {
+    pin = JSON.parse(fs.readFileSync(versionPath, "utf8"));
+  } catch (error) {
+    fail(`cli_version_json:${error.message}`);
+  }
+  if (!/^\d+\.\d+\.\d+$/u.test(String(pin?.cli_version || ""))) {
+    fail("cli_version_identity");
+  }
+  return pin.cli_version;
+}
+
 function verifyCli(cliPath, version, options = {}) {
   if (!path.isAbsolute(cliPath)) fail("codestory_cli_must_be_absolute");
   const resolved = path.resolve(cliPath);
@@ -294,7 +309,8 @@ function stageCandidate({
   pluginSource,
   sourceIdentity,
   stagingRoot,
-  version,
+  cliVersion,
+  pluginVersion,
   platform,
   arch,
   probeVersion,
@@ -319,7 +335,7 @@ function stageCandidate({
       purpose: receiptPurpose,
       plugin_id: receiptPluginId,
       plugin_name: receiptPluginName,
-      plugin_version: version,
+      plugin_version: pluginVersion,
       source_commit: sourceIdentity.commit,
       source_package_sha256: sourceIdentity.sha256,
       target: sourceBuildTarget(platform, arch),
@@ -338,7 +354,8 @@ function stageCandidate({
     });
     const verified = validateDevCliReceipt(candidate, {
       arch,
-      expectedPluginVersion: version,
+      expectedCliVersion: cliVersion,
+      expectedPluginVersion: pluginVersion,
       platform,
       probeVersion,
       requireCacheIdentity: false,
@@ -375,7 +392,8 @@ export function installDevPlugin(rawOptions = {}) {
 
   const sourceIdentity = verifyCommittedPluginSource(repoRoot, pluginSource);
   const manifest = pluginManifest(pluginSource);
-  const cli = verifyCli(path.resolve(cliPath), manifest.version, rawOptions);
+  const cliVersion = pinnedCliVersion(pluginSource);
+  const cli = verifyCli(path.resolve(cliPath), cliVersion, rawOptions);
   const target = sourceBuildTarget(rawOptions.platform, rawOptions.arch);
   if (!target) fail(`unsupported_target:${rawOptions.platform || process.platform}-${rawOptions.arch || process.arch}`);
   marketplaceTargetsStaging(marketplacePlugin, stagingRoot);
@@ -388,7 +406,8 @@ export function installDevPlugin(rawOptions = {}) {
     probeVersion: rawOptions.probeVersion,
     sourceIdentity,
     stagingRoot,
-    version: manifest.version,
+    cliVersion,
+    pluginVersion: manifest.version,
   });
   const replacement = replaceDirectory(candidate, stagingRoot);
   let previouslyInstalled = false;
@@ -407,6 +426,7 @@ export function installDevPlugin(rawOptions = {}) {
     directDirectory(installedPath, "installed_plugin_root");
     const installed = validateDevCliReceipt(installedPath, {
       arch: rawOptions.arch,
+      expectedCliVersion: cliVersion,
       expectedPluginVersion: manifest.version,
       platform: rawOptions.platform,
       probeVersion: rawOptions.probeVersion,

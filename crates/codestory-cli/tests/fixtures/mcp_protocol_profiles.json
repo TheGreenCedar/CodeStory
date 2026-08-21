@@ -1,0 +1,40 @@
+{
+  "profiles": [
+    {
+      "revision": "2024-11-05",
+      "tool_fields": ["name", "description", "inputSchema"],
+      "result_form": "json_text_content_only",
+      "batch": "accept_independent_ordered_omit_notifications"
+    },
+    {
+      "revision": "2025-03-26",
+      "tool_fields": ["name", "description", "inputSchema", "annotations"],
+      "result_form": "json_text_content_only",
+      "batch": "accept_independent_ordered_omit_notifications"
+    },
+    {
+      "revision": "2025-06-18",
+      "tool_fields": ["name", "title", "description", "inputSchema", "outputSchema", "_meta"],
+      "result_form": "structured_content_and_identical_json_text",
+      "batch": "reject_invalid_request"
+    },
+    {
+      "revision": "2025-11-25",
+      "tool_fields": ["name", "title", "description", "inputSchema", "outputSchema", "_meta"],
+      "result_form": "structured_content_and_identical_json_text",
+      "batch": "reject_invalid_request"
+    }
+  ],
+  "nonstandard_codestory_fields": ["safety"],
+  "normalization": [
+    "operation_id",
+    "request_id",
+    "packet_id",
+    "publication_id",
+    "timestamps",
+    "timing",
+    "runtime_binary_hash",
+    "source_identity",
+    "build_identity"
+  ]
+}

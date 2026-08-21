@@ -48,6 +48,29 @@ const GROUNDING_ORIENTATION_UNCERTAINTY_WIRE_VALUES: [&str; 7] = {
     values
 };
 
+#[test]
+fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
+    let profiles: Value = serde_json::from_str(include_str!("fixtures/mcp_protocol_profiles.json"))
+        .expect("compatibility profile fixture json");
+    let revisions = profiles
+        .get("profiles")
+        .and_then(Value::as_array)
+        .expect("profile array")
+        .iter()
+        .filter_map(|profile| profile.get("revision").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        revisions,
+        vec!["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+        "the compatibility harness must name every planned wire profile"
+    );
+    assert_eq!(
+        codestory_contracts::wire::SUPPORTED_MCP_PROTOCOL_VERSIONS,
+        ["2024-11-05"],
+        "profiles are test data only until the public cut changes negotiation"
+    );
+}
+
 struct StdioFixture {
     workspace: TempDir,
     cache_dir: TempDir,

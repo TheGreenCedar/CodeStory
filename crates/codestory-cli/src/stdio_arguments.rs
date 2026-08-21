@@ -116,6 +116,32 @@ pub(crate) fn validate_tool_arguments(
     }
 }
 
+/// Validate a tool result's `structuredContent` against its declared output
+/// schema. This is intentionally an audit boundary for now: v2 still emits
+/// fail-open launcher and error payloads that are outside success schemas.
+///
+/// Keeping the interpreter shared with input validation means the catalog's
+/// closed schema subset has one implementation before a later protocol cut
+/// turns this observation into an enforced result boundary.
+#[allow(dead_code)]
+pub(crate) fn validate_structured_content(
+    schema: &Value,
+    structured_content: &Value,
+) -> Result<(), Vec<ArgumentViolation>> {
+    let mut violations = Vec::new();
+    validate_value(
+        schema,
+        structured_content,
+        "/structuredContent",
+        &mut violations,
+    );
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
 fn validate_value(schema: &Value, value: &Value, pointer: &str, out: &mut Vec<ArgumentViolation>) {
     let Some(schema) = schema.as_object() else {
         return;
@@ -586,6 +612,66 @@ mod tests {
                 Some(&json!(false)),
                 "{tool} must deny undeclared arguments"
             );
+        }
+    }
+
+    #[test]
+    fn structured_content_validator_admits_a_closed_tagged_output_union() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["state", "payload"],
+            "properties": {
+                "state": {"type": "string", "enum": ["ready", "preparing"]},
+                "payload": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["files"],
+                            "properties": {"files": {"type": "integer", "minimum": 0}}
+                        },
+                        {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["retry_after_ms"],
+                            "properties": {"retry_after_ms": {"type": "integer", "minimum": 1}}
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            validate_structured_content(
+                &schema,
+                &json!({
+                    "state": "preparing",
+                    "payload": {"retry_after_ms": 250}
+                })
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            codes_from_output(
+                &schema,
+                json!({
+                    "state": "ready",
+                    "payload": {"files": -1, "unexpected": true},
+                    "extra": true
+                })
+            ),
+            vec!["unknown_property", "invalid_selector"]
+        );
+    }
+
+    fn codes_from_output(schema: &Value, structured_content: Value) -> Vec<&'static str> {
+        match validate_structured_content(schema, &structured_content) {
+            Ok(()) => Vec::new(),
+            Err(violations) => violations
+                .iter()
+                .map(super::ArgumentViolation::code)
+                .collect(),
         }
     }
 
