@@ -2153,6 +2153,7 @@ fn production_source_never_spawns_git() {
     let mut files = Vec::new();
     collect_rs_files(&repo_root().join("crates"), &mut files);
     let mut violations = Vec::new();
+    let benchmark_root = repo_root().join("crates/codestory-bench");
     for path in files {
         if !path
             .components()
@@ -2160,7 +2161,9 @@ fn production_source_never_spawns_git() {
         {
             continue;
         }
-        if path == repo_root().join("crates/codestory-runtime/src/test_support.rs") {
+        if path.starts_with(&benchmark_root)
+            || path == repo_root().join("crates/codestory-runtime/src/test_support.rs")
+        {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read Rust source");
@@ -2172,6 +2175,38 @@ fn production_source_never_spawns_git() {
         violations.is_empty(),
         "production Git reads must stay behind the non-executing workspace reader:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn crate_source_git_spawns_are_limited_to_named_non_product_boundaries() {
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join("crates"), &mut files);
+    let actual = files
+        .into_iter()
+        .filter(|path| {
+            path.components()
+                .any(|component| component.as_os_str() == "src")
+        })
+        .filter(|path| {
+            let source = fs::read_to_string(path).expect("read Rust source");
+            production_source_prefix(&source).contains("Command::new(\"git\")")
+        })
+        .map(|path| {
+            path.strip_prefix(repo_root())
+                .expect("crate source stays below repository root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeSet::from([
+        "crates/codestory-bench/src/bin/codestory_proof_availability/materialize.rs".to_owned(),
+        "crates/codestory-runtime/src/test_support.rs".to_owned(),
+    ]);
+
+    assert_eq!(
+        actual, expected,
+        "Git process execution under crate source is limited to the feature-dark proof-availability materializer and the explicit runtime test-support helper"
     );
 }
 
