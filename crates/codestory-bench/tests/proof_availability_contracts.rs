@@ -4,8 +4,13 @@ mod cli;
 mod contracts;
 
 use clap::Parser;
-use contracts::{CorpusV1, QualificationSummaryV1, SchemaDocument, ThresholdsV1};
+use contracts::{
+    CandidateFailureV1, CandidateGateV1, CorpusV1, FinalizationTraceV1, FunnelOutcomeV1,
+    ProofQualificationTraceV1, QualificationSummaryV1, SchemaDocument, ThresholdsV1,
+    TransportEvidenceV1,
+};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -96,16 +101,102 @@ fn thresholds() -> Value {
 }
 
 fn report() -> Value {
+    let frozen = corpus();
+    let cohort_ids = frozen["cohorts"]
+        .as_array()
+        .expect("cohorts")
+        .iter()
+        .map(|cohort| cohort["repository_id"].as_str().expect("repository id"))
+        .collect::<Vec<_>>();
+    let cases = frozen["paths"]
+        .as_array()
+        .expect("paths")
+        .iter()
+        .enumerate()
+        .map(|(case_index, path)| {
+            let attempted = path["spec"]["expected_step_count"].as_u64().expect("step count");
+            let case_id = path["case_id"].as_str().expect("case id");
+            let repository_id = path["repository_id"].as_str().expect("repository id");
+            let steps = (0..attempted)
+                .map(|step_index| {
+                    let edge_id = i64::try_from(case_index * 10 + step_index as usize + 1)
+                        .expect("fixture edge id");
+                    json!({"step_index":step_index,"candidate_edge_ids":[edge_id],"outcome":{"kind":"admitted","edge_ids":[edge_id]}})
+                })
+                .collect::<Vec<_>>();
+            let negative_mutations = path["negative_mutations"]
+                .as_array()
+                .expect("mutations")
+                .iter()
+                .map(|mutation| json!({
+                    "mutation_id":mutation["mutation_id"],
+                    "path_id":mutation["path_id"],
+                    "kind":mutation["kind"],
+                    "step_index":mutation["step_index"],
+                    "caller":mutation["caller"],
+                    "target":mutation["target"],
+                    "contract_proven":false
+                }))
+                .collect::<Vec<_>>();
+            json!({
+                "case_id":case_id,"repository_id":repository_id,
+                "product_disposition":{"kind":"contract_proven","gaps":[]},
+                "authoritative_receipt_count":attempted,"oracle_receipts_exact":true,
+                "proven_step_precision_milli":1000,"proven_step_recall_milli":1000,
+                "proven_prefix_length":attempted,"actionable_exact_gap":null,
+                "diagnostic_candidate_count":0,"authoritative_receipt_evidence_count":attempted,
+                "warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},
+                "attempted_step_count":attempted,"unclassified_step_indices":[],
+                "complete_projection_bytes":128,
+                "transport":{"kind":"measurements","measurements":{"measurements":[
+                    {"revision":"2024-11-05","actual_bytes":128},
+                    {"revision":"2025-03-26","actual_bytes":128},
+                    {"revision":"2025-06-18","actual_bytes":128},
+                    {"revision":"2025-11-25","actual_bytes":128}
+                ]}},
+                "negative_mutations":negative_mutations,
+                "proof_trace":{"selectors":[{"selector_index":0,"outcome":{"kind":"resolved","node_id":-1}}],"selector_early_return":false,"steps":steps,"finalization":{"kind":"complete","projection_bytes":128}}
+            })
+        })
+        .collect::<Vec<_>>();
     json!({
       "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-0123456789ab",
       "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":SHA,"thresholds_sha256":SHA,"results_sha256":SHA},
-      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"core_generation":1,"core_run_id":"run-1","database_sha256":SHA},
-      "inventory":[{"repository_id":"codestory-rust","stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"}],
-      "trails":[{"repository_id":"codestory-rust","lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]}],
-      "cases":[{"case_id":"codestory-rust-path","repository_id":"codestory-rust","product_disposition":{"kind":"contract_proven","gaps":[]},"authoritative_receipt_count":1,"oracle_receipts_exact":true,"proven_step_precision_milli":1000,"proven_step_recall_milli":1000,"proven_prefix_length":1,"actionable_exact_gap":null,"diagnostic_candidate_count":0,"authoritative_receipt_evidence_count":1,"warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},"attempted_step_count":1,"complete_projection_bytes":128,"transport":{"kind":"measurements","measurements":{"measurements":[{"revision":"2024-11-05","actual_bytes":128},{"revision":"2025-03-26","actual_bytes":128},{"revision":"2025-06-18","actual_bytes":128},{"revision":"2025-11-25","actual_bytes":128}]}},"negative_mutations":[{"mutation_id":"negative-1","contract_proven":false},{"mutation_id":"negative-2","contract_proven":false}],"proof_trace":{"selectors":[{"selector_index":0,"outcome":{"kind":"resolved","node_id":1}}],"selector_early_return":false,"steps":[{"step_index":0,"candidate_edge_ids":[1],"outcome":{"kind":"admitted","edge_ids":[1]}}],"finalization":{"kind":"complete","projection_bytes":128}}}],
-      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"outcome":{"kind":"admitted"},"count":"311"},{"outcome":{"kind":"first_zero_survivor","gate":"raw_admission","histogram":[{"reason":{"kind":"raw_admission","reason":"certainty_probable"},"edge_ids":[9]}]},"count":"1"}]},
+      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"projects":cohort_ids.iter().map(|id|json!({"repository_id":id,"source_head":COMMIT,"source_tree":COMMIT,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"core_run_id":format!("run-{id}")})).collect::<Vec<_>>()},
+      "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
+      "trails":cohort_ids.iter().map(|id|json!({"repository_id":id,"lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]})).collect::<Vec<_>>(),
+      "cases":cases,
+      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"outcome":{"kind":"admitted"},"count":"312"}]},
       "decision":{"outcome":"keep_proof_dark","failed_gates":[{"gate_id":"experimental-usefulness-1","kind":"experimental_usefulness","detail":{"kind":"count","observed":"1","required":"24"}}],"automatic_thresholds_met":false}
     })
+}
+
+fn rebuild_funnel(value: &mut Value) {
+    let mut buckets = BTreeMap::<String, (Value, u64)>::new();
+    let mut classified = 0u64;
+    let mut unclassified = 0u64;
+    for case in value["cases"].as_array().expect("cases") {
+        unclassified += case["unclassified_step_indices"]
+            .as_array()
+            .expect("unclassified")
+            .len() as u64;
+        for step in case["proof_trace"]["steps"].as_array().expect("steps") {
+            let outcome: FunnelOutcomeV1 =
+                serde_json::from_value(step["outcome"].clone()).expect("closed funnel outcome");
+            let key = serde_json::to_string(&outcome).expect("outcome key");
+            let entry = buckets
+                .entry(key)
+                .or_insert((serde_json::to_value(outcome).expect("outcome value"), 0));
+            entry.1 += 1;
+            classified += 1;
+        }
+    }
+    value["failure_funnel"] = json!({
+        "attempted_positive_steps":312,
+        "classified_positive_steps":classified,
+        "unclassified_positive_steps":unclassified,
+        "buckets":buckets.into_values().map(|(outcome, count)|json!({"outcome":outcome,"count":count.to_string()})).collect::<Vec<_>>()
+    });
 }
 
 #[test]
@@ -147,7 +238,17 @@ fn frozen_thresholds_cover_all_role_and_hard_gate_semantics() {
 
 #[test]
 fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
-    QualificationSummaryV1::from_json(report()).expect("maximal report");
+    let maximal = report();
+    let parsed = QualificationSummaryV1::from_json(maximal.clone()).expect("maximal report");
+    parsed
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .expect("report binds all corpus evidence");
+    let mut wrong_mutation_binding = report();
+    wrong_mutation_binding["cases"][0]["negative_mutations"][0]["target"] = json!("wrong");
+    QualificationSummaryV1::from_json(wrong_mutation_binding)
+        .expect("summary retains mutation evidence before corpus binding")
+        .validate_against_corpus(&CorpusV1::from_json(corpus()).expect("frozen corpus"))
+        .expect_err("corpus binding rejects altered mutation evidence");
     let mut lengths = report();
     lengths["trails"][0]["lengths"]
         .as_array_mut()
@@ -155,23 +256,22 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
         .pop();
     assert!(QualificationSummaryV1::from_json(lengths).is_err());
     let mut reason = report();
-    reason["failure_funnel"]["buckets"][1]["outcome"]["histogram"][0]["reason"]["reason"] =
-        json!("free form");
+    reason["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
+        "kind":"first_zero_survivor","gate":"raw_admission",
+        "histogram":[{"reason":{"kind":"raw_admission","reason":"free form"},"edge_ids":[1]}]
+    });
     assert!(QualificationSummaryV1::from_json(reason).is_err());
     let mut gate = report();
     gate["decision"]["failed_gates"][0]["kind"] = json!("free form");
     assert!(QualificationSummaryV1::from_json(gate).is_err());
     let mut hard_failure = report();
-    hard_failure["failure_funnel"]["classified_positive_steps"] = json!(311);
-    hard_failure["failure_funnel"]["unclassified_positive_steps"] = json!(1);
-    hard_failure["failure_funnel"]["buckets"]
-        .as_array_mut()
-        .unwrap()
-        .pop();
+    hard_failure["cases"][0]["proof_trace"]["steps"] = json!([]);
+    hard_failure["cases"][0]["unclassified_step_indices"] = json!([0]);
     hard_failure["cases"][0]["transport"] = json!({
         "kind":"error",
         "error":{"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}
     });
+    rebuild_funnel(&mut hard_failure);
     QualificationSummaryV1::from_json(hard_failure).expect("failure evidence is representable");
 }
 
@@ -195,6 +295,17 @@ fn closed_contracts_reject_hostile_nested_shapes() {
         "error":{"kind":"result_exceeds_budget","maximum_bytes":1,"actual_bytes":65537}
     });
     assert!(QualificationSummaryV1::from_json(invalid_transport).is_err());
+
+    let mut over_projection = report();
+    over_projection["cases"][0]["complete_projection_bytes"] = json!(65537);
+    assert!(QualificationSummaryV1::from_json(over_projection).is_err());
+
+    let mut missing_measurement = report();
+    missing_measurement["cases"][0]["transport"]["measurements"]["measurements"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    assert!(QualificationSummaryV1::from_json(missing_measurement).is_err());
 
     let mut noncanonical_u128 = report();
     noncanonical_u128["inventory"][0]["stored_call_rows"] = json!("01");
@@ -229,6 +340,14 @@ fn closed_contracts_reject_hostile_nested_shapes() {
         "evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof","passing_test":{"test_id":"packet_v3_requires_proof","kind":"packet_v3_requires_proof","status":"passed"}}
     });
     assert!(QualificationSummaryV1::from_json(wrong_dependency_gate).is_err());
+
+    let mut transport_gate = report();
+    transport_gate["decision"]["failed_gates"] = json!([{
+        "gate_id":"transport-over-cap","kind":"response_size",
+        "detail":{"kind":"transport","evidence":{"kind":"error","error":{"kind":"result_exceeds_budget","maximum_bytes":65536,"actual_bytes":65537}}}
+    }]);
+    QualificationSummaryV1::from_json(transport_gate)
+        .expect("transport gate evidence is closed and representable");
 }
 
 #[test]
@@ -293,26 +412,6 @@ fn invariant_table_exhausts_task4_task6_and_corpus_variants() {
         assert_valid_first_zero("line", "source_binding", reason);
     }
 
-    for outcome in [
-        json!({"kind":"failed","reason":"missing"}),
-        json!({"kind":"failed","reason":"ambiguous"}),
-        json!({"kind":"failed","reason":"non_callable"}),
-        json!({"kind":"unavailable","reason":"validated_contract_hash_mismatch"}),
-        json!({"kind":"unavailable","reason":"publication_pin_mismatch"}),
-        json!({"kind":"unavailable","reason":"source_not_bound_to_publication"}),
-        json!({"kind":"unavailable","reason":"proof_facts_unavailable"}),
-    ] {
-        let mut value = report();
-        value["cases"][0]["attempted_step_count"] = json!(0);
-        value["cases"][0]["proof_trace"] = json!({
-            "selectors":[{"selector_index":0,"outcome":outcome}],
-            "selector_early_return":true,
-            "steps":[],
-            "finalization":{"kind":"not_run"}
-        });
-        QualificationSummaryV1::from_json(value).expect("every selector outcome maps losslessly");
-    }
-
     for failure in ["receipt_integration", "receipt_budget", "projection_budget"] {
         let mut value = report();
         value["cases"][0]["proof_trace"]["finalization"] =
@@ -336,6 +435,137 @@ fn invariant_table_exhausts_task4_task6_and_corpus_variants() {
     assert!(CorpusV1::from_json(wrong_range).is_err());
 }
 
+#[test]
+fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
+    use codestory_agent::proof_qualification_support::UnavailableReason;
+    use codestory_contracts::graph::NodeId;
+    use codestory_runtime::proof_qualification_support::{
+        CandidateFailure, CandidateGate, ContainmentFailure, FinalizationFailure,
+        FinalizationTrace, ProofQualificationTrace, SelectorFailure, SelectorGateOutcome,
+        SelectorQualificationTrace, SourceBindingFailure,
+    };
+
+    let trace = ProofQualificationTrace {
+        selectors: vec![
+            SelectorQualificationTrace {
+                selector_index: 0,
+                outcome: SelectorGateOutcome::Failed(SelectorFailure::Missing),
+            },
+            SelectorQualificationTrace {
+                selector_index: 1,
+                outcome: SelectorGateOutcome::Resolved {
+                    node_id: NodeId(-7),
+                },
+            },
+            SelectorQualificationTrace {
+                selector_index: 2,
+                outcome: SelectorGateOutcome::Unavailable(UnavailableReason::ProofFactsUnavailable),
+            },
+        ],
+        selector_early_return: true,
+        steps: vec![],
+        finalization: FinalizationTrace::Complete {
+            projection_bytes: 512,
+        },
+    };
+    let converted = ProofQualificationTraceV1::try_from(trace).expect("convert trace");
+    assert_eq!(converted.selectors.len(), 3, "all selectors are retained");
+    assert!(
+        converted.selector_early_return,
+        "a failure before the last selector returns early"
+    );
+    assert_eq!(
+        serde_json::to_value(&converted.selectors[1]).unwrap()["outcome"]["node_id"],
+        -7
+    );
+
+    for failure in [
+        FinalizationFailure::ReceiptIntegration,
+        FinalizationFailure::ReceiptBudget,
+        FinalizationFailure::ProjectionBudget,
+    ] {
+        assert!(matches!(
+            FinalizationTraceV1::try_from(FinalizationTrace::Failed(failure)).unwrap(),
+            FinalizationTraceV1::Failed { .. }
+        ));
+    }
+
+    for gate in [
+        CandidateGate::RawAdmission,
+        CandidateGate::Containment,
+        CandidateGate::SourceBinding,
+        CandidateGate::Line,
+    ] {
+        let _: CandidateGateV1 = gate.into();
+    }
+    for reason in [
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyAbsent,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyProbable,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyUncertain,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::CandidateAlternativesRetained,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingFileNode,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingLine,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteFileMismatch,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteLineMismatch,
+        codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteRawTargetMismatch,
+    ] {
+        let _: CandidateFailureV1 = CandidateFailure::RawAdmission(reason).into();
+    }
+    for reason in [
+        ContainmentFailure::EdgeSourceFileMismatch,
+        ContainmentFailure::Missing,
+        ContainmentFailure::Ambiguous,
+    ] {
+        let _: CandidateFailureV1 = CandidateFailure::Containment(reason).into();
+    }
+    for reason in [
+        SourceBindingFailure::FileIncomplete,
+        SourceBindingFailure::StoredHashAbsent,
+        SourceBindingFailure::WorkingTreeReadFailed,
+        SourceBindingFailure::WorkingTreeHashMismatch,
+        SourceBindingFailure::InvalidUtf8,
+        SourceBindingFailure::LineMissing,
+        SourceBindingFailure::LineOverLimit,
+    ] {
+        let _: CandidateFailureV1 = CandidateFailure::SourceBinding(reason).into();
+    }
+
+    for error in [
+        codestory_cli::proof_qualification_support::ProofQualificationTransportError::Serialization("encode".into()),
+        codestory_cli::proof_qualification_support::ProofQualificationTransportError::InvalidProjection("root".into()),
+        codestory_cli::proof_qualification_support::ProofQualificationTransportError::OutputSchemaViolation,
+        codestory_cli::proof_qualification_support::ProofQualificationTransportError::ResultExceedsBudget { maximum_bytes: 65_536, actual_bytes: 65_537 },
+    ] {
+        assert!(matches!(
+            TransportEvidenceV1::try_from(Err::<Vec<codestory_cli::proof_qualification_support::RevisionNativeToolResultMeasurement>, _>(error)).unwrap(),
+            TransportEvidenceV1::Error { .. }
+        ));
+    }
+    let measurements = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+        .into_iter()
+        .map(|revision| {
+            codestory_cli::proof_qualification_support::RevisionNativeToolResultMeasurement {
+                revision: revision.to_owned(),
+                call_tool_result_bytes: vec![0; 128],
+                byte_length: 128,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        TransportEvidenceV1::try_from(Ok::<
+            _,
+            codestory_cli::proof_qualification_support::ProofQualificationTransportError,
+        >(measurements))
+        .unwrap(),
+        TransportEvidenceV1::Measurements { .. }
+    ));
+}
+
 fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
     let mut value = report();
     value["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
@@ -343,6 +573,7 @@ fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
         "gate":gate,
         "histogram":[{"reason":{"kind":kind,"reason":reason},"edge_ids":[1]}]
     });
+    rebuild_funnel(&mut value);
     QualificationSummaryV1::from_json(value).expect("mapped first-zero outcome");
 }
 
@@ -391,12 +622,6 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
         value["decision"]["outcome"] = json!(outcome);
         QualificationSummaryV1::from_json(value).expect("closed activation outcome");
     }
-    let mut selector_funnel = report();
-    selector_funnel["failure_funnel"]["buckets"] = json!([
-        {"outcome":{"kind":"selector_early_return","outcome":{"kind":"failed","reason":"missing"}},"count":"312"}
-    ]);
-    QualificationSummaryV1::from_json(selector_funnel).expect("selector funnel outcome");
-
     let mut transport_dependency = report();
     transport_dependency["decision"] = json!({
         "outcome":"delay_full_v3_cut",
@@ -482,18 +707,9 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         cli::Command::Materialize(_)
     ));
     assert!(matches!(
-        cli::Cli::try_parse_from([
-            "bin",
-            "run",
-            "--corpus",
-            "/tmp/c",
-            "--environment",
-            "/tmp/e",
-            "--out",
-            "/tmp/r"
-        ])
-        .expect("run")
-        .command,
+        cli::Cli::try_parse_from(["bin", "run", "--environment", "/tmp/e", "--out", "/tmp/r"])
+            .expect("run")
+            .command,
         cli::Command::Run(_)
     ));
     assert!(matches!(

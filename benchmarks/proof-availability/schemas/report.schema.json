@@ -13,6 +13,8 @@
           "items": {
             "$ref": "#/$defs/FailedGateV1"
           },
+          "maxItems": 12,
+          "minItems": 0,
           "type": "array"
         },
         "outcome": {
@@ -39,8 +41,7 @@
       "properties": {
         "edge_ids": {
           "items": {
-            "format": "uint64",
-            "minimum": 0,
+            "format": "int64",
             "type": "integer"
           },
           "type": "array"
@@ -153,6 +154,7 @@
         },
         "complete_projection_bytes": {
           "format": "uint64",
+          "maximum": 65536,
           "minimum": 0,
           "type": "integer"
         },
@@ -165,6 +167,8 @@
           "items": {
             "$ref": "#/$defs/NegativeMutationResultV1"
           },
+          "maxItems": 2,
+          "minItems": 2,
           "type": "array"
         },
         "oracle_receipts_exact": {
@@ -203,6 +207,17 @@
         "transport": {
           "$ref": "#/$defs/TransportEvidenceV1"
         },
+        "unclassified_step_indices": {
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 6,
+          "minItems": 0,
+          "type": "array"
+        },
         "warm_end_to_end_ms": {
           "format": "uint64",
           "minimum": 0,
@@ -223,6 +238,7 @@
         "warm_end_to_end_ms",
         "stage_durations_ms",
         "attempted_step_count",
+        "unclassified_step_indices",
         "complete_projection_bytes",
         "transport",
         "negative_mutations",
@@ -248,23 +264,19 @@
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
-        "core_generation": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "core_run_id": {
-          "type": "string"
-        },
-        "database_sha256": {
-          "pattern": "^[0-9a-f]{64}$",
-          "type": "string"
-        },
         "environment_id": {
           "type": "string"
         },
         "os": {
           "type": "string"
+        },
+        "projects": {
+          "items": {
+            "$ref": "#/$defs/ProjectMaterializationEvidenceV1"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": "array"
         },
         "rust_host": {
           "type": "string"
@@ -276,9 +288,7 @@
         "architecture",
         "rust_host",
         "binary_sha256",
-        "core_generation",
-        "core_run_id",
-        "database_sha256"
+        "projects"
       ],
       "type": "object"
     },
@@ -333,6 +343,8 @@
           "items": {
             "$ref": "#/$defs/FailureBucketV1"
           },
+          "maxItems": 312,
+          "minItems": 1,
           "type": "array"
         },
         "classified_positive_steps": {
@@ -388,6 +400,7 @@
             },
             "projection_bytes": {
               "format": "uint64",
+              "maximum": 65536,
               "minimum": 0,
               "type": "integer"
             }
@@ -629,6 +642,14 @@
       ],
       "type": "object"
     },
+    "MaterializationFreshnessV1": {
+      "enum": [
+        "fresh",
+        "stale",
+        "missing"
+      ],
+      "type": "string"
+    },
     "McpRevisionV1": {
       "enum": [
         "2024-11-05",
@@ -638,18 +659,48 @@
       ],
       "type": "string"
     },
+    "NegativeMutationKindV1": {
+      "enum": [
+        "remove_expected_relation",
+        "add_ambiguous_relation"
+      ],
+      "type": "string"
+    },
     "NegativeMutationResultV1": {
       "additionalProperties": false,
       "properties": {
+        "caller": {
+          "type": "string"
+        },
         "contract_proven": {
           "type": "boolean"
         },
+        "kind": {
+          "$ref": "#/$defs/NegativeMutationKindV1"
+        },
         "mutation_id": {
+          "type": "string"
+        },
+        "path_id": {
+          "type": "string"
+        },
+        "step_index": {
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target": {
           "type": "string"
         }
       },
       "required": [
         "mutation_id",
+        "path_id",
+        "kind",
+        "step_index",
+        "caller",
+        "target",
         "contract_proven"
       ],
       "type": "object"
@@ -717,6 +768,69 @@
       ],
       "type": "object"
     },
+    "ProjectMaterializationEvidenceV1": {
+      "additionalProperties": false,
+      "properties": {
+        "core_generation": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "core_run_id": {
+          "type": "string"
+        },
+        "database_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "edge_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "file_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "freshness": {
+          "$ref": "#/$defs/MaterializationFreshnessV1"
+        },
+        "node_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repository_id": {
+          "type": "string"
+        },
+        "source_head": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "source_tree": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "store_schema": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository_id",
+        "source_head",
+        "source_tree",
+        "store_schema",
+        "file_count",
+        "node_count",
+        "edge_count",
+        "freshness",
+        "database_sha256",
+        "core_generation",
+        "core_run_id"
+      ],
+      "type": "object"
+    },
     "ProofQualificationTraceV1": {
       "additionalProperties": false,
       "properties": {
@@ -730,6 +844,8 @@
           "items": {
             "$ref": "#/$defs/SelectorQualificationTraceV1"
           },
+          "maxItems": 7,
+          "minItems": 1,
           "type": "array"
         },
         "steps": {
@@ -841,8 +957,7 @@
               "type": "string"
             },
             "node_id": {
-              "format": "uint64",
-              "minimum": 0,
+              "format": "int64",
               "type": "integer"
             }
           },
@@ -895,8 +1010,7 @@
           "$ref": "#/$defs/SelectorGateOutcomeV1"
         },
         "selector_index": {
-          "format": "uint8",
-          "maximum": 255,
+          "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
@@ -982,8 +1096,7 @@
           "properties": {
             "edge_ids": {
               "items": {
-                "format": "uint64",
-                "minimum": 0,
+                "format": "int64",
                 "type": "integer"
               },
               "type": "array"
@@ -1030,8 +1143,7 @@
       "properties": {
         "candidate_edge_ids": {
           "items": {
-            "format": "uint64",
-            "minimum": 0,
+            "format": "int64",
             "type": "integer"
           },
           "type": "array"
@@ -1040,8 +1152,7 @@
           "$ref": "#/$defs/StepQualificationOutcomeV1"
         },
         "step_index": {
-          "format": "uint8",
-          "maximum": 255,
+          "format": "uint64",
           "minimum": 0,
           "type": "integer"
         }
@@ -1226,6 +1337,8 @@
           "items": {
             "$ref": "#/$defs/TransportMeasurementV1"
           },
+          "maxItems": 4,
+          "minItems": 4,
           "type": "array"
         }
       },
@@ -1282,7 +1395,8 @@
       "items": {
         "$ref": "#/$defs/CaseReportV1"
       },
-      "minItems": 1,
+      "maxItems": 120,
+      "minItems": 120,
       "type": "array"
     },
     "decision": {
@@ -1298,7 +1412,8 @@
       "items": {
         "$ref": "#/$defs/InventoryReportV1"
       },
-      "minItems": 1,
+      "maxItems": 4,
+      "minItems": 4,
       "type": "array"
     },
     "provenance": {
@@ -1315,7 +1430,8 @@
       "items": {
         "$ref": "#/$defs/TrailReportV1"
       },
-      "minItems": 1,
+      "maxItems": 4,
+      "minItems": 4,
       "type": "array"
     }
   },

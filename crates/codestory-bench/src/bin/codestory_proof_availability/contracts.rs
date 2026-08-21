@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
 pub const PATH_SCHEMA: &str = "codestory.proof-availability-path/v1";
@@ -445,14 +445,14 @@ pub enum UnavailableReasonV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectorGateOutcomeV1 {
-    Resolved { node_id: u64 },
+    Resolved { node_id: i64 },
     Failed { reason: SelectorFailureV1 },
     Unavailable { reason: UnavailableReasonV1 },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SelectorQualificationTraceV1 {
-    pub selector_index: u8,
+    pub selector_index: u64,
     pub outcome: SelectorGateOutcomeV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -473,12 +473,45 @@ pub enum RawAdmissionFailureV1 {
     CallsiteLineMismatch,
     CallsiteRawTargetMismatch,
 }
+impl From<codestory_agent::proof_qualification_support::RawAdmissionFailure>
+    for RawAdmissionFailureV1
+{
+    fn from(value: codestory_agent::proof_qualification_support::RawAdmissionFailure) -> Self {
+        match value {
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind => Self::WrongKind,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyAbsent => Self::CertaintyAbsent,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyProbable => Self::CertaintyProbable,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyUncertain => Self::CertaintyUncertain,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource => Self::WrongEffectiveSource,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget => Self::WrongEffectiveTarget,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget => Self::MissingExactResolvedTarget,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::CandidateAlternativesRetained => Self::CandidateAlternativesRetained,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingFileNode => Self::MissingFileNode,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingLine => Self::MissingLine,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity => Self::InvalidOrLegacyCallsiteIdentity,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteFileMismatch => Self::CallsiteFileMismatch,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteLineMismatch => Self::CallsiteLineMismatch,
+            codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteRawTargetMismatch => Self::CallsiteRawTargetMismatch,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContainmentFailureV1 {
     EdgeSourceFileMismatch,
     Missing,
     Ambiguous,
+}
+impl From<codestory_runtime::proof_qualification_support::ContainmentFailure>
+    for ContainmentFailureV1
+{
+    fn from(value: codestory_runtime::proof_qualification_support::ContainmentFailure) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::ContainmentFailure::EdgeSourceFileMismatch => Self::EdgeSourceFileMismatch,
+            codestory_runtime::proof_qualification_support::ContainmentFailure::Missing => Self::Missing,
+            codestory_runtime::proof_qualification_support::ContainmentFailure::Ambiguous => Self::Ambiguous,
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -491,12 +524,38 @@ pub enum SourceBindingFailureV1 {
     LineMissing,
     LineOverLimit,
 }
+impl From<codestory_runtime::proof_qualification_support::SourceBindingFailure>
+    for SourceBindingFailureV1
+{
+    fn from(value: codestory_runtime::proof_qualification_support::SourceBindingFailure) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::FileIncomplete => Self::FileIncomplete,
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::StoredHashAbsent => Self::StoredHashAbsent,
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::WorkingTreeReadFailed => Self::WorkingTreeReadFailed,
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::WorkingTreeHashMismatch => Self::WorkingTreeHashMismatch,
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::InvalidUtf8 => Self::InvalidUtf8,
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::LineMissing => Self::LineMissing,
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::LineOverLimit => Self::LineOverLimit,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum FinalizationFailureV1 {
     ReceiptIntegration,
     ReceiptBudget,
     ProjectionBudget,
+}
+impl From<codestory_runtime::proof_qualification_support::FinalizationFailure>
+    for FinalizationFailureV1
+{
+    fn from(value: codestory_runtime::proof_qualification_support::FinalizationFailure) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::FinalizationFailure::ReceiptIntegration => Self::ReceiptIntegration,
+            codestory_runtime::proof_qualification_support::FinalizationFailure::ReceiptBudget => Self::ReceiptBudget,
+            codestory_runtime::proof_qualification_support::FinalizationFailure::ProjectionBudget => Self::ProjectionBudget,
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -517,13 +576,13 @@ pub enum CandidateFailureV1 {
 #[serde(deny_unknown_fields)]
 pub struct CandidateFailureHistogramV1 {
     pub reason: CandidateFailureV1,
-    pub edge_ids: Vec<u64>,
+    pub edge_ids: Vec<i64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StepQualificationOutcomeV1 {
     Admitted {
-        edge_ids: Vec<u64>,
+        edge_ids: Vec<i64>,
     },
     FirstZeroSurvivor {
         gate: CandidateGateV1,
@@ -533,8 +592,8 @@ pub enum StepQualificationOutcomeV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StepQualificationTraceV1 {
-    pub step_index: u8,
-    pub candidate_edge_ids: Vec<u64>,
+    pub step_index: u64,
+    pub candidate_edge_ids: Vec<i64>,
     pub outcome: StepQualificationOutcomeV1,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -551,6 +610,209 @@ pub struct ProofQualificationTraceV1 {
     pub selector_early_return: bool,
     pub steps: Vec<StepQualificationTraceV1>,
     pub finalization: FinalizationTraceV1,
+}
+
+impl From<codestory_runtime::proof_qualification_support::SelectorFailure> for SelectorFailureV1 {
+    fn from(value: codestory_runtime::proof_qualification_support::SelectorFailure) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::SelectorFailure::Missing => {
+                Self::Missing
+            }
+            codestory_runtime::proof_qualification_support::SelectorFailure::Ambiguous => {
+                Self::Ambiguous
+            }
+            codestory_runtime::proof_qualification_support::SelectorFailure::NonCallable => {
+                Self::NonCallable
+            }
+        }
+    }
+}
+
+impl From<codestory_agent::proof_qualification_support::UnavailableReason> for UnavailableReasonV1 {
+    fn from(value: codestory_agent::proof_qualification_support::UnavailableReason) -> Self {
+        match value {
+            codestory_agent::proof_qualification_support::UnavailableReason::ValidatedContractHashMismatch => Self::ValidatedContractHashMismatch,
+            codestory_agent::proof_qualification_support::UnavailableReason::PublicationPinMismatch => Self::PublicationPinMismatch,
+            codestory_agent::proof_qualification_support::UnavailableReason::SourceNotBoundToPublication => Self::SourceNotBoundToPublication,
+            codestory_agent::proof_qualification_support::UnavailableReason::ProofFactsUnavailable => Self::ProofFactsUnavailable,
+        }
+    }
+}
+
+impl From<codestory_runtime::proof_qualification_support::SelectorGateOutcome>
+    for SelectorGateOutcomeV1
+{
+    fn from(value: codestory_runtime::proof_qualification_support::SelectorGateOutcome) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::SelectorGateOutcome::Resolved {
+                node_id,
+            } => Self::Resolved { node_id: node_id.0 },
+            codestory_runtime::proof_qualification_support::SelectorGateOutcome::Failed(reason) => {
+                Self::Failed {
+                    reason: reason.into(),
+                }
+            }
+            codestory_runtime::proof_qualification_support::SelectorGateOutcome::Unavailable(
+                reason,
+            ) => Self::Unavailable {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl TryFrom<codestory_runtime::proof_qualification_support::SelectorQualificationTrace>
+    for SelectorQualificationTraceV1
+{
+    type Error = anyhow::Error;
+
+    fn try_from(
+        value: codestory_runtime::proof_qualification_support::SelectorQualificationTrace,
+    ) -> Result<Self> {
+        Ok(Self {
+            selector_index: u64::try_from(value.selector_index)
+                .map_err(|_| anyhow::anyhow!("proof_availability_selector_index_overflow"))?,
+            outcome: value.outcome.into(),
+        })
+    }
+}
+
+impl From<codestory_runtime::proof_qualification_support::CandidateGate> for CandidateGateV1 {
+    fn from(value: codestory_runtime::proof_qualification_support::CandidateGate) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::CandidateGate::RawAdmission => {
+                Self::RawAdmission
+            }
+            codestory_runtime::proof_qualification_support::CandidateGate::Containment => {
+                Self::Containment
+            }
+            codestory_runtime::proof_qualification_support::CandidateGate::SourceBinding => {
+                Self::SourceBinding
+            }
+            codestory_runtime::proof_qualification_support::CandidateGate::Line => Self::Line,
+        }
+    }
+}
+
+impl From<codestory_runtime::proof_qualification_support::CandidateFailure> for CandidateFailureV1 {
+    fn from(value: codestory_runtime::proof_qualification_support::CandidateFailure) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::CandidateFailure::RawAdmission(
+                reason,
+            ) => Self::RawAdmission {
+                reason: reason.into(),
+            },
+            codestory_runtime::proof_qualification_support::CandidateFailure::Containment(
+                reason,
+            ) => Self::Containment {
+                reason: reason.into(),
+            },
+            codestory_runtime::proof_qualification_support::CandidateFailure::SourceBinding(
+                reason,
+            ) => Self::SourceBinding {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+impl From<codestory_runtime::proof_qualification_support::CandidateFailureHistogram>
+    for CandidateFailureHistogramV1
+{
+    fn from(
+        value: codestory_runtime::proof_qualification_support::CandidateFailureHistogram,
+    ) -> Self {
+        Self {
+            reason: value.reason.into(),
+            edge_ids: value.edge_ids.into_iter().map(|id| id.0).collect(),
+        }
+    }
+}
+
+impl From<codestory_runtime::proof_qualification_support::StepQualificationOutcome>
+    for StepQualificationOutcomeV1
+{
+    fn from(
+        value: codestory_runtime::proof_qualification_support::StepQualificationOutcome,
+    ) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::StepQualificationOutcome::Admitted { edge_ids } => Self::Admitted { edge_ids: edge_ids.into_iter().map(|id| id.0).collect() },
+            codestory_runtime::proof_qualification_support::StepQualificationOutcome::FirstZeroSurvivor { gate, histogram } => Self::FirstZeroSurvivor { gate: gate.into(), histogram: histogram.into_iter().map(Into::into).collect() },
+        }
+    }
+}
+
+impl TryFrom<codestory_runtime::proof_qualification_support::StepQualificationTrace>
+    for StepQualificationTraceV1
+{
+    type Error = anyhow::Error;
+
+    fn try_from(
+        value: codestory_runtime::proof_qualification_support::StepQualificationTrace,
+    ) -> Result<Self> {
+        Ok(Self {
+            step_index: u64::try_from(value.step_index)
+                .map_err(|_| anyhow::anyhow!("proof_availability_step_index_overflow"))?,
+            candidate_edge_ids: value
+                .candidate_edge_ids
+                .into_iter()
+                .map(|id| id.0)
+                .collect(),
+            outcome: value.outcome.into(),
+        })
+    }
+}
+
+impl TryFrom<codestory_runtime::proof_qualification_support::FinalizationTrace>
+    for FinalizationTraceV1
+{
+    type Error = anyhow::Error;
+
+    fn try_from(
+        value: codestory_runtime::proof_qualification_support::FinalizationTrace,
+    ) -> Result<Self> {
+        match value {
+            codestory_runtime::proof_qualification_support::FinalizationTrace::NotRun => {
+                Ok(Self::NotRun)
+            }
+            codestory_runtime::proof_qualification_support::FinalizationTrace::Complete {
+                projection_bytes,
+            } => Ok(Self::Complete {
+                projection_bytes: u64::try_from(projection_bytes)
+                    .map_err(|_| anyhow::anyhow!("proof_availability_projection_bytes_overflow"))?,
+            }),
+            codestory_runtime::proof_qualification_support::FinalizationTrace::Failed(failure) => {
+                Ok(Self::Failed {
+                    failure: failure.into(),
+                })
+            }
+        }
+    }
+}
+
+impl TryFrom<codestory_runtime::proof_qualification_support::ProofQualificationTrace>
+    for ProofQualificationTraceV1
+{
+    type Error = anyhow::Error;
+
+    fn try_from(
+        value: codestory_runtime::proof_qualification_support::ProofQualificationTrace,
+    ) -> Result<Self> {
+        Ok(Self {
+            selectors: value
+                .selectors
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_>>()?,
+            selector_early_return: value.selector_early_return,
+            steps: value
+                .steps
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_>>()?,
+            finalization: value.finalization.try_into()?,
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -570,9 +832,29 @@ pub struct EnvironmentReportV1 {
     pub architecture: String,
     pub rust_host: String,
     pub binary_sha256: String,
+    pub projects: Vec<ProjectMaterializationEvidenceV1>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum MaterializationFreshnessV1 {
+    Fresh,
+    Stale,
+    Missing,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectMaterializationEvidenceV1 {
+    pub repository_id: String,
+    pub source_head: String,
+    pub source_tree: String,
+    pub store_schema: String,
+    pub file_count: u64,
+    pub node_count: u64,
+    pub edge_count: u64,
+    pub freshness: MaterializationFreshnessV1,
+    pub database_sha256: String,
     pub core_generation: u64,
     pub core_run_id: String,
-    pub database_sha256: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -666,6 +948,19 @@ pub enum McpRevisionV1 {
     #[serde(rename = "2025-11-25")]
     V2025_11_25,
 }
+impl TryFrom<&str> for McpRevisionV1 {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "2024-11-05" => Ok(Self::V2024_11_05),
+            "2025-03-26" => Ok(Self::V2025_03_26),
+            "2025-06-18" => Ok(Self::V2025_06_18),
+            "2025-11-25" => Ok(Self::V2025_11_25),
+            _ => bail!("proof_availability_mcp_revision_invalid"),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TransportErrorV1 {
@@ -691,10 +986,61 @@ pub enum TransportEvidenceV1 {
         error: TransportErrorV1,
     },
 }
+impl
+    TryFrom<
+        std::result::Result<
+            Vec<codestory_cli::proof_qualification_support::RevisionNativeToolResultMeasurement>,
+            codestory_cli::proof_qualification_support::ProofQualificationTransportError,
+        >,
+    > for TransportEvidenceV1
+{
+    type Error = anyhow::Error;
+
+    fn try_from(
+        value: std::result::Result<
+            Vec<codestory_cli::proof_qualification_support::RevisionNativeToolResultMeasurement>,
+            codestory_cli::proof_qualification_support::ProofQualificationTransportError,
+        >,
+    ) -> Result<Self> {
+        match value {
+            Ok(measurements) => Ok(Self::Measurements {
+                measurements: TransportMeasurementSetV1 {
+                    measurements: measurements
+                        .into_iter()
+                        .map(|measurement| {
+                            Ok(TransportMeasurementV1 {
+                                revision: measurement.revision.as_str().try_into()?,
+                                actual_bytes: u64::try_from(measurement.byte_length).map_err(
+                                    |_| anyhow::anyhow!("proof_availability_transport_bytes_overflow"),
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                },
+            }),
+            Err(error) => Ok(Self::Error {
+                error: match error {
+                    codestory_cli::proof_qualification_support::ProofQualificationTransportError::Serialization(message) => TransportErrorV1::Serialization { message },
+                    codestory_cli::proof_qualification_support::ProofQualificationTransportError::InvalidProjection(projection) => TransportErrorV1::InvalidProjection { projection },
+                    codestory_cli::proof_qualification_support::ProofQualificationTransportError::OutputSchemaViolation => TransportErrorV1::OutputSchemaViolation {},
+                    codestory_cli::proof_qualification_support::ProofQualificationTransportError::ResultExceedsBudget { maximum_bytes, actual_bytes } => TransportErrorV1::ResultExceedsBudget {
+                        maximum_bytes: u64::try_from(maximum_bytes).map_err(|_| anyhow::anyhow!("proof_availability_transport_bytes_overflow"))?,
+                        actual_bytes: u64::try_from(actual_bytes).map_err(|_| anyhow::anyhow!("proof_availability_transport_bytes_overflow"))?,
+                    },
+                },
+            }),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NegativeMutationResultV1 {
     pub mutation_id: String,
+    pub path_id: String,
+    pub kind: NegativeMutationKindV1,
+    pub step_index: u8,
+    pub caller: String,
+    pub target: String,
     pub contract_proven: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -714,6 +1060,7 @@ pub struct CaseReportV1 {
     pub warm_end_to_end_ms: u64,
     pub stage_durations_ms: StageDurationsV1,
     pub attempted_step_count: u8,
+    pub unclassified_step_indices: Vec<u8>,
     pub complete_projection_bytes: u64,
     pub transport: TransportEvidenceV1,
     pub negative_mutations: Vec<NegativeMutationResultV1>,
@@ -865,6 +1212,16 @@ impl QualificationSummaryV1 {
         Ok(value)
     }
     pub fn validate(&self) -> Result<()> {
+        let funnel_total = self
+            .failure_funnel
+            .buckets
+            .iter()
+            .try_fold(0u128, |total, bucket| {
+                if bucket.count > 312 {
+                    return None;
+                }
+                total.checked_add(bucket.count)
+            });
         if self.schema != REPORT_SCHEMA
             || empty(&self.qualification_id)
             || !commit(&self.provenance.source_commit)
@@ -878,21 +1235,30 @@ impl QualificationSummaryV1 {
             .iter()
             .all(|v| hash(v))
             || !hash(&self.environment.binary_sha256)
-            || !hash(&self.environment.database_sha256)
-            || empty(&self.environment.core_run_id)
+            || self.environment.projects.len() != 4
+            || !unique(
+                self.environment
+                    .projects
+                    .iter()
+                    .map(|project| project.repository_id.as_str()),
+            )
+            || self.inventory.len() != 4
+            || self.trails.len() != 4
+            || self.cases.len() != 120
+            || !unique(
+                self.inventory
+                    .iter()
+                    .map(|inventory| inventory.repository_id.as_str()),
+            )
+            || !unique(self.trails.iter().map(|trail| trail.repository_id.as_str()))
+            || !unique(self.cases.iter().map(|case| case.case_id.as_str()))
             || self.failure_funnel.attempted_positive_steps != 312
             || self.failure_funnel.classified_positive_steps > 312
             || self.failure_funnel.unclassified_positive_steps > 312
             || u32::from(self.failure_funnel.classified_positive_steps)
                 + u32::from(self.failure_funnel.unclassified_positive_steps)
                 != 312
-            || self
-                .failure_funnel
-                .buckets
-                .iter()
-                .map(|bucket| bucket.count)
-                .sum::<u128>()
-                != u128::from(self.failure_funnel.classified_positive_steps)
+            || funnel_total != Some(u128::from(self.failure_funnel.classified_positive_steps))
             || !self
                 .failure_funnel
                 .buckets
@@ -900,6 +1266,33 @@ impl QualificationSummaryV1 {
                 .all(|bucket| valid_funnel_outcome(&bucket.outcome))
         {
             bail!("proof_availability_summary_invalid")
+        }
+        for project in &self.environment.projects {
+            if !commit(&project.source_head)
+                || !commit(&project.source_tree)
+                || empty(&project.store_schema)
+                || !hash(&project.database_sha256)
+                || empty(&project.core_run_id)
+            {
+                bail!("proof_availability_materialization_invalid")
+            }
+        }
+        let project_ids = self
+            .environment
+            .projects
+            .iter()
+            .map(|project| project.repository_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if !self
+            .inventory
+            .iter()
+            .all(|inventory| project_ids.contains(inventory.repository_id.as_str()))
+            || !self
+                .trails
+                .iter()
+                .all(|trail| project_ids.contains(trail.repository_id.as_str()))
+        {
+            bail!("proof_availability_report_project_set_invalid")
         }
         for t in &self.trails {
             if t.lengths.len() != 6
@@ -912,33 +1305,108 @@ impl QualificationSummaryV1 {
                 bail!("proof_availability_trail_counts_invalid")
             }
         }
+        let mut cases_per_project = BTreeMap::<&str, usize>::new();
+        let mut attempted_total = 0u16;
+        let mut expected_funnel = BTreeMap::<String, u128>::new();
+        let mut expected_unclassified = 0u16;
+        let mut mutation_ids = BTreeSet::new();
         for c in &self.cases {
             if c.negative_mutations.len() != 2
                 || c.proven_step_precision_milli > 1000
                 || c.proven_step_recall_milli > 1000
                 || c.attempted_step_count > 6
-                || c.proof_trace.steps.len() != usize::from(c.attempted_step_count)
+                || usize::from(c.attempted_step_count)
+                    != c.proof_trace.steps.len() + c.unclassified_step_indices.len()
                 || !c
                     .proof_trace
                     .selectors
                     .iter()
                     .enumerate()
-                    .all(|(index, selector)| selector.selector_index == index as u8)
+                    .all(|(index, selector)| selector.selector_index == index as u64)
                 || !valid_selector_trace(&c.proof_trace)
-                || !c
-                    .proof_trace
-                    .steps
+                || !c.proof_trace.steps.iter().all(|step| {
+                    step.step_index < u64::from(c.attempted_step_count) && valid_step_trace(step)
+                })
+                || !unique_u64(c.proof_trace.steps.iter().map(|step| step.step_index))
+                || !unique_u8(c.unclassified_step_indices.iter().copied())
+                || c.unclassified_step_indices
                     .iter()
-                    .enumerate()
-                    .all(|(index, step)| step.step_index == index as u8 && valid_step_trace(step))
+                    .any(|index| *index >= c.attempted_step_count)
+                || c.proof_trace.steps.iter().any(|step| {
+                    c.unclassified_step_indices
+                        .contains(&(step.step_index as u8))
+                })
                 || !valid_finalization(&c.proof_trace.finalization)
+                || matches!(c.proof_trace.finalization, FinalizationTraceV1::NotRun)
+                || c.complete_projection_bytes > 65_536
                 || !valid_transport(&c.transport)
-                || (c.proof_trace.selector_early_return
-                    != matches!(c.proof_trace.finalization, FinalizationTraceV1::NotRun))
-                || (c.proof_trace.selector_early_return && c.attempted_step_count != 0)
+                || !unique(
+                    c.negative_mutations
+                        .iter()
+                        .map(|mutation| mutation.mutation_id.as_str()),
+                )
+                || c.negative_mutations.iter().any(|mutation| {
+                    mutation.path_id != c.case_id
+                        || mutation.step_index >= c.attempted_step_count
+                        || empty(&mutation.caller)
+                        || empty(&mutation.target)
+                })
             {
                 bail!("proof_availability_case_invalid")
             }
+            *cases_per_project
+                .entry(c.repository_id.as_str())
+                .or_default() += 1;
+            attempted_total = attempted_total
+                .checked_add(u16::from(c.attempted_step_count))
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_attempted_steps_overflow"))?;
+            expected_unclassified = expected_unclassified
+                .checked_add(
+                    u16::try_from(c.unclassified_step_indices.len())
+                        .map_err(|_| anyhow::anyhow!("proof_availability_unclassified_overflow"))?,
+                )
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_unclassified_overflow"))?;
+            for mutation in &c.negative_mutations {
+                if !mutation_ids.insert(mutation.mutation_id.as_str()) {
+                    bail!("proof_availability_mutation_result_duplicate")
+                }
+            }
+            for step in &c.proof_trace.steps {
+                let outcome = match &step.outcome {
+                    StepQualificationOutcomeV1::Admitted { .. } => FunnelOutcomeV1::Admitted,
+                    StepQualificationOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
+                        FunnelOutcomeV1::FirstZeroSurvivor {
+                            gate: gate.clone(),
+                            histogram: histogram.clone(),
+                        }
+                    }
+                };
+                let key = serde_json::to_string(&outcome)?;
+                *expected_funnel.entry(key).or_default() += 1;
+            }
+        }
+        if !self
+            .cases
+            .iter()
+            .all(|case| project_ids.contains(case.repository_id.as_str()))
+            || project_ids
+                .iter()
+                .any(|id| cases_per_project.get(id).copied() != Some(30))
+            || attempted_total != 312
+            || mutation_ids.len() != 240
+            || expected_unclassified != self.failure_funnel.unclassified_positive_steps
+        {
+            bail!("proof_availability_report_evidence_totals_invalid")
+        }
+        let mut actual_funnel = BTreeMap::<String, u128>::new();
+        for bucket in &self.failure_funnel.buckets {
+            let key = serde_json::to_string(&bucket.outcome)?;
+            if actual_funnel.insert(key, bucket.count).is_some() {
+                bail!("proof_availability_funnel_bucket_duplicate")
+            }
+        }
+        if expected_funnel != actual_funnel {
+            bail!("proof_availability_funnel_evidence_mismatch")
         }
         if !unique(
             self.decision
@@ -961,6 +1429,50 @@ impl QualificationSummaryV1 {
                 .any(|gate| matches!(gate.detail, GateFailureDetailV1::SourceDependency { .. }))
         {
             bail!("proof_availability_delay_dependency_missing")
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_corpus(&self, corpus: &CorpusV1) -> Result<()> {
+        self.validate()?;
+        corpus.validate()?;
+        let paths = corpus
+            .paths
+            .iter()
+            .map(|path| (path.case_id.as_str(), path))
+            .collect::<BTreeMap<_, _>>();
+        let mut result_ids = BTreeSet::new();
+        for case in &self.cases {
+            let path = paths
+                .get(case.case_id.as_str())
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_case_oracle_missing"))?;
+            if path.repository_id != case.repository_id
+                || case.attempted_step_count != path.spec.expected_step_count
+            {
+                bail!("proof_availability_case_oracle_mismatch")
+            }
+            let mutations = path
+                .negative_mutations
+                .iter()
+                .map(|mutation| (mutation.mutation_id.as_str(), mutation))
+                .collect::<BTreeMap<_, _>>();
+            for result in &case.negative_mutations {
+                let mutation = mutations
+                    .get(result.mutation_id.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("proof_availability_mutation_oracle_missing"))?;
+                if result.path_id != mutation.path_id
+                    || result.kind != mutation.kind
+                    || result.step_index != mutation.step_index
+                    || result.caller != mutation.caller
+                    || result.target != mutation.target
+                    || !result_ids.insert(result.mutation_id.as_str())
+                {
+                    bail!("proof_availability_mutation_oracle_mismatch")
+                }
+            }
+        }
+        if result_ids.len() != 240 {
+            bail!("proof_availability_mutation_oracle_total_invalid")
         }
         Ok(())
     }
@@ -1014,10 +1526,12 @@ fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
 
 fn valid_selector_trace(trace: &ProofQualificationTraceV1) -> bool {
     if trace.selector_early_return {
-        matches!(
-            trace.selectors.last().map(|selector| &selector.outcome),
-            Some(SelectorGateOutcomeV1::Failed { .. } | SelectorGateOutcomeV1::Unavailable { .. })
-        )
+        trace.selectors.iter().any(|selector| {
+            matches!(
+                selector.outcome,
+                SelectorGateOutcomeV1::Failed { .. } | SelectorGateOutcomeV1::Unavailable { .. }
+            )
+        })
     } else {
         trace
             .selectors
@@ -1026,7 +1540,7 @@ fn valid_selector_trace(trace: &ProofQualificationTraceV1) -> bool {
     }
 }
 
-fn strictly_ascending(values: &[u64]) -> bool {
+fn strictly_ascending(values: &[i64]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
@@ -1082,7 +1596,7 @@ fn valid_transport(evidence: &TransportEvidenceV1) -> bool {
 fn valid_finalization(finalization: &FinalizationTraceV1) -> bool {
     match finalization {
         FinalizationTraceV1::NotRun => true,
-        FinalizationTraceV1::Complete { .. } => true,
+        FinalizationTraceV1::Complete { projection_bytes } => *projection_bytes <= 65_536,
         FinalizationTraceV1::Failed { .. } => true,
     }
 }
@@ -1165,7 +1679,10 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
             ) {
                 property.insert("pattern".into(), Value::String(SHA256.into()));
             }
-            if matches!(name.as_str(), "commit" | "source_commit" | "source_tree") {
+            if matches!(
+                name.as_str(),
+                "commit" | "source_commit" | "source_tree" | "source_head"
+            ) {
                 property.insert("pattern".into(), Value::String(COMMIT.into()));
             }
         }
@@ -1198,7 +1715,10 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
                 ) {
                     property.insert("pattern".into(), Value::String(SHA256.into()));
                 }
-                if matches!(name.as_str(), "commit" | "source_commit" | "source_tree") {
+                if matches!(
+                    name.as_str(),
+                    "commit" | "source_commit" | "source_tree" | "source_head"
+                ) {
                     property.insert("pattern".into(), Value::String(COMMIT.into()));
                 }
                 if matches!(
@@ -1232,6 +1752,7 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
     }
     semantic_contract_bounds(schema, document);
     annotate_transport_bounds(schema);
+    annotate_finalization_bounds(schema);
 }
 
 fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
@@ -1358,9 +1879,16 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
             }
         }
         SchemaDocument::Report => {
-            set_bounds(schema, None, "inventory", Some(1), None);
-            set_bounds(schema, None, "trails", Some(1), None);
-            set_bounds(schema, None, "cases", Some(1), None);
+            set_bounds(schema, None, "inventory", Some(4), Some(4));
+            set_bounds(schema, None, "trails", Some(4), Some(4));
+            set_bounds(schema, None, "cases", Some(120), Some(120));
+            set_bounds(
+                schema,
+                Some("EnvironmentReportV1"),
+                "projects",
+                Some(4),
+                Some(4),
+            );
             set_const(
                 schema,
                 Some("FailureFunnelReportV1"),
@@ -1393,6 +1921,55 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 "steps",
                 Some(0),
                 Some(6),
+            );
+            set_bounds(
+                schema,
+                Some("ProofQualificationTraceV1"),
+                "selectors",
+                Some(1),
+                Some(7),
+            );
+            set_bounds(
+                schema,
+                Some("CaseReportV1"),
+                "negative_mutations",
+                Some(2),
+                Some(2),
+            );
+            set_bounds(
+                schema,
+                Some("CaseReportV1"),
+                "unclassified_step_indices",
+                Some(0),
+                Some(6),
+            );
+            set_bounds(
+                schema,
+                Some("CaseReportV1"),
+                "complete_projection_bytes",
+                Some(0),
+                Some(65_536),
+            );
+            set_bounds(
+                schema,
+                Some("FailureFunnelReportV1"),
+                "buckets",
+                Some(1),
+                Some(312),
+            );
+            set_bounds(
+                schema,
+                Some("ActivationDecisionV1"),
+                "failed_gates",
+                Some(0),
+                Some(12),
+            );
+            set_bounds(
+                schema,
+                Some("TransportMeasurementSetV1"),
+                "measurements",
+                Some(4),
+                Some(4),
             );
             set_bounds(
                 schema,
@@ -1482,6 +2059,34 @@ fn annotate_transport_bounds(value: &mut Value) {
         _ => {}
     }
 }
+
+fn annotate_finalization_bounds(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let kind = map
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get("kind"))
+                .and_then(Value::as_object)
+                .and_then(|kind| kind.get("const"))
+                .and_then(Value::as_str);
+            if kind == Some("complete")
+                && let Some(bytes) = map
+                    .get_mut("properties")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|properties| properties.get_mut("projection_bytes"))
+                    .and_then(Value::as_object_mut)
+            {
+                bytes.insert("maximum".into(), Value::from(65_536));
+            }
+            for value in map.values_mut() {
+                annotate_finalization_bounds(value);
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(annotate_finalization_bounds),
+        _ => {}
+    }
+}
 fn empty(value: &str) -> bool {
     value.trim().is_empty()
 }
@@ -1515,4 +2120,14 @@ fn range(value: &OracleSourceRangeV1) -> Result<()> {
 fn unique<'a>(mut values: impl Iterator<Item = &'a str>) -> bool {
     let mut set = BTreeSet::new();
     values.all(|v| !empty(v) && set.insert(v))
+}
+
+fn unique_u64(mut values: impl Iterator<Item = u64>) -> bool {
+    let mut set = BTreeSet::new();
+    values.all(|value| set.insert(value))
+}
+
+fn unique_u8(mut values: impl Iterator<Item = u8>) -> bool {
+    let mut set = BTreeSet::new();
+    values.all(|value| set.insert(value))
 }
