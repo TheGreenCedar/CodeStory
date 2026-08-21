@@ -37,7 +37,7 @@
   "producer": {
     "name": "codestory-llama-sys",
     "embedding_revision": "0.16.1",
-    "version": "0.17.4"
+    "version": "0.17.5"
   },
   "license": {
     "spdx_id": "MIT",
