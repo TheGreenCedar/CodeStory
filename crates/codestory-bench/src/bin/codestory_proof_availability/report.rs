@@ -2037,7 +2037,7 @@ fn append_array_index_pointer(pointer: &str, index: usize) -> Option<String> {
 
 fn fixed_json_pointer_segment(segment: &str) -> Option<&'static str> {
     const ADDITIONAL_FIXED: &[&str] = &["oracle_step_index", "projection_bytes", "receipts"];
-    const FIXED: &str = "actionable_exact_gap actionable_incomplete_gap actual actual_bytes admitted_rows all_authoritative_receipts_exact architecture attempted_positive_steps attempted_step_count audit authoritative_exact_receipt_count authoritative_receipt_count authoritative_receipts automatic automatic_thresholds_met binary_name binary_sha256 boundary buckets build byte_end byte_start caller caller_body callsite_expression callsite_identity callsite_line candidate_edge_ids canonical_id cargo_profile case_id cases certainty certified_absence classification classified_positive_steps clause_id clauses code cohorts commit complete_projection_bytes complete_response_p95_bytes containment contract_digest contract_proven contract_proven_supported core_generation core_generation_id core_run_id corpus_id corpus_sha256 count curator database_sha256 decision denominator detail diagnostic_candidate_count edge_count edge_id edge_ids effective_endpoint effective_endpoint_rows elapsed_ns end_byte end_byte_exclusive end_line environment environment_id exact_oracle_step_count exact_resolved exact_resolved_rows exclude_from_projection expected_cohort_count expected_negative_requests expected_positive_requests expected_positive_steps experimental failed_gates failure_funnel false_contract_proven false_positive_receipt_count file_byte_length file_count file_node_id finalization finding freshness full_or_useful_partial full_proof_wilson full_proofs gap gaps gate_id hard_gates identity incomplete_provenance indexed_sha256 invalid_results inventory invocation kind language length lengths line_window lower lower_milli maximum_certified_absence maximum_complete_response_p95_bytes maximum_false_contract_proven maximum_invalid_results maximum_over_cap_results maximum_proof_bytes maximum_response_bytes maximum_transport_errors maximum_transport_p95_ms maximum_unknown_p95_ms maximum_unknown_response_p95_bytes measurements methodology_sha256 milli minimum_actionable_exact_gap_milli minimum_cohort_wilson_lower_milli minimum_full_or_useful_partial_milli minimum_full_proof_wilson_lower_milli minimum_full_proofs minimum_full_proofs_per_cohort minimum_positive_step_recall_milli missing_oracle_step_count missing_oracle_steps mutated_spec mutation_id negative_mutations negative_request_count node_count node_id non_exact_authoritative_receipts numerator observations observations_sha256 observed_receipt_count observed_receipts observed_sha256 operation oracle_comparison oracle_receipts_exact oracle_step oracle_steps os outcome over_cap_results owner_node_id path path_count path_file path_file_sha256 path_id path_length path_length_distribution paths pinned positive_request_count positive_step_count positive_step_precision_milli positive_step_recall positive_step_recall_milli prescribed_argv product_disposition product_disposition_matches_evidence product_disposition_mismatches profile project_file_components project_id projects proof_trace prohibit_traversal_through proven_prefix_length proven_prefix_step_count proven_step_precision_milli proven_step_recall_milli provenance qualification_id qualification_source_commit qualification_source_tree qualified_name quote range reason receipt_evidence receipt_file_sha256 receipt_id receipt_line_window recorded_at repository repository_id require_complete_failure_funnel require_complete_provenance require_each_cohort require_exact_receipt_matches require_product_disposition_match results_sha256 review_date reviewer revision rust_host rustc_vv schema selector selector_early_return selector_index selectors sha256 source source_area source_area_requirement source_audit source_commit source_dirty source_head source_text source_tree source_tree_sha256 spec stable_explicit stage stage_durations_ms start start_byte start_line step_index steps store_schema stored_call_rows strictly_admitted symbol target text thresholds_id thresholds_sha256 trails transport transport_errors transport_p95 unclassified_positive_steps unclassified_step_indices unknown_response_p95_bytes unknown_warm_p95_ms unresolved_placeholder_rows upper validation warm_end_to_end_ms wilson wilson_z workspace";
+    const FIXED: &str = "actionable_exact_gap actionable_incomplete_gap actual actual_bytes admitted_rows all_authoritative_receipts_exact architecture attempted_positive_steps attempted_step_count audit authoritative_exact_receipt_count authoritative_receipt_count authoritative_receipts automatic automatic_thresholds_met binary_name binary_sha256 boundary buckets build byte_end byte_start caller caller_body callsite_expression callsite_identity callsite_line candidate_edge_ids canonical_id canonical_id_binding_sha256 cargo_profile case_id cases certainty certified_absence classification classified_positive_steps clause_id clauses code cohorts commit complete_projection_bytes complete_response_p95_bytes containment contract_digest contract_proven contract_proven_supported core_generation core_generation_id core_run_id corpus_id corpus_sha256 count curator database_sha256 decision denominator detail diagnostic_candidate_count edge_count edge_id edge_ids effective_endpoint effective_endpoint_rows elapsed_ns end_byte end_byte_exclusive end_line environment environment_id exact_oracle_step_count exact_resolved exact_resolved_rows exclude_from_projection expected_cohort_count expected_negative_requests expected_positive_requests expected_positive_steps experimental failed_gates failure_funnel false_contract_proven false_positive_receipt_count file_byte_length file_count file_node_id finalization finding freshness full_or_useful_partial full_proof_wilson full_proofs gap gaps gate_id hard_gates identity incomplete_provenance indexed_sha256 invalid_results inventory invocation kind language length lengths line_window lower lower_milli maximum_certified_absence maximum_complete_response_p95_bytes maximum_false_contract_proven maximum_invalid_results maximum_over_cap_results maximum_proof_bytes maximum_response_bytes maximum_transport_errors maximum_transport_p95_ms maximum_unknown_p95_ms maximum_unknown_response_p95_bytes measurements methodology_sha256 milli minimum_actionable_exact_gap_milli minimum_cohort_wilson_lower_milli minimum_full_or_useful_partial_milli minimum_full_proof_wilson_lower_milli minimum_full_proofs minimum_full_proofs_per_cohort minimum_positive_step_recall_milli missing_oracle_step_count missing_oracle_steps mutated_spec mutation_id negative_mutations negative_request_count node_count node_id non_exact_authoritative_receipts numerator observations observations_sha256 observed_receipt_count observed_receipts observed_sha256 operation oracle_comparison oracle_receipts_exact oracle_step oracle_steps os outcome over_cap_results owner_node_id path path_count path_file path_file_sha256 path_id path_length path_length_distribution paths pinned positive_request_count positive_step_count positive_step_precision_milli positive_step_recall positive_step_recall_milli prescribed_argv product_disposition product_disposition_matches_evidence product_disposition_mismatches profile project_file_components project_id projects proof_trace prohibit_traversal_through proven_prefix_length proven_prefix_step_count proven_step_precision_milli proven_step_recall_milli provenance qualification_id qualification_source_commit qualification_source_tree qualified_name quote range reason receipt_evidence receipt_file_sha256 receipt_id receipt_line_window recorded_at repository repository_id require_complete_failure_funnel require_complete_provenance require_each_cohort require_exact_receipt_matches require_product_disposition_match results_sha256 review_date reviewer revision rust_host rustc_vv schema selector selector_early_return selector_index selectors sha256 source source_area source_area_requirement source_audit source_commit source_dirty source_head source_text source_tree source_tree_sha256 spec stable_explicit stage stage_durations_ms start start_byte start_line step_index steps store_schema stored_call_rows strictly_admitted symbol target text thresholds_id thresholds_sha256 trails transport transport_errors transport_p95 unclassified_positive_steps unclassified_step_indices unknown_response_p95_bytes unknown_warm_p95_ms unresolved_placeholder_rows upper validation warm_end_to_end_ms wilson wilson_z workspace";
     if let Some(candidate) = ADDITIONAL_FIXED
         .iter()
         .copied()
@@ -2676,11 +2676,150 @@ mod tests {
         )
     ))]
     #[test]
-    fn builder_path_writes_the_first_cases_path_failure_diagnostic() {
+    fn task6_receipt_paths_are_bound_before_public_artifact_publication() {
+        use codestory_agent::proof_qualification_support::{
+            CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow,
+            PinnedNodeIdentity, ReceiptRef, ResolvedNodeIdentity,
+        };
+        use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+
+        const SOURCE_CANONICAL_ID: &str = "/Users/private/worktree/src/caller.rs::caller";
+        const TARGET_CANONICAL_ID: &str = r"C:\private\worktree\src\target.rs::target";
+
         let (mut report, corpus, thresholds) =
             super::super::thresholds::tests::accepted_fixture::values();
-        report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]["canonical_id"] =
-            json!("/private/canonical-id");
+        let path_files =
+            super::super::thresholds::tests::accepted_fixture::oracle_path_file_values()
+                .into_iter()
+                .map(CohortPathFileV1::from_json)
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+        let oracle = &path_files[0].paths[0].oracle_steps[0];
+        let prior: super::super::contracts::ObservedReceiptV1 = serde_json::from_value(
+            report["cases"][0]["receipt_evidence"]["observed_receipts"][0].clone(),
+        )
+        .unwrap();
+        let resolved = |identity: &super::super::contracts::ResolvedNodeIdentityV1,
+                        canonical_id: &str| {
+            ResolvedNodeIdentity {
+                pinned: PinnedNodeIdentity {
+                    project_id: identity.pinned.project_id.clone(),
+                    core_generation_id: identity.pinned.core_generation_id.clone(),
+                    core_run_id: identity.pinned.core_run_id.clone(),
+                    node_id: identity.pinned.node_id.clone(),
+                },
+                canonical_id: canonical_id.to_owned(),
+                qualified_name: identity.qualified_name.clone(),
+                project_file_components: identity.project_file_components.clone(),
+            }
+        };
+        let task6_receipt = IndexedCallEdgeReceipt {
+            receipt: ReceiptRef {
+                receipt_id: prior.receipt_id.clone(),
+                edge_id: prior.edge_id.to_string(),
+            },
+            source: resolved(&prior.source, SOURCE_CANONICAL_ID),
+            target: resolved(&prior.target, TARGET_CANONICAL_ID),
+            certainty: ResolutionCertainty::Certain,
+            callsite_identity: prior.callsite_identity.clone(),
+            containment: CallableContainmentEvidence {
+                file_node_id: NodeId(prior.containment.file_node_id),
+                owner_node_id: NodeId(prior.containment.owner_node_id),
+                start_line: prior.containment.start_line,
+                end_line: prior.containment.end_line,
+            },
+            line_window: IndexedLineWindow {
+                kind: "indexed_line_v1",
+                project_file_components: prior.line_window.project_file_components.clone(),
+                indexed_sha256: prior.line_window.indexed_sha256.clone(),
+                observed_sha256: prior.line_window.observed_sha256.clone(),
+                anchor_line: prior.callsite_line,
+                byte_start: usize::try_from(prior.line_window.byte_start).unwrap(),
+                byte_end: usize::try_from(prior.line_window.byte_end).unwrap(),
+                text: prior.line_window.text.clone(),
+            },
+        };
+        let observed =
+            super::super::contracts::observed_receipt_from_task6(0, &task6_receipt, oracle)
+                .unwrap();
+        report["cases"][0]["receipt_evidence"]["observed_receipts"][0] =
+            serde_json::to_value(observed).unwrap();
+        super::super::thresholds::tests::refresh_results_digest(&mut report);
+
+        let parsed = QualificationSummaryV1::from_json(report).unwrap();
+        let corpus = CorpusV1::from_json(corpus).unwrap();
+        let thresholds = ThresholdsV1::from_json(thresholds).unwrap();
+        let summary = build_summary(
+            QualificationReportInputV1 {
+                qualification_id: parsed.qualification_id,
+                source_commit: parsed.provenance.source_commit,
+                source_tree: parsed.provenance.source_tree,
+                environment: parsed.environment,
+                inventory: parsed.inventory,
+                trails: parsed.trails,
+                cases: parsed.cases,
+                failure_funnel: parsed.failure_funnel,
+            },
+            &corpus,
+            &thresholds,
+        )
+        .unwrap();
+        summary
+            .validate_against_inputs(&corpus, &thresholds)
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join(&summary.qualification_id);
+        let reservation = reserve_case_diagnostic(root.path(), &summary.qualification_id).unwrap();
+        build_and_publish(
+            &destination,
+            &summary,
+            &corpus,
+            &thresholds,
+            &PublicLeakPolicy::default(),
+            PublicArtifactDiagnosticContext::new(
+                &reservation,
+                &summary.qualification_id,
+                &summary.provenance.source_commit,
+                &summary.provenance.source_tree,
+            ),
+        )
+        .unwrap();
+
+        let cases = fs::read_to_string(destination.join("cases.json")).unwrap();
+        let summary = fs::read_to_string(destination.join("summary.json")).unwrap();
+        for raw in [SOURCE_CANONICAL_ID, TARGET_CANONICAL_ID] {
+            assert!(!cases.contains(raw));
+            assert!(!summary.contains(raw));
+        }
+        verify_published(
+            &destination,
+            &corpus,
+            &thresholds,
+            &path_files,
+            &PublicLeakPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 8);
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
+    #[test]
+    fn builder_path_writes_a_non_receipt_path_failure_diagnostic() {
+        let (mut report, corpus, thresholds) =
+            super::super::thresholds::tests::accepted_fixture::values();
+        report["environment"]["build"]["rustc_vv"] = json!(format!(
+            "/private/compiler\n{}",
+            report["environment"]["build"]["rustc_vv"].as_str().unwrap()
+        ));
         super::super::thresholds::tests::refresh_results_digest(&mut report);
         let summary = QualificationSummaryV1::from_json(report).unwrap();
         let corpus = CorpusV1::from_json(corpus).unwrap();
@@ -2721,12 +2860,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(diagnostic["failure"]["reason"], "path_leak");
-        assert_eq!(diagnostic["failure"]["artifact"], "cases.json");
-        assert_eq!(diagnostic["failure"]["case_ordinal"], 0);
-        assert_eq!(
-            diagnostic["failure"]["json_pointer"],
-            "/0/receipt_evidence/observed_receipts/0/source/canonical_id"
-        );
+        assert_eq!(diagnostic["failure"]["artifact"], "environment.json");
+        assert!(diagnostic["failure"]["case_ordinal"].is_null());
+        assert_eq!(diagnostic["failure"]["json_pointer"], "/build/rustc_vv");
     }
 
     #[cfg(all(

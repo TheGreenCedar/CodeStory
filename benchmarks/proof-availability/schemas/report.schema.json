@@ -2010,8 +2010,9 @@
     "ResolvedNodeIdentityV1": {
       "additionalProperties": false,
       "properties": {
-        "canonical_id": {
+        "canonical_id_binding_sha256": {
           "minLength": 1,
+          "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
         "pinned": {
@@ -2032,7 +2033,7 @@
       },
       "required": [
         "pinned",
-        "canonical_id",
+        "canonical_id_binding_sha256",
         "qualified_name",
         "project_file_components"
       ],
@@ -2489,7 +2490,7 @@
       "type": "string"
     }
   },
-  "$id": "codestory.proof-availability-report/v1",
+  "$id": "codestory.proof-availability-report/v2",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -2523,7 +2524,7 @@
       "type": "string"
     },
     "schema": {
-      "const": "codestory.proof-availability-report/v1",
+      "const": "codestory.proof-availability-report/v2",
       "type": "string"
     },
     "trails": {

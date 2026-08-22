@@ -705,6 +705,10 @@ pub(crate) mod tests {
         pub(crate) fn values() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
             (report(), corpus(), thresholds())
         }
+
+        pub(crate) fn oracle_path_file_values() -> Vec<serde_json::Value> {
+            path_files()
+        }
     }
 
     fn observed(full: u64, cohorts: [u64; 4]) -> Observations {
