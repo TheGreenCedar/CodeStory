@@ -17,6 +17,16 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) const PUBLIC_ARTIFACT_NAMES: [&str; 8] = [
     "cases.json",
@@ -37,12 +47,41 @@ const MAX_CASE_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
 /// A process-owned, initially empty directory that makes a qualification ID
 /// single-use for the private invalid-case recovery artifact. It is never a
 /// public result artifact and it is intentionally left behind after a crash.
+/// A process-owned single-use directory. The held directory handle, rather
+/// than the discoverable pathname, is the only authority permitted to create
+/// or publish the private diagnostic file.
 #[derive(Debug)]
 pub(crate) struct CaseDiagnosticReservation {
     path: PathBuf,
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
+    directory: File,
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
     device: u64,
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
     inode: u64,
 }
 
@@ -51,18 +90,17 @@ impl CaseDiagnosticReservation {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
-
-    /// Remove only the same still-empty directory we created. `remove_dir`
-    /// provides the non-recursive empty-directory guarantee.
-    pub(crate) fn remove_empty(self) -> Result<()> {
-        if !same_reserved_directory(&self)? {
-            bail!("proof_availability_case_diagnostic_cleanup_failed")
-        }
-        fs::remove_dir(&self.path)
-            .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_cleanup_failed"))
-    }
 }
 
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
 pub(crate) fn reserve_case_diagnostic(
     output_parent: &Path,
     qualification_id: &str,
@@ -75,25 +113,28 @@ pub(crate) fn reserve_case_diagnostic(
     let path = output_parent.join(format!(
         ".codestory-proof-availability-case-diagnostic-{qualification_id}"
     ));
-    fs::create_dir(&path)
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .create(&path)
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_exists"))?;
-    if set_private_directory(&path).is_err() {
-        let _ = fs::remove_dir(&path);
-        bail!("proof_availability_case_diagnostic_create_failed")
-    }
-    let metadata = fs::symlink_metadata(&path)
+    let directory = File::open(&path)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
+    let metadata = directory
+        .metadata()
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("proof_availability_case_diagnostic_create_failed")
     }
     Ok(CaseDiagnosticReservation {
         path,
-        #[cfg(unix)]
+        directory,
         device: {
             use std::os::unix::fs::MetadataExt as _;
             metadata.dev()
         },
-        #[cfg(unix)]
         inode: {
             use std::os::unix::fs::MetadataExt as _;
             metadata.ino()
@@ -101,6 +142,28 @@ pub(crate) fn reserve_case_diagnostic(
     })
 }
 
+#[cfg(not(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+)))]
+pub(crate) fn reserve_case_diagnostic(_: &Path, _: &str) -> Result<CaseDiagnosticReservation> {
+    bail!("proof_availability_case_diagnostic_unsupported")
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
 pub(crate) fn write_invalid_case_diagnostic(
     reservation: &CaseDiagnosticReservation,
     qualification_id: &str,
@@ -109,11 +172,73 @@ pub(crate) fn write_invalid_case_diagnostic(
     failure: &CaseValidationFailure,
     forbidden_values: &[String],
 ) -> Result<()> {
-    if !same_reserved_directory(reservation)? {
+    // This compares only the recovery path with the held identity. It must
+    // never determine the write target: a pathname replacement cannot divert
+    // the private artifact away from the directory we opened at reservation.
+    let _path_still_names_reservation = path_matches_held_directory(reservation);
+    if !reservation_handle_is_directory(reservation)? {
         bail!("proof_availability_case_diagnostic_write_failed")
     }
     let unredacted_case = serde_json::to_value(&failure.case)
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    let project_materialization = serde_json::to_value(&failure.project)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    let artifact = build_invalid_case_diagnostic_artifact(
+        qualification_id,
+        source_commit,
+        source_tree,
+        failure.case_ordinal,
+        &failure.case.case_id,
+        &failure.case.repository_id,
+        unredacted_case,
+        project_materialization,
+        forbidden_values,
+    )?;
+    let bytes = canonical_json_file(&artifact)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    if bytes.len() > MAX_CASE_DIAGNOSTIC_BYTES {
+        bail!("proof_availability_case_diagnostic_write_failed")
+    }
+    write_private_diagnostic_file(reservation, &bytes)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    reservation
+        .directory
+        .sync_all()
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))
+}
+
+#[cfg(not(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+)))]
+pub(crate) fn write_invalid_case_diagnostic(
+    _: &CaseDiagnosticReservation,
+    _: &str,
+    _: &str,
+    _: &str,
+    _: &CaseValidationFailure,
+    _: &[String],
+) -> Result<()> {
+    bail!("proof_availability_case_diagnostic_unsupported")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_invalid_case_diagnostic_artifact(
+    qualification_id: &str,
+    source_commit: &str,
+    source_tree: &str,
+    case_ordinal: usize,
+    case_id: &str,
+    repository_id: &str,
+    unredacted_case: Value,
+    project_materialization: Value,
+    forbidden_values: &[String],
+) -> Result<Value> {
     let case_sha256 = domain_sha256(
         b"codestory.proof-availability.invalid-case-unredacted.v1\\0",
         &canonical_json_bytes(&unredacted_case)?,
@@ -127,41 +252,53 @@ pub(crate) fn write_invalid_case_diagnostic(
         "qualification_id": qualification_id,
         "validator_source_commit": source_commit,
         "validator_source_tree": source_tree,
-        "case_ordinal": failure.case_ordinal,
-        "case_id": failure.case.case_id,
-        "repository_id": failure.case.repository_id,
+        "case_ordinal": case_ordinal,
+        "case_id": case_id,
+        "repository_id": repository_id,
         "failure_code": "proof_availability_case_invalid",
         "unredacted_case_sha256": case_sha256,
-        "project_materialization": failure.project,
+        "project_materialization": project_materialization,
         "case": redacted_case,
         "removed_text_commitments": text_commitments,
     });
     validate_private_diagnostic_value(&artifact, forbidden_values)?;
-    let bytes = canonical_json_file(&artifact)
-        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
-    if bytes.len() > MAX_CASE_DIAGNOSTIC_BYTES {
-        bail!("proof_availability_case_diagnostic_write_failed")
-    }
-    write_private_diagnostic_file(&reservation.path.join(CASE_DIAGNOSTIC_FILE), &bytes)
-        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
-    sync_directory(&reservation.path)
-        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))
+    Ok(artifact)
 }
 
-fn same_reserved_directory(reservation: &CaseDiagnosticReservation) -> Result<bool> {
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+fn reservation_handle_is_directory(reservation: &CaseDiagnosticReservation) -> Result<bool> {
+    let metadata = reservation.directory.metadata()?;
+    if !metadata.is_dir() {
+        return Ok(false);
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(metadata.dev() == reservation.device && metadata.ino() == reservation.inode)
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+fn path_matches_held_directory(reservation: &CaseDiagnosticReservation) -> Result<bool> {
     let metadata = fs::symlink_metadata(&reservation.path)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Ok(false);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        Ok(metadata.dev() == reservation.device && metadata.ino() == reservation.inode)
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(true)
-    }
+    use std::os::unix::fs::MetadataExt as _;
+    Ok(metadata.dev() == reservation.device && metadata.ino() == reservation.inode)
 }
 
 fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>> {
@@ -216,6 +353,14 @@ fn json_pointer_escape(segment: &str) -> String {
 }
 
 fn validate_private_diagnostic_value(value: &Value, forbidden_values: &[String]) -> Result<()> {
+    validate_private_diagnostic_value_at(value, forbidden_values, "")
+}
+
+fn validate_private_diagnostic_value_at(
+    value: &Value,
+    forbidden_values: &[String],
+    pointer: &str,
+) -> Result<()> {
     match value {
         Value::Object(object) => {
             for (key, nested) in object {
@@ -235,25 +380,58 @@ fn validate_private_diagnostic_value(value: &Value, forbidden_values: &[String])
                 {
                     bail!("proof_availability_case_diagnostic_unsafe_value")
                 }
-                validate_private_diagnostic_value(nested, forbidden_values)?;
+                validate_private_diagnostic_value_at(
+                    nested,
+                    forbidden_values,
+                    &format!("{pointer}/{}", json_pointer_escape(key)),
+                )?;
             }
         }
         Value::Array(array) => {
-            for nested in array {
-                validate_private_diagnostic_value(nested, forbidden_values)?;
+            for (index, nested) in array.iter().enumerate() {
+                validate_private_diagnostic_value_at(
+                    nested,
+                    forbidden_values,
+                    &format!("{pointer}/{index}"),
+                )?;
             }
         }
-        Value::String(string)
-            if is_absolute_path(string)
-                || forbidden_values
-                    .iter()
-                    .any(|needle| !needle.is_empty() && string.contains(needle)) =>
-        {
-            bail!("proof_availability_case_diagnostic_unsafe_value")
+        Value::String(string) => {
+            let forbidden = forbidden_values
+                .iter()
+                .any(|needle| !needle.is_empty() && string.contains(needle));
+            if is_removed_text_commitment_pointer_field(pointer) {
+                if !valid_json_pointer(string) || forbidden {
+                    bail!("proof_availability_case_diagnostic_unsafe_value")
+                }
+            } else if is_absolute_path(string) || forbidden {
+                bail!("proof_availability_case_diagnostic_unsafe_value")
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+fn is_removed_text_commitment_pointer_field(pointer: &str) -> bool {
+    pointer.starts_with("/removed_text_commitments/") && pointer.ends_with("/json_pointer")
+}
+
+fn valid_json_pointer(value: &str) -> bool {
+    value.is_empty()
+        || (value.starts_with('/')
+            && value.split('/').skip(1).all(|segment| {
+                let mut bytes = segment.bytes();
+                while let Some(byte) = bytes.next() {
+                    if byte == b'~' && !matches!(bytes.next(), Some(b'0' | b'1')) {
+                        return false;
+                    }
+                    if byte.is_ascii_control() {
+                        return false;
+                    }
+                }
+                true
+            }))
 }
 
 fn is_absolute_path(value: &str) -> bool {
@@ -262,26 +440,113 @@ fn is_absolute_path(value: &str) -> bool {
         || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
 }
 
-fn write_private_diagnostic_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let mut temporary = tempfile::Builder::new()
-        .prefix(".invalid-case-v1-")
-        .tempfile_in(
-            path.parent()
-                .ok_or_else(|| std::io::Error::other("missing parent"))?,
-        )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        temporary
-            .as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))?;
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+static CASE_DIAGNOSTIC_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+fn write_private_diagnostic_file(
+    reservation: &CaseDiagnosticReservation,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let sequence = CASE_DIAGNOSTIC_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary_name = format!(".invalid-case-v1-{}-{sequence}", std::process::id());
+    let temporary_c = CString::new(temporary_name.as_bytes())
+        .map_err(|_| std::io::Error::other("invalid temporary name"))?;
+    let final_c = CString::new(CASE_DIAGNOSTIC_FILE)
+        .map_err(|_| std::io::Error::other("invalid final name"))?;
+    let directory_fd = reservation.directory.as_raw_fd();
+    let descriptor = unsafe {
+        libc::openat(
+            directory_fd,
+            temporary_c.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    temporary.write_all(bytes)?;
-    temporary.as_file_mut().sync_all()?;
-    temporary
-        .persist_noclobber(path)
-        .map_err(|error| error.error)?;
+    let mut temporary = unsafe { File::from_raw_fd(descriptor) };
+    if let Err(error) = temporary
+        .write_all(bytes)
+        .and_then(|_| temporary.sync_all())
+    {
+        drop(temporary);
+        let _ = unsafe { libc::unlinkat(directory_fd, temporary_c.as_ptr(), 0) };
+        return Err(error);
+    }
+    drop(temporary);
+    let rename_result = rename_noreplace_at(directory_fd, &temporary_c, directory_fd, &final_c);
+    if let Err(error) = rename_result {
+        let _ = unsafe { libc::unlinkat(directory_fd, temporary_c.as_ptr(), 0) };
+        return Err(error);
+    }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace_at(
+    from_fd: std::os::fd::RawFd,
+    from: &std::ffi::CString,
+    to_fd: std::os::fd::RawFd,
+    to: &std::ffi::CString,
+) -> std::io::Result<()> {
+    let result = unsafe {
+        libc::renameat2(
+            from_fd,
+            from.as_ptr(),
+            to_fd,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn rename_noreplace_at(
+    from_fd: std::os::fd::RawFd,
+    from: &std::ffi::CString,
+    to_fd: std::os::fd::RawFd,
+    to: &std::ffi::CString,
+) -> std::io::Result<()> {
+    let result = unsafe {
+        libc::renameatx_np(
+            from_fd,
+            from.as_ptr(),
+            to_fd,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[derive(Debug)]
@@ -1525,8 +1790,11 @@ mod tests {
                 .to_string(),
             "proof_availability_case_diagnostic_exists"
         );
-        reservation.remove_empty().unwrap();
-        assert!(!reservation_path.exists());
+        drop(reservation);
+        assert!(
+            reservation_path.is_dir(),
+            "an empty reservation is single-use"
+        );
     }
 
     #[cfg(unix)]
@@ -1545,7 +1813,7 @@ mod tests {
                 & 0o777,
             0o700
         );
-        reservation.remove_empty().unwrap();
+        drop(reservation);
     }
 
     #[test]
@@ -1579,16 +1847,87 @@ mod tests {
         ] {
             assert!(validate_private_diagnostic_value(&unsafe_value, &[]).is_err());
         }
+        let pointer_artifact = json!({
+            "removed_text_commitments": [{
+                "json_pointer": "/receipt/source_line/text",
+                "utf8_byte_length": 1,
+                "sha256": "a"
+            }]
+        });
+        validate_private_diagnostic_value(&pointer_artifact, &[])
+            .expect("the typed RFC6901 field may begin with a slash");
+        let invalid_pointer = json!({
+            "removed_text_commitments": [{"json_pointer": "/bad~2pointer"}]
+        });
+        assert!(validate_private_diagnostic_value(&invalid_pointer, &[]).is_err());
     }
 
     #[test]
     fn case_diagnostic_file_is_newline_terminated_and_no_clobber() {
         let root = tempfile::tempdir().unwrap();
-        let target = root.path().join(CASE_DIAGNOSTIC_FILE);
-        write_private_diagnostic_file(&target, b"{}\\n").unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"{}\\n");
-        assert!(write_private_diagnostic_file(&target, b"changed\\n").is_err());
-        assert_eq!(fs::read(&target).unwrap(), b"{}\\n");
+        let reservation =
+            reserve_case_diagnostic(root.path(), "20260821T120000Z-222222222222").unwrap();
+        let target = reservation.path().join(CASE_DIAGNOSTIC_FILE);
+        write_private_diagnostic_file(&reservation, b"{}\n").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"{}\n");
+        assert!(write_private_diagnostic_file(&reservation, b"changed\n").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn complete_private_artifact_redacts_real_receipt_text_before_handle_relative_write() {
+        let root = tempfile::tempdir().unwrap();
+        let reservation =
+            reserve_case_diagnostic(root.path(), "20260821T120000Z-222222222222").unwrap();
+        let artifact = build_invalid_case_diagnostic_artifact(
+            "20260821T120000Z-222222222222",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            0,
+            "case-1",
+            "repository-1",
+            json!({
+                "receipt_evidence": {"observed_receipts": [{
+                    "source_line": {"text": "call(target);\n"}
+                }]}
+            }),
+            Value::Null,
+            &[],
+        )
+        .unwrap();
+        let bytes = canonical_json_file(&artifact).unwrap();
+        write_private_diagnostic_file(&reservation, &bytes).unwrap();
+        let written: Value = serde_json::from_slice(
+            &fs::read(reservation.path().join(CASE_DIAGNOSTIC_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(written["schema"], CASE_DIAGNOSTIC_SCHEMA);
+        assert_eq!(written["classification"], "non_evidence");
+        assert!(
+            written
+                .pointer("/case/receipt_evidence/observed_receipts/0/source_line/text")
+                .is_none()
+        );
+        assert_eq!(
+            written["removed_text_commitments"][0]["json_pointer"],
+            "/receipt_evidence/observed_receipts/0/source_line/text"
+        );
+        assert!(written["unredacted_case_sha256"].as_str().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reservation_handle_cannot_be_redirected_by_a_path_swap() {
+        let root = tempfile::tempdir().unwrap();
+        let reservation =
+            reserve_case_diagnostic(root.path(), "20260821T120000Z-222222222222").unwrap();
+        let original = root.path().join("held-directory");
+        fs::rename(reservation.path(), &original).unwrap();
+        fs::create_dir(reservation.path()).unwrap();
+        assert!(!path_matches_held_directory(&reservation).unwrap());
+        write_private_diagnostic_file(&reservation, b"{}\n").unwrap();
+        assert!(original.join(CASE_DIAGNOSTIC_FILE).is_file());
+        assert!(!reservation.path().join(CASE_DIAGNOSTIC_FILE).exists());
     }
 
     #[test]

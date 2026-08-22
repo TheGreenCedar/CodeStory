@@ -51,18 +51,9 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
                 output_parent,
                 &operational.environment.qualification_id,
             )?;
-            let input = match runner::run_qualification(&loaded, &thresholds, &operational) {
-                Ok(input) => input,
-                Err(error) => {
-                    let _ = reservation.remove_empty();
-                    return Err(error);
-                }
-            };
+            let input = runner::run_qualification(&loaded, &thresholds, &operational)?;
             let summary = match report::build_summary(input, &loaded.corpus, &thresholds) {
-                Ok(summary) => {
-                    let _ = reservation.remove_empty();
-                    summary
-                }
+                Ok(summary) => summary,
                 Err(error) => {
                     if let Some(failure) = error.downcast_ref::<contracts::CaseValidationFailure>()
                     {
@@ -87,8 +78,6 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
                             failure,
                             &forbidden_values,
                         )?;
-                    } else {
-                        let _ = reservation.remove_empty();
                     }
                     return Err(error);
                 }
