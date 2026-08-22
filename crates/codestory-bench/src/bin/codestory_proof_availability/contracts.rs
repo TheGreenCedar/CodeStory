@@ -27,6 +27,15 @@ pub const MAX_CANDIDATE_EDGES_PER_STEP: usize =
         as usize;
 pub const MAX_OBSERVED_RECEIPTS_PER_CASE: usize =
     codestory_runtime::proof_qualification_support::MAX_QUALIFICATION_OBSERVED_RECEIPTS_PER_CASE;
+const ACTUAL_SELECTOR_GAP_VARIANTS: usize = 3;
+const ACTUAL_SELECTOR_GAP_INDEX_COUNT: usize = 7;
+const ACTUAL_STEP_GAP_VARIANTS: usize = 9;
+const ACTUAL_STEP_GAP_INDEX_COUNT: usize = 6;
+const ACTUAL_UNINDEXED_GAP_VARIANTS: usize = 1;
+pub const MAX_ACTUAL_PROOF_GAPS: usize = ACTUAL_SELECTOR_GAP_VARIANTS
+    * ACTUAL_SELECTOR_GAP_INDEX_COUNT
+    + ACTUAL_STEP_GAP_VARIANTS * ACTUAL_STEP_GAP_INDEX_COUNT
+    + ACTUAL_UNINDEXED_GAP_VARIANTS;
 const SHA256: &str = "^[0-9a-f]{64}$";
 const COMMIT: &str = "^[0-9a-f]{40}$";
 const QUALIFICATION_ID_PATTERN: &str = "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$";
@@ -4326,7 +4335,7 @@ fn valid_actual_product_result(actual: &ActualProductResultV1) -> bool {
             connected_receipts,
         } => {
             hash(contract_digest)
-                && (1..=6).contains(&gaps.len())
+                && (1..=MAX_ACTUAL_PROOF_GAPS).contains(&gaps.len())
                 && gaps.iter().copied().collect::<BTreeSet<_>>().len() == gaps.len()
                 && gaps.iter().all(valid_actual_gap)
                 && valid_projected_receipts(connected_receipts)
@@ -5024,7 +5033,13 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some(0),
                 Some(6),
             );
-            set_recursive_field_bounds(schema, "ActualProductResultV1", "gaps", Some(1), Some(6));
+            set_recursive_field_bounds(
+                schema,
+                "ActualProductResultV1",
+                "gaps",
+                Some(1),
+                Some(MAX_ACTUAL_PROOF_GAPS as u64),
+            );
             set_recursive_field_bounds(
                 schema,
                 "ActualProductResultV1",
@@ -5692,6 +5707,32 @@ fn ratio_milli(numerator: u64, denominator: u64) -> Result<u16> {
 mod contract_digest_binding_tests {
     use super::*;
 
+    fn every_actual_gap() -> Vec<ActualProofGapV1> {
+        let mut gaps = Vec::new();
+        for selector_index in 0..=6 {
+            gaps.extend([
+                ActualProofGapV1::SelectorMissing { selector_index },
+                ActualProofGapV1::SelectorAmbiguous { selector_index },
+                ActualProofGapV1::NonCallableSelector { selector_index },
+            ]);
+        }
+        for step_index in 0..=5 {
+            gaps.extend([
+                ActualProofGapV1::DirectCallMissing { step_index },
+                ActualProofGapV1::RecursiveCallNotRepresentable { step_index },
+                ActualProofGapV1::SourceWindowTooLarge { step_index },
+                ActualProofGapV1::InvalidUtf8 { step_index },
+                ActualProofGapV1::SourceLineOutOfRange { step_index },
+                ActualProofGapV1::EdgeContainmentUnproven { step_index },
+                ActualProofGapV1::MissingDirectCallReceipt { step_index },
+                ActualProofGapV1::ReceiptOrEdgeAlreadyUsed { step_index },
+                ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { step_index },
+            ]);
+        }
+        gaps.push(ActualProofGapV1::OutputBudgetExceeded);
+        gaps
+    }
+
     #[test]
     fn wrong_well_formed_product_digest_is_rejected_against_frozen_oracle() {
         let path_file: CohortPathFileV1 = serde_json::from_str(include_str!(
@@ -5718,5 +5759,37 @@ mod contract_digest_binding_tests {
                 .to_string()
                 .contains("proof_availability_product_contract_digest_mismatch")
         );
+    }
+
+    #[test]
+    fn actual_unknown_accepts_the_closed_gap_domain_and_rejects_a_seventy_seventh_gap() {
+        let gaps = every_actual_gap();
+        assert_eq!(gaps.len(), MAX_ACTUAL_PROOF_GAPS);
+        let actual = ActualProductResultV1::Unknown {
+            contract_digest: "a".repeat(64),
+            gaps: gaps.clone(),
+            connected_receipts: Vec::new(),
+        };
+        assert!(valid_actual_product_result(&actual));
+
+        let mut duplicate = gaps.clone();
+        duplicate.push(gaps[0]);
+        assert!(!valid_actual_product_result(
+            &ActualProductResultV1::Unknown {
+                contract_digest: "a".repeat(64),
+                gaps: duplicate,
+                connected_receipts: Vec::new(),
+            }
+        ));
+
+        let mut invalid = gaps;
+        invalid.push(ActualProofGapV1::SelectorMissing { selector_index: 7 });
+        assert!(!valid_actual_product_result(
+            &ActualProductResultV1::Unknown {
+                contract_digest: "a".repeat(64),
+                gaps: invalid,
+                connected_receipts: Vec::new(),
+            }
+        ));
     }
 }

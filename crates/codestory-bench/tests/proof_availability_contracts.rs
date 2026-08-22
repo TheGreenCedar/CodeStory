@@ -2539,6 +2539,157 @@ fn make_non_proven_case(value: &mut Value, disposition: &str, gap: Option<&str>)
     rebuild_funnel(value);
 }
 
+fn six_step_case(value: &mut Value) -> &mut Value {
+    value["cases"]
+        .as_array_mut()
+        .expect("cases")
+        .iter_mut()
+        .find(|case| case["attempted_step_count"] == 6)
+        .expect("six-step fixture case")
+}
+
+fn selector_missing_gaps() -> Vec<Value> {
+    (0..=6)
+        .map(|selector_index| json!({"kind":"selector_missing","selector_index":selector_index}))
+        .collect()
+}
+
+fn set_six_step_selector_unknown_case(value: &mut Value, matching_trace: bool) {
+    let case = six_step_case(value);
+    let missing = case["receipt_evidence"]["observed_receipts"]
+        .as_array()
+        .expect("observed receipts")
+        .iter()
+        .map(|receipt| {
+            json!({
+                "step_index":receipt["step_index"],
+                "oracle_step":receipt["oracle_comparison"]["oracle_step"]
+            })
+        })
+        .collect::<Vec<_>>();
+    case["product_disposition"] = json!({
+        "kind":"unknown",
+        "gaps":["selector_missing"],
+        "authoritative_receipts":[],
+        "actual":{
+            "kind":"unknown",
+            "contract_digest":SHA,
+            "gaps":selector_missing_gaps(),
+            "connected_receipts":[]
+        }
+    });
+    case["receipt_evidence"]["missing_oracle_steps"] = Value::Array(missing);
+    if matching_trace {
+        for selector in case["proof_trace"]["selectors"]
+            .as_array_mut()
+            .expect("selector traces")
+        {
+            selector["outcome"] = json!({"kind":"failed","reason":"missing"});
+        }
+        case["proof_trace"]["selector_early_return"] = json!(true);
+        case["proof_trace"]["steps"] = json!([]);
+        case["unclassified_step_indices"] = json!([0, 1, 2, 3, 4, 5]);
+        case["receipt_evidence"]["observed_receipts"] = json!([]);
+        case["actionable_exact_gap"] = json!({
+            "gap":{"kind":"selector_missing","selector_index":0},
+            "boundary":{"kind":"selector","selector_index":0}
+        });
+    } else {
+        case["actionable_exact_gap"] = Value::Null;
+    }
+    rebuild_funnel(value);
+}
+
+#[test]
+fn actual_unknown_accepts_all_seven_selector_gaps_when_the_trace_matches() {
+    let mut value = report();
+    set_six_step_selector_unknown_case(&mut value, true);
+    rebind_results_digest(&mut value);
+
+    let parsed = QualificationSummaryV1::from_json(value)
+        .expect("seven legal selector gaps must remain structurally reportable");
+    let actual = &parsed
+        .cases
+        .iter()
+        .find(|case| case.attempted_step_count == 6)
+        .expect("six-step parsed case")
+        .product_disposition
+        .actual;
+    assert!(matches!(
+        actual,
+        ActualProductResultV1::Unknown { gaps, .. } if gaps.len() == 7
+    ));
+    assert!(
+        parsed
+            .cases
+            .iter()
+            .find(|case| case.attempted_step_count == 6)
+            .expect("six-step parsed case")
+            .evaluable_facts()
+            .expect("evaluable facts")
+            .product_disposition_matches_evidence
+    );
+}
+
+#[test]
+fn actual_unknown_trace_mismatch_remains_structurally_reportable_but_fails_evidence_gate() {
+    let mut value = report();
+    set_six_step_selector_unknown_case(&mut value, false);
+    rebind_results_digest(&mut value);
+
+    let parsed = QualificationSummaryV1::from_json(value)
+        .expect("trace disagreements must remain measurable evidence");
+    assert!(
+        !parsed
+            .cases
+            .iter()
+            .find(|case| case.attempted_step_count == 6)
+            .expect("six-step parsed case")
+            .evaluable_facts()
+            .expect("evaluable facts")
+            .product_disposition_matches_evidence
+    );
+}
+
+#[test]
+fn actual_unknown_rejects_empty_duplicate_invalid_index_and_digest_gaps() {
+    let mut empty = report();
+    set_six_step_selector_unknown_case(&mut empty, true);
+    six_step_case(&mut empty)["product_disposition"]["actual"]["gaps"] = json!([]);
+    assert_rebound_report_rejected(empty, "Unknown requires at least one actual gap");
+
+    let mut duplicate = report();
+    set_six_step_selector_unknown_case(&mut duplicate, true);
+    let duplicate_gap =
+        six_step_case(&mut duplicate)["product_disposition"]["actual"]["gaps"][0].clone();
+    six_step_case(&mut duplicate)["product_disposition"]["actual"]["gaps"]
+        .as_array_mut()
+        .expect("actual gaps")
+        .push(duplicate_gap);
+    assert_rebound_report_rejected(duplicate, "actual gaps must be unique");
+
+    let mut invalid_selector = report();
+    set_six_step_selector_unknown_case(&mut invalid_selector, true);
+    six_step_case(&mut invalid_selector)["product_disposition"]["actual"]["gaps"][6] =
+        json!({"kind":"selector_missing","selector_index":7});
+    assert_rebound_report_rejected(
+        invalid_selector,
+        "selector index seven is outside the domain",
+    );
+
+    let mut invalid_step = report();
+    set_six_step_selector_unknown_case(&mut invalid_step, true);
+    six_step_case(&mut invalid_step)["product_disposition"]["actual"]["gaps"][6] =
+        json!({"kind":"direct_call_missing","step_index":6});
+    assert_rebound_report_rejected(invalid_step, "step index six is outside the domain");
+
+    let mut invalid_digest = report();
+    set_six_step_selector_unknown_case(&mut invalid_digest, true);
+    six_step_case(&mut invalid_digest)["product_disposition"]["actual"]["contract_digest"] =
+        json!("not-a-sha256");
+    assert_rebound_report_rejected(invalid_digest, "actual results retain their digest binding");
+}
+
 #[test]
 fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
     for disposition in ["unknown", "certified_absence", "unavailable"] {
@@ -2759,6 +2910,14 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
     assert_eq!(
         report_schema["$defs"]["ActualProductResultV1"]["oneOf"][2]["properties"]["gaps"]["minItems"],
         1
+    );
+    assert_eq!(
+        report_schema["$defs"]["ActualProductResultV1"]["oneOf"][2]["properties"]["gaps"]["maxItems"],
+        76
+    );
+    assert_eq!(
+        report_schema["$defs"]["ProductDispositionV1"]["properties"]["gaps"]["maxItems"],
+        6
     );
     assert_eq!(
         report_schema["$defs"]["ActualProductResultV1"]["oneOf"][3]["properties"]["reasons"]["maxItems"],
