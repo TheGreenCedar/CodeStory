@@ -41,6 +41,17 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
             let operational = materialize::load_operational_environment(&arguments.environment)?;
             let input = runner::run_qualification(&loaded, &thresholds, &operational)?;
             let summary = report::build_summary(input, &loaded.corpus, &thresholds)?;
+            let source_dependency = arguments
+                .source_dependency
+                .as_deref()
+                .map(|path| {
+                    materialize::load_source_dependency(
+                        path,
+                        &summary.provenance.source_commit,
+                        &summary.provenance.source_tree,
+                    )
+                })
+                .transpose()?;
             let leak_policy = report::PublicLeakPolicy::new(
                 std::iter::once(operational.workspace_root.display().to_string())
                     .chain(std::iter::once(
@@ -54,11 +65,12 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
                         ]
                     })),
             );
-            report::build_and_publish(
+            report::build_and_publish_with_dependency(
                 &arguments.out,
                 &summary,
                 &loaded.corpus,
                 &thresholds,
+                source_dependency.as_ref(),
                 &leak_policy,
             )?;
             Ok(())
@@ -72,11 +84,12 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
                 .context("validate proof availability corpus against thresholds")?;
             // Verify is intentionally read-only. It neither creates an output
             // directory nor starts indexing or proof execution.
-            report::verify_published(
+            report::verify_published_with_dependency(
                 &arguments.results,
                 &loaded.corpus,
                 &thresholds,
                 &loaded.path_files,
+                arguments.source_dependency.as_deref(),
                 &report::PublicLeakPolicy::new(std::iter::empty::<String>()),
             )?;
             Ok(())

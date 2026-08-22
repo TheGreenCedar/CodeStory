@@ -4,8 +4,9 @@ use super::contracts::{
     ProjectMaterializationEvidenceV1, ProofQualificationTraceV1, ReceiptEvidenceBuildOutcomeV1,
     ReceiptEvidenceV1, ReceiptOracleComparisonV1, ReceiptOracleStepV1, StageDurationsV1,
     StepQualificationOutcomeV1, ThresholdsV1, TransportErrorV1, TransportEvidenceV1,
-    negative_mutation_product_contract, observed_product_disposition_to_report,
-    observed_receipt_from_task6, oracle_path_product_contract,
+    actionable_exact_gap_for_case, negative_mutation_product_contract,
+    observed_product_disposition_to_report, observed_receipt_from_task6,
+    oracle_path_product_contract,
 };
 use super::corpus::LoadedCorpusV1;
 use super::inventory::analyze_store;
@@ -263,7 +264,12 @@ fn assemble_case_report(
             Duration::ZERO,
         )
     };
-    let actionable_exact_gap = product_disposition.gaps.first().copied();
+    let actionable_exact_gap = actionable_exact_gap_for_case(
+        &product_disposition,
+        &receipt_evidence,
+        u8::try_from(path.spec.steps.len())?,
+        &proof_trace,
+    )?;
     negative_mutations.sort_by(|left, right| left.mutation_id.cmp(&right.mutation_id));
     Ok(CaseReportV1 {
         case_id: path.case_id.clone(),

@@ -1,5 +1,6 @@
 #[path = "../src/bin/codestory_proof_availability/cli.rs"]
 mod cli;
+#[allow(dead_code)] // This test includes only the contract surface, not report construction.
 #[path = "../src/bin/codestory_proof_availability/contracts.rs"]
 mod contracts;
 
@@ -553,12 +554,43 @@ fn range_at(path: &str, start: u64, end: u64) -> Value {
     json!({"path":path,"start_byte":start,"end_byte":end,"file_byte_length":4096,"sha256":SHA})
 }
 
+fn receipt_line_range_at(path: &str, start: u64, end: u64) -> Value {
+    assert_eq!(end - start, 8);
+    json!({
+        "path":path,
+        "start_byte":start,
+        "end_byte":end,
+        "file_byte_length":4096,
+        "sha256":format!("{:x}", Sha256::digest(b"call();\n")),
+    })
+}
+
 fn selector(symbol: &str, path: &str) -> Value {
     json!({"kind":"qualified_name","qualified_name":symbol,"project_file_components":path.split('/').collect::<Vec<_>>()})
 }
 
 fn declaration(symbol: &str, path: &str, start: u64, end: u64) -> Value {
     json!({"symbol":symbol,"selector":selector(symbol,path),"range":range_at(path,start,end)})
+}
+
+fn source_dependency_evidence(dependency: &str) -> Value {
+    let (test_id, test_kind) = match dependency {
+        "v3_packet_requires_proof" => ("packet_v3_requires_proof", "packet_v3_requires_proof"),
+        "transport_cannot_represent_keep_dark" => (
+            "transport_cannot_represent_keep_dark",
+            "transport_cannot_represent_keep_dark",
+        ),
+        other => panic!("unsupported source dependency {other}"),
+    };
+    json!({
+        "schema":"codestory.proof-availability-source-dependency/v1",
+        "qualification_source_commit":COMMIT,
+        "qualification_source_tree":COMMIT,
+        "dependency_source":{"range":range(0,10),"file_sha256":SHA},
+        "test_source":{"range":range_at("tests/architecture.rs",20,30),"file_sha256":SHA},
+        "dependency":dependency,
+        "passing_test":{"test_id":test_id,"kind":test_kind,"status":"passed"}
+    })
 }
 
 fn path(case_id: &str, step_count: u8, ordinal: usize) -> Value {
@@ -578,7 +610,7 @@ fn path(case_id: &str, step_count: u8, ordinal: usize) -> Value {
               "caller":declaration(&caller_symbol,&source_path,caller_start,caller_end),
               "callsite_line":index + 1,
               "callsite_expression":range_at(&source_path,start + 12,start + 18),
-              "receipt_line_window":range_at(&source_path,start + 11,start + 19),
+              "receipt_line_window":receipt_line_range_at(&source_path,start + 11,start + 19),
               "target":declaration(&format!("{case_id}::target_{index}"),&source_path,start + 20,start + 32)
             })
         })
@@ -666,7 +698,7 @@ fn parsed_path_files() -> Vec<CohortPathFileV1> {
         .collect()
 }
 
-fn corpus() -> Value {
+pub(crate) fn corpus() -> Value {
     let files = parsed_path_files();
     let threshold_hash =
         canonical_thresholds_sha256(&ThresholdsV1::from_json(thresholds()).expect("thresholds"))
@@ -697,7 +729,7 @@ fn thresholds() -> Value {
     json!({"schema":"codestory.proof-availability-thresholds/v1","thresholds_id":"proof-availability-v1","methodology_sha256":SHA,"wilson_z":1.959963984540054,"expected_cohort_count":4,"expected_positive_requests":120,"expected_positive_steps":312,"expected_negative_requests":240,"hard_gates":{"maximum_false_contract_proven":0,"require_exact_receipt_matches":true,"maximum_certified_absence":0,"require_complete_failure_funnel":true,"require_complete_provenance":true,"maximum_invalid_results":0,"maximum_over_cap_results":0,"maximum_transport_errors":0,"maximum_proof_bytes":65536,"require_each_cohort":true,"require_product_disposition_match":true},"automatic":role(96,21,900,950,950,500,1500,32768,16384),"stable_explicit":role(60,12,750,800,900,1000,2000,32768,16384),"experimental":role(24,12,500,600,800,2000,3000,49152,24576)})
 }
 
-fn report() -> Value {
+pub(crate) fn report() -> Value {
     let frozen = corpus();
     let files = path_files();
     let threshold_hash = frozen["thresholds_sha256"]
@@ -757,10 +789,10 @@ fn report() -> Value {
                     let end = callsite["end_byte"].as_u64().expect("callsite end");
                     let source_path = callsite["path"].as_str().expect("source path");
                     let oracle_step = json!({
-                        "caller_symbol":step["caller"]["symbol"],
+                        "caller":step["caller"],
                         "callsite_line":step["callsite_line"],
                         "receipt_line_window":step["receipt_line_window"],
-                        "target_symbol":step["target"]["symbol"]
+                        "target":step["target"]
                     });
                     let source_node_id = -(i64::try_from(step_index).expect("step index") + 1);
                     let target_node_id = source_node_id - 1;
@@ -1383,7 +1415,7 @@ fn closed_contracts_reject_hostile_nested_shapes() {
     let delayed_with_evidence: ActivationDecisionV1 = serde_json::from_value(json!({
         "outcome":"delay_full_v3_cut",
         "automatic_thresholds_met":null,
-        "failed_gates":[{"gate_id":"packet-proof-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof","passing_test":{"test_id":"packet_v3_requires_proof","kind":"packet_v3_requires_proof","status":"passed"}}}}]
+        "failed_gates":[{"gate_id":"packet-proof-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":source_dependency_evidence("v3_packet_requires_proof")}}]
     }))
     .expect("closed decision DTO");
     delayed_with_evidence
@@ -1393,7 +1425,7 @@ fn closed_contracts_reject_hostile_nested_shapes() {
         "outcome":"keep_proof_dark","automatic_thresholds_met":false,
         "failed_gates":[{"gate_id":"wrong","kind":"response_size","detail":{
             "kind":"source_dependency",
-            "evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"v3_packet_requires_proof","passing_test":{"test_id":"packet_v3_requires_proof","kind":"packet_v3_requires_proof","status":"passed"}}
+            "evidence":source_dependency_evidence("v3_packet_requires_proof")
         }}]
     }))
     .expect("closed decision DTO");
@@ -1525,7 +1557,10 @@ fn set_receipt_budget_case(case: &mut Value) {
             "connected_receipts":[]
         }
     });
-    case["actionable_exact_gap"] = json!("projection_budget");
+    case["actionable_exact_gap"] = json!({
+        "gap":{"kind":"output_budget_exceeded"},
+        "boundary":{"kind":"finalization","after_step_count":case["attempted_step_count"]}
+    });
     case["receipt_evidence"]["missing_oracle_steps"] = Value::Array(missing);
     case["proof_trace"]["finalization"] = json!({"kind":"failed","failure":"receipt_budget"});
     case["complete_projection_bytes"] = json!(128);
@@ -1639,7 +1674,10 @@ fn finalization_pairings_reject_crossed_or_incomplete_states() {
     wrong_budget_gap["cases"][0]["product_disposition"]["actual"]["gaps"] =
         json!([{"kind":"direct_call_missing","step_index":0}]);
     wrong_budget_gap["cases"][0]["product_disposition"]["gaps"] = json!(["relation_missing"]);
-    wrong_budget_gap["cases"][0]["actionable_exact_gap"] = json!("relation_missing");
+    wrong_budget_gap["cases"][0]["actionable_exact_gap"] = json!({
+        "gap":{"kind":"direct_call_missing","step_index":0},
+        "boundary":{"kind":"step","step_index":0}
+    });
     assert_rebound_report_rejected(
         wrong_budget_gap,
         "receipt budget requires the output-budget gap",
@@ -2096,7 +2134,10 @@ fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
         "kind":"unknown","gaps":["relation_missing"],"authoritative_receipts":[],
         "actual":{"kind":"unknown","contract_digest":SHA,"gaps":[{"kind":"direct_call_missing","step_index":0}]}
     });
-    case["actionable_exact_gap"] = json!("relation_missing");
+    case["actionable_exact_gap"] = json!({
+        "gap":{"kind":"direct_call_missing","step_index":0},
+        "boundary":{"kind":"step","step_index":0}
+    });
     case["receipt_evidence"]["missing_oracle_steps"] = json!([{
         "step_index":0,"oracle_step":observed["oracle_comparison"]["oracle_step"]
     }]);
@@ -2144,7 +2185,35 @@ fn make_non_proven_case(value: &mut Value, disposition: &str, gap: Option<&str>)
             other => panic!("unsupported fixture disposition {other}"),
         }
     });
-    case["actionable_exact_gap"] = gap.map(Value::from).unwrap_or(Value::Null);
+    case["actionable_exact_gap"] = gap
+        .map(|gap| match gap {
+            "selector_missing" => json!({
+                "gap":{"kind":"selector_missing","selector_index":0},
+                "boundary":{"kind":"selector","selector_index":0}
+            }),
+            "selector_ambiguous" => json!({
+                "gap":{"kind":"selector_ambiguous","selector_index":0},
+                "boundary":{"kind":"selector","selector_index":0}
+            }),
+            "relation_missing" => json!({
+                "gap":{"kind":"direct_call_missing","step_index":0},
+                "boundary":{"kind":"step","step_index":0}
+            }),
+            "recursion" => json!({
+                "gap":{"kind":"recursive_call_not_representable","step_index":0},
+                "boundary":{"kind":"step","step_index":0}
+            }),
+            "source_binding" => json!({
+                "gap":{"kind":"source_window_too_large","step_index":0},
+                "boundary":{"kind":"step","step_index":0}
+            }),
+            "projection_budget" => json!({
+                "gap":{"kind":"output_budget_exceeded"},
+                "boundary":{"kind":"finalization","after_step_count":case["attempted_step_count"]}
+            }),
+            other => panic!("unsupported fixture actionable gap {other}"),
+        })
+        .unwrap_or(Value::Null);
 }
 
 #[test]
@@ -2235,7 +2304,7 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
     let transport_dependency: ActivationDecisionV1 = serde_json::from_value(json!({
         "outcome":"delay_full_v3_cut",
         "automatic_thresholds_met":null,
-        "failed_gates":[{"gate_id":"transport-keep-dark-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":{"source_path":"src/lib.rs","source_range":range(0,10),"source_sha256":SHA,"dependency":"transport_cannot_represent_keep_dark","passing_test":{"test_id":"transport_cannot_represent_keep_dark","kind":"transport_cannot_represent_keep_dark","status":"passed"}}}}]
+        "failed_gates":[{"gate_id":"transport-keep-dark-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":source_dependency_evidence("transport_cannot_represent_keep_dark")}}]
     }))
     .expect("second source dependency variant");
     transport_dependency
@@ -2447,6 +2516,29 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         .command,
         cli::Command::Run(_)
     ));
+    let cli::Command::Run(run_with_dependency) = cli::Cli::try_parse_from([
+        "bin",
+        "run",
+        "--corpus",
+        "/tmp/c",
+        "--thresholds",
+        "/tmp/t",
+        "--environment",
+        "/tmp/e",
+        "--out",
+        "/tmp/r",
+        "--source-dependency",
+        "/tmp/dependency.json",
+    ])
+    .expect("run with optional source dependency")
+    .command
+    else {
+        panic!("run command");
+    };
+    assert_eq!(
+        run_with_dependency.source_dependency.as_deref(),
+        Some(std::path::Path::new("/tmp/dependency.json"))
+    );
     assert!(matches!(
         cli::Cli::try_parse_from([
             "bin",
@@ -2805,6 +2897,108 @@ fn exact_oracle_claims_reject_mismatched_line_window_and_target() {
         json!("crate::wrong_target");
     QualificationSummaryV1::from_json(target)
         .expect_err("an exact oracle claim cannot carry a mismatched target");
+
+    let mut caller_path = report();
+    caller_path["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]["project_file_components"] =
+        json!(["src", "wrong.rs"]);
+    caller_path["cases"][0]["receipt_evidence"]["observed_receipts"][0]["line_window"]["project_file_components"] =
+        json!(["src", "wrong.rs"]);
+    QualificationSummaryV1::from_json(caller_path)
+        .expect_err("an exact oracle claim binds the caller declaration path");
+
+    let mut indexed_drift = report();
+    indexed_drift["cases"][0]["receipt_evidence"]["observed_receipts"][0]["line_window"]["observed_sha256"] =
+        json!("c".repeat(64));
+    QualificationSummaryV1::from_json(indexed_drift)
+        .expect_err("indexed and observed whole-file hashes must agree");
+
+    let mut oracle_selector = report();
+    oracle_selector["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]
+        ["oracle_step"]["caller"]["selector"] =
+        json!({"kind":"canonical_id","canonical_id":"wrong-canonical"});
+    QualificationSummaryV1::from_json(oracle_selector)
+        .expect_err("an exact oracle claim binds the full caller selector");
+}
+
+#[test]
+fn actionable_gap_keeps_the_exact_first_unproven_coordinate() {
+    let mut value = report();
+    let case = &mut value["cases"][10];
+    assert_eq!(case["attempted_step_count"], 2);
+    let missing = case["receipt_evidence"]["observed_receipts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|receipt| {
+            json!({
+                "step_index":receipt["step_index"],
+                "oracle_step":receipt["oracle_comparison"]["oracle_step"]
+            })
+        })
+        .collect::<Vec<_>>();
+    case["receipt_evidence"]["missing_oracle_steps"] = Value::Array(missing);
+    case["product_disposition"] = json!({
+        "kind":"unknown",
+        "gaps":["relation_missing"],
+        "authoritative_receipts":[],
+        "actual":{
+            "kind":"unknown",
+            "contract_digest":SHA,
+            "gaps":[
+                {"kind":"direct_call_missing","step_index":1},
+                {"kind":"direct_call_missing","step_index":0}
+            ],
+            "connected_receipts":[]
+        }
+    });
+    case["actionable_exact_gap"] = json!({
+        "gap":{"kind":"direct_call_missing","step_index":0},
+        "boundary":{"kind":"step","step_index":0}
+    });
+    rebind_results_digest(&mut value);
+    QualificationSummaryV1::from_json(value.clone())
+        .expect("the next prefix boundary is selected independent of gap order");
+
+    value["cases"][10]["actionable_exact_gap"] = json!({
+        "gap":{"kind":"direct_call_missing","step_index":1},
+        "boundary":{"kind":"step","step_index":1}
+    });
+    rebind_results_digest(&mut value);
+    QualificationSummaryV1::from_json(value)
+        .expect_err("a later gap is not actionable at the current prefix boundary");
+}
+
+#[test]
+fn output_budget_is_actionable_only_after_every_step_was_admitted() {
+    let mut value = report();
+    set_receipt_budget_case(&mut value["cases"][0]);
+    let mut case: contracts::CaseReportV1 =
+        serde_json::from_value(value["cases"][0].clone()).expect("budget case DTO");
+    assert!(
+        contracts::actionable_exact_gap_for_case(
+            &case.product_disposition,
+            &case.receipt_evidence,
+            case.attempted_step_count,
+            &case.proof_trace,
+        )
+        .expect("derive budget boundary")
+        .is_some()
+    );
+
+    case.proof_trace.steps[0].outcome = contracts::StepQualificationOutcomeV1::FirstZeroSurvivor {
+        gate: contracts::CandidateGateV1::RawAdmission,
+        histogram: Vec::new(),
+    };
+    assert_eq!(
+        contracts::actionable_exact_gap_for_case(
+            &case.product_disposition,
+            &case.receipt_evidence,
+            case.attempted_step_count,
+            &case.proof_trace,
+        )
+        .expect("derive non-actionable budget boundary"),
+        None
+    );
 }
 
 #[test]
@@ -2827,7 +3021,10 @@ fn missing_oracle_steps_are_separate_exact_rows() {
         "kind":"unknown","gaps":["relation_missing"],"authoritative_receipts":[],
         "actual":{"kind":"unknown","contract_digest":SHA,"gaps":[{"kind":"direct_call_missing","step_index":0}]}
     });
-    case["actionable_exact_gap"] = json!("relation_missing");
+    case["actionable_exact_gap"] = json!({
+        "gap":{"kind":"direct_call_missing","step_index":0},
+        "boundary":{"kind":"step","step_index":0}
+    });
     case["proof_trace"]["steps"][0]["outcome"] = json!({
         "kind":"first_zero_survivor","gate":"raw_admission",
         "histogram":[{"reason":{"kind":"raw_admission","reason":"wrong_kind"},"edge_ids":[1]}]
@@ -2840,8 +3037,8 @@ fn missing_oracle_steps_are_separate_exact_rows() {
     QualificationSummaryV1::from_json(omitted)
         .expect_err("an uncovered oracle step requires separate missing evidence");
     let mut wrong_oracle = value.clone();
-    wrong_oracle["cases"][0]["receipt_evidence"]["missing_oracle_steps"][0]["oracle_step"]["target_symbol"] =
-        json!("crate::wrong_target");
+    wrong_oracle["cases"][0]["receipt_evidence"]["missing_oracle_steps"][0]["oracle_step"]["target"]
+        ["symbol"] = json!("crate::wrong_target");
     rebind_results_digest(&mut wrong_oracle);
     QualificationSummaryV1::from_json(wrong_oracle)
         .expect("missing row is structurally closed")

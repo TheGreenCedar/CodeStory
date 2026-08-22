@@ -46,6 +46,13 @@ cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
   --out target/proof-availability/results
 ```
 
+The command remains unchanged for outcomes A, B, or C. If review finds a
+source-level dependency that independently requires outcome D, pass a closed
+evidence file with `--source-dependency <EVIDENCE_JSON>`. The evidence binds
+two exact source coordinates, their full-file and range hashes, the clean
+qualification source commit and tree, and one supported dependency/test pair.
+Invalid evidence fails the run; it is never treated as absent.
+
 All destinations are no-replace. Choose new paths for a rerun. Failed
 materialization or publication keeps its owner-marked staging path for manual
 inspection; the command never recursively removes a path as rollback.
@@ -81,9 +88,19 @@ JSON files use canonical compact JSON followed by one newline. The private
 environment descriptor, absolute paths, environment variables, source logs, and
 unbounded source text are excluded. The decision is recomputed from the complete
 case rows and the explicitly supplied thresholds; it is not an input to the run.
+`decision.json` embeds raw numerators and denominators, unrounded Wilson bounds
+plus presentation values, per-cohort rows, step/partial/actionable rates,
+latency and size percentiles, and hard-gate counts. Its domain-separated digest
+binds those observations to the result and threshold hashes. Verification
+recomputes the wrapper rather than trusting reported aggregates.
 `findings.md` separates reproduced measurements from labeled inferences, records
 the frozen hard gates and role thresholds used by the evaluator, and presents the
 decision with its failed gates, provenance hashes, and explicit nonclaims.
+
+An actionable gap retains its exact selector, step, or finalization coordinate.
+Only a gap at the first unproven prefix boundary counts. An output-budget gap is
+actionable only after every attempted step has an admitted trace and finalization
+names the matching receipt/projection budget state.
 
 ## Read-only verification
 
@@ -97,6 +114,10 @@ cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
   --thresholds benchmarks/proof-availability/thresholds-v1.json \
   --results target/proof-availability/results
 ```
+
+When `run` used `--source-dependency`, `verify` requires the same option and
+revalidates the evidence from the clean qualification source tree. Without that
+option, the original command remains the complete A/B/C verification contract.
 
 ## Interpretation
 

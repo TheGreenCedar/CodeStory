@@ -10,6 +10,8 @@ pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
 pub const PATH_FILE_SCHEMA: &str = "codestory.proof-availability-path-file/v1";
 pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v1";
 pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1";
+pub const SOURCE_DEPENDENCY_SCHEMA: &str = "codestory.proof-availability-source-dependency/v1";
+pub const DECISION_REPORT_SCHEMA: &str = "codestory.proof-availability-decision/v1";
 pub const MAX_CANDIDATE_EDGES_PER_STEP: usize =
     codestory_runtime::proof_qualification_support::MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP
         as usize;
@@ -1936,6 +1938,21 @@ pub enum TypedGapV1 {
     SourceBinding,
     ProjectionBudget,
 }
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActionableGapBoundaryV1 {
+    Selector { selector_index: u8 },
+    Step { step_index: u8 },
+    Finalization { after_step_count: u8 },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionableExactGapV1 {
+    pub gap: ActualProofGapV1,
+    pub boundary: ActionableGapBoundaryV1,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StageDurationsV1 {
@@ -2108,19 +2125,19 @@ impl ReceiptOracleComparisonV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReceiptOracleStepV1 {
-    pub caller_symbol: String,
+    pub caller: OracleDeclarationV1,
     pub callsite_line: u32,
     pub receipt_line_window: OracleSourceRangeV1,
-    pub target_symbol: String,
+    pub target: OracleDeclarationV1,
 }
 
 impl From<&OracleStepV1> for ReceiptOracleStepV1 {
     fn from(value: &OracleStepV1) -> Self {
         Self {
-            caller_symbol: value.caller.symbol.clone(),
+            caller: value.caller.clone(),
             callsite_line: value.callsite_line,
             receipt_line_window: value.receipt_line_window.clone(),
-            target_symbol: value.target.symbol.clone(),
+            target: value.target.clone(),
         }
     }
 }
@@ -2259,8 +2276,10 @@ pub(crate) fn compare_task6_receipt_to_oracle(
     oracle: &OracleStepV1,
 ) -> Result<ReceiptOracleComparisonV1> {
     let oracle_step = ReceiptOracleStepV1::from(oracle);
+    let observed_source = ResolvedNodeIdentityV1::from(&receipt.source);
+    let observed_target = ResolvedNodeIdentityV1::from(&receipt.target);
     let mut mismatches = Vec::new();
-    if receipt.source.qualified_name != oracle_step.caller_symbol {
+    if !resolved_identity_matches_declaration(&observed_source, &oracle_step.caller) {
         mismatches.push(ReceiptMismatchFieldV1::Caller);
     }
     if receipt.line_window.anchor_line != oracle_step.callsite_line {
@@ -2269,14 +2288,15 @@ pub(crate) fn compare_task6_receipt_to_oracle(
     let observed_start = u64::try_from(receipt.line_window.byte_start)?;
     let observed_end = u64::try_from(receipt.line_window.byte_end)?;
     if receipt.line_window.project_file_components.join("/") != oracle_step.receipt_line_window.path
-        || receipt.line_window.indexed_sha256 != oracle_step.receipt_line_window.sha256
-        || receipt.line_window.observed_sha256 != oracle_step.receipt_line_window.sha256
+        || receipt.line_window.indexed_sha256 != receipt.line_window.observed_sha256
+        || sha256_bytes(receipt.line_window.text.as_bytes())
+            != oracle_step.receipt_line_window.sha256
         || observed_start != oracle_step.receipt_line_window.start_byte
         || observed_end != oracle_step.receipt_line_window.end_byte
     {
         mismatches.push(ReceiptMismatchFieldV1::CallsiteWindow);
     }
-    if receipt.target.qualified_name != oracle_step.target_symbol {
+    if !resolved_identity_matches_declaration(&observed_target, &oracle_step.target) {
         mismatches.push(ReceiptMismatchFieldV1::Target);
     }
     Ok(if mismatches.is_empty() {
@@ -2347,7 +2367,7 @@ pub struct CaseReportV1 {
     pub case_id: String,
     pub repository_id: String,
     pub product_disposition: ProductDispositionV1,
-    pub actionable_exact_gap: Option<TypedGapV1>,
+    pub actionable_exact_gap: Option<ActionableExactGapV1>,
     pub warm_end_to_end_ms: u64,
     pub stage_durations_ms: StageDurationsV1,
     pub attempted_step_count: u8,
@@ -2581,11 +2601,53 @@ pub struct IntegrationDependencyTestV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SourceDependencyEvidenceV1 {
-    pub source_path: String,
-    pub source_range: OracleSourceRangeV1,
-    pub source_sha256: String,
+    pub schema: String,
+    pub qualification_source_commit: String,
+    pub qualification_source_tree: String,
+    pub dependency_source: SourceDependencyCoordinateV1,
+    pub test_source: SourceDependencyCoordinateV1,
     pub dependency: SourceDependencyKindV1,
     pub passing_test: IntegrationDependencyTestV1,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SourceDependencyCoordinateV1 {
+    pub range: OracleSourceRangeV1,
+    pub file_sha256: String,
+}
+impl SourceDependencyEvidenceV1 {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.schema != SOURCE_DEPENDENCY_SCHEMA
+            || !commit(&self.qualification_source_commit)
+            || !commit(&self.qualification_source_tree)
+            || !valid_source_dependency_coordinate(&self.dependency_source)
+            || !valid_source_dependency_coordinate(&self.test_source)
+            || empty(&self.passing_test.test_id)
+            || !matches!(
+                self.passing_test.status,
+                IntegrationDependencyTestStatusV1::Passed
+            )
+            || !matches!(
+                (
+                    &self.dependency,
+                    &self.passing_test.kind,
+                    self.passing_test.test_id.as_str(),
+                ),
+                (
+                    SourceDependencyKindV1::V3PacketRequiresProof,
+                    IntegrationDependencyTestKindV1::PacketV3RequiresProof,
+                    "packet_v3_requires_proof",
+                ) | (
+                    SourceDependencyKindV1::TransportCannotRepresentKeepDark,
+                    IntegrationDependencyTestKindV1::TransportCannotRepresentKeepDark,
+                    "transport_cannot_represent_keep_dark",
+                )
+            )
+        {
+            bail!("proof_availability_source_dependency_invalid")
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -2611,7 +2673,7 @@ pub enum GateFailureDetailV1 {
         evidence: TransportEvidenceV1,
     },
     SourceDependency {
-        evidence: SourceDependencyEvidenceV1,
+        evidence: Box<SourceDependencyEvidenceV1>,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2627,6 +2689,123 @@ pub struct ActivationDecisionV1 {
     pub outcome: ActivationOutcomeV1,
     pub failed_gates: Vec<FailedGateV1>,
     pub automatic_thresholds_met: Option<bool>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RatioObservationV1 {
+    pub numerator: u64,
+    pub denominator: u64,
+    pub milli: u16,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WilsonObservationV1 {
+    pub numerator: u64,
+    pub denominator: u64,
+    pub lower: f64,
+    pub upper: f64,
+    pub lower_milli: u16,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CohortObservationV1 {
+    pub repository_id: String,
+    pub full_proofs: RatioObservationV1,
+    pub wilson: WilsonObservationV1,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TransportP95ObservationV1 {
+    pub revision: McpRevisionV1,
+    pub elapsed_ns: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HardGateObservationsV1 {
+    pub false_contract_proven: u64,
+    pub non_exact_authoritative_receipts: u64,
+    pub certified_absence: u64,
+    pub unclassified_positive_steps: u64,
+    pub incomplete_provenance: u64,
+    pub invalid_results: u64,
+    pub over_cap_results: u64,
+    pub transport_errors: u64,
+    pub product_disposition_mismatches: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedObservationsV1 {
+    pub full_proofs: RatioObservationV1,
+    pub full_proof_wilson: WilsonObservationV1,
+    pub cohorts: Vec<CohortObservationV1>,
+    pub positive_step_recall: RatioObservationV1,
+    pub full_or_useful_partial: RatioObservationV1,
+    pub actionable_incomplete_gap: RatioObservationV1,
+    pub unknown_warm_p95_ms: u64,
+    pub transport_p95: Vec<TransportP95ObservationV1>,
+    pub complete_response_p95_bytes: u64,
+    pub unknown_response_p95_bytes: u64,
+    pub maximum_response_bytes: u64,
+    pub hard_gates: HardGateObservationsV1,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActivationDecisionReportV1 {
+    pub schema: String,
+    pub results_sha256: String,
+    pub thresholds_sha256: String,
+    pub observations: DerivedObservationsV1,
+    pub observations_sha256: String,
+    pub source_dependency: Option<SourceDependencyEvidenceV1>,
+    pub source_dependency_sha256: Option<String>,
+    pub decision: ActivationDecisionV1,
+}
+impl ActivationDecisionReportV1 {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.decision.validate()?;
+        let decision_dependencies = self
+            .decision
+            .failed_gates
+            .iter()
+            .filter_map(|gate| match &gate.detail {
+                GateFailureDetailV1::SourceDependency { evidence } => {
+                    Some((gate.gate_id.as_str(), evidence.as_ref()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let source_dependency_valid = match (
+            &self.source_dependency,
+            &self.source_dependency_sha256,
+            decision_dependencies.as_slice(),
+        ) {
+            (None, None, []) => true,
+            (Some(evidence), Some(digest), [(gate_id, decision_evidence)]) => {
+                evidence.validate().is_ok()
+                    && hash(digest)
+                    && *gate_id == "integration.source_dependency"
+                    && matches!(self.decision.outcome, ActivationOutcomeV1::DelayFullV3Cut)
+                    && self.decision.automatic_thresholds_met.is_none()
+                    && *digest == canonical_source_dependency_sha256(evidence)?
+                    && *digest == canonical_source_dependency_sha256(decision_evidence)?
+            }
+            _ => false,
+        };
+        if self.schema != DECISION_REPORT_SCHEMA
+            || !hash(&self.results_sha256)
+            || !hash(&self.thresholds_sha256)
+            || self.observations_sha256
+                != canonical_observations_sha256(
+                    &self.results_sha256,
+                    &self.thresholds_sha256,
+                    &self.observations,
+                )?
+            || !source_dependency_valid
+        {
+            bail!("proof_availability_decision_report_invalid")
+        }
+        Ok(())
+    }
 }
 impl ActivationDecisionV1 {
     pub fn validate(&self) -> Result<()> {
@@ -3200,6 +3379,27 @@ fn canonical_artifact_sha256<T: Serialize>(domain: &[u8], value: &T) -> Result<S
     Ok(format!("{:x}", digest.finalize()))
 }
 
+pub(crate) fn canonical_observations_sha256(
+    results_sha256: &str,
+    thresholds_sha256: &str,
+    observations: &DerivedObservationsV1,
+) -> Result<String> {
+    canonical_artifact_sha256(
+        b"codestory.proof-availability-observations/v1\0",
+        &(results_sha256, thresholds_sha256, observations),
+    )
+}
+
+pub(crate) fn canonical_source_dependency_sha256(
+    evidence: &SourceDependencyEvidenceV1,
+) -> Result<String> {
+    evidence.validate()?;
+    canonical_artifact_sha256(
+        b"codestory.proof-availability-source-dependency/v1\0",
+        evidence,
+    )
+}
+
 fn canonical_artifact_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     codestory_agent::proof_qualification_support::canonical_json_bytes(value)
         .map_err(|error| anyhow::anyhow!(error))
@@ -3548,7 +3748,13 @@ fn valid_receipt_budget_pair(case: &CaseReportV1) -> bool {
         && case.product_disposition.kind == ProductDispositionKindV1::Unknown
         && case.product_disposition.gaps == [TypedGapV1::ProjectionBudget]
         && case.product_disposition.authoritative_receipts.is_empty()
-        && case.actionable_exact_gap == Some(TypedGapV1::ProjectionBudget)
+        && case.actionable_exact_gap
+            == Some(ActionableExactGapV1 {
+                gap: ActualProofGapV1::OutputBudgetExceeded,
+                boundary: ActionableGapBoundaryV1::Finalization {
+                    after_step_count: case.attempted_step_count,
+                },
+            })
         && !product_tool_failure_transport(&case.transport)
 }
 
@@ -3690,12 +3896,127 @@ fn valid_receipts(case: &CaseReportV1, project: Option<&ProjectMaterializationEv
 
 fn valid_disposition_structure(case: &CaseReportV1) -> bool {
     unique_typed_gaps(case.product_disposition.gaps.iter().copied())
-        && case
-            .actionable_exact_gap
-            .as_ref()
-            .is_none_or(|gap| case.product_disposition.gaps.contains(gap))
+        && expected_actionable_exact_gap(case).ok() == Some(case.actionable_exact_gap)
         && valid_actual_product_result(&case.product_disposition.actual)
         && disposition_summary_matches_actual(&case.product_disposition)
+}
+
+pub(crate) fn actionable_exact_gap_for_case(
+    disposition: &ProductDispositionV1,
+    evidence: &ReceiptEvidenceV1,
+    attempted_step_count: u8,
+    trace: &ProofQualificationTraceV1,
+) -> Result<Option<ActionableExactGapV1>> {
+    let authoritative = disposition
+        .authoritative_receipts
+        .iter()
+        .filter_map(|reference| {
+            evidence.observed_receipts.iter().find(|receipt| {
+                receipt.receipt_id == reference.receipt_id
+                    && receipt.edge_id == reference.edge_id
+                    && receipt.oracle_comparison.is_exact()
+            })
+        })
+        .map(|receipt| receipt.step_index)
+        .collect::<BTreeSet<_>>();
+    let mut proven_prefix = 0u8;
+    while proven_prefix < attempted_step_count && authoritative.contains(&proven_prefix) {
+        proven_prefix += 1;
+    }
+    let ActualProductResultV1::Unknown { gaps, .. } = &disposition.actual else {
+        return Ok(None);
+    };
+    let mut candidates = gaps
+        .iter()
+        .filter_map(|gap| {
+            actionable_boundary(*gap, proven_prefix, attempted_step_count, trace).map(|boundary| {
+                ActionableExactGapV1 {
+                    gap: *gap,
+                    boundary,
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| (candidate.boundary, candidate.gap));
+    candidates.dedup();
+    Ok(candidates.into_iter().next())
+}
+
+fn expected_actionable_exact_gap(case: &CaseReportV1) -> Result<Option<ActionableExactGapV1>> {
+    actionable_exact_gap_for_case(
+        &case.product_disposition,
+        &case.receipt_evidence,
+        case.attempted_step_count,
+        &case.proof_trace,
+    )
+}
+
+fn actionable_boundary(
+    gap: ActualProofGapV1,
+    proven_prefix: u8,
+    attempted_step_count: u8,
+    trace: &ProofQualificationTraceV1,
+) -> Option<ActionableGapBoundaryV1> {
+    if let Some(selector_index) = selector_index_for_gap(gap) {
+        let step_boundary = selector_index.saturating_sub(1);
+        return (step_boundary == proven_prefix)
+            .then_some(ActionableGapBoundaryV1::Selector { selector_index });
+    }
+    if let Some(step_index) = step_index_for_gap(gap) {
+        return (step_index == proven_prefix)
+            .then_some(ActionableGapBoundaryV1::Step { step_index });
+    }
+    matches!(gap, ActualProofGapV1::OutputBudgetExceeded)
+        .then(|| {
+            (trace_steps_fully_admitted(trace, attempted_step_count)
+                && matches!(
+                    trace.finalization,
+                    FinalizationTraceV1::Failed {
+                        failure: FinalizationFailureV1::ReceiptBudget
+                            | FinalizationFailureV1::ProjectionBudget
+                    }
+                ))
+            .then_some(ActionableGapBoundaryV1::Finalization {
+                after_step_count: attempted_step_count,
+            })
+        })
+        .flatten()
+}
+
+fn trace_steps_fully_admitted(trace: &ProofQualificationTraceV1, attempted_step_count: u8) -> bool {
+    trace.steps.len() == usize::from(attempted_step_count)
+        && (0..attempted_step_count).all(|step_index| {
+            trace.steps.iter().any(|step| {
+                step.step_index == u64::from(step_index)
+                    && matches!(step.outcome, StepQualificationOutcomeV1::Admitted { .. })
+            })
+        })
+}
+
+fn selector_index_for_gap(gap: ActualProofGapV1) -> Option<u8> {
+    match gap {
+        ActualProofGapV1::SelectorMissing { selector_index }
+        | ActualProofGapV1::SelectorAmbiguous { selector_index }
+        | ActualProofGapV1::NonCallableSelector { selector_index } => Some(selector_index),
+        _ => None,
+    }
+}
+
+fn step_index_for_gap(gap: ActualProofGapV1) -> Option<u8> {
+    match gap {
+        ActualProofGapV1::DirectCallMissing { step_index }
+        | ActualProofGapV1::RecursiveCallNotRepresentable { step_index }
+        | ActualProofGapV1::SourceWindowTooLarge { step_index }
+        | ActualProofGapV1::InvalidUtf8 { step_index }
+        | ActualProofGapV1::SourceLineOutOfRange { step_index }
+        | ActualProofGapV1::EdgeContainmentUnproven { step_index }
+        | ActualProofGapV1::MissingDirectCallReceipt { step_index }
+        | ActualProofGapV1::ReceiptOrEdgeAlreadyUsed { step_index }
+        | ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { step_index } => {
+            Some(step_index)
+        }
+        _ => None,
+    }
 }
 
 fn valid_actual_product_result(actual: &ActualProductResultV1) -> bool {
@@ -3884,9 +4205,9 @@ fn disposition_summary_matches_actual(disposition: &ProductDispositionV1) -> boo
 }
 
 fn valid_oracle_step(step: &ReceiptOracleStepV1) -> bool {
-    !empty(&step.caller_symbol)
+    validate_declaration(&step.caller).is_ok()
         && step.callsite_line > 0
-        && !empty(&step.target_symbol)
+        && validate_declaration(&step.target).is_ok()
         && range(&step.receipt_line_window).is_ok()
 }
 
@@ -4061,24 +4382,64 @@ fn receipt_mismatches(
     oracle: &ReceiptOracleStepV1,
 ) -> Vec<ReceiptMismatchFieldV1> {
     let mut mismatches = Vec::new();
-    if receipt.source.qualified_name != oracle.caller_symbol {
+    if !resolved_identity_matches_declaration(&receipt.source, &oracle.caller) {
         mismatches.push(ReceiptMismatchFieldV1::Caller);
     }
     if receipt.callsite_line != oracle.callsite_line {
         mismatches.push(ReceiptMismatchFieldV1::CallsiteLine);
     }
     if receipt.line_window.project_file_components.join("/") != oracle.receipt_line_window.path
-        || receipt.line_window.indexed_sha256 != oracle.receipt_line_window.sha256
-        || receipt.line_window.observed_sha256 != oracle.receipt_line_window.sha256
+        || receipt.line_window.indexed_sha256 != receipt.line_window.observed_sha256
+        || sha256_bytes(receipt.line_window.text.as_bytes()) != oracle.receipt_line_window.sha256
         || receipt.line_window.byte_start != oracle.receipt_line_window.start_byte
         || receipt.line_window.byte_end != oracle.receipt_line_window.end_byte
     {
         mismatches.push(ReceiptMismatchFieldV1::CallsiteWindow);
     }
-    if receipt.target.qualified_name != oracle.target_symbol {
+    if !resolved_identity_matches_declaration(&receipt.target, &oracle.target) {
         mismatches.push(ReceiptMismatchFieldV1::Target);
     }
     mismatches
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn resolved_identity_matches_declaration(
+    identity: &ResolvedNodeIdentityV1,
+    declaration: &OracleDeclarationV1,
+) -> bool {
+    if identity.qualified_name != declaration.symbol
+        || identity.project_file_components.join("/") != declaration.range.path
+    {
+        return false;
+    }
+    match &declaration.selector {
+        ExactSymbolSelectorV1::PinnedNode {
+            project_id,
+            core_generation_id,
+            core_run_id,
+            node_id,
+        } => {
+            identity.pinned.project_id == *project_id
+                && identity.pinned.core_generation_id == *core_generation_id
+                && identity.pinned.core_run_id == *core_run_id
+                && identity.pinned.node_id == *node_id
+        }
+        ExactSymbolSelectorV1::CanonicalId { canonical_id } => {
+            identity.canonical_id == *canonical_id
+        }
+        ExactSymbolSelectorV1::QualifiedName {
+            qualified_name,
+            project_file_components,
+        } => {
+            identity.qualified_name == *qualified_name
+                && project_file_components
+                    .as_ref()
+                    .is_none_or(|components| identity.project_file_components == *components)
+        }
+    }
 }
 
 fn strictly_ascending_mismatch_fields(values: &[ReceiptMismatchFieldV1]) -> bool {
@@ -4092,24 +4453,22 @@ fn valid_gate_detail(kind: &QualificationGateKindV1, detail: &GateFailureDetailV
         GateFailureDetailV1::Transport { evidence } => valid_transport(evidence),
         GateFailureDetailV1::SourceDependency { evidence } => {
             matches!(kind, QualificationGateKindV1::IntegrationDependency)
-                && !empty(&evidence.source_path)
-                && hash(&evidence.source_sha256)
-                && range(&evidence.source_range).is_ok()
-                && evidence.source_path == evidence.source_range.path
-                && evidence.source_sha256 == evidence.source_range.sha256
-                && !empty(&evidence.passing_test.test_id)
-                && matches!(
-                    (&evidence.dependency, &evidence.passing_test.kind),
-                    (
-                        SourceDependencyKindV1::V3PacketRequiresProof,
-                        IntegrationDependencyTestKindV1::PacketV3RequiresProof,
-                    ) | (
-                        SourceDependencyKindV1::TransportCannotRepresentKeepDark,
-                        IntegrationDependencyTestKindV1::TransportCannotRepresentKeepDark,
-                    )
-                )
+                && evidence.validate().is_ok()
         }
     }
+}
+
+fn valid_source_dependency_coordinate(coordinate: &SourceDependencyCoordinateV1) -> bool {
+    range(&coordinate.range).is_ok()
+        && hash(&coordinate.file_sha256)
+        && valid_project_file_components(
+            &coordinate
+                .range
+                .path
+                .split('/')
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>(),
+        )
 }
 
 pub fn schema_json(document: SchemaDocument) -> Value {

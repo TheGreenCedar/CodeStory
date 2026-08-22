@@ -1,8 +1,10 @@
 use super::contracts::{
-    ActivationDecisionV1, ActivationOutcomeV1, CorpusV1, FailedGateV1, GateFailureDetailV1,
-    MaterializationFreshnessV1, ProductDispositionKindV1, QualificationGateKindV1,
-    QualificationSummaryV1, RoleThresholdsV1, SourceDependencyEvidenceV1, ThresholdsV1,
-    TransportErrorV1, TransportEvidenceV1,
+    ActivationDecisionV1, ActivationOutcomeV1, CohortObservationV1, CorpusV1,
+    DerivedObservationsV1, FailedGateV1, GateFailureDetailV1, HardGateObservationsV1,
+    MaterializationFreshnessV1, McpRevisionV1, ProductDispositionKindV1, QualificationGateKindV1,
+    QualificationSummaryV1, RatioObservationV1, RoleThresholdsV1, SourceDependencyEvidenceV1,
+    ThresholdsV1, TransportErrorV1, TransportEvidenceV1, TransportP95ObservationV1,
+    WilsonObservationV1,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -50,6 +52,13 @@ pub fn wilson_score_interval(
 struct Observations {
     full_proofs: u64,
     full_proofs_by_cohort: BTreeMap<String, u64>,
+    positive_requests: u64,
+    positive_requests_by_cohort: BTreeMap<String, u64>,
+    exact_positive_steps: u64,
+    positive_steps: u64,
+    full_or_useful: u64,
+    incomplete: u64,
+    actionable_incomplete: u64,
     positive_step_recall_milli: u16,
     full_or_useful_partial_milli: u16,
     actionable_incomplete_gap_milli: u16,
@@ -67,6 +76,102 @@ struct Observations {
     over_cap_results: u64,
     transport_errors: u64,
     product_disposition_mismatches: u64,
+}
+
+pub(crate) fn derive_observations(
+    summary: &QualificationSummaryV1,
+    thresholds: &ThresholdsV1,
+) -> Result<DerivedObservationsV1> {
+    let observed = observations(summary)?;
+    let full_wilson = wilson_score_interval(
+        observed.full_proofs,
+        observed.positive_requests,
+        thresholds.wilson_z,
+    )?;
+    let cohorts = observed
+        .full_proofs_by_cohort
+        .iter()
+        .map(|(repository_id, numerator)| {
+            let denominator = *observed
+                .positive_requests_by_cohort
+                .get(repository_id)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_cohort_missing"))?;
+            let wilson = wilson_score_interval(*numerator, denominator, thresholds.wilson_z)?;
+            Ok(CohortObservationV1 {
+                repository_id: repository_id.clone(),
+                full_proofs: ratio_observation(*numerator, denominator)?,
+                wilson: wilson_observation(wilson),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DerivedObservationsV1 {
+        full_proofs: ratio_observation(observed.full_proofs, observed.positive_requests)?,
+        full_proof_wilson: wilson_observation(full_wilson),
+        cohorts,
+        positive_step_recall: ratio_observation(
+            observed.exact_positive_steps,
+            observed.positive_steps,
+        )?,
+        full_or_useful_partial: ratio_observation(
+            observed.full_or_useful,
+            observed.positive_requests,
+        )?,
+        actionable_incomplete_gap: if observed.incomplete == 0 {
+            RatioObservationV1 {
+                numerator: 0,
+                denominator: 0,
+                milli: 1_000,
+            }
+        } else {
+            ratio_observation(observed.actionable_incomplete, observed.incomplete)?
+        },
+        unknown_warm_p95_ms: observed.unknown_warm_p95_ms,
+        transport_p95: [
+            McpRevisionV1::V2024_11_05,
+            McpRevisionV1::V2025_03_26,
+            McpRevisionV1::V2025_06_18,
+            McpRevisionV1::V2025_11_25,
+        ]
+        .into_iter()
+        .zip(observed.transport_p95_ns)
+        .map(|(revision, elapsed_ns)| TransportP95ObservationV1 {
+            revision,
+            elapsed_ns,
+        })
+        .collect(),
+        complete_response_p95_bytes: observed.complete_response_p95_bytes,
+        unknown_response_p95_bytes: observed.unknown_response_p95_bytes,
+        maximum_response_bytes: observed.maximum_response_bytes,
+        hard_gates: HardGateObservationsV1 {
+            false_contract_proven: observed.false_contract_proven,
+            non_exact_authoritative_receipts: observed.non_exact_authoritative_receipts,
+            certified_absence: observed.certified_absence,
+            unclassified_positive_steps: observed.unclassified_positive_steps,
+            incomplete_provenance: observed.incomplete_provenance,
+            invalid_results: observed.invalid_results,
+            over_cap_results: observed.over_cap_results,
+            transport_errors: observed.transport_errors,
+            product_disposition_mismatches: observed.product_disposition_mismatches,
+        },
+    })
+}
+
+fn ratio_observation(numerator: u64, denominator: u64) -> Result<RatioObservationV1> {
+    Ok(RatioObservationV1 {
+        numerator,
+        denominator,
+        milli: ratio_milli(numerator, denominator)?,
+    })
+}
+
+fn wilson_observation(value: WilsonScoreInterval) -> WilsonObservationV1 {
+    WilsonObservationV1 {
+        numerator: value.numerator,
+        denominator: value.denominator,
+        lower: value.lower,
+        upper: value.upper,
+        lower_milli: value.lower_milli,
+    }
 }
 
 pub fn evaluate_activation_decision(
@@ -123,7 +228,7 @@ fn decision_from_observations(
                 gate_id: "integration.source_dependency".to_owned(),
                 kind: QualificationGateKindV1::IntegrationDependency,
                 detail: GateFailureDetailV1::SourceDependency {
-                    evidence: evidence.clone(),
+                    evidence: Box::new(evidence.clone()),
                 },
             },
         );
@@ -158,6 +263,12 @@ fn observations(summary: &QualificationSummaryV1) -> Result<Observations> {
         .iter()
         .map(|project| (project.repository_id.clone(), 0u64))
         .collect::<BTreeMap<_, _>>();
+    let mut positive_requests_by_cohort = summary
+        .environment
+        .projects
+        .iter()
+        .map(|project| (project.repository_id.clone(), 0u64))
+        .collect::<BTreeMap<_, _>>();
     let mut exact_steps = 0u64;
     let mut full_or_useful = 0u64;
     let mut incomplete = 0u64;
@@ -176,6 +287,9 @@ fn observations(summary: &QualificationSummaryV1) -> Result<Observations> {
     let mut product_disposition_mismatches = 0u64;
 
     for case in &summary.cases {
+        *positive_requests_by_cohort
+            .get_mut(&case.repository_id)
+            .ok_or_else(|| anyhow::anyhow!("proof_availability_cohort_missing"))? += 1;
         let metrics = case.receipt_metrics()?;
         let facts = case.evaluable_facts()?;
         exact_steps = exact_steps
@@ -277,6 +391,13 @@ fn observations(summary: &QualificationSummaryV1) -> Result<Observations> {
     Ok(Observations {
         full_proofs,
         full_proofs_by_cohort,
+        positive_requests: u64::try_from(summary.cases.len())?,
+        positive_requests_by_cohort,
+        exact_positive_steps: exact_steps,
+        positive_steps: u64::from(summary.failure_funnel.attempted_positive_steps),
+        full_or_useful,
+        incomplete,
+        actionable_incomplete,
         positive_step_recall_milli: ratio_milli(exact_steps, 312)?,
         full_or_useful_partial_milli: ratio_milli(full_or_useful, 120)?,
         actionable_incomplete_gap_milli: if incomplete == 0 {
@@ -594,8 +715,8 @@ fn maximum(
 mod tests {
     use super::super::contracts::{
         IntegrationDependencyTestKindV1, IntegrationDependencyTestStatusV1,
-        IntegrationDependencyTestV1, OracleSourceRangeV1, SourceDependencyKindV1,
-        canonical_thresholds_sha256, results_evidence_sha256_from_json,
+        IntegrationDependencyTestV1, OracleSourceRangeV1, SourceDependencyCoordinateV1,
+        SourceDependencyKindV1, canonical_thresholds_sha256, results_evidence_sha256_from_json,
     };
     use super::*;
     use sha2::{Digest, Sha256};
@@ -617,6 +738,16 @@ mod tests {
                 .zip(cohorts)
                 .map(|(id, count)| (id.to_owned(), count))
                 .collect(),
+            positive_requests: 120,
+            positive_requests_by_cohort: ["a", "b", "c", "d"]
+                .into_iter()
+                .map(|id| (id.to_owned(), 30))
+                .collect(),
+            exact_positive_steps: 312,
+            positive_steps: 312,
+            full_or_useful: 120,
+            incomplete: 120u64.saturating_sub(full),
+            actionable_incomplete: 120u64.saturating_sub(full),
             positive_step_recall_milli: 1_000,
             full_or_useful_partial_milli: 1_000,
             actionable_incomplete_gap_milli: 1_000,
@@ -873,24 +1004,146 @@ mod tests {
 
     fn source_dependency() -> SourceDependencyEvidenceV1 {
         SourceDependencyEvidenceV1 {
-            source_path: "crates/codestory-cli/src/stdio_v3.rs".to_owned(),
-            source_range: OracleSourceRangeV1 {
-                path: "crates/codestory-cli/src/stdio_v3.rs".to_owned(),
-                start_byte: 10,
-                end_byte: 20,
-                file_byte_length: 100,
-                sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                    .to_owned(),
+            schema: "codestory.proof-availability-source-dependency/v1".to_owned(),
+            qualification_source_commit: "b".repeat(40),
+            qualification_source_tree: "c".repeat(40),
+            dependency_source: SourceDependencyCoordinateV1 {
+                range: OracleSourceRangeV1 {
+                    path: "crates/codestory-cli/src/stdio_v3.rs".to_owned(),
+                    start_byte: 10,
+                    end_byte: 20,
+                    file_byte_length: 100,
+                    sha256: "a".repeat(64),
+                },
+                file_sha256: "d".repeat(64),
             },
-            source_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                .to_owned(),
+            test_source: SourceDependencyCoordinateV1 {
+                range: OracleSourceRangeV1 {
+                    path: "crates/codestory-cli/tests/architecture_contracts.rs".to_owned(),
+                    start_byte: 30,
+                    end_byte: 40,
+                    file_byte_length: 200,
+                    sha256: "e".repeat(64),
+                },
+                file_sha256: "f".repeat(64),
+            },
             dependency: SourceDependencyKindV1::TransportCannotRepresentKeepDark,
             passing_test: IntegrationDependencyTestV1 {
-                test_id: "transport_keep_dark_is_inseparable".to_owned(),
+                test_id: "transport_cannot_represent_keep_dark".to_owned(),
                 kind: IntegrationDependencyTestKindV1::TransportCannotRepresentKeepDark,
                 status: IntegrationDependencyTestStatusV1::Passed,
             },
         }
+    }
+
+    #[test]
+    fn derived_observations_publish_raw_counts_unrounded_wilson_and_tamper_evidence() {
+        use super::super::contracts::{
+            ActivationDecisionReportV1, DECISION_REPORT_SCHEMA, canonical_observations_sha256,
+        };
+
+        let (report, corpus, threshold_value) = accepted_fixture::values();
+        let summary = QualificationSummaryV1::from_json(report).expect("summary");
+        let thresholds = ThresholdsV1::from_json(threshold_value).expect("thresholds");
+        let observations = derive_observations(&summary, &thresholds).expect("observations");
+        assert_eq!(observations.full_proofs.numerator, 120);
+        assert_eq!(observations.full_proofs.denominator, 120);
+        assert_eq!(observations.positive_step_recall.numerator, 312);
+        assert_eq!(observations.positive_step_recall.denominator, 312);
+        assert_eq!(observations.cohorts.len(), 4);
+        assert_eq!(observations.cohorts[0].full_proofs.denominator, 30);
+        assert!(observations.full_proof_wilson.lower > 0.96);
+        assert!(observations.full_proof_wilson.upper <= 1.0);
+        assert_eq!(observations.transport_p95.len(), 4);
+        let observations_sha256 = canonical_observations_sha256(
+            &summary.provenance.results_sha256,
+            &summary.provenance.thresholds_sha256,
+            &observations,
+        )
+        .unwrap();
+        let mut report = ActivationDecisionReportV1 {
+            schema: DECISION_REPORT_SCHEMA.into(),
+            results_sha256: summary.provenance.results_sha256.clone(),
+            thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
+            observations,
+            observations_sha256,
+            source_dependency: None,
+            source_dependency_sha256: None,
+            decision: evaluate_activation_decision(
+                &summary,
+                &CorpusV1::from_json(corpus).expect("corpus"),
+                &thresholds,
+                None,
+            )
+            .expect("decision"),
+        };
+        report.validate().expect("bound decision report");
+        report.observations.full_proofs.numerator -= 1;
+        report
+            .validate()
+            .expect_err("derived observation tampering invalidates its digest");
+    }
+
+    #[test]
+    fn decision_report_binds_delay_outcome_to_the_validated_source_dependency() {
+        use super::super::contracts::{
+            ActivationDecisionReportV1, DECISION_REPORT_SCHEMA, canonical_observations_sha256,
+            canonical_source_dependency_sha256,
+        };
+
+        let (report, corpus, threshold_value) = accepted_fixture::values();
+        let summary = QualificationSummaryV1::from_json(report).expect("summary");
+        let corpus = CorpusV1::from_json(corpus).expect("corpus");
+        let thresholds = ThresholdsV1::from_json(threshold_value).expect("thresholds");
+        let observations = derive_observations(&summary, &thresholds).expect("observations");
+        let observations_sha256 = canonical_observations_sha256(
+            &summary.provenance.results_sha256,
+            &summary.provenance.thresholds_sha256,
+            &observations,
+        )
+        .expect("observation digest");
+        let dependency = source_dependency();
+        let source_dependency_sha256 =
+            canonical_source_dependency_sha256(&dependency).expect("dependency digest");
+        let mut decision =
+            evaluate_activation_decision(&summary, &corpus, &thresholds, Some(&dependency))
+                .expect("dependency outcome D");
+        let report = ActivationDecisionReportV1 {
+            schema: DECISION_REPORT_SCHEMA.into(),
+            results_sha256: summary.provenance.results_sha256.clone(),
+            thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
+            observations: observations.clone(),
+            observations_sha256: observations_sha256.clone(),
+            source_dependency: Some(dependency.clone()),
+            source_dependency_sha256: Some(source_dependency_sha256.clone()),
+            decision: decision.clone(),
+        };
+        report.validate().expect("outcome D report");
+
+        let mut wrong_outcome = report.clone();
+        wrong_outcome.decision.outcome = ActivationOutcomeV1::KeepProofDark;
+        wrong_outcome
+            .validate()
+            .expect_err("source dependency evidence selects only outcome D");
+
+        let GateFailureDetailV1::SourceDependency { evidence } =
+            &mut decision.failed_gates[0].detail
+        else {
+            panic!("outcome D must carry dependency evidence")
+        };
+        evidence.passing_test.test_id = "different-passing-test".to_owned();
+        ActivationDecisionReportV1 {
+            schema: DECISION_REPORT_SCHEMA.into(),
+            results_sha256: summary.provenance.results_sha256.clone(),
+            thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
+            observations,
+            observations_sha256,
+            source_dependency: Some(dependency),
+            source_dependency_sha256: Some(source_dependency_sha256),
+            decision,
+        }
+        .validate()
+        .expect_err("decision evidence must equal the validated dependency input");
     }
 
     #[test]
@@ -1053,7 +1306,7 @@ mod tests {
         report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]["kind"] =
             serde_json::json!("mismatched");
         report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]["oracle_step"]
-            ["target_symbol"] = serde_json::json!("fixture::wrong-target");
+            ["target"]["symbol"] = serde_json::json!("fixture::wrong-target");
         report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]["mismatches"] =
             serde_json::json!(["target"]);
         let step_index =

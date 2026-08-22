@@ -1,5 +1,85 @@
 {
   "$defs": {
+    "ActionableExactGapV1": {
+      "additionalProperties": false,
+      "properties": {
+        "boundary": {
+          "$ref": "#/$defs/ActionableGapBoundaryV1"
+        },
+        "gap": {
+          "$ref": "#/$defs/ActualProofGapV1"
+        }
+      },
+      "required": [
+        "gap",
+        "boundary"
+      ],
+      "type": "object"
+    },
+    "ActionableGapBoundaryV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "selector",
+              "type": "string"
+            },
+            "selector_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "selector_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "step",
+              "type": "string"
+            },
+            "step_index": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "step_index"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "after_step_count": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "finalization",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "after_step_count"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ActualProductResultV1": {
       "oneOf": [
         {
@@ -543,7 +623,7 @@
         "actionable_exact_gap": {
           "anyOf": [
             {
-              "$ref": "#/$defs/TypedGapV1"
+              "$ref": "#/$defs/ActionableExactGapV1"
             },
             {
               "type": "null"
@@ -1263,6 +1343,26 @@
       ],
       "type": "object"
     },
+    "OracleDeclarationV1": {
+      "additionalProperties": false,
+      "properties": {
+        "range": {
+          "$ref": "#/$defs/OracleSourceRangeV1"
+        },
+        "selector": {
+          "$ref": "#/$defs/ExactSymbolSelectorV1"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "symbol",
+        "selector",
+        "range"
+      ],
+      "type": "object"
+    },
     "OracleSourceRangeV1": {
       "additionalProperties": false,
       "properties": {
@@ -1800,8 +1900,8 @@
     "ReceiptOracleStepV1": {
       "additionalProperties": false,
       "properties": {
-        "caller_symbol": {
-          "type": "string"
+        "caller": {
+          "$ref": "#/$defs/OracleDeclarationV1"
         },
         "callsite_line": {
           "format": "uint32",
@@ -1811,15 +1911,15 @@
         "receipt_line_window": {
           "$ref": "#/$defs/OracleSourceRangeV1"
         },
-        "target_symbol": {
-          "type": "string"
+        "target": {
+          "$ref": "#/$defs/OracleDeclarationV1"
         }
       },
       "required": [
-        "caller_symbol",
+        "caller",
         "callsite_line",
         "receipt_line_window",
-        "target_symbol"
+        "target"
       ],
       "type": "object"
     },

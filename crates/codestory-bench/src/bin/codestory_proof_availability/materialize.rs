@@ -3,8 +3,8 @@ use super::contracts::{
     CohortPathFileV1, EnvironmentIdentityV1, EnvironmentReportV1, MaterializationFreshnessV1,
     OraclePathV1, OracleSourceRangeV1, ProjectMaterializationEvidenceV1,
     QUALIFICATION_REPOSITORIES, QualificationInvocationIdentityV1, QualificationOperationV1,
-    QualificationProfileV1, canonical_cohort_path_file_sha256, canonical_corpus_sha256,
-    validate_project_file,
+    QualificationProfileV1, SourceDependencyCoordinateV1, SourceDependencyEvidenceV1,
+    canonical_cohort_path_file_sha256, canonical_corpus_sha256, validate_project_file,
 };
 use super::corpus::LoadedCorpusV1;
 use anyhow::{Context, Result, bail};
@@ -901,19 +901,101 @@ pub(crate) fn core_only_runtime(project_root: &Path, cache_root: &Path) -> Runti
     ))
 }
 
+pub(crate) fn load_source_dependency(
+    path: &Path,
+    expected_commit: &str,
+    expected_tree: &str,
+) -> Result<SourceDependencyEvidenceV1> {
+    let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_repository_root_missing"))?
+        .canonicalize()?;
+    load_source_dependency_from_root(path, &repository_root, expected_commit, expected_tree)
+}
+
+fn load_source_dependency_from_root(
+    path: &Path,
+    repository_root: &Path,
+    expected_commit: &str,
+    expected_tree: &str,
+) -> Result<SourceDependencyEvidenceV1> {
+    let input_metadata = fs::symlink_metadata(path)?;
+    if input_metadata.file_type().is_symlink()
+        || !input_metadata.is_file()
+        || input_metadata.len() > MAX_DESCRIPTOR_BYTES as u64
+    {
+        bail!("proof_availability_source_dependency_input_invalid")
+    }
+    let bytes = fs::read(path)?;
+    if bytes.len() > MAX_DESCRIPTOR_BYTES {
+        bail!("proof_availability_source_dependency_input_invalid")
+    }
+    let evidence: SourceDependencyEvidenceV1 = serde_json::from_slice(&bytes)?;
+    evidence.validate()?;
+    if evidence.qualification_source_commit != expected_commit
+        || evidence.qualification_source_tree != expected_tree
+    {
+        bail!("proof_availability_source_dependency_provenance_mismatch")
+    }
+    let scope = tempfile::Builder::new()
+        .prefix("codestory-proof-dependency-git-")
+        .tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(scope.path(), fs::Permissions::from_mode(0o700))?;
+    }
+    let hooks = scope.path().join("hooks");
+    create_private_directory(&hooks)?;
+    prepare_private_git_scope(&hooks)?;
+    require_head_and_clean(repository_root, expected_commit, &hooks)?;
+    let observed_tree = String::from_utf8(
+        git(Some(repository_root), &hooks, ["rev-parse", "HEAD^{tree}"])?.stdout,
+    )?;
+    if observed_tree.trim() != expected_tree {
+        bail!("proof_availability_source_dependency_provenance_mismatch")
+    }
+    validate_source_dependency_coordinate(repository_root, &evidence.dependency_source)?;
+    validate_source_dependency_coordinate(repository_root, &evidence.test_source)?;
+    Ok(evidence)
+}
+
+fn validate_source_dependency_coordinate(
+    repository_root: &Path,
+    coordinate: &SourceDependencyCoordinateV1,
+) -> Result<()> {
+    let components = parse_project_path(&coordinate.range.path)?;
+    let relative = components.iter().collect::<PathBuf>();
+    reject_symlink_components(repository_root, &relative)?;
+    let source = repository_root.join(relative);
+    let canonical = source.canonicalize()?;
+    if !canonical.starts_with(repository_root) || !canonical.is_file() {
+        bail!("proof_availability_source_dependency_escape")
+    }
+    let bytes = fs::read(canonical)?;
+    if sha256(&bytes) != coordinate.file_sha256 {
+        bail!("proof_availability_source_dependency_file_hash_mismatch")
+    }
+    validate_source_range(&coordinate.range, &bytes)
+}
+
 pub(crate) fn revalidate_case_source(
     path_file: &CohortPathFileV1,
     checkout_root: &Path,
     project_root: &Path,
 ) -> Result<()> {
-    let hooks = checkout_root
-        .parent()
-        .and_then(Path::parent)
-        .map(|root| root.join(".qualification-empty-hooks"))
-        .ok_or_else(|| anyhow::anyhow!("proof_availability_checkout_layout_invalid"))?;
-    if !hooks.exists() {
-        fs::create_dir_all(&hooks)?;
+    let scope = tempfile::Builder::new()
+        .prefix("codestory-proof-git-")
+        .tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(scope.path(), fs::Permissions::from_mode(0o700))?;
     }
+    let hooks = scope.path().join("hooks");
+    create_private_directory(&hooks)?;
+    prepare_private_git_scope(&hooks)?;
     revalidate_repository(path_file, checkout_root, project_root, &hooks)
 }
 
@@ -1241,7 +1323,13 @@ fn stage_repository(
 }
 
 fn git<const N: usize>(cwd: Option<&Path>, hooks: &Path, args: [&str; N]) -> Result<Output> {
+    let (hooks_identity, config_identity) = prepare_private_git_scope(hooks)?;
     let mut command = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if is_git_override_variable(&name) {
+            command.env_remove(name);
+        }
+    }
     command
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1254,6 +1342,11 @@ fn git<const N: usize>(cwd: Option<&Path>, hooks: &Path, args: [&str; N]) -> Res
         command.current_dir(cwd);
     }
     let output = command.output().context("execute isolated git command")?;
+    if workspace_path_identity(hooks)? != hooks_identity
+        || workspace_path_identity(&hooks.join("empty-global.gitconfig"))? != config_identity
+    {
+        bail!("proof_availability_git_scope_replaced")
+    }
     if !output.status.success() {
         bail!(
             "proof_availability_git_failed: {}",
@@ -1261,6 +1354,65 @@ fn git<const N: usize>(cwd: Option<&Path>, hooks: &Path, args: [&str; N]) -> Res
         )
     }
     Ok(output)
+}
+
+fn is_git_override_variable(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy()
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_"))
+}
+
+fn prepare_private_git_scope(
+    hooks: &Path,
+) -> Result<(WorkspacePathIdentity, WorkspacePathIdentity)> {
+    let metadata = fs::symlink_metadata(hooks)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("proof_availability_git_scope_invalid")
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        fs::set_permissions(hooks, fs::Permissions::from_mode(0o700))?;
+        let config = hooks.join("empty-global.gitconfig");
+        if !config.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config)?
+                .sync_all()?;
+        }
+        let config_metadata = fs::symlink_metadata(&config)?;
+        if config_metadata.file_type().is_symlink()
+            || !config_metadata.is_file()
+            || config_metadata.len() != 0
+            || config_metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!("proof_availability_git_config_invalid")
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let config = hooks.join("empty-global.gitconfig");
+        if !config.exists() {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&config)?
+                .sync_all()?;
+        }
+        let config_metadata = fs::symlink_metadata(&config)?;
+        if config_metadata.file_type().is_symlink()
+            || !config_metadata.is_file()
+            || config_metadata.len() != 0
+        {
+            bail!("proof_availability_git_config_invalid")
+        }
+    }
+    Ok((
+        workspace_path_identity(hooks)?,
+        workspace_path_identity(&hooks.join("empty-global.gitconfig"))?,
+    ))
 }
 
 fn require_head_and_clean(checkout: &Path, commit: &str, hooks: &Path) -> Result<()> {
@@ -1835,6 +1987,162 @@ mod tests {
         run_git(&checkout, &["checkout", "--quiet", "--", "src/lib.rs"]);
         fs::write(checkout.join("untracked.txt"), b"untracked\n").unwrap();
         assert!(require_head_and_clean(&checkout, &commit, &hooks).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_revalidation_ignores_predictable_sibling_git_configuration() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
+
+        let (origin, commit, raw_tree) = cohort_repository();
+        let tree_sha256 = sha256(&raw_tree);
+        let (loaded, _) = local_inputs(origin.path().to_str().unwrap(), &commit, &tree_sha256);
+        let sandbox = tempfile::tempdir().unwrap();
+        let checkout = sandbox.path().join("cohort/checkout");
+        let setup_hooks = sandbox.path().join("setup-hooks");
+        fs::create_dir_all(&setup_hooks).unwrap();
+        stage_repository(
+            origin.path().to_str().unwrap(),
+            &commit,
+            &checkout,
+            &setup_hooks,
+        )
+        .unwrap();
+        let predictable = sandbox.path().join(".qualification-empty-hooks");
+        let attacker_hooks = sandbox.path().join("attacker-controlled-hooks");
+        fs::create_dir(&attacker_hooks).unwrap();
+        let marker = sandbox.path().join("attacker-config-was-read");
+        let monitor = attacker_hooks.join("fsmonitor.sh");
+        fs::write(
+            &monitor,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&monitor, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(
+            attacker_hooks.join("empty-global.gitconfig"),
+            format!("[core]\n\tfsmonitor = {}\n", monitor.display()),
+        )
+        .unwrap();
+        symlink(&attacker_hooks, &predictable).unwrap();
+
+        let project_root = checkout.canonicalize().unwrap();
+        revalidate_case_source(&loaded.path_files[0], &checkout, &project_root)
+            .expect("revalidation creates an isolated private Git scope");
+
+        assert!(!marker.exists(), "the sibling Git config was not read");
+        fs::remove_file(predictable).unwrap();
+    }
+
+    #[test]
+    fn inherited_git_override_names_are_removed_case_insensitively() {
+        for name in ["GIT_CONFIG_GLOBAL", "git_config_system", "Git_Dir"] {
+            assert!(is_git_override_variable(std::ffi::OsStr::new(name)));
+        }
+        for name in ["GITHUB_TOKEN", "GIT", "PATH"] {
+            assert!(!is_git_override_variable(std::ffi::OsStr::new(name)));
+        }
+    }
+
+    #[test]
+    fn source_dependency_is_bound_to_clean_source_tree_files_and_ranges() {
+        let (repository, commit, _) = cohort_repository();
+        let root = repository.path().canonicalize().unwrap();
+        let tree = String::from_utf8(run_git(&root, &["rev-parse", "HEAD^{tree}"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let source_path = "src/area0/file.rs";
+        let source = fs::read(root.join(source_path)).unwrap();
+        let coordinate = |start: usize, end: usize| {
+            json!({
+                "range":{
+                    "path":source_path,
+                    "start_byte":start,
+                    "end_byte":end,
+                    "file_byte_length":source.len(),
+                    "sha256":sha256(&source[start..end]),
+                },
+                "file_sha256":sha256(&source),
+            })
+        };
+        let evidence = json!({
+            "schema":"codestory.proof-availability-source-dependency/v1",
+            "qualification_source_commit":commit,
+            "qualification_source_tree":tree,
+            "dependency_source":coordinate(0, 6),
+            "test_source":coordinate(7, 13),
+            "dependency":"transport_cannot_represent_keep_dark",
+            "passing_test":{
+                "test_id":"transport_cannot_represent_keep_dark",
+                "kind":"transport_cannot_represent_keep_dark",
+                "status":"passed"
+            }
+        });
+        let input = repository.path().join("dependency.json");
+        fs::write(&input, serde_json::to_vec(&evidence).unwrap()).unwrap();
+        run_git(&root, &["add", "dependency.json"]);
+        run_git(&root, &["commit", "--quiet", "-m", "dependency input"]);
+        let bound_commit = String::from_utf8(run_git(&root, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let bound_tree = String::from_utf8(run_git(&root, &["rev-parse", "HEAD^{tree}"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let mut rebound = evidence.clone();
+        rebound["qualification_source_commit"] = json!(bound_commit);
+        rebound["qualification_source_tree"] = json!(bound_tree);
+        fs::write(&input, serde_json::to_vec(&rebound).unwrap()).unwrap();
+        run_git(&root, &["add", "dependency.json"]);
+        run_git(&root, &["commit", "--quiet", "-m", "bind dependency input"]);
+        let final_commit = String::from_utf8(run_git(&root, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        let final_tree = String::from_utf8(run_git(&root, &["rev-parse", "HEAD^{tree}"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        // The evidence file itself is outside the evidence coordinates, so bind its
+        // descriptor to the final source identity without placing it in the checkout.
+        let external = tempfile::NamedTempFile::new().unwrap();
+        rebound["qualification_source_commit"] = json!(final_commit);
+        rebound["qualification_source_tree"] = json!(final_tree);
+        fs::write(external.path(), serde_json::to_vec(&rebound).unwrap()).unwrap();
+        load_source_dependency_from_root(external.path(), &root, &final_commit, &final_tree)
+            .expect("closed source dependency");
+
+        let accepted = rebound.clone();
+        rebound["dependency_source"]["file_sha256"] = json!("0".repeat(64));
+        fs::write(external.path(), serde_json::to_vec(&rebound).unwrap()).unwrap();
+        load_source_dependency_from_root(external.path(), &root, &final_commit, &final_tree)
+            .expect_err("tampered source evidence fails closed");
+
+        let mut unknown = accepted.clone();
+        unknown["unrecognized"] = json!(true);
+        fs::write(external.path(), serde_json::to_vec(&unknown).unwrap()).unwrap();
+        load_source_dependency_from_root(external.path(), &root, &final_commit, &final_tree)
+            .expect_err("unknown evidence fields fail closed");
+
+        let mut mismatched_pair = accepted;
+        mismatched_pair["passing_test"]["kind"] = json!("packet_v3_requires_proof");
+        fs::write(
+            external.path(),
+            serde_json::to_vec(&mismatched_pair).unwrap(),
+        )
+        .unwrap();
+        load_source_dependency_from_root(external.path(), &root, &final_commit, &final_tree)
+            .expect_err("dependency and passing-test kinds are a closed pair");
+
+        let mut unnamed_test = mismatched_pair;
+        unnamed_test["passing_test"]["kind"] = json!("transport_cannot_represent_keep_dark");
+        unnamed_test["passing_test"]["test_id"] = json!("some_other_passing_test");
+        fs::write(external.path(), serde_json::to_vec(&unnamed_test).unwrap()).unwrap();
+        load_source_dependency_from_root(external.path(), &root, &final_commit, &final_tree)
+            .expect_err("the architecture test ID is closed with the dependency kind");
     }
 
     #[test]

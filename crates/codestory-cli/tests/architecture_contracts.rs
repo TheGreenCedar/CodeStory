@@ -206,6 +206,10 @@ fn production_source_prefix(source: &str) -> &str {
         .map_or(source, |(production, _)| production)
 }
 
+fn production_source_contains_git_spawn(source: &str) -> bool {
+    production_source(source).contains("Command::new(\"git\")")
+}
+
 /// Everything in `source` that a release build actually compiles: every
 /// top-level `#[cfg(test)]` item is removed, wherever in the file it sits.
 ///
@@ -2167,7 +2171,7 @@ fn production_source_never_spawns_git() {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read Rust source");
-        if production_source_prefix(&source).contains("Command::new(\"git\")") {
+        if production_source_contains_git_spawn(&source) {
             violations.push(path.display().to_string());
         }
     }
@@ -2190,7 +2194,7 @@ fn crate_source_git_spawns_are_limited_to_named_non_product_boundaries() {
         })
         .filter(|path| {
             let source = fs::read_to_string(path).expect("read Rust source");
-            production_source_prefix(&source).contains("Command::new(\"git\")")
+            production_source_contains_git_spawn(&source)
         })
         .map(|path| {
             path.strip_prefix(repo_root())
@@ -2328,6 +2332,21 @@ fn production() {
     let production = production_source(multiline_gated_use);
     assert!(!production.contains("first, second"));
     assert!(production.contains("real_call()"));
+}
+
+#[test]
+fn production_git_scan_sees_code_after_a_test_module() {
+    let source = "\
+#[cfg(test)]
+mod tests {
+    fn fixture() {}
+}
+
+fn shipped() {
+    Command::new(\"git\");
+}
+";
+    assert!(production_source_contains_git_spawn(source));
 }
 
 #[test]

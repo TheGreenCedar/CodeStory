@@ -1,12 +1,14 @@
 use super::contracts::{
-    ActivationDecisionV1, ActualProductResultV1, CaseReportV1, CohortPathFileV1, CorpusV1,
-    EnvironmentReportV1, FailureFunnelReportV1, FunnelOutcomeV1, InventoryReportV1,
-    ProductDispositionKindV1, ProductRefutationBasisV1, ProjectedReceiptReferenceV1, ProvenanceV1,
-    QualificationSummaryV1, REPORT_SCHEMA, ReceiptOracleComparisonV1, RoleThresholdsV1,
-    StepQualificationOutcomeV1, ThresholdsV1, TrailReportV1, TransportErrorV1, TransportEvidenceV1,
-    canonical_corpus_sha256, canonical_thresholds_sha256, results_evidence_sha256,
+    ActivationDecisionReportV1, ActualProductResultV1, CaseReportV1, CohortPathFileV1, CorpusV1,
+    DECISION_REPORT_SCHEMA, EnvironmentReportV1, FailureFunnelReportV1, FunnelOutcomeV1,
+    InventoryReportV1, ProductDispositionKindV1, ProductRefutationBasisV1,
+    ProjectedReceiptReferenceV1, ProvenanceV1, QualificationSummaryV1, REPORT_SCHEMA,
+    ReceiptOracleComparisonV1, RoleThresholdsV1, StepQualificationOutcomeV1, ThresholdsV1,
+    TrailReportV1, TransportErrorV1, TransportEvidenceV1, canonical_corpus_sha256,
+    canonical_observations_sha256, canonical_source_dependency_sha256, canonical_thresholds_sha256,
+    results_evidence_sha256,
 };
-use super::thresholds::evaluate_activation_decision;
+use super::thresholds::{derive_observations, evaluate_activation_decision};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::Value;
@@ -182,14 +184,34 @@ pub(crate) fn build_summary(
     Ok(summary)
 }
 
-pub(crate) fn build_public_artifacts(
+pub(crate) fn build_public_artifacts_with_dependency(
     summary: &QualificationSummaryV1,
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
+    source_dependency: Option<&super::contracts::SourceDependencyEvidenceV1>,
 ) -> Result<PublicArtifactBundle> {
     summary.validate_against_inputs(corpus, thresholds)?;
-    let decision = evaluate_activation_decision(summary, corpus, thresholds, None)?;
-    let findings = render_findings(summary, thresholds, &decision)?;
+    let observations = derive_observations(summary, thresholds)?;
+    let observations_sha256 = canonical_observations_sha256(
+        &summary.provenance.results_sha256,
+        &summary.provenance.thresholds_sha256,
+        &observations,
+    )?;
+    let decision = evaluate_activation_decision(summary, corpus, thresholds, source_dependency)?;
+    let decision_report = ActivationDecisionReportV1 {
+        schema: DECISION_REPORT_SCHEMA.to_owned(),
+        results_sha256: summary.provenance.results_sha256.clone(),
+        thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
+        observations,
+        observations_sha256,
+        source_dependency: source_dependency.cloned(),
+        source_dependency_sha256: source_dependency
+            .map(canonical_source_dependency_sha256)
+            .transpose()?,
+        decision,
+    };
+    decision_report.validate()?;
+    let findings = render_findings(summary, thresholds, &decision_report)?;
     let bundle = PublicArtifactBundle {
         environment: serde_json::to_value(&summary.environment)?,
         inventory: serde_json::to_value(&summary.inventory)?,
@@ -197,34 +219,38 @@ pub(crate) fn build_public_artifacts(
         cases: serde_json::to_value(&summary.cases)?,
         failure_funnel: serde_json::to_value(&summary.failure_funnel)?,
         summary: serde_json::to_value(summary)?,
-        decision: serde_json::to_value(decision)?,
+        decision: serde_json::to_value(decision_report)?,
         findings,
     };
     validate_public_bundle(&bundle, &PublicLeakPolicy::default())?;
     Ok(bundle)
 }
 
-pub(crate) fn build_and_publish(
+pub(crate) fn build_and_publish_with_dependency(
     destination: &Path,
     summary: &QualificationSummaryV1,
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
+    source_dependency: Option<&super::contracts::SourceDependencyEvidenceV1>,
     leak_policy: &PublicLeakPolicy,
 ) -> std::result::Result<(), ReportPublishError> {
-    let bundle = build_public_artifacts(summary, corpus, thresholds).map_err(|_| {
-        ReportPublishError::before_staging(
-            "proof_availability_public_artifact_build_failed",
-            destination,
-        )
-    })?;
+    let bundle =
+        build_public_artifacts_with_dependency(summary, corpus, thresholds, source_dependency)
+            .map_err(|_| {
+                ReportPublishError::before_staging(
+                    "proof_availability_public_artifact_build_failed",
+                    destination,
+                )
+            })?;
     publish_bundle(destination, &bundle, leak_policy)
 }
 
-pub(crate) fn verify_published(
+pub(crate) fn verify_published_with_dependency(
     destination: &Path,
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
     path_files: &[CohortPathFileV1],
+    source_dependency_path: Option<&Path>,
     leak_policy: &PublicLeakPolicy,
 ) -> Result<()> {
     require_exact_artifact_set(destination)?;
@@ -247,6 +273,15 @@ pub(crate) fn verify_published(
     let findings_bytes = read_bounded(&destination.join("findings.md"))?;
 
     let summary: QualificationSummaryV1 = serde_json::from_value(summary_value)?;
+    let source_dependency = source_dependency_path
+        .map(|path| {
+            super::materialize::load_source_dependency(
+                path,
+                &summary.provenance.source_commit,
+                &summary.provenance.source_tree,
+            )
+        })
+        .transpose()?;
     let reconstructed = QualificationSummaryV1 {
         schema: summary.schema.clone(),
         qualification_id: summary.qualification_id.clone(),
@@ -279,7 +314,12 @@ pub(crate) fn verify_published(
     if canonical_json_file(&recomputed)? != canonical_json_file(&reconstructed)? {
         bail!("proof_availability_summary_recomputation_mismatch")
     }
-    let expected = build_public_artifacts(&recomputed, corpus, thresholds)?;
+    let expected = build_public_artifacts_with_dependency(
+        &recomputed,
+        corpus,
+        thresholds,
+        source_dependency.as_ref(),
+    )?;
     validate_public_bundle(&expected, leak_policy)?;
     let actual = PublicArtifactBundle {
         environment: serde_json::to_value(&recomputed.environment)?,
@@ -295,7 +335,7 @@ pub(crate) fn verify_published(
     if artifact_file_map(&actual)? != artifact_file_map(&expected)? {
         bail!("proof_availability_artifact_recomputation_mismatch")
     }
-    let decision: ActivationDecisionV1 = serde_json::from_value(decision_value)?;
+    let decision: ActivationDecisionReportV1 = serde_json::from_value(decision_value)?;
     decision.validate()?;
     Ok(())
 }
@@ -509,8 +549,9 @@ struct FindingsDocumentV1 {
 fn render_findings(
     summary: &QualificationSummaryV1,
     thresholds: &ThresholdsV1,
-    decision: &ActivationDecisionV1,
+    decision_report: &ActivationDecisionReportV1,
 ) -> Result<String> {
+    let decision = &decision_report.decision;
     let receipt_metrics = summary.receipt_metrics()?;
     let mut cohort_full_proofs = summary
         .environment
@@ -618,7 +659,58 @@ fn render_findings(
             .map(|gate| Ok((gate.gate_id.clone(), closed_enum_name(&gate.kind)?)))
             .collect::<Result<_>>()?,
     };
-    render_findings_document(&document)
+    let mut findings = render_findings_document(&document)?;
+    findings.push_str(&render_derived_observations(&decision_report.observations));
+    Ok(findings)
+}
+
+fn render_derived_observations(observations: &super::contracts::DerivedObservationsV1) -> String {
+    let mut text = format!(
+        "\n## Recomputed decision observations\n\n| Metric | Raw | Presentation |\n| --- | ---: | ---: |\n| Full proofs | {} / {} | {} milli |\n| Full-proof Wilson 95% | {} / {} | lower {:.17}, upper {:.17}, floor {} milli |\n| Positive-step recall | {} / {} | {} milli |\n| Full or useful partial | {} / {} | {} milli |\n| Actionable incomplete gap | {} / {} | {} milli |\n| Unknown warm p95 | - | {} ms |\n| Complete response p95 | - | {} bytes |\n| Unknown response p95 | - | {} bytes |\n| Maximum response | - | {} bytes |\n",
+        observations.full_proofs.numerator,
+        observations.full_proofs.denominator,
+        observations.full_proofs.milli,
+        observations.full_proof_wilson.numerator,
+        observations.full_proof_wilson.denominator,
+        observations.full_proof_wilson.lower,
+        observations.full_proof_wilson.upper,
+        observations.full_proof_wilson.lower_milli,
+        observations.positive_step_recall.numerator,
+        observations.positive_step_recall.denominator,
+        observations.positive_step_recall.milli,
+        observations.full_or_useful_partial.numerator,
+        observations.full_or_useful_partial.denominator,
+        observations.full_or_useful_partial.milli,
+        observations.actionable_incomplete_gap.numerator,
+        observations.actionable_incomplete_gap.denominator,
+        observations.actionable_incomplete_gap.milli,
+        observations.unknown_warm_p95_ms,
+        observations.complete_response_p95_bytes,
+        observations.unknown_response_p95_bytes,
+        observations.maximum_response_bytes,
+    );
+    text.push_str("\n### Cohort Wilson observations\n\n| Cohort | Full proofs | Wilson 95% |\n| --- | ---: | ---: |\n");
+    for cohort in &observations.cohorts {
+        text.push_str(&format!(
+            "| `{}` | {} / {} ({} milli) | lower {:.17}, upper {:.17}, floor {} milli |\n",
+            cohort.repository_id,
+            cohort.full_proofs.numerator,
+            cohort.full_proofs.denominator,
+            cohort.full_proofs.milli,
+            cohort.wilson.lower,
+            cohort.wilson.upper,
+            cohort.wilson.lower_milli,
+        ));
+    }
+    text.push_str("\n### Transport p95\n\n| Revision | Nanoseconds |\n| --- | ---: |\n");
+    for transport in &observations.transport_p95 {
+        text.push_str(&format!(
+            "| `{}` | {} |\n",
+            closed_enum_name(&transport.revision).expect("closed MCP revision"),
+            transport.elapsed_ns,
+        ));
+    }
+    text
 }
 
 fn render_findings_document(document: &FindingsDocumentV1) -> Result<String> {

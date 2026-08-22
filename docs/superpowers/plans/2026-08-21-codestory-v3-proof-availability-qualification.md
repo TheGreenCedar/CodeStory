@@ -412,6 +412,8 @@ Commands:
 
 `materialize` creates detached pinned checkouts, verifies oracle hashes, builds fresh full indexes through the source-linked runtime/indexer, and records core generation/run plus database SHA. `run` is local and does not fetch. `verify` recomputes every aggregate and decision from case rows.
 
+The exact commands above remain the A/B/C contract. Outcome D additionally requires the same optional `--source-dependency <EVIDENCE_JSON>` on `run` and `verify`. That closed evidence is bound to the qualification source commit/tree, full-file and range hashes for both the dependency and its architecture test, and a supported dependency/test pairing. Present-but-invalid evidence fails closed; omitted evidence cannot select D.
+
 ## 6. Revised PR and issue sequence
 
 | Order | Owner | Purpose | Blocks public cut? |
@@ -479,7 +481,7 @@ Thresholds are frozen in `thresholds-v1.json` before the first benchmark run. Us
 
 The overall and cohort cutoffs are sized for 120 and 30 observations respectively; the Wilson lower bounds prevent a small cohort from passing on a brittle point estimate. Step recall measures the 312 audited relations. Partial-value thresholds stop a low full-chain rate from looking useful merely because diagnostics mention candidates. Latency and size gates reflect the role: automatic use must be cheap, while an explicit manual verifier can tolerate more abstention and cost.
 
-“Actionable exact gap” is closed, not prose-scored: selector missing/ambiguous identifies the selector that must be resolved; relation/recursion gaps identify the exact step and unsupported indexed relation; source-binding gaps identify reindex/freshness as the recovery; projection budget identifies request narrowing. A gap without one of those typed recovery classes does not count toward partial usefulness.
+“Actionable exact gap” is closed, coordinate-bearing, and not prose-scored: selector missing/ambiguous retains its selector index; relation/recursion and source-binding gaps retain their exact step; finalization budget retains the completed step count. Only a gap matching the first unproven prefix boundary counts. Projection budget is actionable only when every attempted step has an admitted trace, no step is unclassified, and finalization records the matching receipt/projection budget state. A later or global gap does not count merely because it appears first in a product list.
 
 No threshold is tuned after viewing results. Changing a corpus, threshold, kernel, indexer, or qualification calculation invalidates Q2 and requires a new qualification ID.
 
@@ -1043,8 +1045,8 @@ git commit -m "count proof inventory and connected trails"
 
 **Interfaces:**
 
-- Consumes: `QualificationSummaryV1`, hard-gate observations, and the frozen role thresholds in Section 8.
-- Produces: `evaluate_activation_decision(&QualificationSummaryV1, &ThresholdsV1) -> ActivationDecisionV1`, including the selected A/B/C/D outcome and every failed gate; Task 13 records this result verbatim.
+- Consumes: `QualificationSummaryV1`, recomputed hard-gate and role observations, the frozen role thresholds in Section 8, and optional closed source-dependency evidence.
+- Produces: a decision report containing the selected A/B/C/D outcome, every failed gate, raw numerators/denominators, unrounded and presentation Wilson values, cohort rows, latency/size observations, hard-gate counts, and domain-separated observation/evidence digests. Task 13 records this report verbatim in `decision.json`; no ninth artifact is added.
 
 - [ ] **Step 1: Add threshold boundary RED tests**
 
@@ -1141,7 +1143,7 @@ Expected: all pinned source ranges and hashes validate; no database, proof resul
 **Interfaces:**
 
 - Consumes: the frozen corpus/threshold DTOs, Task 8 inventory/trail counters, Task 6 observed runtime facade, and Task 4 revision-native measurement facade.
-- Produces: atomic `environment.json`, `inventory.json`, `trails.json`, `cases.json`, `failure-funnel.json`, `summary.json`, `decision.json`, and `findings.md` artifacts. The executable never substitutes SQL or benchmark logic for a product disposition.
+- Produces: atomic `environment.json`, `inventory.json`, `trails.json`, `cases.json`, `failure-funnel.json`, `summary.json`, `decision.json`, and `findings.md` artifacts. `decision.json` embeds recomputable derived observations and optional closed source-dependency evidence while preserving this exact eight-artifact set. The executable never substitutes SQL or benchmark logic for a product disposition.
 
 - [ ] **Step 1: Add materialization RED tests**
 
@@ -1299,6 +1301,8 @@ mkdir -p "$run_root"
   --thresholds benchmarks/proof-availability/thresholds-v1.json \
   --results "$run_root/results"
 ```
+
+If and only if independent source review supplies valid outcome-D evidence, add the same `--source-dependency <EVIDENCE_JSON>` argument to both `run` and `verify`. The default Q2 command remains exactly as shown.
 
 Do not rerun unchanged failures. A source/oracle/logic failure invalidates the run and returns to Q1; a product result is evidence even when it selects C.
 
