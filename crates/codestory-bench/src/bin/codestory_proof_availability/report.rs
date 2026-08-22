@@ -41,8 +41,195 @@ pub(crate) const PUBLIC_ARTIFACT_NAMES: [&str; 8] = [
 const OWNER_MARKER: &str = ".codestory-proof-availability-report-staging";
 const MAX_PUBLIC_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 const CASE_DIAGNOSTIC_SCHEMA: &str = "codestory.proof-availability.invalid-case-diagnostic.v1";
-const CASE_DIAGNOSTIC_FILE: &str = "invalid-case-v1.json";
+const PUBLIC_ARTIFACT_BUILD_DIAGNOSTIC_SCHEMA: &str =
+    "codestory.proof-availability.public-artifact-build-diagnostic.v1";
 const MAX_CASE_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateDiagnosticFileKind {
+    InvalidCaseV1,
+    PublicArtifactBuildV1,
+}
+
+impl PrivateDiagnosticFileKind {
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::InvalidCaseV1 => "invalid-case-v1.json",
+            Self::PublicArtifactBuildV1 => "public-artifact-build-v1.json",
+        }
+    }
+
+    const fn temporary_prefix(self) -> &'static str {
+        match self {
+            Self::InvalidCaseV1 => ".invalid-case-v1",
+            Self::PublicArtifactBuildV1 => ".public-artifact-build-v1",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicArtifactName {
+    Environment,
+    Inventory,
+    Trails,
+    Cases,
+    FailureFunnel,
+    Summary,
+    Decision,
+    Findings,
+}
+
+impl PublicArtifactName {
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::Environment => "environment.json",
+            Self::Inventory => "inventory.json",
+            Self::Trails => "trails.json",
+            Self::Cases => "cases.json",
+            Self::FailureFunnel => "failure-funnel.json",
+            Self::Summary => "summary.json",
+            Self::Decision => "decision.json",
+            Self::Findings => "findings.md",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicArtifactBuildStage {
+    SummaryValidation,
+    ObservationDerivation,
+    ObservationCanonicalization,
+    DecisionEvaluation,
+    DecisionValidation,
+    FindingsRendering,
+    Serialization,
+    BundleValidation,
+}
+
+impl PublicArtifactBuildStage {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::SummaryValidation => "summary_validation",
+            Self::ObservationDerivation => "observation_derivation",
+            Self::ObservationCanonicalization => "observation_canonicalization",
+            Self::DecisionEvaluation => "decision_evaluation",
+            Self::DecisionValidation => "decision_validation",
+            Self::FindingsRendering => "findings_rendering",
+            Self::Serialization => "serialization",
+            Self::BundleValidation => "bundle_validation",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicArtifactBuildReason {
+    PathLeak,
+    SecretField,
+    ExistingInvariant,
+    Canonicalization,
+    Serialization,
+}
+
+impl PublicArtifactBuildReason {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::PathLeak => "path_leak",
+            Self::SecretField => "secret_field",
+            Self::ExistingInvariant => "existing_invariant",
+            Self::Canonicalization => "canonicalization",
+            Self::Serialization => "serialization",
+        }
+    }
+}
+
+pub(crate) struct PublicArtifactBuildFailure {
+    stage: PublicArtifactBuildStage,
+    reason: PublicArtifactBuildReason,
+    artifact: Option<PublicArtifactName>,
+    case_ordinal: Option<usize>,
+    json_pointer: Option<String>,
+    rejected_string: Option<(usize, String)>,
+}
+
+impl PublicArtifactBuildFailure {
+    fn closed(stage: PublicArtifactBuildStage, reason: PublicArtifactBuildReason) -> Self {
+        Self {
+            stage,
+            reason,
+            artifact: None,
+            case_ordinal: None,
+            json_pointer: None,
+            rejected_string: None,
+        }
+    }
+
+    fn rejected_string(
+        stage: PublicArtifactBuildStage,
+        reason: PublicArtifactBuildReason,
+        artifact: PublicArtifactName,
+        case_ordinal: Option<usize>,
+        json_pointer: String,
+        rejected: &str,
+    ) -> Self {
+        Self {
+            stage,
+            reason,
+            artifact: Some(artifact),
+            case_ordinal,
+            json_pointer: Some(json_pointer),
+            rejected_string: Some((
+                rejected.len(),
+                domain_sha256(
+                    b"codestory.proof-availability.public-artifact-build-rejected-string.v1\\0",
+                    rejected.as_bytes(),
+                ),
+            )),
+        }
+    }
+
+    fn artifact_closed(
+        stage: PublicArtifactBuildStage,
+        reason: PublicArtifactBuildReason,
+        artifact: PublicArtifactName,
+    ) -> Self {
+        Self {
+            artifact: Some(artifact),
+            ..Self::closed(stage, reason)
+        }
+    }
+
+    #[cfg(test)]
+    fn path_leak(
+        stage: PublicArtifactBuildStage,
+        artifact: PublicArtifactName,
+        case_ordinal: Option<usize>,
+        json_pointer: &str,
+        rejected: &str,
+    ) -> Self {
+        Self::rejected_string(
+            stage,
+            PublicArtifactBuildReason::PathLeak,
+            artifact,
+            case_ordinal,
+            json_pointer.to_owned(),
+            rejected,
+        )
+    }
+}
+
+impl fmt::Display for PublicArtifactBuildFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("proof_availability_public_artifact_build_failed")
+    }
+}
+
+impl fmt::Debug for PublicArtifactBuildFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
+}
+
+impl std::error::Error for PublicArtifactBuildFailure {}
 
 /// A process-owned, initially empty directory that makes a qualification ID
 /// single-use for the private invalid-case recovery artifact. It is never a
@@ -302,12 +489,106 @@ pub(crate) fn write_invalid_case_diagnostic(
     if bytes.len() > MAX_CASE_DIAGNOSTIC_BYTES {
         bail!("proof_availability_case_diagnostic_write_failed")
     }
-    write_private_diagnostic_file(reservation, &bytes)
-        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    write_private_diagnostic_file(
+        reservation,
+        PrivateDiagnosticFileKind::InvalidCaseV1,
+        &bytes,
+    )
+    .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
     reservation
         .directory
         .sync_all()
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+pub(crate) fn write_public_artifact_build_diagnostic(
+    reservation: &CaseDiagnosticReservation,
+    qualification_id: &str,
+    source_commit: &str,
+    source_tree: &str,
+    failure: &PublicArtifactBuildFailure,
+) -> Result<()> {
+    ensure_discoverable_reservation(reservation)?;
+    let artifact = build_public_artifact_build_diagnostic_artifact(
+        qualification_id,
+        source_commit,
+        source_tree,
+        failure,
+    )?;
+    let bytes = canonical_json_file(&artifact)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    if bytes.len() > MAX_CASE_DIAGNOSTIC_BYTES {
+        bail!("proof_availability_case_diagnostic_write_failed")
+    }
+    write_private_diagnostic_file(
+        reservation,
+        PrivateDiagnosticFileKind::PublicArtifactBuildV1,
+        &bytes,
+    )
+    .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    reservation
+        .directory
+        .sync_all()
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))
+}
+
+#[cfg(not(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+)))]
+pub(crate) fn write_public_artifact_build_diagnostic(
+    _: &CaseDiagnosticReservation,
+    _: &str,
+    _: &str,
+    _: &str,
+    _: &PublicArtifactBuildFailure,
+) -> Result<()> {
+    bail!("proof_availability_case_diagnostic_unsupported")
+}
+
+fn build_public_artifact_build_diagnostic_artifact(
+    qualification_id: &str,
+    source_commit: &str,
+    source_tree: &str,
+    failure: &PublicArtifactBuildFailure,
+) -> Result<Value> {
+    let rejected_string = failure.rejected_string.as_ref().map(|(length, sha256)| {
+        json!({
+            "utf8_byte_length": length,
+            "sha256": sha256,
+        })
+    });
+    let artifact = json!({
+        "schema": PUBLIC_ARTIFACT_BUILD_DIAGNOSTIC_SCHEMA,
+        "classification": "non_evidence",
+        "qualification_id": qualification_id,
+        "validator_source_commit": source_commit,
+        "validator_source_tree": source_tree,
+        "failure": {
+            "stage": failure.stage.name(),
+            "reason": failure.reason.name(),
+            "artifact": failure.artifact.map(PublicArtifactName::file_name),
+            "case_ordinal": failure.case_ordinal,
+            "json_pointer": failure.json_pointer,
+            "rejected_string": rejected_string,
+        },
+    });
+    validate_private_diagnostic_value(&artifact, &[])?;
+    Ok(artifact)
 }
 
 #[cfg(all(
@@ -535,7 +816,8 @@ fn validate_private_diagnostic_value_at(
 }
 
 fn is_removed_text_commitment_pointer_field(pointer: &str) -> bool {
-    pointer.starts_with("/removed_text_commitments/") && pointer.ends_with("/json_pointer")
+    (pointer.starts_with("/removed_text_commitments/") && pointer.ends_with("/json_pointer"))
+        || pointer == "/failure/json_pointer"
 }
 
 fn valid_json_pointer(value: &str) -> bool {
@@ -583,17 +865,22 @@ static CASE_DIAGNOSTIC_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 ))]
 fn write_private_diagnostic_file(
     reservation: &CaseDiagnosticReservation,
+    kind: PrivateDiagnosticFileKind,
     bytes: &[u8],
 ) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
     let sequence = CASE_DIAGNOSTIC_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temporary_name = format!(".invalid-case-v1-{}-{sequence}", std::process::id());
+    let temporary_name = format!(
+        "{}-{}-{sequence}",
+        kind.temporary_prefix(),
+        std::process::id()
+    );
     let temporary_c = CString::new(temporary_name.as_bytes())
         .map_err(|_| std::io::Error::other("invalid temporary name"))?;
-    let final_c = CString::new(CASE_DIAGNOSTIC_FILE)
-        .map_err(|_| std::io::Error::other("invalid final name"))?;
+    let final_c =
+        CString::new(kind.file_name()).map_err(|_| std::io::Error::other("invalid final name"))?;
     let directory_fd = reservation.directory.as_raw_fd();
     let descriptor = unsafe {
         libc::openat(
@@ -827,15 +1114,38 @@ pub(crate) fn build_public_artifacts(
     summary: &QualificationSummaryV1,
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
-) -> Result<PublicArtifactBundle> {
-    summary.validate_against_inputs(corpus, thresholds)?;
-    let observations = derive_observations(summary, thresholds)?;
+) -> std::result::Result<PublicArtifactBundle, PublicArtifactBuildFailure> {
+    summary
+        .validate_against_inputs(corpus, thresholds)
+        .map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::SummaryValidation,
+                PublicArtifactBuildReason::ExistingInvariant,
+            )
+        })?;
+    let observations = derive_observations(summary, thresholds).map_err(|_| {
+        PublicArtifactBuildFailure::closed(
+            PublicArtifactBuildStage::ObservationDerivation,
+            PublicArtifactBuildReason::ExistingInvariant,
+        )
+    })?;
     let observations_sha256 = canonical_observations_sha256(
         &summary.provenance.results_sha256,
         &summary.provenance.thresholds_sha256,
         &observations,
-    )?;
-    let decision = evaluate_activation_decision(summary, corpus, thresholds)?;
+    )
+    .map_err(|_| {
+        PublicArtifactBuildFailure::closed(
+            PublicArtifactBuildStage::ObservationCanonicalization,
+            PublicArtifactBuildReason::Canonicalization,
+        )
+    })?;
+    let decision = evaluate_activation_decision(summary, corpus, thresholds).map_err(|_| {
+        PublicArtifactBuildFailure::closed(
+            PublicArtifactBuildStage::DecisionEvaluation,
+            PublicArtifactBuildReason::ExistingInvariant,
+        )
+    })?;
     let decision_report = ActivationDecisionReportV1 {
         schema: DECISION_REPORT_SCHEMA.to_owned(),
         results_sha256: summary.provenance.results_sha256.clone(),
@@ -844,19 +1154,64 @@ pub(crate) fn build_public_artifacts(
         observations_sha256,
         decision,
     };
-    decision_report.validate()?;
-    let findings = render_findings(summary, thresholds, &decision_report)?;
+    decision_report.validate().map_err(|_| {
+        PublicArtifactBuildFailure::closed(
+            PublicArtifactBuildStage::DecisionValidation,
+            PublicArtifactBuildReason::ExistingInvariant,
+        )
+    })?;
+    let findings = render_findings(summary, thresholds, &decision_report).map_err(|_| {
+        PublicArtifactBuildFailure::closed(
+            PublicArtifactBuildStage::FindingsRendering,
+            PublicArtifactBuildReason::ExistingInvariant,
+        )
+    })?;
     let bundle = PublicArtifactBundle {
-        environment: serde_json::to_value(&summary.environment)?,
-        inventory: serde_json::to_value(&summary.inventory)?,
-        trails: serde_json::to_value(&summary.trails)?,
-        cases: serde_json::to_value(&summary.cases)?,
-        failure_funnel: serde_json::to_value(&summary.failure_funnel)?,
-        summary: serde_json::to_value(summary)?,
-        decision: serde_json::to_value(decision_report)?,
+        environment: serde_json::to_value(&summary.environment).map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::Serialization,
+                PublicArtifactBuildReason::Serialization,
+            )
+        })?,
+        inventory: serde_json::to_value(&summary.inventory).map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::Serialization,
+                PublicArtifactBuildReason::Serialization,
+            )
+        })?,
+        trails: serde_json::to_value(&summary.trails).map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::Serialization,
+                PublicArtifactBuildReason::Serialization,
+            )
+        })?,
+        cases: serde_json::to_value(&summary.cases).map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::Serialization,
+                PublicArtifactBuildReason::Serialization,
+            )
+        })?,
+        failure_funnel: serde_json::to_value(&summary.failure_funnel).map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::Serialization,
+                PublicArtifactBuildReason::Serialization,
+            )
+        })?,
+        summary: serde_json::to_value(summary).map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::Serialization,
+                PublicArtifactBuildReason::Serialization,
+            )
+        })?,
+        decision: serde_json::to_value(decision_report).map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::Serialization,
+                PublicArtifactBuildReason::Serialization,
+            )
+        })?,
         findings,
     };
-    validate_public_bundle(&bundle, &PublicLeakPolicy::default())?;
+    validate_public_bundle_for_build(&bundle)?;
     Ok(bundle)
 }
 
@@ -866,6 +1221,7 @@ pub(crate) fn build_and_publish(
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
     leak_policy: &PublicLeakPolicy,
+    diagnostic: PublicArtifactDiagnosticContext<'_>,
 ) -> std::result::Result<(), ReportPublishError> {
     require_result_directory_identity(destination, &summary.qualification_id).map_err(|_| {
         ReportPublishError::before_staging(
@@ -873,13 +1229,52 @@ pub(crate) fn build_and_publish(
             destination,
         )
     })?;
-    let bundle = build_public_artifacts(summary, corpus, thresholds).map_err(|_| {
-        ReportPublishError::before_staging(
-            "proof_availability_public_artifact_build_failed",
-            destination,
-        )
-    })?;
+    let bundle = match build_public_artifacts(summary, corpus, thresholds) {
+        Ok(bundle) => bundle,
+        Err(failure) => {
+            write_public_artifact_build_diagnostic(
+                diagnostic.reservation,
+                diagnostic.qualification_id,
+                diagnostic.source_commit,
+                diagnostic.source_tree,
+                &failure,
+            )
+            .map_err(|_| {
+                ReportPublishError::before_staging(
+                    "proof_availability_public_artifact_build_failed",
+                    destination,
+                )
+            })?;
+            return Err(ReportPublishError::before_staging(
+                "proof_availability_public_artifact_build_failed",
+                destination,
+            ));
+        }
+    };
     publish_bundle(destination, &bundle, leak_policy)
+}
+
+pub(crate) struct PublicArtifactDiagnosticContext<'a> {
+    reservation: &'a CaseDiagnosticReservation,
+    qualification_id: &'a str,
+    source_commit: &'a str,
+    source_tree: &'a str,
+}
+
+impl<'a> PublicArtifactDiagnosticContext<'a> {
+    pub(crate) fn new(
+        reservation: &'a CaseDiagnosticReservation,
+        qualification_id: &'a str,
+        source_commit: &'a str,
+        source_tree: &'a str,
+    ) -> Self {
+        Self {
+            reservation,
+            qualification_id,
+            source_commit,
+            source_tree,
+        }
+    }
 }
 
 pub(crate) fn verify_published(
@@ -1523,6 +1918,104 @@ fn artifact_file_map(bundle: &PublicArtifactBundle) -> Result<Vec<(&'static str,
     Ok(files)
 }
 
+fn validate_public_bundle_for_build(
+    bundle: &PublicArtifactBundle,
+) -> std::result::Result<(), PublicArtifactBuildFailure> {
+    for (name, value) in [
+        (PublicArtifactName::Environment, &bundle.environment),
+        (PublicArtifactName::Inventory, &bundle.inventory),
+        (PublicArtifactName::Trails, &bundle.trails),
+        (PublicArtifactName::Cases, &bundle.cases),
+        (PublicArtifactName::FailureFunnel, &bundle.failure_funnel),
+        (PublicArtifactName::Summary, &bundle.summary),
+        (PublicArtifactName::Decision, &bundle.decision),
+    ] {
+        validate_public_json_for_build(name, value, "", None)?;
+    }
+    if bundle.findings.contains('\0') || bundle.findings.contains('\r') {
+        return Err(PublicArtifactBuildFailure::artifact_closed(
+            PublicArtifactBuildStage::BundleValidation,
+            PublicArtifactBuildReason::ExistingInvariant,
+            PublicArtifactName::Findings,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_public_json_for_build(
+    artifact: PublicArtifactName,
+    value: &Value,
+    pointer: &str,
+    case_ordinal: Option<usize>,
+) -> std::result::Result<(), PublicArtifactBuildFailure> {
+    match value {
+        Value::Object(object) => {
+            for (field, child) in object {
+                let child_pointer = append_fixed_json_pointer(pointer, field).ok_or_else(|| {
+                    PublicArtifactBuildFailure::closed(
+                        PublicArtifactBuildStage::BundleValidation,
+                        PublicArtifactBuildReason::ExistingInvariant,
+                    )
+                })?;
+                if secret_field(field) {
+                    let rejected = child.as_str().unwrap_or(field);
+                    return Err(PublicArtifactBuildFailure::rejected_string(
+                        PublicArtifactBuildStage::BundleValidation,
+                        PublicArtifactBuildReason::SecretField,
+                        artifact,
+                        case_ordinal,
+                        child_pointer,
+                        rejected,
+                    ));
+                }
+                validate_public_json_for_build(artifact, child, &child_pointer, case_ordinal)?;
+            }
+        }
+        Value::Array(values) => {
+            for (index, child) in values.iter().enumerate() {
+                let child_pointer = append_fixed_json_pointer(pointer, &index.to_string())
+                    .ok_or_else(|| {
+                        PublicArtifactBuildFailure::closed(
+                            PublicArtifactBuildStage::BundleValidation,
+                            PublicArtifactBuildReason::ExistingInvariant,
+                        )
+                    })?;
+                let child_case_ordinal =
+                    if artifact == PublicArtifactName::Cases && pointer.is_empty() {
+                        Some(index)
+                    } else {
+                        case_ordinal
+                    };
+                validate_public_json_for_build(
+                    artifact,
+                    child,
+                    &child_pointer,
+                    child_case_ordinal,
+                )?;
+            }
+        }
+        Value::String(text) if !pointer.ends_with("/text") && absolute_path(text) => {
+            return Err(PublicArtifactBuildFailure::rejected_string(
+                PublicArtifactBuildStage::BundleValidation,
+                PublicArtifactBuildReason::PathLeak,
+                artifact,
+                case_ordinal,
+                pointer.to_owned(),
+                text,
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn append_fixed_json_pointer(pointer: &str, segment: &str) -> Option<String> {
+    const MAX_DIAGNOSTIC_POINTER_BYTES: usize = 4096;
+    let escaped = json_pointer_escape(segment);
+    let length = pointer.len().checked_add(1)?.checked_add(escaped.len())?;
+    (length <= MAX_DIAGNOSTIC_POINTER_BYTES).then(|| format!("{pointer}/{escaped}"))
+}
+
 fn validate_public_bundle(bundle: &PublicArtifactBundle, policy: &PublicLeakPolicy) -> Result<()> {
     for value in [
         &bundle.environment,
@@ -1898,6 +2391,154 @@ mod tests {
         );
     }
 
+    #[test]
+    fn public_artifact_build_failure_keeps_only_a_path_commitment() {
+        let failure = PublicArtifactBuildFailure::path_leak(
+            PublicArtifactBuildStage::BundleValidation,
+            PublicArtifactName::Cases,
+            Some(0),
+            "/0/canonical_id",
+            "/Users/albert/private/canonical-id",
+        );
+
+        assert_eq!(
+            failure.to_string(),
+            "proof_availability_public_artifact_build_failed"
+        );
+        assert_eq!(
+            format!("{failure:?}"),
+            "proof_availability_public_artifact_build_failed"
+        );
+        let artifact = build_public_artifact_build_diagnostic_artifact(
+            "20260821T120000Z-222222222222",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &failure,
+        )
+        .unwrap();
+        let bytes = canonical_json_file(&artifact).unwrap();
+
+        assert_eq!(artifact["classification"], "non_evidence");
+        assert_eq!(artifact["failure"]["stage"], "bundle_validation");
+        assert_eq!(artifact["failure"]["reason"], "path_leak");
+        assert_eq!(artifact["failure"]["artifact"], "cases.json");
+        assert_eq!(artifact["failure"]["case_ordinal"], 0);
+        assert_eq!(artifact["failure"]["json_pointer"], "/0/canonical_id");
+        assert_eq!(
+            artifact["failure"]["rejected_string"]["utf8_byte_length"],
+            "/Users/albert/private/canonical-id".len()
+        );
+        assert_eq!(
+            artifact["failure"]["rejected_string"]["sha256"],
+            domain_sha256(
+                b"codestory.proof-availability.public-artifact-build-rejected-string.v1\\0",
+                b"/Users/albert/private/canonical-id",
+            )
+        );
+        assert!(
+            !String::from_utf8(bytes)
+                .unwrap()
+                .contains("/Users/albert/private")
+        );
+    }
+
+    #[test]
+    fn public_artifact_validation_keeps_first_artifact_and_case_in_depth_first_order() {
+        let mut bundle = fixture_bundle();
+        bundle.environment = json!({"workspace": "C:\\\\private"});
+        bundle.cases = json!([
+            {"canonical_id": "\\\\server\\share\\private"},
+            {"canonical_id": "\\\\?\\\\C:\\\\private"}
+        ]);
+        let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
+        assert_eq!(failure.artifact, Some(PublicArtifactName::Environment));
+        assert_eq!(failure.case_ordinal, None);
+        assert_eq!(failure.json_pointer.as_deref(), Some("/workspace"));
+
+        bundle.environment = json!({"workspace": "relative"});
+        let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
+        assert_eq!(failure.artifact, Some(PublicArtifactName::Cases));
+        assert_eq!(failure.case_ordinal, Some(0));
+        assert_eq!(failure.json_pointer.as_deref(), Some("/0/canonical_id"));
+    }
+
+    #[test]
+    fn public_artifact_validation_commits_secret_field_without_retaining_it() {
+        let mut bundle = fixture_bundle();
+        bundle.cases = json!([{"api_token": "private\\0TOKEN=do-not-publish"}]);
+        let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
+        let artifact = build_public_artifact_build_diagnostic_artifact(
+            "20260821T120000Z-222222222222",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &failure,
+        )
+        .unwrap();
+        let bytes = canonical_json_file(&artifact).unwrap();
+
+        assert_eq!(artifact["failure"]["reason"], "secret_field");
+        assert_eq!(artifact["failure"]["case_ordinal"], 0);
+        assert!(
+            artifact["failure"]["rejected_string"]["sha256"]
+                .as_str()
+                .is_some()
+        );
+        let rendered = String::from_utf8(bytes).unwrap();
+        assert!(!rendered.contains("TOKEN=do-not-publish"));
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
+    #[test]
+    fn public_artifact_diagnostic_uses_the_fixed_owner_private_file_kind() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let reservation =
+            reserve_case_diagnostic(root.path(), "20260821T120000Z-222222222222").unwrap();
+        let failure = PublicArtifactBuildFailure::path_leak(
+            PublicArtifactBuildStage::BundleValidation,
+            PublicArtifactName::Cases,
+            Some(0),
+            "/0/canonical_id",
+            "/private",
+        );
+        write_public_artifact_build_diagnostic(
+            &reservation,
+            "20260821T120000Z-222222222222",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &failure,
+        )
+        .unwrap();
+        let target = reservation
+            .path()
+            .join(PrivateDiagnosticFileKind::PublicArtifactBuildV1.file_name());
+        let bytes = fs::read(&target).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            write_public_artifact_build_diagnostic(
+                &reservation,
+                "20260821T120000Z-222222222222",
+                &"a".repeat(40),
+                &"b".repeat(40),
+                &failure,
+            )
+            .is_err()
+        );
+    }
+
     #[cfg(all(
         unix,
         any(
@@ -2014,10 +2655,24 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let reservation =
             reserve_case_diagnostic(root.path(), "20260821T120000Z-222222222222").unwrap();
-        let target = reservation.path().join(CASE_DIAGNOSTIC_FILE);
-        write_private_diagnostic_file(&reservation, b"{}\n").unwrap();
+        let target = reservation
+            .path()
+            .join(PrivateDiagnosticFileKind::InvalidCaseV1.file_name());
+        write_private_diagnostic_file(
+            &reservation,
+            PrivateDiagnosticFileKind::InvalidCaseV1,
+            b"{}\n",
+        )
+        .unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"{}\n");
-        assert!(write_private_diagnostic_file(&reservation, b"changed\n").is_err());
+        assert!(
+            write_private_diagnostic_file(
+                &reservation,
+                PrivateDiagnosticFileKind::InvalidCaseV1,
+                b"changed\n",
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(&target).unwrap(), b"{}\n");
     }
 
@@ -2052,9 +2707,19 @@ mod tests {
         )
         .unwrap();
         let bytes = canonical_json_file(&artifact).unwrap();
-        write_private_diagnostic_file(&reservation, &bytes).unwrap();
+        write_private_diagnostic_file(
+            &reservation,
+            PrivateDiagnosticFileKind::InvalidCaseV1,
+            &bytes,
+        )
+        .unwrap();
         let written: Value = serde_json::from_slice(
-            &fs::read(reservation.path().join(CASE_DIAGNOSTIC_FILE)).unwrap(),
+            &fs::read(
+                reservation
+                    .path()
+                    .join(PrivateDiagnosticFileKind::InvalidCaseV1.file_name()),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(written["schema"], CASE_DIAGNOSTIC_SCHEMA);
@@ -2095,8 +2760,17 @@ mod tests {
                 .to_string(),
             "proof_availability_case_diagnostic_write_failed"
         );
-        assert!(!original.join(CASE_DIAGNOSTIC_FILE).exists());
-        assert!(!reservation.path().join(CASE_DIAGNOSTIC_FILE).exists());
+        assert!(
+            !original
+                .join(PrivateDiagnosticFileKind::InvalidCaseV1.file_name())
+                .exists()
+        );
+        assert!(
+            !reservation
+                .path()
+                .join(PrivateDiagnosticFileKind::InvalidCaseV1.file_name())
+                .exists()
+        );
     }
 
     #[cfg(all(
@@ -2131,8 +2805,16 @@ mod tests {
         fs::rename(reservation.path(), &held).unwrap();
         symlink(&actual_parent, reservation.path()).unwrap();
         assert!(ensure_discoverable_reservation(&reservation).is_err());
-        assert!(!held.join(CASE_DIAGNOSTIC_FILE).exists());
-        assert!(!actual_parent.join(CASE_DIAGNOSTIC_FILE).exists());
+        assert!(
+            !held
+                .join(PrivateDiagnosticFileKind::InvalidCaseV1.file_name())
+                .exists()
+        );
+        assert!(
+            !actual_parent
+                .join(PrivateDiagnosticFileKind::InvalidCaseV1.file_name())
+                .exists()
+        );
     }
 
     #[cfg(not(all(

@@ -101,6 +101,12 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
                 &loaded.corpus,
                 &thresholds,
                 &leak_policy,
+                report::PublicArtifactDiagnosticContext::new(
+                    &reservation,
+                    &operational.environment.qualification_id,
+                    &operational.environment.qualification_source_commit,
+                    &operational.environment.qualification_source_tree,
+                ),
             )?;
             Ok(())
         }
