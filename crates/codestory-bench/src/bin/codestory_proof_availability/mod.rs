@@ -44,8 +44,55 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
                 &arguments.out,
                 &operational.environment.qualification_id,
             )?;
-            let input = runner::run_qualification(&loaded, &thresholds, &operational)?;
-            let summary = report::build_summary(input, &loaded.corpus, &thresholds)?;
+            let output_parent = arguments.out.parent().ok_or_else(|| {
+                anyhow::anyhow!("proof_availability_case_diagnostic_parent_invalid")
+            })?;
+            let reservation = report::reserve_case_diagnostic(
+                output_parent,
+                &operational.environment.qualification_id,
+            )?;
+            let input = match runner::run_qualification(&loaded, &thresholds, &operational) {
+                Ok(input) => input,
+                Err(error) => {
+                    let _ = reservation.remove_empty();
+                    return Err(error);
+                }
+            };
+            let summary = match report::build_summary(input, &loaded.corpus, &thresholds) {
+                Ok(summary) => {
+                    let _ = reservation.remove_empty();
+                    summary
+                }
+                Err(error) => {
+                    if let Some(failure) = error.downcast_ref::<contracts::CaseValidationFailure>()
+                    {
+                        let forbidden_values =
+                            std::iter::once(operational.workspace_root.display().to_string())
+                                .chain(std::iter::once(
+                                    operational.cache_root.display().to_string(),
+                                ))
+                                .chain(operational.repositories.iter().flat_map(|repository| {
+                                    [
+                                        repository.checkout_root.display().to_string(),
+                                        repository.project_root.display().to_string(),
+                                        repository.database_path.display().to_string(),
+                                    ]
+                                }))
+                                .collect::<Vec<_>>();
+                        report::write_invalid_case_diagnostic(
+                            &reservation,
+                            &operational.environment.qualification_id,
+                            &operational.environment.qualification_source_commit,
+                            &operational.environment.qualification_source_tree,
+                            failure,
+                            &forbidden_values,
+                        )?;
+                    } else {
+                        let _ = reservation.remove_empty();
+                    }
+                    return Err(error);
+                }
+            };
             let leak_policy = report::PublicLeakPolicy::new(
                 std::iter::once(operational.workspace_root.display().to_string())
                     .chain(std::iter::once(

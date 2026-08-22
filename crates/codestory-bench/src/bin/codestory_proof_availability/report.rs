@@ -1,7 +1,7 @@
 use super::contracts::{
-    ActivationDecisionReportV1, ActualProductResultV1, CaseReportV1, CohortPathFileV1, CorpusV1,
-    DECISION_REPORT_SCHEMA, EnvironmentReportV1, FailureFunnelReportV1, FunnelOutcomeV1,
-    InventoryReportV1, ProductDispositionKindV1, ProductRefutationBasisV1,
+    ActivationDecisionReportV1, ActualProductResultV1, CaseReportV1, CaseValidationFailure,
+    CohortPathFileV1, CorpusV1, DECISION_REPORT_SCHEMA, EnvironmentReportV1, FailureFunnelReportV1,
+    FunnelOutcomeV1, InventoryReportV1, ProductDispositionKindV1, ProductRefutationBasisV1,
     ProjectedReceiptReferenceV1, ProvenanceV1, QualificationSummaryV1, REPORT_SCHEMA,
     ReceiptOracleComparisonV1, RoleThresholdsV1, StepQualificationOutcomeV1, ThresholdsV1,
     TrailReportV1, TransportErrorV1, TransportEvidenceV1, canonical_corpus_sha256,
@@ -10,7 +10,8 @@ use super::contracts::{
 use super::thresholds::{derive_observations, evaluate_activation_decision};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +30,259 @@ pub(crate) const PUBLIC_ARTIFACT_NAMES: [&str; 8] = [
 ];
 const OWNER_MARKER: &str = ".codestory-proof-availability-report-staging";
 const MAX_PUBLIC_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+const CASE_DIAGNOSTIC_SCHEMA: &str = "codestory.proof-availability.invalid-case-diagnostic.v1";
+const CASE_DIAGNOSTIC_FILE: &str = "invalid-case-v1.json";
+const MAX_CASE_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+
+/// A process-owned, initially empty directory that makes a qualification ID
+/// single-use for the private invalid-case recovery artifact. It is never a
+/// public result artifact and it is intentionally left behind after a crash.
+#[derive(Debug)]
+pub(crate) struct CaseDiagnosticReservation {
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl CaseDiagnosticReservation {
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Remove only the same still-empty directory we created. `remove_dir`
+    /// provides the non-recursive empty-directory guarantee.
+    pub(crate) fn remove_empty(self) -> Result<()> {
+        if !same_reserved_directory(&self)? {
+            bail!("proof_availability_case_diagnostic_cleanup_failed")
+        }
+        fs::remove_dir(&self.path)
+            .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_cleanup_failed"))
+    }
+}
+
+pub(crate) fn reserve_case_diagnostic(
+    output_parent: &Path,
+    qualification_id: &str,
+) -> Result<CaseDiagnosticReservation> {
+    let metadata = fs::symlink_metadata(output_parent)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_parent_invalid"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("proof_availability_case_diagnostic_parent_invalid")
+    }
+    let path = output_parent.join(format!(
+        ".codestory-proof-availability-case-diagnostic-{qualification_id}"
+    ));
+    fs::create_dir(&path)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_exists"))?;
+    if set_private_directory(&path).is_err() {
+        let _ = fs::remove_dir(&path);
+        bail!("proof_availability_case_diagnostic_create_failed")
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("proof_availability_case_diagnostic_create_failed")
+    }
+    Ok(CaseDiagnosticReservation {
+        path,
+        #[cfg(unix)]
+        device: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.dev()
+        },
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.ino()
+        },
+    })
+}
+
+pub(crate) fn write_invalid_case_diagnostic(
+    reservation: &CaseDiagnosticReservation,
+    qualification_id: &str,
+    source_commit: &str,
+    source_tree: &str,
+    failure: &CaseValidationFailure,
+    forbidden_values: &[String],
+) -> Result<()> {
+    if !same_reserved_directory(reservation)? {
+        bail!("proof_availability_case_diagnostic_write_failed")
+    }
+    let unredacted_case = serde_json::to_value(&failure.case)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    let case_sha256 = domain_sha256(
+        b"codestory.proof-availability.invalid-case-unredacted.v1\\0",
+        &canonical_json_bytes(&unredacted_case)?,
+    );
+    let mut redacted_case = unredacted_case;
+    let mut text_commitments = Vec::new();
+    redact_text_values(&mut redacted_case, "", &mut text_commitments)?;
+    let artifact = json!({
+        "schema": CASE_DIAGNOSTIC_SCHEMA,
+        "classification": "non_evidence",
+        "qualification_id": qualification_id,
+        "validator_source_commit": source_commit,
+        "validator_source_tree": source_tree,
+        "case_ordinal": failure.case_ordinal,
+        "case_id": failure.case.case_id,
+        "repository_id": failure.case.repository_id,
+        "failure_code": "proof_availability_case_invalid",
+        "unredacted_case_sha256": case_sha256,
+        "project_materialization": failure.project,
+        "case": redacted_case,
+        "removed_text_commitments": text_commitments,
+    });
+    validate_private_diagnostic_value(&artifact, forbidden_values)?;
+    let bytes = canonical_json_file(&artifact)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    if bytes.len() > MAX_CASE_DIAGNOSTIC_BYTES {
+        bail!("proof_availability_case_diagnostic_write_failed")
+    }
+    write_private_diagnostic_file(&reservation.path.join(CASE_DIAGNOSTIC_FILE), &bytes)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
+    sync_directory(&reservation.path)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))
+}
+
+fn same_reserved_directory(reservation: &CaseDiagnosticReservation) -> Result<bool> {
+    let metadata = fs::symlink_metadata(&reservation.path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(metadata.dev() == reservation.device && metadata.ino() == reservation.inode)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(true)
+    }
+}
+
+fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>> {
+    codestory_agent::proof_qualification_support::canonical_json_bytes(value)
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))
+}
+
+fn domain_sha256(domain: &[u8], bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
+fn redact_text_values(
+    value: &mut Value,
+    pointer: &str,
+    commitments: &mut Vec<Value>,
+) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            if let Some(text) = object.remove("text") {
+                let text = text.as_str().ok_or_else(|| {
+                    anyhow::anyhow!("proof_availability_case_diagnostic_write_failed")
+                })?;
+                commitments.push(json!({
+                    "json_pointer": format!("{pointer}/text"),
+                    "utf8_byte_length": text.len(),
+                    "sha256": domain_sha256(b"codestory.proof-availability.removed-text.v1\\0", text.as_bytes()),
+                }));
+            }
+            for (key, nested) in object.iter_mut() {
+                redact_text_values(
+                    nested,
+                    &format!("{pointer}/{}", json_pointer_escape(key)),
+                    commitments,
+                )?;
+            }
+        }
+        Value::Array(array) => {
+            for (index, nested) in array.iter_mut().enumerate() {
+                redact_text_values(nested, &format!("{pointer}/{index}"), commitments)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn json_pointer_escape(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
+}
+
+fn validate_private_diagnostic_value(value: &Value, forbidden_values: &[String]) -> Result<()> {
+    match value {
+        Value::Object(object) => {
+            for (key, nested) in object {
+                let lower = key.to_ascii_lowercase();
+                if matches!(lower.as_str(), "text" | "source_text")
+                    || [
+                        "secret",
+                        "token",
+                        "password",
+                        "private-key",
+                        "private_key",
+                        "api-key",
+                        "api_key",
+                    ]
+                    .iter()
+                    .any(|needle| lower.contains(needle))
+                {
+                    bail!("proof_availability_case_diagnostic_unsafe_value")
+                }
+                validate_private_diagnostic_value(nested, forbidden_values)?;
+            }
+        }
+        Value::Array(array) => {
+            for nested in array {
+                validate_private_diagnostic_value(nested, forbidden_values)?;
+            }
+        }
+        Value::String(string)
+            if is_absolute_path(string)
+                || forbidden_values
+                    .iter()
+                    .any(|needle| !needle.is_empty() && string.contains(needle)) =>
+        {
+            bail!("proof_availability_case_diagnostic_unsafe_value")
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_absolute_path(value: &str) -> bool {
+    Path::new(value).is_absolute()
+        || value.starts_with("\\\\")
+        || value.as_bytes().get(1).is_some_and(|byte| *byte == b':')
+}
+
+fn write_private_diagnostic_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".invalid-case-v1-")
+        .tempfile_in(
+            path.parent()
+                .ok_or_else(|| std::io::Error::other("missing parent"))?,
+        )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(bytes)?;
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
+    Ok(())
+}
 
 #[derive(Debug)]
 pub(crate) struct QualificationReportInputV1 {
@@ -1256,6 +1510,85 @@ mod tests {
             canonical_json_file(&json!({"z":2,"a":1})).unwrap(),
             b"{\"a\":1,\"z\":2}\n"
         );
+    }
+
+    #[test]
+    fn case_diagnostic_reservation_is_private_and_no_replace() {
+        let root = tempfile::tempdir().unwrap();
+        let qualification_id = "20260821T120000Z-222222222222";
+        let reservation = reserve_case_diagnostic(root.path(), qualification_id).unwrap();
+        assert!(reservation.path().is_dir());
+        let reservation_path = reservation.path().to_path_buf();
+        assert_eq!(
+            reserve_case_diagnostic(root.path(), qualification_id)
+                .unwrap_err()
+                .to_string(),
+            "proof_availability_case_diagnostic_exists"
+        );
+        reservation.remove_empty().unwrap();
+        assert!(!reservation_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn case_diagnostic_reservation_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let reservation =
+            reserve_case_diagnostic(root.path(), "20260821T120000Z-222222222222").unwrap();
+        assert_eq!(
+            fs::metadata(reservation.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        reservation.remove_empty().unwrap();
+    }
+
+    #[test]
+    fn case_diagnostic_redacts_text_and_rejects_unsafe_values() {
+        let mut value = json!({
+            "receipt": {"text": "a\nλ", "other": [ {"text": "b"} ]}
+        });
+        let mut commitments = Vec::new();
+        redact_text_values(&mut value, "", &mut commitments).unwrap();
+        assert_eq!(value, json!({"receipt": {"other": [{}]}}));
+        assert_eq!(
+            commitments,
+            vec![
+                json!({
+                    "json_pointer": "/receipt/text",
+                    "utf8_byte_length": 4,
+                    "sha256": domain_sha256(b"codestory.proof-availability.removed-text.v1\\0", "a\nλ".as_bytes()),
+                }),
+                json!({
+                    "json_pointer": "/receipt/other/0/text",
+                    "utf8_byte_length": 1,
+                    "sha256": domain_sha256(b"codestory.proof-availability.removed-text.v1\\0", b"b"),
+                }),
+            ]
+        );
+        for unsafe_value in [
+            json!({"source_text": "private"}),
+            json!({"api_token": "private"}),
+            json!({"location": "/Users/albert/private"}),
+            json!({"location": "C:\\\\private"}),
+        ] {
+            assert!(validate_private_diagnostic_value(&unsafe_value, &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn case_diagnostic_file_is_newline_terminated_and_no_clobber() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join(CASE_DIAGNOSTIC_FILE);
+        write_private_diagnostic_file(&target, b"{}\\n").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"{}\\n");
+        assert!(write_private_diagnostic_file(&target, b"changed\\n").is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"{}\\n");
     }
 
     #[test]

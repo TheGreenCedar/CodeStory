@@ -7,12 +7,13 @@ mod contracts;
 use clap::Parser;
 use contracts::{
     ActivationDecisionV1, ActualProductResultV1, CandidateFailureV1, CandidateGateV1,
-    ClauseClassificationV1, CohortPathFileV1, CorpusV1, ExactScopeSelectorV1,
-    ExactSymbolSelectorV1, FinalizationTraceV1, FunnelOutcomeV1, MAX_CANDIDATE_EDGES_PER_STEP,
-    MAX_OBSERVED_RECEIPTS_PER_CASE, ObservedReceiptV1, ProofContractFieldV1,
-    ProofQualificationTraceV1, QualificationSummaryV1, ReceiptOracleComparisonV1, SchemaDocument,
-    SelectorGateOutcomeV1, ThresholdsV1, TransportEvidenceV1, canonical_cohort_path_file_sha256,
-    canonical_corpus_sha256, canonical_thresholds_sha256,
+    CaseValidationFailure, ClauseClassificationV1, CohortPathFileV1, CorpusV1,
+    ExactScopeSelectorV1, ExactSymbolSelectorV1, FinalizationTraceV1, FunnelOutcomeV1,
+    MAX_CANDIDATE_EDGES_PER_STEP, MAX_OBSERVED_RECEIPTS_PER_CASE, ObservedReceiptV1,
+    ProofContractFieldV1, ProofQualificationTraceV1, QualificationSummaryV1,
+    ReceiptOracleComparisonV1, SchemaDocument, SelectorGateOutcomeV1, ThresholdsV1,
+    TransportEvidenceV1, canonical_cohort_path_file_sha256, canonical_corpus_sha256,
+    canonical_thresholds_sha256,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1292,6 +1293,28 @@ fn threshold_corpus_summary_digest_dag_rejects_stale_or_mismatched_inputs() {
         .expect("summary")
         .validate_against_inputs(&altered_corpus, &threshold)
         .expect_err("summary corpus hash must bind exact corpus semantics");
+}
+
+#[test]
+fn invalid_case_retains_private_payload_but_renders_only_the_safe_umbrella() {
+    let threshold = ThresholdsV1::from_json(thresholds()).expect("thresholds");
+    let frozen_corpus = CorpusV1::from_json(corpus()).expect("corpus");
+    let mut invalid = report();
+    invalid["cases"][0]["negative_mutations"] = json!([]);
+    rebind_results_digest(&mut invalid);
+    let summary: QualificationSummaryV1 = serde_json::from_value(invalid).expect("shape");
+    let error = summary
+        .validate_against_inputs(&frozen_corpus, &threshold)
+        .expect_err("negative-mutation cardinality must remain invalid");
+    let failure = error
+        .downcast_ref::<CaseValidationFailure>()
+        .expect("private invalid-case payload");
+    assert_eq!(failure.case_ordinal, 0);
+    assert_eq!(failure.case.case_id, "codestory-rust-l1-0");
+    assert_eq!(failure.case.repository_id, "codestory-rust");
+    assert_eq!(failure.to_string(), "proof_availability_case_invalid");
+    assert_eq!(format!("{failure:?}"), "proof_availability_case_invalid");
+    assert_eq!(error.to_string(), "proof_availability_case_invalid");
 }
 
 #[test]

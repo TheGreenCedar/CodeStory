@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
 pub const PATH_FILE_SCHEMA: &str = "codestory.proof-availability-path-file/v1";
@@ -2446,6 +2447,29 @@ pub struct CaseReportV1 {
     pub negative_mutations: Vec<NegativeMutationResultV1>,
     pub proof_trace: ProofQualificationTraceV1,
 }
+
+/// Internal-only payload retained long enough to produce the owner-private
+/// invalid-case diagnostic. Its formatters deliberately expose no case data:
+/// this error is propagated to the CLI stderr path.
+pub(crate) struct CaseValidationFailure {
+    pub(crate) case_ordinal: usize,
+    pub(crate) case: Box<CaseReportV1>,
+    pub(crate) project: Option<ProjectMaterializationEvidenceV1>,
+}
+
+impl fmt::Display for CaseValidationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("proof_availability_case_invalid")
+    }
+}
+
+impl fmt::Debug for CaseValidationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("proof_availability_case_invalid")
+    }
+}
+
+impl std::error::Error for CaseValidationFailure {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CaseReceiptMetricsV1 {
     pub observed_receipt_count: u64,
@@ -2970,7 +2994,7 @@ impl QualificationSummaryV1 {
         let mut expected_unclassified = 0u16;
         let mut expected_classified = 0u16;
         let mut mutation_ids = BTreeSet::new();
-        for c in &self.cases {
+        for (case_ordinal, c) in self.cases.iter().enumerate() {
             c.receipt_metrics()?;
             if empty(&c.case_id)
                 || empty(&c.repository_id)
@@ -3022,7 +3046,17 @@ impl QualificationSummaryV1 {
                 )
                 || !valid_disposition_structure(c)
             {
-                bail!("proof_availability_case_invalid")
+                return Err(CaseValidationFailure {
+                    case_ordinal,
+                    case: Box::new(c.clone()),
+                    project: self
+                        .environment
+                        .projects
+                        .iter()
+                        .find(|project| project.repository_id == c.repository_id)
+                        .cloned(),
+                }
+                .into());
             }
             *cases_per_project
                 .entry(c.repository_id.as_str())
