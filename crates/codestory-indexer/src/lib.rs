@@ -996,6 +996,7 @@ struct PreparedIndexInput {
 #[derive(Debug)]
 struct PreparedStructuralInput {
     full_path: PathBuf,
+    role_classification_path: PathBuf,
     artifact_cache_path: Option<PathBuf>,
     artifact_cache_key: Option<String>,
     source: String,
@@ -3244,6 +3245,9 @@ impl WorkspaceIndexer {
         stats: &mut IncrementalIndexingStats,
     ) -> std::result::Result<PreparedIndexWork, IntermediateStorage> {
         let full_path = Self::normalize_index_path(root, path);
+        let role_classification_path =
+            codestory_workspace::workspace_relative_path(root, &full_path)
+                .unwrap_or_else(|| path.to_path_buf());
         let language = structural::structural_language_name(&full_path);
         let producer = structural::structural_producer(&full_path)
             .expect("admitted structural paths have one producer");
@@ -3324,6 +3328,7 @@ impl WorkspaceIndexer {
         stats.structural_artifact_cache.record_lookup();
         let prepared_input = || PreparedStructuralInput {
             full_path: full_path.clone(),
+            role_classification_path: role_classification_path.clone(),
             artifact_cache_path: artifact_cache_path.clone(),
             artifact_cache_key: artifact_cache_key.clone(),
             source: source.clone(),
@@ -3499,6 +3504,8 @@ impl WorkspaceIndexer {
         if codestory_contracts::language_support::is_github_actions_workflow_path(
             path_text.as_ref(),
         ) || codestory_contracts::language_support::is_docker_compose_file_path(
+            path_text.as_ref(),
+        ) || codestory_contracts::language_support::is_typescript_config_jsonc_file_path(
             path_text.as_ref(),
         ) {
             return Ok(None);
@@ -3714,8 +3721,9 @@ impl WorkspaceIndexer {
             .as_ref()
             .map(|policy| policy.structural_unit_cap)
             .unwrap_or(codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP);
-        let collected = match structural::index_structural_source_with_unit_cap(
+        let collected = match structural::index_structural_source_with_role_and_unit_cap(
             &prepared_input.full_path,
+            &prepared_input.role_classification_path,
             &prepared_input.source,
             structural_unit_cap,
             self.structural_source_byte_cap,

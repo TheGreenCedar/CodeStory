@@ -1944,6 +1944,7 @@ fn structural_source_drift_discards_units_and_cache_write_even_with_restored_mti
     let content_hash = source_content_hash(original.as_bytes());
     let prepared = PreparedStructuralInput {
         full_path: path.clone(),
+        role_classification_path: PathBuf::from("schema.sql"),
         artifact_cache_path: Some(PathBuf::from("schema.sql")),
         artifact_cache_key: Some("v1:original".to_string()),
         source: original.to_string(),
@@ -2121,6 +2122,11 @@ fn prepare_path_preserves_specialized_structural_and_openapi_routing() -> Result
             "[package]\nname = \"app\"\n",
             "structural_cargo_manifest_collector",
         ),
+        (
+            "tsconfig.json",
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/health\":{\"get\":{}}},\"compilerOptions\":{\"strict\":true}}",
+            "structural_typescript_config_jsonc_collector",
+        ),
     ];
     for (relative, source, _expected_producer) in fixtures {
         let path = dir.path().join(relative);
@@ -2229,6 +2235,49 @@ fn prepare_path_preserves_specialized_structural_and_openapi_routing() -> Result
         Ok(_) => panic!("parser-backed .sh entered structural fallback"),
         Err(_) => panic!("parser-backed .sh preparation failed"),
     }
+    Ok(())
+}
+
+#[test]
+fn structural_zero_byte_role_uses_the_workspace_relative_path() -> Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path().join("target/workspace");
+    let relative = PathBuf::from("src/__tests__/fixtures/empty.json");
+    let full_path = root.join(&relative);
+    std::fs::create_dir_all(full_path.parent().expect("fixture parent"))?;
+    std::fs::write(&full_path, [])?;
+
+    let indexer = WorkspaceIndexer::new(root.clone());
+    let mut storage = Storage::new_in_memory()?;
+    let symbol_table = Arc::new(SymbolTable::new());
+    let mut stats = IncrementalIndexingStats::default();
+    let prepared_result = {
+        let mut cache_access =
+            ArtifactCacheAccess::storage(&mut storage, ArtifactCachePolicies::default());
+        indexer.prepare_index_work(
+            &mut cache_access,
+            &relative,
+            &root,
+            None,
+            &symbol_table,
+            &mut stats,
+        )
+    };
+    let prepared = match prepared_result {
+        Ok(prepared) => prepared,
+        Err(_) => panic!("zero-byte test JSON preparation failed"),
+    };
+    let input = match prepared {
+        PreparedIndexWork::Structural(input) => input,
+        _ => panic!("zero-byte test JSON must enter structural collection"),
+    };
+    let projected = indexer.execute_prepared_structural_index(&input);
+    assert!(projected.local_storage.errors.is_empty());
+    assert_eq!(
+        projected.local_storage.files[0].file_role,
+        codestory_store::FileRole::Test
+    );
+    assert!(projected.local_storage.structural_text_units.is_empty());
     Ok(())
 }
 

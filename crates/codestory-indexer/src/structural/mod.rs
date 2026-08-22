@@ -332,6 +332,22 @@ pub(crate) fn index_structural_source_with_unit_cap(
     structural_unit_cap: u64,
     structural_byte_cap: u64,
 ) -> std::result::Result<IntermediateStorage, StructuralCollectionError> {
+    index_structural_source_with_role_and_unit_cap(
+        path,
+        path,
+        source,
+        structural_unit_cap,
+        structural_byte_cap,
+    )
+}
+
+pub(crate) fn index_structural_source_with_role_and_unit_cap(
+    path: &Path,
+    role_classification_path: &Path,
+    source: &str,
+    structural_unit_cap: u64,
+    structural_byte_cap: u64,
+) -> std::result::Result<IntermediateStorage, StructuralCollectionError> {
     if source.len() as u64 > structural_byte_cap {
         return Err(StructuralCollectionError::SourceByteLimit {
             observed_size: source.len() as u64,
@@ -343,6 +359,7 @@ pub(crate) fn index_structural_source_with_unit_cap(
     }
     let mut storage = IntermediateStorage::default();
     let (file_node, _file_name, file_id) = crate::file_node_from_source(path, source);
+    let file_role = codestory_store::FileRole::classify_path(role_classification_path);
     storage.files.push(codestory_store::FileInfo {
         id: file_id.0,
         path: path.to_path_buf(),
@@ -351,16 +368,17 @@ pub(crate) fn index_structural_source_with_unit_cap(
         indexed: true,
         complete: true,
         line_count: source.lines().count() as u32,
-        file_role: codestory_store::FileRole::classify_path(path),
+        file_role,
     });
     storage.nodes.push(file_node);
 
     let path_key = path.to_string_lossy();
     let exact_empty_test_or_benchmark_json = source.is_empty()
         && matches!(structural_extension(path).as_deref(), Some("json"))
-        // The helper deliberately recognizes test/benchmark scope even when
-        // an absolute build-root ancestor has stronger diagnostic role precedence.
-        && codestory_store::FileRole::path_is_test_or_bench(path_key.as_ref());
+        && matches!(
+            file_role,
+            codestory_store::FileRole::Test | codestory_store::FileRole::Benchmark
+        );
     if exact_empty_test_or_benchmark_json {
         // A zero-byte test or benchmark artifact is a verified complete file,
         // deliberately without structural evidence or semantic claims.
@@ -1031,12 +1049,28 @@ mod tests {
     }
 
     #[test]
-    fn exact_empty_test_json_stays_admitted_when_an_absolute_parent_looks_generated() {
-        let path = Path::new("/tmp/proof/target/workspaces/vite/src/__tests__/fixtures/empty.json");
-        let storage = index_structural_source(path, "")
-            .expect("test scope must win for zero-byte structural JSON admission");
-        assert_eq!(storage.nodes.len(), 1);
-        assert!(storage.structural_unit_node_ids.is_empty());
+    fn exact_empty_json_requires_the_existing_test_or_benchmark_file_role() {
+        for (path, expected_role) in [
+            (
+                "/tmp/proof/target/workspaces/vite/src/__tests__/fixtures/empty.json",
+                codestory_store::FileRole::Generated,
+            ),
+            (
+                "/tmp/proof/vendor/fixture/tests/empty.json",
+                codestory_store::FileRole::Vendor,
+            ),
+        ] {
+            let path = Path::new(path);
+            assert_eq!(
+                codestory_store::FileRole::classify_path(path),
+                expected_role,
+                "role precedence must remain intact for {path:?}"
+            );
+            assert!(matches!(
+                index_structural_source(path, ""),
+                Err(StructuralCollectionError::Malformed(_))
+            ));
+        }
     }
 
     #[test]
