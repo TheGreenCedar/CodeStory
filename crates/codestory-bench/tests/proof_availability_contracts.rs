@@ -2251,6 +2251,97 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         .expect_err("Task 6 receipts must retain and require Certain certainty");
 }
 
+#[test]
+fn admitted_callsite_identity_is_opaque_after_task6() {
+    use codestory_agent::proof_qualification_support::{
+        CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
+        ReceiptRef, ResolvedNodeIdentity,
+    };
+    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+
+    const RAW_TARGET: i64 = -8_657_445_931_347_514_024;
+    const RESOLVED_TARGET: i64 = -8_657_442_632_812_629_391;
+
+    let path_file =
+        CohortPathFileV1::from_json(cohort_path_file("codestory-rust")).expect("oracle path file");
+    let oracle = &path_file.paths[0].oracle_steps[0];
+    let project_file_components = oracle
+        .receipt_line_window
+        .path
+        .split('/')
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let identity =
+        |node_id: i64, declaration: &contracts::OracleDeclarationV1| ResolvedNodeIdentity {
+            pinned: PinnedNodeIdentity {
+                project_id: "project".into(),
+                core_generation_id: "generation".into(),
+                core_run_id: "run".into(),
+                node_id: node_id.to_string(),
+            },
+            canonical_id: format!("canonical-{node_id}"),
+            qualified_name: declaration.symbol.clone(),
+            project_file_components: project_file_components.clone(),
+        };
+    let callsite_identity = format!("-3:{}:0:{RAW_TARGET}|fixture", oracle.callsite_line);
+    let receipt = IndexedCallEdgeReceipt {
+        receipt: ReceiptRef {
+            receipt_id: "indexed-call-edge:raw-resolved-split".into(),
+            edge_id: "-42".into(),
+        },
+        source: identity(-1, &oracle.caller),
+        target: identity(RESOLVED_TARGET, &oracle.target),
+        certainty: ResolutionCertainty::Certain,
+        callsite_identity: callsite_identity.clone(),
+        containment: CallableContainmentEvidence {
+            file_node_id: NodeId(-3),
+            owner_node_id: NodeId(-1),
+            start_line: oracle.callsite_line,
+            end_line: oracle.callsite_line,
+        },
+        line_window: IndexedLineWindow {
+            kind: "indexed_line_v1",
+            project_file_components,
+            indexed_sha256: oracle.receipt_file_sha256.clone(),
+            observed_sha256: oracle.receipt_file_sha256.clone(),
+            anchor_line: oracle.callsite_line,
+            byte_start: usize::try_from(oracle.receipt_line_window.start_byte).unwrap(),
+            byte_end: usize::try_from(oracle.receipt_line_window.end_byte).unwrap(),
+            text: "call();\n".into(),
+        },
+    };
+
+    let observed = contracts::observed_receipt_from_task6(0, &receipt, oracle)
+        .expect("Task 6 already admitted the raw call occurrence");
+    assert_eq!(observed.callsite_identity, callsite_identity);
+    assert_eq!(observed.target.pinned.node_id, RESOLVED_TARGET.to_string());
+
+    let mut closed = report();
+    closed["cases"][0]["receipt_evidence"]["observed_receipts"][0]["callsite_identity"] =
+        json!(format!("-10000:1:0:{RAW_TARGET}|fixture"));
+    closed["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"]["pinned"]["node_id"] =
+        json!(RESOLVED_TARGET.to_string());
+    closed["cases"][0]["proof_trace"]["selectors"][1]["outcome"]["node_id"] =
+        json!(RESOLVED_TARGET);
+    rebind_results_digest(&mut closed);
+
+    let mut empty_identity = closed.clone();
+    empty_identity["cases"][0]["receipt_evidence"]["observed_receipts"][0]["callsite_identity"] =
+        json!("");
+    rebind_results_digest(&mut empty_identity);
+    QualificationSummaryV1::from_json(empty_identity)
+        .expect_err("the opaque diagnostic identity remains non-empty");
+
+    let parsed = QualificationSummaryV1::from_json(closed)
+        .expect("closed report validation keeps the admitted identity opaque");
+    parsed
+        .validate_against_oracle(
+            &CorpusV1::from_json(corpus()).expect("corpus"),
+            &parsed_path_files(),
+        )
+        .expect("the raw and resolved targets retain the same frozen oracle relation");
+}
+
 fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
     let mut value = report();
     let case = &mut value["cases"][0];

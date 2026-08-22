@@ -4478,22 +4478,15 @@ fn valid_observed_receipt_shape(receipt: &ObservedReceiptV1) -> bool {
     let Some(source_node_id) = valid_resolved_node_identity(&receipt.source) else {
         return false;
     };
-    let Some(target_node_id) = valid_resolved_node_identity(&receipt.target) else {
+    if valid_resolved_node_identity(&receipt.target).is_none() {
         return false;
-    };
-    let Some((file_node_id, callsite_line, _, callsite_target_node_id)) =
-        parse_callsite_identity(&receipt.callsite_identity)
-    else {
-        return false;
-    };
+    }
     valid_receipt_id(&receipt.receipt_id)
         && receipt.certainty == ReceiptCertaintyV1::Certain
         && receipt.source.pinned.project_id == receipt.target.pinned.project_id
         && receipt.source.pinned.core_generation_id == receipt.target.pinned.core_generation_id
         && receipt.source.pinned.core_run_id == receipt.target.pinned.core_run_id
-        && callsite_line == receipt.callsite_line
-        && file_node_id == receipt.containment.file_node_id
-        && callsite_target_node_id == target_node_id
+        && !empty(&receipt.callsite_identity)
         && receipt.containment.owner_node_id == source_node_id
         && receipt.containment.start_line > 0
         && receipt.containment.start_line <= receipt.callsite_line
@@ -4507,29 +4500,6 @@ fn valid_receipt_id(receipt_id: &str) -> bool {
     receipt_id
         .strip_prefix("indexed-call-edge:")
         .is_some_and(|suffix| !empty(suffix))
-}
-
-fn parse_callsite_identity(identity: &str) -> Option<(i64, u32, u32, i64)> {
-    if empty(identity) {
-        return None;
-    }
-    let pre_marker = identity
-        .split_once('|')
-        .map_or(identity, |(identity, _)| identity);
-    let mut fields = pre_marker.split(':');
-    let parsed = (
-        fields.next().and_then(|value| value.parse::<i64>().ok()),
-        fields.next().and_then(|value| value.parse::<u32>().ok()),
-        fields.next().and_then(|value| value.parse::<u32>().ok()),
-        fields.next().and_then(|value| value.parse::<i64>().ok()),
-    );
-    let (Some(file), Some(parsed_line), Some(column_or_ordinal), Some(target)) = parsed else {
-        return None;
-    };
-    (fields.next().is_none()
-        && parsed_line > 0
-        && format!("{file}:{parsed_line}:{column_or_ordinal}:{target}") == pre_marker)
-        .then_some((file, parsed_line, column_or_ordinal, target))
 }
 
 fn valid_resolved_node_identity(identity: &ResolvedNodeIdentityV1) -> Option<i64> {
