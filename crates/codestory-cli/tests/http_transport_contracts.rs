@@ -527,6 +527,14 @@ fn assert_nonempty_array(value: &Value, pointer: &str) -> usize {
     items.len()
 }
 
+fn required_nonempty_string<'a>(value: &'a Value, pointer: &str) -> &'a str {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| panic!("expected nonempty string at {pointer}: {value}"))
+}
+
 fn max_node_depth(value: &Value, pointer: &str) -> u64 {
     value
         .pointer(pointer)
@@ -782,17 +790,133 @@ fn http_smoke_keeps_existing_routes_and_default_semantics_against_indexed_repo()
     publish_zero_dense_agent_fixture(&search_fixture);
     let (_search_server, search_addr) = spawn_http_server(&search_fixture);
     let search = get_json(&search_addr, "/search?q=HTTP_METADATA_ANCHOR&repo_text=on");
-    assert_eq!(search["query"], "HTTP_METADATA_ANCHOR", "{search}");
+    assert_eq!(search["schema_version"], 3, "{search}");
+    assert_eq!(search["kind"], "complete", "{search}");
+    assert_eq!(search["status"], "available", "{search}");
+    assert_eq!(search["retrieval"]["state"], "full", "{search}");
     assert!(
-        search["_meta"]["codestory_publication"]["core_publication"].is_object()
-            && search["_meta"]["codestory_publication"]["retrieval_publication"].is_object()
-            && search["_meta"]["codestory_publication"]["operation"]["operation_id"].is_string(),
-        "/search success must retain the complete core and retrieval publications plus operation identity: {search}"
+        search["retrieval"]["generation_id"].is_string()
+            && search["publication"]["core"]["project_id"].is_string()
+            && search["publication"]["core"]["generation_id"].is_string()
+            && search["publication"]["core"]["run_id"].is_string()
+            && search["publication"]["retrieval"].is_object(),
+        "/search success must identify the full retrieval and complete publication: {search}"
     );
     assert_eq!(
-        search["_meta"]["codestory_publication"]["retrieval_publication"]["core_generation_id"],
-        search["_meta"]["codestory_publication"]["core_publication"]["generation_id"],
+        search["publication"]["retrieval"]["core_generation_id"],
+        search["publication"]["core"]["generation_id"],
+        "/search retrieval must bind the served core generation: {search}"
+    );
+    assert_eq!(
+        search["publication"]["retrieval"]["core_run_id"], search["publication"]["core"]["run_id"],
+        "/search retrieval must bind the served core run: {search}"
+    );
+    assert_eq!(
+        search["retrieval"]["generation_id"],
+        search["publication"]["retrieval"]["retrieval_generation"],
+        "/search retrieval descriptor must name the served retrieval generation: {search}"
+    );
+    assert!(
+        search["evidence"]
+            .as_array()
+            .is_some_and(|evidence| evidence.iter().any(|row| {
+                row["path"] == "metadata.rs"
+                    && row["excerpt"]
+                        .as_str()
+                        .is_some_and(|excerpt| excerpt.contains("HTTP_METADATA_ANCHOR"))
+            })),
+        "/search evidence must retain the matched source path and anchor: {search}"
+    );
+    assert!(
+        search["gaps"].as_array().is_some_and(Vec::is_empty) && search["continuation"].is_null(),
+        "complete available /search evidence must not invent a gap or continuation: {search}"
+    );
+    for legacy_field in ["query", "hits", "proof"] {
+        assert!(
+            search.get(legacy_field).is_none(),
+            "/search schema-3 projection must omit legacy field {legacy_field}: {search}"
+        );
+    }
+    let search_text = search.to_string();
+    for proof_authority in ["disposition", "proof_status", "supported"] {
+        assert!(
+            !search_text.contains(&format!("\"{proof_authority}\"")),
+            "/search evidence must not expose proof authority {proof_authority}: {search}"
+        );
+    }
+    assert!(
+        search["_meta"]["codestory_publication"]["schema_version"] == 3
+            && search["_meta"]["codestory_publication"]["minimum_compatible_schema_version"] == 3
+            && search["_meta"]["codestory_publication"]["served_from"] == "complete_publication"
+            && search["_meta"]["codestory_publication"]["core_publication"]["mode"] == "full"
+            && search["_meta"]["codestory_publication"]["core_publication"].is_object()
+            && search["_meta"]["codestory_publication"]["retrieval_publication"].is_object()
+            && search["_meta"]["codestory_publication"]["operation"]["operation_id"].is_string(),
+        "/search success metadata must retain schema 3 and the complete core and retrieval publications plus operation identity: {search}"
+    );
+    required_nonempty_string(&search, "/publication/core/project_id");
+    let public_core_generation_id =
+        required_nonempty_string(&search, "/publication/core/generation_id");
+    let public_core_run_id = required_nonempty_string(&search, "/publication/core/run_id");
+    let public_retrieval_core_generation_id =
+        required_nonempty_string(&search, "/publication/retrieval/core_generation_id");
+    let public_retrieval_core_run_id =
+        required_nonempty_string(&search, "/publication/retrieval/core_run_id");
+    let public_retrieval_generation =
+        required_nonempty_string(&search, "/publication/retrieval/retrieval_generation");
+    let public_retrieval_descriptor_generation =
+        required_nonempty_string(&search, "/retrieval/generation_id");
+    let metadata_core_generation_id = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/core_publication/generation_id",
+    );
+    let metadata_core_run_id = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/core_publication/run_id",
+    );
+    let metadata_retrieval_core_generation_id = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/retrieval_publication/core_generation_id",
+    );
+    let metadata_retrieval_core_run_id = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/retrieval_publication/core_run_id",
+    );
+    let metadata_retrieval_generation = required_nonempty_string(
+        &search,
+        "/_meta/codestory_publication/retrieval_publication/retrieval_generation",
+    );
+    assert_eq!(
+        metadata_retrieval_core_generation_id, metadata_core_generation_id,
         "/search retrieval evidence must bind the served core publication: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_core_run_id, metadata_core_run_id,
+        "/search metadata retrieval evidence must bind the served core run: {search}"
+    );
+    assert_eq!(
+        metadata_core_generation_id, public_core_generation_id,
+        "/search metadata must name the public core generation: {search}"
+    );
+    assert_eq!(
+        metadata_core_run_id, public_core_run_id,
+        "/search metadata must name the public core run: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_core_generation_id, public_retrieval_core_generation_id,
+        "/search metadata retrieval must name the public retrieval core generation: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_core_run_id, public_retrieval_core_run_id,
+        "/search metadata retrieval must name the public retrieval core run: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_generation, public_retrieval_generation,
+        "/search metadata must name the public retrieval generation: {search}"
+    );
+    assert_eq!(
+        metadata_retrieval_generation, public_retrieval_descriptor_generation,
+        "/search metadata must bind the public retrieval descriptor generation: {search}"
     );
 
     let definition = get_json(&addr, "/definition?q=AppController");
