@@ -14,6 +14,7 @@ mod docker_compose;
 mod generic;
 mod github_actions;
 mod html;
+mod jsonc;
 mod sql;
 
 pub(crate) use blanking::byte_offset_line_col;
@@ -31,6 +32,7 @@ use anyhow::Result;
 use codestory_contracts::graph::NodeId;
 use codestory_contracts::language_support::{
     is_cargo_manifest_file_path, is_docker_compose_file_path, is_github_actions_workflow_path,
+    is_typescript_config_jsonc_file_path,
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -102,6 +104,9 @@ pub(crate) fn decode_structural_source(
 
 pub(crate) fn structural_producer(path: &Path) -> Option<&'static str> {
     let path_text = path.to_string_lossy();
+    if is_typescript_config_jsonc_file_path(path_text.as_ref()) {
+        return Some("structural_typescript_config_jsonc_collector");
+    }
     if is_github_actions_workflow_path(path_text.as_ref()) {
         return Some("structural_github_actions_workflow_collector");
     }
@@ -351,7 +356,17 @@ pub(crate) fn index_structural_source_with_unit_cap(
     storage.nodes.push(file_node);
 
     let path_key = path.to_string_lossy();
-    if is_github_actions_workflow_path(path_key.as_ref()) {
+    let exact_empty_test_or_benchmark_json = source.is_empty()
+        && matches!(structural_extension(path).as_deref(), Some("json"))
+        // The helper deliberately recognizes test/benchmark scope even when
+        // an absolute build-root ancestor has stronger diagnostic role precedence.
+        && codestory_store::FileRole::path_is_test_or_bench(path_key.as_ref());
+    if exact_empty_test_or_benchmark_json {
+        // A zero-byte test or benchmark artifact is a verified complete file,
+        // deliberately without structural evidence or semantic claims.
+    } else if is_typescript_config_jsonc_file_path(path_key.as_ref()) {
+        jsonc::collect_typescript_config_jsonc_entities(path, source, file_id, &mut storage)?;
+    } else if is_github_actions_workflow_path(path_key.as_ref()) {
         github_actions::collect_github_actions_workflow_entities(
             path,
             source,
@@ -859,6 +874,169 @@ mod tests {
                 "missing streamed JSON object-key anchor {expected}"
             );
         }
+    }
+
+    #[test]
+    fn typescript_config_jsonc_accepts_comments_and_trailing_commas_with_exact_key_anchors() {
+        let source = concat!(
+            "{\n",
+            "  // \"commentedOut\": false\n",
+            "  \"compilerOptions\": {\n",
+            "    /* URL: https://example.com/\\\"quoted\\\" */\n",
+            "    \"strict\": true,\n",
+            "  },\n",
+            "  \"endpoint\": \"https://example.com//keep/*literal*/\\\"quote\\\"\",\n",
+            "}\n",
+        );
+        let storage = index_structural_source(Path::new("tsconfig.build.json"), source)
+            .expect("recognized TypeScript configs should accept strict JSONC");
+
+        let mut anchors = storage
+            .nodes
+            .iter()
+            .filter(|node| node.kind != NodeKind::FILE)
+            .map(|node| {
+                std::str::from_utf8(
+                    exact_source_range_bytes(
+                        source,
+                        node.start_line.expect("anchor start line"),
+                        node.start_col.expect("anchor start column"),
+                        node.end_line.expect("anchor end line"),
+                        node.end_col.expect("anchor end column"),
+                    )
+                    .expect("exact key span"),
+                )
+                .expect("UTF-8 key span")
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        anchors.sort();
+        assert_eq!(
+            anchors,
+            ["\"compilerOptions\"", "\"endpoint\"", "\"strict\""]
+        );
+        assert_eq!(
+            structural_producer(Path::new("tsconfig.build.json")),
+            Some("structural_typescript_config_jsonc_collector")
+        );
+    }
+
+    #[test]
+    fn exact_zero_byte_test_json_emits_a_complete_zero_unit_projection() {
+        let path = Path::new("tests/fixtures/empty.json");
+        let collected = index_structural_source(path, "")
+            .expect("exact zero-byte test JSON should be a verified structural file");
+        assert_eq!(
+            collected.files[0].file_role,
+            codestory_store::FileRole::Test
+        );
+        assert!(collected.files[0].complete);
+        assert_eq!(collected.nodes.len(), 1);
+        assert!(collected.edges.is_empty());
+        assert!(collected.occurrences.is_empty());
+        assert!(collected.structural_unit_node_ids.is_empty());
+
+        let projected =
+            finalize_structural_storage(path, "", &format!("{:x}", Sha256::digest([])), collected)
+                .expect("zero-byte test JSON should finalize");
+        assert_eq!(projected.structural_text_projections[0].unit_count, 0);
+    }
+
+    #[test]
+    fn typescript_config_jsonc_rejects_every_unapproved_json_extension() {
+        for source in [
+            "{ loose: true }",
+            "{ \"first\": true \"second\": false }",
+            "{ 'single': true }",
+            "{ \"hex\": 0x10 }",
+            "{ \"plus\": +1 }",
+            "{ \"first\": true } { \"second\": false }",
+            "{ /* unterminated",
+            "{ \"valid\": true } trailing",
+        ] {
+            assert!(
+                matches!(
+                    index_structural_source(Path::new("tsconfig.json"), source),
+                    Err(StructuralCollectionError::Malformed(_))
+                ),
+                "{source:?} must remain outside the JSONC dialect"
+            );
+        }
+        assert!(matches!(
+            index_structural_source(
+                Path::new("config.json"),
+                "{ // comment\n \"strict\": true }"
+            ),
+            Err(StructuralCollectionError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn jsonc_and_generic_json_use_distinct_cache_producers() {
+        let source = br#"{"strict":true}"#;
+        let generic = structural_producer(Path::new("config.json")).expect("generic producer");
+        let jsonc = structural_producer(Path::new("tsconfig.json")).expect("JSONC producer");
+        assert_eq!(generic, "structural_json_collector");
+        assert_eq!(jsonc, "structural_typescript_config_jsonc_collector");
+        assert_ne!(
+            crate::cache::build_structural_artifact_cache_key(
+                Path::new("config.json"),
+                source,
+                generic
+            ),
+            crate::cache::build_structural_artifact_cache_key(
+                Path::new("config.json"),
+                source,
+                jsonc
+            )
+        );
+    }
+
+    #[test]
+    fn only_exact_empty_test_or_benchmark_json_can_publish_without_units() {
+        for path in [
+            "tests/empty.json",
+            "__tests__/empty.json",
+            "fixtures/empty.json",
+            "benchmarks/empty.json",
+        ] {
+            let storage = index_structural_source(Path::new(path), "").expect(path);
+            assert!(storage.files[0].complete, "{path}");
+            assert_eq!(storage.nodes.len(), 1, "{path}");
+            assert!(storage.edges.is_empty(), "{path}");
+            assert!(storage.occurrences.is_empty(), "{path}");
+            assert!(storage.structural_unit_node_ids.is_empty(), "{path}");
+        }
+        for (path, source) in [
+            ("config.json", ""),
+            ("tests/blank.json", " \n"),
+            ("fixtures/bad.json", "{\"bad\":"),
+        ] {
+            assert!(
+                matches!(
+                    index_structural_source(Path::new(path), source),
+                    Err(StructuralCollectionError::Malformed(_))
+                ),
+                "{path}"
+            );
+        }
+        assert!(matches!(
+            decode_structural_source(vec![b'{', 0, b'}']),
+            Err(StructuralCollectionError::Binary)
+        ));
+        assert!(matches!(
+            index_structural_source_with_unit_cap(Path::new("tests/large.json"), "{}", 10, 1),
+            Err(StructuralCollectionError::SourceByteLimit { .. })
+        ));
+    }
+
+    #[test]
+    fn exact_empty_test_json_stays_admitted_when_an_absolute_parent_looks_generated() {
+        let path = Path::new("/tmp/proof/target/workspaces/vite/src/__tests__/fixtures/empty.json");
+        let storage = index_structural_source(path, "")
+            .expect("test scope must win for zero-byte structural JSON admission");
+        assert_eq!(storage.nodes.len(), 1);
+        assert!(storage.structural_unit_node_ids.is_empty());
     }
 
     #[test]

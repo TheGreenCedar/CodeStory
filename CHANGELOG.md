@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- TypeScript and JavaScript config files can now be indexed when they use JSONC comments or trailing commas. Ordinary JSON stays strict, and malformed config changes leave the previous complete index available.
+
 ## 0.17.4
 
 Cursor marketplace MCP tool results match the schemas Cursor validates. After the server started, Cursor rejected `status`, `packet`, and `files` because the advertised output schema forbade extra compact-status fields, typed packet `support` as an object, and omitted `files.coverage_gaps`.
