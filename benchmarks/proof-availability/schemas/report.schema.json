@@ -510,12 +510,12 @@
           "type": "integer"
         },
         "file_node_id": {
-          "format": "int64",
-          "type": "integer"
+          "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+          "type": "string"
         },
         "owner_node_id": {
-          "format": "int64",
-          "type": "integer"
+          "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+          "type": "string"
         },
         "start_line": {
           "format": "uint32",
@@ -536,8 +536,8 @@
       "properties": {
         "edge_ids": {
           "items": {
-            "format": "int64",
-            "type": "integer"
+            "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+            "type": "string"
           },
           "maxItems": 128,
           "minItems": 1,
@@ -829,6 +829,7 @@
               "type": "string"
             },
             "node_id": {
+              "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
               "type": "string"
             },
             "project_id": {
@@ -905,6 +906,7 @@
               "type": "string"
             },
             "node_id": {
+              "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
               "type": "string"
             },
             "project_id": {
@@ -1310,8 +1312,8 @@
           "$ref": "#/$defs/CallableContainmentEvidenceV1"
         },
         "edge_id": {
-          "format": "int64",
-          "type": "integer"
+          "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+          "type": "string"
         },
         "line_window": {
           "$ref": "#/$defs/ObservedLineWindowV1"
@@ -1420,7 +1422,7 @@
         },
         "node_id": {
           "minLength": 1,
-          "pattern": "^-?(0|[1-9][0-9]*)$",
+          "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
           "type": "string"
         },
         "project_id": {
@@ -1656,7 +1658,7 @@
       "properties": {
         "edge_id": {
           "minLength": 1,
-          "pattern": "^-?(0|[1-9][0-9]*)$",
+          "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
           "type": "string"
         },
         "receipt_id": {
@@ -1992,8 +1994,8 @@
       "additionalProperties": false,
       "properties": {
         "edge_id": {
-          "format": "int64",
-          "type": "integer"
+          "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+          "type": "string"
         },
         "receipt_id": {
           "minLength": 1,
@@ -2057,8 +2059,8 @@
               "type": "string"
             },
             "node_id": {
-              "format": "int64",
-              "type": "integer"
+              "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+              "type": "string"
             }
           },
           "required": [
@@ -2161,8 +2163,8 @@
           "properties": {
             "edge_ids": {
               "items": {
-                "format": "int64",
-                "type": "integer"
+                "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+                "type": "string"
               },
               "maxItems": 128,
               "minItems": 1,
@@ -2237,8 +2239,8 @@
       "properties": {
         "candidate_edge_ids": {
           "items": {
-            "format": "int64",
-            "type": "integer"
+            "pattern": "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+            "type": "string"
           },
           "maxItems": 128,
           "minItems": 0,
@@ -2490,7 +2492,7 @@
       "type": "string"
     }
   },
-  "$id": "codestory.proof-availability-report/v2",
+  "$id": "codestory.proof-availability-report/v3",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -2524,7 +2526,7 @@
       "type": "string"
     },
     "schema": {
-      "const": "codestory.proof-availability-report/v2",
+      "const": "codestory.proof-availability-report/v3",
       "type": "string"
     },
     "trails": {

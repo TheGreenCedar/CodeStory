@@ -6,14 +6,15 @@ mod contracts;
 
 use clap::Parser;
 use contracts::{
-    ActivationDecisionV1, ActualProductResultV1, CandidateFailureV1, CandidateGateV1,
-    CaseValidationFailure, ClauseClassificationV1, CohortPathFileV1, CorpusV1,
-    ExactScopeSelectorV1, ExactSymbolSelectorV1, FinalizationTraceV1, FunnelOutcomeV1,
-    MAX_CANDIDATE_EDGES_PER_STEP, MAX_OBSERVED_RECEIPTS_PER_CASE, ObservedReceiptV1,
-    ProofContractFieldV1, ProofQualificationTraceV1, QualificationSummaryV1,
-    ReceiptOracleComparisonV1, SchemaDocument, SelectorGateOutcomeV1, ThresholdsV1,
-    TransportEvidenceV1, canonical_cohort_path_file_sha256, canonical_corpus_sha256,
-    canonical_thresholds_sha256,
+    ActivationDecisionV1, ActualProductResultV1, CallableContainmentEvidenceV1,
+    CandidateFailureHistogramV1, CandidateFailureV1, CandidateGateV1, CaseValidationFailure,
+    ClauseClassificationV1, CohortPathFileV1, CorpusV1, ExactScopeSelectorV1,
+    ExactSymbolSelectorV1, FinalizationTraceV1, FunnelOutcomeV1, MAX_CANDIDATE_EDGES_PER_STEP,
+    MAX_OBSERVED_RECEIPTS_PER_CASE, ObservedReceiptV1, ProofContractFieldV1,
+    ProofQualificationTraceV1, QualificationSummaryV1, RawAdmissionFailureV1,
+    ReceiptOracleComparisonV1, ReceiptReferenceV1, SchemaDocument, SelectorGateOutcomeV1,
+    StepQualificationOutcomeV1, StepQualificationTraceV1, ThresholdsV1, TransportEvidenceV1,
+    canonical_cohort_path_file_sha256, canonical_corpus_sha256, canonical_thresholds_sha256,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -25,6 +26,173 @@ const COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 fn rebind_results_digest(value: &mut Value) {
     value["provenance"]["results_sha256"] =
         json!(contracts::results_evidence_sha256_from_json(value).unwrap());
+}
+
+#[test]
+fn exact_graph_ids_serialize_as_canonical_signed_decimal_strings() {
+    let adjacent = [9_007_199_254_740_992_i64, 9_007_199_254_740_993_i64];
+    let serialized = adjacent
+        .into_iter()
+        .map(|node_id| {
+            serde_json::to_value(SelectorGateOutcomeV1::Resolved { node_id }).unwrap()["node_id"]
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serialized,
+        vec![json!("9007199254740992"), json!("9007199254740993")],
+        "IEEE-754-colliding graph IDs must remain distinct"
+    );
+
+    let histogram = CandidateFailureHistogramV1 {
+        reason: CandidateFailureV1::RawAdmission {
+            reason: RawAdmissionFailureV1::WrongKind,
+        },
+        edge_ids: vec![i64::MIN, i64::MAX],
+    };
+    assert_eq!(
+        serde_json::to_value(histogram).unwrap()["edge_ids"],
+        json!([i64::MIN.to_string(), i64::MAX.to_string()])
+    );
+
+    let admitted = StepQualificationOutcomeV1::Admitted {
+        edge_ids: vec![i64::MIN, i64::MAX],
+    };
+    assert_eq!(
+        serde_json::to_value(admitted).unwrap()["edge_ids"],
+        json!([i64::MIN.to_string(), i64::MAX.to_string()])
+    );
+
+    let trace = StepQualificationTraceV1 {
+        step_index: 0,
+        candidate_edge_ids: vec![i64::MIN, i64::MAX],
+        outcome: StepQualificationOutcomeV1::Admitted {
+            edge_ids: vec![i64::MIN, i64::MAX],
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(trace).unwrap()["candidate_edge_ids"],
+        json!([i64::MIN.to_string(), i64::MAX.to_string()])
+    );
+
+    let reference = ReceiptReferenceV1 {
+        receipt_id: "indexed-call-edge:fixture".into(),
+        edge_id: i64::MIN,
+    };
+    assert_eq!(
+        serde_json::to_value(reference).unwrap()["edge_id"],
+        i64::MIN.to_string()
+    );
+
+    let containment = CallableContainmentEvidenceV1 {
+        file_node_id: i64::MIN,
+        owner_node_id: i64::MAX,
+        start_line: 1,
+        end_line: 1,
+    };
+    let containment = serde_json::to_value(containment).unwrap();
+    assert_eq!(containment["file_node_id"], i64::MIN.to_string());
+    assert_eq!(containment["owner_node_id"], i64::MAX.to_string());
+
+    let mut accepted = QualificationSummaryV1::from_json(report()).expect("accepted report");
+    let receipt = &mut accepted.cases[0].receipt_evidence.observed_receipts[0];
+    receipt.edge_id = i64::MAX;
+    receipt.containment.file_node_id = i64::MIN;
+    receipt.containment.owner_node_id = i64::MAX;
+    let receipt = serde_json::to_value(receipt).unwrap();
+    assert_eq!(receipt["edge_id"], i64::MAX.to_string());
+    assert_eq!(receipt["containment"]["file_node_id"], i64::MIN.to_string());
+    assert_eq!(
+        receipt["containment"]["owner_node_id"],
+        i64::MAX.to_string()
+    );
+}
+
+#[test]
+fn exact_graph_id_codecs_reject_noncanonical_or_lossy_json() {
+    for invalid in [
+        json!(0),
+        json!("+1"),
+        json!("-0"),
+        json!("01"),
+        json!("-01"),
+        json!(" 1"),
+        json!("1 "),
+        json!("1.0"),
+        json!("1e0"),
+        json!("9223372036854775808"),
+        json!("-9223372036854775809"),
+    ] {
+        assert!(
+            serde_json::from_value::<ReceiptReferenceV1>(json!({
+                "receipt_id": "indexed-call-edge:fixture",
+                "edge_id": invalid,
+            }))
+            .is_err()
+        );
+    }
+
+    for invalid in [json!([1]), json!(["-0"]), json!(["01"]), json!(["1e0"])] {
+        assert!(
+            serde_json::from_value::<CandidateFailureHistogramV1>(json!({
+                "reason": {"kind": "raw_admission", "reason": "wrong_kind"},
+                "edge_ids": invalid,
+            }))
+            .is_err()
+        );
+    }
+
+    for exact in [i64::MIN, -1, 0, 1, i64::MAX] {
+        let parsed: ReceiptReferenceV1 = serde_json::from_value(json!({
+            "receipt_id": "indexed-call-edge:fixture",
+            "edge_id": exact.to_string(),
+        }))
+        .expect("full i64 domain");
+        assert_eq!(parsed.edge_id, exact);
+    }
+}
+
+#[test]
+fn failure_funnel_preserves_unsafe_graph_ids_exactly() {
+    let outcome = FunnelOutcomeV1::FirstZeroSurvivor {
+        gate: CandidateGateV1::RawAdmission,
+        histogram: vec![CandidateFailureHistogramV1 {
+            reason: CandidateFailureV1::RawAdmission {
+                reason: RawAdmissionFailureV1::WrongKind,
+            },
+            edge_ids: vec![i64::MIN, 9_007_199_254_740_993, i64::MAX],
+        }],
+    };
+    let serialized = serde_json::to_value(&outcome).expect("serialize funnel outcome");
+    assert_eq!(
+        serialized["histogram"][0]["edge_ids"],
+        json!([
+            i64::MIN.to_string(),
+            "9007199254740993",
+            i64::MAX.to_string()
+        ])
+    );
+    let reparsed: FunnelOutcomeV1 =
+        serde_json::from_value(serialized.clone()).expect("parse exact funnel graph IDs");
+    assert_eq!(
+        serde_json::to_value(reparsed).expect("re-serialize funnel outcome"),
+        serialized
+    );
+}
+
+#[test]
+fn canonical_one_digit_graph_id_mutations_fail_relationship_validation() {
+    let mut receipt = report();
+    receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["edge_id"] = json!("2");
+    rebind_results_digest(&mut receipt);
+    QualificationSummaryV1::from_json(receipt)
+        .expect_err("one changed receipt digit must not survive reference reconstruction");
+
+    let mut selector = report();
+    selector["cases"][0]["proof_trace"]["selectors"][0]["outcome"]["node_id"] = json!("-3");
+    rebind_results_digest(&mut selector);
+    QualificationSummaryV1::from_json(selector)
+        .expect_err("one changed selector digit must not survive pinned-node reconstruction");
 }
 
 #[test]
@@ -796,11 +964,11 @@ pub(crate) fn report() -> Value {
                 .map(|step_index| {
                     let edge_id = i64::try_from(case_index * 10 + step_index as usize + 1)
                         .expect("fixture edge id");
-                    json!({"step_index":step_index,"candidate_edge_ids":[edge_id],"outcome":{"kind":"admitted","edge_ids":[edge_id]}})
+                    json!({"step_index":step_index,"candidate_edge_ids":[edge_id.to_string()],"outcome":{"kind":"admitted","edge_ids":[edge_id.to_string()]}})
                 })
                 .collect::<Vec<_>>();
             let selectors = (0..=attempted)
-                .map(|selector_index| json!({"selector_index":selector_index,"outcome":{"kind":"resolved","node_id":-(selector_index as i64 + 1)}}))
+                .map(|selector_index| json!({"selector_index":selector_index,"outcome":{"kind":"resolved","node_id":(-(selector_index as i64 + 1)).to_string()}}))
                 .collect::<Vec<_>>();
             let observed_receipts = path["oracle_steps"]
                 .as_array()
@@ -842,7 +1010,7 @@ pub(crate) fn report() -> Value {
                     json!({
                         "receipt_id":format!("indexed-call-edge:fixture-{case_index}-{step_index}"),
                         "step_index":step_index,
-                        "edge_id":edge_id,
+                        "edge_id":edge_id.to_string(),
                         "source":{
                             "pinned":{"project_id":project_id,"core_generation_id":core_generation_id,"core_run_id":core_run_id,"node_id":source_node_id.to_string()},
                             "canonical_id_binding_sha256":contracts::resolved_canonical_id_binding_sha256(&source_pinned, &source_canonical_id).unwrap(),
@@ -858,7 +1026,7 @@ pub(crate) fn report() -> Value {
                         "certainty":"certain",
                         "callsite_identity":format!("{file_node_id}:{}:0:{target_node_id}|fixture", step_index + 1),
                         "callsite_line":step_index + 1,
-                        "containment":{"file_node_id":file_node_id,"owner_node_id":source_node_id,"start_line":1,"end_line":attempted},
+                        "containment":{"file_node_id":file_node_id.to_string(),"owner_node_id":source_node_id.to_string(),"start_line":1,"end_line":attempted},
                         "line_window":{
                             "kind":"indexed_line_v1",
                             "project_file_components":source_path.split('/').collect::<Vec<_>>(),
@@ -883,7 +1051,7 @@ pub(crate) fn report() -> Value {
                 .iter()
                 .map(|receipt| json!({
                     "receipt_id":receipt["receipt_id"],
-                    "edge_id":receipt["edge_id"].as_i64().unwrap().to_string()
+                    "edge_id":receipt["edge_id"]
                 }))
                 .collect::<Vec<_>>();
             let negative_mutations = path["negative_mutations"]
@@ -919,7 +1087,7 @@ pub(crate) fn report() -> Value {
         })
         .collect::<Vec<_>>();
     let mut report = json!({
-      "schema":"codestory.proof-availability-report/v2","qualification_id":"20260821T000000Z-bbbbbbbbbbbb",
+      "schema":"codestory.proof-availability-report/v3","qualification_id":"20260821T000000Z-bbbbbbbbbbbb",
       "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash,"results_sha256":SHA},
       "environment":{"qualification_id":"20260821T000000Z-bbbbbbbbbbbb","environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"qualification_source_commit":COMMIT,"qualification_source_tree":COMMIT,"recorded_at":"2026-08-21T12:34:56Z","build":{"source_commit":COMMIT,"source_tree":COMMIT,"source_dirty":false,"rustc_vv":"rustc 1.91.0\nbinary: rustc\nhost: aarch64-apple-darwin\n","cargo_profile":"release","prescribed_argv":["cargo","build","--release","--locked","-p","codestory-bench","--bin","codestory-proof-availability"]},"invocation":{"binary_name":"codestory-proof-availability","operation":"run","profile":"local_core_only","corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash},"projects":frozen["cohorts"].as_array().unwrap().iter().map(|cohort|{let id=cohort["repository_id"].as_str().unwrap();json!({"repository_id":id,"source_head":cohort["commit"],"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})}).collect::<Vec<_>>()},
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
@@ -1694,7 +1862,7 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
     let mut reason = report();
     reason["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
         "kind":"first_zero_survivor","gate":"raw_admission",
-        "histogram":[{"reason":{"kind":"raw_admission","reason":"free form"},"edge_ids":[1]}]
+        "histogram":[{"reason":{"kind":"raw_admission","reason":"free form"},"edge_ids":["1"]}]
     });
     assert!(QualificationSummaryV1::from_json(reason).is_err());
     let mut hard_failure = report();
@@ -1727,7 +1895,7 @@ fn closed_contracts_reject_hostile_nested_shapes() {
     invalid_trace["cases"][0]["proof_trace"]["steps"][0]["outcome"] = json!({
         "kind":"first_zero_survivor",
         "gate":"line",
-        "histogram":[{"reason":{"kind":"raw_admission","reason":"certainty_probable"},"edge_ids":[1]}]
+        "histogram":[{"reason":{"kind":"raw_admission","reason":"certainty_probable"},"edge_ids":["1"]}]
     });
     assert!(QualificationSummaryV1::from_json(invalid_trace).is_err());
 
@@ -1739,7 +1907,8 @@ fn closed_contracts_reject_hostile_nested_shapes() {
     assert!(QualificationSummaryV1::from_json(missing_selector).is_err());
 
     let mut non_candidate_edge = report();
-    non_candidate_edge["cases"][0]["proof_trace"]["steps"][0]["outcome"]["edge_ids"] = json!([999]);
+    non_candidate_edge["cases"][0]["proof_trace"]["steps"][0]["outcome"]["edge_ids"] =
+        json!(["999"]);
     assert!(QualificationSummaryV1::from_json(non_candidate_edge).is_err());
 
     let mut receipt_count_mismatch = report();
@@ -2036,7 +2205,7 @@ fn finalization_pairings_reject_crossed_or_incomplete_states() {
     let observed = &fallback_receipt_subset["cases"][0]["receipt_evidence"]["observed_receipts"][0];
     let receipt_id = observed["receipt_id"].clone();
     let edge_id = observed["edge_id"].clone();
-    let projected_edge_id = edge_id.as_i64().expect("fixture edge id").to_string();
+    let projected_edge_id = edge_id.as_str().expect("fixture edge id").to_owned();
     fallback_receipt_subset["cases"][0]["product_disposition"]["authoritative_receipts"] =
         json!([{"receipt_id":receipt_id,"edge_id":edge_id}]);
     fallback_receipt_subset["cases"][0]["product_disposition"]["actual"]["connected_receipts"] =
@@ -2230,7 +2399,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
     );
     assert_eq!(
         serde_json::to_value(&converted.selectors[1]).unwrap()["outcome"]["node_id"],
-        -7
+        "-7"
     );
 
     for failure in [
@@ -2579,7 +2748,7 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
     closed["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"]["pinned"]["node_id"] =
         json!(RESOLVED_TARGET.to_string());
     closed["cases"][0]["proof_trace"]["selectors"][1]["outcome"]["node_id"] =
-        json!(RESOLVED_TARGET);
+        json!(RESOLVED_TARGET.to_string());
     rebind_results_digest(&mut closed);
 
     let mut empty_identity = closed.clone();
@@ -2652,7 +2821,7 @@ fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
     case["proof_trace"]["steps"][0]["outcome"] = json!({
         "kind":"first_zero_survivor",
         "gate":gate,
-        "histogram":[{"reason":{"kind":kind,"reason":reason},"edge_ids":[1]}]
+        "histogram":[{"reason":{"kind":kind,"reason":reason},"edge_ids":["1"]}]
     });
     rebuild_funnel(&mut value);
     rebind_results_digest(&mut value);
@@ -2753,7 +2922,7 @@ fn make_non_proven_case(value: &mut Value, disposition: &str, gap: Option<&str>)
             Some("source_binding") => {
                 case["proof_trace"]["steps"][0]["outcome"] = json!({
                     "kind":"first_zero_survivor","gate":"line",
-                    "histogram":[{"reason":{"kind":"source_binding","reason":"line_over_limit"},"edge_ids":[1]}]
+                    "histogram":[{"reason":{"kind":"source_binding","reason":"line_over_limit"},"edge_ids":["1"]}]
                 });
             }
             Some("projection_budget") | None => {}
@@ -3088,8 +3257,48 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
     let report_schema = contracts::schema_json(SchemaDocument::Report);
     assert_eq!(
         report_schema["$id"],
-        "codestory.proof-availability-report/v2"
+        "codestory.proof-availability-report/v3"
     );
+    fn assert_exact_graph_id_schema(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                    for (field, property) in properties {
+                        if matches!(
+                            field.as_str(),
+                            "node_id" | "edge_id" | "file_node_id" | "owner_node_id"
+                        ) {
+                            assert_eq!(property["type"], "string", "{field}");
+                            assert_eq!(
+                                property["pattern"], "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+                                "{field}"
+                            );
+                            assert!(property.get("format").is_none(), "{field}");
+                        }
+                        if matches!(field.as_str(), "edge_ids" | "candidate_edge_ids") {
+                            assert_eq!(property["type"], "array", "{field}");
+                            assert_eq!(property["items"]["type"], "string", "{field}");
+                            assert_eq!(
+                                property["items"]["pattern"], "^(0|-[1-9][0-9]*|[1-9][0-9]*)$",
+                                "{field}"
+                            );
+                            assert!(property["items"].get("format").is_none(), "{field}");
+                        }
+                    }
+                }
+                for child in object.values() {
+                    assert_exact_graph_id_schema(child);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    assert_exact_graph_id_schema(child);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_exact_graph_id_schema(&report_schema);
     assert_eq!(
         report_schema["$defs"]["ResolvedNodeIdentityV1"]["properties"]["canonical_id_binding_sha256"]
             ["pattern"],
@@ -3173,7 +3382,7 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
     );
     assert_eq!(
         report_schema["$defs"]["ProjectedReceiptReferenceV1"]["properties"]["edge_id"]["pattern"],
-        "^-?(0|[1-9][0-9]*)$"
+        "^(0|-[1-9][0-9]*|[1-9][0-9]*)$"
     );
     assert_eq!(
         contracts::schema_json(SchemaDocument::Report)["$defs"]["ObservedReceiptV1"]["properties"]
@@ -3622,7 +3831,7 @@ fn false_positive_extra_edges_remain_observed_without_becoming_authoritative() {
     falsely_authoritative["cases"][0]["product_disposition"]["actual"]["receipts"]
         .as_array_mut()
         .expect("actual product receipts")
-        .push(json!({"receipt_id":extra["receipt_id"],"edge_id":extra["edge_id"].as_i64().unwrap().to_string()}));
+        .push(json!({"receipt_id":extra["receipt_id"],"edge_id":extra["edge_id"]}));
     rebind_results_digest(&mut falsely_authoritative);
     let falsely_authoritative = QualificationSummaryV1::from_json(falsely_authoritative)
         .expect("wrong sealed product outcomes remain reportable evidence");
@@ -3700,7 +3909,7 @@ fn receipt_provenance_is_bound_to_environment_selectors_and_containment() {
         (
             "containment",
             vec!["containment", "owner_node_id"],
-            json!(-999999),
+            json!("-999999"),
         ),
         ("certainty", vec!["certainty"], json!("probable")),
     ];
@@ -3721,9 +3930,9 @@ fn receipt_provenance_is_bound_to_environment_selectors_and_containment() {
 #[test]
 fn receipts_unrelated_to_task6_admitted_edges_are_rejected() {
     let mut value = report();
-    value["cases"][0]["receipt_evidence"]["observed_receipts"][0]["edge_id"] = json!(999_999);
+    value["cases"][0]["receipt_evidence"]["observed_receipts"][0]["edge_id"] = json!("999999");
     value["cases"][0]["product_disposition"]["authoritative_receipts"][0]["edge_id"] =
-        json!(999_999);
+        json!("999999");
 
     QualificationSummaryV1::from_json(value)
         .expect_err("every observed receipt edge must come from the matching admitted step");
@@ -3847,9 +4056,9 @@ fn actionable_gap_requires_the_trace_to_explain_the_exact_gap_cause() {
     let claimed_receipt = claimed["cases"][0]["receipt_evidence"]["observed_receipts"][0].clone();
     make_non_proven_case(&mut claimed, "unknown", Some("source_binding"));
     claimed["cases"][0]["receipt_evidence"]["observed_receipts"] = json!([claimed_receipt]);
-    claimed["cases"][0]["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!([1]);
+    claimed["cases"][0]["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!(["1"]);
     claimed["cases"][0]["proof_trace"]["steps"][0]["outcome"] =
-        json!({"kind":"admitted","edge_ids":[1]});
+        json!({"kind":"admitted","edge_ids":["1"]});
     rebuild_funnel(&mut claimed);
     rebind_results_digest(&mut claimed);
     QualificationSummaryV1::from_json(claimed)
@@ -3860,9 +4069,9 @@ fn actionable_gap_requires_the_trace_to_explain_the_exact_gap_cause() {
     make_non_proven_case(&mut measured, "unknown", Some("source_binding"));
     measured["cases"][0]["actionable_exact_gap"] = Value::Null;
     measured["cases"][0]["receipt_evidence"]["observed_receipts"] = json!([admitted_receipt]);
-    measured["cases"][0]["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!([1]);
+    measured["cases"][0]["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!(["1"]);
     measured["cases"][0]["proof_trace"]["steps"][0]["outcome"] =
-        json!({"kind":"admitted","edge_ids":[1]});
+        json!({"kind":"admitted","edge_ids":["1"]});
     rebuild_funnel(&mut measured);
     rebind_results_digest(&mut measured);
     let parsed = QualificationSummaryV1::from_json(measured)
@@ -3955,7 +4164,7 @@ fn missing_oracle_steps_are_separate_exact_rows() {
     });
     case["proof_trace"]["steps"][0]["outcome"] = json!({
         "kind":"first_zero_survivor","gate":"raw_admission",
-        "histogram":[{"reason":{"kind":"raw_admission","reason":"wrong_kind"},"edge_ids":[1]}]
+        "histogram":[{"reason":{"kind":"raw_admission","reason":"wrong_kind"},"edge_ids":["1"]}]
     });
     rebuild_funnel(&mut value);
     rebind_results_digest(&mut value);
@@ -4086,7 +4295,7 @@ fn candidate_and_observed_receipt_bounds_cover_exact_cap_and_cap_plus_one() {
     case["product_disposition"]["actual"]["receipts"] = json!([]);
     case["proof_trace"]["steps"][0]["candidate_edge_ids"] = Value::Array(
         (1..=MAX_CANDIDATE_EDGES_PER_STEP)
-            .map(|edge| json!(edge))
+            .map(|edge| json!(edge.to_string()))
             .collect(),
     );
     case["proof_trace"]["steps"][0]["outcome"] = json!({
@@ -4124,20 +4333,21 @@ fn expand_six_step_case_to_candidate_cap(value: &mut Value, case_index: usize) {
         let edge_ids = (0..MAX_CANDIDATE_EDGES_PER_STEP)
             .map(|offset| base + i64::try_from(offset).expect("edge offset"))
             .collect::<Vec<_>>();
+        let edge_id_strings = edge_ids.iter().map(i64::to_string).collect::<Vec<_>>();
         case["proof_trace"]["steps"][step_index]["candidate_edge_ids"] =
-            serde_json::to_value(&edge_ids).expect("candidate ids");
+            serde_json::to_value(&edge_id_strings).expect("candidate ids");
         case["proof_trace"]["steps"][step_index]["outcome"]["edge_ids"] =
-            serde_json::to_value(&edge_ids).expect("admitted ids");
+            serde_json::to_value(&edge_id_strings).expect("admitted ids");
         for (offset, edge_id) in edge_ids.into_iter().enumerate() {
             let mut receipt = templates[step_index].clone();
             receipt["receipt_id"] = json!(format!(
                 "indexed-call-edge:cap-{case_index}-{step_index}-{offset}"
             ));
-            receipt["edge_id"] = json!(edge_id);
+            receipt["edge_id"] = json!(edge_id.to_string());
             if offset == 0 {
                 authoritative_receipts.push(json!({
                     "receipt_id":receipt["receipt_id"],
-                    "edge_id":edge_id
+                    "edge_id":edge_id.to_string()
                 }));
                 projected_receipts.push(json!({
                     "receipt_id":receipt["receipt_id"],
@@ -4156,27 +4366,31 @@ fn add_extra_observed_receipt(value: &mut Value, mismatched: bool) {
     let case = &mut value["cases"][0];
     let step = &mut case["proof_trace"]["steps"][0];
     let original_edge = step["candidate_edge_ids"][0]
-        .as_i64()
-        .expect("fixture edge id");
+        .as_str()
+        .expect("fixture edge id")
+        .parse::<i64>()
+        .expect("i64 edge id");
     let extra_edge = original_edge + 1_000_000;
     step["candidate_edge_ids"]
         .as_array_mut()
         .expect("candidate ids")
-        .push(json!(extra_edge));
+        .push(json!(extra_edge.to_string()));
     step["outcome"]["edge_ids"]
         .as_array_mut()
         .expect("admitted ids")
-        .push(json!(extra_edge));
+        .push(json!(extra_edge.to_string()));
     let mut extra = case["receipt_evidence"]["observed_receipts"][0].clone();
     let file_node_id = extra["containment"]["file_node_id"]
-        .as_i64()
-        .expect("file node id");
+        .as_str()
+        .expect("file node id")
+        .parse::<i64>()
+        .expect("i64 file node id");
     let target_node_id = extra["target"]["pinned"]["node_id"]
         .as_str()
         .expect("target node id")
         .to_owned();
     extra["receipt_id"] = json!(format!("indexed-call-edge:extra-{extra_edge}"));
-    extra["edge_id"] = json!(extra_edge);
+    extra["edge_id"] = json!(extra_edge.to_string());
     extra["callsite_identity"] = json!(format!("{file_node_id}:1:0:{target_node_id}|extra"));
     if mismatched {
         extra["callsite_line"] = json!(99);
