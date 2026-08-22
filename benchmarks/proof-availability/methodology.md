@@ -141,9 +141,11 @@ invalid result, over-budget result, transport error, response above 64 KiB, or
 product/evidence disposition mismatch. Input validation separately rejects
 missing cohorts, malformed evidence, or broken provenance and artifact binding.
 
-A validated source dependency with a named passing inseparability test selects
-D independently of metrics. Without it, any hard failure selects C. Otherwise
-the evaluator checks automatic A, stable-explicit A, experimental B, then C.
+Outcome D exists only as Q1's separability precondition: if the proof-disabled
+packet/context/search feature build or sealed four-revision conformance probe
+fails, Q2 does not run. After that gate passes, the qualification binary has no
+Outcome-D input and evaluates only automatic A, stable-explicit A, experimental
+B, then C. Any Q2 hard failure selects C.
 Stable A requires every cohort. Experimental B requires at least one cohort at
 12/30; failures for every other cohort remain visible. Failed-gate identifiers
 are emitted in fixed hard, automatic, stable, experimental order, with cohorts

@@ -6,7 +6,7 @@ use super::contracts::{
     StepQualificationOutcomeV1, ThresholdsV1, TransportErrorV1, TransportEvidenceV1,
     actionable_exact_gap_for_case, negative_mutation_product_contract,
     observed_product_disposition_to_report, observed_receipt_from_task6,
-    oracle_path_product_contract,
+    oracle_path_product_contract, require_expected_product_contract_digest,
 };
 use super::corpus::LoadedCorpusV1;
 use super::inventory::analyze_store;
@@ -153,6 +153,11 @@ fn run_case(
         bail!("proof_availability_publication_binding_invalid")
     }
     let observed = &operation.value;
+    let observed_disposition = observed_product_disposition_to_report(observed)?;
+    require_expected_product_contract_digest(
+        &observed_disposition.actual,
+        hashes.contract_digest(),
+    )?;
     let mut negative_mutations = Vec::with_capacity(path.negative_mutations.len());
     for mutation in &path.negative_mutations {
         let outcome = validate_contract(negative_mutation_product_contract(

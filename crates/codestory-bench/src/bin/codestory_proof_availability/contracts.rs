@@ -1724,6 +1724,47 @@ pub(crate) fn observed_product_disposition_to_report(
     product_disposition_from_projection(root)
 }
 
+pub(crate) fn expected_contract_digest_for_oracle_path(path: &OraclePathV1) -> Result<String> {
+    match product_proof::validate_contract(oracle_path_product_contract(path)?).map_err(
+        |error| anyhow::anyhow!("proof_availability_positive_contract_invalid: {error:?}"),
+    )? {
+        product_proof::ValidationOutcome::Validated { hashes, .. } => {
+            Ok(hashes.contract_digest().to_owned())
+        }
+        product_proof::ValidationOutcome::Unknown { .. } => {
+            bail!("proof_availability_positive_contract_translation_incomplete")
+        }
+    }
+}
+
+fn actual_product_contract_digest(actual: &ActualProductResultV1) -> Option<&str> {
+    match actual {
+        ActualProductResultV1::ContractProven {
+            contract_digest, ..
+        }
+        | ActualProductResultV1::ContractRefuted {
+            contract_digest, ..
+        }
+        | ActualProductResultV1::Unknown {
+            contract_digest, ..
+        }
+        | ActualProductResultV1::Unavailable {
+            contract_digest, ..
+        } => Some(contract_digest),
+        ActualProductResultV1::Invalid { .. } => None,
+    }
+}
+
+pub(crate) fn require_expected_product_contract_digest(
+    actual: &ActualProductResultV1,
+    expected: &str,
+) -> Result<()> {
+    if actual_product_contract_digest(actual).is_some_and(|actual| actual != expected) {
+        bail!("proof_availability_product_contract_digest_mismatch")
+    }
+    Ok(())
+}
+
 pub(crate) fn invalid_contract_report(code: impl Into<String>) -> ProductDispositionV1 {
     ProductDispositionV1 {
         kind: ProductDispositionKindV1::Invalid,
@@ -3119,6 +3160,11 @@ impl QualificationSummaryV1 {
             {
                 bail!("proof_availability_case_oracle_mismatch")
             }
+            let expected_contract_digest = expected_contract_digest_for_oracle_path(path)?;
+            require_expected_product_contract_digest(
+                &case.product_disposition.actual,
+                &expected_contract_digest,
+            )?;
             for receipt in &case.receipt_evidence.observed_receipts {
                 let oracle_step_index = receipt.oracle_comparison.oracle_step_index();
                 let Some(step) = path.oracle_steps.get(usize::from(oracle_step_index)) else {
@@ -5495,4 +5541,37 @@ fn ratio_milli(numerator: u64, denominator: u64) -> Result<u16> {
         .ok_or_else(|| anyhow::anyhow!("proof_availability_metric_overflow"))?
         / denominator;
     u16::try_from(scaled).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod contract_digest_binding_tests {
+    use super::*;
+
+    #[test]
+    fn wrong_well_formed_product_digest_is_rejected_against_frozen_oracle() {
+        let path_file: CohortPathFileV1 = serde_json::from_str(include_str!(
+            "../../../../../benchmarks/proof-availability/paths/codestory-rust.json"
+        ))
+        .expect("frozen CodeStory path cohort");
+        let path = path_file.paths.first().expect("frozen oracle path");
+        let expected = expected_contract_digest_for_oracle_path(path).expect("product digest");
+        let wrong = if expected == "0".repeat(64) {
+            "1".repeat(64)
+        } else {
+            "0".repeat(64)
+        };
+        let actual = ActualProductResultV1::Unknown {
+            contract_digest: wrong,
+            gaps: vec![ActualProofGapV1::DirectCallMissing { step_index: 0 }],
+            connected_receipts: Vec::new(),
+        };
+
+        let error = require_expected_product_contract_digest(&actual, &expected)
+            .expect_err("wrong 64-hex digest must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("proof_availability_product_contract_digest_mismatch")
+        );
+    }
 }

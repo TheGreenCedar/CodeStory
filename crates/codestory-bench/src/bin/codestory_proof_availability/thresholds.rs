@@ -1117,7 +1117,7 @@ mod tests {
             canonical_thresholds_sha256(&thresholds).expect("canonical threshold identity");
         assert_eq!(
             original_identity,
-            "bc9882f2896c43758b361fb1c5c2a570f37a86548101dc07a55e2d7d76b23f7e"
+            "c10242b9bd3d288070a50493af890ec9180cab3f16bb0df7762a7f6db5f74bca"
         );
         let mut value = serde_json::to_value(&thresholds).expect("threshold JSON");
         value["automatic"]["minimum_full_proofs"] = serde_json::json!(95);

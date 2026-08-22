@@ -96,6 +96,9 @@ mod semantic_projection;
 mod semantic_republish;
 mod snippets;
 mod source_coverage;
+#[cfg(feature = "v3-evidence-separation-support")]
+#[doc(hidden)]
+pub mod v3_evidence_qualification_support;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{

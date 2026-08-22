@@ -635,8 +635,9 @@ const AGENT_PLANNING_MODULES: [&str; 27] = [
 /// - `indexed_source_call_path_v1.rs` is the dark v3 proof kernel. Task 2 keeps
 ///   it behind the same test-support gate until the atomic public v3 cut.
 /// - `packet_execution_plan_v3.rs` is the dark v3 evidence-planning ledger.
-///   Task 3A keeps its callable surface behind the same test-support gate; it
-///   is not one of the 27 production packet-planning modules.
+///   Task 3A keeps its callable surface behind test support and the sealed Q1
+///   evidence-only compile feature; it is not one of the 27 production
+///   packet-planning modules.
 const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 4] = [
     "lib.rs",
     "eval_probes.rs",
@@ -649,9 +650,9 @@ fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
     let agent_lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
         agent_lib.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod packet_execution_plan_v3;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\n#[doc(hidden)]\npub mod packet_execution_plan_v3;"
         ),
-        "the v3 evidence planner must remain test-support-only until the atomic v3 cut"
+        "the v3 evidence planner must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
     );
     assert!(
         AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"packet_execution_plan_v3.rs"),
@@ -666,6 +667,7 @@ fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
                 &[
                     "agent/packet_execution_record_v3.rs",
                     "agent/packet_projection_v3.rs",
+                    "v3_evidence_qualification_support.rs",
                 ],
             ),
         ),
@@ -706,15 +708,15 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
     let runtime_agent_modules = read("crates/codestory-runtime/src/agent/mod.rs");
     assert!(
         runtime_agent_modules.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\npub(crate) mod packet_execution_record_v3;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\npub(crate) mod packet_execution_record_v3;"
         ),
-        "the runtime-owned v3 record must remain test-support-only until the atomic v3 cut"
+        "the runtime-owned v3 record must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
     );
     assert!(
         runtime_agent_modules.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\npub(crate) mod packet_projection_v3;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\npub(crate) mod packet_projection_v3;"
         ),
-        "the runtime-owned v3 projector must remain test-support-only until the atomic v3 cut"
+        "the runtime-owned v3 projector must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
     );
 
     let record_path = "crates/codestory-runtime/src/agent/packet_execution_record_v3.rs";
@@ -791,6 +793,7 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
                 &[
                     "agent/packet_execution_record_v3.rs",
                     "agent/packet_projection_v3.rs",
+                    "v3_evidence_qualification_support.rs",
                 ],
             )
             .replace("pub(crate) mod packet_execution_record_v3;", "")
@@ -2390,9 +2393,24 @@ fn shipped() {
 
 #[test]
 fn evidence_only_v3_support_is_feature_separate_from_proof_qualification() {
-    let manifest = read("crates/codestory-cli/Cargo.toml");
+    const FEATURE: &str = "v3-evidence-separation-support";
+    let agent_manifest = read("crates/codestory-agent/Cargo.toml");
+    let runtime_manifest = read("crates/codestory-runtime/Cargo.toml");
+    let cli_manifest = read("crates/codestory-cli/Cargo.toml");
     assert!(
-        manifest.contains("v3-evidence-separation-support = []"),
+        agent_manifest.contains("v3-evidence-separation-support"),
+        "the packet v3 planner must have a proof-independent sealed feature"
+    );
+    assert!(
+        runtime_manifest.contains(
+            "v3-evidence-separation-support = [\"codestory-agent/v3-evidence-separation-support\"]"
+        ),
+        "the runtime packet record and projection builders must carry the sealed agent feature"
+    );
+    assert!(
+        cli_manifest.contains(
+            "v3-evidence-separation-support = [\"codestory-runtime/v3-evidence-separation-support\"]"
+        ),
         "the Q1 evidence-only compile gate must not activate proof qualification"
     );
     let library = read("crates/codestory-cli/src/lib.rs");
@@ -2400,6 +2418,51 @@ fn evidence_only_v3_support_is_feature_separate_from_proof_qualification() {
         library.contains("feature = \"v3-evidence-separation-support\""),
         "the sealed evidence-only conformance facade must compile independently"
     );
+    let stdio_v3 = read("crates/codestory-cli/src/stdio_v3/mod.rs");
+    assert!(
+        stdio_v3.contains(
+            "codestory_runtime::v3_evidence_qualification_support::real_projection_fixtures"
+        ),
+        "four-revision conformance must consume the real runtime record/projection builders"
+    );
+    assert!(
+        !stdio_v3.contains("serde_json::json!"),
+        "four-revision conformance must not substitute hand-built JSON for product projections"
+    );
+
+    for (path, expected) in [
+        (
+            "crates/codestory-agent/Cargo.toml",
+            BTreeSet::from(["dep:serde_json_canonicalizer"]),
+        ),
+        (
+            "crates/codestory-runtime/Cargo.toml",
+            BTreeSet::from(["codestory-agent/v3-evidence-separation-support"]),
+        ),
+        (
+            "crates/codestory-cli/Cargo.toml",
+            BTreeSet::from(["codestory-runtime/v3-evidence-separation-support"]),
+        ),
+    ] {
+        let document = manifest(path);
+        let enabled = document["features"][FEATURE]
+            .as_array()
+            .expect("sealed evidence feature array")
+            .iter()
+            .map(|value| value.as_str().expect("feature edge"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            enabled, expected,
+            "unexpected sealed feature graph at {path}"
+        );
+        assert!(
+            enabled
+                .iter()
+                .all(|edge| !edge.contains("proof-qualification-support")
+                    && !edge.contains("test-support")),
+            "{path} must not pull proof or general test support into the evidence-only gate"
+        );
+    }
 }
 
 #[test]

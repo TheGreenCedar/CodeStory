@@ -736,6 +736,11 @@ pub(crate) fn report() -> Value {
         .into_iter()
         .enumerate()
         .map(|(case_index, (repository_id, path))| {
+            let oracle_path: contracts::OraclePathV1 =
+                serde_json::from_value(path.clone()).expect("oracle path");
+            let contract_digest =
+                contracts::expected_contract_digest_for_oracle_path(&oracle_path)
+                    .expect("product contract digest");
             let attempted = path["spec"]["steps"].as_array().expect("steps").len() as u64;
             let case_id = path["case_id"].as_str().expect("case id");
             let project_id = format!("project-{repository_id}");
@@ -834,7 +839,7 @@ pub(crate) fn report() -> Value {
                 .collect::<Vec<_>>();
             json!({
                 "case_id":case_id,"repository_id":repository_id,
-                "product_disposition":{"kind":"contract_proven","gaps":[],"authoritative_receipts":authoritative_receipts,"actual":{"kind":"contract_proven","contract_digest":SHA,"receipts":projected_receipts}},
+                "product_disposition":{"kind":"contract_proven","gaps":[],"authoritative_receipts":authoritative_receipts,"actual":{"kind":"contract_proven","contract_digest":contract_digest,"receipts":projected_receipts}},
                 "actionable_exact_gap":null,
                 "warm_end_to_end_ms":12,"stage_durations_ms":{"validation":1,"operation":2},
                 "attempted_step_count":attempted,"unclassified_step_indices":[],
@@ -983,15 +988,15 @@ fn task10a_refreeze_binds_methodology_thresholds_and_future_corpus() {
     assert_eq!(methodology_sha, thresholds.methodology_sha256);
     assert_eq!(
         methodology_sha,
-        "f2c82560b8c7c249f005a7895628640aa9d0bf16be985d425cfc25225f2f87e4"
+        "28f11893fc1d0c17c1b1b70aeda74818a311009e24b85d899b2d52fa6c8e0dcf"
     );
     assert_eq!(
         format!("{:x}", Sha256::digest(threshold_bytes)),
-        "0b772d3fb1c678f090ce7fc4a2a268eb952044be269ef8540d0d60ee258a841b"
+        "feb145cd778ecd0a1e06e90f24a2dd9e4c2e44a0905364439698dbd5622e246f"
     );
     assert_eq!(
         canonical_thresholds_sha256(&thresholds).unwrap(),
-        "bc9882f2896c43758b361fb1c5c2a570f37a86548101dc07a55e2d7d76b23f7e"
+        "c10242b9bd3d288070a50493af890ec9180cab3f16bb0df7762a7f6db5f74bca"
     );
 
     let mut future = corpus();
@@ -1009,6 +1014,21 @@ fn task10a_refreeze_binds_methodology_thresholds_and_future_corpus() {
         canonical_thresholds_sha256(&changed).unwrap()
     );
     assert!(future.validate_against_thresholds(&changed).is_err());
+
+    let checked_corpus = CorpusV1::from_json(
+        serde_json::from_slice(include_bytes!(
+            "../../../benchmarks/proof-availability/corpus-v1.json"
+        ))
+        .expect("checked corpus JSON"),
+    )
+    .expect("checked corpus");
+    checked_corpus
+        .validate_against_thresholds(&thresholds)
+        .expect("checked corpus binds refrozen thresholds");
+    assert_eq!(
+        canonical_corpus_sha256(&checked_corpus).expect("canonical corpus identity"),
+        "e425d8bd8c280e65ea601d582f617e5505c1fa9895a3622a0a743f7ee7f0ff1f"
+    );
 }
 
 #[test]
@@ -1232,6 +1252,17 @@ fn reports_preserve_typed_task_8_to_13_evidence_and_reject_open_gates() {
             &parsed_path_files(),
         )
         .expect_err("corpus binding rejects altered mutation evidence");
+    let mut wrong_contract_digest = report();
+    wrong_contract_digest["cases"][0]["product_disposition"]["actual"]["contract_digest"] =
+        json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+    rebind_results_digest(&mut wrong_contract_digest);
+    QualificationSummaryV1::from_json(wrong_contract_digest)
+        .expect("wrong digest remains structurally measurable")
+        .validate_against_oracle(
+            &CorpusV1::from_json(corpus()).expect("frozen corpus"),
+            &parsed_path_files(),
+        )
+        .expect_err("wrong well-formed digest must fail before evaluation");
     let mut wrong_corpus_hash = report();
     wrong_corpus_hash["provenance"]["corpus_sha256"] = json!(SHA);
     wrong_corpus_hash["environment"]["invocation"]["corpus_sha256"] = json!(SHA);
@@ -3113,6 +3144,7 @@ fn output_budget_is_actionable_only_after_every_step_was_admitted() {
 fn missing_oracle_steps_are_separate_exact_rows() {
     let mut value = report();
     let case = &mut value["cases"][0];
+    let contract_digest = case["product_disposition"]["actual"]["contract_digest"].clone();
     let observed = case["receipt_evidence"]["observed_receipts"]
         .as_array_mut()
         .expect("observed receipts")
@@ -3127,7 +3159,7 @@ fn missing_oracle_steps_are_separate_exact_rows() {
     }]);
     case["product_disposition"] = json!({
         "kind":"unknown","gaps":["relation_missing"],"authoritative_receipts":[],
-        "actual":{"kind":"unknown","contract_digest":SHA,"gaps":[{"kind":"direct_call_missing","step_index":0}]}
+        "actual":{"kind":"unknown","contract_digest":contract_digest,"gaps":[{"kind":"direct_call_missing","step_index":0}]}
     });
     case["actionable_exact_gap"] = json!({
         "gap":{"kind":"direct_call_missing","step_index":0},

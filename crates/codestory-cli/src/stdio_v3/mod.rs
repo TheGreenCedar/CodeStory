@@ -66,43 +66,36 @@ pub(crate) fn measure_revision_native_proof_result_v3(
         .collect()
 }
 
+#[cfg(feature = "v3-evidence-separation-support")]
 pub(crate) fn validate_evidence_only_surface_v3() -> Result<(), String> {
-    use serde_json::json;
-
-    let identity = json!({
-        "packet_id":"b96ac0cc-e552-4c35-a0ba-c83b9ead67de",
-        "request_id":"evidence-only-conformance",
-        "question_sha256":"a".repeat(64)
-    });
-    let publication = json!({
-        "core":{"project_id":"project","generation_id":"generation","run_id":"run"},
-        "retrieval":null
-    });
-    let diagnostics = json!({"availability":"unavailable"});
+    let projections =
+        codestory_runtime::v3_evidence_qualification_support::real_projection_fixtures(|packet| {
+            let root = serde_json::to_value(packet).map_err(|_| ())?;
+            McpRevisionV3::all()
+                .iter()
+                .map(|revision| {
+                    let result = transport::build_tool_result_v3(*revision, "packet", &root)
+                        .map_err(|_| ())?;
+                    crate::stdio_transport::v3_serialize_call_tool_result(&result)
+                        .map(|bytes| bytes.len())
+                        .map_err(|_| ())
+                })
+                .max()
+                .transpose()
+                .map(|maximum| maximum.unwrap_or_default())
+        })?;
     let projections = [
         (
             "packet",
-            json!({
-                "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
-                "status":"no_useful_evidence","retrieval":{"state":"unavailable","generation_id":null},
-                "evidence":[],"gaps":[],"continuation":null,"diagnostics":diagnostics
-            }),
+            serde_json::to_value(projections.packet).map_err(|error| error.to_string())?,
         ),
         (
             "context",
-            json!({
-                "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
-                "status":"no_useful_evidence","target":{"path":"src/lib.rs","symbol_id":null},
-                "evidence":[],"gaps":[],"continuation":null,"diagnostics":diagnostics
-            }),
+            serde_json::to_value(projections.context).map_err(|error| error.to_string())?,
         ),
         (
             "search",
-            json!({
-                "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
-                "status":"no_useful_evidence","evidence":[],"gaps":[],"continuation":null,
-                "retrieval":{"state":"unavailable","generation_id":null},"diagnostics":diagnostics
-            }),
+            serde_json::to_value(projections.search).map_err(|error| error.to_string())?,
         ),
     ];
     for revision in McpRevisionV3::all() {
@@ -138,7 +131,7 @@ pub(crate) fn validate_evidence_only_surface_v3() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "v3-evidence-separation-support"))]
 mod evidence_separation_tests {
     #[test]
     fn sealed_evidence_only_conformance_covers_all_revisions() {

@@ -151,12 +151,12 @@
   ],
   "corpus_id": "proof-availability-v1",
   "curator": "codex-corpus-curator",
-  "methodology_sha256": "f2c82560b8c7c249f005a7895628640aa9d0bf16be985d425cfc25225f2f87e4",
+  "methodology_sha256": "28f11893fc1d0c17c1b1b70aeda74818a311009e24b85d899b2d52fa6c8e0dcf",
   "negative_request_count": 240,
   "positive_request_count": 120,
   "positive_step_count": 312,
   "review_date": "2026-08-21",
   "reviewer": "codex-corpus-reviewer",
   "schema": "codestory.proof-availability-corpus/v1",
-  "thresholds_sha256": "bc9882f2896c43758b361fb1c5c2a570f37a86548101dc07a55e2d7d76b23f7e"
+  "thresholds_sha256": "c10242b9bd3d288070a50493af890ec9180cab3f16bb0df7762a7f6db5f74bca"
 }

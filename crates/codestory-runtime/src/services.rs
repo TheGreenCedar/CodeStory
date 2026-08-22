@@ -1898,7 +1898,11 @@ impl PublicOperationService {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(
+        test,
+        feature = "test-support",
+        feature = "v3-evidence-separation-support"
+    ))]
     pub(crate) fn active_project_identity_v3(
         &self,
     ) -> Result<codestory_workspace::ProjectIdentityV3, ApiError> {

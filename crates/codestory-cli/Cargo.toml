@@ -19,7 +19,7 @@ path = "src/runtime_main.rs"
 
 [features]
 proof-qualification-support = ["codestory-runtime/proof-qualification-support"]
-v3-evidence-separation-support = []
+v3-evidence-separation-support = ["codestory-runtime/v3-evidence-separation-support"]
 
 [dependencies]
 codestory-contracts = { workspace = true }

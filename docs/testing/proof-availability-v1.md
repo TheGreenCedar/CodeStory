@@ -18,6 +18,11 @@ context, and search results for every supported MCP revision while omitting the
 proof tool, schema, and route. The companion feature-matrix build proves that
 this surface compiles without the proof-qualification feature:
 
+The sealed feature edge runs from the agent's v3 evidence planner through the
+runtime's real `PacketExecutionRecordV3` and packet/context/search projection
+builders to the CLI transport validator. The conformance probe serializes those
+typed outputs; hand-built substitute JSON does not qualify.
+
 ```sh
 cargo check --locked -p codestory-cli --lib --no-default-features \
   --features v3-evidence-separation-support
@@ -79,6 +84,11 @@ derives inventory and edge-distinct trail counts, then sends every positive case
 and its two frozen mutations through the accepted validator and the single
 Runtime-owned core-pinned proof operation. No semantic retrieval publication is
 created or required.
+
+For every positive case, the runner immediately compares the product result's
+contract digest with the digest produced by validating that frozen oracle path.
+Read-only verification recomputes the same expected digest from the frozen
+oracle, so a different well-formed SHA-256 fails before metrics are evaluated.
 
 A product finalization failure remains an `Invalid` case row rather than
 aborting the report. It retains the actual trace and both completed mutation
