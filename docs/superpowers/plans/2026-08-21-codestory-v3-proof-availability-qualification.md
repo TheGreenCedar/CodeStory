@@ -1288,7 +1288,7 @@ git status --short
 git rev-parse HEAD^{commit} HEAD^{tree}
 ```
 
-Expected: clean tracked tree. Record the command, binary SHA, Rust host/toolchain, OS/architecture, and source commit/tree in `environment.json`.
+Expected: clean tracked tree. The build embeds its source commit, source tree, dirty state, Cargo-selected `rustc -vV`, and Cargo profile. Indexed materialization rejects a dirty build, a non-release profile, or a live checkout whose clean commit/tree no longer equals that embedded identity. Record the prescribed command, binary SHA, Rust host/toolchain, OS/architecture, and embedded source identity in `environment.json`.
 
 - [ ] **Step 3: Create one immutable qualification ID**
 

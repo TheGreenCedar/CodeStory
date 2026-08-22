@@ -1518,6 +1518,9 @@ pub struct EnvironmentReportV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QualificationBuildProvenanceV1 {
+    pub source_commit: String,
+    pub source_tree: String,
+    pub source_dirty: bool,
     pub rustc_vv: String,
     pub cargo_profile: String,
     pub prescribed_argv: Vec<String>,
@@ -3457,7 +3460,12 @@ fn valid_build_provenance(environment: &EnvironmentReportV1) -> bool {
         .lines()
         .filter_map(|line| line.strip_prefix("host: "))
         .collect::<Vec<_>>();
-    !build.rustc_vv.is_empty()
+    commit(&build.source_commit)
+        && commit(&build.source_tree)
+        && build.source_commit == environment.qualification_source_commit
+        && build.source_tree == environment.qualification_source_tree
+        && !build.source_dirty
+        && !build.rustc_vv.is_empty()
         && build.rustc_vv.len() <= 8192
         && !build.rustc_vv.contains('\0')
         && build.cargo_profile == "release"
@@ -4984,6 +4992,12 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some("QualificationBuildProvenanceV1"),
                 "cargo_profile",
                 Value::String("release".into()),
+            );
+            set_const(
+                schema,
+                Some("QualificationBuildProvenanceV1"),
+                "source_dirty",
+                Value::Bool(false),
             );
             set_const(
                 schema,

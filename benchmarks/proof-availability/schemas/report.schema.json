@@ -1770,9 +1770,24 @@
           "maxLength": 8192,
           "minLength": 1,
           "type": "string"
+        },
+        "source_commit": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "source_dirty": {
+          "const": false,
+          "type": "boolean"
+        },
+        "source_tree": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
         }
       },
       "required": [
+        "source_commit",
+        "source_tree",
+        "source_dirty",
         "rustc_vv",
         "cargo_profile",
         "prescribed_argv"

@@ -10,9 +10,11 @@ public.
 Build one locked release `codestory-proof-availability` binary with the closed
 command below, then use that same binary for materialization, the run, and
 verification. It embeds Cargo's selected `rustc -vV` and build profile. Indexed
-materialization rejects a non-release build and records that compiler identity,
-the prescribed build command, and the explicit qualification ID in public
-environment evidence. Materialization checks out the exact frozen commits,
+materialization rejects a non-release or dirty-source build. The embedded source
+commit and tree are authoritative: the live checkout must remain clean and at
+that exact identity. Public environment evidence records the build source,
+compiler identity, prescribed build command, and explicit qualification ID.
+Materialization checks out the exact frozen commits,
 verifies every oracle range and each receipt step's independently frozen
 full-source-file SHA-256, builds one fresh core index per project, and writes a
 private local environment descriptor:

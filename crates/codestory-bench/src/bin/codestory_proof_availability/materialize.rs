@@ -161,6 +161,7 @@ struct QualificationBinaryIdentity {
     rust_host: String,
     rustc_vv: String,
     build_profile: String,
+    source_dirty: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -460,10 +461,13 @@ fn materialize_indexed_with_registry(
             architecture: std::env::consts::ARCH.to_owned(),
             rust_host: qualification.rust_host,
             binary_sha256: qualification.binary_sha256,
-            qualification_source_commit: qualification.source_commit,
-            qualification_source_tree: qualification.source_tree,
+            qualification_source_commit: qualification.source_commit.clone(),
+            qualification_source_tree: qualification.source_tree.clone(),
             recorded_at: qualification.recorded_at,
             build: QualificationBuildProvenanceV1 {
+                source_commit: qualification.source_commit.clone(),
+                source_tree: qualification.source_tree.clone(),
+                source_dirty: qualification.source_dirty,
                 rustc_vv: qualification.rustc_vv,
                 cargo_profile: qualification.build_profile,
                 prescribed_argv: PRESCRIBED_BUILD_ARGV
@@ -837,6 +841,9 @@ fn validate_operational_environment_with_identity(
         bail!("proof_availability_qualification_identity_mismatch")
     }
     if descriptor.environment.rust_host != qualification.rust_host
+        || descriptor.environment.build.source_commit != qualification.source_commit
+        || descriptor.environment.build.source_tree != qualification.source_tree
+        || descriptor.environment.build.source_dirty != qualification.source_dirty
         || descriptor.environment.build.rustc_vv != qualification.rustc_vv
         || descriptor.environment.build.cargo_profile != qualification.build_profile
         || descriptor.environment.build.prescribed_argv
@@ -980,7 +987,7 @@ fn qualification_binary_identity() -> Result<QualificationBinaryIdentity> {
         .and_then(Path::parent)
         .ok_or_else(|| anyhow::anyhow!("proof_availability_repository_root_missing"))?;
     let hooks = tempfile::tempdir()?;
-    let source_commit = String::from_utf8(
+    let live_commit = String::from_utf8(
         git(
             Some(repository),
             hooks.path(),
@@ -990,12 +997,25 @@ fn qualification_binary_identity() -> Result<QualificationBinaryIdentity> {
     )?
     .trim()
     .to_owned();
-    let source_tree = String::from_utf8(
+    let live_tree = String::from_utf8(
         git(Some(repository), hooks.path(), ["rev-parse", "HEAD^{tree}"])?.stdout,
     )?
     .trim()
     .to_owned();
-    require_head_and_clean(repository, &source_commit, hooks.path())?;
+    let live_clean = git(
+        Some(repository),
+        hooks.path(),
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?
+    .stdout
+    .is_empty();
+    let source_commit = build_provenance::SOURCE_COMMIT.trim().to_owned();
+    let source_tree = build_provenance::SOURCE_TREE.trim().to_owned();
+    let source_dirty = match build_provenance::SOURCE_DIRTY.trim() {
+        "true" => true,
+        "false" => false,
+        _ => bail!("proof_availability_qualification_build_dirty_state_invalid"),
+    };
     let rustc_vv = build_provenance::RUSTC_VV.to_owned();
     let rust_host = rustc_vv
         .lines()
@@ -1008,7 +1028,7 @@ fn qualification_binary_identity() -> Result<QualificationBinaryIdentity> {
     if !date.status.success() {
         bail!("proof_availability_recorded_at_unavailable")
     }
-    Ok(QualificationBinaryIdentity {
+    let qualification = QualificationBinaryIdentity {
         binary_sha256,
         source_commit,
         source_tree,
@@ -1016,7 +1036,28 @@ fn qualification_binary_identity() -> Result<QualificationBinaryIdentity> {
         rust_host,
         rustc_vv,
         build_profile: build_provenance::BUILD_PROFILE.to_owned(),
-    })
+        source_dirty,
+    };
+    require_live_source_matches_build(&qualification, &live_commit, &live_tree, live_clean)?;
+    Ok(qualification)
+}
+
+fn require_live_source_matches_build(
+    qualification: &QualificationBinaryIdentity,
+    live_commit: &str,
+    live_tree: &str,
+    live_clean: bool,
+) -> Result<()> {
+    if qualification.source_dirty {
+        bail!("proof_availability_qualification_binary_built_dirty")
+    }
+    if !live_clean {
+        bail!("proof_availability_qualification_live_source_dirty")
+    }
+    if qualification.source_commit != live_commit || qualification.source_tree != live_tree {
+        bail!("proof_availability_qualification_live_source_mismatch")
+    }
+    Ok(())
 }
 
 fn require_indexed_qualification(
@@ -2570,6 +2611,7 @@ mod tests {
             rust_host: "aarch64-apple-darwin".into(),
             rustc_vv: "rustc 1.91.0\nbinary: rustc\nhost: aarch64-apple-darwin\n".into(),
             build_profile: "release".into(),
+            source_dirty: false,
         };
 
         assert_eq!(
@@ -2577,7 +2619,7 @@ mod tests {
             "20260821T120000Z-222222222222"
         );
 
-        arguments.qualification_id = Some("20260821T120000Z-aaaaaaaaaaaa".into());
+        arguments.qualification_id = Some("20260821T120000Z-444444444444".into());
         assert!(
             require_indexed_qualification(&arguments, &qualification)
                 .unwrap_err()
@@ -2602,6 +2644,44 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("qualification_rust_host_mismatch")
+        );
+
+        require_live_source_matches_build(&qualification, &"2".repeat(40), &"3".repeat(40), true)
+            .unwrap();
+        assert!(
+            require_live_source_matches_build(
+                &qualification,
+                &"4".repeat(40),
+                &"5".repeat(40),
+                true,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_live_source_mismatch")
+        );
+        let mut dirty_build = qualification.clone();
+        dirty_build.source_dirty = true;
+        assert!(
+            require_live_source_matches_build(
+                &dirty_build,
+                &"2".repeat(40),
+                &"3".repeat(40),
+                true,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_binary_built_dirty")
+        );
+        assert!(
+            require_live_source_matches_build(
+                &qualification,
+                &"2".repeat(40),
+                &"3".repeat(40),
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_live_source_dirty")
         );
     }
 
@@ -2639,6 +2719,7 @@ mod tests {
             rust_host: "aarch64-apple-darwin".into(),
             rustc_vv: "rustc 1.91.0\nbinary: rustc\nhost: aarch64-apple-darwin\n".into(),
             build_profile: "release".into(),
+            source_dirty: false,
         };
 
         materialize_indexed_with_registry(
