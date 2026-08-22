@@ -158,7 +158,8 @@ def installed_plugin_identity(
         and args.installed_plugin_data.is_dir(),
         "installed_runtime proof requires one attestation and its plugin data directory",
     )
-    source_root = args.project.resolve() if args.project is not None else REPOSITORY_ROOT
+    project = getattr(args, "project", None)
+    source_root = project.resolve() if project is not None else REPOSITORY_ROOT
     _reject_source_checkout(plugin_root, source_root)
     attestation = _load_attestation(args.installed_plugin_attestation)
     # Each installer identity routes to exactly one accepted shape. A live public-catalog
