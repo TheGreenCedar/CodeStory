@@ -44,6 +44,7 @@ const CASE_DIAGNOSTIC_SCHEMA: &str = "codestory.proof-availability.invalid-case-
 const PUBLIC_ARTIFACT_BUILD_DIAGNOSTIC_SCHEMA: &str =
     "codestory.proof-availability.public-artifact-build-diagnostic.v1";
 const MAX_CASE_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+const MAX_DIAGNOSTIC_POINTER_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrivateDiagnosticFileKind {
@@ -125,6 +126,11 @@ impl PublicArtifactBuildStage {
 enum PublicArtifactBuildReason {
     PathLeak,
     SecretField,
+    ControlCharacter,
+    FindingsValidation,
+    ObjectFieldNotInFixedVocabulary,
+    ObjectPointerBudgetExceeded,
+    ArrayPointerBudgetExceeded,
     ExistingInvariant,
     Canonicalization,
     Serialization,
@@ -135,6 +141,11 @@ impl PublicArtifactBuildReason {
         match self {
             Self::PathLeak => "path_leak",
             Self::SecretField => "secret_field",
+            Self::ControlCharacter => "control_character",
+            Self::FindingsValidation => "findings_validation",
+            Self::ObjectFieldNotInFixedVocabulary => "object_field_not_in_fixed_vocabulary",
+            Self::ObjectPointerBudgetExceeded => "object_pointer_budget_exceeded",
+            Self::ArrayPointerBudgetExceeded => "array_pointer_budget_exceeded",
             Self::ExistingInvariant => "existing_invariant",
             Self::Canonicalization => "canonicalization",
             Self::Serialization => "serialization",
@@ -147,8 +158,24 @@ pub(crate) struct PublicArtifactBuildFailure {
     reason: PublicArtifactBuildReason,
     artifact: Option<PublicArtifactName>,
     case_ordinal: Option<usize>,
-    json_pointer: Option<String>,
-    rejected_string: Option<(usize, String)>,
+    evidence: PublicArtifactBuildEvidence,
+}
+
+enum PublicArtifactBuildEvidence {
+    None,
+    RejectedString {
+        json_pointer: Option<String>,
+        utf8_byte_length: usize,
+        sha256: String,
+    },
+    ObjectField {
+        parent_json_pointer: String,
+        utf8_byte_length: usize,
+        sha256: String,
+    },
+    PointerBudget {
+        parent_json_pointer: String,
+    },
 }
 
 impl PublicArtifactBuildFailure {
@@ -158,8 +185,7 @@ impl PublicArtifactBuildFailure {
             reason,
             artifact: None,
             case_ordinal: None,
-            json_pointer: None,
-            rejected_string: None,
+            evidence: PublicArtifactBuildEvidence::None,
         }
     }
 
@@ -176,14 +202,60 @@ impl PublicArtifactBuildFailure {
             reason,
             artifact: Some(artifact),
             case_ordinal,
-            json_pointer: Some(json_pointer),
-            rejected_string: Some((
-                rejected.len(),
-                domain_sha256(
+            evidence: PublicArtifactBuildEvidence::RejectedString {
+                json_pointer: Some(json_pointer),
+                utf8_byte_length: rejected.len(),
+                sha256: domain_sha256(
                     b"codestory.proof-availability.public-artifact-build-rejected-string.v1\0",
                     rejected.as_bytes(),
                 ),
-            )),
+            },
+        }
+    }
+
+    fn object_field_not_in_fixed_vocabulary(
+        artifact: PublicArtifactName,
+        case_ordinal: Option<usize>,
+        parent_json_pointer: &str,
+        field: &str,
+    ) -> Self {
+        debug_assert!(parent_json_pointer.len() <= MAX_DIAGNOSTIC_POINTER_BYTES);
+        Self {
+            stage: PublicArtifactBuildStage::BundleValidation,
+            reason: PublicArtifactBuildReason::ObjectFieldNotInFixedVocabulary,
+            artifact: Some(artifact),
+            case_ordinal,
+            evidence: PublicArtifactBuildEvidence::ObjectField {
+                parent_json_pointer: parent_json_pointer.to_owned(),
+                utf8_byte_length: field.len(),
+                sha256: domain_sha256(
+                    b"codestory.proof-availability.public-artifact-build-object-field-name.v1\0",
+                    field.as_bytes(),
+                ),
+            },
+        }
+    }
+
+    fn pointer_budget_exceeded(
+        reason: PublicArtifactBuildReason,
+        artifact: PublicArtifactName,
+        case_ordinal: Option<usize>,
+        parent_json_pointer: &str,
+    ) -> Self {
+        debug_assert!(matches!(
+            reason,
+            PublicArtifactBuildReason::ObjectPointerBudgetExceeded
+                | PublicArtifactBuildReason::ArrayPointerBudgetExceeded
+        ));
+        debug_assert!(parent_json_pointer.len() <= MAX_DIAGNOSTIC_POINTER_BYTES);
+        Self {
+            stage: PublicArtifactBuildStage::BundleValidation,
+            reason,
+            artifact: Some(artifact),
+            case_ordinal,
+            evidence: PublicArtifactBuildEvidence::PointerBudget {
+                parent_json_pointer: parent_json_pointer.to_owned(),
+            },
         }
     }
 
@@ -195,15 +267,30 @@ impl PublicArtifactBuildFailure {
         rejected: &str,
     ) -> Self {
         Self {
-            json_pointer: None,
-            ..Self::rejected_string(
-                stage,
-                reason,
-                artifact,
-                case_ordinal,
-                String::new(),
-                rejected,
-            )
+            stage,
+            reason,
+            artifact: Some(artifact),
+            case_ordinal,
+            evidence: PublicArtifactBuildEvidence::RejectedString {
+                json_pointer: None,
+                utf8_byte_length: rejected.len(),
+                sha256: domain_sha256(
+                    b"codestory.proof-availability.public-artifact-build-rejected-string.v1\0",
+                    rejected.as_bytes(),
+                ),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn json_pointer(&self) -> Option<&str> {
+        match &self.evidence {
+            PublicArtifactBuildEvidence::RejectedString { json_pointer, .. } => {
+                json_pointer.as_deref()
+            }
+            PublicArtifactBuildEvidence::None
+            | PublicArtifactBuildEvidence::ObjectField { .. }
+            | PublicArtifactBuildEvidence::PointerBudget { .. } => None,
         }
     }
 
@@ -575,12 +662,38 @@ fn build_public_artifact_build_diagnostic_artifact(
     source_tree: &str,
     failure: &PublicArtifactBuildFailure,
 ) -> Result<Value> {
-    let rejected_string = failure.rejected_string.as_ref().map(|(length, sha256)| {
-        json!({
-            "utf8_byte_length": length,
-            "sha256": sha256,
-        })
-    });
+    let (json_pointer, parent_json_pointer, rejected_string, field_name) = match &failure.evidence {
+        PublicArtifactBuildEvidence::None => (None, None, None, None),
+        PublicArtifactBuildEvidence::RejectedString {
+            json_pointer,
+            utf8_byte_length,
+            sha256,
+        } => (
+            json_pointer.as_deref(),
+            None,
+            Some(json!({
+                "utf8_byte_length": utf8_byte_length,
+                "sha256": sha256,
+            })),
+            None,
+        ),
+        PublicArtifactBuildEvidence::ObjectField {
+            parent_json_pointer,
+            utf8_byte_length,
+            sha256,
+        } => (
+            None,
+            Some(parent_json_pointer.as_str()),
+            None,
+            Some(json!({
+                "utf8_byte_length": utf8_byte_length,
+                "sha256": sha256,
+            })),
+        ),
+        PublicArtifactBuildEvidence::PointerBudget {
+            parent_json_pointer,
+        } => (None, Some(parent_json_pointer.as_str()), None, None),
+    };
     let artifact = json!({
         "schema": PUBLIC_ARTIFACT_BUILD_DIAGNOSTIC_SCHEMA,
         "classification": "non_evidence",
@@ -592,8 +705,10 @@ fn build_public_artifact_build_diagnostic_artifact(
             "reason": failure.reason.name(),
             "artifact": failure.artifact.map(PublicArtifactName::file_name),
             "case_ordinal": failure.case_ordinal,
-            "json_pointer": failure.json_pointer,
+            "json_pointer": json_pointer,
+            "parent_json_pointer": parent_json_pointer,
             "rejected_string": rejected_string,
+            "field_name": field_name,
         },
     });
     validate_private_diagnostic_value(&artifact, &[])?;
@@ -826,7 +941,10 @@ fn validate_private_diagnostic_value_at(
 
 fn is_removed_text_commitment_pointer_field(pointer: &str) -> bool {
     (pointer.starts_with("/removed_text_commitments/") && pointer.ends_with("/json_pointer"))
-        || pointer == "/failure/json_pointer"
+        || matches!(
+            pointer,
+            "/failure/json_pointer" | "/failure/parent_json_pointer"
+        )
 }
 
 fn valid_json_pointer(value: &str) -> bool {
@@ -1944,7 +2062,7 @@ fn validate_public_bundle_for_build(
     if bundle.findings.contains('\0') || bundle.findings.contains('\r') {
         return Err(PublicArtifactBuildFailure::rejected_string(
             PublicArtifactBuildStage::BundleValidation,
-            PublicArtifactBuildReason::ExistingInvariant,
+            PublicArtifactBuildReason::FindingsValidation,
             PublicArtifactName::Findings,
             None,
             "/text".to_owned(),
@@ -1973,11 +2091,32 @@ fn validate_public_json_for_build(
                         rejected,
                     ));
                 }
+                if field.bytes().any(|byte| byte.is_ascii_control()) {
+                    return Err(PublicArtifactBuildFailure::rejected_without_pointer(
+                        PublicArtifactBuildStage::BundleValidation,
+                        PublicArtifactBuildReason::ControlCharacter,
+                        artifact,
+                        case_ordinal,
+                        field,
+                    ));
+                }
+                let Some(escaped) = fixed_json_pointer_segment(field) else {
+                    return Err(
+                        PublicArtifactBuildFailure::object_field_not_in_fixed_vocabulary(
+                            artifact,
+                            case_ordinal,
+                            pointer,
+                            field,
+                        ),
+                    );
+                };
                 let child_pointer =
-                    append_fixed_object_pointer(pointer, field).ok_or_else(|| {
-                        PublicArtifactBuildFailure::closed(
-                            PublicArtifactBuildStage::BundleValidation,
-                            PublicArtifactBuildReason::ExistingInvariant,
+                    append_known_object_pointer(pointer, escaped).ok_or_else(|| {
+                        PublicArtifactBuildFailure::pointer_budget_exceeded(
+                            PublicArtifactBuildReason::ObjectPointerBudgetExceeded,
+                            artifact,
+                            case_ordinal,
+                            pointer,
                         )
                     })?;
                 validate_public_json_for_build(artifact, child, &child_pointer, case_ordinal)?;
@@ -1987,9 +2126,11 @@ fn validate_public_json_for_build(
             for (index, child) in values.iter().enumerate() {
                 let child_pointer =
                     append_array_index_pointer(pointer, index).ok_or_else(|| {
-                        PublicArtifactBuildFailure::closed(
-                            PublicArtifactBuildStage::BundleValidation,
-                            PublicArtifactBuildReason::ExistingInvariant,
+                        PublicArtifactBuildFailure::pointer_budget_exceeded(
+                            PublicArtifactBuildReason::ArrayPointerBudgetExceeded,
+                            artifact,
+                            case_ordinal,
+                            pointer,
                         )
                     })?;
                 let child_case_ordinal =
@@ -2021,33 +2162,30 @@ fn validate_public_json_for_build(
     Ok(())
 }
 
+#[cfg(test)]
 fn append_fixed_object_pointer(pointer: &str, segment: &str) -> Option<String> {
-    const MAX_DIAGNOSTIC_POINTER_BYTES: usize = 4096;
     let escaped = fixed_json_pointer_segment(segment)?;
+    append_known_object_pointer(pointer, escaped)
+}
+
+fn append_known_object_pointer(pointer: &str, escaped: &str) -> Option<String> {
     let length = pointer.len().checked_add(1)?.checked_add(escaped.len())?;
     (length <= MAX_DIAGNOSTIC_POINTER_BYTES).then(|| format!("{pointer}/{escaped}"))
 }
 
 fn append_array_index_pointer(pointer: &str, index: usize) -> Option<String> {
-    const MAX_DIAGNOSTIC_POINTER_BYTES: usize = 4096;
     let index = index.to_string();
     let length = pointer.len().checked_add(1)?.checked_add(index.len())?;
     (length <= MAX_DIAGNOSTIC_POINTER_BYTES).then(|| format!("{pointer}/{index}"))
 }
 
 fn fixed_json_pointer_segment(segment: &str) -> Option<&'static str> {
-    const ADDITIONAL_FIXED: &[&str] = &["oracle_step_index", "projection_bytes", "receipts"];
-    const FIXED: &str = "actionable_exact_gap actionable_incomplete_gap actual actual_bytes admitted_rows all_authoritative_receipts_exact architecture attempted_positive_steps attempted_step_count audit authoritative_exact_receipt_count authoritative_receipt_count authoritative_receipts automatic automatic_thresholds_met binary_name binary_sha256 boundary buckets build byte_end byte_start caller caller_body callsite_expression callsite_identity callsite_line candidate_edge_ids canonical_id canonical_id_binding_sha256 cargo_profile case_id cases certainty certified_absence classification classified_positive_steps clause_id clauses code cohorts commit complete_projection_bytes complete_response_p95_bytes containment contract_digest contract_proven contract_proven_supported core_generation core_generation_id core_run_id corpus_id corpus_sha256 count curator database_sha256 decision denominator detail diagnostic_candidate_count edge_count edge_id edge_ids effective_endpoint effective_endpoint_rows elapsed_ns end_byte end_byte_exclusive end_line environment environment_id exact_oracle_step_count exact_resolved exact_resolved_rows exclude_from_projection expected_cohort_count expected_negative_requests expected_positive_requests expected_positive_steps experimental failed_gates failure_funnel false_contract_proven false_positive_receipt_count file_byte_length file_count file_node_id finalization finding freshness full_or_useful_partial full_proof_wilson full_proofs gap gaps gate_id hard_gates identity incomplete_provenance indexed_sha256 invalid_results inventory invocation kind language length lengths line_window lower lower_milli maximum_certified_absence maximum_complete_response_p95_bytes maximum_false_contract_proven maximum_invalid_results maximum_over_cap_results maximum_proof_bytes maximum_response_bytes maximum_transport_errors maximum_transport_p95_ms maximum_unknown_p95_ms maximum_unknown_response_p95_bytes measurements methodology_sha256 milli minimum_actionable_exact_gap_milli minimum_cohort_wilson_lower_milli minimum_full_or_useful_partial_milli minimum_full_proof_wilson_lower_milli minimum_full_proofs minimum_full_proofs_per_cohort minimum_positive_step_recall_milli missing_oracle_step_count missing_oracle_steps mutated_spec mutation_id negative_mutations negative_request_count node_count node_id non_exact_authoritative_receipts numerator observations observations_sha256 observed_receipt_count observed_receipts observed_sha256 operation oracle_comparison oracle_receipts_exact oracle_step oracle_steps os outcome over_cap_results owner_node_id path path_count path_file path_file_sha256 path_id path_length path_length_distribution paths pinned positive_request_count positive_step_count positive_step_precision_milli positive_step_recall positive_step_recall_milli prescribed_argv product_disposition product_disposition_matches_evidence product_disposition_mismatches profile project_file_components project_id projects proof_trace prohibit_traversal_through proven_prefix_length proven_prefix_step_count proven_step_precision_milli proven_step_recall_milli provenance qualification_id qualification_source_commit qualification_source_tree qualified_name quote range reason receipt_evidence receipt_file_sha256 receipt_id receipt_line_window recorded_at repository repository_id require_complete_failure_funnel require_complete_provenance require_each_cohort require_exact_receipt_matches require_product_disposition_match results_sha256 review_date reviewer revision rust_host rustc_vv schema selector selector_early_return selector_index selectors sha256 source source_area source_area_requirement source_audit source_commit source_dirty source_head source_text source_tree source_tree_sha256 spec stable_explicit stage stage_durations_ms start start_byte start_line step_index steps store_schema stored_call_rows strictly_admitted symbol target text thresholds_id thresholds_sha256 trails transport transport_errors transport_p95 unclassified_positive_steps unclassified_step_indices unknown_response_p95_bytes unknown_warm_p95_ms unresolved_placeholder_rows upper validation warm_end_to_end_ms wilson wilson_z workspace";
-    if let Some(candidate) = ADDITIONAL_FIXED
-        .iter()
-        .copied()
-        .find(|candidate| *candidate == segment)
-    {
-        return Some(candidate);
-    }
-    FIXED
-        .split_ascii_whitespace()
-        .find(|candidate| *candidate == segment)
+    fixed_json_pointer_segments().find(|candidate| *candidate == segment)
+}
+
+fn fixed_json_pointer_segments() -> impl Iterator<Item = &'static str> {
+    const FIXED: &str = "actionable_exact_gap actionable_incomplete_gap actual actual_bytes admitted_rows after_step_count architecture attempted_positive_steps attempted_step_count authoritative_receipts automatic_thresholds_met basis binary_name binary_sha256 boundary buckets build byte_end byte_start caller callsite_identity callsite_line candidate_edge_ids canonical_id canonical_id_binding_sha256 cargo_profile case_id cases certainty certified_absence classified_positive_steps code cohorts complete_projection_bytes complete_response_p95_bytes connected_receipts containment contract_digest contract_proven core_generation core_generation_id core_run_id corpus_sha256 count database_sha256 decision denominator detail edge_count edge_id edge_ids effective_endpoint effective_endpoint_rows elapsed_ns end_byte end_line enumeration_receipt_id environment environment_id error evidence exact_resolved exact_resolved_rows exclude_from_projection extractor_capability_receipt_id failed_gates failure failure_funnel false_contract_proven file_byte_length file_count file_node_id finalization freshness full_or_useful_partial full_proof_wilson full_proofs gap gaps gate gate_id hard_gates histogram identity incomplete_provenance indexed_sha256 invalid_results inventory invocation kind length lengths line_window lower lower_milli maximum_bytes maximum_candidate_edges maximum_response_bytes measurements message milli mismatches missing_oracle_steps mutated_spec mutation_id negative_mutations node_count node_id non_exact_authoritative_receipts numerator observations observations_sha256 observed observed_candidate_edges_at_least observed_receipts observed_sha256 operation oracle_comparison oracle_step oracle_step_index os outcome over_cap_results owner_node_id path path_id pinned positive_step_recall prescribed_argv product_disposition product_disposition_mismatches profile prohibit_traversal_through prohibition_index project_file_components project_id projection projection_bytes projects proof_trace provenance qualification_id qualification_source_commit qualification_source_tree qualified_name range reason reasons receipt_evidence receipt_file_sha256 receipt_id receipt_line_window receipts recorded_at repository_id required results_sha256 revision rust_host rustc_vv schema selector selector_early_return selector_index selectors sha256 source source_commit source_dirty source_head source_tree stage stage_durations_ms start start_byte start_line step_index steps store_schema stored_call_rows strictly_admitted symbol target text thresholds_sha256 trails transport transport_errors transport_p95 unclassified_positive_steps unclassified_step_indices unknown_response_p95_bytes unknown_warm_p95_ms unresolved_placeholder_rows upper validation warm_end_to_end_ms wilson";
+    FIXED.split_ascii_whitespace()
 }
 
 fn validate_public_bundle(bundle: &PublicArtifactBundle, policy: &PublicLeakPolicy) -> Result<()> {
@@ -2388,6 +2526,7 @@ fn rename_directory_noreplace(_: &Path, _: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::fs;
 
     fn fixture_bundle() -> PublicArtifactBundle {
@@ -2479,7 +2618,7 @@ mod tests {
     #[test]
     fn public_artifact_validation_keeps_first_artifact_and_case_in_depth_first_order() {
         let mut bundle = fixture_bundle();
-        bundle.environment = json!({"workspace": "C:\\\\private"});
+        bundle.environment = json!({"source_head": "C:\\\\private"});
         bundle.cases = json!([
             {"canonical_id": "\\\\server\\share\\private"},
             {"canonical_id": "\\\\?\\\\C:\\\\private"}
@@ -2487,13 +2626,13 @@ mod tests {
         let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
         assert_eq!(failure.artifact, Some(PublicArtifactName::Environment));
         assert_eq!(failure.case_ordinal, None);
-        assert_eq!(failure.json_pointer.as_deref(), Some("/workspace"));
+        assert_eq!(failure.json_pointer(), Some("/source_head"));
 
-        bundle.environment = json!({"workspace": "relative"});
+        bundle.environment = json!({"source_head": "relative"});
         let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
         assert_eq!(failure.artifact, Some(PublicArtifactName::Cases));
         assert_eq!(failure.case_ordinal, Some(0));
-        assert_eq!(failure.json_pointer.as_deref(), Some("/0/canonical_id"));
+        assert_eq!(failure.json_pointer(), Some("/0/canonical_id"));
     }
 
     #[test]
@@ -2527,17 +2666,13 @@ mod tests {
         for key in [
             "private prose /Users/albert/secret",
             "token-like-key=private",
-            "hostile\u{0}control",
         ] {
             let mut bundle = fixture_bundle();
-            bundle.cases = Value::Object(
-                [(
-                    key.to_owned(),
-                    Value::String("/Users/albert/secret".to_owned()),
-                )]
-                .into_iter()
-                .collect(),
-            );
+            bundle.cases = Value::Array(vec![Value::Object(
+                [(key.to_owned(), Value::String("relative".to_owned()))]
+                    .into_iter()
+                    .collect(),
+            )]);
             let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
             let artifact = build_public_artifact_build_diagnostic_artifact(
                 "20260821T120000Z-222222222222",
@@ -2548,11 +2683,49 @@ mod tests {
             .unwrap();
             let rendered = String::from_utf8(canonical_json_file(&artifact).unwrap()).unwrap();
 
-            assert_eq!(artifact["failure"]["reason"], "existing_invariant");
-            assert!(artifact["failure"]["json_pointer"].is_null());
+            assert_eq!(
+                artifact["failure"]["reason"],
+                "object_field_not_in_fixed_vocabulary"
+            );
+            assert_eq!(artifact["failure"]["case_ordinal"], 0);
+            assert_eq!(artifact["failure"]["parent_json_pointer"], "/0");
+            assert_eq!(
+                artifact["failure"]["field_name"]["utf8_byte_length"],
+                key.len()
+            );
+            assert_eq!(
+                artifact["failure"]["field_name"]["sha256"],
+                domain_sha256(
+                    b"codestory.proof-availability.public-artifact-build-object-field-name.v1\0",
+                    key.as_bytes(),
+                )
+            );
             assert!(!rendered.contains(key));
-            assert!(!rendered.contains("/Users/albert/secret"));
+            assert!(!rendered.contains("relative"));
         }
+    }
+
+    #[test]
+    fn public_artifact_control_character_rejection_is_typed_and_redacted() {
+        let mut bundle = fixture_bundle();
+        bundle.cases = Value::Object(
+            [("hostile\u{0}control".to_owned(), Value::Null)]
+                .into_iter()
+                .collect(),
+        );
+        let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
+        let artifact = build_public_artifact_build_diagnostic_artifact(
+            "20260821T120000Z-222222222222",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &failure,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(canonical_json_file(&artifact).unwrap()).unwrap();
+
+        assert_eq!(artifact["failure"]["reason"], "control_character");
+        assert!(artifact["failure"]["rejected_string"]["sha256"].is_string());
+        assert!(!rendered.contains("hostile"));
     }
 
     #[test]
@@ -2571,7 +2744,7 @@ mod tests {
             let rendered = String::from_utf8(canonical_json_file(&artifact).unwrap()).unwrap();
 
             assert_eq!(artifact["failure"]["artifact"], "findings.md");
-            assert_eq!(artifact["failure"]["reason"], "existing_invariant");
+            assert_eq!(artifact["failure"]["reason"], "findings_validation");
             assert_eq!(
                 artifact["failure"]["rejected_string"]["utf8_byte_length"],
                 findings.len()
@@ -2599,14 +2772,76 @@ mod tests {
     }
 
     #[test]
+    fn public_artifact_pointer_budget_failures_distinguish_object_and_array_paths() {
+        let object_parent = format!("/{}", "x".repeat(4092));
+        let object_failure = validate_public_json_for_build(
+            PublicArtifactName::Cases,
+            &json!({"schema": "fixture"}),
+            &object_parent,
+            Some(7),
+        )
+        .unwrap_err();
+        let object_artifact = build_public_artifact_build_diagnostic_artifact(
+            "20260821T120000Z-222222222222",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &object_failure,
+        )
+        .unwrap();
+        assert_eq!(
+            object_artifact["failure"]["reason"],
+            "object_pointer_budget_exceeded"
+        );
+        assert_eq!(
+            object_artifact["failure"]["parent_json_pointer"],
+            object_parent
+        );
+
+        let array_parent = format!("/{}", "x".repeat(4095));
+        let array_failure = validate_public_json_for_build(
+            PublicArtifactName::Cases,
+            &json!([null]),
+            &array_parent,
+            Some(8),
+        )
+        .unwrap_err();
+        let array_artifact = build_public_artifact_build_diagnostic_artifact(
+            "20260821T120000Z-222222222222",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &array_failure,
+        )
+        .unwrap();
+        assert_eq!(
+            array_artifact["failure"]["reason"],
+            "array_pointer_budget_exceeded"
+        );
+        assert_eq!(
+            array_artifact["failure"]["parent_json_pointer"],
+            array_parent
+        );
+    }
+
+    #[test]
     fn public_artifact_pointer_admits_numeric_segments_only_from_arrays() {
         assert!(append_fixed_object_pointer("", "7").is_none());
         assert_eq!(append_array_index_pointer("", 7).as_deref(), Some("/7"));
         let mut bundle = fixture_bundle();
         bundle.cases = json!({"7": "/Users/albert/private"});
         let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
-        assert_eq!(failure.reason, PublicArtifactBuildReason::ExistingInvariant);
-        assert!(failure.json_pointer.is_none());
+        let artifact = build_public_artifact_build_diagnostic_artifact(
+            "20260821T120000Z-222222222222",
+            &"a".repeat(40),
+            &"b".repeat(40),
+            &failure,
+        )
+        .unwrap();
+        assert_eq!(
+            artifact["failure"]["reason"],
+            "object_field_not_in_fixed_vocabulary"
+        );
+        assert_eq!(artifact["failure"]["parent_json_pointer"], "");
+        assert_eq!(artifact["failure"]["field_name"]["utf8_byte_length"], 1);
     }
 
     #[test]
@@ -2644,6 +2879,123 @@ mod tests {
         }
         build_public_artifacts(&summary, &corpus, &thresholds)
             .expect("every typed report field has a fixed pointer segment");
+    }
+
+    #[test]
+    fn fixed_pointer_vocabulary_exactly_matches_closed_public_schema_properties() {
+        let mut schema_fields = BTreeSet::new();
+        collect_schema_property_names(
+            &serde_json::to_value(schemars::schema_for!(QualificationSummaryV1)).unwrap(),
+            &mut schema_fields,
+        );
+        collect_schema_property_names(
+            &serde_json::to_value(schemars::schema_for!(ActivationDecisionReportV1)).unwrap(),
+            &mut schema_fields,
+        );
+        let vocabulary_fields = fixed_json_pointer_segments().collect::<Vec<_>>();
+        assert!(
+            vocabulary_fields.windows(2).all(|pair| pair[0] < pair[1]),
+            "fixed vocabulary must be unique and sorted"
+        );
+        let vocabulary = vocabulary_fields
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+
+        for field in [
+            "after_step_count",
+            "basis",
+            "connected_receipts",
+            "enumeration_receipt_id",
+            "error",
+            "extractor_capability_receipt_id",
+            "failure",
+            "gate",
+            "histogram",
+            "maximum_bytes",
+            "maximum_candidate_edges",
+            "message",
+            "mismatches",
+            "observed_candidate_edges_at_least",
+            "prohibition_index",
+            "projection",
+            "reasons",
+            "observed",
+            "required",
+            "evidence",
+        ] {
+            assert!(schema_fields.contains(field), "schema omitted {field}");
+            assert!(vocabulary.contains(field), "vocabulary omitted {field}");
+        }
+        assert_eq!(vocabulary, schema_fields);
+    }
+
+    fn collect_schema_property_names(value: &Value, fields: &mut BTreeSet<String>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                    fields.extend(properties.keys().cloned());
+                }
+                for child in object.values() {
+                    collect_schema_property_names(child, fields);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    collect_schema_property_names(child, fields);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
+    #[test]
+    fn builder_accepts_a_legitimate_transport_error_variant() {
+        let (mut report, corpus, thresholds) =
+            super::super::thresholds::tests::accepted_fixture::values();
+        report["cases"][0]["transport"] = json!({
+            "kind": "error",
+            "error": {
+                "kind": "result_exceeds_budget",
+                "maximum_bytes": 65_536,
+                "actual_bytes": 65_537,
+            },
+        });
+        super::super::thresholds::tests::refresh_results_digest(&mut report);
+        let summary = QualificationSummaryV1::from_json(report).unwrap();
+        let corpus = CorpusV1::from_json(corpus).unwrap();
+        let thresholds = ThresholdsV1::from_json(thresholds).unwrap();
+        summary
+            .validate_against_inputs(&corpus, &thresholds)
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join(&summary.qualification_id);
+        let reservation = reserve_case_diagnostic(root.path(), &summary.qualification_id).unwrap();
+        build_and_publish(
+            &destination,
+            &summary,
+            &corpus,
+            &thresholds,
+            &PublicLeakPolicy::default(),
+            PublicArtifactDiagnosticContext::new(
+                &reservation,
+                &summary.qualification_id,
+                &summary.provenance.source_commit,
+                &summary.provenance.source_tree,
+            ),
+        )
+        .expect("every field of a legitimate closed transport error is publishable");
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 8);
     }
 
     fn assert_fixed_object_keys(value: &Value) {
