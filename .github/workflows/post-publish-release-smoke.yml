@@ -136,6 +136,7 @@ jobs:
             .github/scripts/install-codestory-marketplace-proof.mjs \
             .github/scripts/marketplace-delivery-identity.mjs \
             .github/scripts/check-packaged-agent-proof.py \
+            .github/scripts/native_binary_contract.py \
             .github/scripts/packaged_agent_proof \
             | tar -x -C "$harness_root"
           echo "helper=$harness_root/.github/scripts/install-codestory-marketplace-proof.mjs" >> "$GITHUB_OUTPUT"
@@ -668,6 +669,7 @@ jobs:
             --checksum-file "$ASSET_CHECKSUM" \
             --expected-version "$RELEASE_VERSION" \
             --project "${{ github.workspace }}" \
+            --measurement-protocol "${{ github.workspace }}/crates/codestory-llama-sys/per-user-embedding-server-measurement-protocol.json" \
             --plugin-root "$INSTALLED_PLUGIN_ROOT" \
             --plugin-handoff \
             --engine-policy accelerated \

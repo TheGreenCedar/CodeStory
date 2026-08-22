@@ -443,7 +443,12 @@ def _validate_marketplace_checkout(
     return marketplace_commit
 
 
-def _validate_release_source(plugin: dict, plugin_root: Path, manifest: dict) -> str:
+def _validate_release_source(
+    plugin: dict,
+    plugin_root: Path,
+    manifest: dict,
+    source_root: Path,
+) -> str:
     package_sha256 = directory_contract_sha256(plugin_root)
     source_commit = plugin["source_commit"]
     require(
@@ -453,17 +458,17 @@ def _validate_release_source(plugin: dict, plugin_root: Path, manifest: dict) ->
         and plugin["package_sha256"] == package_sha256
         and isinstance(source_commit, str)
         and re.fullmatch(r"[0-9a-f]{40}", source_commit) is not None
-        and _git_output(REPOSITORY_ROOT, "rev-parse", f"{source_commit}^{{commit}}")
+        and _git_output(source_root, "rev-parse", f"{source_commit}^{{commit}}")
         == source_commit
-        and _git_output(REPOSITORY_ROOT, "rev-parse", f"{source_commit}^{{tree}}")
+        and _git_output(source_root, "rev-parse", f"{source_commit}^{{tree}}")
         == manifest["source"]["tree"]
-        and _git_output(REPOSITORY_ROOT, "rev-parse", "HEAD")
+        and _git_output(source_root, "rev-parse", "HEAD")
         == manifest["source"]["commit"]
-        and _git_output(REPOSITORY_ROOT, "rev-parse", "HEAD^{tree}")
+        and _git_output(source_root, "rev-parse", "HEAD^{tree}")
         == manifest["source"]["tree"],
         "marketplace install is not bound to the exact packaged release source",
     )
-    source_plugin_root = REPOSITORY_ROOT / "plugins" / "codestory"
+    source_plugin_root = source_root / "plugins" / "codestory"
     require(
         package_sha256 == directory_contract_sha256(source_plugin_root),
         "Codex-installed plugin bytes differ from the packaged release source tree",
@@ -477,6 +482,7 @@ def marketplace_installed_plugin_identity(
     installed_plugin_data: Path,
     plugin_root: Path,
     manifest: dict,
+    source_root: Path = REPOSITORY_ROOT,
 ) -> dict:
     codex_home, plugin, marketplace = _validate_attestation_paths(
         attestation,
@@ -504,7 +510,9 @@ def marketplace_installed_plugin_identity(
         plugin["source_commit"] == plugin_source_sha,
         "marketplace attestation source does not match the catalog pin",
     )
-    package_sha256 = _validate_release_source(plugin, plugin_root, manifest)
+    package_sha256 = _validate_release_source(
+        plugin, plugin_root, manifest, source_root
+    )
     return {
         "schema_version": 2,
         "installation_source": state.installation_source,

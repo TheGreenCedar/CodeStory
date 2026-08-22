@@ -16,8 +16,8 @@ from .marketplace_installation import (
 )
 
 
-def _reject_source_checkout(plugin_root: Path) -> None:
-    source_plugin_root = REPOSITORY_ROOT / "plugins" / "codestory"
+def _reject_source_checkout(plugin_root: Path, source_root: Path) -> None:
+    source_plugin_root = source_root / "plugins" / "codestory"
     require(
         not same_existing_path(plugin_root, source_plugin_root),
         "installed_runtime proof rejects the repository-source plugin root",
@@ -158,7 +158,9 @@ def installed_plugin_identity(
         and args.installed_plugin_data.is_dir(),
         "installed_runtime proof requires one attestation and its plugin data directory",
     )
-    _reject_source_checkout(plugin_root)
+    project = getattr(args, "project", None)
+    source_root = project.resolve() if project is not None else REPOSITORY_ROOT
+    _reject_source_checkout(plugin_root, source_root)
     attestation = _load_attestation(args.installed_plugin_attestation)
     # Each installer identity routes to exactly one accepted shape. A live public-catalog
     # install and a deferred candidate-pinned fixture are different states of the world, so
@@ -172,6 +174,7 @@ def installed_plugin_identity(
             args.installed_plugin_data,
             plugin_root,
             manifest,
+            source_root,
         )
     return _candidate_installed_plugin_identity(
         args,
