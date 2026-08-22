@@ -10362,6 +10362,22 @@ fn raw_call_edges_by_effective_source_match_the_broad_edge_filter() -> Result<()
         vec![EdgeId(1), EdgeId(2), EdgeId(5)],
         "selective route lookup lost deterministic edge-id order across branches"
     );
+    let exact_cap = storage.get_bounded_raw_call_edges_by_effective_source(NodeId(10), 3)?;
+    assert_eq!(exact_cap.edges, selective);
+    assert!(!exact_cap.truncated, "the exact cap is complete");
+    let cap_plus_one = storage.get_bounded_raw_call_edges_by_effective_source(NodeId(10), 2)?;
+    assert_eq!(
+        cap_plus_one
+            .edges
+            .iter()
+            .map(|edge| edge.id)
+            .collect::<Vec<_>>(),
+        vec![EdgeId(1), EdgeId(2)]
+    );
+    assert!(
+        cap_plus_one.truncated,
+        "the query observes cap + 1 without returning an unbounded collection"
+    );
 
     // The trail accessor is not a substitute: its policy clears exactly the
     // resolution fields the route-handler DTO reports, for both the uncertain

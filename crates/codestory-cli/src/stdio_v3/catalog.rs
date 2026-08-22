@@ -1,14 +1,20 @@
 use serde_json::{Map, Value, json};
 
-use super::profile::McpRevisionV3;
+use super::{V3SurfaceSet, profile::McpRevisionV3};
 
 const VENDOR_SAFETY_KEY: &str = "com.thegreencedar.codestory/safety";
 const PROJECTION_ROWS_MAX_V3: usize = 256;
 const PROJECTION_REFERENCES_MAX_V3: usize = 256;
 
 pub(crate) fn tools_for_revision_v3(revision: McpRevisionV3) -> Vec<Value> {
+    tools_for_surface_v3(revision, V3SurfaceSet::WithProof)
+}
+
+pub(crate) fn tools_for_surface_v3(revision: McpRevisionV3, surface: V3SurfaceSet) -> Vec<Value> {
     let mut sources = crate::stdio_catalog::v3_tool_source_json();
-    sources.push(proof_tool_source_v3());
+    if surface == V3SurfaceSet::WithProof {
+        sources.push(proof_tool_source_v3());
+    }
     sources
         .into_iter()
         .map(|source| project_tool_v3(revision, &source))
@@ -559,6 +565,22 @@ mod tests {
             .iter()
             .find(|tool| tool["name"] == name)
             .unwrap_or_else(|| panic!("missing v3 tool {name}"))
+    }
+
+    #[test]
+    fn evidence_only_surface_is_closed_and_never_advertises_proof() {
+        for revision in McpRevisionV3::all() {
+            let tools = tools_for_surface_v3(*revision, super::super::V3SurfaceSet::EvidenceOnly);
+            let names = tools
+                .iter()
+                .map(|tool| tool["name"].as_str().expect("tool name"))
+                .collect::<BTreeSet<_>>();
+            assert!(!names.contains("prove_call_path"));
+            for required in ["packet", "context", "search"] {
+                assert!(names.contains(required), "missing evidence tool {required}");
+            }
+            assert_eq!(tools.len(), 20);
+        }
     }
 
     #[test]

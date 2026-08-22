@@ -71,8 +71,15 @@ mod index_freshness;
 mod index_full;
 mod index_incremental;
 mod index_timings;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "proof-qualification-support"
+))]
 mod indexed_source_call_path_v1;
+#[cfg(feature = "proof-qualification-support")]
+#[doc(hidden)]
+pub mod proof_qualification_support;
 mod publication;
 mod repo_text;
 mod root_rank;
@@ -89,6 +96,9 @@ mod semantic_projection;
 mod semantic_republish;
 mod snippets;
 mod source_coverage;
+#[cfg(feature = "v3-evidence-separation-support")]
+#[doc(hidden)]
+pub mod v3_evidence_qualification_support;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{

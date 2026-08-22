@@ -1898,7 +1898,11 @@ impl PublicOperationService {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(
+        test,
+        feature = "test-support",
+        feature = "v3-evidence-separation-support"
+    ))]
     pub(crate) fn active_project_identity_v3(
         &self,
     ) -> Result<codestory_workspace::ProjectIdentityV3, ApiError> {
@@ -2783,7 +2787,7 @@ mod freshness_gate_tests {
     #[test]
     fn dark_indexed_call_path_builder_remains_core_only() {
         assert!(!operation_requires_retrieval(
-            codestory_agent::indexed_source_call_path_v1::PROOF_DOMAIN
+            codestory_agent::proof_qualification_test_support::PROOF_DOMAIN
         ));
         for operation in ["packet", "search", "context", "drill"] {
             assert!(operation_requires_retrieval(operation));

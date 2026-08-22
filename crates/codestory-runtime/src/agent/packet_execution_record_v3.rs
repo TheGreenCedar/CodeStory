@@ -786,7 +786,7 @@ fn digest_v3(bytes: &[u8]) -> Result<Sha256DigestV3Dto, RecordValidationErrorV3>
         .map_err(|_| RecordValidationErrorV3::InvalidDigest)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "v3-evidence-separation-support"))]
 pub(crate) fn build_packet_execution_record_fixture_v3(
     input: &FinalizedPacketExecutionInputV3,
     with_retrieval_publication: bool,

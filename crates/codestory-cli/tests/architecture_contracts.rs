@@ -206,6 +206,10 @@ fn production_source_prefix(source: &str) -> &str {
         .map_or(source, |(production, _)| production)
 }
 
+fn production_source_contains_git_spawn(source: &str) -> bool {
+    production_source(source).contains("Command::new(\"git\")")
+}
+
 /// Everything in `source` that a release build actually compiles: every
 /// top-level `#[cfg(test)]` item is removed, wherever in the file it sits.
 ///
@@ -246,6 +250,10 @@ fn skip_gated_item<'a>(lines: &mut impl Iterator<Item = &'a str>) {
             return;
         }
         if line.contains('{') {
+            let trimmed = line.trim_end();
+            if !opened_block && (trimmed.ends_with('}') || trimmed.ends_with("};")) {
+                return;
+            }
             opened_block = true;
             continue;
         }
@@ -627,8 +635,9 @@ const AGENT_PLANNING_MODULES: [&str; 27] = [
 /// - `indexed_source_call_path_v1.rs` is the dark v3 proof kernel. Task 2 keeps
 ///   it behind the same test-support gate until the atomic public v3 cut.
 /// - `packet_execution_plan_v3.rs` is the dark v3 evidence-planning ledger.
-///   Task 3A keeps its callable surface behind the same test-support gate; it
-///   is not one of the 27 production packet-planning modules.
+///   Task 3A keeps its callable surface behind test support and the sealed Q1
+///   evidence-only compile feature; it is not one of the 27 production
+///   packet-planning modules.
 const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 4] = [
     "lib.rs",
     "eval_probes.rs",
@@ -641,9 +650,9 @@ fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
     let agent_lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
         agent_lib.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod packet_execution_plan_v3;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\n#[doc(hidden)]\npub mod packet_execution_plan_v3;"
         ),
-        "the v3 evidence planner must remain test-support-only until the atomic v3 cut"
+        "the v3 evidence planner must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
     );
     assert!(
         AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"packet_execution_plan_v3.rs"),
@@ -658,6 +667,7 @@ fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
                 &[
                     "agent/packet_execution_record_v3.rs",
                     "agent/packet_projection_v3.rs",
+                    "v3_evidence_qualification_support.rs",
                 ],
             ),
         ),
@@ -698,15 +708,15 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
     let runtime_agent_modules = read("crates/codestory-runtime/src/agent/mod.rs");
     assert!(
         runtime_agent_modules.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\npub(crate) mod packet_execution_record_v3;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\npub(crate) mod packet_execution_record_v3;"
         ),
-        "the runtime-owned v3 record must remain test-support-only until the atomic v3 cut"
+        "the runtime-owned v3 record must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
     );
     assert!(
         runtime_agent_modules.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\npub(crate) mod packet_projection_v3;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\npub(crate) mod packet_projection_v3;"
         ),
-        "the runtime-owned v3 projector must remain test-support-only until the atomic v3 cut"
+        "the runtime-owned v3 projector must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
     );
 
     let record_path = "crates/codestory-runtime/src/agent/packet_execution_record_v3.rs";
@@ -783,6 +793,7 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
                 &[
                     "agent/packet_execution_record_v3.rs",
                     "agent/packet_projection_v3.rs",
+                    "v3_evidence_qualification_support.rs",
                 ],
             )
             .replace("pub(crate) mod packet_execution_record_v3;", "")
@@ -852,8 +863,10 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
 fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     let cli_lib = read("crates/codestory-cli/src/lib.rs");
     assert!(
-        cli_lib.contains("#[cfg(test)]\nmod stdio_v3;"),
-        "the revision-native transport facade must stay test-only until the sealed benchmark feature lands"
+        cli_lib.contains(
+            "#[cfg(any(\n    test,\n    feature = \"proof-qualification-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\n#[allow(dead_code)]\nmod stdio_v3;"
+        ),
+        "the revision-native transport facade must stay behind the sealed benchmark feature"
     );
 
     let facade = read_source_tree("crates/codestory-cli/src/stdio_v3");
@@ -871,6 +884,7 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     let production_cli = read_source_tree_excluding_many(
         "crates/codestory-cli/src",
         &[
+            "lib.rs",
             "stdio_v3/catalog.rs",
             "stdio_v3/mod.rs",
             "stdio_v3/profile.rs",
@@ -891,8 +905,6 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     }
 
     for surface in [
-        "crates/codestory-cli/Cargo.toml",
-        "crates/codestory-bench/Cargo.toml",
         "crates/codestory-cli/src/args.rs",
         "crates/codestory-cli/src/http_transport.rs",
         "plugins/codestory/generated-mcp-catalog.json",
@@ -902,7 +914,6 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
         for forbidden in [
             "measure_revision_native_proof_result_v3",
             "RevisionNativeToolResultMeasurementV3",
-            "proof-qualification-support",
             "prove_call_path",
         ] {
             assert!(
@@ -941,13 +952,299 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
 }
 
 #[test]
+fn proof_qualification_support_is_bench_only_and_never_a_product_feature() {
+    const SUPPORT_FEATURE: &str = "proof-qualification-support";
+    const BENCHMARK_FEATURE: &str = "benchmark-support";
+
+    for crate_manifest in [
+        "crates/codestory-agent/Cargo.toml",
+        "crates/codestory-runtime/Cargo.toml",
+        "crates/codestory-cli/Cargo.toml",
+    ] {
+        let crate_manifest_value = manifest(crate_manifest);
+        let features = crate_manifest_value
+            .get("features")
+            .and_then(Value::as_table)
+            .expect("qualification crate must declare features");
+        assert!(
+            features.contains_key(SUPPORT_FEATURE),
+            "{crate_manifest} must declare the sealed {SUPPORT_FEATURE} feature"
+        );
+    }
+
+    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        agent_lib.contains("feature = \"proof-qualification-support\"")
+            && agent_lib.contains("pub mod proof_qualification_support"),
+        "the agent qualification facade must be feature-gated rather than public by default"
+    );
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
+    assert!(
+        runtime_lib.contains("feature = \"proof-qualification-support\"")
+            && runtime_lib.contains("pub mod proof_qualification_support;"),
+        "the runtime qualification facade must be feature-gated rather than public by default"
+    );
+    let cli_lib = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        cli_lib.contains("feature = \"proof-qualification-support\"")
+            && cli_lib.contains("pub mod proof_qualification_support"),
+        "the CLI qualification facade must be feature-gated rather than public by default"
+    );
+
+    let bench = manifest("crates/codestory-bench/Cargo.toml");
+    let dependencies = bench
+        .get("dependencies")
+        .and_then(Value::as_table)
+        .expect("qualification dependencies must be normal benchmark dependencies");
+    for required in [
+        "codestory-agent",
+        "codestory-runtime",
+        "codestory-cli",
+        "codestory-store",
+        "codestory-indexer",
+        "codestory-contracts",
+    ] {
+        assert!(
+            dependencies.contains_key(required),
+            "{required} must be a normal codestory-bench dependency"
+        );
+    }
+    for (dependency, expected) in [
+        ("codestory-agent", BTreeSet::from([SUPPORT_FEATURE])),
+        (
+            "codestory-runtime",
+            BTreeSet::from([SUPPORT_FEATURE, BENCHMARK_FEATURE]),
+        ),
+        ("codestory-cli", BTreeSet::from([SUPPORT_FEATURE])),
+    ] {
+        let enabled = dependencies
+            .get(dependency)
+            .and_then(Value::as_table)
+            .and_then(|entry| entry.get("features"))
+            .and_then(Value::as_array)
+            .expect("qualification dependency must declare its enabled features")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            enabled.contains(SUPPORT_FEATURE),
+            "{dependency} must receive the sealed qualification feature from codestory-bench"
+        );
+        assert!(
+            !enabled.contains("test-support"),
+            "{dependency} must not receive test-support from codestory-bench"
+        );
+        assert_eq!(
+            enabled, expected,
+            "{dependency} must enable exactly the sealed benchmark features"
+        );
+    }
+
+    for crate_manifest in [
+        "crates/codestory-agent/Cargo.toml",
+        "crates/codestory-runtime/Cargo.toml",
+        "crates/codestory-cli/Cargo.toml",
+    ] {
+        for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            let crate_manifest_value = manifest(crate_manifest);
+            let Some(entries) = crate_manifest_value.get(table).and_then(Value::as_table) else {
+                continue;
+            };
+            for (dependency, entry) in entries {
+                let enabled = entry
+                    .as_table()
+                    .and_then(|entry| entry.get("features"))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str);
+                assert!(
+                    !enabled.clone().any(|feature| feature == SUPPORT_FEATURE),
+                    "{crate_manifest} enables {SUPPORT_FEATURE} for {dependency}; only codestory-bench may do that"
+                );
+            }
+        }
+    }
+
+    let runtime_manifest = manifest("crates/codestory-runtime/Cargo.toml");
+    let runtime_features = runtime_manifest
+        .get("features")
+        .and_then(Value::as_table)
+        .expect("runtime features");
+    assert!(
+        runtime_features
+            .get(SUPPORT_FEATURE)
+            .is_some_and(|feature| feature
+                .to_string()
+                .contains("codestory-agent/proof-qualification-support")),
+        "runtime qualification support must carry the sealed agent feature"
+    );
+    let cli_manifest = manifest("crates/codestory-cli/Cargo.toml");
+    let cli_features = cli_manifest
+        .get("features")
+        .and_then(Value::as_table)
+        .expect("CLI features");
+    assert!(
+        cli_features
+            .get(SUPPORT_FEATURE)
+            .is_some_and(|feature| feature
+                .to_string()
+                .contains("codestory-runtime/proof-qualification-support")),
+        "CLI qualification support must carry the sealed runtime feature"
+    );
+
+    for surface in [
+        "crates/codestory-cli/src/args.rs",
+        "crates/codestory-cli/src/http_transport.rs",
+        "plugins/codestory/generated-mcp-catalog.json",
+        "plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md",
+        "plugins/codestory/plugin.json",
+        "plugins/codestory/.codex-plugin/plugin.json",
+        "plugins/codestory/.cursor-plugin/plugin.json",
+        "plugins/codestory/.claude-plugin/plugin.json",
+        "plugins/codestory/.github/plugin/plugin.json",
+    ] {
+        let source = read(surface);
+        for forbidden in [
+            SUPPORT_FEATURE,
+            "proof_qualification_support",
+            "prove_call_path",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{surface} exposes qualification-only behavior via {forbidden}"
+            );
+        }
+    }
+
+    let launcher = read("plugins/codestory/scripts/codestory-mcp.cjs");
+    let launcher_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+    for revision in launcher_revisions {
+        assert!(
+            launcher.contains(revision),
+            "the inert launcher discovery session lost Rust's {revision} revision"
+        );
+    }
+    assert!(
+        launcher.contains("publicationSchemaVersion: 3"),
+        "the inert launcher discovery session must preserve the Rust discovery schema"
+    );
+}
+
+#[cfg(feature = "proof-qualification-support")]
+#[test]
+fn sealed_discovery_contracts_drive_the_inert_launcher_session() {
+    use std::process::Command;
+
+    let contracts = codestory_cli::proof_qualification_support::discovery_contracts();
+    let launcher = repo_root().join("plugins/codestory/scripts/codestory-mcp.cjs");
+    let script = r#"
+const launcher = require(process.argv[1]);
+const contracts = JSON.parse(process.argv[2]);
+process.stdout.write(JSON.stringify(
+  launcher._test.darkV3LauncherSession('2025-06-18', contracts),
+));
+"#;
+    let output = Command::new("node")
+        .args([
+            "-e",
+            script,
+            &launcher.display().to_string(),
+            &serde_json::to_string(&contracts).expect("serialize Rust discovery contracts"),
+        ])
+        .output()
+        .expect("run the inert launcher session");
+    assert!(
+        output.status.success(),
+        "launcher session failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let session: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("launcher session JSON");
+    assert_eq!(session["negotiated"], "2025-06-18");
+    assert_eq!(
+        session["discoveryContractSha256"], contracts["2025-06-18"],
+        "the launcher must retain Rust's discovery digest without substituting one"
+    );
+    assert_eq!(session["publicationSchemaVersion"], 3);
+}
+
+#[test]
+fn proof_qualification_facades_seal_the_kernel_and_preserve_transport_errors() {
+    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        agent_lib.contains("mod indexed_source_call_path_v1;")
+            && !agent_lib.contains("pub mod indexed_source_call_path_v1;"),
+        "proof qualification must not make the dark agent kernel directly reachable"
+    );
+    for required in [
+        "AdmittedRawCallEdge",
+        "BuiltCallPathFacts",
+        "ValidatedCallPathContract",
+        "check_built_call_path_integration",
+        "project_internal_call_path_result",
+    ] {
+        assert!(
+            agent_lib.contains(required),
+            "the sealed agent facade must name the runtime-required {required} API explicitly"
+        );
+    }
+
+    let cli_lib = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        !cli_lib.contains("Result<Vec<RevisionNativeToolResultMeasurement>, String>"),
+        "the CLI qualification facade must not erase transport failures into String"
+    );
+    for required in [
+        "pub enum ProofQualificationTransportError",
+        "Serialization(String)",
+        "InvalidProjection(String)",
+        "OutputSchemaViolation",
+        "ResultExceedsBudget {",
+        "maximum_bytes: usize",
+        "actual_bytes: usize",
+        "impl From<crate::stdio_v3::StdioV3InternalError>",
+    ] {
+        assert!(
+            cli_lib.contains(required),
+            "the CLI qualification facade must preserve {required}"
+        );
+    }
+}
+
+#[test]
+fn runtime_test_support_never_reaches_the_private_agent_kernel() {
+    for surface in [
+        "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
+        "crates/codestory-runtime/src/services.rs",
+    ] {
+        let source = read(surface);
+        assert!(
+            !source.contains("codestory_agent::indexed_source_call_path_v1"),
+            "{surface} reaches the private agent kernel instead of its explicit test-support facade"
+        );
+    }
+    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    assert!(
+        agent_lib.contains(
+            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod proof_qualification_test_support"
+        ),
+        "runtime tests need an explicit test-support-only facade rather than kernel access"
+    );
+}
+
+#[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
     let lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
         lib.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod indexed_source_call_path_v1;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\n#[doc(hidden)]\nmod indexed_source_call_path_v1;"
         ),
-        "the dark call-path kernel must remain test-support-only until the atomic v3 cut"
+        "the dark call-path kernel must remain private behind test or sealed qualification support"
+    );
+    assert!(
+        !lib.contains("pub mod indexed_source_call_path_v1;"),
+        "the dark call-path kernel must never become a qualification-visible module"
     );
     assert!(
         AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"indexed_source_call_path_v1.rs"),
@@ -957,9 +1254,9 @@ fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(
         runtime_lib.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\nmod indexed_source_call_path_v1;"
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod indexed_source_call_path_v1;"
         ),
-        "the dark Store/source adapter must remain test-support-only until the atomic v3 cut"
+        "the dark Store/source adapter must remain behind test or sealed qualification support"
     );
     let adapter = production_source(&read(
         "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
@@ -1062,7 +1359,7 @@ fn dark_call_path_release_surface_violations() -> Vec<String> {
             read("plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md"),
         ),
     ];
-    let gate = "#[cfg(any(test, feature = \"test-support\"))]\nmod indexed_source_call_path_v1;";
+    let gate = "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod indexed_source_call_path_v1;";
     let runtime_facade = read("crates/codestory-runtime/src/lib.rs").replace(gate, "");
     surfaces.push(("public runtime facade", runtime_facade));
     surfaces.push((
@@ -1869,6 +2166,7 @@ fn production_source_never_spawns_git() {
     let mut files = Vec::new();
     collect_rs_files(&repo_root().join("crates"), &mut files);
     let mut violations = Vec::new();
+    let benchmark_root = repo_root().join("crates/codestory-bench");
     for path in files {
         if !path
             .components()
@@ -1876,11 +2174,13 @@ fn production_source_never_spawns_git() {
         {
             continue;
         }
-        if path == repo_root().join("crates/codestory-runtime/src/test_support.rs") {
+        if path.starts_with(&benchmark_root)
+            || path == repo_root().join("crates/codestory-runtime/src/test_support.rs")
+        {
             continue;
         }
         let source = fs::read_to_string(&path).expect("read Rust source");
-        if production_source_prefix(&source).contains("Command::new(\"git\")") {
+        if production_source_contains_git_spawn(&source) {
             violations.push(path.display().to_string());
         }
     }
@@ -1888,6 +2188,38 @@ fn production_source_never_spawns_git() {
         violations.is_empty(),
         "production Git reads must stay behind the non-executing workspace reader:\n{}",
         violations.join("\n")
+    );
+}
+
+#[test]
+fn crate_source_git_spawns_are_limited_to_named_non_product_boundaries() {
+    let mut files = Vec::new();
+    collect_rs_files(&repo_root().join("crates"), &mut files);
+    let actual = files
+        .into_iter()
+        .filter(|path| {
+            path.components()
+                .any(|component| component.as_os_str() == "src")
+        })
+        .filter(|path| {
+            let source = fs::read_to_string(path).expect("read Rust source");
+            production_source_contains_git_spawn(&source)
+        })
+        .map(|path| {
+            path.strip_prefix(repo_root())
+                .expect("crate source stays below repository root")
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = BTreeSet::from([
+        "crates/codestory-bench/src/bin/codestory_proof_availability/materialize.rs".to_owned(),
+        "crates/codestory-runtime/src/test_support.rs".to_owned(),
+    ]);
+
+    assert_eq!(
+        actual, expected,
+        "Git process execution under crate source is limited to the feature-dark proof-availability materializer and the explicit runtime test-support helper"
     );
 }
 
@@ -2009,6 +2341,128 @@ fn production() {
     let production = production_source(multiline_gated_use);
     assert!(!production.contains("first, second"));
     assert!(production.contains("real_call()"));
+
+    let one_line_braced_use = "\
+#[cfg(test)]
+use crate::{first, second};
+
+fn production() {
+    real_call();
+}
+";
+    let production = production_source(one_line_braced_use);
+    assert!(!production.contains("first, second"));
+    assert!(
+        production.contains("real_call()"),
+        "a one-line braced test import must not consume following production code: {production}"
+    );
+
+    let nested_one_line_braces = "\
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        match 1 {
+            _ => {}
+        }
+    }
+}
+
+fn production() {
+    real_call();
+}
+";
+    let production = production_source(nested_one_line_braces);
+    assert!(!production.contains("_ => {}"));
+    assert!(production.contains("real_call()"));
+}
+
+#[test]
+fn production_git_scan_sees_code_after_a_test_module() {
+    let source = "\
+#[cfg(test)]
+mod tests {
+    fn fixture() {}
+}
+
+fn shipped() {
+    Command::new(\"git\");
+}
+";
+    assert!(production_source_contains_git_spawn(source));
+}
+
+#[test]
+fn evidence_only_v3_support_is_feature_separate_from_proof_qualification() {
+    const FEATURE: &str = "v3-evidence-separation-support";
+    let agent_manifest = read("crates/codestory-agent/Cargo.toml");
+    let runtime_manifest = read("crates/codestory-runtime/Cargo.toml");
+    let cli_manifest = read("crates/codestory-cli/Cargo.toml");
+    assert!(
+        agent_manifest.contains("v3-evidence-separation-support"),
+        "the packet v3 planner must have a proof-independent sealed feature"
+    );
+    assert!(
+        runtime_manifest.contains(
+            "v3-evidence-separation-support = [\"codestory-agent/v3-evidence-separation-support\"]"
+        ),
+        "the runtime packet record and projection builders must carry the sealed agent feature"
+    );
+    assert!(
+        cli_manifest.contains(
+            "v3-evidence-separation-support = [\"codestory-runtime/v3-evidence-separation-support\"]"
+        ),
+        "the Q1 evidence-only compile gate must not activate proof qualification"
+    );
+    let library = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        library.contains("feature = \"v3-evidence-separation-support\""),
+        "the sealed evidence-only conformance facade must compile independently"
+    );
+    let stdio_v3 = read("crates/codestory-cli/src/stdio_v3/mod.rs");
+    assert!(
+        stdio_v3.contains(
+            "codestory_runtime::v3_evidence_qualification_support::real_projection_fixtures"
+        ),
+        "four-revision conformance must consume the real runtime record/projection builders"
+    );
+    assert!(
+        !stdio_v3.contains("serde_json::json!"),
+        "four-revision conformance must not substitute hand-built JSON for product projections"
+    );
+
+    for (path, expected) in [
+        (
+            "crates/codestory-agent/Cargo.toml",
+            BTreeSet::from(["dep:serde_json_canonicalizer"]),
+        ),
+        (
+            "crates/codestory-runtime/Cargo.toml",
+            BTreeSet::from(["codestory-agent/v3-evidence-separation-support"]),
+        ),
+        (
+            "crates/codestory-cli/Cargo.toml",
+            BTreeSet::from(["codestory-runtime/v3-evidence-separation-support"]),
+        ),
+    ] {
+        let document = manifest(path);
+        let enabled = document["features"][FEATURE]
+            .as_array()
+            .expect("sealed evidence feature array")
+            .iter()
+            .map(|value| value.as_str().expect("feature edge"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            enabled, expected,
+            "unexpected sealed feature graph at {path}"
+        );
+        assert!(
+            enabled
+                .iter()
+                .all(|edge| !edge.contains("proof-qualification-support")
+                    && !edge.contains("test-support")),
+            "{path} must not pull proof or general test support into the evidence-only gate"
+        );
+    }
 }
 
 #[test]
