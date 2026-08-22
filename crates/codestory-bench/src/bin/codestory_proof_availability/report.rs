@@ -227,6 +227,12 @@ pub(crate) fn build_and_publish(
     thresholds: &ThresholdsV1,
     leak_policy: &PublicLeakPolicy,
 ) -> std::result::Result<(), ReportPublishError> {
+    require_result_directory_identity(destination, &summary.qualification_id).map_err(|_| {
+        ReportPublishError::before_staging(
+            "proof_availability_result_directory_qualification_id_mismatch",
+            destination,
+        )
+    })?;
     let bundle = build_public_artifacts(summary, corpus, thresholds).map_err(|_| {
         ReportPublishError::before_staging(
             "proof_availability_public_artifact_build_failed",
@@ -263,6 +269,7 @@ pub(crate) fn verify_published(
     let findings_bytes = read_bounded(&destination.join("findings.md"))?;
 
     let summary: QualificationSummaryV1 = serde_json::from_value(summary_value)?;
+    require_result_directory_identity(destination, &summary.qualification_id)?;
     let reconstructed = QualificationSummaryV1 {
         schema: summary.schema.clone(),
         qualification_id: summary.qualification_id.clone(),
@@ -313,6 +320,16 @@ pub(crate) fn verify_published(
     }
     let decision: ActivationDecisionReportV1 = serde_json::from_value(decision_value)?;
     decision.validate()?;
+    Ok(())
+}
+
+pub(crate) fn require_result_directory_identity(
+    destination: &Path,
+    qualification_id: &str,
+) -> Result<()> {
+    if destination.file_name().and_then(|name| name.to_str()) != Some(qualification_id) {
+        bail!("proof_availability_result_directory_qualification_id_mismatch")
+    }
     Ok(())
 }
 
@@ -1217,6 +1234,20 @@ mod tests {
             decision: json!({}),
             findings: "# Findings\n\nNone.\n".to_owned(),
         }
+    }
+
+    #[test]
+    fn result_directory_basename_is_the_qualification_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let qualification_id = "20260821T120000Z-222222222222";
+        require_result_directory_identity(&root.path().join(qualification_id), qualification_id)
+            .unwrap();
+        assert!(
+            require_result_directory_identity(&root.path().join("results"), qualification_id)
+                .unwrap_err()
+                .to_string()
+                .contains("result_directory_qualification_id_mismatch")
+        );
     }
 
     #[test]

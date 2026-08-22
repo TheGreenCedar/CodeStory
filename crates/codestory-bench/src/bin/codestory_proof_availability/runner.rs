@@ -89,7 +89,7 @@ pub(crate) fn run_qualification(
     cases.sort_by(|left, right| left.case_id.cmp(&right.case_id));
     let failure_funnel = build_failure_funnel(&cases)?;
     Ok(QualificationReportInputV1 {
-        qualification_id: operational.environment.environment_id.clone(),
+        qualification_id: operational.environment.qualification_id.clone(),
         source_commit: operational.environment.qualification_source_commit.clone(),
         source_tree: operational.environment.qualification_source_tree.clone(),
         environment: operational.environment.clone(),

@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 
+mod build_provenance;
 pub mod cli;
 #[allow(dead_code)] // Later qualification tasks consume the full closed artifact surface.
 pub mod contracts;
@@ -39,6 +40,10 @@ pub fn execute(cli: cli::Cli) -> Result<()> {
                 .context("validate proof availability corpus against thresholds")?;
             util::refuse_existing_output(&arguments.out)?;
             let operational = materialize::load_operational_environment(&arguments.environment)?;
+            report::require_result_directory_identity(
+                &arguments.out,
+                &operational.environment.qualification_id,
+            )?;
             let input = runner::run_qualification(&loaded, &thresholds, &operational)?;
             let summary = report::build_summary(input, &loaded.corpus, &thresholds)?;
             let leak_policy = report::PublicLeakPolicy::new(

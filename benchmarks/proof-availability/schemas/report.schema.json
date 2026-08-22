@@ -757,6 +757,9 @@
           "pattern": "^[0-9a-f]{64}$",
           "type": "string"
         },
+        "build": {
+          "$ref": "#/$defs/QualificationBuildProvenanceV1"
+        },
         "environment_id": {
           "type": "string"
         },
@@ -773,6 +776,10 @@
           "maxItems": 4,
           "minItems": 4,
           "type": "array"
+        },
+        "qualification_id": {
+          "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$",
+          "type": "string"
         },
         "qualification_source_commit": {
           "pattern": "^[0-9a-f]{40}$",
@@ -791,6 +798,7 @@
         }
       },
       "required": [
+        "qualification_id",
         "environment_id",
         "os",
         "architecture",
@@ -799,6 +807,7 @@
         "qualification_source_commit",
         "qualification_source_tree",
         "recorded_at",
+        "build",
         "invocation",
         "projects"
       ],
@@ -1734,6 +1743,42 @@
       ],
       "type": "object"
     },
+    "QualificationBuildProvenanceV1": {
+      "additionalProperties": false,
+      "properties": {
+        "cargo_profile": {
+          "const": "release",
+          "type": "string"
+        },
+        "prescribed_argv": {
+          "const": [
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "codestory-bench",
+            "--bin",
+            "codestory-proof-availability"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "rustc_vv": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "rustc_vv",
+        "cargo_profile",
+        "prescribed_argv"
+      ],
+      "type": "object"
+    },
     "QualificationInvocationIdentityV1": {
       "additionalProperties": false,
       "properties": {
@@ -2459,6 +2504,7 @@
       "$ref": "#/$defs/ProvenanceV1"
     },
     "qualification_id": {
+      "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$",
       "type": "string"
     },
     "schema": {

@@ -395,22 +395,28 @@ binary name: codestory-proof-availability
 Commands:
 
 ```sh
+qualification_id="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=12 HEAD)"
+run_root="target/proof-availability/$qualification_id"
+results_root="$run_root/results"
+mkdir -p "$run_root" "$results_root"
+
 ./target/release/codestory-proof-availability materialize \
+  --qualification-id "$qualification_id" \
   --corpus benchmarks/proof-availability/corpus-v1.json \
-  --workspace target/proof-availability/workspaces \
-  --cache-root target/proof-availability/cache \
-  --out target/proof-availability/run/environment.json
+  --workspace "$run_root/workspaces" \
+  --cache-root "$run_root/cache" \
+  --out "$run_root/environment.json"
 
 ./target/release/codestory-proof-availability run \
   --corpus benchmarks/proof-availability/corpus-v1.json \
   --thresholds benchmarks/proof-availability/thresholds-v1.json \
-  --environment target/proof-availability/run/environment.json \
-  --out target/proof-availability/run
+  --environment "$run_root/environment.json" \
+  --out "$results_root/$qualification_id"
 
 ./target/release/codestory-proof-availability verify \
   --corpus benchmarks/proof-availability/corpus-v1.json \
   --thresholds benchmarks/proof-availability/thresholds-v1.json \
-  --results target/proof-availability/run
+  --results "$results_root/$qualification_id"
 ```
 
 `materialize` creates detached pinned checkouts, verifies oracle hashes, builds fresh full indexes through the source-linked runtime/indexer, and records core generation/run plus database SHA. `run` is local and does not fetch. `verify` recomputes every aggregate and decision from case rows.
@@ -1289,14 +1295,16 @@ Expected: clean tracked tree. Record the command, binary SHA, Rust host/toolchai
 ```sh
 qualification_id="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=12 HEAD)"
 run_root="target/proof-availability/$qualification_id"
+results_root="$run_root/results"
 test ! -e "$run_root"
-mkdir -p "$run_root"
+mkdir -p "$run_root" "$results_root"
 ```
 
 - [ ] **Step 4: Materialize, run, and verify once**
 
 ```sh
 "$qualification_bin" materialize \
+  --qualification-id "$qualification_id" \
   --corpus benchmarks/proof-availability/corpus-v1.json \
   --workspace "$run_root/workspaces" \
   --cache-root "$run_root/cache" \
@@ -1306,12 +1314,12 @@ mkdir -p "$run_root"
   --corpus benchmarks/proof-availability/corpus-v1.json \
   --thresholds benchmarks/proof-availability/thresholds-v1.json \
   --environment "$run_root/environment.json" \
-  --out "$run_root/results"
+  --out "$results_root/$qualification_id"
 
 "$qualification_bin" verify \
   --corpus benchmarks/proof-availability/corpus-v1.json \
   --thresholds benchmarks/proof-availability/thresholds-v1.json \
-  --results "$run_root/results"
+  --results "$results_root/$qualification_id"
 ```
 
 These commands are the complete Q2 interface. The evaluator is closed to A, B,
@@ -1333,7 +1341,7 @@ Require:
 
 - [ ] **Step 6: Copy machine results and generate findings**
 
-Copy only `results` artifacts to `benchmarks/proof-availability/results/$qualification_id`. `findings.md` is generated from the same case rows and names reproduced measurements, inferences, and selected thresholds separately.
+Copy only the eight artifacts from `$results_root/$qualification_id` to `benchmarks/proof-availability/results/$qualification_id`. The source and destination basenames, `environment.json`, and `summary.json` all carry the same qualification ID. `findings.md` is generated from the same case rows and names reproduced measurements, inferences, and selected thresholds separately.
 
 - [ ] **Step 7: Independent exact-artifact review**
 
