@@ -669,6 +669,7 @@ jobs:
             --checksum-file "$ASSET_CHECKSUM" \
             --expected-version "$RELEASE_VERSION" \
             --project "${{ github.workspace }}" \
+            --measurement-protocol "${{ github.workspace }}/crates/codestory-llama-sys/per-user-embedding-server-measurement-protocol.json" \
             --plugin-root "$INSTALLED_PLUGIN_ROOT" \
             --plugin-handoff \
             --engine-policy accelerated \

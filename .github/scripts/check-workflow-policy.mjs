@@ -5394,6 +5394,7 @@ function validatePostPublish(workflows, violations, graph) {
     "--engine-policy accelerated",
     '--expected-backend "$EXPECTED_BACKEND"',
     "--proof-tier installed_runtime",
+    "--measurement-protocol",
     "--server-behavior-only",
     "--installed-plugin-attestation",
     "--installed-plugin-data",
