@@ -823,19 +823,35 @@ pub(crate) fn report() -> Value {
                     });
                     let source_node_id = -(i64::try_from(step_index).expect("step index") + 1);
                     let target_node_id = source_node_id - 1;
+                    let source_canonical_id =
+                        format!("canonical-{case_index}-{source_node_id}");
+                    let target_canonical_id =
+                        format!("canonical-{case_index}-{target_node_id}");
+                    let source_pinned = contracts::PinnedNodeIdentityV1 {
+                        project_id: project_id.clone(),
+                        core_generation_id: core_generation_id.clone(),
+                        core_run_id: core_run_id.clone(),
+                        node_id: source_node_id.to_string(),
+                    };
+                    let target_pinned = contracts::PinnedNodeIdentityV1 {
+                        project_id: project_id.clone(),
+                        core_generation_id: core_generation_id.clone(),
+                        core_run_id: core_run_id.clone(),
+                        node_id: target_node_id.to_string(),
+                    };
                     json!({
                         "receipt_id":format!("indexed-call-edge:fixture-{case_index}-{step_index}"),
                         "step_index":step_index,
                         "edge_id":edge_id,
                         "source":{
                             "pinned":{"project_id":project_id,"core_generation_id":core_generation_id,"core_run_id":core_run_id,"node_id":source_node_id.to_string()},
-                            "canonical_id":format!("canonical-{case_index}-{source_node_id}"),
+                            "canonical_id_binding_sha256":contracts::resolved_canonical_id_binding_sha256(&source_pinned, &source_canonical_id).unwrap(),
                             "qualified_name":step["caller"]["symbol"],
                             "project_file_components":source_path.split('/').collect::<Vec<_>>()
                         },
                         "target":{
                             "pinned":{"project_id":project_id,"core_generation_id":core_generation_id,"core_run_id":core_run_id,"node_id":target_node_id.to_string()},
-                            "canonical_id":format!("canonical-{case_index}-{target_node_id}"),
+                            "canonical_id_binding_sha256":contracts::resolved_canonical_id_binding_sha256(&target_pinned, &target_canonical_id).unwrap(),
                             "qualified_name":step["target"]["symbol"],
                             "project_file_components":source_path.split('/').collect::<Vec<_>>()
                         },
@@ -903,7 +919,7 @@ pub(crate) fn report() -> Value {
         })
         .collect::<Vec<_>>();
     let mut report = json!({
-      "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-bbbbbbbbbbbb",
+      "schema":"codestory.proof-availability-report/v2","qualification_id":"20260821T000000Z-bbbbbbbbbbbb",
       "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash,"results_sha256":SHA},
       "environment":{"qualification_id":"20260821T000000Z-bbbbbbbbbbbb","environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"qualification_source_commit":COMMIT,"qualification_source_tree":COMMIT,"recorded_at":"2026-08-21T12:34:56Z","build":{"source_commit":COMMIT,"source_tree":COMMIT,"source_dirty":false,"rustc_vv":"rustc 1.91.0\nbinary: rustc\nhost: aarch64-apple-darwin\n","cargo_profile":"release","prescribed_argv":["cargo","build","--release","--locked","-p","codestory-bench","--bin","codestory-proof-availability"]},"invocation":{"binary_name":"codestory-proof-availability","operation":"run","profile":"local_core_only","corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash},"projects":frozen["cohorts"].as_array().unwrap().iter().map(|cohort|{let id=cohort["repository_id"].as_str().unwrap();json!({"repository_id":id,"source_head":cohort["commit"],"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})}).collect::<Vec<_>>()},
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
@@ -1067,6 +1083,216 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
         ReceiptOracleComparisonV1::Mismatched { mismatches, .. }
             if mismatches == [contracts::ReceiptMismatchFieldV1::CallsiteWindow]
     ));
+}
+
+#[test]
+fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
+    use codestory_agent::proof_qualification_support::{PinnedNodeIdentity, ResolvedNodeIdentity};
+
+    let raws = [
+        "/Users/private/worktree/src/caller.rs::caller",
+        r"C:\private\worktree\src\caller.rs::caller",
+        r"\\server\share\worktree\src\caller.rs::caller",
+        r"\\?\C:\private\worktree\src\caller.rs::caller",
+        "flask/app.py::dispatch_request",
+    ];
+    let public_pinned = |node_id: &str| contracts::PinnedNodeIdentityV1 {
+        project_id: "project".into(),
+        core_generation_id: "generation".into(),
+        core_run_id: "run".into(),
+        node_id: node_id.into(),
+    };
+    for raw in raws {
+        for node_id in ["-1", "-2"] {
+            let product = ResolvedNodeIdentity {
+                pinned: PinnedNodeIdentity {
+                    project_id: "project".into(),
+                    core_generation_id: "generation".into(),
+                    core_run_id: "run".into(),
+                    node_id: node_id.into(),
+                },
+                canonical_id: raw.into(),
+                qualified_name: "module::callable".into(),
+                project_file_components: vec!["src".into(), "caller.rs".into()],
+            };
+            let public = contracts::ResolvedNodeIdentityV1::try_from(&product).unwrap();
+            assert_eq!(public.canonical_id_binding_sha256.len(), 64);
+            assert!(
+                public
+                    .canonical_id_binding_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
+            assert!(!serde_json::to_string(&public).unwrap().contains(raw));
+        }
+    }
+
+    let same_value_first =
+        contracts::resolved_canonical_id_binding_sha256(&public_pinned("-1"), "same-canonical-id")
+            .unwrap();
+    let same_value_second =
+        contracts::resolved_canonical_id_binding_sha256(&public_pinned("-2"), "same-canonical-id")
+            .unwrap();
+    let different_value_same_pin = contracts::resolved_canonical_id_binding_sha256(
+        &public_pinned("-1"),
+        "different-canonical-id",
+    )
+    .unwrap();
+    assert_ne!(same_value_first, same_value_second);
+    assert_ne!(same_value_first, different_value_same_pin);
+
+    let empty = ResolvedNodeIdentity {
+        pinned: PinnedNodeIdentity {
+            project_id: "project".into(),
+            core_generation_id: "generation".into(),
+            core_run_id: "run".into(),
+            node_id: "-1".into(),
+        },
+        canonical_id: String::new(),
+        qualified_name: "module::callable".into(),
+        project_file_components: vec!["src".into(), "caller.rs".into()],
+    };
+    contracts::ResolvedNodeIdentityV1::try_from(&empty)
+        .expect_err("an empty raw canonical ID cannot produce a public binding");
+}
+
+#[test]
+fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
+    use codestory_agent::proof_qualification_support::{
+        CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
+        ReceiptRef, ResolvedNodeIdentity,
+    };
+    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+
+    let path_file =
+        CohortPathFileV1::from_json(cohort_path_file("codestory-rust")).expect("oracle path file");
+    let mut oracle = path_file.paths[0].oracle_steps[0].clone();
+    let source_raw = "flask/app.py::dispatch_request";
+    let target_raw = r"\\server\share\target.py::target";
+    oracle.caller.selector = ExactSymbolSelectorV1::CanonicalId {
+        canonical_id: source_raw.into(),
+    };
+    oracle.target.selector = ExactSymbolSelectorV1::CanonicalId {
+        canonical_id: target_raw.into(),
+    };
+    let identity = |node_id: &str, canonical_id: &str, qualified_name: &str| ResolvedNodeIdentity {
+        pinned: PinnedNodeIdentity {
+            project_id: "project".into(),
+            core_generation_id: "generation".into(),
+            core_run_id: "run".into(),
+            node_id: node_id.into(),
+        },
+        canonical_id: canonical_id.into(),
+        qualified_name: qualified_name.into(),
+        project_file_components: oracle
+            .receipt_line_window
+            .path
+            .split('/')
+            .map(ToOwned::to_owned)
+            .collect(),
+    };
+    let receipt = IndexedCallEdgeReceipt {
+        receipt: ReceiptRef {
+            receipt_id: "indexed-call-edge:canonical-selector".into(),
+            edge_id: "-42".into(),
+        },
+        source: identity("-1", source_raw, &oracle.caller.symbol),
+        target: identity("-2", target_raw, &oracle.target.symbol),
+        certainty: ResolutionCertainty::Certain,
+        callsite_identity: format!("-3:{}:0:-2|fixture", oracle.callsite_line),
+        containment: CallableContainmentEvidence {
+            file_node_id: NodeId(-3),
+            owner_node_id: NodeId(-1),
+            start_line: oracle.callsite_line,
+            end_line: oracle.callsite_line,
+        },
+        line_window: IndexedLineWindow {
+            kind: "indexed_line_v1",
+            project_file_components: oracle
+                .receipt_line_window
+                .path
+                .split('/')
+                .map(ToOwned::to_owned)
+                .collect(),
+            indexed_sha256: oracle.receipt_file_sha256.clone(),
+            observed_sha256: oracle.receipt_file_sha256.clone(),
+            anchor_line: oracle.callsite_line,
+            byte_start: usize::try_from(oracle.receipt_line_window.start_byte).unwrap(),
+            byte_end: usize::try_from(oracle.receipt_line_window.end_byte).unwrap(),
+            text: "call();\n".into(),
+        },
+    };
+
+    assert!(matches!(
+        contracts::compare_task6_receipt_to_oracle(0, &receipt, &oracle).unwrap(),
+        ReceiptOracleComparisonV1::Exact { .. }
+    ));
+    oracle.target.selector = ExactSymbolSelectorV1::CanonicalId {
+        canonical_id: format!("{target_raw}x"),
+    };
+    assert!(matches!(
+        contracts::compare_task6_receipt_to_oracle(0, &receipt, &oracle).unwrap(),
+        ReceiptOracleComparisonV1::Mismatched { mismatches, .. }
+            if mismatches == [contracts::ReceiptMismatchFieldV1::Target]
+    ));
+}
+
+#[test]
+fn resolved_receipt_bindings_reject_legacy_and_malformed_shapes_and_bind_results_digest() {
+    let base = report();
+    let base_digest = contracts::results_evidence_sha256_from_json(&base).unwrap();
+    let binding = base["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]
+        ["canonical_id_binding_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut changed = base.clone();
+    let replacement = if binding.starts_with('a') { 'b' } else { 'a' };
+    changed["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]["canonical_id_binding_sha256"] =
+        json!(format!("{replacement}{}", &binding[1..]));
+    assert_ne!(
+        contracts::results_evidence_sha256_from_json(&changed).unwrap(),
+        base_digest
+    );
+
+    let mut canonical_bound = base.clone();
+    canonical_bound["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]
+        ["oracle_step"]["caller"]["selector"] =
+        json!({"kind":"canonical_id","canonical_id":"canonical-0--1"});
+    rebind_results_digest(&mut canonical_bound);
+    QualificationSummaryV1::from_json(canonical_bound.clone())
+        .expect("the exact frozen canonical selector recomputes the receipt commitment");
+    canonical_bound["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]
+        ["canonical_id_binding_sha256"] = changed["cases"][0]["receipt_evidence"]
+        ["observed_receipts"][0]["source"]["canonical_id_binding_sha256"]
+        .clone();
+    rebind_results_digest(&mut canonical_bound);
+    QualificationSummaryV1::from_json(canonical_bound)
+        .expect_err("a one-byte commitment mutation cannot satisfy a frozen canonical selector");
+
+    for malformed in [String::new(), "A".repeat(64), "a".repeat(63)] {
+        let mut value = base.clone();
+        value["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]["canonical_id_binding_sha256"] =
+            json!(malformed);
+        rebind_results_digest(&mut value);
+        QualificationSummaryV1::from_json(value)
+            .expect_err("malformed public canonical-ID commitments fail closed");
+    }
+
+    let mut legacy = base;
+    let source = legacy["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]
+        .as_object_mut()
+        .unwrap();
+    source.remove("canonical_id_binding_sha256");
+    source.insert("canonical_id".into(), json!("legacy-raw-canonical-id"));
+    QualificationSummaryV1::from_json(legacy)
+        .expect_err("resolved receipt identities no longer accept a raw canonical_id field");
+
+    serde_json::from_value::<ExactSymbolSelectorV1>(
+        json!({"kind":"canonical_id","canonical_id":"frozen-oracle-value"}),
+    )
+    .expect("frozen oracle selectors continue to carry raw canonical IDs");
 }
 
 #[test]
@@ -2235,7 +2461,11 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
     assert_eq!(observed.source.pinned.core_generation_id, "generation");
     assert_eq!(observed.source.pinned.core_run_id, "run");
     assert_eq!(observed.source.pinned.node_id, "-1");
-    assert_eq!(observed.source.canonical_id, "canonical--1");
+    assert_eq!(
+        observed.source.canonical_id_binding_sha256,
+        contracts::resolved_canonical_id_binding_sha256(&observed.source.pinned, "canonical--1")
+            .unwrap()
+    );
     assert_eq!(observed.source.qualified_name, "codestory-rust-l1-0::start");
     assert_eq!(
         observed.source.project_file_components,
@@ -2253,7 +2483,11 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
     assert_eq!(observed.target.pinned.core_generation_id, "generation");
     assert_eq!(observed.target.pinned.core_run_id, "run");
     assert_eq!(observed.target.pinned.node_id, "-2");
-    assert_eq!(observed.target.canonical_id, "canonical--2");
+    assert_eq!(
+        observed.target.canonical_id_binding_sha256,
+        contracts::resolved_canonical_id_binding_sha256(&observed.target.pinned, "canonical--2")
+            .unwrap()
+    );
     assert_eq!(
         observed.target.qualified_name,
         "codestory-rust-l1-0::target_0"
@@ -2852,6 +3086,20 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
         6
     );
     let report_schema = contracts::schema_json(SchemaDocument::Report);
+    assert_eq!(
+        report_schema["$id"],
+        "codestory.proof-availability-report/v2"
+    );
+    assert_eq!(
+        report_schema["$defs"]["ResolvedNodeIdentityV1"]["properties"]["canonical_id_binding_sha256"]
+            ["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+    assert!(
+        report_schema["$defs"]["ResolvedNodeIdentityV1"]["properties"]
+            .get("canonical_id")
+            .is_none()
+    );
     assert_eq!(
         report_schema["$defs"]["EnvironmentReportV1"]["properties"]["qualification_source_commit"]
             ["pattern"],

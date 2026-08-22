@@ -9,7 +9,7 @@ use std::fmt;
 
 pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
 pub const PATH_FILE_SCHEMA: &str = "codestory.proof-availability-path-file/v1";
-pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v1";
+pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v2";
 pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1";
 pub const DECISION_REPORT_SCHEMA: &str = "codestory.proof-availability-decision/v1";
 pub const PRESCRIBED_BUILD_ARGV: [&str; 8] = [
@@ -2241,26 +2241,56 @@ pub struct PinnedNodeIdentityV1 {
 #[serde(deny_unknown_fields)]
 pub struct ResolvedNodeIdentityV1 {
     pub pinned: PinnedNodeIdentityV1,
-    pub canonical_id: String,
+    pub canonical_id_binding_sha256: String,
     pub qualified_name: String,
     pub project_file_components: Vec<String>,
 }
-impl From<&codestory_agent::proof_qualification_support::ResolvedNodeIdentity>
+impl TryFrom<&codestory_agent::proof_qualification_support::ResolvedNodeIdentity>
     for ResolvedNodeIdentityV1
 {
-    fn from(value: &codestory_agent::proof_qualification_support::ResolvedNodeIdentity) -> Self {
-        Self {
-            pinned: PinnedNodeIdentityV1 {
-                project_id: value.pinned.project_id.clone(),
-                core_generation_id: value.pinned.core_generation_id.clone(),
-                core_run_id: value.pinned.core_run_id.clone(),
-                node_id: value.pinned.node_id.clone(),
-            },
-            canonical_id: value.canonical_id.clone(),
+    type Error = anyhow::Error;
+
+    fn try_from(
+        value: &codestory_agent::proof_qualification_support::ResolvedNodeIdentity,
+    ) -> Result<Self> {
+        let pinned = PinnedNodeIdentityV1 {
+            project_id: value.pinned.project_id.clone(),
+            core_generation_id: value.pinned.core_generation_id.clone(),
+            core_run_id: value.pinned.core_run_id.clone(),
+            node_id: value.pinned.node_id.clone(),
+        };
+        Ok(Self {
+            canonical_id_binding_sha256: resolved_canonical_id_binding_sha256(
+                &pinned,
+                &value.canonical_id,
+            )?,
+            pinned,
             qualified_name: value.qualified_name.clone(),
             project_file_components: value.project_file_components.clone(),
-        }
+        })
     }
+}
+
+#[derive(Serialize)]
+struct ResolvedCanonicalIdBindingV1<'a> {
+    pinned: &'a PinnedNodeIdentityV1,
+    canonical_id: &'a str,
+}
+
+pub(crate) fn resolved_canonical_id_binding_sha256(
+    pinned: &PinnedNodeIdentityV1,
+    canonical_id: &str,
+) -> Result<String> {
+    if canonical_id.is_empty() {
+        bail!("proof_availability_resolved_canonical_id_empty")
+    }
+    canonical_artifact_sha256(
+        b"codestory.proof-availability-resolved-canonical-id/v1\0",
+        &ResolvedCanonicalIdBindingV1 {
+            pinned,
+            canonical_id,
+        },
+    )
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -2314,8 +2344,8 @@ impl ObservedReceiptV1 {
                 .edge_id
                 .parse()
                 .map_err(|_| anyhow::anyhow!("proof_availability_receipt_edge_id_invalid"))?,
-            source: (&receipt.source).into(),
-            target: (&receipt.target).into(),
+            source: (&receipt.source).try_into()?,
+            target: (&receipt.target).try_into()?,
             certainty: receipt.certainty.try_into()?,
             callsite_identity: receipt.callsite_identity.clone(),
             callsite_line: receipt.line_window.anchor_line,
@@ -2353,8 +2383,8 @@ pub(crate) fn compare_task6_receipt_to_oracle(
     oracle: &OracleStepV1,
 ) -> Result<ReceiptOracleComparisonV1> {
     let oracle_step = ReceiptOracleStepV1::from(oracle);
-    let observed_source = ResolvedNodeIdentityV1::from(&receipt.source);
-    let observed_target = ResolvedNodeIdentityV1::from(&receipt.target);
+    let observed_source = ResolvedNodeIdentityV1::try_from(&receipt.source)?;
+    let observed_target = ResolvedNodeIdentityV1::try_from(&receipt.target)?;
     let mut mismatches = Vec::new();
     if !resolved_identity_matches_declaration(&observed_source, &oracle_step.caller) {
         mismatches.push(ReceiptMismatchFieldV1::Caller);
@@ -3351,7 +3381,7 @@ pub(crate) fn results_evidence_sha256(
             )
     });
     canonical_artifact_sha256(
-        b"codestory.proof-availability-results-evidence/v1\0",
+        b"codestory.proof-availability-results-evidence/v2\0",
         &ResultsEvidenceV1 {
             environment: &environment,
             inventory: &inventory,
@@ -4549,7 +4579,7 @@ fn valid_resolved_node_identity(identity: &ResolvedNodeIdentityV1) -> Option<i64
     (!empty(&identity.pinned.project_id)
         && !empty(&identity.pinned.core_generation_id)
         && !empty(&identity.pinned.core_run_id)
-        && !empty(&identity.canonical_id)
+        && hash(&identity.canonical_id_binding_sha256)
         && !empty(&identity.qualified_name)
         && valid_project_file_components(&identity.project_file_components))
     .then(|| parse_node_id(&identity.pinned.node_id))
@@ -4673,7 +4703,8 @@ fn resolved_identity_matches_declaration(
                 && identity.pinned.node_id == *node_id
         }
         ExactSymbolSelectorV1::CanonicalId { canonical_id } => {
-            identity.canonical_id == *canonical_id
+            resolved_canonical_id_binding_sha256(&identity.pinned, canonical_id)
+                .is_ok_and(|binding| binding == identity.canonical_id_binding_sha256)
         }
         ExactSymbolSelectorV1::QualifiedName {
             qualified_name,
@@ -5248,7 +5279,7 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 ("PinnedNodeIdentityV1", "core_generation_id"),
                 ("PinnedNodeIdentityV1", "core_run_id"),
                 ("PinnedNodeIdentityV1", "node_id"),
-                ("ResolvedNodeIdentityV1", "canonical_id"),
+                ("ResolvedNodeIdentityV1", "canonical_id_binding_sha256"),
                 ("ResolvedNodeIdentityV1", "qualified_name"),
                 ("ProjectedReceiptReferenceV1", "receipt_id"),
                 ("ProjectedReceiptReferenceV1", "edge_id"),
@@ -5280,6 +5311,12 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 "PinnedNodeIdentityV1",
                 "node_id",
                 "^-?(0|[1-9][0-9]*)$",
+            );
+            set_pattern(
+                schema,
+                "ResolvedNodeIdentityV1",
+                "canonical_id_binding_sha256",
+                SHA256,
             );
             set_pattern(
                 schema,
