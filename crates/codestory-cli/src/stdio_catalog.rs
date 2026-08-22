@@ -844,9 +844,9 @@ static STATUS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .nullable(),
         SchemaProperty::string("next_action", "Direct next action for the caller."),
         SchemaProperty::integer("retry_after_ms", "Retry delay while preparing.").nullable(),
-        SchemaProperty::object(
+        SchemaProperty::string(
             "failure",
-            "Structured capability failure when the compact status is not live-ready.",
+            "Capability failure message when the compact status is not live-ready.",
         )
         .nullable(),
         SchemaProperty::string(
@@ -975,7 +975,7 @@ static SYMBOL_SUMMARY_SCHEMA: SchemaObject = SchemaObject::object(
 );
 
 pub(crate) static SEARCH_RESULTS_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for proof-bearing graph/source follow-up.",
+    "CodeStory discovery results DTO. Treat broad structural questions as packet-first; search rows select candidates for graph or source follow-up.",
     &[
         SchemaProperty::string("query", "Search query."),
         SchemaProperty::object("retrieval", "Retrieval readiness."),
@@ -1158,13 +1158,7 @@ static INDEXED_FILES_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     &[],
 )
 .with_any_of_required(&[
-    &[
-        "project_root",
-        "usable",
-        "summary",
-        "files",
-        "policy_exclusions",
-    ],
+    &["project_root", "usable", "summary", "files"],
     &["code", "message"],
 ]);
 
@@ -2205,11 +2199,11 @@ static PACKET_PROBE_SCHEMAS: &[&SchemaObject] = &[
 ];
 
 static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
-    "Build a broad task packet with compiled support units and a machine stop or one-round drill disposition.",
+    "Build a broad evidence packet with typed availability and one bounded continuation.",
     &[
         SchemaProperty::string_required(
             "question",
-            "Broad repository question or task. Repeat it unchanged for a DrillOnce continuation.",
+            "Broad repository question or task. Repeat it unchanged for one generation-bound continuation.",
         )
         .with_min_length(1),
         SchemaProperty::string("budget", "Packet budget.")
@@ -2231,11 +2225,6 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .with_item_bounds(1, PACKET_PROBE_MAX_COUNT as u64)
         .with_item_min_length(1)
         .with_item_max_length(PACKET_PROBE_MAX_TEXT_LENGTH as u64),
-        SchemaProperty::boolean(
-            "include_evidence",
-            "Include citation edge ids and score details.",
-        )
-        .with_default(ValueLiteral::Boolean(true)),
         SchemaProperty::integer(
             "latency_budget_ms",
             "Optional packet retrieval latency budget in milliseconds; defaults to 18000 when omitted.",
@@ -2244,21 +2233,21 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         .nullable(),
         SchemaProperty::string(
             "parent_packet_id",
-            "Parent packet id for a generation-bound DrillOnce continuation; repeat the original question unchanged.",
+            "Parent packet id for a generation-bound continuation; repeat the original question unchanged.",
         ),
         SchemaProperty::string_array(
             "option_ids",
-            "Drill option ids from the parent packet disposition. Execute them once; do not invent a second search.",
+            "Continuation option ids returned by the parent packet. Execute them once; do not invent a second search.",
         )
         .with_item_bounds(1, 8)
         .with_item_min_length(1),
         SchemaProperty::string(
             "core_generation_id",
-            "Pinned core publication generation for a DrillOnce continuation.",
+            "Pinned core publication generation for a continuation.",
         ),
         SchemaProperty::string(
             "retrieval_generation",
-            "Pinned retrieval generation for a DrillOnce continuation.",
+            "Pinned retrieval generation for a continuation.",
         ),
     ],
     &["question"],
@@ -2278,7 +2267,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "packet",
-        description: "Answer broad structural questions with compiled support units and a machine stop or one-round drill. Supported, NotEstablished, and Unavailable are terminal. DrillOnce means call packet again once with the exact original question, parent_packet_id, and the listed option_ids. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
+        description: "Answer broad structural questions with closed evidence rows, typed availability and gaps, and at most one generation-bound continuation. Prefer packet before source snippets. CodeStory prepares managed retrieval automatically.",
         input_schema: PACKET_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(AGENT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2404,7 +2393,7 @@ static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "context",
-        description: "Build proof-bearing source/graph evidence for one concrete target; not broad question answering.",
+        description: "Build closed source and graph evidence for one concrete target; not broad question answering.",
         input_schema: CONTEXT_INPUT_SCHEMA,
         output_schema: Some(SchemaSpec::Object(CONTEXT_PACKET_SCHEMA)),
         safety: SafetyMetadata::managed_activation(),
@@ -2516,6 +2505,7 @@ pub(crate) fn tool_input_schema(name: &str) -> Option<&'static Value> {
 }
 
 /// Build the `tools/list` response.
+#[allow(dead_code)]
 pub(crate) fn tools_list_json() -> Value {
     json!({
         "result": {
@@ -2528,11 +2518,6 @@ pub(crate) fn tools_list_json() -> Value {
 ///
 /// The projector owns revision-native field selection; this accessor keeps it
 /// from copying the v2 schemas or reaching the live `tools/list` response.
-#[cfg(any(
-    test,
-    feature = "proof-qualification-support",
-    feature = "v3-evidence-separation-support"
-))]
 pub(crate) fn v3_tool_source_json() -> Vec<Value> {
     TOOLS.iter().map(|tool| tool.to_json()).collect()
 }

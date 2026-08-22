@@ -24,6 +24,13 @@ const repoRoot = dirname(dirname(pluginRoot));
 const require = createRequire(import.meta.url);
 const launcherTest = require(join(pluginRoot, "scripts", "codestory-mcp.cjs"))._test;
 const devCliContract = require(join(pluginRoot, "scripts", "codestory-dev-cli-contract.cjs"));
+const generatedCatalog = JSON.parse(
+  fs.readFileSync(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"),
+);
+const preferredRevision = generatedCatalog.wireContract.preferredMcpProtocolVersion;
+const discoveryDigest = (revision = preferredRevision) =>
+  generatedCatalog.wireContract.discoveryContracts[revision];
+const toolTextJson = (response) => JSON.parse(response.result.content[0].text);
 const statusUri = launcherTest.projectBoundResourceUri("codestory://status", repoRoot);
 const {
   confirmedCursorIdentity: confirmedCursorHookIdentity,
@@ -172,9 +179,13 @@ test("launcher wire contract matches the generated catalog read from the real CL
       launcherTest.minimumCompatiblePublicationStampSchemaVersion,
     supportedMcpProtocolVersions: [...launcherTest.supportedMcpProtocolVersions],
     preferredMcpProtocolVersion: launcherTest.managedCliMcpProtocolVersion,
+    discoveryContracts: generatedCatalog.wireContract.discoveryContracts,
   });
-  assert.equal(catalog.wireContract.publicationStampSchemaVersion, 2);
-  assert.deepEqual(catalog.wireContract.supportedMcpProtocolVersions, ["2024-11-05"]);
+  assert.equal(catalog.wireContract.publicationStampSchemaVersion, 3);
+  assert.deepEqual(
+    catalog.wireContract.supportedMcpProtocolVersions,
+    ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+  );
 });
 
 test("launcher negotiates the MCP protocol revision instead of echoing it", () => {
@@ -183,26 +194,32 @@ test("launcher negotiates the MCP protocol revision instead of echoing it", () =
   assert.deepEqual(launcherTest.negotiateMcpProtocolVersion("2024-11-05"), {
     requested: "2024-11-05",
     negotiated: "2024-11-05",
-    supported: ["2024-11-05"],
+    supported: ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+    preferred: preferredRevision,
     status: "agreed",
     compatible: true,
+    discovery_contract_sha256: discoveryDigest("2024-11-05"),
   });
   assert.deepEqual(launcherTest.negotiateMcpProtocolVersion("2025-03-26"), {
     requested: "2025-03-26",
-    negotiated: "2024-11-05",
-    supported: ["2024-11-05"],
-    status: "unsupported_client_revision",
-    compatible: false,
+    negotiated: "2025-03-26",
+    supported: ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+    preferred: preferredRevision,
+    status: "agreed",
+    compatible: true,
+    discovery_contract_sha256: discoveryDigest("2025-03-26"),
   });
   for (const absent of [undefined, null, "", "   ", 7]) {
     assert.deepEqual(
       launcherTest.negotiateMcpProtocolVersion(absent),
       {
         requested: null,
-        negotiated: "2024-11-05",
-        supported: ["2024-11-05"],
+        negotiated: preferredRevision,
+        supported: ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+        preferred: preferredRevision,
         status: "defaulted",
         compatible: true,
+        discovery_contract_sha256: discoveryDigest(),
       },
       `absent revision ${JSON.stringify(absent)} must default without claiming a client revision`,
     );
@@ -221,7 +238,7 @@ test("launcher classifies the runtime initialize contract fail-closed", () => {
 
   assert.equal(
     launcherTest.runtimeWireContractSkew(
-      stamped({ schema_version: 2, minimum_compatible_schema_version: 2 }),
+      stamped({ schema_version: 3, minimum_compatible_schema_version: 3 }),
       "2024-11-05",
     ),
     null,
@@ -240,7 +257,7 @@ test("launcher classifies the runtime initialize contract fail-closed", () => {
   );
   assert.equal(
     launcherTest.runtimeWireContractSkew(
-      stamped({ schema_version: 2, minimum_compatible_schema_version: 2 }),
+      stamped({ schema_version: 3, minimum_compatible_schema_version: 3 }),
       "2025-03-26",
     ),
     "protocol_version_skew",
@@ -260,14 +277,14 @@ test("launcher classifies the runtime initialize contract fail-closed", () => {
   );
 });
 
-test("dark v3 launcher state rejects old new and wrong-v3 runtime identities without selecting it", () => {
+test("v3 launcher state rejects old new and wrong-v3 runtime identities", () => {
   const contracts = Object.fromEntries(
     ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"].map((revision, index) => [
       revision,
       String(index + 1).repeat(64),
     ]),
   );
-  const session = launcherTest.darkV3LauncherSession("2025-06-18", contracts);
+  const session = launcherTest.v3LauncherSession("2025-06-18", contracts);
   assert.deepEqual(session, {
     requested: "2025-06-18",
     negotiated: "2025-06-18",
@@ -286,34 +303,37 @@ test("dark v3 launcher state rejects old new and wrong-v3 runtime identities wit
     },
   });
   assert.equal(
-    launcherTest.darkV3RuntimeWireContractSkew(
+    launcherTest.v3RuntimeWireContractSkew(
       response(session.negotiated, session.discoveryContractSha256),
       session,
     ),
     null,
   );
   assert.equal(
-    launcherTest.darkV3RuntimeWireContractSkew(
+    launcherTest.v3RuntimeWireContractSkew(
       response("2024-11-05", contracts["2024-11-05"]),
       session,
     ),
     "protocol_version_skew",
   );
   assert.equal(
-    launcherTest.darkV3RuntimeWireContractSkew(
+    launcherTest.v3RuntimeWireContractSkew(
       response(session.negotiated, "f".repeat(64)),
       session,
     ),
     "discovery_contract_skew",
   );
   assert.equal(
-    launcherTest.darkV3RuntimeWireContractSkew(
+    launcherTest.v3RuntimeWireContractSkew(
       response(session.negotiated, session.discoveryContractSha256, 4),
       session,
     ),
     "publication_schema_skew",
   );
-  assert.deepEqual(launcherTest.supportedMcpProtocolVersions, ["2024-11-05"]);
+  assert.deepEqual(
+    launcherTest.supportedMcpProtocolVersions,
+    ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+  );
 });
 
 test("fail-open relay bounds hostile frames and survives null input and a missing catalog", async () => {
@@ -367,7 +387,9 @@ test("fail-open relay bounds hostile frames and survives null input and a missin
   const responses = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
   assert.equal(responses.find((response) => response.error?.code === -32600)?.id, null);
   assert.equal(
-    responses.find((response) => response.id === "null-arguments")?.result.structuredContent.code,
+    JSON.parse(
+      responses.find((response) => response.id === "null-arguments")?.result.content[0].text,
+    ).code,
     "project_required",
   );
   assert.deepEqual(
@@ -381,10 +403,75 @@ test("fail-open relay bounds hostile frames and survives null input and a missin
   const oversized = responses.find((response) => response.error?.data?.code === "stdio_frame_too_large");
   assert.equal(oversized.error.data.max_frame_bytes, 1024 * 1024);
   assert.ok(oversized.error.data.line_bytes > oversized.error.data.max_frame_bytes);
-  assert.equal(
-    responses.find((response) => response.id === "after-oversized")?.result.serverInfo.name,
-    "codestory",
-  );
+  assert.equal(responses.find((response) => response.id === "after-oversized")?.error.code, -32603);
+});
+
+test("fail-open relay applies revision-native JSON-RPC batch rules", async () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const status = {
+    plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+    runtime: { state: "unavailable" },
+    warnings: [],
+    readiness: [],
+    managed_retrieval: { state: "unavailable", automatic: true },
+    degraded_reason: "runtime_unavailable",
+  };
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `run(${JSON.stringify(status)});`,
+  ].join("");
+  const batch = [
+    { jsonrpc: "2.0", id: "tools", method: "tools/list" },
+    { jsonrpc: "2.0", method: "notifications/cancelled" },
+    { jsonrpc: "2.0", id: "resources", method: "resources/list" },
+  ];
+
+  for (const revision of ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]) {
+    const child = spawn(process.execPath, ["-e", fixture], { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdin.end([
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "initialize",
+        method: "initialize",
+        params: { protocolVersion: revision },
+      }),
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "retired-packet-argument",
+        method: "tools/call",
+        params: {
+          name: "packet",
+          arguments: { project: "/tmp/repo", question: "why", include_evidence: true },
+        },
+      }),
+      JSON.stringify(batch),
+      "",
+    ].join("\n"));
+    const [exitCode] = await once(child, "close");
+    assert.equal(exitCode, 0, stderr);
+    const frames = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(frames[0].result.protocolVersion, revision);
+    assert.equal(frames[1].id, "retired-packet-argument");
+    assert.equal(frames[1].error.code, -32602);
+    assert.match(frames[1].error.message, /include_evidence/u);
+    if (revision === "2024-11-05" || revision === "2025-03-26") {
+      assert.ok(Array.isArray(frames[2]), `${revision} must emit one batch response array`);
+      assert.deepEqual(frames[2].map(({ id }) => id), ["tools", "resources"]);
+      assert.ok(Array.isArray(frames[2][0].result.tools));
+      assert.ok(Array.isArray(frames[2][1].result.resources));
+    } else {
+      assert.equal(Array.isArray(frames[2]), false);
+      assert.equal(frames[2].id, null);
+      assert.equal(frames[2].error.code, -32600);
+    }
+    assert.equal(frames.length, 3, `${revision} emitted an unexpected notification response`);
+  }
 });
 
 test("fail-open project resource URIs use the native strict encoding contract", () => {
@@ -820,7 +907,7 @@ async function waitForPath(pathname, timeoutMs = 10000) {
 async function writeFakeCli(cliPath) {
   const script = [
     "const fs=require('fs');const args=process.argv.slice(1);",
-    "if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'2'),minimum_compatible_schema_version:2}}}})+'\\n',()=>process.exit(0))})}",
+    `if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&args[0]==='serve'){let input='';process.stdin.on('data',chunk=>{input+=chunk;const newline=input.indexOf('\\n');if(newline<0)return;const request=JSON.parse(input.slice(0,newline));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:request.params.protocolVersion,capabilities:{},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:${JSON.stringify(discoveryDigest())}},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'3'),minimum_compatible_schema_version:3}}}})+'\\n',()=>process.exit(0))})}`,
     "else if(args[0]==='--version'){if(process.env.CODESTORY_PLUGIN_PROVISIONING_PROBE==='1'&&process.env.CODESTORY_TEST_PROBE_LOG)fs.appendFileSync(process.env.CODESTORY_TEST_PROBE_LOG,'probe\\n');const delay=Number(process.env.CODESTORY_TEST_PROBE_DELAY_MS||0);if(delay>0)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,delay);console.log('codestory-cli '+(process.env.CODESTORY_PLUGIN_CLI_VERSION||process.env.TEST_CODESTORY_VERSION||'0.0.0'));process.exit(0)}",
     "else{fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({source:process.env.CODESTORY_PLUGIN_CLI_SOURCE,path:process.env.CODESTORY_PLUGIN_CLI_PATH,sha256:process.env.CODESTORY_PLUGIN_CLI_SHA256,version:process.env.CODESTORY_PLUGIN_CLI_VERSION,warnings:process.env.CODESTORY_PLUGIN_CLI_WARNINGS,pluginRoot:process.env.CODESTORY_PLUGIN_ROOT,launchCwd:process.env.CODESTORY_PLUGIN_LAUNCH_CWD,runtimeCwd:process.env.CODESTORY_PLUGIN_RUNTIME_CWD,pluginCacheVersion:process.env.CODESTORY_PLUGIN_CACHE_VERSION,repoRef:process.env.CODESTORY_PLUGIN_CLI_REPO_REF,buildSource:process.env.CODESTORY_PLUGIN_CLI_BUILD_SOURCE,archiveSha256:process.env.CODESTORY_PLUGIN_CLI_ARCHIVE_SHA256,retention:process.env.CODESTORY_PLUGIN_CLI_RETENTION,args}))}",
   ].join("");
@@ -848,7 +935,7 @@ async function writeLifecycleCli(cliPath) {
     "if(args[0]!=='serve')process.exit(2);",
     "let initialized=false;let notified=false;let input='';",
     "process.stdin.setEncoding('utf8');",
-    "process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:'2024-11-05',capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'2'),minimum_compatible_schema_version:2}}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});",
+    `const discoveryContracts=${JSON.stringify(generatedCatalog.wireContract.discoveryContracts)};process.stdin.on('data',chunk=>{input+=chunk;const lines=input.split(/\\r?\\n/u);input=lines.pop()||'';for(const line of lines){if(!line)continue;const request=JSON.parse(line);if(request.method==='initialize'){initialized=true;const revision=request.params.protocolVersion;process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{protocolVersion:revision,capabilities:{tools:{listChanged:false},resources:{listChanged:false},prompts:{listChanged:false}},serverInfo:{name:'fixture',version:'1'},_meta:{codestory_protocol:{discovery_contract_sha256:discoveryContracts[revision]},codestory_publication:{schema_version:Number(process.env.CODESTORY_TEST_STAMP_SCHEMA_VERSION||'3'),minimum_compatible_schema_version:3}}}})+'\\n')}else if(request.method==='notifications/initialized'){notified=true}else if(request.method==='tools/list'){if(!initialized||!notified)process.exit(42);fs.writeFileSync(process.env.TEST_OUT,JSON.stringify({initialized,notified,args}));process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{tools:[]}})+'\\n')}else if(request.method==='resources/list'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result:{resources:[]}})+'\\n',()=>process.exit(17))}}});`,
   ].join("");
   if (process.platform === "win32") {
     await writeFile(cliPath, `@echo off\r\n"${process.execPath}" -e "${script}" -- %*\r\n`, "utf8");
@@ -2336,15 +2423,18 @@ test("managed cli staging uses direct executables and requires the exact MCP con
   assert.equal(spawnOptions.shell, false);
 });
 
-function compatibleProbeResult(stamp = { schema_version: 2, minimum_compatible_schema_version: 2 }) {
+function compatibleProbeResult(stamp = { schema_version: 3, minimum_compatible_schema_version: 3 }) {
   return {
     jsonrpc: "2.0",
     id: "managed-cli-staging",
     result: {
-      protocolVersion: "2024-11-05",
+      protocolVersion: preferredRevision,
       capabilities: {},
       serverInfo: { name: "fixture", version: "1" },
-      ...(stamp === null ? {} : { _meta: { codestory_publication: stamp } }),
+      _meta: {
+        codestory_protocol: { discovery_contract_sha256: discoveryDigest() },
+        ...(stamp === null ? {} : { codestory_publication: stamp }),
+      },
     },
   };
 }
@@ -2356,11 +2446,11 @@ test("managed cli staging refuses to stage a runtime whose publication stamp it 
   const cases = [
     [null, "publication_stamp_legacy_v0"],
     [{ schema_version: 0 }, "publication_stamp_legacy_v0"],
-    [{ schema_version: "2" }, "publication_stamp_malformed"],
+    [{ schema_version: "3" }, "publication_stamp_malformed"],
     [{ schema_version: 1 }, "publication_stamp_producer_too_old"],
-    [{ schema_version: 3 }, "publication_stamp_producer_too_new"],
+    [{ schema_version: 4 }, "publication_stamp_producer_too_new"],
     [
-      { schema_version: 2, minimum_compatible_schema_version: 3 },
+      { schema_version: 3, minimum_compatible_schema_version: 4 },
       "publication_stamp_producer_too_new",
     ],
   ];
@@ -3555,7 +3645,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
         "      if (!line.trim()) continue;",
         "      const request = JSON.parse(line);",
       "      if (request.method === 'initialize') {",
-      "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: process.env.TEST_PROTOCOL_VERSION || '2024-11-05', serverInfo: { name: 'codestory' }, _meta: { codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '2'), minimum_compatible_schema_version: 2 } } } }) + '\\n');",
+      `        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: process.env.TEST_PROTOCOL_VERSION || ${JSON.stringify(preferredRevision)}, serverInfo: { name: 'codestory', version: '1' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest())} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '3'), minimum_compatible_schema_version: 3 } } } }) + '\\n');`,
       "      } else if (request.method === 'tools/list') {",
       "        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [{ name: 'ground' }] } }) + '\\n');",
       "      } else if (request.method === 'tools/call' && request.params && request.params.name === 'ground') {",
@@ -3626,7 +3716,7 @@ test("projectless mcp hands off to stdio without active project state", async ()
       jsonrpc: "2.0",
       id: "init",
       method: "initialize",
-      params: { protocolVersion: "2024-11-05" },
+      params: { protocolVersion: preferredRevision },
     });
     assert.equal(init.result.serverInfo.name, "codestory");
 
@@ -3756,7 +3846,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "codestory-failopen-mcp-"));
   const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
   const input = [
-    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: preferredRevision } }),
     JSON.stringify({ jsonrpc: "2.0", id: 2, method: "resources/read", params: { uri: statusUri } }),
     JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list" }),
     JSON.stringify({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "ground", arguments: {} } }),
@@ -3817,24 +3907,34 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
       .map((match) => match[1]);
     assert.deepEqual([...toolNames].sort(), [...canonicalToolNames].sort());
     const coldGroundTool = responses[2].result.tools.find((tool) => tool.name === "ground");
-    assert.equal(coldGroundTool.safety.effect, "managed_activation");
-    assert.equal(coldGroundTool.safety.requiresConfirmation, false);
-    // `ground` still reports managed_activation and openWorld (it can provision the
-    // embedding model); only readOnlyHint changes, because activation never writes the repo.
-    assert.equal(coldGroundTool.safety.localOnly, false);
-    assert.equal(coldGroundTool.safety.openWorld, true);
-    assert.equal(coldGroundTool.annotations.readOnlyHint, true);
-    assert.equal(coldGroundTool.annotations.openWorldHint, true);
+    const groundSafety = coldGroundTool._meta["com.thegreencedar.codestory/safety"];
+    assert.equal(groundSafety.effect, "managed_activation");
+    assert.equal(groundSafety.requiresConfirmation, false);
+    assert.equal(groundSafety.localOnly, false);
+    assert.equal(groundSafety.openWorld, true);
+    assert.deepEqual(coldGroundTool.annotations, {
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
+    const coldStatusTool = responses[2].result.tools.find((tool) => tool.name === "status");
+    assert.deepEqual(coldStatusTool.annotations, {
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+      readOnlyHint: true,
+    });
     assert.equal(responses[3].result.isError, true);
-    assert.equal(responses[3].result.structuredContent.code, "project_required");
-    assert.equal(responses[3].result.structuredContent.tool, "ground");
-    assert.equal(responses[3].result.structuredContent.retry_tool, undefined);
-    assert.match(responses[3].result.structuredContent.message, /absolute repository root/u);
-    assert.equal(responses[4].result.structuredContent.current_operation, null);
+    assert.equal(responses[3].result.structuredContent, undefined);
+    assert.equal(toolTextJson(responses[3]).code, "project_required");
+    assert.equal(toolTextJson(responses[3]).tool, "ground");
+    assert.equal(toolTextJson(responses[3]).retry_tool, undefined);
+    assert.match(toolTextJson(responses[3]).message, /absolute repository root/u);
+    assert.equal(toolTextJson(responses[4]).current_operation, null);
     assert.equal(responses[5].result.isError, true);
-    assert.equal(responses[5].result.structuredContent.code, "project_required");
+    assert.equal(toolTextJson(responses[5]).code, "project_required");
     assert.equal(responses[6].result.isError, true);
-    assert.equal(responses[6].result.structuredContent.code, "project_unavailable");
+    assert.equal(toolTextJson(responses[6]).code, "project_unavailable");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -3851,7 +3951,7 @@ test("mcp launcher preserves the managed CLI verification failure", async () => 
       jsonrpc: "2.0",
       id: 1,
       method: "initialize",
-      params: { protocolVersion: "2024-11-05" },
+      params: { protocolVersion: preferredRevision },
     }),
     JSON.stringify({
       jsonrpc: "2.0",
@@ -3895,9 +3995,10 @@ test("mcp launcher preserves the managed CLI verification failure", async () => 
     assert.equal(status.degraded_reason, reason);
     assert.ok(status.warnings.includes(reason), JSON.stringify(status.warnings));
     assert.equal(status.readiness[0].reason, reason);
-    assert.equal(responses[2].result.structuredContent.failure, reason);
+    assert.equal(toolTextJson(responses[2]).failure, reason);
     assert.equal(responses[2].result.isError, true);
-    assert.equal(responses[2].result.structuredContent.code, "codestory_unavailable");
+    assert.equal(responses[2].result.structuredContent, undefined);
+    assert.equal(toolTextJson(responses[2]).code, "codestory_unavailable");
   } finally {
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -4019,8 +4120,8 @@ test("packaged initialize handshake carries the publication stamp the host reads
       "the packaged handshake must carry _meta.codestory_publication, not only _meta.codestory_protocol",
     );
     assert.deepEqual(stamp, {
-      schema_version: 2,
-      minimum_compatible_schema_version: 2,
+      schema_version: 3,
+      minimum_compatible_schema_version: 3,
       served_from: "contract_only",
       publication: null,
       core_publication: null,
@@ -4060,8 +4161,8 @@ test("packaged initialize handshake carries the publication stamp the host reads
 
     const stamp = failOpenResult._meta?.codestory_publication;
     assert.ok(stamp, "the fail-open handshake must carry the stamp too");
-    assert.equal(stamp.schema_version, 2);
-    assert.equal(stamp.minimum_compatible_schema_version, 2);
+    assert.equal(stamp.schema_version, 3);
+    assert.equal(stamp.minimum_compatible_schema_version, 3);
     assert.equal(stamp.served_from, "contract_only");
     assert.equal(launcherTest.publicationStampSkew(stamp), null);
     assert.equal(stamp.contract_runtime.cli_source, "managed_unavailable");
@@ -4118,12 +4219,10 @@ test("mcp launcher starts the multi-project stdio runtime through its bridge", a
         "          jsonrpc: '2.0',",
         "          id: request.id,",
         "          result: {",
-        // A v2 runtime negotiates: it answers with the revision it implements,
-        // never the one the client asked for.
-        "            protocolVersion: process.env.TEST_PROTOCOL_VERSION || '2024-11-05',",
+        `            protocolVersion: process.env.TEST_PROTOCOL_VERSION || '2025-03-26',`,
         "            capabilities: {},",
         "            serverInfo: { name: 'codestory', version },",
-        "            _meta: { codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '2'), minimum_compatible_schema_version: 2 } },",
+        `            _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: Number(process.env.TEST_STAMP_SCHEMA_VERSION || '3'), minimum_compatible_schema_version: 3 } },`,
         "          },",
         "        }));",
         "      } else if (request.method === 'tools/list') {",
@@ -4242,7 +4341,7 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
         "    if (!line.trim()) continue;",
         "    const request = JSON.parse(line);",
         "    if (request.method === 'initialize') {",
-        "      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_publication: { schema_version: 1 } } } }) + '\\n');",
+        `      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { protocolVersion: '2025-03-26', capabilities: {}, serverInfo: { name: 'codestory', version: '0' }, _meta: { codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discoveryDigest("2025-03-26"))} }, codestory_publication: { schema_version: 1 } } } }) + '\\n');`,
         "    } else if (request.method === 'tools/list') {",
         // Answer in a later chunk so the reply lands after the launcher has
         // already refused this runtime: the relay must stay shut, not just
@@ -4322,15 +4421,17 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
     });
     assert.equal(
       init.result.protocolVersion,
-      "2024-11-05",
-      "the launcher must answer with the revision it implements, not the one requested",
+      "2025-03-26",
+      "the launcher must answer with the negotiated revision",
     );
     assert.deepEqual(init.result._meta.codestory_protocol, {
       requested: "2025-03-26",
-      negotiated: "2024-11-05",
-      supported: ["2024-11-05"],
-      status: "unsupported_client_revision",
-      compatible: false,
+      negotiated: "2025-03-26",
+      supported: ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+      preferred: preferredRevision,
+      status: "agreed",
+      compatible: true,
+      discovery_contract_sha256: discoveryDigest("2025-03-26"),
     });
 
     const delegated = await sendRequest({ jsonrpc: "2.0", id: "tools", method: "tools/list" });
@@ -4341,7 +4442,7 @@ test("CODESTORY_CLI override that publishes an unreadable wire contract is refus
     );
     assert.equal(delegated.error.code, -32000);
     assert.match(delegated.error.message, /reason_code=runtime_wire_contract_skew/u);
-    assert.match(delegated.error.message, /error_code=publication_stamp_producer_too_old/u);
+    assert.match(delegated.error.message, /error_code=publication_schema_skew/u);
 
     const diagnostic = await sendRequest({
       jsonrpc: "2.0",
@@ -4744,12 +4845,14 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       method: "tools/call",
       params: { name: "ground", arguments: { project: repoRoot } },
     });
-    assert.equal(coldGround.result.isError, undefined);
-    assert.equal(coldGround.result.structuredContent.code, "codestory_preparing");
-    assert.equal(coldGround.result.structuredContent.state, "preparing");
-    assert.equal(coldGround.result.structuredContent.retry_tool, "ground");
-    assert.equal(coldGround.result.structuredContent.project, repoRoot);
-    const { progress, ...operationCore } = coldGround.result.structuredContent.operation;
+    assert.equal(coldGround.result.isError, true);
+    assert.equal(coldGround.result.structuredContent, undefined);
+    const coldGroundError = toolTextJson(coldGround);
+    assert.equal(coldGroundError.code, "codestory_preparing");
+    assert.equal(coldGroundError.state, "preparing");
+    assert.equal(coldGroundError.retry_tool, "ground");
+    assert.equal(coldGroundError.project, repoRoot);
+    const { progress, ...operationCore } = coldGroundError.operation;
     // The gated release server withholds every asset byte here, so no transfer is measurable and
     // the retry hint must be the documented no-signal fallback.
     assert.deepEqual(operationCore, {
@@ -4761,8 +4864,8 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       failure: null,
     });
     assert.equal(
-      coldGround.result.structuredContent.retry_after_ms,
-      coldGround.result.structuredContent.operation.retry_after_ms,
+      coldGroundError.retry_after_ms,
+      coldGroundError.operation.retry_after_ms,
     );
     // Progress appears once a release asset fetch is in flight; the request can land just before
     // the background provisioner gets that far, so null is the only other legal value.
@@ -4773,7 +4876,7 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       );
       assert.equal(typeof progress.received_bytes, "number");
     }
-    assert.doesNotMatch(coldGround.result.structuredContent.message, /status/u);
+    assert.doesNotMatch(coldGroundError.message, /status/u);
 
     releaseAssets();
     const managedRoot = join(dataDir, "codestory-cli");
@@ -5040,20 +5143,19 @@ test("fail-open status tool preserves primary runtime failures and no-project pr
   ].join("\n"));
   assert.equal((await completed)[0], 0);
   const responses = output.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+  const resultValue = (id) => toolTextJson(responses.find((response) => response.id === id));
   failures.forEach(([reason, failure], index) => {
-    const structured = responses.find((response) => response.id === index + 1)?.result.structuredContent;
+    const structured = resultValue(index + 1);
     assert.equal(structured.degraded_reason, reason);
     assert.equal(structured.failure, failure);
     assert.equal(structured.current_operation, null);
   });
-  const noProject = responses.find((response) => response.id === failures.length + 1)?.result.structuredContent;
+  const noProject = resultValue(failures.length + 1);
   assert.equal(noProject.code, "project_required");
   assert.equal(noProject.state, "no_project");
   assert.equal(noProject.degraded_reason, undefined);
   assert.equal(noProject.diagnostics_uri, undefined);
-  const unavailableProject = responses.find(
-    (response) => response.id === failures.length + 2,
-  )?.result.structuredContent;
+  const unavailableProject = resultValue(failures.length + 2);
   assert.equal(unavailableProject.code, "project_unavailable");
   assert.equal(unavailableProject.state, "unavailable");
   assert.equal(unavailableProject.diagnostics_uri, undefined);

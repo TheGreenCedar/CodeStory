@@ -30,7 +30,7 @@
     "/mechanical/after/files": 2,
     "/anchors/requested": 1,
     "/anchors/resolved": 1,
-    "/open_gaps/answer_quality_status": "supported",
+    "/open_gaps/answer_quality_status": "available",
     "/open_gaps/next_command_count": 0
   },
   "markdown_contains": [
@@ -41,9 +41,9 @@
     "output_dir: `artifacts/drill`",
     "index_before: files=2 nodes=4 edges=2 errors=0",
     "index_after: files=2 nodes=4 edges=2 errors=0 refresh=none",
-    "question_search: packet [supported duration_ms=1]",
+    "question_search: packet [available duration_ms=1]",
     "anchors:",
     "execution_boundaries:",
-    "evidence_packet: id=packet-task-brief sufficiency=supported citations=2"
+    "evidence_packet: id=packet-task-brief availability=available evidence=2"
   ]
 }

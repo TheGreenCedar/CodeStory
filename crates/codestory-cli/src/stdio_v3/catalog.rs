@@ -7,7 +7,7 @@ const PROJECTION_ROWS_MAX_V3: usize = 256;
 const PROJECTION_REFERENCES_MAX_V3: usize = 256;
 
 pub(crate) fn tools_for_revision_v3(revision: McpRevisionV3) -> Vec<Value> {
-    tools_for_surface_v3(revision, V3SurfaceSet::WithProof)
+    tools_for_surface_v3(revision, V3SurfaceSet::EvidenceOnly)
 }
 
 pub(crate) fn tools_for_surface_v3(revision: McpRevisionV3, surface: V3SurfaceSet) -> Vec<Value> {
@@ -127,15 +127,7 @@ fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
     match revision {
         McpRevisionV3::November2024 => {}
         McpRevisionV3::March2025 => {
-            let mut annotations = Map::from_iter([
-                ("destructiveHint".to_string(), json!(false)),
-                ("idempotentHint".to_string(), json!(true)),
-                ("openWorldHint".to_string(), json!(activates)),
-            ]);
-            if !activates {
-                annotations.insert("readOnlyHint".to_string(), json!(true));
-            }
-            projected.insert("annotations".to_string(), Value::Object(annotations));
+            projected.insert("annotations".to_string(), annotations_v3(activates));
         }
         McpRevisionV3::June2025 | McpRevisionV3::November2025 => {
             projected.insert("title".to_string(), json!(title_v3(name)));
@@ -143,6 +135,7 @@ fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
                 "outputSchema".to_string(),
                 output_schema_for_tool_v3(name, source, activates),
             );
+            projected.insert("annotations".to_string(), annotations_v3(activates));
             projected.insert(
                 "_meta".to_string(),
                 json!({
@@ -162,6 +155,18 @@ fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
         }
     }
     Value::Object(projected)
+}
+
+fn annotations_v3(activates: bool) -> Value {
+    let mut annotations = Map::from_iter([
+        ("destructiveHint".to_string(), json!(false)),
+        ("idempotentHint".to_string(), json!(true)),
+        ("openWorldHint".to_string(), json!(activates)),
+    ]);
+    if !activates {
+        annotations.insert("readOnlyHint".to_string(), json!(true));
+    }
+    Value::Object(annotations)
 }
 
 fn output_schema_for_tool_v3(name: &str, source: &Value, activates: bool) -> Value {
@@ -216,9 +221,22 @@ fn packet_budget_exceeded_schema_v3() -> Value {
         ("schema_version", schema_version_v3()),
         ("identity", packet_identity_schema_v3()),
         ("publication", publication_schema_v3()),
-        ("status", evidence_availability_schema_v3()),
+        ("status", enum_schema_v3(&["unavailable"])),
         ("retrieval", retrieval_state_schema_v3()),
         ("diagnostics", diagnostics_capability_schema_v3()),
+        (
+            "gaps",
+            json!({
+                "type":"array",
+                "items":closed_object_schema_v3(vec![
+                    ("identity", gap_identity_schema_v3()),
+                    ("kind", enum_schema_v3(&["output_budget_exceeded"])),
+                    ("message", nullable_schema_v3(string_schema_v3())),
+                ]),
+                "minItems":1,
+                "maxItems":1
+            }),
+        ),
         ("maximum_bytes", unsigned_integer_schema_v3()),
         ("required_complete_bytes", unsigned_integer_schema_v3()),
     ])
@@ -421,6 +439,7 @@ fn diagnostics_capability_schema_v3() -> Value {
                     ("sha256", sha256_schema_v3()),
                     ("byte_length", unsigned_integer_schema_v3()),
                     ("uri", string_schema_v3()),
+                    ("wall_expiry_epoch_ms", unsigned_integer_schema_v3()),
                 ])),
             ]),
         ]
@@ -584,9 +603,9 @@ mod tests {
     }
 
     #[test]
-    fn discovery_tools_use_only_revision_native_fields_and_audited_annotations() {
+    fn sealed_proof_fixture_uses_only_revision_native_fields_and_audited_annotations() {
         for revision in McpRevisionV3::all() {
-            let tools = tools_for_revision_v3(*revision);
+            let tools = tools_for_surface_v3(*revision, super::super::V3SurfaceSet::WithProof);
             assert_eq!(
                 tools.len(),
                 21,
@@ -607,7 +626,10 @@ mod tests {
                 assert!(projected.get("safety").is_none());
             }
 
-            if *revision == McpRevisionV3::March2025 {
+            if matches!(
+                revision,
+                McpRevisionV3::March2025 | McpRevisionV3::June2025 | McpRevisionV3::November2025
+            ) {
                 assert_eq!(
                     tool(&tools, "status").pointer("/annotations/readOnlyHint"),
                     Some(&json!(true))
@@ -665,7 +687,8 @@ mod tests {
                 "artifact_id":"diagnostic-1",
                 "sha256":"c".repeat(64),
                 "byte_length":128,
-                "uri":"codestory://packet-diagnostics/b96ac0cc-e552-4c35-a0ba-c83b9ead67de/".to_string() + &"d".repeat(64)
+                "uri":"codestory://packet-diagnostics/b96ac0cc-e552-4c35-a0ba-c83b9ead67de/".to_string() + &"d".repeat(64),
+                "wall_expiry_epoch_ms":1_725_000_600_123_u64
             }
         });
         let maximal = [
@@ -685,7 +708,9 @@ mod tests {
                 json!({
                     "kind":"budget_exceeded","schema_version":3,"identity":identity,"publication":publication,
                     "status":"unavailable","retrieval":{"state":"degraded","generation_id":"retrieval-1"},
-                    "diagnostics":diagnostics,"maximum_bytes":16384,"required_complete_bytes":16385
+                    "diagnostics":diagnostics,
+                    "gaps":[{"identity":{"gap_id":"packet-output-budget-exceeded"},"kind":"output_budget_exceeded","message":null}],
+                    "maximum_bytes":16384,"required_complete_bytes":16385
                 }),
             ),
             (
@@ -803,7 +828,9 @@ mod tests {
         let packet_budget = json!({
             "kind":"budget_exceeded","schema_version":3,"identity":identity,"publication":publication,
             "status":"unavailable","retrieval":{"state":"degraded","generation_id":null},
-            "diagnostics":diagnostics,"maximum_bytes":16384,"required_complete_bytes":16385
+            "diagnostics":diagnostics,
+            "gaps":[{"identity":{"gap_id":"packet-output-budget-exceeded"},"kind":"output_budget_exceeded","message":null}],
+            "maximum_bytes":16384,"required_complete_bytes":16385
         });
         let context = json!({
             "kind":"complete","schema_version":3,"identity":identity,"publication":publication,
@@ -833,7 +860,7 @@ mod tests {
             ),
             (
                 "packet",
-                packet_budget,
+                packet_budget.clone(),
                 "/identity/request_id",
                 "/maximum_bytes",
             ),
@@ -890,6 +917,31 @@ mod tests {
             assert!(
                 crate::stdio_arguments::validate_structured_content(schema, &mistyped).is_err(),
                 "{name} accepted mistyped DTO field {typed_pointer}: {mistyped}"
+            );
+        }
+
+        let packet_schema = &tool(&tools, "packet")["outputSchema"];
+        for (label, invalid) in [
+            ("missing typed gap", {
+                let mut invalid = packet_budget.clone();
+                invalid["gaps"] = json!([]);
+                invalid
+            }),
+            ("wrong typed gap", {
+                let mut invalid = packet_budget.clone();
+                invalid["gaps"][0]["kind"] = json!("retrieval_unavailable");
+                invalid
+            }),
+            ("non-unavailable status", {
+                let mut invalid = packet_budget;
+                invalid["status"] = json!("available");
+                invalid
+            }),
+        ] {
+            assert!(
+                crate::stdio_arguments::validate_structured_content(packet_schema, &invalid)
+                    .is_err(),
+                "packet budget fallback accepted {label}: {invalid}"
             );
         }
     }

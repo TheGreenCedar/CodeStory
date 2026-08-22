@@ -15,23 +15,23 @@ The repository map remains useful while broad search initializes. CodeStory
 never treats a half-published generation as current: readers see one complete
 old or new publication.
 
-## Proof, planning evidence, and hints
+## Evidence, planning aids, and hints
 
 | Result | How to use it |
 | --- | --- |
 | Resolved symbol, caller, trail, or snippet from a ready map | Source-navigation evidence |
 | `affected` output | A bounded change-planning aid, never proof that a test ran or that every impact was found |
-| Packet with `supported` disposition and resolvable citations | Evidence for the covered claims |
-| Packet with `drill_once` disposition | A useful lead; run the one requested follow-up packet before claiming completeness |
-| Packet with `not_established` disposition | Answer only what the compiled support establishes, then name what stayed unproven |
-| Packet with `unavailable` disposition | Broad search could not run; fall back to focused source inspection and state the gap |
+| Packet with `available` status and resolvable evidence rows | Evidence for only what those rows directly establish; returned gaps still matter |
+| Packet with `continuation_available` status | Run the one returned continuation, then answer from the combined evidence and gaps |
+| Packet with `no_useful_evidence` status | Name the material gap; do not infer a negative result from a bounded search |
+| Packet with `unavailable` status | Broad retrieval could not serve the request; fall back to focused source inspection and state the gap |
 | Repo-text or semantic suggestion without a resolved symbol | Navigation hint to verify in source |
 | `working_locally` state | Use local graph tools; broad search is still preparing |
 | `unavailable` state | Fall back to focused source inspection and state the gap |
 
 `retrieval_mode=full` proves that the retrieval infrastructure is coherent. It
 does not guarantee that a particular answer found enough evidence. The packet's
-disposition and citations still matter. Compact and MCP status also report
+availability, evidence rows, and gaps still matter. Compact and MCP status also report
 `degraded_reason` and `live_ready`, so `retrieval_mode=full` with
 `live_ready=false` means the publication class is full but packet and search
 must not run yet.
@@ -40,8 +40,9 @@ must not run yet.
 
 - Paths or symbols do not match the checkout.
 - The answer came from an old host session that does not expose CodeStory MCP.
-- A broad tool is still preparing, unavailable, or returned a packet whose
-  disposition is `drill_once` or `not_established`.
+- A broad tool is still preparing or unavailable, or returned
+  `continuation_available` / `no_useful_evidence` without the evidence needed
+  for the claim.
 - Citations cannot be resolved to the files they name.
 - The agent substituted a generic tree search without reporting the CodeStory
   gap.

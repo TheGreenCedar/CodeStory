@@ -4,9 +4,18 @@ mod discovery;
 mod profile;
 mod transport;
 
+pub(crate) use catalog::tools_for_revision_v3;
+pub(crate) use diagnostics::{
+    DiagnosticsBindingV3, DiagnosticsReadErrorV3, DiagnosticsRegistryV3, attach_capability_uri_v3,
+};
+pub(crate) use discovery::NativeSessionV3;
 #[cfg(feature = "proof-qualification-support")]
 pub(crate) use discovery::discovery_contract_v3;
 pub(crate) use profile::McpRevisionV3;
+pub(crate) use transport::{
+    FrameResponseV3, build_tool_result_v3, jsonrpc_internal_error_v3, process_jsonrpc_frame_v3,
+    semantic_tool_error_v3,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum V3SurfaceSet {

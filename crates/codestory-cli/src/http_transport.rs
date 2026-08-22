@@ -142,7 +142,7 @@ pub(crate) fn handle_http_request(
                 .unwrap_or(10)
                 .clamp(1, 100);
             let operation = match runtime.run_public_operation("search", || {
-                runtime
+                let results = runtime
                     .browser
                     .search_results(SearchRequest {
                         query: query.clone(),
@@ -152,7 +152,13 @@ pub(crate) fn handle_http_request(
                         hybrid_weights: None,
                         hybrid_limits: None,
                     })
-                    .map_err(map_api_error)
+                    .map_err(map_api_error)?;
+                codestory_runtime::project_search_v3(
+                    &runtime.public_operation,
+                    "codestory-http",
+                    &results,
+                )
+                .map_err(map_api_error)
             }) {
                 Ok(operation) => operation,
                 Err(error) => {

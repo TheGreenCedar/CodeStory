@@ -3105,6 +3105,7 @@ pub struct PacketPlanDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
+#[serde(deny_unknown_fields)]
 pub struct AgentPacketRequestDto {
     pub question: String,
     #[serde(default)]
@@ -3115,8 +3116,6 @@ pub struct AgentPacketRequestDto {
     pub probes: Vec<PacketProbeDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_probes: Vec<String>,
-    #[serde(default = "default_include_evidence")]
-    pub include_evidence: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_budget_ms: Option<u32>,
     /// Parent packet identity for a generation-bound DrillOnce continuation.
@@ -3680,12 +3679,20 @@ mod packet_tests {
     }
 
     #[test]
-    fn packet_request_uses_standard_budget_by_default() {
+    fn packet_request_uses_standard_budget_and_rejects_the_retired_evidence_switch() {
         let request: AgentPacketRequestDto =
             serde_json::from_str(r#"{"question":"explain indexing"}"#).expect("deserialize");
 
         assert_eq!(request.budget, PacketBudgetModeDto::Standard);
-        assert!(request.include_evidence);
+        let serialized = serde_json::to_value(request).expect("serialize packet request");
+        assert!(serialized.get("include_evidence").is_none());
+        assert!(
+            serde_json::from_str::<AgentPacketRequestDto>(
+                r#"{"question":"explain indexing","include_evidence":true}"#,
+            )
+            .is_err(),
+            "the closed v3 packet request must reject the retired field"
+        );
     }
 
     #[test]
@@ -4238,7 +4245,6 @@ mod packet_tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: Some("packet-1".to_string()),
             option_ids: vec!["bounded_source_read:src%2Fmain.rs".to_string()],

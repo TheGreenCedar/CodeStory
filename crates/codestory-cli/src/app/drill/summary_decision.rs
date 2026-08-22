@@ -133,7 +133,11 @@ pub(super) fn drill_degraded_next_action(
     dedupe_and_rank_drill_files(&mut files);
 
     let mut action = "write a CodeStory-only draft".to_string();
-    let pending_claim_count = output.evidence_packet.disposition.omission_receipts.len();
+    let pending_claim_count = output
+        .legacy_evidence_packet
+        .disposition
+        .omission_receipts
+        .len();
     if pending_claim_count > 0 && degraded_bridge_count > 0 {
         let _ = write!(
             action,
@@ -157,7 +161,7 @@ pub(super) fn drill_degraded_next_action(
         let _ = write!(action, " including {preview}");
     }
     if output
-        .evidence_packet
+        .legacy_evidence_packet
         .disposition
         .drill
         .as_ref()

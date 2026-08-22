@@ -13,9 +13,69 @@ use codestory_contracts::api::{
     AgentPacketRequestDto, ClaimReadinessDto, EdgeId, NodeKind, PacketBudgetModeDto,
     PacketPlanQueryDto,
 };
+use codestory_contracts::packet_projection_v3::{
+    BoundedVecV3, CorePublicationIdentityV3Dto, DiagnosticsCapabilityV3Dto,
+    EvidenceAvailabilityV3Dto, EvidenceIdentityV3Dto, EvidenceKindV3Dto, IdentityTextV3,
+    PacketEvidenceRowV3Dto, PacketProjectionV3Dto, PacketRequestIdentityV3Dto, PathTextV3,
+    PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
+    Sha256DigestV3Dto, SummaryTextV3, SymbolIdTextV3,
+};
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
+
+fn sample_v3_packet_projection(
+    packet: &codestory_contracts::api::AgentPacketDto,
+) -> PacketProjectionV3Dto {
+    let evidence = packet
+        .support
+        .iter()
+        .map(|unit| PacketEvidenceRowV3Dto {
+            identity: EvidenceIdentityV3Dto {
+                evidence_id: IdentityTextV3::new(format!("packet-{}", unit.id))
+                    .expect("bounded evidence id"),
+            },
+            kind: EvidenceKindV3Dto::ExactSource,
+            path: unit
+                .path
+                .as_deref()
+                .map(|path| PathTextV3::new(path).expect("bounded path")),
+            symbol_id: unit
+                .symbol_id
+                .as_deref()
+                .map(|symbol| SymbolIdTextV3::new(symbol).expect("bounded symbol")),
+            start_line: unit.start_line,
+            end_line: unit.end_line,
+            summary: Some(SummaryTextV3::new(&unit.summary).expect("bounded summary")),
+        })
+        .collect();
+    PacketProjectionV3Dto::Complete {
+        schema_version: 3,
+        identity: PacketRequestIdentityV3Dto {
+            packet_id: IdentityTextV3::new(&packet.packet_id).expect("bounded packet id"),
+            request_id: IdentityTextV3::new(&packet.answer.retrieval_trace.request_id)
+                .expect("bounded request id"),
+            question_sha256: Sha256DigestV3Dto::new("a".repeat(64)).expect("digest"),
+        },
+        publication: PublicationIdentityV3Dto {
+            core: CorePublicationIdentityV3Dto {
+                project_id: IdentityTextV3::new("project-1").expect("project id"),
+                generation_id: IdentityTextV3::new("generation-1").expect("generation id"),
+                run_id: IdentityTextV3::new("run-1").expect("run id"),
+            },
+            retrieval: None,
+        },
+        status: EvidenceAvailabilityV3Dto::Available,
+        retrieval: RetrievalStateDescriptorV3Dto {
+            state: RetrievalStateV3Dto::Unavailable,
+            generation_id: None,
+        },
+        evidence: BoundedVecV3::new(evidence).expect("bounded evidence"),
+        gaps: BoundedVecV3::new(Vec::new()).expect("bounded gaps"),
+        continuation: None,
+        diagnostics: DiagnosticsCapabilityV3Dto::Unavailable,
+    }
+}
 
 #[test]
 fn drill_packet_adapter_reuses_packet_citations_and_sufficiency() {
@@ -43,7 +103,7 @@ fn drill_packet_adapter_reuses_packet_citations_and_sufficiency() {
     assert_eq!(bridges[0].evidence.status, "source_truth_only");
     assert_eq!(
         drill_packet_claim_readiness(packet.disposition.kind),
-        ClaimReadinessDto::Supported
+        ClaimReadinessDto::Anchored
     );
     assert_eq!(
         bridges[0].evidence.next_commands,
@@ -61,7 +121,6 @@ fn drill_executes_one_packet_with_explicit_anchor_probes() {
         task_class: None,
         probes: Vec::new(),
         extra_probes: vec!["WorkspaceIndexer".to_string()],
-        include_evidence: true,
         latency_budget_ms: None,
         parent_packet_id: None,
         option_ids: Vec::new(),
@@ -126,7 +185,7 @@ fn drill_retained_fields_match_pre_adapter_fixture() {
         },
         question_search: Some(DrillCommandStatusOutput {
             command: "packet".to_string(),
-            status: "supported".to_string(),
+            status: "available".to_string(),
             duration_ms: 1,
             artifact: None,
             error: None,
@@ -141,7 +200,8 @@ fn drill_retained_fields_match_pre_adapter_fixture() {
         }],
         verification_targets,
         next_commands: packet_drill_option_ids(&packet),
-        evidence_packet: packet,
+        evidence_packet: sample_v3_packet_projection(&packet),
+        legacy_evidence_packet: packet,
     };
     let output_dir = tempdir().expect("output dir");
     let mut operation = codestory_runtime::PublicOperation {

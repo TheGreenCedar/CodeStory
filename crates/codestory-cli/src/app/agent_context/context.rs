@@ -3,14 +3,11 @@ use super::super::artifacts::{
 };
 use super::super::bookmarks::load_bookmark_focus_by_id;
 use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
-use super::super::rendering::build_query_resolution_output;
 use super::super::resolution::resolve_target_or_emit_ambiguity;
 use crate::args;
-use crate::args::{ContextCommand, QueryResolutionOutput, QuerySelectorOutput};
+use crate::args::{ContextCommand, QuerySelectorOutput};
 use crate::display;
-use crate::output::{
-    RenderedPublicOutput, context_packet_json, emit_public_operation, render_context_markdown,
-};
+use crate::output::{RenderedPublicOutput, emit_public_operation};
 use crate::runtime;
 use crate::runtime::{RuntimeContext, map_api_error};
 use anyhow::{Result, bail};
@@ -18,21 +15,6 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentResponseModeDto, AgentRetrievalPresetDto,
     AgentRetrievalProfileSelectionDto, BookmarkDto, NodeId, RetrievalAnnotationDto,
 };
-
-#[derive(serde::Serialize)]
-struct ContextTargetOutput {
-    selector: QuerySelectorOutput,
-    requested: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bookmark_id: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-struct ContextJsonOutput {
-    target: ContextTargetOutput,
-    resolution: QueryResolutionOutput,
-    context: serde_json::Value,
-}
 
 struct ResolvedContextTarget {
     target: runtime::ResolvedTarget,
@@ -52,7 +34,7 @@ pub(in crate::app) fn run_context(cmd: ContextCommand) -> Result<()> {
             resolve_context_target(&runtime, &cmd, cmd.format, cmd.output_file.as_deref())?;
         let target_prompt = context_target_prompt(&resolved);
         let request = AgentAskRequest {
-            prompt: target_prompt,
+            prompt: target_prompt.clone(),
             retrieval_profile: AgentRetrievalProfileSelectionDto::Preset {
                 preset: AgentRetrievalPresetDto::Investigate,
             },
@@ -70,20 +52,16 @@ pub(in crate::app) fn run_context(cmd: ContextCommand) -> Result<()> {
             .annotations
             .push(RetrievalAnnotationDto::observation("mode=db_first"));
         annotate_answer_with_context_target(&mut answer, &resolved);
-        let markdown = render_context_markdown(&runtime.project_root, &answer);
-        let output = ContextJsonOutput {
-            target: ContextTargetOutput {
-                selector: resolved.selector,
-                requested: resolved.requested,
-                bookmark_id: resolved
-                    .bookmark
-                    .as_ref()
-                    .map(|bookmark| bookmark.id.clone()),
-            },
-            resolution: build_query_resolution_output(&runtime.project_root, &resolved.target),
-            context: context_packet_json(&answer),
-        };
-        let rendered = RenderedPublicOutput::structured(&output, markdown)?;
+        let projection = codestory_runtime::project_context_v3(
+            &runtime.public_operation,
+            "codestory-cli",
+            resolved.target.selected.file_path.as_deref(),
+            Some(&resolved.target.selected.node_id.0),
+            &answer,
+        )
+        .map_err(map_api_error)?;
+        let markdown = render_context_projection_markdown(&projection);
+        let rendered = RenderedPublicOutput::structured(&projection, markdown)?;
         Ok((answer, rendered))
     })?;
     if let Some(bundle_dir) = cmd.bundle.as_deref() {
@@ -97,6 +75,38 @@ pub(in crate::app) fn run_context(cmd: ContextCommand) -> Result<()> {
     }
     let operation = runtime::map_public_operation(operation, |(_, rendered)| rendered);
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
+}
+
+fn render_context_projection_markdown(
+    context: &codestory_contracts::packet_projection_v3::ContextProjectionV3Dto,
+) -> String {
+    let mut markdown = String::from("# Context evidence\n\n");
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        markdown,
+        "packet_id: `{}`",
+        context.identity.packet_id.as_str()
+    );
+    let _ = writeln!(markdown, "status: `{:?}`", context.status);
+    if !context.evidence.as_slice().is_empty() {
+        let _ = writeln!(markdown, "\n## Evidence");
+        for row in context.evidence.as_slice() {
+            let _ = writeln!(
+                markdown,
+                "- {}:{}-{}",
+                row.path.as_str(),
+                row.start_line,
+                row.end_line
+            );
+        }
+    }
+    if !context.gaps.as_slice().is_empty() {
+        let _ = writeln!(markdown, "\n## Gaps");
+        for gap in context.gaps.as_slice() {
+            let _ = writeln!(markdown, "- {:?}", gap.kind);
+        }
+    }
+    markdown
 }
 
 fn resolve_context_target(

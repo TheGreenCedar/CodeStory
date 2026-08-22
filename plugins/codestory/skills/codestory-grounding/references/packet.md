@@ -1,4 +1,4 @@
-# `packet` - Broad Task Packet With Typed Stop/Drill
+# `packet` - Broad Evidence Packet
 
 Builds a bounded answer packet for a broad repository question. Use it before
 ordinary source-file reads when the task is explanation, planning, route
@@ -13,11 +13,12 @@ CLI flags. Every call requires `project` (absolute repository root).
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Packet with compiled `support` units, then `disposition`. |
-| Supported / NotEstablished / Unavailable | Stop. For Supported, answer from `support`. For NotEstablished, answer every directly supported claim and name the material gaps without completing the chain by inference. For Unavailable, report the typed preparation reason. | Terminal. Do not search. |
-| DrillOnce | Call `packet` once more with the exact original `question`, `parent_packet_id`, the listed `option_ids`, and the pinned `core_generation_id` / `retrieval_generation` when present. | One generation-bound continuation. Then AnswerNow. Merge cannot emit another drill. |
+| Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
+| `available` | Answer only what the returned evidence rows establish and name material gaps. | Terminal. Do not search to strengthen the answer. |
+| `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids` from `continuation.gap_ids`, and the core/retrieval generation IDs from `publication`. | One bounded continuation, then answer from the combined evidence and gaps. |
+| `no_useful_evidence` / `unavailable` | State the evidence gap. Use focused source inspection when CodeStory could not serve broad retrieval. | Terminal. |
 | User-named exact target | `search`, `context`, `trail`, or `snippet` only when the user named that target. | Not packet recovery. |
-| Integration edge | Use JSON/MCP structured content. Compact text projects support units first, then disposition. Preserve exact source identifiers from support summaries and citation display names. | Comparable agent loops without a follow-up command list. |
+| Integration edge | Use JSON/MCP structured content. Preserve exact paths, symbol IDs, ranges, evidence IDs, and gap IDs. | The public result carries no proof disposition. |
 
 ## Notes
 
@@ -38,33 +39,29 @@ CLI flags. Every call requires `project` (absolute repository root).
   `symbol_id`, and `query`; reuse fails closed when the selected evidence
   generation changes. Search and definition links emit this bound form.
 - `extra_probes` remains a legacy compatibility input. It enters the same
-  runtime resolver. Neither typed nor legacy probes replace the compiled
-  disposition.
-- Judge the answer from compiled support units (symbol locations, source
-  ranges, typed CALL/INHERITANCE/import edges, and complete-query negatives).
-  `disposition.kind=supported` means that evidence is present. It does not mean
-  an English flow-catalog family was closed. Do not treat a missing named
-  family such as `handler_processing` as a reason to search again.
+  runtime resolver. Neither typed nor legacy probes replace the returned
+  availability, evidence, or gap fields.
+- Judge each claim from the concrete evidence rows: exact source, structural
+  source, graph relations, and retrieval excerpts. A bounded negative query is
+  a gap, never proof that something is absent.
 - A parser-partial coverage observation does not invalidate a retained exact
   `source_range` from the same file. That range supports only what its source
   text directly shows; the coverage warning still forbids file-wide absence or
   completeness claims.
-- `drill_once` is only for objectively missing, closable evidence: a deadline-
-  lost candidate, omitted mandatory support, or one bounded source read of a
-  known path. Repeat the exact original question and execute the listed option
-  ids once. Do not invent a second search system. CLI `drill` remains the
-  maintainer report and is not this agent path.
-- `not_established` is terminal. It may be a complete zero-hit, an ambiguous
-  probe that needs a user choice, or a packet with useful support whose material
-  chain is still incomplete after bounded retrieval. State the supported parts
-  and the exact gaps, then stop.
-- `unavailable` is stale publication, a dead sidecar, or a hard retrieval
-  error. Typed retry or preparation, not search.
-- JSON packets include `plan.obligations.version=1`. The obligation ledger
-  still records planned flow steps for query planning. It is not an
-  agent-facing conclusion.
-- CLI JSON, HTTP, and MCP consumers detect the `reported` proof-status value through
-  `_meta.codestory_publication.schema_version`, which is `2` for this contract, and should also
-  inspect `contract_runtime.pinned_pair_matches`. A configured `CODESTORY_CLI` override is
-  surfaced as `contract_runtime.known_override_skew_channel`. The stamp rides on the `initialize`
-  result too, so the version is known before the first tool call.
+- A continuation is only for objectively missing, closable evidence and has a
+  positive `remaining_rounds` bound. Execute it once. Do not invent a second
+  search system. CLI `drill` remains a maintainer report and is not this agent
+  path.
+- `no_useful_evidence` is terminal even when retrieval itself was healthy.
+  State the exact gaps, then stop. `unavailable` means the requested evidence
+  surface could not serve the request; use focused source inspection and say so.
+- Packet JSON is a closed root object. It contains no internal plan,
+  obligations, score, eligibility, or proof-disposition fields.
+- The complete MCP ToolResult is limited to 16 KiB. If the mandatory envelope
+  cannot fit, packet returns the explicit `budget_exceeded` variant with no
+  partial evidence. Diagnostics remain immutable and separately capability-
+  addressed for ten minutes in the serving session.
+- CLI, HTTP, and MCP consumers use CodeStory publication
+  `schema_version=minimum_compatible_schema_version=3`. MCP protocol revision
+  negotiation is separate: CodeStory supports `2024-11-05`, `2025-03-26`,
+  `2025-06-18`, and `2025-11-25`, preferring the newest.

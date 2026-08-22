@@ -31,7 +31,8 @@ impl NativeSessionV3 {
         let negotiated_revision = requested
             .and_then(McpRevisionV3::parse)
             .unwrap_or_else(McpRevisionV3::preferred);
-        let discovery_identity = discovery_contract_v3(negotiated_revision);
+        let discovery_identity =
+            discovery_contract_for_surface_v3(negotiated_revision, V3SurfaceSet::EvidenceOnly);
         Self {
             requested_revision,
             negotiated_revision,
@@ -48,8 +49,19 @@ impl NativeSessionV3 {
     }
 
     pub(crate) fn initialize_result(&self) -> Value {
+        let compatible = self
+            .requested_revision
+            .as_deref()
+            .is_none_or(|requested| McpRevisionV3::parse(requested).is_some());
+        let status = match self.requested_revision.as_deref() {
+            None => "defaulted",
+            Some(_) if compatible => "agreed",
+            Some(_) => "unsupported_client_revision",
+        };
         json!({
             "protocolVersion": self.negotiated_revision.as_str(),
+            "name": "codestory",
+            "version": env!("CARGO_PKG_VERSION"),
             "serverInfo": {"name":"codestory","version":env!("CARGO_PKG_VERSION")},
             "capabilities": initialize_capabilities_v3(),
             "_meta": {
@@ -61,6 +73,8 @@ impl NativeSessionV3 {
                         .map(|revision| revision.as_str())
                         .collect::<Vec<_>>(),
                     "preferred": McpRevisionV3::preferred().as_str(),
+                    "status": status,
+                    "compatible": compatible,
                     "discovery_contract_sha256": self.discovery_identity.sha256
                 },
                 "codestory_publication": {
@@ -87,6 +101,7 @@ pub(crate) enum HandoffSkewV3 {
 }
 
 pub(crate) fn discovery_contract_v3(revision: McpRevisionV3) -> DiscoveryContractIdentityV3 {
+    // Qualification measures the sealed proof-capable contract explicitly.
     discovery_contract_for_surface_v3(revision, V3SurfaceSet::WithProof)
 }
 
@@ -211,7 +226,9 @@ mod tests {
     fn discovery_contracts_are_deterministic_distinct_and_initialize_bound() {
         let identities = McpRevisionV3::all()
             .iter()
-            .map(|revision| discovery_contract_v3(*revision))
+            .map(|revision| {
+                discovery_contract_for_surface_v3(*revision, V3SurfaceSet::EvidenceOnly)
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             identities
@@ -224,7 +241,10 @@ mod tests {
         for identity in &identities {
             assert_eq!(identity.sha256.len(), 64);
             assert!(identity.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
-            assert_eq!(discovery_contract_v3(identity.revision), *identity);
+            assert_eq!(
+                discovery_contract_for_surface_v3(identity.revision, V3SurfaceSet::EvidenceOnly),
+                *identity
+            );
 
             let initialized = initialize_result_v3(Some(identity.revision.as_str()));
             assert_eq!(initialized["protocolVersion"], identity.revision.as_str());
