@@ -36,7 +36,7 @@ inventory only and make no graph, semantic, typed-target, or sufficiency claim.
 | Runtime claim | Languages | Evidence floor | Safe claim |
 | --- | --- | --- | --- |
 | Parser-backed graph, fidelity-gated | Python, Java, Rust, JavaScript, TypeScript/TSX, C++, C, Go, Ruby, PHP, C#, Kotlin, Swift, Dart, Bash | fidelity lab, tictactoe coverage, raw graph contracts, targeted rule/resolution suites, opt-in OSS corpus | daily graph navigation on typical code, with caveats |
-| Structural source-proof | HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, non-parser shell, PowerShell, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
+| Structural source-proof | HTML, CSS, SQL, Markdown/MDX, generic YAML/TOML/JSON, basename-scoped TypeScript/JavaScript config JSONC, non-parser shell, PowerShell, path-scoped GitHub Actions workflows, path-scoped Docker Compose manifests, basename-scoped Cargo manifests, dedicated OpenAPI/Swagger endpoint schema anchors | structural collector and OpenAPI schema-anchor tests | structural-text/schema anchors |
 
 Agent-facing packet/search quality is separate. Run-specific A/B artifacts are
 not blanket promotion proof for every parser-backed language.
@@ -96,7 +96,12 @@ Generic Markdown/MDX emits heading, link/reference-definition, and fenced-block
 labels while suppressing heading/reference syntax inside fences. Generic YAML
 emits conservative block mapping keys without treating URL colons or block
 scalar bodies as mappings; generic TOML emits table and key labels outside
-multiline strings; generic JSON emits object keys in source order. The shell
+multiline strings; generic JSON emits object keys in source order. Only
+`tsconfig.json`, `tsconfig.<suffix>.json`, `jsconfig.json`, and
+`jsconfig.<suffix>.json` admit JSONC comments and trailing commas, under native
+basename case rules; that parser still rejects every other JSON extension and
+emits quoted property-key spans from its AST. Other `.json` files remain strict
+JSON. The shell
 fallback emits function and import anchors outside heredocs only for `.zsh`,
 `.ksh`, and `.command`; `.sh` and `.bash` remain parser-backed Bash. PowerShell
 `.ps1` and `.psm1` emit function and module/dot-source anchors outside block
@@ -104,8 +109,9 @@ comments. These collectors do not interpret references, substitutions,
 imports, execution behavior, or typed targets.
 
 Dedicated routing wins before generic collection: workflow and Compose paths
-keep their YAML producers, `Cargo.toml` keeps its manifest producer, and
-OpenAPI/Swagger JSON or YAML keeps its `exact_source` endpoint path. Structural
+keep their YAML producers, `Cargo.toml` keeps its manifest producer, recognized
+TypeScript/JavaScript config names keep their JSONC producer, and OpenAPI/Swagger
+JSON or YAML keeps its `exact_source` endpoint path. Structural
 admission evaluates only workspace-relative paths and rejects
 generated/vendor, secret-bearing, lockfile, minified, and declared high-noise
 descendants before inventory metadata or content reads. Repository ancestors
@@ -125,8 +131,9 @@ can complete measured suites, but publishable agent-facing packet quality is not
 promoted until one coherent run has all quality, sufficiency, and cold-SLA gates
 green. Run-specific scorecards belong in PRs, issues, release notes, or ignored
 `target/` artifacts; this page records the durable claim boundaries. HTML, CSS,
-SQL, Markdown/MDX, generic YAML/TOML/JSON, non-parser shell, PowerShell, GitHub
-Actions workflows, Docker Compose manifests, and Cargo manifests remain
+SQL, Markdown/MDX, generic YAML/TOML/JSON, basename-scoped TypeScript/JavaScript
+config JSONC, non-parser shell, PowerShell, GitHub Actions workflows, Docker
+Compose manifests, and Cargo manifests remain
 structural source-proof collectors; OpenAPI schemas remain a dedicated
 schema-anchor path.
 

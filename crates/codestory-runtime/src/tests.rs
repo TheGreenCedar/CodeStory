@@ -3184,6 +3184,62 @@ fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
 }
 
 #[test]
+fn full_refresh_publishes_typescript_jsonc_and_exact_empty_test_json_then_preserves_previous_core()
+{
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let config_path = workspace.path().join("tsconfig.json");
+    let empty_test_path = workspace.path().join("tests/empty.json");
+    fs::create_dir_all(empty_test_path.parent().expect("test parent")).expect("create test parent");
+    fs::write(
+        &config_path,
+        "{\n  // strict JSONC config\n  \"compilerOptions\": { \"strict\": true, },\n}\n",
+    )
+    .expect("write JSONC config");
+    fs::write(&empty_test_path, []).expect("write exact empty test JSON");
+
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("recognized JSONC config and exact empty test artifact should publish");
+
+    let baseline = Storage::open(&storage_path)
+        .expect("open baseline storage")
+        .get_complete_index_publication()
+        .expect("read baseline publication")
+        .expect("complete baseline publication");
+    let storage = Storage::open(&storage_path).expect("open published storage");
+    assert_eq!(
+        storage
+            .get_file_by_path(&empty_test_path)
+            .expect("read empty test JSON")
+            .expect("empty test JSON file row")
+            .file_role,
+        codestory_store::FileRole::Test
+    );
+    drop(storage);
+
+    fs::write(&config_path, "{ \"compilerOptions\": , }").expect("write malformed JSONC");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect_err("malformed JSONC must reject a later full refresh");
+    assert_eq!(
+        Storage::open(&storage_path)
+            .expect("open preserved storage")
+            .get_complete_index_publication()
+            .expect("read preserved publication"),
+        Some(baseline)
+    );
+}
+
+#[test]
 fn incremental_refresh_replaces_structural_projection_and_semantics_with_unit_exclusion() {
     let _env = hybrid_test_env();
     let workspace = tempdir().expect("workspace");

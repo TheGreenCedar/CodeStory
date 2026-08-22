@@ -109,9 +109,9 @@ impl CachedStructuralArtifact {
     }
 }
 
-// Bumped to 3 alongside the index artifact cache: the SQL, HTML, and callable
-// projection changes in this wave all reach structural artifacts too.
-pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 3;
+// Bumped to 4 because workspace-relative role classification changes persisted
+// structural file metadata and zero-byte JSON admission.
+pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 4;
 
 pub(crate) fn build_structural_artifact_cache_key(
     cache_path: &Path,
