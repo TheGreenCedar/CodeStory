@@ -88,23 +88,26 @@ function gh(args) {
   return run("gh", args);
 }
 
-function values(args, name) {
+function values(args, name, { allowEmpty = false } = {}) {
   const result = [];
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === name) {
       const value = args[index + 1];
-      if (!value || value.startsWith("--")) {
+      const missing = value === undefined
+        || (!allowEmpty && !value)
+        || (Boolean(value) && value.startsWith("--"));
+      if (missing) {
         fail(`${name} requires a value`);
       }
-      result.push(value);
+      result.push(value ?? "");
       index += 1;
     }
   }
   return result;
 }
 
-function value(args, name, fallback = undefined) {
-  const found = values(args, name);
+function value(args, name, fallback = undefined, options = {}) {
+  const found = values(args, name, options);
   if (found.length > 1) {
     fail(`${name} may be specified only once`);
   }
@@ -591,7 +594,7 @@ function recordActionsReceipt(args) {
   const commit = required(args, "--commit");
   const tree = required(args, "--tree");
   const output = required(args, "--output");
-  const releasePrNumber = value(args, "--release-pr", "");
+  const releasePrNumber = value(args, "--release-pr", "", { allowEmpty: true });
   const runId = required(args, "--run-id");
   const runAttempt = required(args, "--run-attempt");
   const phase = required(args, "--phase");

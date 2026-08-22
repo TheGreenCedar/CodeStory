@@ -428,6 +428,56 @@ test("record-actions-receipt refuses to mint authority outside GitHub Actions", 
   );
 });
 
+test("record-actions-receipt accepts an empty --release-pr for next-head bind", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-empty-release-pr-"));
+  const script = new URL("./release-freeze-barrier.mjs", import.meta.url);
+  const result = spawnSync(
+    process.execPath,
+    [
+      script.pathname,
+      "record-actions-receipt",
+      "--repo",
+      root,
+      "--repository",
+      REPOSITORY,
+      "--branch",
+      "dev/codestory-next",
+      "--commit",
+      COMMIT,
+      "--tree",
+      TREE,
+      "--release-pr",
+      "",
+      "--output",
+      path.join(root, "receipt.json"),
+      "--run-id",
+      String(RUN_ID),
+      "--run-attempt",
+      String(RUN_ATTEMPT),
+      "--phase",
+      "source_stabilization",
+      "--support-prs-json",
+      "[]",
+      "--broad-workflow",
+      "Exact-head source proof",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_ACTIONS: "",
+        GITHUB_EVENT_NAME: "",
+      },
+    },
+  );
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.stderr, /--release-pr requires a value/u);
+  assert.match(
+    result.stderr,
+    /canonical release freeze receipt may be produced only by workflow_dispatch/u,
+  );
+});
+
 test("record-actions-receipt rejects a PR whose snapshot omits the live dev head", () => {
   const sandbox = mkdtempSync(path.join(tmpdir(), "codestory-freeze-stale-base-"));
   const root = path.join(sandbox, "repo");
