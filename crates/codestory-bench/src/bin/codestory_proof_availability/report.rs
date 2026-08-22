@@ -2036,33 +2036,18 @@ fn append_array_index_pointer(pointer: &str, index: usize) -> Option<String> {
 }
 
 fn fixed_json_pointer_segment(segment: &str) -> Option<&'static str> {
-    Some(match segment {
-        "schema" => "schema",
-        "canonical_id" => "canonical_id",
-        "case_id" => "case_id",
-        "repository_id" => "repository_id",
-        "qualification_id" => "qualification_id",
-        "workspace" => "workspace",
-        "environment" => "environment",
-        "inventory" => "inventory",
-        "trails" => "trails",
-        "cases" => "cases",
-        "failure_funnel" => "failure_funnel",
-        "summary" => "summary",
-        "decision" => "decision",
-        "findings" => "findings",
-        "provenance" => "provenance",
-        "observations" => "observations",
-        "results_sha256" => "results_sha256",
-        "thresholds_sha256" => "thresholds_sha256",
-        "observations_sha256" => "observations_sha256",
-        "outcome" => "outcome",
-        "failed_gates" => "failed_gates",
-        "text" => "text",
-        "path" => "path",
-        "value" => "value",
-        _ => return None,
-    })
+    const ADDITIONAL_FIXED: &[&str] = &["oracle_step_index", "projection_bytes", "receipts"];
+    const FIXED: &str = "actionable_exact_gap actionable_incomplete_gap actual actual_bytes admitted_rows all_authoritative_receipts_exact architecture attempted_positive_steps attempted_step_count audit authoritative_exact_receipt_count authoritative_receipt_count authoritative_receipts automatic automatic_thresholds_met binary_name binary_sha256 boundary buckets build byte_end byte_start caller caller_body callsite_expression callsite_identity callsite_line candidate_edge_ids canonical_id cargo_profile case_id cases certainty certified_absence classification classified_positive_steps clause_id clauses code cohorts commit complete_projection_bytes complete_response_p95_bytes containment contract_digest contract_proven contract_proven_supported core_generation core_generation_id core_run_id corpus_id corpus_sha256 count curator database_sha256 decision denominator detail diagnostic_candidate_count edge_count edge_id edge_ids effective_endpoint effective_endpoint_rows elapsed_ns end_byte end_byte_exclusive end_line environment environment_id exact_oracle_step_count exact_resolved exact_resolved_rows exclude_from_projection expected_cohort_count expected_negative_requests expected_positive_requests expected_positive_steps experimental failed_gates failure_funnel false_contract_proven false_positive_receipt_count file_byte_length file_count file_node_id finalization finding freshness full_or_useful_partial full_proof_wilson full_proofs gap gaps gate_id hard_gates identity incomplete_provenance indexed_sha256 invalid_results inventory invocation kind language length lengths line_window lower lower_milli maximum_certified_absence maximum_complete_response_p95_bytes maximum_false_contract_proven maximum_invalid_results maximum_over_cap_results maximum_proof_bytes maximum_response_bytes maximum_transport_errors maximum_transport_p95_ms maximum_unknown_p95_ms maximum_unknown_response_p95_bytes measurements methodology_sha256 milli minimum_actionable_exact_gap_milli minimum_cohort_wilson_lower_milli minimum_full_or_useful_partial_milli minimum_full_proof_wilson_lower_milli minimum_full_proofs minimum_full_proofs_per_cohort minimum_positive_step_recall_milli missing_oracle_step_count missing_oracle_steps mutated_spec mutation_id negative_mutations negative_request_count node_count node_id non_exact_authoritative_receipts numerator observations observations_sha256 observed_receipt_count observed_receipts observed_sha256 operation oracle_comparison oracle_receipts_exact oracle_step oracle_steps os outcome over_cap_results owner_node_id path path_count path_file path_file_sha256 path_id path_length path_length_distribution paths pinned positive_request_count positive_step_count positive_step_precision_milli positive_step_recall positive_step_recall_milli prescribed_argv product_disposition product_disposition_matches_evidence product_disposition_mismatches profile project_file_components project_id projects proof_trace prohibit_traversal_through proven_prefix_length proven_prefix_step_count proven_step_precision_milli proven_step_recall_milli provenance qualification_id qualification_source_commit qualification_source_tree qualified_name quote range reason receipt_evidence receipt_file_sha256 receipt_id receipt_line_window recorded_at repository repository_id require_complete_failure_funnel require_complete_provenance require_each_cohort require_exact_receipt_matches require_product_disposition_match results_sha256 review_date reviewer revision rust_host rustc_vv schema selector selector_early_return selector_index selectors sha256 source source_area source_area_requirement source_audit source_commit source_dirty source_head source_text source_tree source_tree_sha256 spec stable_explicit stage stage_durations_ms start start_byte start_line step_index steps store_schema stored_call_rows strictly_admitted symbol target text thresholds_id thresholds_sha256 trails transport transport_errors transport_p95 unclassified_positive_steps unclassified_step_indices unknown_response_p95_bytes unknown_warm_p95_ms unresolved_placeholder_rows upper validation warm_end_to_end_ms wilson wilson_z workspace";
+    if let Some(candidate) = ADDITIONAL_FIXED
+        .iter()
+        .copied()
+        .find(|candidate| *candidate == segment)
+    {
+        return Some(candidate);
+    }
+    FIXED
+        .split_ascii_whitespace()
+        .find(|candidate| *candidate == segment)
 }
 
 fn validate_public_bundle(bundle: &PublicArtifactBundle, policy: &PublicLeakPolicy) -> Result<()> {
@@ -2634,6 +2619,114 @@ mod tests {
         ] {
             assert!(absolute_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn fixed_pointer_vocabulary_accepts_the_full_closed_summary() {
+        let (report, corpus, thresholds) =
+            super::super::thresholds::tests::accepted_fixture::values();
+        let summary = QualificationSummaryV1::from_json(report).unwrap();
+        let corpus = CorpusV1::from_json(corpus).unwrap();
+        let thresholds = ThresholdsV1::from_json(thresholds).unwrap();
+
+        summary
+            .validate_against_inputs(&corpus, &thresholds)
+            .unwrap();
+        for value in [
+            serde_json::to_value(&summary.environment).unwrap(),
+            serde_json::to_value(&summary.inventory).unwrap(),
+            serde_json::to_value(&summary.trails).unwrap(),
+            serde_json::to_value(&summary.cases).unwrap(),
+            serde_json::to_value(&summary.failure_funnel).unwrap(),
+            serde_json::to_value(&summary).unwrap(),
+        ] {
+            assert_fixed_object_keys(&value);
+        }
+        build_public_artifacts(&summary, &corpus, &thresholds)
+            .expect("every typed report field has a fixed pointer segment");
+    }
+
+    fn assert_fixed_object_keys(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                for (field, child) in object {
+                    assert!(
+                        fixed_json_pointer_segment(field).is_some(),
+                        "unlisted fixture field: {field}"
+                    );
+                    assert_fixed_object_keys(child);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    assert_fixed_object_keys(child);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
+    #[test]
+    fn builder_path_writes_the_first_cases_path_failure_diagnostic() {
+        let (mut report, corpus, thresholds) =
+            super::super::thresholds::tests::accepted_fixture::values();
+        report["cases"][0]["receipt_evidence"]["observed_receipts"][0]["source"]["canonical_id"] =
+            json!("/private/canonical-id");
+        super::super::thresholds::tests::refresh_results_digest(&mut report);
+        let summary = QualificationSummaryV1::from_json(report).unwrap();
+        let corpus = CorpusV1::from_json(corpus).unwrap();
+        let thresholds = ThresholdsV1::from_json(thresholds).unwrap();
+        summary
+            .validate_against_inputs(&corpus, &thresholds)
+            .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join(&summary.qualification_id);
+        let reservation = reserve_case_diagnostic(root.path(), &summary.qualification_id).unwrap();
+        let error = build_and_publish(
+            &destination,
+            &summary,
+            &corpus,
+            &thresholds,
+            &PublicLeakPolicy::default(),
+            PublicArtifactDiagnosticContext::new(
+                &reservation,
+                &summary.qualification_id,
+                &summary.provenance.source_commit,
+                &summary.provenance.source_tree,
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.code,
+            "proof_availability_public_artifact_build_failed"
+        );
+        assert!(!destination.exists());
+        let diagnostic: Value = serde_json::from_slice(
+            &fs::read(
+                reservation
+                    .path()
+                    .join(PrivateDiagnosticFileKind::PublicArtifactBuildV1.file_name()),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(diagnostic["failure"]["reason"], "path_leak");
+        assert_eq!(diagnostic["failure"]["artifact"], "cases.json");
+        assert_eq!(diagnostic["failure"]["case_ordinal"], 0);
+        assert_eq!(
+            diagnostic["failure"]["json_pointer"],
+            "/0/receipt_evidence/observed_receipts/0/source/canonical_id"
+        );
     }
 
     #[cfg(all(
