@@ -693,16 +693,16 @@ fn maximum(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::contracts::{canonical_thresholds_sha256, results_evidence_sha256_from_json};
     use super::*;
     use sha2::{Digest, Sha256};
 
     #[allow(clippy::duplicate_mod)] // Reuse the accepted closed 120-case fixture verbatim.
-    mod accepted_fixture {
+    pub(crate) mod accepted_fixture {
         include!("../../../tests/proof_availability_contracts.rs");
 
-        pub(super) fn values() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+        pub(crate) fn values() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
             (report(), corpus(), thresholds())
         }
     }
@@ -745,7 +745,7 @@ mod tests {
         }
     }
 
-    fn refresh_results_digest(report: &mut serde_json::Value) {
+    pub(crate) fn refresh_results_digest(report: &mut serde_json::Value) {
         let digest = results_evidence_sha256_from_json(report).expect("recomputed results digest");
         report["provenance"]["results_sha256"] = serde_json::json!(digest);
     }
