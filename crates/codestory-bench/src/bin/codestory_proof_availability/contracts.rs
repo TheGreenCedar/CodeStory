@@ -11,6 +11,16 @@ pub const PATH_FILE_SCHEMA: &str = "codestory.proof-availability-path-file/v1";
 pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v1";
 pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1";
 pub const DECISION_REPORT_SCHEMA: &str = "codestory.proof-availability-decision/v1";
+pub const PRESCRIBED_BUILD_ARGV: [&str; 8] = [
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "-p",
+    "codestory-bench",
+    "--bin",
+    "codestory-proof-availability",
+];
 pub const MAX_CANDIDATE_EDGES_PER_STEP: usize =
     codestory_runtime::proof_qualification_support::MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP
         as usize;
@@ -18,6 +28,7 @@ pub const MAX_OBSERVED_RECEIPTS_PER_CASE: usize =
     codestory_runtime::proof_qualification_support::MAX_QUALIFICATION_OBSERVED_RECEIPTS_PER_CASE;
 const SHA256: &str = "^[0-9a-f]{64}$";
 const COMMIT: &str = "^[0-9a-f]{40}$";
+const QUALIFICATION_ID_PATTERN: &str = "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$";
 
 mod u128_decimal {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -1491,6 +1502,7 @@ pub struct ProvenanceV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentReportV1 {
+    pub qualification_id: String,
     pub environment_id: String,
     pub os: String,
     pub architecture: String,
@@ -1499,8 +1511,19 @@ pub struct EnvironmentReportV1 {
     pub qualification_source_commit: String,
     pub qualification_source_tree: String,
     pub recorded_at: String,
+    pub build: QualificationBuildProvenanceV1,
     pub invocation: QualificationInvocationIdentityV1,
     pub projects: Vec<ProjectMaterializationEvidenceV1>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct QualificationBuildProvenanceV1 {
+    pub source_commit: String,
+    pub source_tree: String,
+    pub source_dirty: bool,
+    pub rustc_vv: String,
+    pub cargo_profile: String,
+    pub prescribed_argv: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -2787,7 +2810,8 @@ impl QualificationSummaryV1 {
                 total.checked_add(bucket.count)
             });
         if self.schema != REPORT_SCHEMA
-            || empty(&self.qualification_id)
+            || !valid_qualification_id(&self.qualification_id)
+            || self.qualification_id != self.environment.qualification_id
             || !commit(&self.provenance.source_commit)
             || !commit(&self.provenance.source_tree)
             || ![
@@ -2802,7 +2826,12 @@ impl QualificationSummaryV1 {
             || self.environment.binary_sha256 != self.provenance.binary_sha256
             || self.environment.qualification_source_commit != self.provenance.source_commit
             || self.environment.qualification_source_tree != self.provenance.source_tree
+            || !qualification_id_matches_commit(
+                &self.qualification_id,
+                &self.provenance.source_commit,
+            )
             || !rfc3339_utc(&self.environment.recorded_at)
+            || !valid_build_provenance(&self.environment)
             || self.environment.invocation.binary_name != "codestory-proof-availability"
             || self.environment.invocation.operation != QualificationOperationV1::Run
             || self.environment.invocation.profile != QualificationProfileV1::LocalCoreOnly
@@ -3410,7 +3439,8 @@ fn leap_year(year: u32) -> bool {
 }
 
 fn sanitized_environment(environment: &EnvironmentReportV1) -> bool {
-    sanitized_atom(&environment.environment_id)
+    valid_qualification_id(&environment.qualification_id)
+        && sanitized_atom(&environment.environment_id)
         && sanitized_atom(&environment.os)
         && sanitized_atom(&environment.architecture)
         && sanitized_atom(&environment.rust_host)
@@ -3421,6 +3451,77 @@ fn sanitized_environment(environment: &EnvironmentReportV1) -> bool {
                 && sanitized_atom(&project.identity.core_generation_id)
                 && sanitized_atom(&project.identity.core_run_id)
         })
+}
+
+fn valid_build_provenance(environment: &EnvironmentReportV1) -> bool {
+    let build = &environment.build;
+    let hosts = build
+        .rustc_vv
+        .lines()
+        .filter_map(|line| line.strip_prefix("host: "))
+        .collect::<Vec<_>>();
+    commit(&build.source_commit)
+        && commit(&build.source_tree)
+        && build.source_commit == environment.qualification_source_commit
+        && build.source_tree == environment.qualification_source_tree
+        && !build.source_dirty
+        && !build.rustc_vv.is_empty()
+        && build.rustc_vv.len() <= 8192
+        && !build.rustc_vv.contains('\0')
+        && build.cargo_profile == "release"
+        && hosts.as_slice() == [environment.rust_host.as_str()]
+        && build.prescribed_argv
+            == PRESCRIBED_BUILD_ARGV
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+}
+
+pub fn valid_qualification_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 29
+        || bytes.get(8) != Some(&b'T')
+        || bytes.get(15) != Some(&b'Z')
+        || bytes.get(16) != Some(&b'-')
+        || !bytes[..8].iter().all(u8::is_ascii_digit)
+        || !bytes[9..15].iter().all(u8::is_ascii_digit)
+        || !bytes[17..]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return false;
+    }
+    let parse = |range: std::ops::Range<usize>| {
+        std::str::from_utf8(&bytes[range])
+            .ok()
+            .and_then(|component| component.parse::<u32>().ok())
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        parse(0..4),
+        parse(4..6),
+        parse(6..8),
+        parse(9..11),
+        parse(11..13),
+        parse(13..15),
+    ) else {
+        return false;
+    };
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        _ => return false,
+    };
+    year > 0 && (1..=maximum_day).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
+}
+
+pub fn qualification_id_matches_commit(qualification_id: &str, source_commit: &str) -> bool {
+    valid_qualification_id(qualification_id)
+        && commit(source_commit)
+        && qualification_id.get(17..) == source_commit.get(..12)
 }
 
 fn sanitized_atom(value: &str) -> bool {
@@ -4647,6 +4748,12 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
             ) {
                 property.insert("pattern".into(), Value::String(COMMIT.into()));
             }
+            if name == "qualification_id" {
+                property.insert(
+                    "pattern".into(),
+                    Value::String(QUALIFICATION_ID_PATTERN.into()),
+                );
+            }
         }
     }
     if let Some(definitions) = root.get_mut("$defs").and_then(Value::as_object_mut) {
@@ -4692,6 +4799,12 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
                         | "qualification_source_tree"
                 ) {
                     property.insert("pattern".into(), Value::String(COMMIT.into()));
+                }
+                if name == "qualification_id" {
+                    property.insert(
+                        "pattern".into(),
+                        Value::String(QUALIFICATION_ID_PATTERN.into()),
+                    );
                 }
                 if matches!(
                     name.as_str(),
@@ -4871,6 +4984,26 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 "EnvironmentReportV1",
                 "recorded_at",
                 "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+            );
+            set_min_length(schema, "QualificationBuildProvenanceV1", "rustc_vv", 1);
+            set_max_length(schema, "QualificationBuildProvenanceV1", "rustc_vv", 8192);
+            set_const(
+                schema,
+                Some("QualificationBuildProvenanceV1"),
+                "cargo_profile",
+                Value::String("release".into()),
+            );
+            set_const(
+                schema,
+                Some("QualificationBuildProvenanceV1"),
+                "source_dirty",
+                Value::Bool(false),
+            );
+            set_const(
+                schema,
+                Some("QualificationBuildProvenanceV1"),
+                "prescribed_argv",
+                serde_json::to_value(PRESCRIBED_BUILD_ARGV).expect("closed build argv"),
             );
             set_recursive_field_pattern(schema, "ActualProductResultV1", "contract_digest", SHA256);
             set_recursive_field_bounds(

@@ -119,6 +119,49 @@ fn task11a_environment_identity_is_closed_sanitized_and_bound_to_provenance() {
         json!(contracts::results_evidence_sha256_from_json(&value).unwrap());
     QualificationSummaryV1::from_json(value.clone()).expect("bound environment identity");
 
+    for mutation in [
+        ("qualification_id", json!("20260821T123456Z-aaaaaaaaaaaa")),
+        ("cargo_profile", json!("debug")),
+    ] {
+        let mut drift = value.clone();
+        if mutation.0 == "qualification_id" {
+            drift["environment"][mutation.0] = mutation.1;
+        } else {
+            drift["environment"]["build"][mutation.0] = mutation.1;
+        }
+        rebind_results_digest(&mut drift);
+        assert!(
+            QualificationSummaryV1::from_json(drift).is_err(),
+            "environment must reject {} drift",
+            mutation.0
+        );
+    }
+
+    let mut summary_identity_drift = value.clone();
+    summary_identity_drift["qualification_id"] = json!("20260821T123456Z-bbbbbbbbbbbb");
+    assert!(QualificationSummaryV1::from_json(summary_identity_drift).is_err());
+
+    let mut host_drift = value.clone();
+    host_drift["environment"]["rust_host"] = json!("x86_64-unknown-linux-gnu");
+    rebind_results_digest(&mut host_drift);
+    assert!(QualificationSummaryV1::from_json(host_drift).is_err());
+
+    let mut argv_drift = value.clone();
+    argv_drift["environment"]["build"]["prescribed_argv"][2] = json!("--debug");
+    rebind_results_digest(&mut argv_drift);
+    assert!(QualificationSummaryV1::from_json(argv_drift).is_err());
+
+    let mut dirty_build = value.clone();
+    dirty_build["environment"]["build"]["source_dirty"] = json!(true);
+    rebind_results_digest(&mut dirty_build);
+    assert!(QualificationSummaryV1::from_json(dirty_build).is_err());
+
+    let mut build_source_drift = value.clone();
+    build_source_drift["environment"]["build"]["source_commit"] =
+        json!("cccccccccccccccccccccccccccccccccccccccc");
+    rebind_results_digest(&mut build_source_drift);
+    assert!(QualificationSummaryV1::from_json(build_source_drift).is_err());
+
     for (field, bad) in [
         (
             "qualification_source_commit",
@@ -859,9 +902,9 @@ pub(crate) fn report() -> Value {
         })
         .collect::<Vec<_>>();
     let mut report = json!({
-      "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-0123456789ab",
+      "schema":"codestory.proof-availability-report/v1","qualification_id":"20260821T000000Z-bbbbbbbbbbbb",
       "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash,"results_sha256":SHA},
-      "environment":{"environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"qualification_source_commit":COMMIT,"qualification_source_tree":COMMIT,"recorded_at":"2026-08-21T12:34:56Z","invocation":{"binary_name":"codestory-proof-availability","operation":"run","profile":"local_core_only","corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash},"projects":frozen["cohorts"].as_array().unwrap().iter().map(|cohort|{let id=cohort["repository_id"].as_str().unwrap();json!({"repository_id":id,"source_head":cohort["commit"],"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})}).collect::<Vec<_>>()},
+      "environment":{"qualification_id":"20260821T000000Z-bbbbbbbbbbbb","environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"qualification_source_commit":COMMIT,"qualification_source_tree":COMMIT,"recorded_at":"2026-08-21T12:34:56Z","build":{"source_commit":COMMIT,"source_tree":COMMIT,"source_dirty":false,"rustc_vv":"rustc 1.91.0\nbinary: rustc\nhost: aarch64-apple-darwin\n","cargo_profile":"release","prescribed_argv":["cargo","build","--release","--locked","-p","codestory-bench","--bin","codestory-proof-availability"]},"invocation":{"binary_name":"codestory-proof-availability","operation":"run","profile":"local_core_only","corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash},"projects":frozen["cohorts"].as_array().unwrap().iter().map(|cohort|{let id=cohort["repository_id"].as_str().unwrap();json!({"repository_id":id,"source_head":cohort["commit"],"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})}).collect::<Vec<_>>()},
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
       "trails":cohort_ids.iter().map(|id|json!({"repository_id":id,"lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]})).collect::<Vec<_>>(),
       "cases":cases,
@@ -2554,6 +2597,43 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
         "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
     );
     assert_eq!(
+        report_schema["$defs"]["EnvironmentReportV1"]["properties"]["qualification_id"]["pattern"],
+        "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$"
+    );
+    assert_eq!(
+        report_schema["$defs"]["QualificationBuildProvenanceV1"]["properties"]["rustc_vv"]["maxLength"],
+        8192
+    );
+    assert_eq!(
+        report_schema["$defs"]["QualificationBuildProvenanceV1"]["properties"]["cargo_profile"]["const"],
+        "release"
+    );
+    assert_eq!(
+        report_schema["$defs"]["QualificationBuildProvenanceV1"]["properties"]["prescribed_argv"]["const"],
+        json!([
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "codestory-bench",
+            "--bin",
+            "codestory-proof-availability"
+        ])
+    );
+    assert_eq!(
+        report_schema["$defs"]["QualificationBuildProvenanceV1"]["properties"]["source_commit"]["pattern"],
+        "^[0-9a-f]{40}$"
+    );
+    assert_eq!(
+        report_schema["$defs"]["QualificationBuildProvenanceV1"]["properties"]["source_tree"]["pattern"],
+        "^[0-9a-f]{40}$"
+    );
+    assert_eq!(
+        report_schema["$defs"]["QualificationBuildProvenanceV1"]["properties"]["source_dirty"]["const"],
+        false
+    );
+    assert_eq!(
         report_schema["$defs"]["ActualProductResultV1"]["oneOf"][0]["properties"]["contract_digest"]
             ["pattern"],
         "^[0-9a-f]{64}$"
@@ -2648,6 +2728,29 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
 
 #[test]
 fn cli_matches_frozen_materialize_run_and_verify_shapes() {
+    let indexed = cli::Cli::try_parse_from([
+        "bin",
+        "materialize",
+        "--corpus",
+        "/tmp/c",
+        "--workspace",
+        "/tmp/w",
+        "--cache-root",
+        "/tmp/cache",
+        "--out",
+        "/tmp/e",
+        "--qualification-id",
+        "20260821T123456Z-0123456789ab",
+    ])
+    .expect("indexed materialization with closed qualification identity");
+    let cli::Command::Materialize(indexed) = indexed.command else {
+        panic!("materialize command")
+    };
+    assert_eq!(
+        indexed.qualification_id.as_deref(),
+        Some("20260821T123456Z-0123456789ab")
+    );
+
     assert!(matches!(
         cli::Cli::try_parse_from([
             "bin",
@@ -2666,6 +2769,66 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         .command,
         cli::Command::Materialize(_)
     ));
+    for invalid in [
+        "20260821T123456Z-0123456789a",
+        "20260821T123456Z-0123456789AB",
+        "2026-08-21T12:34:56Z-0123456789ab",
+        "20260230T123456Z-0123456789ab",
+    ] {
+        assert!(
+            cli::Cli::try_parse_from([
+                "bin",
+                "materialize",
+                "--corpus",
+                "/tmp/c",
+                "--workspace",
+                "/tmp/w",
+                "--cache-root",
+                "/tmp/cache",
+                "--out",
+                "/tmp/e",
+                "--qualification-id",
+                invalid,
+            ])
+            .is_err(),
+            "indexed materialization must reject {invalid}"
+        );
+    }
+    assert!(
+        cli::Cli::try_parse_from([
+            "bin",
+            "materialize",
+            "--corpus",
+            "/tmp/c",
+            "--workspace",
+            "/tmp/w",
+            "--cache-root",
+            "/tmp/cache",
+            "--out",
+            "/tmp/e",
+        ])
+        .is_err(),
+        "indexed materialization requires a qualification ID"
+    );
+    assert!(
+        cli::Cli::try_parse_from([
+            "bin",
+            "materialize",
+            "--corpus",
+            "/tmp/c",
+            "--workspace",
+            "/tmp/w",
+            "--cache-root",
+            "/tmp/cache",
+            "--out",
+            "/tmp/e",
+            "--verify-only",
+            "--qualification-id",
+            "20260821T123456Z-0123456789ab",
+        ])
+        .is_err(),
+        "source-only audit rejects indexed qualification identity"
+    );
     assert!(matches!(
         cli::Cli::try_parse_from([
             "bin",

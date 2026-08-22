@@ -1,10 +1,11 @@
+use super::build_provenance;
 use super::cli::MaterializeArgs;
 use super::contracts::{
     CohortPathFileV1, EnvironmentIdentityV1, EnvironmentReportV1, MaterializationFreshnessV1,
-    OraclePathV1, OracleSourceRangeV1, ProjectMaterializationEvidenceV1,
-    QUALIFICATION_REPOSITORIES, QualificationInvocationIdentityV1, QualificationOperationV1,
-    QualificationProfileV1, canonical_cohort_path_file_sha256, canonical_corpus_sha256,
-    validate_project_file,
+    OraclePathV1, OracleSourceRangeV1, PRESCRIBED_BUILD_ARGV, ProjectMaterializationEvidenceV1,
+    QUALIFICATION_REPOSITORIES, QualificationBuildProvenanceV1, QualificationInvocationIdentityV1,
+    QualificationOperationV1, QualificationProfileV1, canonical_cohort_path_file_sha256,
+    canonical_corpus_sha256, qualification_id_matches_commit, validate_project_file,
 };
 use super::corpus::LoadedCorpusV1;
 use anyhow::{Context, Result, bail};
@@ -158,6 +159,9 @@ struct QualificationBinaryIdentity {
     source_tree: String,
     recorded_at: String,
     rust_host: String,
+    rustc_vv: String,
+    build_profile: String,
+    source_dirty: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -271,9 +275,7 @@ fn materialize_indexed_with_registry(
     allow_local_repositories: bool,
     qualification: QualificationBinaryIdentity,
 ) -> Result<()> {
-    if arguments.verify_only {
-        bail!("proof_availability_indexed_materialization_rejects_verify_only")
-    }
+    let qualification_id = require_indexed_qualification(arguments, &qualification)?;
     loaded
         .corpus
         .validate_with_path_files_and_registry(&loaded.path_files, registry)?;
@@ -453,14 +455,26 @@ fn materialize_indexed_with_registry(
             .as_bytes(),
         );
         let environment = EnvironmentReportV1 {
+            qualification_id,
             environment_id,
             os: std::env::consts::OS.to_owned(),
             architecture: std::env::consts::ARCH.to_owned(),
             rust_host: qualification.rust_host,
             binary_sha256: qualification.binary_sha256,
-            qualification_source_commit: qualification.source_commit,
-            qualification_source_tree: qualification.source_tree,
+            qualification_source_commit: qualification.source_commit.clone(),
+            qualification_source_tree: qualification.source_tree.clone(),
             recorded_at: qualification.recorded_at,
+            build: QualificationBuildProvenanceV1 {
+                source_commit: qualification.source_commit.clone(),
+                source_tree: qualification.source_tree.clone(),
+                source_dirty: qualification.source_dirty,
+                rustc_vv: qualification.rustc_vv,
+                cargo_profile: qualification.build_profile,
+                prescribed_argv: PRESCRIBED_BUILD_ARGV
+                    .iter()
+                    .map(|argument| (*argument).to_owned())
+                    .collect(),
+            },
             invocation: QualificationInvocationIdentityV1 {
                 binary_name: "codestory-proof-availability".to_owned(),
                 operation: QualificationOperationV1::Run,
@@ -820,6 +834,26 @@ fn validate_operational_environment_with_identity(
     {
         bail!("proof_availability_qualification_binary_mismatch")
     }
+    if !qualification_id_matches_commit(
+        &descriptor.environment.qualification_id,
+        &qualification.source_commit,
+    ) {
+        bail!("proof_availability_qualification_identity_mismatch")
+    }
+    if descriptor.environment.rust_host != qualification.rust_host
+        || descriptor.environment.build.source_commit != qualification.source_commit
+        || descriptor.environment.build.source_tree != qualification.source_tree
+        || descriptor.environment.build.source_dirty != qualification.source_dirty
+        || descriptor.environment.build.rustc_vv != qualification.rustc_vv
+        || descriptor.environment.build.cargo_profile != qualification.build_profile
+        || descriptor.environment.build.prescribed_argv
+            != PRESCRIBED_BUILD_ARGV
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect::<Vec<_>>()
+    {
+        bail!("proof_availability_qualification_build_mismatch")
+    }
     for path_file in &loaded.path_files {
         let repository = descriptor
             .repositories
@@ -953,7 +987,7 @@ fn qualification_binary_identity() -> Result<QualificationBinaryIdentity> {
         .and_then(Path::parent)
         .ok_or_else(|| anyhow::anyhow!("proof_availability_repository_root_missing"))?;
     let hooks = tempfile::tempdir()?;
-    let source_commit = String::from_utf8(
+    let live_commit = String::from_utf8(
         git(
             Some(repository),
             hooks.path(),
@@ -963,19 +997,27 @@ fn qualification_binary_identity() -> Result<QualificationBinaryIdentity> {
     )?
     .trim()
     .to_owned();
-    let source_tree = String::from_utf8(
+    let live_tree = String::from_utf8(
         git(Some(repository), hooks.path(), ["rev-parse", "HEAD^{tree}"])?.stdout,
     )?
     .trim()
     .to_owned();
-    require_head_and_clean(repository, &source_commit, hooks.path())?;
-    let rustc = Command::new("rustc")
-        .args(["--version", "--verbose"])
-        .output()?;
-    if !rustc.status.success() {
-        bail!("proof_availability_rustc_identity_unavailable")
-    }
-    let rust_host = String::from_utf8(rustc.stdout)?
+    let live_clean = git(
+        Some(repository),
+        hooks.path(),
+        ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?
+    .stdout
+    .is_empty();
+    let source_commit = build_provenance::SOURCE_COMMIT.trim().to_owned();
+    let source_tree = build_provenance::SOURCE_TREE.trim().to_owned();
+    let source_dirty = match build_provenance::SOURCE_DIRTY.trim() {
+        "true" => true,
+        "false" => false,
+        _ => bail!("proof_availability_qualification_build_dirty_state_invalid"),
+    };
+    let rustc_vv = build_provenance::RUSTC_VV.to_owned();
+    let rust_host = rustc_vv
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .ok_or_else(|| anyhow::anyhow!("proof_availability_rust_host_missing"))?
@@ -986,13 +1028,71 @@ fn qualification_binary_identity() -> Result<QualificationBinaryIdentity> {
     if !date.status.success() {
         bail!("proof_availability_recorded_at_unavailable")
     }
-    Ok(QualificationBinaryIdentity {
+    let qualification = QualificationBinaryIdentity {
         binary_sha256,
         source_commit,
         source_tree,
         recorded_at: String::from_utf8(date.stdout)?.trim().to_owned(),
         rust_host,
-    })
+        rustc_vv,
+        build_profile: build_provenance::BUILD_PROFILE.to_owned(),
+        source_dirty,
+    };
+    require_live_source_matches_build(&qualification, &live_commit, &live_tree, live_clean)?;
+    Ok(qualification)
+}
+
+fn require_live_source_matches_build(
+    qualification: &QualificationBinaryIdentity,
+    live_commit: &str,
+    live_tree: &str,
+    live_clean: bool,
+) -> Result<()> {
+    if qualification.source_dirty {
+        bail!("proof_availability_qualification_binary_built_dirty")
+    }
+    if !live_clean {
+        bail!("proof_availability_qualification_live_source_dirty")
+    }
+    if qualification.source_commit != live_commit || qualification.source_tree != live_tree {
+        bail!("proof_availability_qualification_live_source_mismatch")
+    }
+    Ok(())
+}
+
+fn require_indexed_qualification(
+    arguments: &MaterializeArgs,
+    qualification: &QualificationBinaryIdentity,
+) -> Result<String> {
+    if arguments.verify_only {
+        bail!("proof_availability_indexed_materialization_rejects_verify_only")
+    }
+    let qualification_id = arguments
+        .qualification_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_qualification_id_missing"))?;
+    if !super::cli::valid_qualification_id(qualification_id) {
+        bail!("proof_availability_qualification_id_invalid")
+    }
+    let commit_prefix = qualification
+        .source_commit
+        .get(..12)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_source_commit_invalid"))?;
+    if qualification_id.get(17..) != Some(commit_prefix) {
+        bail!("proof_availability_qualification_id_source_commit_mismatch")
+    }
+    if qualification.build_profile != "release" {
+        bail!("proof_availability_qualification_build_profile_not_release")
+    }
+    let embedded_host = qualification
+        .rustc_vv
+        .lines()
+        .filter_map(|line| line.strip_prefix("host: "))
+        .collect::<Vec<_>>();
+    if embedded_host.as_slice() != [qualification.rust_host.as_str()] {
+        bail!("proof_availability_qualification_rust_host_mismatch")
+    }
+    Ok(qualification_id.to_owned())
 }
 
 fn create_private_directory(path: &Path) -> Result<()> {
@@ -2033,6 +2133,7 @@ mod tests {
             workspace: root.path().join("workspace"),
             cache_root: root.path().join("cache-must-not-exist"),
             out: root.path().join("source-environment.json"),
+            qualification_id: None,
             verify_only: true,
         };
 
@@ -2120,6 +2221,7 @@ mod tests {
             workspace: failure_root.path().join("workspace"),
             cache_root: failure_root.path().join("cache-must-not-exist"),
             out: failure_root.path().join("source-environment.json"),
+            qualification_id: None,
             verify_only: true,
         };
         let error = verify_only_with_registry(&failed, &invalid, &registry, true)
@@ -2246,6 +2348,7 @@ mod tests {
                 workspace: workspace.clone(),
                 cache_root,
                 out: out.clone(),
+                qualification_id: None,
                 verify_only: true,
             };
 
@@ -2277,6 +2380,7 @@ mod tests {
             workspace: workspace.clone(),
             cache_root: canonical_root,
             out: out.clone(),
+            qualification_id: None,
             verify_only: true,
         };
 
@@ -2490,6 +2594,98 @@ mod tests {
     }
 
     #[test]
+    fn indexed_qualification_preflight_binds_id_profile_and_compiler_host() {
+        let mut arguments = MaterializeArgs {
+            corpus: PathBuf::from("unused-corpus.json"),
+            workspace: PathBuf::from("unused-workspace"),
+            cache_root: PathBuf::from("unused-cache"),
+            out: PathBuf::from("unused-environment.json"),
+            qualification_id: Some("20260821T120000Z-222222222222".into()),
+            verify_only: false,
+        };
+        let qualification = QualificationBinaryIdentity {
+            binary_sha256: "1".repeat(64),
+            source_commit: "2".repeat(40),
+            source_tree: "3".repeat(40),
+            recorded_at: "2026-08-21T12:00:00Z".into(),
+            rust_host: "aarch64-apple-darwin".into(),
+            rustc_vv: "rustc 1.91.0\nbinary: rustc\nhost: aarch64-apple-darwin\n".into(),
+            build_profile: "release".into(),
+            source_dirty: false,
+        };
+
+        assert_eq!(
+            require_indexed_qualification(&arguments, &qualification).unwrap(),
+            "20260821T120000Z-222222222222"
+        );
+
+        arguments.qualification_id = Some("20260821T120000Z-444444444444".into());
+        assert!(
+            require_indexed_qualification(&arguments, &qualification)
+                .unwrap_err()
+                .to_string()
+                .contains("qualification_id_source_commit_mismatch")
+        );
+        arguments.qualification_id = Some("20260821T120000Z-222222222222".into());
+
+        let mut debug = qualification.clone();
+        debug.build_profile = "debug".into();
+        assert!(
+            require_indexed_qualification(&arguments, &debug)
+                .unwrap_err()
+                .to_string()
+                .contains("qualification_build_profile_not_release")
+        );
+
+        let mut wrong_host = qualification.clone();
+        wrong_host.rust_host = "x86_64-unknown-linux-gnu".into();
+        assert!(
+            require_indexed_qualification(&arguments, &wrong_host)
+                .unwrap_err()
+                .to_string()
+                .contains("qualification_rust_host_mismatch")
+        );
+
+        require_live_source_matches_build(&qualification, &"2".repeat(40), &"3".repeat(40), true)
+            .unwrap();
+        assert!(
+            require_live_source_matches_build(
+                &qualification,
+                &"4".repeat(40),
+                &"5".repeat(40),
+                true,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_live_source_mismatch")
+        );
+        let mut dirty_build = qualification.clone();
+        dirty_build.source_dirty = true;
+        assert!(
+            require_live_source_matches_build(
+                &dirty_build,
+                &"2".repeat(40),
+                &"3".repeat(40),
+                true,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_binary_built_dirty")
+        );
+        assert!(
+            require_live_source_matches_build(
+                &qualification,
+                &"2".repeat(40),
+                &"3".repeat(40),
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_live_source_dirty")
+        );
+    }
+
+    #[test]
     fn non_verify_materialization_builds_a_fresh_core_only_index() {
         let (origin, commit, raw_tree) = cohort_repository();
         let tree_sha256 = sha256(&raw_tree);
@@ -2512,6 +2708,7 @@ mod tests {
             workspace: root.path().join("workspace"),
             cache_root: root.path().join("cache"),
             out: root.path().join("environment.json"),
+            qualification_id: Some("20260821T120000Z-222222222222".into()),
             verify_only: false,
         };
         let qualification = QualificationBinaryIdentity {
@@ -2520,6 +2717,9 @@ mod tests {
             source_tree: "3".repeat(40),
             recorded_at: "2026-08-21T12:00:00Z".into(),
             rust_host: "aarch64-apple-darwin".into(),
+            rustc_vv: "rustc 1.91.0\nbinary: rustc\nhost: aarch64-apple-darwin\n".into(),
+            build_profile: "release".into(),
+            source_dirty: false,
         };
 
         materialize_indexed_with_registry(
@@ -2566,6 +2766,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("qualification_binary_mismatch")
+        );
+        let mut wrong_qualification_id = descriptor.clone();
+        wrong_qualification_id.environment.qualification_id =
+            "20260821T120000Z-aaaaaaaaaaaa".into();
+        assert!(
+            validate_operational_environment_with_identity(
+                &loaded,
+                &wrong_qualification_id,
+                &qualification,
+                &registry,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_identity_mismatch")
+        );
+        let mut wrong_build = descriptor.clone();
+        wrong_build.environment.build.cargo_profile = "debug".into();
+        assert!(
+            validate_operational_environment_with_identity(
+                &loaded,
+                &wrong_build,
+                &qualification,
+                &registry,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("qualification_build_mismatch")
         );
         let mut stale = descriptor.clone();
         stale.environment.projects[0].freshness = MaterializationFreshnessV1::Stale;

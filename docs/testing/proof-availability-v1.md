@@ -7,11 +7,17 @@ public.
 
 ## Inputs and lifecycle
 
-Use one locked `codestory-proof-availability` binary for both materialization and
-the run. Materialization checks out the exact frozen commits, verifies every
-oracle range and each receipt step's independently frozen full-source-file
-SHA-256, builds one fresh core index per project, and writes a private local
-environment descriptor:
+Build one locked release `codestory-proof-availability` binary with the closed
+command below, then use that same binary for materialization, the run, and
+verification. It embeds Cargo's selected `rustc -vV` and build profile. Indexed
+materialization rejects a non-release or dirty-source build. The embedded source
+commit and tree are authoritative: the live checkout must remain clean and at
+that exact identity. Public environment evidence records the build source,
+compiler identity, prescribed build command, and explicit qualification ID.
+Materialization checks out the exact frozen commits,
+verifies every oracle range and each receipt step's independently frozen
+full-source-file SHA-256, builds one fresh core index per project, and writes a
+private local environment descriptor:
 
 Before Q2, Q1 must prove that the evidence-only v3 surface is separable from
 proof activation. The sealed conformance probe builds and validates packet,
@@ -38,16 +44,28 @@ run Q2. A successful Q1 gate constrains Q2 to Outcomes A, B, or C. The
 qualification binary never accepts caller-supplied dependency evidence.
 
 ```sh
-cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
-  materialize \
+cargo build --release --locked -p codestory-bench --bin codestory-proof-availability
+qualification_bin=target/release/codestory-proof-availability
+qualification_id="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short=12 HEAD)"
+run_root="target/proof-availability/$qualification_id"
+results_root="$run_root/results"
+mkdir -p "$run_root" "$results_root"
+
+"$qualification_bin" materialize \
+  --qualification-id "$qualification_id" \
   --corpus benchmarks/proof-availability/corpus-v1.json \
-  --workspace target/proof-availability/workspace \
-  --cache-root target/proof-availability/cache \
-  --out target/proof-availability/environment.json
+  --workspace "$run_root/workspace" \
+  --cache-root "$run_root/cache" \
+  --out "$run_root/environment.json"
 ```
 
-The source-only audit form is separate. It neither creates the cache nor indexes
-or executes proof:
+The ID is exactly `YYYYMMDDTHHMMSSZ-<12 lowercase commit hex>`, and its suffix
+must match the qualification source commit. `environment_id` remains a separate
+identity derived from measured environment and binary evidence.
+
+The source-only audit form is separate. It accepts no qualification ID, does not
+require a release build, and neither creates the cache nor indexes or executes
+proof:
 
 ```sh
 cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
@@ -63,12 +81,11 @@ Run qualification only against the private descriptor produced by the same
 clean source head and binary:
 
 ```sh
-cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
-  run \
+"$qualification_bin" run \
   --corpus benchmarks/proof-availability/corpus-v1.json \
   --thresholds benchmarks/proof-availability/thresholds-v1.json \
-  --environment target/proof-availability/environment.json \
-  --out target/proof-availability/results
+  --environment "$run_root/environment.json" \
+  --out "$results_root/$qualification_id"
 ```
 
 The command is the complete Q2 contract for Outcomes A, B, and C.
@@ -140,15 +157,16 @@ threshold, results, aggregate, and decision bindings, including the same
 three-way oracle/indexed/observed file-hash comparison, and writes nothing:
 
 ```sh
-cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
-  verify \
+"$qualification_bin" verify \
   --corpus benchmarks/proof-availability/corpus-v1.json \
   --thresholds benchmarks/proof-availability/thresholds-v1.json \
-  --results target/proof-availability/results
+  --results "$results_root/$qualification_id"
 ```
 
 This is the complete A/B/C verification contract. There is no runtime input for
-Outcome D.
+Outcome D. The result directory basename, public environment, summary, and
+verification identity must all equal the same qualification ID. The directory
+still contains exactly the eight artifacts listed above.
 
 ## Interpretation
 
