@@ -1468,6 +1468,9 @@ fn verify_oracle_sources(
             let bytes = source_bytes
                 .get(&step.callsite_expression.path)
                 .ok_or_else(|| anyhow::anyhow!("proof_availability_source_buffer_missing"))?;
+            if sha256(bytes) != step.receipt_file_sha256 {
+                bail!("proof_availability_receipt_file_hash_mismatch")
+            }
             validate_line_binding(
                 path,
                 step.callsite_line,
@@ -1702,6 +1705,7 @@ mod tests {
                     "callsite_line":1,
                     "callsite_expression":source_range(&path, 18, 26),
                     "receipt_line_window":source_range(&path, 0, SOURCE.len()),
+                    "receipt_file_sha256":sha256(SOURCE),
                     "target":declaration(target, &path, 18, 26),
                 })
             })
@@ -2135,6 +2139,56 @@ mod tests {
         assert!(!failed.workspace.exists());
         assert!(!failed.out.exists());
         assert!(!failed.cache_root.exists());
+    }
+
+    #[test]
+    fn oracle_source_verification_binds_steps_to_the_exact_full_file_bytes() {
+        let (origin, commit, raw_tree) = cohort_repository();
+        let tree_sha256 = sha256(&raw_tree);
+        let (mut loaded, _) = local_inputs(origin.path().to_str().unwrap(), &commit, &tree_sha256);
+        let project_root = origin.path().canonicalize().unwrap();
+
+        revalidate_case_source(&loaded.path_files[0], origin.path(), &project_root)
+            .expect("the independently frozen full-file hash matches the pinned source bytes");
+
+        loaded.path_files[0].paths[0].oracle_steps[0].receipt_file_sha256 = "c".repeat(64);
+        let error = revalidate_case_source(&loaded.path_files[0], origin.path(), &project_root)
+            .expect_err("a valid but wrong full-file hash must reject materialization");
+        assert!(
+            format!("{error:#}").contains("proof_availability_receipt_file_hash_mismatch"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the source-only frozen CodeStory checkout"]
+    fn frozen_source_receipts_match_the_exact_pinned_checkouts() {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("repository root");
+        for repository_id in ["codestory-rust", "vite-ts-js", "flask-python", "gin-go"] {
+            let path_file: CohortPathFileV1 = serde_json::from_slice(
+                &fs::read(repository_root.join(format!(
+                    "benchmarks/proof-availability/paths/{repository_id}.json"
+                )))
+                .expect("frozen cohort path file"),
+            )
+            .expect("closed frozen cohort path file");
+            let checkout = repository_root.join(format!(
+                "target/proof-availability/oracle-workspaces/{repository_id}"
+            ));
+            let project_root = if path_file.workspace == "." {
+                checkout.canonicalize()
+            } else {
+                checkout.join(&path_file.workspace).canonicalize()
+            }
+            .expect("exact pinned project checkout");
+
+            revalidate_case_source(&path_file, &checkout, &project_root).unwrap_or_else(|error| {
+                panic!("{repository_id} receipt files did not match exact pinned bytes: {error:#}")
+            });
+        }
     }
 
     #[cfg(unix)]

@@ -287,12 +287,15 @@ struct OraclePathV1 {
 #[serde(deny_unknown_fields)]
 struct OracleStepV1 {
     caller: OracleDeclarationV1,
-    callsite: OracleSourceRangeV1,
+    callsite_line: u32,
+    callsite_expression: OracleSourceRangeV1,
+    receipt_line_window: OracleSourceRangeV1,
+    receipt_file_sha256: String,
     target: OracleDeclarationV1,
 }
 ```
 
-`materialize` rehashes every declaration and callsite range against the pinned checkout before indexing. A mismatch stops the entire run.
+`materialize` rehashes every declaration and callsite range plus the complete source file named by each receipt step against the pinned checkout before indexing. Runtime and offline report validation require both the indexed and observed receipt file hashes to equal that independently frozen full-file hash. A mismatch stops the entire run.
 
 ### Separate denominators
 
@@ -1094,7 +1097,7 @@ Pin the exact URLs/commits/workspaces from Section 5. `materialize` clones to a 
 
 - [ ] **Step 2: Curate CodeStory's 30 paths without running CodeStory proof**
 
-Use source reading only. Record the 10/7/5/3/3/2 length distribution, hashes, ranges, typed contract, and two absent-relation mutations per positive.
+Use source reading only. Record the 10/7/5/3/3/2 length distribution, full-file and range hashes, ranges, typed contract, and two absent-relation mutations per positive.
 
 - [ ] **Step 3: Repeat for Vite, Flask, and Gin**
 
@@ -1109,7 +1112,7 @@ git commit -m "add gin proof oracle paths"
 
 - [ ] **Step 4: Obtain independent source review**
 
-The reviewer receives pinned source plus oracle files, not CodeStory benchmark output. Every step must have exact caller/callsite/target agreement. Correct the oracle before freeze; never after results.
+The reviewer receives pinned source plus oracle files, not CodeStory benchmark output. Every step must have exact caller/callsite/target agreement and a SHA-256 of the complete pinned source file used by its future receipt. Correct the oracle before freeze; never after results.
 
 - [ ] **Step 5: Freeze corpus identity**
 

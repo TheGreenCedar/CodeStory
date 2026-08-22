@@ -587,6 +587,7 @@ fn path(case_id: &str, step_count: u8, ordinal: usize) -> Value {
               "callsite_line":index + 1,
               "callsite_expression":range_at(&source_path,start + 12,start + 18),
               "receipt_line_window":receipt_line_range_at(&source_path,start + 11,start + 19),
+              "receipt_file_sha256":SHA,
               "target":declaration(&format!("{case_id}::target_{index}"),&source_path,start + 20,start + 32)
             })
         })
@@ -773,6 +774,7 @@ pub(crate) fn report() -> Value {
                         "caller":step["caller"],
                         "callsite_line":step["callsite_line"],
                         "receipt_line_window":step["receipt_line_window"],
+                        "receipt_file_sha256":step["receipt_file_sha256"],
                         "target":step["target"]
                     });
                     let source_node_id = -(i64::try_from(step_index).expect("step index") + 1);
@@ -932,6 +934,98 @@ fn frozen_corpus_has_all_oracle_freeze_inputs_and_rejects_semantic_violations() 
 }
 
 #[test]
+fn oracle_steps_close_over_the_exact_receipt_source_file_hash() {
+    let mut value = cohort_path_file("codestory-rust");
+    for path in value["paths"].as_array_mut().expect("paths") {
+        for step in path["oracle_steps"].as_array_mut().expect("oracle steps") {
+            step["receipt_file_sha256"] = json!(SHA);
+        }
+    }
+
+    let parsed = CohortPathFileV1::from_json(value).expect("full-file-bound oracle steps");
+    let round_trip = serde_json::to_value(parsed).expect("oracle JSON");
+    assert_eq!(
+        round_trip["paths"][0]["oracle_steps"][0]["receipt_file_sha256"],
+        SHA
+    );
+}
+
+#[test]
+fn equal_runtime_file_hashes_that_disagree_with_the_oracle_are_rejected() {
+    let mut value = report();
+    let wrong = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    value["cases"][0]["receipt_evidence"]["observed_receipts"][0]["line_window"]["indexed_sha256"] =
+        json!(wrong);
+    value["cases"][0]["receipt_evidence"]["observed_receipts"][0]["line_window"]["observed_sha256"] =
+        json!(wrong);
+    rebind_results_digest(&mut value);
+
+    QualificationSummaryV1::from_json(value)
+        .expect_err("equal runtime hashes must still match the independently frozen file hash");
+}
+
+#[test]
+fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement() {
+    let path_file =
+        CohortPathFileV1::from_json(cohort_path_file("codestory-rust")).expect("oracle path file");
+    let oracle = &path_file.paths[0].oracle_steps[0];
+    let project_file_components = oracle
+        .receipt_line_window
+        .path
+        .split('/')
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let pinned = |node_id: &str| codestory_agent::proof_qualification_support::PinnedNodeIdentity {
+        project_id: "project".into(),
+        core_generation_id: "generation".into(),
+        core_run_id: "run".into(),
+        node_id: node_id.into(),
+    };
+    let identity = |node_id: &str, declaration: &contracts::OracleDeclarationV1| {
+        codestory_agent::proof_qualification_support::ResolvedNodeIdentity {
+            pinned: pinned(node_id),
+            canonical_id: format!("canonical-{node_id}"),
+            qualified_name: declaration.symbol.clone(),
+            project_file_components: project_file_components.clone(),
+        }
+    };
+    let wrong = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let receipt = codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt {
+        receipt: codestory_agent::proof_qualification_support::ReceiptRef {
+            receipt_id: "indexed-call-edge:fixture".into(),
+            edge_id: "1".into(),
+        },
+        source: identity("1", &oracle.caller),
+        target: identity("2", &oracle.target),
+        certainty: codestory_contracts::graph::ResolutionCertainty::Certain,
+        callsite_identity: "1:1:0:2|fixture".into(),
+        containment: codestory_agent::proof_qualification_support::CallableContainmentEvidence {
+            file_node_id: codestory_contracts::graph::NodeId(10),
+            owner_node_id: codestory_contracts::graph::NodeId(1),
+            start_line: 1,
+            end_line: 1,
+        },
+        line_window: codestory_agent::proof_qualification_support::IndexedLineWindow {
+            kind: "indexed_line_v1",
+            project_file_components,
+            indexed_sha256: wrong.into(),
+            observed_sha256: wrong.into(),
+            anchor_line: oracle.callsite_line,
+            byte_start: usize::try_from(oracle.receipt_line_window.start_byte).unwrap(),
+            byte_end: usize::try_from(oracle.receipt_line_window.end_byte).unwrap(),
+            text: "call();\n".into(),
+        },
+    };
+
+    assert!(matches!(
+        contracts::compare_task6_receipt_to_oracle(0, &receipt, oracle)
+            .expect("closed comparison"),
+        ReceiptOracleComparisonV1::Mismatched { mismatches, .. }
+            if mismatches == [contracts::ReceiptMismatchFieldV1::CallsiteWindow]
+    ));
+}
+
+#[test]
 fn frozen_thresholds_cover_all_role_and_hard_gate_semantics() {
     ThresholdsV1::from_json(thresholds()).expect("maximal thresholds");
     let mut invalid = thresholds();
@@ -1027,7 +1121,7 @@ fn task10a_refreeze_binds_methodology_thresholds_and_future_corpus() {
         .expect("checked corpus binds refrozen thresholds");
     assert_eq!(
         canonical_corpus_sha256(&checked_corpus).expect("canonical corpus identity"),
-        "e425d8bd8c280e65ea601d582f617e5505c1fa9895a3622a0a743f7ee7f0ff1f"
+        "5a507490554ce4bf9ebe37d380906885feca84bbe07cbb4be5519a1d752ddf31"
     );
 }
 
@@ -2529,6 +2623,16 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
         contracts::schema_json(SchemaDocument::Report)["$defs"]["ObservedLineWindowV1"]["properties"]
             ["text"]["maxLength"],
         8192
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Path)["$defs"]["OracleStepV1"]["properties"]["receipt_file_sha256"]
+            ["pattern"],
+        "^[0-9a-f]{64}$"
+    );
+    assert_eq!(
+        contracts::schema_json(SchemaDocument::Report)["$defs"]["ReceiptOracleStepV1"]["properties"]
+            ["receipt_file_sha256"]["pattern"],
+        "^[0-9a-f]{64}$"
     );
     assert_eq!(
         contracts::schema_json(SchemaDocument::Report)["$defs"]["ReceiptOracleComparisonV1"]["oneOf"]

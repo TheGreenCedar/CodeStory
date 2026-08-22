@@ -179,6 +179,7 @@ pub struct OracleStepV1 {
     pub callsite_line: u32,
     pub callsite_expression: OracleSourceRangeV1,
     pub receipt_line_window: OracleSourceRangeV1,
+    pub receipt_file_sha256: String,
     pub target: OracleDeclarationV1,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -267,7 +268,8 @@ impl OraclePathV1 {
             range(&step.callsite_expression)?;
             range(&step.receipt_line_window)?;
             range(&step.target.range)?;
-            if step.callsite_expression.path != step.receipt_line_window.path
+            if !hash(&step.receipt_file_sha256)
+                || step.callsite_expression.path != step.receipt_line_window.path
                 || step.callsite_expression.file_byte_length
                     != step.receipt_line_window.file_byte_length
                 || step.callsite_expression.start_byte < step.receipt_line_window.start_byte
@@ -2168,6 +2170,7 @@ pub struct ReceiptOracleStepV1 {
     pub caller: OracleDeclarationV1,
     pub callsite_line: u32,
     pub receipt_line_window: OracleSourceRangeV1,
+    pub receipt_file_sha256: String,
     pub target: OracleDeclarationV1,
 }
 
@@ -2177,6 +2180,7 @@ impl From<&OracleStepV1> for ReceiptOracleStepV1 {
             caller: value.caller.clone(),
             callsite_line: value.callsite_line,
             receipt_line_window: value.receipt_line_window.clone(),
+            receipt_file_sha256: value.receipt_file_sha256.clone(),
             target: value.target.clone(),
         }
     }
@@ -2328,7 +2332,8 @@ pub(crate) fn compare_task6_receipt_to_oracle(
     let observed_start = u64::try_from(receipt.line_window.byte_start)?;
     let observed_end = u64::try_from(receipt.line_window.byte_end)?;
     if receipt.line_window.project_file_components.join("/") != oracle_step.receipt_line_window.path
-        || receipt.line_window.indexed_sha256 != receipt.line_window.observed_sha256
+        || receipt.line_window.indexed_sha256 != oracle_step.receipt_file_sha256
+        || receipt.line_window.observed_sha256 != oracle_step.receipt_file_sha256
         || sha256_bytes(receipt.line_window.text.as_bytes())
             != oracle_step.receipt_line_window.sha256
         || observed_start != oracle_step.receipt_line_window.start_byte
@@ -4331,6 +4336,7 @@ fn disposition_summary_matches_actual(disposition: &ProductDispositionV1) -> boo
 fn valid_oracle_step(step: &ReceiptOracleStepV1) -> bool {
     validate_declaration(&step.caller).is_ok()
         && step.callsite_line > 0
+        && hash(&step.receipt_file_sha256)
         && validate_declaration(&step.target).is_ok()
         && range(&step.receipt_line_window).is_ok()
 }
@@ -4513,7 +4519,8 @@ fn receipt_mismatches(
         mismatches.push(ReceiptMismatchFieldV1::CallsiteLine);
     }
     if receipt.line_window.project_file_components.join("/") != oracle.receipt_line_window.path
-        || receipt.line_window.indexed_sha256 != receipt.line_window.observed_sha256
+        || receipt.line_window.indexed_sha256 != oracle.receipt_file_sha256
+        || receipt.line_window.observed_sha256 != oracle.receipt_file_sha256
         || sha256_bytes(receipt.line_window.text.as_bytes()) != oracle.receipt_line_window.sha256
         || receipt.line_window.byte_start != oracle.receipt_line_window.start_byte
         || receipt.line_window.byte_end != oracle.receipt_line_window.end_byte
@@ -4669,6 +4676,7 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
                         | "database_sha256"
                         | "indexed_sha256"
                         | "observed_sha256"
+                        | "receipt_file_sha256"
                 ) {
                     property.insert("pattern".into(), Value::String(SHA256.into()));
                 }

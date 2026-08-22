@@ -520,6 +520,10 @@
           "minimum": 1,
           "type": "integer"
         },
+        "receipt_file_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
         "receipt_line_window": {
           "$ref": "#/$defs/OracleSourceRangeV1"
         },
@@ -532,6 +536,7 @@
         "callsite_line",
         "callsite_expression",
         "receipt_line_window",
+        "receipt_file_sha256",
         "target"
       ],
       "type": "object"

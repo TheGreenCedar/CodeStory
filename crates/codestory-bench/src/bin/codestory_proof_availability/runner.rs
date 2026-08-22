@@ -648,6 +648,7 @@ mod tests {
                     "callsite_line":1,
                     "callsite_expression":{"path":"src/lib.rs","start_byte":0,"end_byte":1,"file_byte_length":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
                     "receipt_line_window":{"path":"src/lib.rs","start_byte":0,"end_byte":2,"file_byte_length":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                    "receipt_file_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "target":{"symbol":"fixture::callee","selector":{"kind":"canonical_id","canonical_id":"fixture::callee"},"range":{"path":"src/lib.rs","start_byte":1,"end_byte":2,"file_byte_length":2,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
                 }],
                 "negative_mutations":[],

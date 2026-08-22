@@ -9,7 +9,8 @@ public.
 
 Use one locked `codestory-proof-availability` binary for both materialization and
 the run. Materialization checks out the exact frozen commits, verifies every
-oracle range, builds one fresh core index per project, and writes a private local
+oracle range and each receipt step's independently frozen full-source-file
+SHA-256, builds one fresh core index per project, and writes a private local
 environment descriptor:
 
 Before Q2, Q1 must prove that the evidence-only v3 surface is separable from
@@ -79,7 +80,10 @@ inspection; the command never recursively removes a path as rollback.
 ## What the run does
 
 The run rechecks the binary, source commit and tree, oracle bytes, database hash,
-store schema, and pinned core publication. It opens each store observationally,
+store schema, and pinned core publication. A receipt matches its oracle source
+only when both the indexed and observed runtime file hashes equal the oracle's
+full-file SHA-256; equality between the two runtime hashes is not sufficient. It
+opens each store observationally,
 derives inventory and edge-distinct trail counts, then sends every positive case
 and its two frozen mutations through the accepted validator and the single
 Runtime-owned core-pinned proof operation. No semantic retrieval publication is
@@ -132,7 +136,8 @@ gate; the harness does not repair it into an actionable gap.
 ## Read-only verification
 
 Verification reads the exact eight-file directory, recomputes corpus, path,
-threshold, results, aggregate, and decision bindings, and writes nothing:
+threshold, results, aggregate, and decision bindings, including the same
+three-way oracle/indexed/observed file-hash comparison, and writes nothing:
 
 ```sh
 cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
