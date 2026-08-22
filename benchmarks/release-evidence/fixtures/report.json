@@ -7,7 +7,7 @@
   "baseline_id": "ci-contract-v1@1111111111111111111111111111111111111111",
   "baseline_sha256": "0bbbe6dd8b4000151edf7b1270959d08e94e08db876e7f2372b25613e0f237c1",
   "candidate_path": "benchmarks/release-evidence/fixtures/candidate.json",
-  "candidate_sha256": "d25ad5ee5cf71e2482c98e4430191bf97390de0282c47b85fefc79e15fdf2eb7",
+  "candidate_sha256": "fcdbc3d918efd5b83b6ddd1da4be2d0ebef56f3a8bb09eb5d80c7a1252c93f51",
   "artifact_paths": [
     {
       "path": "candidate-stats.json",
