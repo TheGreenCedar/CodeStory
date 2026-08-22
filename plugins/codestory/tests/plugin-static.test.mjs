@@ -995,8 +995,59 @@ test("CLI version probe budget covers cold starts above three seconds", () => {
   assert.equal(probe.version, version);
 });
 
-test("managed probe failures stay sanitized through fail-open output", () => {
-  const hostile = "C:\\private\\candidate.exe\nuntrusted-detail";
+function assertManagedProbeDetailsSanitized(output, {
+  expectedProject,
+  expectedDiagnosticsUri,
+  hostilePath,
+  hostileDetail,
+  classified,
+  code,
+  warning,
+  warnings,
+}) {
+  assert.equal(output.isError, true);
+  assert.equal(output.structuredContent.project, expectedProject);
+  assert.equal(output.structuredContent.diagnostics_uri, expectedDiagnosticsUri);
+  assert.equal(output.structuredContent.failure, warning);
+  assert.equal(output.structuredContent.failure_context, null);
+  assert.deepEqual(output.content, [{
+    type: "text",
+    text: output.structuredContent.message,
+  }]);
+  const typedProbeTokens = JSON.stringify({ classified, code, warning, warnings });
+  const outputRemainder = structuredClone(output);
+  outputRemainder.structuredContent.project = "<allowed-project>";
+  outputRemainder.structuredContent.diagnostics_uri = "<allowed-diagnostics-uri>";
+  const serializedRemainder = JSON.stringify(outputRemainder);
+  for (const [label, marker] of [
+    ["path", hostilePath],
+    ["detail", hostileDetail],
+  ]) {
+    const serializedMarker = JSON.stringify(marker).slice(1, -1);
+    assert.equal(
+      typedProbeTokens.includes(serializedMarker),
+      false,
+      `typed probe tokens retained hostile ${label}`,
+    );
+    assert.equal(
+      serializedRemainder.includes(serializedMarker),
+      false,
+      `fail-open remainder retained hostile ${label}`,
+    );
+  }
+}
+
+test("managed probe failures stay sanitized through fail-open output", (t) => {
+  const project = fs.mkdtempSync(
+    join(tmpdir(), "codestory-v3-task16c-private-untrusted-detail-source-"),
+  );
+  t.after(() => fs.rmSync(project, { recursive: true, force: true }));
+  const expectedProject = fs.realpathSync(project);
+  assert.match(expectedProject, /private/u);
+  assert.match(expectedProject, /untrusted-detail/u);
+  const hostilePath = "C:\\private\\candidate.exe";
+  const hostileDetail = "untrusted-detail";
+  const hostile = `${hostilePath}\n${hostileDetail}`;
   const cases = [
     {
       probe: {
@@ -1044,10 +1095,38 @@ test("managed probe failures stay sanitized through fail-open output", () => {
           setup: { probe_error: "generic_probe_failure" },
         }],
       },
-      { project: repoRoot },
+      { project },
     );
-    assert.equal(output.structuredContent.failure, warning);
-    assert.doesNotMatch(JSON.stringify(output), /private|untrusted-detail/u);
+    const expectedDiagnosticsUri = launcherTest.projectBoundResourceUri(
+      "codestory://status",
+      expectedProject,
+    );
+    const assertionContext = {
+      expectedProject,
+      expectedDiagnosticsUri,
+      hostilePath,
+      hostileDetail,
+      classified,
+      code,
+      warning,
+      warnings,
+    };
+    assertManagedProbeDetailsSanitized(output, assertionContext);
+    if (reason === "version_probe_error:ETIMEDOUT") {
+      for (const [label, marker] of [
+        ["path", hostilePath],
+        ["detail", hostileDetail],
+      ]) {
+        const nestedLeak = structuredClone(output);
+        nestedLeak.structuredContent.readiness = [{
+          setup: { probe_stderr: marker },
+        }];
+        assert.throws(
+          () => assertManagedProbeDetailsSanitized(nestedLeak, assertionContext),
+          new RegExp(`fail-open remainder retained hostile ${label}`, "u"),
+        );
+      }
+    }
   }
 });
 
