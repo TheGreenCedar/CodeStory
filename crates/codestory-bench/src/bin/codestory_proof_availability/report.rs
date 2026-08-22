@@ -105,22 +105,26 @@ pub(crate) fn reserve_case_diagnostic(
     output_parent: &Path,
     qualification_id: &str,
 ) -> Result<CaseDiagnosticReservation> {
-    let metadata = fs::symlink_metadata(output_parent)
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd as _;
+
+    let parent = open_directory_nofollow(output_parent)
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_parent_invalid"))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !parent
+        .metadata()
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+    {
         bail!("proof_availability_case_diagnostic_parent_invalid")
     }
-    let path = output_parent.join(format!(
-        ".codestory-proof-availability-case-diagnostic-{qualification_id}"
-    ));
-    use std::os::unix::fs::DirBuilderExt as _;
-
-    let mut builder = fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder
-        .create(&path)
-        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_exists"))?;
-    let directory = File::open(&path)
+    let name = format!(".codestory-proof-availability-case-diagnostic-{qualification_id}");
+    let path = output_parent.join(&name);
+    let component = CString::new(name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o700) } != 0 {
+        return Err(anyhow::anyhow!("proof_availability_case_diagnostic_exists"));
+    }
+    let directory = open_directory_at_nofollow(&parent, &component)
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
     let metadata = directory
         .metadata()
@@ -140,6 +144,64 @@ pub(crate) fn reserve_case_diagnostic(
             metadata.ino()
         },
     })
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+fn open_directory_nofollow(path: &Path) -> std::io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("path contains NUL"))?;
+    let descriptor = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+fn open_directory_at_nofollow(
+    parent: &File,
+    component: &std::ffi::CString,
+) -> std::io::Result<File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
 }
 
 #[cfg(not(all(
@@ -1777,6 +1839,15 @@ mod tests {
         );
     }
 
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
     #[test]
     fn case_diagnostic_reservation_is_private_and_no_replace() {
         let root = tempfile::tempdir().unwrap();
@@ -1797,7 +1868,15 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
     #[test]
     fn case_diagnostic_reservation_is_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1862,6 +1941,15 @@ mod tests {
         assert!(validate_private_diagnostic_value(&invalid_pointer, &[]).is_err());
     }
 
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
     #[test]
     fn case_diagnostic_file_is_newline_terminated_and_no_clobber() {
         let root = tempfile::tempdir().unwrap();
@@ -1874,6 +1962,15 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"{}\n");
     }
 
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
     #[test]
     fn complete_private_artifact_redacts_real_receipt_text_before_handle_relative_write() {
         let root = tempfile::tempdir().unwrap();
@@ -1915,7 +2012,15 @@ mod tests {
         assert!(written["unredacted_case_sha256"].as_str().is_some());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
     #[test]
     fn reservation_handle_cannot_be_redirected_by_a_path_swap() {
         let root = tempfile::tempdir().unwrap();
@@ -1928,6 +2033,62 @@ mod tests {
         write_private_diagnostic_file(&reservation, b"{}\n").unwrap();
         assert!(original.join(CASE_DIAGNOSTIC_FILE).is_file());
         assert!(!reservation.path().join(CASE_DIAGNOSTIC_FILE).exists());
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
+    #[test]
+    fn nofollow_parent_and_replaced_reservation_paths_cannot_redirect_creation_or_writes() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let actual_parent = root.path().join("actual-parent");
+        fs::create_dir(&actual_parent).unwrap();
+        let swapped_parent = root.path().join("swapped-parent");
+        symlink(&actual_parent, &swapped_parent).unwrap();
+        assert_eq!(
+            reserve_case_diagnostic(&swapped_parent, "20260821T120000Z-222222222222")
+                .unwrap_err()
+                .to_string(),
+            "proof_availability_case_diagnostic_parent_invalid"
+        );
+        assert!(fs::read_dir(&actual_parent).unwrap().next().is_none());
+
+        let reservation =
+            reserve_case_diagnostic(&actual_parent, "20260821T120000Z-222222222222").unwrap();
+        let held = root.path().join("held-reservation");
+        fs::rename(reservation.path(), &held).unwrap();
+        symlink(&actual_parent, reservation.path()).unwrap();
+        write_private_diagnostic_file(&reservation, b"{}\n").unwrap();
+        assert!(held.join(CASE_DIAGNOSTIC_FILE).is_file());
+        assert!(!actual_parent.join(CASE_DIAGNOSTIC_FILE).exists());
+    }
+
+    #[cfg(not(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    )))]
+    #[test]
+    fn unsupported_target_rejects_before_runner_or_artifact_creation() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            reserve_case_diagnostic(root.path(), "20260821T120000Z-222222222222")
+                .unwrap_err()
+                .to_string(),
+            "proof_availability_case_diagnostic_unsupported"
+        );
     }
 
     #[test]
