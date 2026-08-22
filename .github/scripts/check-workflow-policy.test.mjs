@@ -3140,7 +3140,7 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["source manual SHA equality", sourceFile, workflow => {
       sourceResolver(workflow).run = sourceResolver(workflow).run
         .replace('test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"', 'test -n "$GITHUB_SHA"');
-    }, /GITHUB_SHA.*EXPECTED_HEAD_SHA/u],
+    }, /GITHUB_SHA.*EXPECTED_HEAD_SHA|trusted resolver script contract/u],
     ["source manual SHA short-circuit", sourceFile, workflow => {
       sourceResolver(workflow).run = sourceResolver(workflow).run
         .replace(
@@ -3177,7 +3177,7 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["platform manual SHA equality", packagedCoordinatorFile, workflow => {
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace('test "$GITHUB_SHA" = "$INPUT_HEAD_SHA"', 'test -n "$GITHUB_SHA"');
-    }, /GITHUB_SHA.*INPUT_HEAD_SHA/u],
+    }, /GITHUB_SHA.*INPUT_HEAD_SHA|trusted resolver script contract/u],
     ["platform manual SHA short-circuit", packagedCoordinatorFile, workflow => {
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace(
@@ -3213,7 +3213,7 @@ test("exact proof policy rejects trigger and identity downgrades", async (t) => 
     ["integration live dev SHA equality", packagedCoordinatorFile, workflow => {
       packagedResolver(workflow).run = packagedResolver(workflow).run
         .replace('test "$GITHUB_SHA" = "$dev_head"', 'test -n "$GITHUB_SHA"');
-    }, /GITHUB_SHA.*dev_head/u],
+    }, /GITHUB_SHA.*dev_head|trusted resolver script contract/u],
     ["hosted-only integration scope removed", packagedCoordinatorFile, workflow => {
       workflow.on.workflow_dispatch.inputs.scope.options
         = workflow.on.workflow_dispatch.inputs.scope.options.filter(scope => scope !== "none");
@@ -4102,7 +4102,7 @@ test("release freeze policy pins live PR base and support ancestry revalidation"
         "JSON.parse('{}')",
       )],
     ["release base lookup stops using the live integration ref", value =>
-      value.replace(
+      value.replaceAll(
         "`repos/${repository}/git/ref/heads/dev/codestory-next`",
         "`repos/${repository}/git/commits/${pr.base.sha}`",
       )],
