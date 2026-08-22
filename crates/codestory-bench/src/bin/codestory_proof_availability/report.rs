@@ -117,14 +117,20 @@ pub(crate) fn reserve_case_diagnostic(
     {
         bail!("proof_availability_case_diagnostic_parent_invalid")
     }
-    let name = format!(".codestory-proof-availability-case-diagnostic-{qualification_id}");
-    let path = output_parent.join(&name);
-    let component = CString::new(name.as_bytes())
+    let fixed_name = format!(".codestory-proof-availability-case-diagnostic-{qualification_id}");
+    let path = output_parent.join(&fixed_name);
+    let fixed_component = CString::new(fixed_name.as_bytes())
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), component.as_ptr(), 0o700) } != 0 {
-        return Err(anyhow::anyhow!("proof_availability_case_diagnostic_exists"));
+    let staging_name = random_staging_component()
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
+    let staging_component = CString::new(staging_name.as_bytes())
+        .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), staging_component.as_ptr(), 0o700) } != 0 {
+        return Err(anyhow::anyhow!(
+            "proof_availability_case_diagnostic_create_failed"
+        ));
     }
-    let directory = open_directory_at_nofollow(&parent, &component)
+    let directory = open_directory_at_nofollow(&parent, &staging_component)
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_create_failed"))?;
     let metadata = directory
         .metadata()
@@ -132,7 +138,7 @@ pub(crate) fn reserve_case_diagnostic(
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("proof_availability_case_diagnostic_create_failed")
     }
-    Ok(CaseDiagnosticReservation {
+    let reservation = CaseDiagnosticReservation {
         path,
         directory,
         device: {
@@ -143,7 +149,45 @@ pub(crate) fn reserve_case_diagnostic(
             use std::os::unix::fs::MetadataExt as _;
             metadata.ino()
         },
-    })
+    };
+    if rename_noreplace_at(
+        parent.as_raw_fd(),
+        &staging_component,
+        parent.as_raw_fd(),
+        &fixed_component,
+    )
+    .is_err()
+    {
+        return Err(anyhow::anyhow!("proof_availability_case_diagnostic_exists"));
+    }
+    if !path_matches_held_directory(&reservation).unwrap_or(false) {
+        bail!("proof_availability_case_diagnostic_create_failed")
+    }
+    Ok(reservation)
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+fn random_staging_component() -> std::io::Result<String> {
+    use std::io::Read as _;
+
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let mut encoded = String::with_capacity(64);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        write!(&mut encoded, "{byte:02x}").expect("writing into String cannot fail");
+    }
+    Ok(format!(
+        ".codestory-proof-availability-case-staging-{encoded}"
+    ))
 }
 
 #[cfg(all(
@@ -237,10 +281,7 @@ pub(crate) fn write_invalid_case_diagnostic(
     // This compares only the recovery path with the held identity. It must
     // never determine the write target: a pathname replacement cannot divert
     // the private artifact away from the directory we opened at reservation.
-    let _path_still_names_reservation = path_matches_held_directory(reservation);
-    if !reservation_handle_is_directory(reservation)? {
-        bail!("proof_availability_case_diagnostic_write_failed")
-    }
+    ensure_discoverable_reservation(reservation)?;
     let unredacted_case = serde_json::to_value(&failure.case)
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))?;
     let project_materialization = serde_json::to_value(&failure.project)
@@ -267,6 +308,24 @@ pub(crate) fn write_invalid_case_diagnostic(
         .directory
         .sync_all()
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))
+}
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )
+))]
+fn ensure_discoverable_reservation(reservation: &CaseDiagnosticReservation) -> Result<()> {
+    if !matches!(path_matches_held_directory(reservation), Ok(true))
+        || !reservation_handle_is_directory(reservation)?
+    {
+        bail!("proof_availability_case_diagnostic_write_failed")
+    }
+    Ok(())
 }
 
 #[cfg(not(all(
@@ -2030,8 +2089,13 @@ mod tests {
         fs::rename(reservation.path(), &original).unwrap();
         fs::create_dir(reservation.path()).unwrap();
         assert!(!path_matches_held_directory(&reservation).unwrap());
-        write_private_diagnostic_file(&reservation, b"{}\n").unwrap();
-        assert!(original.join(CASE_DIAGNOSTIC_FILE).is_file());
+        assert_eq!(
+            ensure_discoverable_reservation(&reservation)
+                .unwrap_err()
+                .to_string(),
+            "proof_availability_case_diagnostic_write_failed"
+        );
+        assert!(!original.join(CASE_DIAGNOSTIC_FILE).exists());
         assert!(!reservation.path().join(CASE_DIAGNOSTIC_FILE).exists());
     }
 
@@ -2066,8 +2130,8 @@ mod tests {
         let held = root.path().join("held-reservation");
         fs::rename(reservation.path(), &held).unwrap();
         symlink(&actual_parent, reservation.path()).unwrap();
-        write_private_diagnostic_file(&reservation, b"{}\n").unwrap();
-        assert!(held.join(CASE_DIAGNOSTIC_FILE).is_file());
+        assert!(ensure_discoverable_reservation(&reservation).is_err());
+        assert!(!held.join(CASE_DIAGNOSTIC_FILE).exists());
         assert!(!actual_parent.join(CASE_DIAGNOSTIC_FILE).exists());
     }
 
