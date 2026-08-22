@@ -77,7 +77,7 @@ integration head
 | State | Entry condition | Exit condition |
 | --- | --- | --- |
 | Integrated | Every release blocker is merged to `dev/codestory-next`; focused checks are green; no source or workflow change remains planned | Record the exact dev commit and tree, reconcile the control plane and proof hosts, and begin the merge moratorium |
-| Stabilized calibration source | One open same-repository release PR into dev contains the approved version bump and current dev ancestry | Exact-head review, hostile mutations, generalization checks, full Linux workspace compile/lint/test, and Windows source contracts pass in one source-stabilization run |
+| Stabilized calibration source | `dev/codestory-next` is already the approved versioned head `C`, or one same-repository release PR into dev still carries that exact head | Exact-head review, hostile mutations, generalization checks, full Linux workspace compile/lint/test, and Windows source contracts pass in one source-stabilization run |
 | Frozen candidate | Exactly three fresh protected Apple-Silicon Metal calibration runs are assembled, and the direct child of the stabilized source changes only `crates/codestory-llama-sys/per-user-embedding-server-constant-set.json` | Reaccept the exact generated head through lineage, hostile mutations, calibration-specific checks, and native probes, then complete required package, platform, and qualification evidence without repeating the workspace suite |
 | Promotion ready | The reviewed release PR can fast-forward dev to the exact frozen candidate | Fast-forward dev to the frozen head without an intervening merge commit, accept the graph-declared pre-publish ledger from that live dev head, record the combined approval, then create the sole tree-preserving dev-to-main promotion commit with the frozen head as a direct parent |
 | Published | The automatic main release creates the tag, release, archives, checksums, notes, and closeout summary | The graph-declared post-publish ledger accepts current downloads, installed runtimes, and live behavior |
@@ -89,7 +89,7 @@ Do not skip states or reconstruct them from memory.
 
 Confirm all of the following before starting the version change:
 
-- the release PR contains the current `dev/codestory-next` head;
+- `dev/codestory-next` is the intended calibration-source head, or the release PR still carries that exact head;
 - the worktree is clean and every commit is pushed;
 - all planned source, workflow, policy, documentation, and telemetry changes are
   already integrated;
@@ -116,12 +116,14 @@ Do not edit version surfaces by hand.
 
 ## Freeze and qualification
 
-Run source stabilization on the bumped release-PR head before calibration. It
-owns the one broad source proof and runs the hostile mutations, retrieval
+Run source stabilization on the bumped head before calibration. It owns the
+one broad source proof and runs the hostile mutations, retrieval
 generalization, Linux all-target/all-feature lint plus the complete workspace
 test, and Windows source contracts concurrently. The canonical dispatch uses
 `source-proof.yml` with `acceptance_only=true` and
-`acceptance_phase=source_stabilization`, bound to exact commit `C`. Calibration
+`acceptance_phase=source_stabilization`, bound to exact commit `C`. When
+`dev/codestory-next` already is `C`, omit `pr_number` and dispatch with
+`--ref dev/codestory-next`. GitHub will not keep an empty PR open. Calibration
 cannot start until that run publishes its authenticated receipt.
 
 Collect exactly three fresh protected Apple-Silicon Metal calibration runs with

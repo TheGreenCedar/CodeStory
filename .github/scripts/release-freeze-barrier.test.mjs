@@ -90,6 +90,20 @@ test("an exact clean pushed source-stabilization Actions receipt passes", () => 
   validateReceipt(receipt(), RECEIPT_CONTEXT);
 });
 
+test("a next-head bind passes when next is already the exact head", () => {
+  validateReceipt(receipt({
+    branch: "dev/codestory-next",
+    release_pr: {
+      number: 0,
+      bind: "next_head",
+      base: "dev/codestory-next",
+      base_commit: "0".repeat(40),
+      head: "dev/codestory-next",
+      head_commit: COMMIT,
+    },
+  }), RECEIPT_CONTEXT);
+});
+
 test("a frozen-candidate receipt carries no future mutation and passes", () => {
   const frozen = receipt({ phase: "frozen_candidate" });
   validateReceipt(frozen, {
@@ -161,10 +175,10 @@ for (const [name, mutate, pattern] of [
   ["unpushed head", (value) => { value.remote_head = "5".repeat(40); }, /clean worktree/u],
   ["moved release PR", (value) => {
     value.release_pr.head_commit = "5".repeat(40);
-  }, /bind the open release PR/u],
+  }, /bind the open release PR or next-head/u],
   ["unbound release base", (value) => {
     value.release_pr.base_commit = "";
-  }, /bind the open release PR/u],
+  }, /bind the open release PR or next-head/u],
   ["undeclared source change", (value) => {
     value.known_future_source_changes.push(".github/workflows/release.yml");
   }, /future changes do not match source_stabilization/u],

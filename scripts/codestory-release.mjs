@@ -171,6 +171,13 @@ function ensureBaseGroups(record, host) {
       tree: head.tree,
     });
   }
+  if (!receipt.groups["pull-requests"]) {
+    receipt = recordGroup(receipt, "pull-requests", {
+      release_pr: null,
+      bind: "next_head",
+      integrated_support_prs: [],
+    });
+  }
   if (!receipt.groups.evidence) {
     receipt = recordGroup(receipt, "evidence", { reusable: [], invalidated: [] });
   }
@@ -483,7 +490,6 @@ function dispatchSourceStabilization(record, host) {
     workflow: SOURCE_PROOF_WORKFLOW,
     ref: "dev/codestory-next",
     inputs: {
-      pr_number: String(record.issue_number),
       expected_head_sha: host.heads.next.commit,
       version: record.receipt.version,
       acceptance_only: "true",
@@ -570,7 +576,6 @@ function dispatchFor(record, host) {
       workflow: SOURCE_PROOF_WORKFLOW,
       ref: "dev/codestory-next",
       inputs: {
-        pr_number: String(record.issue_number),
         expected_head_sha: frozen.commit,
         version: record.receipt.version,
         acceptance_only: "true",
@@ -841,7 +846,8 @@ function fillReceipt(record, phase, host) {
   const success = (group, id, commit, tree) => runEvidence(group, { id, attempt: 1, conclusion: "success" }, commit, tree);
   if (!record.receipt.groups["pull-requests"]) {
     record.receipt = recordGroup(record.receipt, "pull-requests", {
-      release_pr: 1998,
+      release_pr: null,
+      bind: "next_head",
       integrated_support_prs: [],
     });
   }
@@ -1124,10 +1130,38 @@ export function createDefaultHost({ repository = "TheGreenCedar/CodeStory" } = {
     dispatch({ workflow, ref, inputs }) {
       const args = ["workflow", "run", workflow, "--repo", repository, "--ref", ref];
       for (const [key, value] of Object.entries(inputs ?? {})) {
+        if (value === undefined || value === null) continue;
         args.push("-f", `${key}=${value}`);
       }
       gh(args);
       return { id: Date.now(), workflow, ref, inputs, status: "queued" };
+    },
+    workflowRuns() {
+      const rows = JSON.parse(gh([
+        "run",
+        "list",
+        "--repo",
+        repository,
+        "--limit",
+        "30",
+        "--json",
+        "databaseId,headSha,status,conclusion,event,workflowName,attempt",
+      ]));
+      const workflowPath = (name) => {
+        if (name === "Exact-head source proof") return SOURCE_PROOF_WORKFLOW;
+        if (name === "Platform and integration proof") return PACKAGED_WORKFLOW;
+        if (name === "Release") return RELEASE_WORKFLOW;
+        return name;
+      };
+      return (rows ?? []).map((row) => ({
+        id: row.databaseId,
+        workflow: workflowPath(row.workflowName),
+        headSha: row.headSha,
+        status: row.status,
+        conclusion: row.conclusion,
+        event: row.event,
+        attempt: row.attempt ?? 1,
+      }));
     },
     cancelRun(id) {
       gh(["run", "cancel", String(id), "--repo", repository]);
