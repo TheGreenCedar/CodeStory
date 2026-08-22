@@ -9,7 +9,7 @@ use std::fmt;
 
 pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
 pub const PATH_FILE_SCHEMA: &str = "codestory.proof-availability-path-file/v1";
-pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v2";
+pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v3";
 pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1";
 pub const DECISION_REPORT_SCHEMA: &str = "codestory.proof-availability-decision/v1";
 pub const PRESCRIBED_BUILD_ARGV: [&str; 8] = [
@@ -39,6 +39,61 @@ pub const MAX_ACTUAL_PROOF_GAPS: usize = ACTUAL_SELECTOR_GAP_VARIANTS
 const SHA256: &str = "^[0-9a-f]{64}$";
 const COMMIT: &str = "^[0-9a-f]{40}$";
 const QUALIFICATION_ID_PATTERN: &str = "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$";
+const SIGNED_I64_DECIMAL: &str = "^(0|-[1-9][0-9]*|[1-9][0-9]*)$";
+
+mod i64_decimal {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    fn parse<E>(value: String) -> Result<i64, E>
+    where
+        E: serde::de::Error,
+    {
+        let parsed = value.parse::<i64>().map_err(E::custom)?;
+        if parsed.to_string() != value {
+            return Err(E::custom("proof_availability_i64_decimal_invalid"));
+        }
+        Ok(parsed)
+    }
+
+    pub fn serialize<S>(value: &i64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<i64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        parse(String::deserialize(deserializer)?)
+    }
+
+    pub mod vec {
+        use super::*;
+
+        pub fn serialize<S>(values: &[i64], serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            values
+                .iter()
+                .map(i64::to_string)
+                .collect::<Vec<_>>()
+                .serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<i64>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            Vec::<String>::deserialize(deserializer)?
+                .into_iter()
+                .map(super::parse)
+                .collect()
+        }
+    }
+}
 
 mod u128_decimal {
     use serde::{Deserialize, Deserializer, Serializer};
@@ -1121,9 +1176,17 @@ pub enum UnavailableReasonV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectorGateOutcomeV1 {
-    Resolved { node_id: i64 },
-    Failed { reason: SelectorFailureV1 },
-    Unavailable { reason: UnavailableReasonV1 },
+    Resolved {
+        #[serde(with = "i64_decimal")]
+        #[schemars(with = "String")]
+        node_id: i64,
+    },
+    Failed {
+        reason: SelectorFailureV1,
+    },
+    Unavailable {
+        reason: UnavailableReasonV1,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1252,12 +1315,16 @@ pub enum CandidateFailureV1 {
 #[serde(deny_unknown_fields)]
 pub struct CandidateFailureHistogramV1 {
     pub reason: CandidateFailureV1,
+    #[serde(with = "i64_decimal::vec")]
+    #[schemars(with = "Vec<String>")]
     pub edge_ids: Vec<i64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StepQualificationOutcomeV1 {
     Admitted {
+        #[serde(with = "i64_decimal::vec")]
+        #[schemars(with = "Vec<String>")]
         edge_ids: Vec<i64>,
     },
     FirstZeroSurvivor {
@@ -1273,6 +1340,8 @@ pub enum StepQualificationOutcomeV1 {
 #[serde(deny_unknown_fields)]
 pub struct StepQualificationTraceV1 {
     pub step_index: u64,
+    #[serde(with = "i64_decimal::vec")]
+    #[schemars(with = "Vec<String>")]
     pub candidate_edge_ids: Vec<i64>,
     pub outcome: StepQualificationOutcomeV1,
 }
@@ -1999,6 +2068,8 @@ fn coarse_gap(gap: &ActualProofGapV1) -> TypedGapV1 {
 #[serde(deny_unknown_fields)]
 pub struct ReceiptReferenceV1 {
     pub receipt_id: String,
+    #[serde(with = "i64_decimal")]
+    #[schemars(with = "String")]
     pub edge_id: i64,
 }
 #[derive(
@@ -2310,7 +2381,11 @@ impl TryFrom<codestory_contracts::graph::ResolutionCertainty> for ReceiptCertain
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CallableContainmentEvidenceV1 {
+    #[serde(with = "i64_decimal")]
+    #[schemars(with = "String")]
     pub file_node_id: i64,
+    #[serde(with = "i64_decimal")]
+    #[schemars(with = "String")]
     pub owner_node_id: i64,
     pub start_line: u32,
     pub end_line: u32,
@@ -2320,6 +2395,8 @@ pub struct CallableContainmentEvidenceV1 {
 pub struct ObservedReceiptV1 {
     pub receipt_id: String,
     pub step_index: u8,
+    #[serde(with = "i64_decimal")]
+    #[schemars(with = "String")]
     pub edge_id: i64,
     pub source: ResolvedNodeIdentityV1,
     pub target: ResolvedNodeIdentityV1,
@@ -3381,7 +3458,7 @@ pub(crate) fn results_evidence_sha256(
             )
     });
     canonical_artifact_sha256(
-        b"codestory.proof-availability-results-evidence/v2\0",
+        b"codestory.proof-availability-results-evidence/v3\0",
         &ResultsEvidenceV1 {
             environment: &environment,
             inventory: &inventory,
@@ -4872,6 +4949,43 @@ fn semantic(schema: &mut Value, document: SchemaDocument) {
     semantic_contract_bounds(schema, document);
     annotate_transport_bounds(schema);
     annotate_finalization_bounds(schema);
+    if document == SchemaDocument::Report {
+        annotate_exact_graph_id_patterns(schema);
+    }
+}
+
+fn annotate_exact_graph_id_patterns(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            if let Some(properties) = object.get_mut("properties").and_then(Value::as_object_mut) {
+                for (field, property) in properties {
+                    let Some(property) = property.as_object_mut() else {
+                        continue;
+                    };
+                    if matches!(
+                        field.as_str(),
+                        "node_id" | "edge_id" | "file_node_id" | "owner_node_id"
+                    ) {
+                        property.insert("pattern".into(), Value::String(SIGNED_I64_DECIMAL.into()));
+                    } else if matches!(field.as_str(), "edge_ids" | "candidate_edge_ids")
+                        && let Some(items) =
+                            property.get_mut("items").and_then(Value::as_object_mut)
+                    {
+                        items.insert("pattern".into(), Value::String(SIGNED_I64_DECIMAL.into()));
+                    }
+                }
+            }
+            for child in object.values_mut() {
+                annotate_exact_graph_id_patterns(child);
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                annotate_exact_graph_id_patterns(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {

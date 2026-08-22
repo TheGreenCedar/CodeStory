@@ -2998,6 +2998,132 @@ mod tests {
         assert_eq!(fs::read_dir(destination).unwrap().count(), 8);
     }
 
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos"
+        )
+    ))]
+    #[test]
+    fn builder_readback_verifier_preserves_unsafe_graph_ids_exactly() {
+        let (report, corpus, thresholds) =
+            super::super::thresholds::tests::accepted_fixture::values();
+        let path_files =
+            super::super::thresholds::tests::accepted_fixture::oracle_path_file_values()
+                .into_iter()
+                .map(CohortPathFileV1::from_json)
+                .collect::<Result<Vec<_>>>()
+                .unwrap();
+        let mut parsed = QualificationSummaryV1::from_json(report).unwrap();
+        let case = &mut parsed.cases[0];
+
+        let selector_node_ids = (0..=case.attempted_step_count)
+            .map(|index| i64::MIN + 100 + i64::from(index))
+            .collect::<Vec<_>>();
+        for (selector, node_id) in case
+            .proof_trace
+            .selectors
+            .iter_mut()
+            .zip(selector_node_ids.iter().copied())
+        {
+            let super::super::contracts::SelectorGateOutcomeV1::Resolved { node_id: selected } =
+                &mut selector.outcome
+            else {
+                panic!("accepted fixture selector")
+            };
+            *selected = node_id;
+        }
+
+        let mut edge_by_receipt = BTreeMap::new();
+        for step_index in 0..case.attempted_step_count {
+            let edge_id = 9_007_199_254_740_993_i64 + i64::from(step_index);
+            let step = case
+                .proof_trace
+                .steps
+                .iter_mut()
+                .find(|step| step.step_index == u64::from(step_index))
+                .unwrap();
+            step.candidate_edge_ids = vec![edge_id];
+            step.outcome = StepQualificationOutcomeV1::Admitted {
+                edge_ids: vec![edge_id],
+            };
+
+            let receipt = case
+                .receipt_evidence
+                .observed_receipts
+                .iter_mut()
+                .find(|receipt| receipt.step_index == step_index)
+                .unwrap();
+            receipt.edge_id = edge_id;
+            receipt.source.pinned.node_id = selector_node_ids[usize::from(step_index)].to_string();
+            receipt.target.pinned.node_id =
+                selector_node_ids[usize::from(step_index) + 1].to_string();
+            receipt.containment.file_node_id = i64::MAX - 100;
+            receipt.containment.owner_node_id = selector_node_ids[usize::from(step_index)];
+            edge_by_receipt.insert(receipt.receipt_id.clone(), edge_id);
+        }
+        for reference in &mut case.product_disposition.authoritative_receipts {
+            reference.edge_id = edge_by_receipt[&reference.receipt_id];
+        }
+        let ActualProductResultV1::ContractProven { receipts, .. } =
+            &mut case.product_disposition.actual
+        else {
+            panic!("accepted fixture disposition")
+        };
+        for reference in receipts {
+            reference.edge_id = edge_by_receipt[&reference.receipt_id].to_string();
+        }
+
+        let corpus = CorpusV1::from_json(corpus).unwrap();
+        let thresholds = ThresholdsV1::from_json(thresholds).unwrap();
+        let summary = build_summary(
+            QualificationReportInputV1 {
+                qualification_id: parsed.qualification_id,
+                source_commit: parsed.provenance.source_commit,
+                source_tree: parsed.provenance.source_tree,
+                environment: parsed.environment,
+                inventory: parsed.inventory,
+                trails: parsed.trails,
+                cases: parsed.cases,
+                failure_funnel: parsed.failure_funnel,
+            },
+            &corpus,
+            &thresholds,
+        )
+        .unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join(&summary.qualification_id);
+        let reservation = reserve_case_diagnostic(root.path(), &summary.qualification_id).unwrap();
+        build_and_publish(
+            &destination,
+            &summary,
+            &corpus,
+            &thresholds,
+            &PublicLeakPolicy::default(),
+            PublicArtifactDiagnosticContext::new(
+                &reservation,
+                &summary.qualification_id,
+                &summary.provenance.source_commit,
+                &summary.provenance.source_tree,
+            ),
+        )
+        .unwrap();
+
+        verify_published(
+            &destination,
+            &corpus,
+            &thresholds,
+            &path_files,
+            &PublicLeakPolicy::default(),
+        )
+        .expect("split readback must preserve every exact graph ID");
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 8);
+    }
+
     fn assert_fixed_object_keys(value: &Value) {
         match value {
             Value::Object(object) => {

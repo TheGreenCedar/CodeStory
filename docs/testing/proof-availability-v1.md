@@ -111,16 +111,19 @@ contract digest with the digest produced by validating that frozen oracle path.
 Read-only verification recomputes the same expected digest from the frozen
 oracle, so a different well-formed SHA-256 fails before metrics are evaluated.
 
-Public report schema `codestory.proof-availability-report/v2` does not expose
+Public report schema `codestory.proof-availability-report/v3` does not expose
 resolved runtime canonical IDs because those identities may contain host paths.
 Each resolved source and target instead carries
 `canonical_id_binding_sha256`, computed over RFC 8785 canonical JSON containing
 the complete pinned node identity and raw canonical ID with the domain
 `codestory.proof-availability-resolved-canonical-id/v1\0`. Frozen oracle
 selectors may still use raw canonical IDs; verification recomputes the same
-contextual binding from the selector and receipt pin. The v2 results-evidence
-digest binds these commitments under
-`codestory.proof-availability-results-evidence/v2\0`.
+contextual binding from the selector and receipt pin. Exact graph IDs remain
+signed 64-bit integers inside the runner but are encoded as strict canonical
+signed-decimal JSON strings in public reports. This keeps RFC 8785
+canonicalization from rounding IDs through IEEE-754 numbers. The v3
+results-evidence digest binds these commitments under
+`codestory.proof-availability-results-evidence/v3\0`.
 
 A product finalization failure remains an `Invalid` case row rather than
 aborting the report. It retains the actual trace and both completed mutation
