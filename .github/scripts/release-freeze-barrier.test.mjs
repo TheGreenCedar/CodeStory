@@ -90,6 +90,20 @@ test("an exact clean pushed source-stabilization Actions receipt passes", () => 
   validateReceipt(receipt(), RECEIPT_CONTEXT);
 });
 
+test("a next-head bind passes when next is already the exact head", () => {
+  validateReceipt(receipt({
+    branch: "dev/codestory-next",
+    release_pr: {
+      number: 0,
+      bind: "next_head",
+      base: "dev/codestory-next",
+      base_commit: "0".repeat(40),
+      head: "dev/codestory-next",
+      head_commit: COMMIT,
+    },
+  }), RECEIPT_CONTEXT);
+});
+
 test("a frozen-candidate receipt carries no future mutation and passes", () => {
   const frozen = receipt({ phase: "frozen_candidate" });
   validateReceipt(frozen, {
@@ -161,10 +175,10 @@ for (const [name, mutate, pattern] of [
   ["unpushed head", (value) => { value.remote_head = "5".repeat(40); }, /clean worktree/u],
   ["moved release PR", (value) => {
     value.release_pr.head_commit = "5".repeat(40);
-  }, /bind the open release PR/u],
+  }, /bind the open release PR or next-head/u],
   ["unbound release base", (value) => {
     value.release_pr.base_commit = "";
-  }, /bind the open release PR/u],
+  }, /bind the open release PR or next-head/u],
   ["undeclared source change", (value) => {
     value.known_future_source_changes.push(".github/workflows/release.yml");
   }, /future changes do not match source_stabilization/u],
@@ -408,6 +422,56 @@ test("record-actions-receipt refuses to mint authority outside GitHub Actions", 
     },
   );
   assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /canonical release freeze receipt may be produced only by workflow_dispatch/u,
+  );
+});
+
+test("record-actions-receipt accepts an empty --release-pr for next-head bind", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "codestory-freeze-empty-release-pr-"));
+  const script = new URL("./release-freeze-barrier.mjs", import.meta.url);
+  const result = spawnSync(
+    process.execPath,
+    [
+      script.pathname,
+      "record-actions-receipt",
+      "--repo",
+      root,
+      "--repository",
+      REPOSITORY,
+      "--branch",
+      "dev/codestory-next",
+      "--commit",
+      COMMIT,
+      "--tree",
+      TREE,
+      "--release-pr",
+      "",
+      "--output",
+      path.join(root, "receipt.json"),
+      "--run-id",
+      String(RUN_ID),
+      "--run-attempt",
+      String(RUN_ATTEMPT),
+      "--phase",
+      "source_stabilization",
+      "--support-prs-json",
+      "[]",
+      "--broad-workflow",
+      "Exact-head source proof",
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GITHUB_ACTIONS: "",
+        GITHUB_EVENT_NAME: "",
+      },
+    },
+  );
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(result.stderr, /--release-pr requires a value/u);
   assert.match(
     result.stderr,
     /canonical release freeze receipt may be produced only by workflow_dispatch/u,

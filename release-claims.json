@@ -1675,7 +1675,7 @@
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
         "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
-        "job_manifest_sha256": "b1ae13eabcbda9c99f7d0ba17cae97ca292d11fa4b010f87c534f9b7938843c7",
+        "job_manifest_sha256": "7eb0812b601c3f06d5885b741d4dd1775b85c10619b18fc680dbb77a9ccc13b4",
         "phases": {
           "source_stabilization": {
             "known_future_source_changes": [
@@ -1743,7 +1743,7 @@
         "file": "source-proof.yml",
         "job": "resolve",
         "step": "Resolve trusted exact head",
-        "sha256": "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af",
+        "sha256": "b6a71101fabf7f21a2d3483132eadbe9062c53b55988946c5a26da46d2719dc2",
         "reason": "The trusted-head resolver authenticates which commit the broad source proof runs against; fragment checks alone cannot prove the authentication logic was not rewritten around them."
       },
       "packaged_platform_pr_resolver": {
@@ -1751,7 +1751,7 @@
         "file": "packaged-platform-pr.yml",
         "job": "route",
         "step": "Resolve trusted exact head",
-        "sha256": "057bb7924c9ec281671defe683519debfb71359729d66fb0afb84513dc22bf5f",
+        "sha256": "fa1ec1a09cf8588ce2109c25289a0d1c797c63d4b0429ff222d7d549ce67b3f0",
         "reason": "The coordinator's trusted-head resolver authenticates the exact frozen-candidate head for every broad proof mode; its executable text must match the reviewed contract, not merely contain its tokens."
       },
       "marketplace_sync_dispatch_guard": {
@@ -1779,7 +1779,7 @@
       "packaged_platform_pr_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-pr.yml",
-        "sha256": "a633fd7e6def5305940844aca96a6869fca77622050dc79f0c4682f5e0a9c1c3",
+        "sha256": "111a730a2ea35476aa94ee2fdb16d5795b5230e4e6002664ac3ff2d913a23c31",
         "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "frozen_candidate_quality_workflow": {
@@ -3271,7 +3271,7 @@
         "step": "Prove the catalog-resolved published runtime",
         "fragments": [
           "common=(",
-          "python .github/scripts/check-packaged-agent-proof.py",
+          "python \"$PROOF_HELPER\"",
           "--expected-backend \"$EXPECTED_BACKEND\"",
           "\"${common[@]}\" --out-dir \"$proof_root/session-1\"",
           "\"${common[@]}\" --out-dir \"$proof_root/session-2\"",

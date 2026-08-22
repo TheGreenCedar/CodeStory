@@ -18,7 +18,7 @@ every host guide.
 | Architecture | `docs/architecture/` | Components, ownership, data flow, invariants, failure boundaries |
 | Contributor workflow | `docs/contributors/` | Current branch/worktree, owning crate, smallest proof |
 | Test and release claims | `docs/contributors/testing-matrix.md` and `docs/testing/` | Exact commands, proof tiers, evidence records |
-| Release authority and operator sequence | `docs/contributors/release-runbook.md` | Own the sequence, approval boundaries, invalidation, and evidence handoff; link to machine policy for changing lanes and cells |
+| Release authority and operator sequence | `docs/contributors/release-runbook.md` | Own the sequence, approval boundaries, invalidation, and evidence handoff; the operator interface is `scripts/codestory-release.mjs`; link to machine policy for changing lanes and cells |
 | Dated review evidence | `docs/testing/architecture-review-*.md`, `docs/testing/code-review-*.md` | Pin an exact date and commit; label it as a snapshot rather than current architecture or live issue state |
 | Maintainer operations | `docs/ops/` | Diagnostics and bounded recovery; link user-facing recovery back to troubleshooting |
 | Agent behavior | `plugins/codestory/skills/codestory-grounding/` | MCP intent, retry, evidence, and failure contracts |

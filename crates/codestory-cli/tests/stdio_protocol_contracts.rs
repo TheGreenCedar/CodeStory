@@ -722,6 +722,22 @@ fn tool_output_schema<'a>(tools: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("tool {name} should include outputSchema: {tools}"))
 }
 
+fn required_on_any_branch(schema: &Value, field: &str) -> bool {
+    schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|value| value.as_str() == Some(field))
+        || schema["anyOf"].as_array().is_some_and(|any_of| {
+            any_of.iter().any(|branch| {
+                branch["required"].as_array().is_some_and(|required| {
+                    required.iter().any(|value| value.as_str() == Some(field))
+                })
+            })
+        })
+}
+
 fn required_fields(schema: &Value) -> BTreeSet<&str> {
     schema
         .get("required")
@@ -2566,7 +2582,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
                 "retrieval_trace_summary",
             ] {
                 assert!(
-                    required_fields(output_schema).contains(field),
+                    required_on_any_branch(output_schema, field),
                     "packet outputSchema should require {field}: {tool}"
                 );
             }
@@ -2584,7 +2600,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
             );
             for field in ["stats", "coverage", "orientation", "root_symbols", "files"] {
                 assert!(
-                    required_fields(output_schema).contains(field),
+                    required_on_any_branch(output_schema, field),
                     "ground outputSchema should require grounding DTO field {field}: {tool}"
                 );
             }
@@ -2897,7 +2913,7 @@ fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     let snippet = tool_output_schema(&tools, "snippet");
     for field in ["scope", "requested_context", "snippet_truncated"] {
         assert!(
-            required_fields(snippet).contains(field),
+            required_on_any_branch(snippet, field),
             "snippet outputSchema should require emitted DTO field {field}: {snippet}"
         );
         let _ = schema_property(snippet, field);

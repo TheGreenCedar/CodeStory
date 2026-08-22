@@ -30,6 +30,8 @@ on:
       - .github/scripts/run-actionlint.test.mjs
       - .github/actionlint.yaml
       - release-claims.json
+      - scripts/codestory-release.mjs
+      - scripts/codestory-release.test.mjs
       - scripts/codestory-release-claims.mjs
       - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
@@ -113,6 +115,8 @@ on:
       - .github/scripts/run-actionlint.test.mjs
       - .github/actionlint.yaml
       - release-claims.json
+      - scripts/codestory-release.mjs
+      - scripts/codestory-release.test.mjs
       - scripts/codestory-release-claims.mjs
       - scripts/codestory-release-closeout.mjs
       - scripts/codestory-release-evidence-gate.mjs
@@ -210,6 +214,7 @@ jobs:
         run: >-
           node --test
           .github/scripts/publish-marketplace-catalog.test.mjs
+          scripts/codestory-release.test.mjs
           scripts/tests/codestory-release-claims.test.mjs
           scripts/tests/codestory-release-closeout.test.mjs
           scripts/tests/codestory-release-evidence-gate.test.mjs

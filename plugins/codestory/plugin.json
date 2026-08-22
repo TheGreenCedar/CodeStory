@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "codestory",
-  "version": "0.17.4",
+  "version": "0.17.5",
   "description": "CodeStory grounding for coding agents over a local managed runtime.",
   "author": {
     "name": "The Green Cedar",

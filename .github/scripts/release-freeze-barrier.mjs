@@ -88,23 +88,26 @@ function gh(args) {
   return run("gh", args);
 }
 
-function values(args, name) {
+function values(args, name, { allowEmpty = false } = {}) {
   const result = [];
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === name) {
       const value = args[index + 1];
-      if (!value || value.startsWith("--")) {
+      const missing = value === undefined
+        || (!allowEmpty && !value)
+        || (Boolean(value) && value.startsWith("--"));
+      if (missing) {
         fail(`${name} requires a value`);
       }
-      result.push(value);
+      result.push(value ?? "");
       index += 1;
     }
   }
   return result;
 }
 
-function value(args, name, fallback = undefined) {
-  const found = values(args, name);
+function value(args, name, fallback = undefined, options = {}) {
+  const found = values(args, name, options);
   if (found.length > 1) {
     fail(`${name} may be specified only once`);
   }
@@ -251,6 +254,22 @@ export function validateAcceptanceProvenance({
   return Number(target[1]);
 }
 
+function validReleasePrBind(receipt, commit) {
+  const pr = receipt?.release_pr;
+  if (!pr || pr.base !== "dev/codestory-next" || pr.head_commit !== commit) {
+    return false;
+  }
+  if (!/^[0-9a-f]{40}$/u.test(String(pr.base_commit ?? ""))) {
+    return false;
+  }
+  if (pr.bind === "next_head" || pr.number === 0) {
+    return pr.head === "dev/codestory-next" && receipt.branch === "dev/codestory-next";
+  }
+  return Number.isInteger(pr.number)
+    && pr.number > 0
+    && pr.head === receipt.branch;
+}
+
 export function validateReceipt(
   receipt,
   { repository, commit, tree, runId, runAttempt, phase },
@@ -273,15 +292,8 @@ export function validateReceipt(
   if (receipt.worktree_clean !== true || receipt.remote_head !== commit) {
     fail("freeze receipt must prove a clean worktree pushed at the exact commit");
   }
-  if (
-    !Number.isInteger(receipt?.release_pr?.number)
-    || receipt.release_pr.number <= 0
-    || receipt?.release_pr?.head_commit !== commit
-    || receipt?.release_pr?.head !== receipt.branch
-    || receipt?.release_pr?.base !== "dev/codestory-next"
-    || !/^[0-9a-f]{40}$/u.test(String(receipt?.release_pr?.base_commit ?? ""))
-  ) {
-    fail("freeze receipt must bind the open release PR at this exact head");
+  if (!validReleasePrBind(receipt, commit)) {
+    fail("freeze receipt must bind the open release PR or next-head at this exact head");
   }
   if (
     !Array.isArray(receipt.integrated_support_prs)
@@ -476,21 +488,58 @@ function supportPr(repository, number, commit, repo) {
   };
 }
 
-function releasePr(repository, number, { branch, commit }) {
-  const pr = JSON.parse(gh(["api", `repos/${repository}/pulls/${number}`]));
+function nextHeadBind(repository, commit, { branch } = {}) {
+  if (branch && branch !== "dev/codestory-next") {
+    fail("next-head freeze bind must run on dev/codestory-next");
+  }
   const liveBaseRef = JSON.parse(gh([
     "api",
     `repos/${repository}/git/ref/heads/dev/codestory-next`,
   ]));
   const liveBaseCommit = liveBaseRef?.object?.sha;
   if (
-    pr.state !== "open"
-    || pr?.base?.ref !== "dev/codestory-next"
-    || pr?.head?.ref !== branch
-    || pr?.head?.sha !== commit
-    || pr?.head?.repo?.full_name !== repository
+    liveBaseCommit !== commit
     || !/^[0-9a-f]{40}$/u.test(String(liveBaseCommit ?? ""))
   ) {
+    fail(
+      `dev/codestory-next must already be exact head ${commit} when no open release PR exists`,
+    );
+  }
+  return {
+    number: 0,
+    bind: "next_head",
+    base: "dev/codestory-next",
+    base_commit: liveBaseCommit,
+    head: "dev/codestory-next",
+    head_commit: commit,
+  };
+}
+
+function releasePr(repository, number, { branch, commit }) {
+  if (!number || String(number).trim() === "" || String(number) === "0") {
+    return nextHeadBind(repository, commit, { branch });
+  }
+  const pr = JSON.parse(gh(["api", `repos/${repository}/pulls/${number}`]));
+  const liveBaseRef = JSON.parse(gh([
+    "api",
+    `repos/${repository}/git/ref/heads/dev/codestory-next`,
+  ]));
+  const liveBaseCommit = liveBaseRef?.object?.sha;
+  const sameRepository = pr?.head?.repo?.full_name === repository;
+  const liveShaOk = /^[0-9a-f]{40}$/u.test(String(liveBaseCommit ?? ""));
+  const openExact = pr.state === "open"
+    && pr?.base?.ref === "dev/codestory-next"
+    && pr?.head?.ref === branch
+    && pr?.head?.sha === commit
+    && sameRepository
+    && liveShaOk;
+  const closedSameSha = pr.state === "closed"
+    && pr?.base?.ref === "dev/codestory-next"
+    && pr?.head?.sha === commit
+    && liveBaseCommit === commit
+    && sameRepository
+    && liveShaOk;
+  if (!openExact && !closedSameSha) {
     fail(
       `release PR #${number} must be an open same-repository ${branch} -> `
       + `dev/codestory-next PR at exact head ${commit}`,
@@ -504,6 +553,9 @@ function releasePr(repository, number, { branch, commit }) {
     fail(
       `release PR #${number} head ${commit} does not contain current dev base ${liveBaseCommit}`,
     );
+  }
+  if (closedSameSha) {
+    return nextHeadBind(repository, commit, { branch: "dev/codestory-next" });
   }
   return {
     number: pr.number,
@@ -542,7 +594,7 @@ function recordActionsReceipt(args) {
   const commit = required(args, "--commit");
   const tree = required(args, "--tree");
   const output = required(args, "--output");
-  const releasePrNumber = required(args, "--release-pr");
+  const releasePrNumber = value(args, "--release-pr", "", { allowEmpty: true });
   const runId = required(args, "--run-id");
   const runAttempt = required(args, "--run-attempt");
   const phase = required(args, "--phase");
