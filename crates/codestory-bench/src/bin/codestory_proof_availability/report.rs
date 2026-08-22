@@ -1973,19 +1973,20 @@ fn validate_public_json_for_build(
                         rejected,
                     ));
                 }
-                let child_pointer = append_fixed_json_pointer(pointer, field).ok_or_else(|| {
-                    PublicArtifactBuildFailure::closed(
-                        PublicArtifactBuildStage::BundleValidation,
-                        PublicArtifactBuildReason::ExistingInvariant,
-                    )
-                })?;
+                let child_pointer =
+                    append_fixed_object_pointer(pointer, field).ok_or_else(|| {
+                        PublicArtifactBuildFailure::closed(
+                            PublicArtifactBuildStage::BundleValidation,
+                            PublicArtifactBuildReason::ExistingInvariant,
+                        )
+                    })?;
                 validate_public_json_for_build(artifact, child, &child_pointer, case_ordinal)?;
             }
         }
         Value::Array(values) => {
             for (index, child) in values.iter().enumerate() {
-                let child_pointer = append_fixed_json_pointer(pointer, &index.to_string())
-                    .ok_or_else(|| {
+                let child_pointer =
+                    append_array_index_pointer(pointer, index).ok_or_else(|| {
                         PublicArtifactBuildFailure::closed(
                             PublicArtifactBuildStage::BundleValidation,
                             PublicArtifactBuildReason::ExistingInvariant,
@@ -2020,15 +2021,18 @@ fn validate_public_json_for_build(
     Ok(())
 }
 
-fn append_fixed_json_pointer(pointer: &str, segment: &str) -> Option<String> {
+fn append_fixed_object_pointer(pointer: &str, segment: &str) -> Option<String> {
     const MAX_DIAGNOSTIC_POINTER_BYTES: usize = 4096;
-    let escaped = if !segment.is_empty() && segment.bytes().all(|byte| byte.is_ascii_digit()) {
-        segment
-    } else {
-        fixed_json_pointer_segment(segment)?
-    };
+    let escaped = fixed_json_pointer_segment(segment)?;
     let length = pointer.len().checked_add(1)?.checked_add(escaped.len())?;
     (length <= MAX_DIAGNOSTIC_POINTER_BYTES).then(|| format!("{pointer}/{escaped}"))
+}
+
+fn append_array_index_pointer(pointer: &str, index: usize) -> Option<String> {
+    const MAX_DIAGNOSTIC_POINTER_BYTES: usize = 4096;
+    let index = index.to_string();
+    let length = pointer.len().checked_add(1)?.checked_add(index.len())?;
+    (length <= MAX_DIAGNOSTIC_POINTER_BYTES).then(|| format!("{pointer}/{index}"))
 }
 
 fn fixed_json_pointer_segment(segment: &str) -> Option<&'static str> {
@@ -2172,7 +2176,6 @@ where
             }
             _ => "proof_availability_public_artifact_invalid",
         };
-        write_legacy_public_artifact_diagnostic(destination, code);
         ReportPublishError::before_staging(code, destination)
     })?;
     let parent = destination.parent().ok_or_else(|| {
@@ -2252,32 +2255,6 @@ where
         )
     })?;
     Ok(())
-}
-
-fn write_legacy_public_artifact_diagnostic(destination: &Path, code: &str) {
-    let reason = match code {
-        "proof_availability_public_path_leak" => PublicArtifactBuildReason::PathLeak,
-        "proof_availability_public_secret_leak" => PublicArtifactBuildReason::SecretField,
-        _ => PublicArtifactBuildReason::ExistingInvariant,
-    };
-    let Some(parent) = destination.parent() else {
-        return;
-    };
-    let Some(qualification_id) = destination.file_name().and_then(|name| name.to_str()) else {
-        return;
-    };
-    let Ok(reservation) = reserve_case_diagnostic(parent, qualification_id) else {
-        return;
-    };
-    let failure =
-        PublicArtifactBuildFailure::closed(PublicArtifactBuildStage::BundleValidation, reason);
-    let _ = write_public_artifact_build_diagnostic(
-        &reservation,
-        qualification_id,
-        "unavailable",
-        "unavailable",
-        &failure,
-    );
 }
 
 fn stage_bundle(staging: &Path, bundle: &PublicArtifactBundle) -> Result<()> {
@@ -2630,10 +2607,21 @@ mod tests {
         let exact = "x".repeat(4083);
         let expected = format!("{exact}/canonical_id");
         assert_eq!(
-            append_fixed_json_pointer(&exact, "canonical_id").as_deref(),
+            append_fixed_object_pointer(&exact, "canonical_id").as_deref(),
             Some(expected.as_str())
         );
-        assert!(append_fixed_json_pointer(&format!("{exact}/canonical_id"), "schema").is_none());
+        assert!(append_fixed_object_pointer(&format!("{exact}/canonical_id"), "schema").is_none());
+    }
+
+    #[test]
+    fn public_artifact_pointer_admits_numeric_segments_only_from_arrays() {
+        assert!(append_fixed_object_pointer("", "7").is_none());
+        assert_eq!(append_array_index_pointer("", 7).as_deref(), Some("/7"));
+        let mut bundle = fixture_bundle();
+        bundle.cases = json!({"7": "/Users/albert/private"});
+        let failure = validate_public_bundle_for_build(&bundle).unwrap_err();
+        assert_eq!(failure.reason, PublicArtifactBuildReason::ExistingInvariant);
+        assert!(failure.json_pointer.is_none());
     }
 
     #[test]
@@ -3103,34 +3091,6 @@ mod tests {
             .unwrap_err()
             .code,
             "proof_availability_public_secret_leak"
-        );
-    }
-
-    #[cfg(all(
-        unix,
-        any(
-            target_os = "android",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos"
-        )
-    ))]
-    #[test]
-    fn public_path_failure_writes_the_private_build_diagnostic() {
-        let root = tempfile::tempdir().unwrap();
-        let destination = root.path().join("behavior-red");
-        let mut bundle = fixture_bundle();
-        bundle.summary = json!({"workspace": "/Users/albert/private"});
-
-        let error = publish_bundle(&destination, &bundle, &PublicLeakPolicy::default())
-            .expect_err("synthetic path must fail");
-        assert_eq!(error.code, "proof_availability_public_path_leak");
-        assert!(
-            root.path()
-                .join(".codestory-proof-availability-case-diagnostic-behavior-red")
-                .join("public-artifact-build-v1.json")
-                .is_file(),
-            "the path failure must retain the fixed private diagnostic"
         );
     }
 
