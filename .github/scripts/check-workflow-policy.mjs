@@ -4953,6 +4953,7 @@ function validatePostPublish(workflows, violations, graph) {
     ".github/scripts/install-codestory-marketplace-proof.mjs",
     ".github/scripts/marketplace-delivery-identity.mjs",
     ".github/scripts/check-packaged-agent-proof.py",
+    ".github/scripts/native_binary_contract.py",
     ".github/scripts/packaged_agent_proof",
     '| tar -x -C "$harness_root"',
     'echo "helper=$harness_root/.github/scripts/install-codestory-marketplace-proof.mjs" >> "$GITHUB_OUTPUT"',
