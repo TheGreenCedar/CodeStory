@@ -7,7 +7,7 @@
     },
     "connect_timeout_ms": 2000,
     "election_backoff_policy": {
-      "initial_backoff_ms": 9,
+      "initial_backoff_ms": 7,
       "jitter": "sha256(process_start_id||attempt) modulo inclusive [initial_backoff_ms,maximum_backoff_ms]",
       "maximum_backoff_ms": 109
     },
@@ -43,7 +43,22 @@
     "query_queue_capacity": 64,
     "true_idle_observation_grace_ms": 2500
   },
-  "freeze_record": null,
+  "freeze_record": {
+    "calibration_bundle_sha256": "5cd2285a1f363916074db14cdac52d5b1953a444dc54b52275352fdedc38b580",
+    "calibration_freeze_digest": "aac841c0d94870e78ca6a8e27fd5972e4eedf4ab4aaca27a4a10215ef6cd1c17",
+    "input_constant_set_sha256": "2c4157ce273fd8b6bd3cf7764c53b51baec66874217f07868c6350e3072aa0ab",
+    "measurement_protocol_sha256": "9eb303b6204ca6218e97ae299356370b16921a485350146fe85203a298e59269",
+    "protocol_sha256": "25373a136cc1da119ed6829769b90aab075084406b0489f9f7698b370f5ee447",
+    "run_artifact_sha256s": [
+      "3b82164f955e8712f019ada3e9f0d41b1b283ccca00a00c476b0aead84b878d4",
+      "91e0a833ef7cd33d2332dad2a48431a991e602c02aba947ed7745127b9008a05",
+      "b1fb4e7b02fe20da28baa111335950ff1affa5add42372b6367a5c871a96b281"
+    ],
+    "selected_at": "github-actions-run:32582114363:1",
+    "selection_rule": "constant_only_three_fresh_generations_one_sample_each+slow_host_floors_v2",
+    "selection_source_commit": "e19bc09b3e50e75eb599be8c1e2620bfb96c83d8",
+    "selection_source_tree": "60a29b5057f4244d3564e7b3ca529bc22e31c656"
+  },
   "qualification_threshold_overrides": {
     "protected_windows_x64_vulkan": {
       "existing_owner_connect": 125,
@@ -66,5 +81,5 @@
   },
   "schema_version": 1,
   "selection_protocol": "codestory-per-user-embedding-server-v1",
-  "status": "unfrozen"
+  "status": "frozen"
 }
