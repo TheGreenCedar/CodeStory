@@ -12,6 +12,25 @@ the run. Materialization checks out the exact frozen commits, verifies every
 oracle range, builds one fresh core index per project, and writes a private local
 environment descriptor:
 
+Before Q2, Q1 must prove that the evidence-only v3 surface is separable from
+proof activation. The sealed conformance probe builds and validates packet,
+context, and search results for every supported MCP revision while omitting the
+proof tool, schema, and route. The companion feature-matrix build proves that
+this surface compiles without the proof-qualification feature:
+
+```sh
+cargo check --locked -p codestory-cli --lib --no-default-features \
+  --features v3-evidence-separation-support
+cargo test --locked -p codestory-cli --lib --no-default-features \
+  --features v3-evidence-separation-support \
+  stdio_v3::evidence_separation_tests::sealed_evidence_only_conformance_covers_all_revisions \
+  -- --exact
+```
+
+Failure is a Q1 inseparability blocker: record plan-level Outcome D and do not
+run Q2. A successful Q1 gate constrains Q2 to Outcomes A, B, or C. The
+qualification binary never accepts caller-supplied dependency evidence.
+
 ```sh
 cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
   materialize \
@@ -46,12 +65,7 @@ cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
   --out target/proof-availability/results
 ```
 
-The command remains unchanged for outcomes A, B, or C. If review finds a
-source-level dependency that independently requires outcome D, pass a closed
-evidence file with `--source-dependency <EVIDENCE_JSON>`. The evidence binds
-two exact source coordinates, their full-file and range hashes, the clean
-qualification source commit and tree, and one supported dependency/test pair.
-Invalid evidence fails the run; it is never treated as absent.
+The command is the complete Q2 contract for Outcomes A, B, and C.
 
 All destinations are no-replace. Choose new paths for a rerun. Failed
 materialization or publication keeps its owner-marked staging path for manual
@@ -97,10 +111,13 @@ recomputes the wrapper rather than trusting reported aggregates.
 the frozen hard gates and role thresholds used by the evaluator, and presents the
 decision with its failed gates, provenance hashes, and explicit nonclaims.
 
-An actionable gap retains its exact selector, step, or finalization coordinate.
-Only a gap at the first unproven prefix boundary counts. An output-budget gap is
-actionable only after every attempted step has an admitted trace and finalization
-names the matching receipt/projection budget state.
+An actionable gap retains its exact selector, step, or finalization coordinate
+and its cause must match the trace at that coordinate. Only a gap at the first
+unproven prefix boundary counts. An output-budget gap is actionable only after
+every attempted step has an admitted trace and finalization names the matching
+receipt/projection budget state. A product disposition whose reported gap cause
+contradicts that trace remains measurable and fails the product-disposition hard
+gate; the harness does not repair it into an actionable gap.
 
 ## Read-only verification
 
@@ -115,9 +132,8 @@ cargo run --locked -p codestory-bench --bin codestory-proof-availability -- \
   --results target/proof-availability/results
 ```
 
-When `run` used `--source-dependency`, `verify` requires the same option and
-revalidates the evidence from the clean qualification source tree. Without that
-option, the original command remains the complete A/B/C verification contract.
+This is the complete A/B/C verification contract. There is no runtime input for
+Outcome D.
 
 ## Interpretation
 

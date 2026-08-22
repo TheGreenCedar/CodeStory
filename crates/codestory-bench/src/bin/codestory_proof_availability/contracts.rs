@@ -10,7 +10,6 @@ pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
 pub const PATH_FILE_SCHEMA: &str = "codestory.proof-availability-path-file/v1";
 pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v1";
 pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1";
-pub const SOURCE_DEPENDENCY_SCHEMA: &str = "codestory.proof-availability-source-dependency/v1";
 pub const DECISION_REPORT_SCHEMA: &str = "codestory.proof-availability-decision/v1";
 pub const MAX_CANDIDATE_EDGES_PER_STEP: usize =
     codestory_runtime::proof_qualification_support::MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP
@@ -2486,10 +2485,13 @@ impl CaseReportV1 {
             && metrics.proven_prefix_length == self.attempted_step_count;
         let product_disposition_matches_evidence = match &self.product_disposition.actual {
             ActualProductResultV1::ContractProven { .. } => contract_proven_supported,
-            ActualProductResultV1::Unknown { .. } => {
+            ActualProductResultV1::Unknown { gaps, .. } => {
                 metrics.proven_prefix_length < self.attempted_step_count
                     && (!self.product_disposition.gaps.is_empty()
                         || self.actionable_exact_gap.is_some())
+                    && gaps
+                        .iter()
+                        .all(|gap| gap_cause_matches_trace(*gap, &self.proof_trace))
             }
             ActualProductResultV1::ContractRefuted { basis, .. } => match basis {
                 ProductRefutationBasisV1::PositiveContradiction { step_index, .. } => {
@@ -2556,7 +2558,6 @@ pub enum ActivationOutcomeV1 {
     PublicExactVerifier,
     ExperimentalManualVerifier,
     KeepProofDark,
-    DelayFullV3Cut,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -2572,82 +2573,6 @@ pub enum QualificationGateKindV1 {
     AutomaticThreshold,
     StableThreshold,
     ExperimentalUsefulness,
-    IntegrationDependency,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum SourceDependencyKindV1 {
-    V3PacketRequiresProof,
-    TransportCannotRepresentKeepDark,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum IntegrationDependencyTestKindV1 {
-    PacketV3RequiresProof,
-    TransportCannotRepresentKeepDark,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub enum IntegrationDependencyTestStatusV1 {
-    Passed,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct IntegrationDependencyTestV1 {
-    pub test_id: String,
-    pub kind: IntegrationDependencyTestKindV1,
-    pub status: IntegrationDependencyTestStatusV1,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SourceDependencyEvidenceV1 {
-    pub schema: String,
-    pub qualification_source_commit: String,
-    pub qualification_source_tree: String,
-    pub dependency_source: SourceDependencyCoordinateV1,
-    pub test_source: SourceDependencyCoordinateV1,
-    pub dependency: SourceDependencyKindV1,
-    pub passing_test: IntegrationDependencyTestV1,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SourceDependencyCoordinateV1 {
-    pub range: OracleSourceRangeV1,
-    pub file_sha256: String,
-}
-impl SourceDependencyEvidenceV1 {
-    pub(crate) fn validate(&self) -> Result<()> {
-        if self.schema != SOURCE_DEPENDENCY_SCHEMA
-            || !commit(&self.qualification_source_commit)
-            || !commit(&self.qualification_source_tree)
-            || !valid_source_dependency_coordinate(&self.dependency_source)
-            || !valid_source_dependency_coordinate(&self.test_source)
-            || empty(&self.passing_test.test_id)
-            || !matches!(
-                self.passing_test.status,
-                IntegrationDependencyTestStatusV1::Passed
-            )
-            || !matches!(
-                (
-                    &self.dependency,
-                    &self.passing_test.kind,
-                    self.passing_test.test_id.as_str(),
-                ),
-                (
-                    SourceDependencyKindV1::V3PacketRequiresProof,
-                    IntegrationDependencyTestKindV1::PacketV3RequiresProof,
-                    "packet_v3_requires_proof",
-                ) | (
-                    SourceDependencyKindV1::TransportCannotRepresentKeepDark,
-                    IntegrationDependencyTestKindV1::TransportCannotRepresentKeepDark,
-                    "transport_cannot_represent_keep_dark",
-                )
-            )
-        {
-            bail!("proof_availability_source_dependency_invalid")
-        }
-        Ok(())
-    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -2671,9 +2596,6 @@ pub enum GateFailureDetailV1 {
     },
     Transport {
         evidence: TransportEvidenceV1,
-    },
-    SourceDependency {
-        evidence: Box<SourceDependencyEvidenceV1>,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2756,41 +2678,11 @@ pub struct ActivationDecisionReportV1 {
     pub thresholds_sha256: String,
     pub observations: DerivedObservationsV1,
     pub observations_sha256: String,
-    pub source_dependency: Option<SourceDependencyEvidenceV1>,
-    pub source_dependency_sha256: Option<String>,
     pub decision: ActivationDecisionV1,
 }
 impl ActivationDecisionReportV1 {
     pub(crate) fn validate(&self) -> Result<()> {
         self.decision.validate()?;
-        let decision_dependencies = self
-            .decision
-            .failed_gates
-            .iter()
-            .filter_map(|gate| match &gate.detail {
-                GateFailureDetailV1::SourceDependency { evidence } => {
-                    Some((gate.gate_id.as_str(), evidence.as_ref()))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let source_dependency_valid = match (
-            &self.source_dependency,
-            &self.source_dependency_sha256,
-            decision_dependencies.as_slice(),
-        ) {
-            (None, None, []) => true,
-            (Some(evidence), Some(digest), [(gate_id, decision_evidence)]) => {
-                evidence.validate().is_ok()
-                    && hash(digest)
-                    && *gate_id == "integration.source_dependency"
-                    && matches!(self.decision.outcome, ActivationOutcomeV1::DelayFullV3Cut)
-                    && self.decision.automatic_thresholds_met.is_none()
-                    && *digest == canonical_source_dependency_sha256(evidence)?
-                    && *digest == canonical_source_dependency_sha256(decision_evidence)?
-            }
-            _ => false,
-        };
         if self.schema != DECISION_REPORT_SCHEMA
             || !hash(&self.results_sha256)
             || !hash(&self.thresholds_sha256)
@@ -2800,7 +2692,6 @@ impl ActivationDecisionReportV1 {
                     &self.thresholds_sha256,
                     &self.observations,
                 )?
-            || !source_dependency_valid
         {
             bail!("proof_availability_decision_report_invalid")
         }
@@ -2814,10 +2705,6 @@ impl ActivationDecisionV1 {
                 .failed_gates
                 .iter()
                 .any(|gate| empty(&gate.gate_id) || !valid_gate_detail(&gate.kind, &gate.detail))
-            || (matches!(self.outcome, ActivationOutcomeV1::DelayFullV3Cut)
-                && !self.failed_gates.iter().any(|gate| {
-                    matches!(gate.detail, GateFailureDetailV1::SourceDependency { .. })
-                }))
         {
             bail!("proof_availability_decision_invalid")
         }
@@ -3390,16 +3277,6 @@ pub(crate) fn canonical_observations_sha256(
     )
 }
 
-pub(crate) fn canonical_source_dependency_sha256(
-    evidence: &SourceDependencyEvidenceV1,
-) -> Result<String> {
-    evidence.validate()?;
-    canonical_artifact_sha256(
-        b"codestory.proof-availability-source-dependency/v1\0",
-        evidence,
-    )
-}
-
 fn canonical_artifact_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     codestory_agent::proof_qualification_support::canonical_json_bytes(value)
         .map_err(|error| anyhow::anyhow!(error))
@@ -3957,6 +3834,9 @@ fn actionable_boundary(
     attempted_step_count: u8,
     trace: &ProofQualificationTraceV1,
 ) -> Option<ActionableGapBoundaryV1> {
+    if !gap_cause_matches_trace(gap, trace) {
+        return None;
+    }
     if let Some(selector_index) = selector_index_for_gap(gap) {
         let step_boundary = selector_index.saturating_sub(1);
         return (step_boundary == proven_prefix)
@@ -3981,6 +3861,204 @@ fn actionable_boundary(
             })
         })
         .flatten()
+}
+
+fn gap_cause_matches_trace(gap: ActualProofGapV1, trace: &ProofQualificationTraceV1) -> bool {
+    match gap {
+        ActualProofGapV1::SelectorMissing { selector_index } => {
+            selector_failure_matches(trace, selector_index, SelectorFailureV1::Missing)
+        }
+        ActualProofGapV1::SelectorAmbiguous { selector_index } => {
+            selector_failure_matches(trace, selector_index, SelectorFailureV1::Ambiguous)
+        }
+        ActualProofGapV1::NonCallableSelector { selector_index } => {
+            selector_failure_matches(trace, selector_index, SelectorFailureV1::NonCallable)
+        }
+        ActualProofGapV1::DirectCallMissing { step_index } => {
+            first_zero_gate_matches(trace, step_index, &CandidateGateV1::RawAdmission)
+                && !recursive_selector_pair(trace, step_index)
+        }
+        ActualProofGapV1::RecursiveCallNotRepresentable { step_index } => {
+            first_zero_gate_matches(trace, step_index, &CandidateGateV1::RawAdmission)
+                && recursive_selector_pair(trace, step_index)
+        }
+        ActualProofGapV1::SourceWindowTooLarge { step_index } => source_failure_matches(
+            trace,
+            step_index,
+            CandidateGateV1::Line,
+            SourceBindingFailureV1::LineOverLimit,
+        ),
+        ActualProofGapV1::InvalidUtf8 { step_index } => source_failure_matches(
+            trace,
+            step_index,
+            CandidateGateV1::SourceBinding,
+            SourceBindingFailureV1::InvalidUtf8,
+        ),
+        ActualProofGapV1::SourceLineOutOfRange { step_index } => source_failure_matches(
+            trace,
+            step_index,
+            CandidateGateV1::Line,
+            SourceBindingFailureV1::LineMissing,
+        ),
+        ActualProofGapV1::EdgeContainmentUnproven { step_index } => {
+            first_zero_gate_matches(trace, step_index, &CandidateGateV1::Containment)
+        }
+        ActualProofGapV1::MissingDirectCallReceipt { step_index }
+        | ActualProofGapV1::ReceiptOrEdgeAlreadyUsed { step_index }
+        | ActualProofGapV1::ProjectionExclusionConflictsWithRequiredReceipt { step_index } => {
+            step_admitted(trace, step_index)
+        }
+        ActualProofGapV1::OutputBudgetExceeded => matches!(
+            trace.finalization,
+            FinalizationTraceV1::Failed {
+                failure: FinalizationFailureV1::ReceiptBudget
+                    | FinalizationFailureV1::ProjectionBudget
+            }
+        ),
+    }
+}
+
+fn selector_failure_matches(
+    trace: &ProofQualificationTraceV1,
+    selector_index: u8,
+    expected: SelectorFailureV1,
+) -> bool {
+    trace.selectors.iter().any(|selector| {
+        selector.selector_index == u64::from(selector_index)
+            && matches!(
+                (&selector.outcome, &expected),
+                (
+                    SelectorGateOutcomeV1::Failed {
+                        reason: SelectorFailureV1::Missing
+                    },
+                    SelectorFailureV1::Missing
+                ) | (
+                    SelectorGateOutcomeV1::Failed {
+                        reason: SelectorFailureV1::Ambiguous
+                    },
+                    SelectorFailureV1::Ambiguous
+                ) | (
+                    SelectorGateOutcomeV1::Failed {
+                        reason: SelectorFailureV1::NonCallable
+                    },
+                    SelectorFailureV1::NonCallable
+                )
+            )
+    })
+}
+
+fn step_trace(
+    trace: &ProofQualificationTraceV1,
+    step_index: u8,
+) -> Option<&StepQualificationTraceV1> {
+    trace
+        .steps
+        .iter()
+        .find(|step| step.step_index == u64::from(step_index))
+}
+
+fn first_zero_gate_matches(
+    trace: &ProofQualificationTraceV1,
+    step_index: u8,
+    expected: &CandidateGateV1,
+) -> bool {
+    step_trace(trace, step_index).is_some_and(|step| {
+        matches!(
+            (&step.outcome, expected),
+            (
+                StepQualificationOutcomeV1::FirstZeroSurvivor {
+                    gate: CandidateGateV1::RawAdmission,
+                    ..
+                },
+                CandidateGateV1::RawAdmission
+            ) | (
+                StepQualificationOutcomeV1::FirstZeroSurvivor {
+                    gate: CandidateGateV1::Containment,
+                    ..
+                },
+                CandidateGateV1::Containment
+            ) | (
+                StepQualificationOutcomeV1::FirstZeroSurvivor {
+                    gate: CandidateGateV1::SourceBinding,
+                    ..
+                },
+                CandidateGateV1::SourceBinding
+            ) | (
+                StepQualificationOutcomeV1::FirstZeroSurvivor {
+                    gate: CandidateGateV1::Line,
+                    ..
+                },
+                CandidateGateV1::Line
+            )
+        )
+    })
+}
+
+fn source_failure_matches(
+    trace: &ProofQualificationTraceV1,
+    step_index: u8,
+    expected_gate: CandidateGateV1,
+    expected_reason: SourceBindingFailureV1,
+) -> bool {
+    step_trace(trace, step_index).is_some_and(|step| {
+        let StepQualificationOutcomeV1::FirstZeroSurvivor { gate, histogram } = &step.outcome
+        else {
+            return false;
+        };
+        first_zero_gate_matches(trace, step_index, &expected_gate)
+            && histogram.iter().any(|entry| {
+                matches!(
+                    (&entry.reason, &expected_reason),
+                    (
+                        CandidateFailureV1::SourceBinding {
+                            reason: SourceBindingFailureV1::LineOverLimit
+                        },
+                        SourceBindingFailureV1::LineOverLimit
+                    ) | (
+                        CandidateFailureV1::SourceBinding {
+                            reason: SourceBindingFailureV1::InvalidUtf8
+                        },
+                        SourceBindingFailureV1::InvalidUtf8
+                    ) | (
+                        CandidateFailureV1::SourceBinding {
+                            reason: SourceBindingFailureV1::LineMissing
+                        },
+                        SourceBindingFailureV1::LineMissing
+                    )
+                )
+            })
+            && matches!(
+                (gate, &expected_gate),
+                (
+                    CandidateGateV1::SourceBinding,
+                    CandidateGateV1::SourceBinding
+                ) | (CandidateGateV1::Line, CandidateGateV1::Line)
+            )
+    })
+}
+
+fn recursive_selector_pair(trace: &ProofQualificationTraceV1, step_index: u8) -> bool {
+    let source_index = u64::from(step_index);
+    let target_index = source_index + 1;
+    let resolved = |selector_index| {
+        trace.selectors.iter().find_map(|selector| {
+            if selector.selector_index != selector_index {
+                return None;
+            }
+            match selector.outcome {
+                SelectorGateOutcomeV1::Resolved { node_id } => Some(node_id),
+                _ => None,
+            }
+        })
+    };
+    resolved(source_index)
+        .zip(resolved(target_index))
+        .is_some_and(|(source, target)| source == target)
+}
+
+fn step_admitted(trace: &ProofQualificationTraceV1, step_index: u8) -> bool {
+    step_trace(trace, step_index)
+        .is_some_and(|step| matches!(step.outcome, StepQualificationOutcomeV1::Admitted { .. }))
 }
 
 fn trace_steps_fully_admitted(trace: &ProofQualificationTraceV1, attempted_step_count: u8) -> bool {
@@ -4446,29 +4524,12 @@ fn strictly_ascending_mismatch_fields(values: &[ReceiptMismatchFieldV1]) -> bool
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn valid_gate_detail(kind: &QualificationGateKindV1, detail: &GateFailureDetailV1) -> bool {
+fn valid_gate_detail(_kind: &QualificationGateKindV1, detail: &GateFailureDetailV1) -> bool {
     match detail {
         GateFailureDetailV1::Count { .. } => true,
         GateFailureDetailV1::Cohort { repository_id, .. } => !empty(repository_id),
         GateFailureDetailV1::Transport { evidence } => valid_transport(evidence),
-        GateFailureDetailV1::SourceDependency { evidence } => {
-            matches!(kind, QualificationGateKindV1::IntegrationDependency)
-                && evidence.validate().is_ok()
-        }
     }
-}
-
-fn valid_source_dependency_coordinate(coordinate: &SourceDependencyCoordinateV1) -> bool {
-    range(&coordinate.range).is_ok()
-        && hash(&coordinate.file_sha256)
-        && valid_project_file_components(
-            &coordinate
-                .range
-                .path
-                .split('/')
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>(),
-        )
 }
 
 pub fn schema_json(document: SchemaDocument) -> Value {

@@ -546,10 +546,6 @@ fn task10a_oracle_validation_uses_every_product_clause_guard_family() {
     }
 }
 
-fn range(start: u64, end: u64) -> Value {
-    json!({"path":"src/lib.rs","start_byte":start,"end_byte":end,"file_byte_length":4096,"sha256":SHA})
-}
-
 fn range_at(path: &str, start: u64, end: u64) -> Value {
     json!({"path":path,"start_byte":start,"end_byte":end,"file_byte_length":4096,"sha256":SHA})
 }
@@ -571,26 +567,6 @@ fn selector(symbol: &str, path: &str) -> Value {
 
 fn declaration(symbol: &str, path: &str, start: u64, end: u64) -> Value {
     json!({"symbol":symbol,"selector":selector(symbol,path),"range":range_at(path,start,end)})
-}
-
-fn source_dependency_evidence(dependency: &str) -> Value {
-    let (test_id, test_kind) = match dependency {
-        "v3_packet_requires_proof" => ("packet_v3_requires_proof", "packet_v3_requires_proof"),
-        "transport_cannot_represent_keep_dark" => (
-            "transport_cannot_represent_keep_dark",
-            "transport_cannot_represent_keep_dark",
-        ),
-        other => panic!("unsupported source dependency {other}"),
-    };
-    json!({
-        "schema":"codestory.proof-availability-source-dependency/v1",
-        "qualification_source_commit":COMMIT,
-        "qualification_source_tree":COMMIT,
-        "dependency_source":{"range":range(0,10),"file_sha256":SHA},
-        "test_source":{"range":range_at("tests/architecture.rs",20,30),"file_sha256":SHA},
-        "dependency":dependency,
-        "passing_test":{"test_id":test_id,"kind":test_kind,"status":"passed"}
-    })
 }
 
 fn path(case_id: &str, step_count: u8, ordinal: usize) -> Value {
@@ -1407,29 +1383,13 @@ fn closed_contracts_reject_hostile_nested_shapes() {
         .validate()
         .expect("each failed gate has a stable id");
 
-    let delayed_without_evidence: ActivationDecisionV1 = serde_json::from_value(json!({
-        "outcome":"delay_full_v3_cut","automatic_thresholds_met":null,"failed_gates":[]
-    }))
-    .expect("closed decision DTO");
-    assert!(delayed_without_evidence.validate().is_err());
-    let delayed_with_evidence: ActivationDecisionV1 = serde_json::from_value(json!({
-        "outcome":"delay_full_v3_cut",
-        "automatic_thresholds_met":null,
-        "failed_gates":[{"gate_id":"packet-proof-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":source_dependency_evidence("v3_packet_requires_proof")}}]
-    }))
-    .expect("closed decision DTO");
-    delayed_with_evidence
-        .validate()
-        .expect("outcome D uses closed source evidence");
-    let wrong_dependency_gate: ActivationDecisionV1 = serde_json::from_value(json!({
-        "outcome":"keep_proof_dark","automatic_thresholds_met":false,
-        "failed_gates":[{"gate_id":"wrong","kind":"response_size","detail":{
-            "kind":"source_dependency",
-            "evidence":source_dependency_evidence("v3_packet_requires_proof")
-        }}]
-    }))
-    .expect("closed decision DTO");
-    assert!(wrong_dependency_gate.validate().is_err());
+    assert!(
+        serde_json::from_value::<ActivationDecisionV1>(json!({
+            "outcome":"delay_full_v3_cut","automatic_thresholds_met":null,"failed_gates":[]
+        }))
+        .is_err(),
+        "Outcome D is a Q1 blocker, not a Q2 decision variant"
+    );
 
     let transport_gate: ActivationDecisionV1 = serde_json::from_value(json!({
         "outcome":"keep_proof_dark","automatic_thresholds_met":false,
@@ -2130,13 +2090,45 @@ fn assert_valid_first_zero(gate: &str, kind: &str, reason: &str) {
         .as_array_mut()
         .expect("observed receipts")
         .remove(0);
-    case["product_disposition"] = json!({
-        "kind":"unknown","gaps":["relation_missing"],"authoritative_receipts":[],
-        "actual":{"kind":"unknown","contract_digest":SHA,"gaps":[{"kind":"direct_call_missing","step_index":0}]}
-    });
-    case["actionable_exact_gap"] = json!({
-        "gap":{"kind":"direct_call_missing","step_index":0},
-        "boundary":{"kind":"step","step_index":0}
+    let (coarse_gap, actual_gap) = match (gate, reason) {
+        ("raw_admission", _) => (
+            Some("relation_missing"),
+            Some(json!({"kind":"direct_call_missing","step_index":0})),
+        ),
+        ("containment", _) => (
+            Some("source_binding"),
+            Some(json!({"kind":"edge_containment_unproven","step_index":0})),
+        ),
+        ("source_binding", "invalid_utf8") => (
+            Some("source_binding"),
+            Some(json!({"kind":"invalid_utf8","step_index":0})),
+        ),
+        ("source_binding", _) => (None, None),
+        ("line", "line_missing") => (
+            Some("source_binding"),
+            Some(json!({"kind":"source_line_out_of_range","step_index":0})),
+        ),
+        ("line", "line_over_limit") => (
+            Some("source_binding"),
+            Some(json!({"kind":"source_window_too_large","step_index":0})),
+        ),
+        _ => panic!("unsupported trace cause {gate}/{reason}"),
+    };
+    case["product_disposition"] = actual_gap.as_ref().map_or_else(
+        || json!({
+            "kind":"unknown","gaps":[],"authoritative_receipts":[],
+            "actual":{"kind":"unavailable","contract_digest":SHA,"reasons":["source_not_bound_to_publication"]}
+        }),
+        |gap| json!({
+            "kind":"unknown","gaps":[coarse_gap.unwrap()],"authoritative_receipts":[],
+            "actual":{"kind":"unknown","contract_digest":SHA,"gaps":[gap]}
+        }),
+    );
+    case["actionable_exact_gap"] = actual_gap.map_or(Value::Null, |gap| {
+        json!({
+            "gap":gap,
+            "boundary":{"kind":"step","step_index":0}
+        })
     });
     case["receipt_evidence"]["missing_oracle_steps"] = json!([{
         "step_index":0,"oracle_step":observed["oracle_comparison"]["oracle_step"]
@@ -2214,6 +2206,55 @@ fn make_non_proven_case(value: &mut Value, disposition: &str, gap: Option<&str>)
             other => panic!("unsupported fixture actionable gap {other}"),
         })
         .unwrap_or(Value::Null);
+    if disposition == "unknown" {
+        match gap {
+            Some("selector_missing") | Some("selector_ambiguous") => {
+                let reason = gap.unwrap().strip_prefix("selector_").unwrap();
+                case["proof_trace"]["selectors"][0]["outcome"] =
+                    json!({"kind":"failed","reason":reason});
+                case["proof_trace"]["selector_early_return"] = json!(true);
+                case["proof_trace"]["steps"] = json!([]);
+                case["unclassified_step_indices"] = Value::Array(
+                    (0..case["attempted_step_count"].as_u64().unwrap())
+                        .map(|index| json!(index))
+                        .collect(),
+                );
+            }
+            Some("relation_missing") => {
+                case["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!([]);
+                case["proof_trace"]["steps"][0]["outcome"] = json!({
+                    "kind":"first_zero_survivor","gate":"raw_admission","histogram":[]
+                });
+            }
+            Some("recursion") => {
+                let source_node = case["proof_trace"]["selectors"][0]["outcome"]["node_id"].clone();
+                case["proof_trace"]["selectors"][1]["outcome"]["node_id"] = source_node;
+                case["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!([]);
+                case["proof_trace"]["steps"][0]["outcome"] = json!({
+                    "kind":"first_zero_survivor","gate":"raw_admission","histogram":[]
+                });
+            }
+            Some("source_binding") => {
+                case["proof_trace"]["steps"][0]["outcome"] = json!({
+                    "kind":"first_zero_survivor","gate":"line",
+                    "histogram":[{"reason":{"kind":"source_binding","reason":"line_over_limit"},"edge_ids":[1]}]
+                });
+            }
+            Some("projection_budget") | None => {}
+            Some(other) => panic!("unsupported trace fixture gap {other}"),
+        }
+        if matches!(
+            gap,
+            Some("selector_missing")
+                | Some("selector_ambiguous")
+                | Some("relation_missing")
+                | Some("recursion")
+                | Some("source_binding")
+        ) {
+            case["receipt_evidence"]["observed_receipts"] = json!([]);
+        }
+    }
+    rebuild_funnel(value);
 }
 
 #[test]
@@ -2239,7 +2280,7 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
     QualificationSummaryV1::from_json(unavailable_as_proven)
         .expect_err("Unavailable cannot flatten into ContractProven");
     let mut mismatched_receipt = report();
-    make_non_proven_case(&mut mismatched_receipt, "unknown", Some("relation_missing"));
+    make_non_proven_case(&mut mismatched_receipt, "unavailable", None);
     mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"][0]["target"]["qualified_name"] =
         json!("crate::false_positive");
     let oracle = mismatched_receipt["cases"][0]["receipt_evidence"]["observed_receipts"]
@@ -2301,15 +2342,6 @@ fn invariant_table_exercises_remaining_closed_decision_and_funnel_variants() {
         .expect("closed activation outcome");
         value.validate().expect("non-delay outcome");
     }
-    let transport_dependency: ActivationDecisionV1 = serde_json::from_value(json!({
-        "outcome":"delay_full_v3_cut",
-        "automatic_thresholds_met":null,
-        "failed_gates":[{"gate_id":"transport-keep-dark-dependency","kind":"integration_dependency","detail":{"kind":"source_dependency","evidence":source_dependency_evidence("transport_cannot_represent_keep_dark")}}]
-    }))
-    .expect("second source dependency variant");
-    transport_dependency
-        .validate()
-        .expect("second source dependency variant");
 }
 
 #[test]
@@ -2516,28 +2548,23 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         .command,
         cli::Command::Run(_)
     ));
-    let cli::Command::Run(run_with_dependency) = cli::Cli::try_parse_from([
-        "bin",
-        "run",
-        "--corpus",
-        "/tmp/c",
-        "--thresholds",
-        "/tmp/t",
-        "--environment",
-        "/tmp/e",
-        "--out",
-        "/tmp/r",
-        "--source-dependency",
-        "/tmp/dependency.json",
-    ])
-    .expect("run with optional source dependency")
-    .command
-    else {
-        panic!("run command");
-    };
-    assert_eq!(
-        run_with_dependency.source_dependency.as_deref(),
-        Some(std::path::Path::new("/tmp/dependency.json"))
+    assert!(
+        cli::Cli::try_parse_from([
+            "bin",
+            "run",
+            "--corpus",
+            "/tmp/c",
+            "--thresholds",
+            "/tmp/t",
+            "--environment",
+            "/tmp/e",
+            "--out",
+            "/tmp/r",
+            "--source-dependency",
+            "/tmp/dependency.json",
+        ])
+        .is_err(),
+        "Q2 rejects caller-supplied outcome-D evidence"
     );
     assert!(matches!(
         cli::Cli::try_parse_from([
@@ -2554,6 +2581,22 @@ fn cli_matches_frozen_materialize_run_and_verify_shapes() {
         .command,
         cli::Command::Verify(_)
     ));
+    assert!(
+        cli::Cli::try_parse_from([
+            "bin",
+            "verify",
+            "--corpus",
+            "/tmp/c",
+            "--thresholds",
+            "/tmp/t",
+            "--results",
+            "/tmp/r",
+            "--source-dependency",
+            "/tmp/dependency.json",
+        ])
+        .is_err(),
+        "verification has no self-asserted outcome-D input"
+    );
     assert!(
         cli::Cli::try_parse_from([
             "bin",
@@ -2955,6 +2998,17 @@ fn actionable_gap_keeps_the_exact_first_unproven_coordinate() {
         "gap":{"kind":"direct_call_missing","step_index":0},
         "boundary":{"kind":"step","step_index":0}
     });
+    case["receipt_evidence"]["observed_receipts"] = json!([]);
+    for step in case["proof_trace"]["steps"]
+        .as_array_mut()
+        .expect("step traces")
+    {
+        step["candidate_edge_ids"] = json!([]);
+        step["outcome"] = json!({
+            "kind":"first_zero_survivor","gate":"raw_admission","histogram":[]
+        });
+    }
+    rebuild_funnel(&mut value);
     rebind_results_digest(&mut value);
     QualificationSummaryV1::from_json(value.clone())
         .expect("the next prefix boundary is selected independent of gap order");
@@ -2966,6 +3020,60 @@ fn actionable_gap_keeps_the_exact_first_unproven_coordinate() {
     rebind_results_digest(&mut value);
     QualificationSummaryV1::from_json(value)
         .expect_err("a later gap is not actionable at the current prefix boundary");
+}
+
+#[test]
+fn actionable_gap_requires_the_trace_to_explain_the_exact_gap_cause() {
+    let mut claimed = report();
+    let claimed_receipt = claimed["cases"][0]["receipt_evidence"]["observed_receipts"][0].clone();
+    make_non_proven_case(&mut claimed, "unknown", Some("source_binding"));
+    claimed["cases"][0]["receipt_evidence"]["observed_receipts"] = json!([claimed_receipt]);
+    claimed["cases"][0]["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!([1]);
+    claimed["cases"][0]["proof_trace"]["steps"][0]["outcome"] =
+        json!({"kind":"admitted","edge_ids":[1]});
+    rebuild_funnel(&mut claimed);
+    rebind_results_digest(&mut claimed);
+    QualificationSummaryV1::from_json(claimed)
+        .expect_err("an admitted step cannot explain a source-window gap");
+
+    let mut measured = report();
+    let admitted_receipt = measured["cases"][0]["receipt_evidence"]["observed_receipts"][0].clone();
+    make_non_proven_case(&mut measured, "unknown", Some("source_binding"));
+    measured["cases"][0]["actionable_exact_gap"] = Value::Null;
+    measured["cases"][0]["receipt_evidence"]["observed_receipts"] = json!([admitted_receipt]);
+    measured["cases"][0]["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!([1]);
+    measured["cases"][0]["proof_trace"]["steps"][0]["outcome"] =
+        json!({"kind":"admitted","edge_ids":[1]});
+    rebuild_funnel(&mut measured);
+    rebind_results_digest(&mut measured);
+    let parsed = QualificationSummaryV1::from_json(measured)
+        .expect("a trace-disposition mismatch remains measurable as a hard-gate failure");
+    assert!(
+        !parsed.cases[0]
+            .evaluable_facts()
+            .expect("derive product-disposition evidence")
+            .product_disposition_matches_evidence,
+        "a product gap whose cause is absent from the trace must fail the disposition gate"
+    );
+}
+
+#[test]
+fn selector_and_finalization_gap_causes_are_trace_bound() {
+    let mut selector = report();
+    make_non_proven_case(&mut selector, "unknown", Some("selector_missing"));
+    selector["cases"][0]["proof_trace"]["selectors"][0]["outcome"] =
+        json!({"kind":"failed","reason":"ambiguous"});
+    rebind_results_digest(&mut selector);
+    QualificationSummaryV1::from_json(selector)
+        .expect_err("selector_missing cannot be explained by an ambiguous selector trace");
+
+    let mut budget = report();
+    set_receipt_budget_case(&mut budget["cases"][0]);
+    budget["cases"][0]["proof_trace"]["finalization"] =
+        json!({"kind":"failed","failure":"receipt_integration"});
+    rebind_results_digest(&mut budget);
+    QualificationSummaryV1::from_json(budget)
+        .expect_err("an integration failure cannot explain output_budget_exceeded");
 }
 
 #[test]

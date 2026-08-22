@@ -44,9 +44,6 @@ pub struct RunArgs {
     pub environment: PathBuf,
     #[arg(long, value_name = "OUTPUT_DIR")]
     pub out: PathBuf,
-    /// Optional, closed source evidence that the evidence-only v3 cut is inseparable.
-    #[arg(long, value_name = "EVIDENCE_JSON")]
-    pub source_dependency: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -57,7 +54,4 @@ pub struct VerifyArgs {
     pub thresholds: PathBuf,
     #[arg(long, value_name = "RESULTS_DIR")]
     pub results: PathBuf,
-    /// The exact optional source evidence used by `run`, when decision D was selected.
-    #[arg(long, value_name = "EVIDENCE_JSON")]
-    pub source_dependency: Option<PathBuf>,
 }

@@ -2,9 +2,8 @@ use super::contracts::{
     ActivationDecisionV1, ActivationOutcomeV1, CohortObservationV1, CorpusV1,
     DerivedObservationsV1, FailedGateV1, GateFailureDetailV1, HardGateObservationsV1,
     MaterializationFreshnessV1, McpRevisionV1, ProductDispositionKindV1, QualificationGateKindV1,
-    QualificationSummaryV1, RatioObservationV1, RoleThresholdsV1, SourceDependencyEvidenceV1,
-    ThresholdsV1, TransportErrorV1, TransportEvidenceV1, TransportP95ObservationV1,
-    WilsonObservationV1,
+    QualificationSummaryV1, RatioObservationV1, RoleThresholdsV1, ThresholdsV1, TransportErrorV1,
+    TransportEvidenceV1, TransportP95ObservationV1, WilsonObservationV1,
 };
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
@@ -178,17 +177,15 @@ pub fn evaluate_activation_decision(
     summary: &QualificationSummaryV1,
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
-    source_dependency: Option<&SourceDependencyEvidenceV1>,
 ) -> Result<ActivationDecisionV1> {
     summary.validate_against_inputs(corpus, thresholds)?;
     let observations = observations(summary)?;
-    decision_from_observations(&observations, thresholds, source_dependency)
+    decision_from_observations(&observations, thresholds)
 }
 
 fn decision_from_observations(
     observations: &Observations,
     thresholds: &ThresholdsV1,
-    source_dependency: Option<&SourceDependencyEvidenceV1>,
 ) -> Result<ActivationDecisionV1> {
     let mut failed_gates = hard_gate_failures(observations, thresholds);
     let hard_failed = !failed_gates.is_empty();
@@ -221,19 +218,7 @@ fn decision_from_observations(
     failed_gates.extend(stable.failures);
     failed_gates.extend(experimental.failures);
 
-    let outcome = if let Some(evidence) = source_dependency {
-        failed_gates.insert(
-            0,
-            FailedGateV1 {
-                gate_id: "integration.source_dependency".to_owned(),
-                kind: QualificationGateKindV1::IntegrationDependency,
-                detail: GateFailureDetailV1::SourceDependency {
-                    evidence: Box::new(evidence.clone()),
-                },
-            },
-        );
-        ActivationOutcomeV1::DelayFullV3Cut
-    } else if hard_failed {
+    let outcome = if hard_failed {
         ActivationOutcomeV1::KeepProofDark
     } else if stable.role_met {
         ActivationOutcomeV1::PublicExactVerifier
@@ -243,11 +228,7 @@ fn decision_from_observations(
         ActivationOutcomeV1::KeepProofDark
     };
     let decision = ActivationDecisionV1 {
-        automatic_thresholds_met: if matches!(outcome, ActivationOutcomeV1::DelayFullV3Cut) {
-            None
-        } else {
-            Some(automatic_met)
-        },
+        automatic_thresholds_met: Some(automatic_met),
         outcome,
         failed_gates,
     };
@@ -713,11 +694,7 @@ fn maximum(
 
 #[cfg(test)]
 mod tests {
-    use super::super::contracts::{
-        IntegrationDependencyTestKindV1, IntegrationDependencyTestStatusV1,
-        IntegrationDependencyTestV1, OracleSourceRangeV1, SourceDependencyCoordinateV1,
-        SourceDependencyKindV1, canonical_thresholds_sha256, results_evidence_sha256_from_json,
-    };
+    use super::super::contracts::{canonical_thresholds_sha256, results_evidence_sha256_from_json};
     use super::*;
     use sha2::{Digest, Sha256};
 
@@ -1002,40 +979,6 @@ mod tests {
         );
     }
 
-    fn source_dependency() -> SourceDependencyEvidenceV1 {
-        SourceDependencyEvidenceV1 {
-            schema: "codestory.proof-availability-source-dependency/v1".to_owned(),
-            qualification_source_commit: "b".repeat(40),
-            qualification_source_tree: "c".repeat(40),
-            dependency_source: SourceDependencyCoordinateV1 {
-                range: OracleSourceRangeV1 {
-                    path: "crates/codestory-cli/src/stdio_v3.rs".to_owned(),
-                    start_byte: 10,
-                    end_byte: 20,
-                    file_byte_length: 100,
-                    sha256: "a".repeat(64),
-                },
-                file_sha256: "d".repeat(64),
-            },
-            test_source: SourceDependencyCoordinateV1 {
-                range: OracleSourceRangeV1 {
-                    path: "crates/codestory-cli/tests/architecture_contracts.rs".to_owned(),
-                    start_byte: 30,
-                    end_byte: 40,
-                    file_byte_length: 200,
-                    sha256: "e".repeat(64),
-                },
-                file_sha256: "f".repeat(64),
-            },
-            dependency: SourceDependencyKindV1::TransportCannotRepresentKeepDark,
-            passing_test: IntegrationDependencyTestV1 {
-                test_id: "transport_cannot_represent_keep_dark".to_owned(),
-                kind: IntegrationDependencyTestKindV1::TransportCannotRepresentKeepDark,
-                status: IntegrationDependencyTestStatusV1::Passed,
-            },
-        }
-    }
-
     #[test]
     fn derived_observations_publish_raw_counts_unrounded_wilson_and_tamper_evidence() {
         use super::super::contracts::{
@@ -1067,13 +1010,10 @@ mod tests {
             thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
             observations,
             observations_sha256,
-            source_dependency: None,
-            source_dependency_sha256: None,
             decision: evaluate_activation_decision(
                 &summary,
                 &CorpusV1::from_json(corpus).expect("corpus"),
                 &thresholds,
-                None,
             )
             .expect("decision"),
         };
@@ -1085,111 +1025,34 @@ mod tests {
     }
 
     #[test]
-    fn decision_report_binds_delay_outcome_to_the_validated_source_dependency() {
-        use super::super::contracts::{
-            ActivationDecisionReportV1, DECISION_REPORT_SCHEMA, canonical_observations_sha256,
-            canonical_source_dependency_sha256,
-        };
-
-        let (report, corpus, threshold_value) = accepted_fixture::values();
-        let summary = QualificationSummaryV1::from_json(report).expect("summary");
-        let corpus = CorpusV1::from_json(corpus).expect("corpus");
-        let thresholds = ThresholdsV1::from_json(threshold_value).expect("thresholds");
-        let observations = derive_observations(&summary, &thresholds).expect("observations");
-        let observations_sha256 = canonical_observations_sha256(
-            &summary.provenance.results_sha256,
-            &summary.provenance.thresholds_sha256,
-            &observations,
-        )
-        .expect("observation digest");
-        let dependency = source_dependency();
-        let source_dependency_sha256 =
-            canonical_source_dependency_sha256(&dependency).expect("dependency digest");
-        let mut decision =
-            evaluate_activation_decision(&summary, &corpus, &thresholds, Some(&dependency))
-                .expect("dependency outcome D");
-        let report = ActivationDecisionReportV1 {
-            schema: DECISION_REPORT_SCHEMA.into(),
-            results_sha256: summary.provenance.results_sha256.clone(),
-            thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
-            observations: observations.clone(),
-            observations_sha256: observations_sha256.clone(),
-            source_dependency: Some(dependency.clone()),
-            source_dependency_sha256: Some(source_dependency_sha256.clone()),
-            decision: decision.clone(),
-        };
-        report.validate().expect("outcome D report");
-
-        let mut wrong_outcome = report.clone();
-        wrong_outcome.decision.outcome = ActivationOutcomeV1::KeepProofDark;
-        wrong_outcome
-            .validate()
-            .expect_err("source dependency evidence selects only outcome D");
-
-        let GateFailureDetailV1::SourceDependency { evidence } =
-            &mut decision.failed_gates[0].detail
-        else {
-            panic!("outcome D must carry dependency evidence")
-        };
-        evidence.passing_test.test_id = "different-passing-test".to_owned();
-        ActivationDecisionReportV1 {
-            schema: DECISION_REPORT_SCHEMA.into(),
-            results_sha256: summary.provenance.results_sha256.clone(),
-            thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
-            observations,
-            observations_sha256,
-            source_dependency: Some(dependency),
-            source_dependency_sha256: Some(source_dependency_sha256),
-            decision,
-        }
-        .validate()
-        .expect_err("decision evidence must equal the validated dependency input");
-    }
-
-    #[test]
-    fn decision_order_is_automatic_stable_experimental_dark_and_dependency() {
+    fn decision_order_is_automatic_stable_experimental_and_dark() {
         let thresholds = frozen();
-        let automatic = decision_from_observations(&observed(120, [30; 4]), &thresholds, None)
-            .expect("automatic A");
+        let automatic =
+            decision_from_observations(&observed(120, [30; 4]), &thresholds).expect("automatic A");
         assert!(matches!(
             automatic.outcome,
             ActivationOutcomeV1::PublicExactVerifier
         ));
         assert_eq!(automatic.automatic_thresholds_met, Some(true));
 
-        let stable = decision_from_observations(&observed(60, [15; 4]), &thresholds, None)
-            .expect("stable A");
+        let stable =
+            decision_from_observations(&observed(60, [15; 4]), &thresholds).expect("stable A");
         assert!(matches!(
             stable.outcome,
             ActivationOutcomeV1::PublicExactVerifier
         ));
         assert_eq!(stable.automatic_thresholds_met, Some(false));
 
-        let experimental =
-            decision_from_observations(&observed(25, [12, 5, 4, 4]), &thresholds, None)
-                .expect("experimental B");
+        let experimental = decision_from_observations(&observed(25, [12, 5, 4, 4]), &thresholds)
+            .expect("experimental B");
         assert!(matches!(
             experimental.outcome,
             ActivationOutcomeV1::ExperimentalManualVerifier
         ));
 
-        let dark = decision_from_observations(&observed(23, [6, 6, 6, 5]), &thresholds, None)
-            .expect("dark C");
+        let dark =
+            decision_from_observations(&observed(23, [6, 6, 6, 5]), &thresholds).expect("dark C");
         assert!(matches!(dark.outcome, ActivationOutcomeV1::KeepProofDark));
-
-        let dependency = source_dependency();
-        let delayed =
-            decision_from_observations(&observed(120, [30; 4]), &thresholds, Some(&dependency))
-                .expect("dependency D");
-        assert!(matches!(
-            delayed.outcome,
-            ActivationOutcomeV1::DelayFullV3Cut
-        ));
-        assert_eq!(delayed.automatic_thresholds_met, None);
-        assert_eq!(
-            delayed.failed_gates[0].gate_id,
-            "integration.source_dependency"
-        );
     }
 
     #[test]
@@ -1198,7 +1061,7 @@ mod tests {
         let mut value = observed(120, [30; 4]);
         value.false_contract_proven = 1;
         let decision =
-            decision_from_observations(&value, &thresholds, None).expect("hard-failed decision");
+            decision_from_observations(&value, &thresholds).expect("hard-failed decision");
         assert!(matches!(
             decision.outcome,
             ActivationOutcomeV1::KeepProofDark
@@ -1223,11 +1086,11 @@ mod tests {
             .map(|(key, value)| (key.clone(), *value))
             .collect();
         let left = serde_json::to_vec(
-            &decision_from_observations(&first, &thresholds, None).expect("left decision"),
+            &decision_from_observations(&first, &thresholds).expect("left decision"),
         )
         .expect("left JSON");
         let right = serde_json::to_vec(
-            &decision_from_observations(&second, &thresholds, None).expect("right decision"),
+            &decision_from_observations(&second, &thresholds).expect("right decision"),
         )
         .expect("right JSON");
         assert_eq!(left, right);
@@ -1271,7 +1134,7 @@ mod tests {
         let summary = QualificationSummaryV1::from_json(report).expect("accepted summary");
         let corpus = CorpusV1::from_json(corpus).expect("accepted corpus");
         let thresholds = ThresholdsV1::from_json(thresholds).expect("accepted thresholds");
-        let decision = evaluate_activation_decision(&summary, &corpus, &thresholds, None)
+        let decision = evaluate_activation_decision(&summary, &corpus, &thresholds)
             .expect("evaluated decision");
         assert!(matches!(
             decision.outcome,
@@ -1289,7 +1152,7 @@ mod tests {
         let summary = QualificationSummaryV1::from_json(report).expect("false-proof summary");
         let corpus = CorpusV1::from_json(corpus).expect("accepted corpus");
         let thresholds = ThresholdsV1::from_json(thresholds).expect("accepted thresholds");
-        let decision = evaluate_activation_decision(&summary, &corpus, &thresholds, None)
+        let decision = evaluate_activation_decision(&summary, &corpus, &thresholds)
             .expect("false-proof decision");
         assert!(matches!(
             decision.outcome,
@@ -1322,7 +1185,7 @@ mod tests {
         let summary = QualificationSummaryV1::from_json(report).expect("mismatched summary");
         let corpus = CorpusV1::from_json(corpus).expect("accepted corpus");
         let thresholds = ThresholdsV1::from_json(thresholds).expect("accepted thresholds");
-        let decision = evaluate_activation_decision(&summary, &corpus, &thresholds, None)
+        let decision = evaluate_activation_decision(&summary, &corpus, &thresholds)
             .expect("mismatch decision");
         assert!(
             decision
@@ -1340,7 +1203,7 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
         let corpus = CorpusV1::from_json(corpus).expect("accepted corpus");
         let thresholds = ThresholdsV1::from_json(thresholds).expect("accepted thresholds");
-        evaluate_activation_decision(&summary, &corpus, &thresholds, None)
+        evaluate_activation_decision(&summary, &corpus, &thresholds)
             .expect_err("summary threshold identity mismatch");
 
         let (report, mut corpus, thresholds) = accepted_fixture::values();
@@ -1349,7 +1212,7 @@ mod tests {
         let summary = QualificationSummaryV1::from_json(report).expect("accepted summary");
         let corpus = CorpusV1::from_json(corpus).expect("shaped corpus");
         let thresholds = ThresholdsV1::from_json(thresholds).expect("accepted thresholds");
-        evaluate_activation_decision(&summary, &corpus, &thresholds, None)
+        evaluate_activation_decision(&summary, &corpus, &thresholds)
             .expect_err("corpus threshold freeze mismatch");
     }
 }

@@ -250,6 +250,10 @@ fn skip_gated_item<'a>(lines: &mut impl Iterator<Item = &'a str>) {
             return;
         }
         if line.contains('{') {
+            let trimmed = line.trim_end();
+            if !opened_block && (trimmed.ends_with('}') || trimmed.ends_with("};")) {
+                return;
+            }
             opened_block = true;
             continue;
         }
@@ -856,7 +860,9 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
 fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     let cli_lib = read("crates/codestory-cli/src/lib.rs");
     assert!(
-        cli_lib.contains("#[cfg(any(test, feature = \"proof-qualification-support\"))]\n#[allow(dead_code)]\nmod stdio_v3;"),
+        cli_lib.contains(
+            "#[cfg(any(\n    test,\n    feature = \"proof-qualification-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\n#[allow(dead_code)]\nmod stdio_v3;"
+        ),
         "the revision-native transport facade must stay behind the sealed benchmark feature"
     );
 
@@ -2332,6 +2338,39 @@ fn production() {
     let production = production_source(multiline_gated_use);
     assert!(!production.contains("first, second"));
     assert!(production.contains("real_call()"));
+
+    let one_line_braced_use = "\
+#[cfg(test)]
+use crate::{first, second};
+
+fn production() {
+    real_call();
+}
+";
+    let production = production_source(one_line_braced_use);
+    assert!(!production.contains("first, second"));
+    assert!(
+        production.contains("real_call()"),
+        "a one-line braced test import must not consume following production code: {production}"
+    );
+
+    let nested_one_line_braces = "\
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        match 1 {
+            _ => {}
+        }
+    }
+}
+
+fn production() {
+    real_call();
+}
+";
+    let production = production_source(nested_one_line_braces);
+    assert!(!production.contains("_ => {}"));
+    assert!(production.contains("real_call()"));
 }
 
 #[test]
@@ -2347,6 +2386,20 @@ fn shipped() {
 }
 ";
     assert!(production_source_contains_git_spawn(source));
+}
+
+#[test]
+fn evidence_only_v3_support_is_feature_separate_from_proof_qualification() {
+    let manifest = read("crates/codestory-cli/Cargo.toml");
+    assert!(
+        manifest.contains("v3-evidence-separation-support = []"),
+        "the Q1 evidence-only compile gate must not activate proof qualification"
+    );
+    let library = read("crates/codestory-cli/src/lib.rs");
+    assert!(
+        library.contains("feature = \"v3-evidence-separation-support\""),
+        "the sealed evidence-only conformance facade must compile independently"
+    );
 }
 
 #[test]

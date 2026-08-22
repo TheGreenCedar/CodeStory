@@ -10,7 +10,7 @@
 
 **Spec:** [CodeStory v3 retrieval/proof separation](../codestory-v3-retrieval-proof-separation.md). This plan preserves that document's proof semantics but supersedes its fixed five-PR sequence and unconditional public `prove_call_path` registration.
 
-**2026-08-21 operational amendment:** The verified-state section below records the historical planning snapshot and remains useful as provenance. All remaining branches and integration PRs target `dev/codestory-0.18`, not `dev/codestory-next`. The concurrent 0.17.4 release lane is outside this program. Q1 remains production-dark and produces neither an availability result nor an activation decision; Q2 alone may select Outcome A, B, C, or D. Current `run` invocations must pass the frozen thresholds explicitly, and current `verify` invocations must pass the frozen corpus explicitly.
+**2026-08-21 operational amendment:** The verified-state section below records the historical planning snapshot and remains useful as provenance. All remaining branches and integration PRs target `dev/codestory-0.18`, not `dev/codestory-next`. The concurrent 0.17.4 release lane is outside this program. Q1 remains production-dark and produces no availability result. It must prove that evidence-only v3 compiles and conforms without proof activation; failure records plan-level Outcome D and stops before Q2. After that gate passes, Q2 may select only Outcome A, B, or C. Current `run` invocations must pass the frozen thresholds explicitly, and current `verify` invocations must pass the frozen corpus explicitly.
 
 ## Global Constraints
 
@@ -412,7 +412,7 @@ Commands:
 
 `materialize` creates detached pinned checkouts, verifies oracle hashes, builds fresh full indexes through the source-linked runtime/indexer, and records core generation/run plus database SHA. `run` is local and does not fetch. `verify` recomputes every aggregate and decision from case rows.
 
-The exact commands above remain the A/B/C contract. Outcome D additionally requires the same optional `--source-dependency <EVIDENCE_JSON>` on `run` and `verify`. That closed evidence is bound to the qualification source commit/tree, full-file and range hashes for both the dependency and its architecture test, and a supported dependency/test pairing. Present-but-invalid evidence fails closed; omitted evidence cannot select D.
+The exact commands above are the complete A/B/C contract. Outcome D is not a qualification-binary input or Q2 result. It is selected only when Q1's proof-disabled evidence-surface build or sealed four-revision conformance probe fails; Q2 does not run in that state.
 
 ## 6. Revised PR and issue sequence
 
@@ -572,7 +572,7 @@ Treat the script's printed base, branch head, and proof target as authoritative.
 
 **Interfaces:**
 
-- Consumes: the verified issue/branch state in Section 2 and the A/B/C/D decision contract in Section 7.
+- Consumes: the verified issue/branch state in Section 2 and the staged outcome contract in Section 7: Q1 may stop with D; Q2 may select A, B, or C.
 - Produces: three PR-sized child issue numbers, Q1 → Q2 → #1977 dependency links, and parent text that no longer assumes unconditional proof activation.
 
 - [ ] **Step 1: Recheck exact state before external mutation**
@@ -603,7 +603,7 @@ The packet issue references #1968 and blocks #1977. Q1 and Q2 reference #1973; Q
 
 - [ ] **Step 3: Update the parents without selecting an outcome**
 
-Replace “five PR-sized children” in #1973 with the sequence in Section 6. Add the A/B/C/D table to #1977. Keep #1976 closed and #1200 untouched.
+Replace “five PR-sized children” in #1973 with the sequence in Section 6. Add the staged Q1-D/Q2-A-B-C table to #1977. Keep #1976 closed and #1200 untouched.
 
 - [ ] **Step 4: Verify the control plane**
 
@@ -1045,18 +1045,18 @@ git commit -m "count proof inventory and connected trails"
 
 **Interfaces:**
 
-- Consumes: `QualificationSummaryV1`, recomputed hard-gate and role observations, the frozen role thresholds in Section 8, and optional closed source-dependency evidence.
-- Produces: a decision report containing the selected A/B/C/D outcome, every failed gate, raw numerators/denominators, unrounded and presentation Wilson values, cohort rows, latency/size observations, hard-gate counts, and domain-separated observation/evidence digests. Task 13 records this report verbatim in `decision.json`; no ninth artifact is added.
+- Consumes: `QualificationSummaryV1`, recomputed hard-gate and role observations, and the frozen role thresholds in Section 8.
+- Produces: a decision report containing the selected A/B/C outcome, every failed gate, raw numerators/denominators, unrounded and presentation Wilson values, cohort rows, latency/size observations, hard-gate counts, and a domain-separated observation digest. Task 13 records this report verbatim in `decision.json`; no ninth artifact is added.
 
 - [ ] **Step 1: Add threshold boundary RED tests**
 
-Fixtures cover 95/120 versus 96/120, 11/30 versus 12/30, one false proof, 311/312 classified steps, one invalid payload, and every A/B/C/D decision branch.
+Fixtures cover 95/120 versus 96/120, 11/30 versus 12/30, one false proof, 311/312 classified steps, one invalid payload, and every A/B/C decision branch.
 
 Expected RED: evaluator and frozen threshold document are absent.
 
 - [ ] **Step 2: Implement Wilson bounds and hard-gate precedence**
 
-Use `z = 1.959963984540054`. Hard failures select C with `hard_gate_failed` unless a demonstrated integration dependency independently selects D. Then evaluate automatic, stable, experimental, dark in that order.
+Use `z = 1.959963984540054`. Hard failures select C with `hard_gate_failed`. Then evaluate automatic, stable, experimental, dark in that order.
 
 - [ ] **Step 3: Bind threshold identity**
 
@@ -1143,7 +1143,7 @@ Expected: all pinned source ranges and hashes validate; no database, proof resul
 **Interfaces:**
 
 - Consumes: the frozen corpus/threshold DTOs, Task 8 inventory/trail counters, Task 6 observed runtime facade, and Task 4 revision-native measurement facade.
-- Produces: atomic `environment.json`, `inventory.json`, `trails.json`, `cases.json`, `failure-funnel.json`, `summary.json`, `decision.json`, and `findings.md` artifacts. `decision.json` embeds recomputable derived observations and optional closed source-dependency evidence while preserving this exact eight-artifact set. The executable never substitutes SQL or benchmark logic for a product disposition.
+- Produces: atomic `environment.json`, `inventory.json`, `trails.json`, `cases.json`, `failure-funnel.json`, `summary.json`, `decision.json`, and `findings.md` artifacts. `decision.json` embeds recomputable derived observations while preserving this exact eight-artifact set. The executable never substitutes SQL or benchmark logic for a product disposition.
 
 - [ ] **Step 1: Add materialization RED tests**
 
@@ -1223,6 +1223,8 @@ cargo test --locked -p codestory-agent indexed_source_call_path_v1
 cargo test --locked -p codestory-runtime indexed_source_call_path_v1
 cargo test --locked -p codestory-bench proof_availability
 cargo test --locked -p codestory-cli --test architecture_contracts
+cargo check --locked -p codestory-cli --lib --no-default-features --features v3-evidence-separation-support
+cargo test --locked -p codestory-cli --lib --no-default-features --features v3-evidence-separation-support stdio_v3::evidence_separation_tests::sealed_evidence_only_conformance_covers_all_revisions -- --exact
 node .github/scripts/check-doc-links.mjs
 git diff --check
 ```
@@ -1235,6 +1237,13 @@ shasum -a 256 plugins/codestory/generated-mcp-catalog.json
 ```
 
 Expected: the architecture feature-graph scan passes; catalog remains the accepted v2/v3-dark baseline for the current integration head.
+
+The proof-disabled feature build and sealed conformance probe are Q1
+preconditions. They build and validate packet, context, and search results for
+all four revisions under `EvidenceOnly`, reject any proof tool/schema/route,
+and bind discovery identity to the selected surface set. If either fails, stop
+Q1, record the exact inseparability blocker as Outcome D, and do not create Q2
+artifacts.
 
 - [ ] **Step 4: Independent adversarial review**
 
@@ -1254,7 +1263,7 @@ Close Q1 only. Reference #1973 and #1977. State that no availability result or a
 **Interfaces:**
 
 - Consumes: one exact clean post-PR3/scoring/PR4/Q1 source head, the frozen corpus and thresholds, and one locked release build of `codestory-proof-availability`.
-- Produces: an independently reviewed immutable result directory and a machine-selected A/B/C/D decision for PR 5. No code, corpus, or threshold file changes in this task.
+- Produces: an independently reviewed immutable result directory and a machine-selected A/B/C decision for PR 5. No code, corpus, or threshold file changes in this task.
 
 - [ ] **Step 1: Freeze the source candidate**
 
@@ -1302,7 +1311,8 @@ mkdir -p "$run_root"
   --results "$run_root/results"
 ```
 
-If and only if independent source review supplies valid outcome-D evidence, add the same `--source-dependency <EVIDENCE_JSON>` argument to both `run` and `verify`. The default Q2 command remains exactly as shown.
+These commands are the complete Q2 interface. The evaluator is closed to A, B,
+or C and accepts no caller-supplied Outcome-D evidence.
 
 Do not rerun unchanged failures. A source/oracle/logic failure invalidates the run and returns to Q1; a product result is evidence even when it selects C.
 
@@ -1381,7 +1391,7 @@ Redesign the failing seam rather than adding repository-specific heuristics.
 **Interfaces:**
 
 - Consumes: merged dark PR 3/PR 4 machinery, the scoring fix, Q2's immutable decision, and unchanged Q2 proof/kernel/corpus/threshold hashes.
-- Produces: exactly one public CodeStory schema-3 contract: A registers stable CLI+MCP proof, B registers experimental CLI proof only, C registers no proof surface, and D produces no public cut.
+- Produces: exactly one public CodeStory schema-3 contract: A registers stable CLI+MCP proof, B registers experimental CLI proof only, or C registers no proof surface. A plan-level Outcome D stops before Q2 and therefore never reaches this task.
 
 - [ ] **Step 1: Write the outcome-specific registration RED**
 
@@ -1405,7 +1415,7 @@ Remove packet truth authority, packet-only `include_evidence`, and public proof-
 
 **Outcome C:** keep both proof modules and qualification support dark. Preserve their focused CI tests and document the current Q2 decision.
 
-**Outcome D:** do not implement this task; file the demonstrated inseparability blocker.
+**Outcome D:** unreachable here. Q1 already stopped and filed the demonstrated inseparability blocker before producing Q2 artifacts.
 
 - [ ] **Step 4: Add route exclusivity tests**
 
@@ -1485,7 +1495,7 @@ Record clean head/tree, locked build command, CLI SHA, installed receipt SHA, li
 
 - Outcome A: close #1968, #1977, and #1973 after installed acceptance.
 - Outcome B/C: close #1968 and #1977; keep #1973 open with the Q2 decision and next requalification trigger.
-- Outcome D: keep all public-cut parents open.
+- Plan-level Outcome D: Q1 already stopped before this task; keep all public-cut parents open.
 
 - [ ] **Step 7: Stop**
 

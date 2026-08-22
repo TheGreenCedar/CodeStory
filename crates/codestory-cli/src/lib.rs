@@ -30,9 +30,24 @@ mod status_wire_test_support;
 mod stdio_arguments;
 mod stdio_catalog;
 mod stdio_transport;
-#[cfg(any(test, feature = "proof-qualification-support"))]
+#[cfg(any(
+    test,
+    feature = "proof-qualification-support",
+    feature = "v3-evidence-separation-support"
+))]
 #[allow(dead_code)]
 mod stdio_v3;
+
+/// Sealed Q1 conformance for shipping evidence-only v3 without proof support.
+/// It registers no command, route, transport, or public tool.
+#[cfg(feature = "v3-evidence-separation-support")]
+#[doc(hidden)]
+pub mod v3_evidence_separation_support {
+    /// Validate all four revision-native evidence-only catalogs and results.
+    pub fn validate() -> Result<(), String> {
+        crate::stdio_v3::validate_evidence_only_surface_v3()
+    }
+}
 
 /// Benchmark-only proof qualification observations. This module is not part of
 /// the default CLI module graph and registers no command, transport, or tool.

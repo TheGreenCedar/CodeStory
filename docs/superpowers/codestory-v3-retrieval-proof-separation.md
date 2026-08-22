@@ -187,11 +187,11 @@ Issue: #1977. Parents #1968 and #1973. One integration commit owns the public cu
 
 The [proof availability qualification plan](plans/2026-08-21-codestory-v3-proof-availability-qualification.md) supersedes only this document's fixed delivery sequence and unconditional proof activation. The proof contract, receipt requirements, negative-proof limits, and authority boundaries above remain unchanged. In particular, packet, context, and search remain evidence products; only the exact call-path proof domain may emit proof dispositions.
 
-The qualification work is now split into Q1 followed by Q2. Q1 builds and freezes a production-dark benchmark harness, oracle corpus, thresholds, and verification machinery. Q1 does not produce an availability result and does not make an activation decision. Q2 runs that frozen machinery once on an exact clean head and selects one of four outcomes:
+The qualification work is now split into Q1 followed by Q2. Q1 builds and freezes a production-dark benchmark harness, oracle corpus, thresholds, and verification machinery. Q1 also proves, with a proof-disabled feature build and a sealed four-revision conformance probe, that packet, context, and search can ship without the proof surface. Q1 does not produce an availability result. If that separability gate fails, Q1 records Outcome D as an architecture blocker and Q2 does not run. After the gate passes, Q2 runs the frozen machinery once on an exact clean head and selects one of three outcomes:
 
 - **Outcome A:** register the stable CLI and MCP proof surfaces, with automatic or explicit-only workflow guidance determined by the frozen thresholds.
 - **Outcome B:** expose only an explicitly experimental CLI verifier; do not register MCP, catalog, or skill proof surfaces.
 - **Outcome C:** keep proof dark while shipping the evidence-only packet, context, and search separation.
-- **Outcome D:** delay the public v3 cut only if source-level evidence shows that the evidence-only surfaces cannot ship independently of proof activation.
+- **Outcome D:** stop in Q1 if the evidence-only feature build or sealed conformance probe demonstrates that the evidence surfaces cannot ship independently of proof activation. Q2 never selects D and accepts no caller-supplied dependency evidence.
 
 All remaining integration work targets `dev/codestory-0.18`. The concurrent 0.17.4 release lane is outside this program and must not be changed, rebased, or used as qualification evidence. Publication schema 3 is still cut exactly once, after Q2, only in the selected final integration outcome.

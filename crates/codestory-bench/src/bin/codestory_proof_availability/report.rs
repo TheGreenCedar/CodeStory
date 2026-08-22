@@ -5,8 +5,7 @@ use super::contracts::{
     ProjectedReceiptReferenceV1, ProvenanceV1, QualificationSummaryV1, REPORT_SCHEMA,
     ReceiptOracleComparisonV1, RoleThresholdsV1, StepQualificationOutcomeV1, ThresholdsV1,
     TrailReportV1, TransportErrorV1, TransportEvidenceV1, canonical_corpus_sha256,
-    canonical_observations_sha256, canonical_source_dependency_sha256, canonical_thresholds_sha256,
-    results_evidence_sha256,
+    canonical_observations_sha256, canonical_thresholds_sha256, results_evidence_sha256,
 };
 use super::thresholds::{derive_observations, evaluate_activation_decision};
 use anyhow::{Context, Result, bail};
@@ -184,11 +183,10 @@ pub(crate) fn build_summary(
     Ok(summary)
 }
 
-pub(crate) fn build_public_artifacts_with_dependency(
+pub(crate) fn build_public_artifacts(
     summary: &QualificationSummaryV1,
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
-    source_dependency: Option<&super::contracts::SourceDependencyEvidenceV1>,
 ) -> Result<PublicArtifactBundle> {
     summary.validate_against_inputs(corpus, thresholds)?;
     let observations = derive_observations(summary, thresholds)?;
@@ -197,17 +195,13 @@ pub(crate) fn build_public_artifacts_with_dependency(
         &summary.provenance.thresholds_sha256,
         &observations,
     )?;
-    let decision = evaluate_activation_decision(summary, corpus, thresholds, source_dependency)?;
+    let decision = evaluate_activation_decision(summary, corpus, thresholds)?;
     let decision_report = ActivationDecisionReportV1 {
         schema: DECISION_REPORT_SCHEMA.to_owned(),
         results_sha256: summary.provenance.results_sha256.clone(),
         thresholds_sha256: summary.provenance.thresholds_sha256.clone(),
         observations,
         observations_sha256,
-        source_dependency: source_dependency.cloned(),
-        source_dependency_sha256: source_dependency
-            .map(canonical_source_dependency_sha256)
-            .transpose()?,
         decision,
     };
     decision_report.validate()?;
@@ -226,31 +220,27 @@ pub(crate) fn build_public_artifacts_with_dependency(
     Ok(bundle)
 }
 
-pub(crate) fn build_and_publish_with_dependency(
+pub(crate) fn build_and_publish(
     destination: &Path,
     summary: &QualificationSummaryV1,
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
-    source_dependency: Option<&super::contracts::SourceDependencyEvidenceV1>,
     leak_policy: &PublicLeakPolicy,
 ) -> std::result::Result<(), ReportPublishError> {
-    let bundle =
-        build_public_artifacts_with_dependency(summary, corpus, thresholds, source_dependency)
-            .map_err(|_| {
-                ReportPublishError::before_staging(
-                    "proof_availability_public_artifact_build_failed",
-                    destination,
-                )
-            })?;
+    let bundle = build_public_artifacts(summary, corpus, thresholds).map_err(|_| {
+        ReportPublishError::before_staging(
+            "proof_availability_public_artifact_build_failed",
+            destination,
+        )
+    })?;
     publish_bundle(destination, &bundle, leak_policy)
 }
 
-pub(crate) fn verify_published_with_dependency(
+pub(crate) fn verify_published(
     destination: &Path,
     corpus: &CorpusV1,
     thresholds: &ThresholdsV1,
     path_files: &[CohortPathFileV1],
-    source_dependency_path: Option<&Path>,
     leak_policy: &PublicLeakPolicy,
 ) -> Result<()> {
     require_exact_artifact_set(destination)?;
@@ -273,15 +263,6 @@ pub(crate) fn verify_published_with_dependency(
     let findings_bytes = read_bounded(&destination.join("findings.md"))?;
 
     let summary: QualificationSummaryV1 = serde_json::from_value(summary_value)?;
-    let source_dependency = source_dependency_path
-        .map(|path| {
-            super::materialize::load_source_dependency(
-                path,
-                &summary.provenance.source_commit,
-                &summary.provenance.source_tree,
-            )
-        })
-        .transpose()?;
     let reconstructed = QualificationSummaryV1 {
         schema: summary.schema.clone(),
         qualification_id: summary.qualification_id.clone(),
@@ -314,12 +295,7 @@ pub(crate) fn verify_published_with_dependency(
     if canonical_json_file(&recomputed)? != canonical_json_file(&reconstructed)? {
         bail!("proof_availability_summary_recomputation_mismatch")
     }
-    let expected = build_public_artifacts_with_dependency(
-        &recomputed,
-        corpus,
-        thresholds,
-        source_dependency.as_ref(),
-    )?;
+    let expected = build_public_artifacts(&recomputed, corpus, thresholds)?;
     validate_public_bundle(&expected, leak_policy)?;
     let actual = PublicArtifactBundle {
         environment: serde_json::to_value(&recomputed.environment)?,
