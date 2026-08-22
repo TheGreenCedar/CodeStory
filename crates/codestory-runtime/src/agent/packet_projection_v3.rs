@@ -1,4 +1,4 @@
-//! Dark, pure v3 packet/context/search projection builders.
+//! Pure v3 packet, context, and search projection builders.
 
 #![allow(dead_code)]
 
@@ -8,11 +8,11 @@ use codestory_contracts::packet_projection_v3::{
     BoundViolationV3, BoundedVecV3, ContextEvidenceRowV3Dto, ContextProjectionKindV3Dto,
     ContextProjectionV3Dto, ContextTargetV3Dto, DIAGNOSTIC_ROWS_MAX_V3,
     DiagnosticArtifactKindV3Dto, DiagnosticArtifactV3Dto, DiagnosticReferenceV3Dto,
-    DiagnosticRowV3Dto, DiagnosticsCapabilityV3Dto, EvidenceAvailabilityV3Dto, GapKindV3Dto,
-    IdentityTextV3, PACKET_PROJECTION_V3_SCHEMA_VERSION, PacketProjectionV3Dto,
-    PacketRequestIdentityV3Dto, ProjectionGapRowV3Dto, PublicationIdentityV3Dto,
-    RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto, SearchEvidenceRowV3Dto,
-    SearchProjectionKindV3Dto, SearchProjectionV3Dto, Sha256DigestV3Dto,
+    DiagnosticRowV3Dto, DiagnosticsCapabilityV3Dto, EvidenceAvailabilityV3Dto, GAP_ROWS_MAX_V3,
+    GapIdentityV3Dto, GapKindV3Dto, IdentityTextV3, PACKET_PROJECTION_V3_SCHEMA_VERSION,
+    PacketProjectionV3Dto, PacketRequestIdentityV3Dto, ProjectionGapRowV3Dto,
+    PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
+    SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SearchProjectionV3Dto, Sha256DigestV3Dto,
 };
 use sha2::{Digest, Sha256};
 
@@ -191,6 +191,7 @@ pub(crate) fn build_packet_projection_v3(
         status: EvidenceAvailabilityV3Dto::Unavailable,
         retrieval: record.retrieval().clone(),
         diagnostics,
+        gaps: packet_budget_exceeded_gaps_v3(),
         maximum_bytes: PACKET_PUBLIC_RESULT_MAX_BYTES_V3 as u64,
         required_complete_bytes: required_complete_bytes as u64,
     };
@@ -202,6 +203,18 @@ pub(crate) fn build_packet_projection_v3(
         });
     }
     Ok(fallback)
+}
+
+fn packet_budget_exceeded_gaps_v3() -> BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3> {
+    BoundedVecV3::new(vec![ProjectionGapRowV3Dto {
+        identity: GapIdentityV3Dto {
+            gap_id: IdentityTextV3::new("packet-output-budget-exceeded")
+                .expect("static budget gap identity is bounded"),
+        },
+        kind: GapKindV3Dto::OutputBudgetExceeded,
+        message: None,
+    }])
+    .expect("one budget gap fits the closed projection")
 }
 
 fn packet_complete_candidate_v3(
@@ -512,6 +525,7 @@ pub(crate) fn build_diagnostic_artifact_v3(
         artifact_id,
         sha256,
         byte_length: bytes.len() as u64,
+        wall_expiry_epoch_ms: None,
     };
     Ok(DiagnosticArtifactBuildV3::Complete {
         artifact: Box::new(artifact),
@@ -651,7 +665,6 @@ mod tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: None,
             option_ids: Vec::new(),
@@ -730,6 +743,7 @@ mod tests {
                 artifact_id: identity("diagnostic-artifact-1"),
                 sha256: Sha256DigestV3Dto::new("d".repeat(64)).unwrap(),
                 byte_length: 512,
+                wall_expiry_epoch_ms: None,
             },
         }
     }
@@ -1092,11 +1106,19 @@ mod tests {
                     status,
                     retrieval: record.retrieval().clone(),
                     diagnostics,
+                    gaps: packet_budget_exceeded_gaps_v3(),
                     maximum_bytes,
                     required_complete_bytes,
                 })
                 .unwrap();
-                for absent in ["evidence", "gaps", "continuation", "summary", "message"] {
+                let gaps = serialized["gaps"].as_array().expect("typed budget gap");
+                assert_eq!(gaps.len(), 1, "fallback must carry exactly one gap");
+                assert_eq!(gaps[0]["kind"], "output_budget_exceeded");
+                assert_eq!(
+                    gaps[0]["identity"]["gap_id"],
+                    "packet-output-budget-exceeded"
+                );
+                for absent in ["evidence", "continuation", "summary"] {
                     assert!(serialized.get(absent).is_none(), "fallback leaked {absent}");
                 }
             }

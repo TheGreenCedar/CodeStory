@@ -116,7 +116,6 @@ fn prepare_drill(cmd: &DrillCommand) -> Result<PreparedDrill> {
             task_class: None,
             probes: Vec::new(),
             extra_probes: anchors.clone(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: None,
             option_ids: Vec::new(),
@@ -156,6 +155,19 @@ pub(super) fn execute_drill(
         let evidence_packet = execute_drill_packet(packet_request.clone(), |request| {
             runtime.browser.packet(request)
         })?;
+        let evidence_projection = codestory_runtime::project_packet_v3(
+            &runtime.public_operation,
+            "codestory-cli-drill",
+            &packet_request,
+            &evidence_packet,
+            |candidate| {
+                serde_json::to_vec(candidate)
+                    .map(|bytes| bytes.len())
+                    .map_err(|_| ())
+            },
+        )
+        .map_err(map_api_error)?
+        .projection;
         let question_search_ms = elapsed_ms(packet_timer);
         let evidence_assembly_timer = Instant::now();
         let citations = drill_packet_citations(&evidence_packet);
@@ -165,7 +177,7 @@ pub(super) fn execute_drill(
         let mut all_verification_targets =
             drill_packet_verification_targets(&runtime.project_root, &citations);
         dedupe_verification_targets(&mut all_verification_targets);
-        let next_commands = packet_drill_option_ids(&evidence_packet);
+        let next_commands = Vec::new();
         let question_search = Some(DrillCommandStatusOutput {
             command: "packet".to_string(),
             status: packet_sufficiency_label(evidence_packet.disposition.kind).to_string(),
@@ -212,7 +224,8 @@ pub(super) fn execute_drill(
             bridges: bridge_outputs,
             execution_boundaries: drill_execution_boundaries(),
             verification_targets: all_verification_targets,
-            evidence_packet,
+            evidence_packet: evidence_projection,
+            legacy_evidence_packet: evidence_packet,
             next_commands,
         })
     })

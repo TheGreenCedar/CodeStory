@@ -80,16 +80,15 @@ const managedCliProbeForceKillGraceMs = 1000;
 // plugin test suite pins the launcher copy to that recording. The launcher must
 // not depend on the catalog at run time: a packaging failure that loses the
 // catalog must not also lose the skew detector.
-const managedCliMcpProtocolVersion = '2024-11-05';
-const supportedMcpProtocolVersions = Object.freeze(['2024-11-05']);
-const darkV3SupportedMcpProtocolVersions = Object.freeze([
+const managedCliMcpProtocolVersion = '2025-11-25';
+const supportedMcpProtocolVersions = Object.freeze([
   '2024-11-05',
   '2025-03-26',
   '2025-06-18',
   '2025-11-25',
 ]);
-const publicationStampSchemaVersion = 2;
-const minimumCompatiblePublicationStampSchemaVersion = 2;
+const publicationStampSchemaVersion = 3;
+const minimumCompatiblePublicationStampSchemaVersion = 3;
 const runtimeStderrObservedBytesCap = 16 * 1024 * 1024;
 const runtimeStderrObservedChunksCap = 65_535;
 const failOpenMaxFrameBytes = 1024 * 1024;
@@ -2233,24 +2232,33 @@ function isPlainObject(value) {
 // launcher answers `initialize` itself and suppresses the CLI's answer, so an
 // echoed revision here would be a false compatibility claim the host can never
 // see corrected.
-function negotiateMcpProtocolVersion(requested) {
+function negotiateMcpProtocolVersion(
+  requested,
+  discoveryContracts = canonicalMcpCatalog?.wireContract?.discoveryContracts,
+) {
   const asked = typeof requested === 'string' ? requested.trim() : '';
   if (!asked) {
+    const negotiated = managedCliMcpProtocolVersion;
     return {
       requested: null,
-      negotiated: managedCliMcpProtocolVersion,
+      negotiated,
       supported: [...supportedMcpProtocolVersions],
+      preferred: managedCliMcpProtocolVersion,
       status: 'defaulted',
       compatible: true,
+      discovery_contract_sha256: discoveryContracts?.[negotiated] ?? null,
     };
   }
   const agreed = supportedMcpProtocolVersions.includes(asked);
+  const negotiated = agreed ? asked : managedCliMcpProtocolVersion;
   return {
     requested: asked,
-    negotiated: agreed ? asked : managedCliMcpProtocolVersion,
+    negotiated,
     supported: [...supportedMcpProtocolVersions],
+    preferred: managedCliMcpProtocolVersion,
     status: agreed ? 'agreed' : 'unsupported_client_revision',
     compatible: agreed,
+    discovery_contract_sha256: discoveryContracts?.[negotiated] ?? null,
   };
 }
 
@@ -2333,14 +2341,14 @@ function runtimeWireContractSkew(response, negotiatedProtocolVersion) {
   return publicationStampSkew(result._meta?.codestory_publication);
 }
 
-function darkV3LauncherSession(requested, discoveryContracts) {
+function v3LauncherSession(requested, discoveryContracts) {
   const asked = typeof requested === 'string' ? requested.trim() : '';
-  const negotiated = darkV3SupportedMcpProtocolVersions.includes(asked)
+  const negotiated = supportedMcpProtocolVersions.includes(asked)
     ? asked
-    : darkV3SupportedMcpProtocolVersions.at(-1);
+    : managedCliMcpProtocolVersion;
   const discoveryContractSha256 = discoveryContracts?.[negotiated];
   if (!/^[0-9a-f]{64}$/u.test(String(discoveryContractSha256 || ''))) {
-    throw new Error('dark_v3_discovery_contract_missing');
+    throw new Error('v3_discovery_contract_missing');
   }
   return Object.freeze({
     requested: asked || null,
@@ -2350,7 +2358,7 @@ function darkV3LauncherSession(requested, discoveryContracts) {
   });
 }
 
-function darkV3RuntimeWireContractSkew(response, session) {
+function v3RuntimeWireContractSkew(response, session) {
   if (!isPlainObject(response)) return 'initialize_response_invalid';
   if (response.error !== undefined) return 'initialize_rejected';
   const result = response.result;
@@ -2444,6 +2452,8 @@ function probeManagedCliStdio(cliPath, timeoutMs = 5000, options = {}) {
         response?.jsonrpc !== '2.0' || response?.id !== 'managed-cli-staging' ||
         !isPlainObject(response.result) ||
         response.result.protocolVersion !== managedCliMcpProtocolVersion ||
+        response.result._meta?.codestory_protocol?.discovery_contract_sha256
+          !== canonicalMcpCatalog?.wireContract?.discoveryContracts?.[managedCliMcpProtocolVersion] ||
         !isPlainObject(response.result.capabilities) ||
         !isPlainObject(response.result.serverInfo) ||
         typeof response.result.serverInfo.name !== 'string' || !response.result.serverInfo.name.trim() ||
@@ -3917,12 +3927,6 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       project: selection.project,
       state: selection.code === 'project_required' ? 'no_project' : 'unavailable',
     };
-    if (tool === 'status' && selection.code === 'project_required') {
-      return {
-        content: [{ type: 'text', text: 'state: no_project\nresult: structured\n' }],
-        structuredContent,
-      };
-    }
     return {
       content: [{ type: 'text', text: structuredContent.message }],
       structuredContent,
@@ -3942,8 +3946,6 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
       capabilities: { local_navigation: 'unavailable', broad_search: preparing ? 'preparing' : 'unavailable' },
       current_operation: currentOperation,
       failure: preparing ? null : primaryFailure,
-      failure_context: !preparing && managedFailure ? managedCliProvisionFailure.context : null,
-      hint: !preparing && managedFailure ? managedCliProvisionFailure.hint : null,
       next_action: preparing ? 'retry_intended_tool' : 'use_source_inspection',
       retry_after_ms: currentOperation ? currentOperation.retry_after_ms : null,
       diagnostics_uri: diagnosticsUri,
@@ -3984,10 +3986,36 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
     content: [{ type: 'text', text: structuredContent.message }],
     structuredContent,
   };
-  if (!preparing) {
-    result.isError = true;
-  }
+  result.isError = true;
   return result;
+}
+
+function revisionNativeFailOpenToolResult(revision, legacyResult) {
+  const root = legacyResult?.structuredContent;
+  const isError = legacyResult?.isError === true || !isPlainObject(root);
+  const text = JSON.stringify(
+    isPlainObject(root)
+      ? root
+      : { code: 'codestory_unavailable', message: 'CodeStory is unavailable.' },
+  );
+  if (isError) {
+    return { content: [{ type: 'text', text }], isError: true };
+  }
+  if (revision === '2024-11-05' || revision === '2025-03-26') {
+    return { content: [{ type: 'text', text }], isError: false };
+  }
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: root,
+    isError: false,
+    _meta: {
+      'com.thegreencedar.codestory/protocolRevision': revision,
+      codestory_publication: {
+        schema_version: publicationStampSchemaVersion,
+        minimum_compatible_schema_version: minimumCompatiblePublicationStampSchemaVersion,
+      },
+    },
+  };
 }
 
 const shuttingDownHandoffs = new WeakSet();
@@ -4145,14 +4173,19 @@ function runFailOpenMcp(status, options = {}) {
   let tools;
   let resources;
   let resourceTemplates;
-  try {
-    tools = failOpenToolCatalog(catalog);
-    if (!Array.isArray(catalog.resources) || !Array.isArray(catalog.resourceTemplates)) {
+  const catalogProfile = (revision) => catalog?.revisionProfiles?.[revision] ?? catalog;
+  const selectCatalogProfile = (revision) => {
+    const profile = catalogProfile(revision);
+    tools = failOpenToolCatalog(profile);
+    if (!Array.isArray(profile?.resources) || !Array.isArray(profile?.resourceTemplates)) {
       throw new Error('generated_mcp_catalog_missing:run_generate_codestory_skill_syntax');
     }
-    resources = catalog.resources.filter(({ uri }) => uri === 'codestory://agent-guide');
-    resourceTemplates = catalog.resourceTemplates.filter(({ uriTemplate }) =>
+    resources = profile.resources.filter(({ uri }) => uri === 'codestory://agent-guide');
+    resourceTemplates = profile.resourceTemplates.filter(({ uriTemplate }) =>
       uriTemplate === 'codestory://status{?project}');
+  };
+  try {
+    selectCatalogProfile(managedCliMcpProtocolVersion);
   } catch (error) {
     catalogFailure = error;
     tools = emergencyStatusToolCatalog();
@@ -4171,6 +4204,7 @@ function runFailOpenMcp(status, options = {}) {
   let handoffWrite = null;
   let initializeRequest = null;
   let negotiatedProtocol = null;
+  let v3Session = null;
   let initializedNotification = null;
   let runtimeReadyNotified = false;
   let stdinEnded = false;
@@ -4298,10 +4332,7 @@ function runFailOpenMcp(status, options = {}) {
             // `initialize`. That makes the launcher the only reader of the
             // runtime's own compatibility claim, and the only place a
             // `CODESTORY_CLI` override can be caught at session runtime.
-            const skew = runtimeWireContractSkew(
-              parsed,
-              negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion,
-            );
+            const skew = v3RuntimeWireContractSkew(parsed, v3Session);
             if (skew) {
               failHandoff('runtime_wire_contract_skew', { errorCode: skew });
               return;
@@ -4355,38 +4386,61 @@ function runFailOpenMcp(status, options = {}) {
       diagnostics_uri_template: 'codestory://status{?project}',
     };
   };
-  const handleLine = (line) => {
-    if (!line.trim()) return;
-    let request;
-    try {
-      request = JSON.parse(line);
-    } catch {
-      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
-      return;
+  const validJsonRpcId = (value) => value === null
+    || typeof value === 'string'
+    || (typeof value === 'number' && Number.isFinite(value));
+  const validateJsonRpcRequest = (request) => isPlainObject(request)
+    && Object.keys(request).every((field) => ['jsonrpc', 'id', 'method', 'params'].includes(field))
+    && request.jsonrpc === '2.0'
+    && typeof request.method === 'string'
+    && (!Object.hasOwn(request, 'id') || validJsonRpcId(request.id))
+    && (!Object.hasOwn(request, 'params')
+      || Array.isArray(request.params)
+      || isPlainObject(request.params));
+  const invalidRequest = (request) => jsonrpcError(
+    isPlainObject(request) && validJsonRpcId(request.id) ? request.id : null,
+    -32600,
+    'Invalid Request',
+  );
+  const unknownToolArgument = (tool, argumentsValue) => {
+    if (!isPlainObject(argumentsValue)) return null;
+    const properties = tool?.inputSchema?.properties;
+    if (!isPlainObject(properties) || tool?.inputSchema?.additionalProperties !== false) {
+      return null;
     }
-    if (!request || typeof request !== 'object' || Array.isArray(request)) {
-      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32600, 'Invalid Request'))}\n`);
-      return;
-    }
+    return Object.keys(argumentsValue).find((field) => !Object.hasOwn(properties, field)) ?? null;
+  };
+  const handleRequest = (request, rawLine, allowHandoff = true) => {
+    if (!validateJsonRpcRequest(request)) return invalidRequest(request);
     if (request.method === 'notifications/initialized') {
       initializedNotification = request;
       notifyRuntimeReady();
-      return;
+      return null;
     }
     if (request.method === 'initialize' && request.id !== undefined) {
       initializeRequest = request;
     }
-    const delegated = request.method === 'initialize' ? null : maybeHandoff();
+    const delegated = allowHandoff && request.method !== 'initialize' ? maybeHandoff() : null;
     if (delegated) {
       if (request.id !== undefined) delegatedRequestIds.add(JSON.stringify(request.id));
-      handoffWrite(line);
-      return;
+      handoffWrite(rawLine);
+      return null;
     }
-    if (request.id === undefined) return;
+    if (request.id === undefined) return null;
     let response;
     if (request.method === 'initialize') {
       const liveStatus = currentStatus();
       negotiatedProtocol = negotiateMcpProtocolVersion(request.params?.protocolVersion);
+      try {
+        v3Session = v3LauncherSession(
+          request.params?.protocolVersion,
+          catalog?.wireContract?.discoveryContracts,
+        );
+        selectCatalogProfile(v3Session.negotiated);
+      } catch (error) {
+        response = jsonrpcError(request.id, -32603, safeFailureToken(error.message, 'discovery_contract_invalid'));
+        return response;
+      }
       response = jsonrpcResult(request.id, {
         protocolVersion: negotiatedProtocol.negotiated,
         capabilities: {
@@ -4444,17 +4498,65 @@ function runFailOpenMcp(status, options = {}) {
         response = jsonrpcResult(request.id, resourceContents(parsedResource.uri, guide()));
       }
     } else if (request.method === 'tools/call') {
-      const tool = request.params?.name;
-      response = tools.some((candidate) => candidate.name === tool)
-        ? jsonrpcResult(
-            request.id,
-            failOpenToolResult(tool, currentStatus(), request.params?.arguments ?? {}),
-          )
-        : jsonrpcError(request.id, -32602, `unknown tool: ${tool || '<missing>'}`);
+      const toolName = request.params?.name;
+      const tool = tools.find((candidate) => candidate.name === toolName);
+      const argumentsValue = request.params?.arguments ?? {};
+      const unknownArgument = unknownToolArgument(tool, argumentsValue);
+      if (!tool) {
+        response = jsonrpcError(request.id, -32602, `unknown tool: ${toolName || '<missing>'}`);
+      } else if (unknownArgument !== null) {
+        response = jsonrpcError(
+          request.id,
+          -32602,
+          `invalid arguments: unknown field ${unknownArgument}`,
+        );
+      } else {
+        response = jsonrpcResult(
+          request.id,
+          revisionNativeFailOpenToolResult(
+            negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion,
+            failOpenToolResult(toolName, currentStatus(), argumentsValue),
+          ),
+        );
+      }
     } else {
       response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
     }
-    process.stdout.write(`${JSON.stringify(response)}\n`);
+    return response;
+  };
+  const handleLine = (line) => {
+    if (!line.trim()) return;
+    let frame;
+    try {
+      frame = JSON.parse(line);
+    } catch {
+      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32700, 'Parse error'))}\n`);
+      return;
+    }
+    if (!Array.isArray(frame)) {
+      const response = handleRequest(frame, line);
+      if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
+      return;
+    }
+    const revision = negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion;
+    if (frame.length === 0 || revision === '2025-06-18' || revision === '2025-11-25') {
+      process.stdout.write(`${JSON.stringify(jsonrpcError(null, -32600, 'Invalid Request'))}\n`);
+      return;
+    }
+    const delegated = maybeHandoff();
+    if (delegated) {
+      for (const request of frame) {
+        if (validateJsonRpcRequest(request) && request.id !== undefined) {
+          delegatedRequestIds.add(JSON.stringify(request.id));
+        }
+      }
+      handoffWrite(line);
+      return;
+    }
+    const responses = frame
+      .map((request) => handleRequest(request, JSON.stringify(request), false))
+      .filter(Boolean);
+    if (responses.length > 0) process.stdout.write(`${JSON.stringify(responses)}\n`);
   };
   let buffer = '';
   let bufferBytes = 0;
@@ -4815,8 +4917,8 @@ if (require.main === module) {
       failOpenPublicationStamp,
       publicationStampSkew,
       runtimeWireContractSkew,
-      darkV3LauncherSession,
-      darkV3RuntimeWireContractSkew,
+      v3LauncherSession,
+      v3RuntimeWireContractSkew,
       supportedMcpProtocolVersions,
       managedCliMcpProtocolVersion,
       publicationStampSchemaVersion,

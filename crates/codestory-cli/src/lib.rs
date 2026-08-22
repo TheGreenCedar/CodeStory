@@ -19,6 +19,7 @@ mod explore;
 mod file_state;
 mod http_transport;
 mod local_refresh_status;
+#[allow(dead_code)]
 mod output;
 mod readiness;
 mod report;
@@ -29,12 +30,8 @@ mod sidecar_runtime;
 mod status_wire_test_support;
 mod stdio_arguments;
 mod stdio_catalog;
+#[allow(dead_code)]
 mod stdio_transport;
-#[cfg(any(
-    test,
-    feature = "proof-qualification-support",
-    feature = "v3-evidence-separation-support"
-))]
 #[allow(dead_code)]
 mod stdio_v3;
 
@@ -182,8 +179,7 @@ pub(crate) use app::resolution::{
 /// Parse arguments and run the CodeStory CLI.
 pub use app::run;
 pub(crate) use app::{
-    attach_complete_publication, local_refresh_output_from_summary, packet_sufficiency_label,
-    preflight_output_file,
+    attach_complete_publication, local_refresh_output_from_summary, preflight_output_file,
 };
 
 /// Install the native same-user embedding client transport for this executable.

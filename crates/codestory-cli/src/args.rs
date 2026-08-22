@@ -554,11 +554,6 @@ pub(crate) struct PacketCommand {
     pub(crate) output_file: Option<PathBuf>,
     #[arg(
         long,
-        help = "Omit citation edge ids and score breakdowns from the structured packet."
-    )]
-    pub(crate) no_evidence: bool,
-    #[arg(
-        long,
         value_name = "MS",
         help = "Optional packet-level latency budget in milliseconds."
     )]
@@ -567,14 +562,14 @@ pub(crate) struct PacketCommand {
         long,
         value_name = "ID",
         requires = "option_ids",
-        help = "Parent packet id for a one-round DrillOnce continuation. Requires --option-id."
+        help = "Parent packet id for a one-round continuation. Requires --option-id."
     )]
     pub(crate) parent_packet_id: Option<String>,
     #[arg(
         long = "option-id",
         value_name = "ID",
         requires = "parent_packet_id",
-        help = "Drill option id from the parent packet's disposition. Repeatable. Requires --parent-packet-id."
+        help = "Continuation option id from the parent packet. Repeatable. Requires --parent-packet-id."
     )]
     pub(crate) option_ids: Vec<String>,
     #[arg(
@@ -591,10 +586,10 @@ pub(crate) struct PacketCommand {
     pub(crate) retrieval_generation: Option<String>,
     #[arg(
         long,
-        value_name = "PATH",
-        help = "Write per-step packet retrieval trace JSON for golden scoring."
+        value_name = "DIAGNOSTICS_OUT",
+        help = "Write the immutable packet diagnostic projection atomically to this path."
     )]
-    pub(crate) step_trace_out: Option<PathBuf>,
+    pub(crate) diagnostics_out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -650,11 +645,6 @@ pub(crate) struct TaskBriefCommand {
         help = "Write command output to this file instead of stdout. The parent directory must already exist."
     )]
     pub(crate) output_file: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Omit citation edge ids and score breakdowns from the underlying packet."
-    )]
-    pub(crate) no_evidence: bool,
     #[arg(
         long,
         value_name = "MS",
@@ -1829,6 +1819,7 @@ pub(crate) struct VerificationTargetOutput {
 ///
 /// Retrieval readiness and repo-text mode are explicit so consumers can
 /// distinguish full retrieval evidence from degraded or fallback search paths.
+#[allow(dead_code)]
 pub(crate) struct SearchOutput {
     pub(crate) query: String,
     pub(crate) retrieval: RetrievalStateDto,
@@ -2240,7 +2231,9 @@ pub(crate) struct DrillOutput {
     pub(crate) execution_boundaries: Vec<DrillExecutionBoundaryOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
-    pub(crate) evidence_packet: AgentPacketDto,
+    pub(crate) evidence_packet: codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
+    #[serde(skip)]
+    pub(crate) legacy_evidence_packet: AgentPacketDto,
     pub(crate) next_commands: Vec<String>,
 }
 

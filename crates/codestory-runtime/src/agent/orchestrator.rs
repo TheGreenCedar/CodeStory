@@ -459,12 +459,8 @@ pub(crate) fn agent_packet(
         }
     }
     let probe_resolutions = resolve_packet_probes(controller, probes);
-    let exact_probe_citations = exact_packet_probe_citations(
-        controller,
-        &probe_resolutions,
-        &question,
-        req.include_evidence,
-    );
+    let exact_probe_citations =
+        exact_packet_probe_citations(controller, &probe_resolutions, &question, true);
     let extra_probes = resolved_packet_probe_queries(&probe_resolutions);
     let mut plan =
         build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);
@@ -508,7 +504,7 @@ pub(crate) fn agent_packet(
             max_results: Some(limits.max_anchors.clamp(1, 25)),
             response_mode: AgentResponseModeDto::Structured,
             latency_budget_ms: req.latency_budget_ms,
-            include_evidence: req.include_evidence,
+            include_evidence: true,
             hybrid_weights: None,
         },
     )?;
@@ -517,7 +513,7 @@ pub(crate) fn agent_packet(
         let selected = merge_packet_initial_search_hits(
             &mut answer,
             &initial_packet_hits,
-            req.include_evidence,
+            true,
             &rank_terms,
             packet_stage_citation_carry_limit(&limits),
             &flow_requirements,
@@ -562,7 +558,7 @@ pub(crate) fn agent_packet(
         &plan,
         req.budget,
         &limits,
-        req.include_evidence,
+        true,
         packet_latency,
         &rank_terms,
         &mut answer,

@@ -56,11 +56,9 @@ function usage(text) {
     .replace(/^codestory-cli(?:-runtime)?(?:\.exe)?\b/u, "codestory-cli");
 }
 
-function mcpCatalog() {
+function mcpCatalogForRevision(revision) {
   const requests = [
-    // Omit an offered revision so the binary's compiled default, rather than
-    // this caller, selects the catalog's preferred protocol revision.
-    { jsonrpc: "2.0", id: 1, method: "initialize", params: { capabilities: {}, clientInfo: { name: "catalog-generator", version: "1" } } },
+    { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: revision, capabilities: {}, clientInfo: { name: "catalog-generator", version: "1" } } },
     { jsonrpc: "2.0", id: 2, method: "tools/list" },
     { jsonrpc: "2.0", id: 3, method: "resources/list" },
     { jsonrpc: "2.0", id: 4, method: "resources/templates/list" },
@@ -95,19 +93,74 @@ function mcpCatalog() {
       "Canonical MCP initialize result is missing its wire contract stamp: expected _meta.codestory_publication and _meta.codestory_protocol.",
     );
   }
+  if (protocol.negotiated !== revision) {
+    throw new Error(`Canonical MCP catalog negotiated ${protocol.negotiated} for ${revision}.`);
+  }
   return {
-    // Read out of the real binary so the launcher's mirrored wire constants are
-    // pinned to the CLI they ship with instead of hand-copied.
-    wireContract: {
-      publicationStampSchemaVersion: stamp.schema_version,
-      minimumCompatiblePublicationStampSchemaVersion: stamp.minimum_compatible_schema_version,
-      supportedMcpProtocolVersions: protocol.supported,
-      preferredMcpProtocolVersion: protocol.negotiated,
-    },
+    initialize,
+    stamp,
+    protocol,
     tools: responses.get(2).result.tools,
     resources: responses.get(3).result.resources,
     resourceTemplates: responses.get(4).result.resourceTemplates,
     prompts: responses.get(5).result.prompts,
+  };
+}
+
+function mcpCatalog() {
+  const revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
+  const profiles = Object.fromEntries(
+    revisions.map((revision) => [revision, mcpCatalogForRevision(revision)]),
+  );
+  const preferred = revisions.at(-1);
+  const preferredProfile = profiles[preferred];
+  const first = profiles[revisions[0]];
+  for (const revision of revisions) {
+    const profile = profiles[revision];
+    if (
+      profile.stamp.schema_version !== first.stamp.schema_version
+      || profile.stamp.minimum_compatible_schema_version
+        !== first.stamp.minimum_compatible_schema_version
+      || JSON.stringify(profile.protocol.supported) !== JSON.stringify(first.protocol.supported)
+      || profile.protocol.preferred !== preferred
+    ) {
+      throw new Error(`Canonical MCP wire contract drifted for ${revision}.`);
+    }
+  }
+  const revisionProfiles = Object.fromEntries(
+    revisions.map((revision) => {
+      const profile = profiles[revision];
+      return [revision, {
+        discoveryContractSha256: profile.protocol.discovery_contract_sha256,
+        tools: profile.tools,
+        resources: profile.resources,
+        resourceTemplates: profile.resourceTemplates,
+        prompts: profile.prompts,
+      }];
+    }),
+  );
+  return {
+    // Read out of the real binary so the launcher's mirrored wire constants are
+    // pinned to the CLI they ship with instead of hand-copied.
+    wireContract: {
+      publicationStampSchemaVersion: first.stamp.schema_version,
+      minimumCompatiblePublicationStampSchemaVersion:
+        first.stamp.minimum_compatible_schema_version,
+      supportedMcpProtocolVersions: first.protocol.supported,
+      preferredMcpProtocolVersion: preferred,
+      discoveryContracts: Object.fromEntries(
+        revisions.map((revision) => [
+          revision,
+          revisionProfiles[revision].discoveryContractSha256,
+        ]),
+      ),
+    },
+    revisionProfiles,
+    // Preferred-profile mirrors keep simple catalog consumers deterministic.
+    tools: preferredProfile.tools,
+    resources: preferredProfile.resources,
+    resourceTemplates: preferredProfile.resourceTemplates,
+    prompts: preferredProfile.prompts,
   };
 }
 

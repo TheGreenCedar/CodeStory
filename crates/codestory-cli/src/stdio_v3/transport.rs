@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use super::{
-    StdioV3InternalError,
+    StdioV3InternalError, V3SurfaceSet,
     profile::{BatchPolicyV3, McpRevisionV3},
 };
 
@@ -87,7 +87,12 @@ pub(crate) fn build_proof_tool_result_v3(
     revision: McpRevisionV3,
     root: &Value,
 ) -> Result<Value, StdioV3InternalError> {
-    let result = build_tool_result_v3(revision, "prove_call_path", root)?;
+    let result = build_tool_result_for_surface_v3(
+        revision,
+        "prove_call_path",
+        root,
+        V3SurfaceSet::WithProof,
+    )?;
     let bytes = crate::stdio_transport::v3_serialize_call_tool_result(&result)
         .map_err(|error| StdioV3InternalError::Serialization(error.to_string()))?;
     if bytes.len() <= PROOF_TOOL_RESULT_MAX_BYTES_V3 {
@@ -95,7 +100,12 @@ pub(crate) fn build_proof_tool_result_v3(
     }
 
     let fallback = proof_budget_fallback_v3(root, bytes.len())?;
-    let fallback_result = build_tool_result_v3(revision, "prove_call_path", &fallback)?;
+    let fallback_result = build_tool_result_for_surface_v3(
+        revision,
+        "prove_call_path",
+        &fallback,
+        V3SurfaceSet::WithProof,
+    )?;
     let fallback_bytes = crate::stdio_transport::v3_serialize_call_tool_result(&fallback_result)
         .map_err(|error| StdioV3InternalError::Serialization(error.to_string()))?;
     if fallback_bytes.len() > PROOF_TOOL_RESULT_MAX_BYTES_V3 {
@@ -112,7 +122,16 @@ pub(crate) fn build_tool_result_v3(
     tool_name: &str,
     root: &Value,
 ) -> Result<Value, StdioV3InternalError> {
-    let modern_tools = super::catalog::tools_for_revision_v3(McpRevisionV3::June2025);
+    build_tool_result_for_surface_v3(revision, tool_name, root, V3SurfaceSet::EvidenceOnly)
+}
+
+fn build_tool_result_for_surface_v3(
+    revision: McpRevisionV3,
+    tool_name: &str,
+    root: &Value,
+    surface: V3SurfaceSet,
+) -> Result<Value, StdioV3InternalError> {
+    let modern_tools = super::catalog::tools_for_surface_v3(McpRevisionV3::June2025, surface);
     let schema = modern_tools
         .iter()
         .find(|tool| tool.get("name").and_then(Value::as_str) == Some(tool_name))
@@ -127,8 +146,9 @@ fn revision_native_tool_result_with_schema_v3(
     schema: &Value,
 ) -> Result<Value, StdioV3InternalError> {
     if revision.profile().structured_content
-        && crate::stdio_arguments::validate_structured_content(schema, root).is_err()
+        && let Err(violations) = crate::stdio_arguments::validate_structured_content(schema, root)
     {
+        let _ = violations;
         return Err(StdioV3InternalError::OutputSchemaViolation);
     }
     let text = serde_json::to_string(root)
@@ -139,7 +159,11 @@ fn revision_native_tool_result_with_schema_v3(
             "structuredContent": root,
             "isError": false,
             "_meta": {
-                "com.thegreencedar.codestory/protocolRevision": revision.as_str()
+                "com.thegreencedar.codestory/protocolRevision": revision.as_str(),
+                "codestory_publication": {
+                    "schema_version": codestory_contracts::wire::PUBLICATION_STAMP_SCHEMA_VERSION,
+                    "minimum_compatible_schema_version": codestory_contracts::wire::MINIMUM_COMPATIBLE_PUBLICATION_STAMP_SCHEMA_VERSION
+                }
             }
         }))
     } else {
@@ -487,8 +511,10 @@ mod tests {
             .register_at(
                 super::super::diagnostics::DiagnosticsBindingV3 {
                     packet_id: uuid::Uuid::new_v4().to_string(),
-                    project_id: "project-1".into(),
-                    publication_id: "core-1/retrieval-1".into(),
+                    project_identity: "project-1".into(),
+                    core_generation: "core-1".into(),
+                    core_run: "run-1".into(),
+                    retrieval_generation: Some("retrieval-1".into()),
                     request_digest: "a".repeat(64),
                     wall_expiry_epoch_ms: 99_000,
                 },
@@ -525,6 +551,11 @@ mod tests {
         super::super::diagnostics::attach_capability_uri_v3(&mut projection, &grant)
             .expect("bind capability URI to finalized projection");
         let token = grant.uri.rsplit('/').next().unwrap();
+        assert_eq!(grant.wall_expiry_epoch_ms, 99_000);
+        assert_eq!(
+            projection.pointer("/diagnostics/reference/wall_expiry_epoch_ms"),
+            Some(&json!(99_000))
+        );
 
         for revision in McpRevisionV3::all() {
             let result = build_tool_result_v3(*revision, "packet", &projection)
@@ -533,7 +564,18 @@ mod tests {
                 .pointer("/content/0/text")
                 .and_then(Value::as_str)
                 .unwrap();
-            assert_eq!(serde_json::from_str::<Value>(mirrored).unwrap(), projection);
+            let mirrored = serde_json::from_str::<Value>(mirrored).unwrap();
+            assert_eq!(mirrored, projection);
+            assert_eq!(
+                mirrored.pointer("/diagnostics/reference/wall_expiry_epoch_ms"),
+                Some(&json!(99_000))
+            );
+            if revision.profile().structured_content {
+                assert_eq!(
+                    result.pointer("/structuredContent/diagnostics/reference/wall_expiry_epoch_ms"),
+                    Some(&json!(99_000))
+                );
+            }
             assert!(
                 !result
                     .get("_meta")

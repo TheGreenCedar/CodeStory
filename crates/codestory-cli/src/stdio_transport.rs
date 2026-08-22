@@ -36,9 +36,9 @@ use crate::http_transport::{
     BROWSER_SYMBOLS_DEFAULT_LIMIT, BROWSER_SYMBOLS_MAX_LIMIT, BROWSER_TRAIL_DEFAULT_DEPTH,
     BROWSER_TRAIL_MAX_DEPTH, browser_references_config, browser_trail_config,
 };
-use crate::output::{
-    REPO_CONTENT_BOUNDARY_LINE, UNTRUSTED_REPO_EVIDENCE_TRUST, context_packet_json,
-};
+#[cfg(test)]
+use crate::output::context_packet_json;
+use crate::output::{REPO_CONTENT_BOUNDARY_LINE, UNTRUSTED_REPO_EVIDENCE_TRUST};
 use crate::runtime::{
     AmbiguousTargetError, RuntimeContext, map_api_error, resolve_source_target, resolve_target,
 };
@@ -46,7 +46,7 @@ use crate::stdio_catalog::{
     is_tool_name as is_stdio_tool_name, prompt_get_json as stdio_prompt_get_json,
     prompts_list_json as stdio_prompts_list_json,
     resource_templates_list_json as stdio_resource_templates_list_json,
-    resources_list_json as stdio_resources_list_json, tools_list_json as stdio_tools_list_json,
+    resources_list_json as stdio_resources_list_json,
 };
 use crate::{
     build_ambiguous_target_error_output, build_query_resolution_output, build_search_hit_output,
@@ -64,6 +64,7 @@ const STDIO_FILES_DEFAULT_LIMIT: u32 = 100;
 const STDIO_FILES_MAX_LIMIT: u32 = 500;
 const STDIO_TEXT_ITEM_LIMIT: usize = 8;
 const STDIO_TEXT_MAX_BYTES: usize = 4 * 1024;
+const STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3: usize = 16 * 1024;
 const STDIO_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 const STDIO_STATUS_PUBLICATION_ATTEMPTS: usize = 3;
 const STDIO_SOURCE_FINGERPRINT_FILE_CAP: usize = 25_000;
@@ -107,11 +108,6 @@ const STDIO_PANIC_EVICTION_BUDGET: Duration = Duration::from_millis(250);
 const STDIO_DETACHED_EVICTION_BUDGET: Duration = Duration::from_secs(30);
 const DIRTY_MARKER_SCHEMA_VERSION: u32 = 1;
 
-#[cfg(any(
-    test,
-    feature = "proof-qualification-support",
-    feature = "v3-evidence-separation-support"
-))]
 pub(crate) fn v3_serialize_call_tool_result(
     result: &serde_json::Value,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -1146,6 +1142,8 @@ struct StdioServerSession {
     project_required: bool,
     startup: crate::config::CliStartupConfig,
     tainted_project: Option<args::ProjectArgs>,
+    protocol_v3: crate::stdio_v3::NativeSessionV3,
+    diagnostics_v3: Arc<std::sync::Mutex<crate::stdio_v3::DiagnosticsRegistryV3>>,
 }
 
 impl StdioServerSession {
@@ -1163,6 +1161,10 @@ impl StdioServerSession {
             retained_projects: VecDeque::new(),
             startup: crate::config::process_startup_config(),
             tainted_project: None,
+            protocol_v3: crate::stdio_v3::NativeSessionV3::negotiate(None),
+            diagnostics_v3: Arc::new(std::sync::Mutex::new(
+                crate::stdio_v3::DiagnosticsRegistryV3::new(),
+            )),
         }
     }
 
@@ -1448,7 +1450,7 @@ fn handle_stdio_message(
     line: &str,
     cancelled: &Arc<AtomicBool>,
 ) -> Option<serde_json::Value> {
-    let mut request: serde_json::Value = match serde_json::from_str(line) {
+    let frame: serde_json::Value = match serde_json::from_str(line) {
         Ok(value) => value,
         Err(error) => {
             return Some(stdio_jsonrpc_error(
@@ -1458,6 +1460,24 @@ fn handle_stdio_message(
             ));
         }
     };
+    let revision = session.protocol_v3.negotiated_revision();
+    match crate::stdio_v3::process_jsonrpc_frame_v3(revision, &frame, |request| {
+        handle_stdio_request(session, request, cancelled).unwrap_or(serde_json::Value::Null)
+    }) {
+        crate::stdio_v3::FrameResponseV3::None => None,
+        crate::stdio_v3::FrameResponseV3::Single(response) => Some(response),
+        crate::stdio_v3::FrameResponseV3::Batch(responses) => {
+            Some(serde_json::Value::Array(responses))
+        }
+    }
+}
+
+fn handle_stdio_request(
+    session: &mut StdioServerSession,
+    request: &serde_json::Value,
+    cancelled: &Arc<AtomicBool>,
+) -> Option<serde_json::Value> {
+    let mut request = request.clone();
     if !request.is_object() {
         return Some(stdio_jsonrpc_error(
             serde_json::Value::Null,
@@ -1475,12 +1495,23 @@ fn handle_stdio_message(
     };
     let legacy_response = match method {
         "initialize" => {
-            return Some(stdio_jsonrpc_success(
-                id,
-                stdio_initialize_result_json(&request),
-            ));
+            session.protocol_v3 = crate::stdio_v3::NativeSessionV3::negotiate(
+                request
+                    .pointer("/params/protocolVersion")
+                    .and_then(|value| value.as_str()),
+            );
+            let mut result = session.protocol_v3.initialize_result();
+            result["_meta"]["codestory_publication"] =
+                crate::runtime::codestory_publication_meta(None, None, None, None, false);
+            return Some(stdio_jsonrpc_success(id, result));
         }
-        "tools/list" => stdio_tools_list_json(),
+        "tools/list" => serde_json::json!({
+            "result": {
+                "tools": crate::stdio_v3::tools_for_revision_v3(
+                    session.protocol_v3.negotiated_revision()
+                )
+            }
+        }),
         "resources/list" => stdio_resources_list_json(),
         "resources/templates/list" => stdio_resource_templates_list_json(),
         "prompts/list" => stdio_prompts_list_json(),
@@ -1513,6 +1544,31 @@ fn handle_stdio_message(
                     "Invalid params: missing resource uri",
                 ));
             };
+            if uri.starts_with("codestory://packet-diagnostics/") {
+                return Some(
+                    match session
+                        .diagnostics_v3
+                        .lock()
+                        .expect("diagnostic registry mutex")
+                        .read_at(uri, Instant::now())
+                    {
+                        Ok(bytes) => match std::str::from_utf8(&bytes) {
+                            Ok(text) => stdio_jsonrpc_success(
+                                id,
+                                serde_json::json!({
+                                    "contents": [{
+                                        "uri": uri,
+                                        "mimeType": "application/json",
+                                        "text": text
+                                    }]
+                                }),
+                            ),
+                            Err(_) => stdio_jsonrpc_error(id, -32603, "Internal error"),
+                        },
+                        Err(error) => stdio_packet_diagnostic_read_error(id, error),
+                    },
+                );
+            }
             let parsed = match StdioResource::parse(uri) {
                 Ok(resource) => resource,
                 Err(error) => {
@@ -1645,7 +1701,7 @@ fn handle_stdio_message(
                 Err(error) => {
                     return Some(stdio_jsonrpc_success(
                         id,
-                        stdio_tool_call_error(&stdio_api_error_value(error)),
+                        stdio_tool_call_error_v3(&stdio_api_error_value(error)),
                     ));
                 }
             };
@@ -1663,8 +1719,10 @@ fn handle_stdio_message(
                     "message": message,
                     "tool": name
                 });
-                return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
             }
+            let revision = session.protocol_v3.negotiated_revision();
+            let diagnostics_registry = Arc::clone(&session.diagnostics_v3);
             let (runtime, state) = session.active_project_mut();
             let public_operation = stdio_public_operation_name(name, &request);
             let observes_complete_core = stdio_tool_observes_complete_core(name);
@@ -1679,7 +1737,7 @@ fn handle_stdio_message(
                         ),
                         "tool": name,
                     });
-                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                    return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
                 }
                 let activation = if observes_complete_core {
                     runtime.activation.ensure_complete_core_for_observation(
@@ -1778,7 +1836,32 @@ fn handle_stdio_message(
                             "recommended_next_calls": recommended_next_calls,
                             "diagnostics_uri": diagnostics_uri,
                         });
-                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
+                        if preparing {
+                            let preparing = serde_json::json!({
+                                "kind": "preparing",
+                                "state": "preparing",
+                                "retry_after_ms": operation
+                                    .as_ref()
+                                    .and_then(|snapshot| snapshot.retry_after_ms)
+                                    .unwrap_or(250)
+                                    .max(1),
+                                "operation": operation
+                                    .as_ref()
+                                    .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+                                    .unwrap_or_else(|| serde_json::json!({})),
+                            });
+                            return Some(
+                                match crate::stdio_v3::build_tool_result_v3(
+                                    revision, name, &preparing,
+                                ) {
+                                    Ok(result) => stdio_jsonrpc_success(id, result),
+                                    Err(error) => {
+                                        crate::stdio_v3::jsonrpc_internal_error_v3(id, &error)
+                                    }
+                                },
+                            );
+                        }
+                        return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
                     }
                 }
                 state.status_cache = None;
@@ -1786,64 +1869,79 @@ fn handle_stdio_message(
             // Public-operation retry belongs to codestory-runtime's pinned
             // retrieval wrapper. The transport executes one logical operation
             // and only renders the identity attached by that owner.
-            let (response, core_publication, retrieval_publication, operation_id, attempt) =
-                if stdio_tool_reads_publication(name) {
-                    let operation = if observes_complete_core {
-                        runtime.public_operation.run_observational_with_cancel(
-                            public_operation,
-                            Arc::clone(cancelled),
-                            || Ok(handle_stdio_tool_call(runtime, state, &request, &prepared)),
-                        )
-                    } else {
-                        runtime.public_operation.run_with_cancel(
-                            public_operation,
-                            Arc::clone(cancelled),
-                            || Ok(handle_stdio_tool_call(runtime, state, &request, &prepared)),
-                        )
-                    };
-                    match operation {
-                        Ok(operation) => (
-                            operation.value,
-                            operation.core_publication,
-                            operation
-                                .retrieval_publication
-                                .and_then(|publication| serde_json::to_value(publication).ok()),
-                            Some(operation.operation_id),
-                            Some(operation.attempt),
-                        ),
-                        Err(error) => {
-                            let error = serde_json::json!({
-                                "code": error.code,
-                                "message": error.message,
-                                "tool": name,
-                            });
-                            return Some(stdio_jsonrpc_success(id, stdio_tool_call_error(&error)));
-                        }
-                    }
+            let execution = if stdio_tool_reads_publication(name) {
+                let operation = if observes_complete_core {
+                    runtime.public_operation.run_observational_with_cancel(
+                        public_operation,
+                        Arc::clone(cancelled),
+                        || {
+                            project_stdio_tool_execution_v3(
+                                runtime, state, &request, &prepared, name,
+                            )
+                        },
+                    )
                 } else {
-                    (
-                        handle_stdio_tool_call(runtime, state, &request, &prepared),
-                        None,
-                        None,
-                        None,
-                        None,
+                    runtime.public_operation.run_with_cancel(
+                        public_operation,
+                        Arc::clone(cancelled),
+                        || {
+                            project_stdio_tool_execution_v3(
+                                runtime, state, &request, &prepared, name,
+                            )
+                        },
                     )
                 };
-            let publication_meta = stdio_served_publication_meta(
-                state,
-                core_publication.as_ref(),
-                retrieval_publication
-                    .as_ref()
-                    .or_else(|| stdio_response_retrieval_publication(&response)),
-                operation_id.as_deref(),
-                attempt,
-            );
-            return Some(stdio_jsonrpc_tool_call_from_legacy_with_packet_budget(
+                match operation {
+                    Ok(operation) => {
+                        let retrieval_publication = operation
+                            .retrieval_publication
+                            .as_ref()
+                            .and_then(|publication| serde_json::to_value(publication).ok());
+                        let mut execution = operation.value;
+                        execution.publication_meta = Some(stdio_served_publication_meta(
+                            state,
+                            operation.core_publication.as_ref(),
+                            retrieval_publication.as_ref().or_else(|| {
+                                stdio_response_retrieval_publication(&execution.response)
+                            }),
+                            Some(&operation.operation_id),
+                            Some(operation.attempt),
+                        ));
+                        execution
+                    }
+                    Err(error) => {
+                        return Some(stdio_jsonrpc_success(
+                            id,
+                            crate::stdio_v3::semantic_tool_error_v3(&error.message),
+                        ));
+                    }
+                }
+            } else {
+                match project_stdio_tool_execution_v3(runtime, state, &request, &prepared, name) {
+                    Ok(mut execution) => {
+                        execution.publication_meta = Some(stdio_served_publication_meta(
+                            state,
+                            None,
+                            stdio_response_retrieval_publication(&execution.response),
+                            None,
+                            None,
+                        ));
+                        execution
+                    }
+                    Err(error) => {
+                        return Some(stdio_jsonrpc_success(
+                            id,
+                            crate::stdio_v3::semantic_tool_error_v3(&error.message),
+                        ));
+                    }
+                }
+            };
+            return Some(stdio_jsonrpc_tool_execution_v3(
                 id,
-                response,
-                publication_meta,
                 name,
-                &runtime.project_root,
+                revision,
+                execution,
+                &diagnostics_registry,
             ));
         }
         _ => {
@@ -1855,6 +1953,31 @@ fn handle_stdio_message(
         }
     };
     Some(stdio_jsonrpc_from_legacy(id, legacy_response))
+}
+
+fn stdio_packet_diagnostic_read_error(
+    id: serde_json::Value,
+    error: crate::stdio_v3::DiagnosticsReadErrorV3,
+) -> serde_json::Value {
+    let mut response = stdio_jsonrpc_error(
+        id,
+        error.jsonrpc_code() as i32,
+        match error {
+            crate::stdio_v3::DiagnosticsReadErrorV3::MalformedUri => {
+                "Invalid packet diagnostic capability URI"
+            }
+            crate::stdio_v3::DiagnosticsReadErrorV3::CapabilityUnavailable => {
+                "Packet diagnostic capability unavailable"
+            }
+            crate::stdio_v3::DiagnosticsReadErrorV3::Internal => "Internal error",
+        },
+    );
+    if error == crate::stdio_v3::DiagnosticsReadErrorV3::CapabilityUnavailable {
+        response["error"]["data"] = serde_json::json!({
+            "code": "diagnostics_capability_unavailable"
+        });
+    }
+    response
 }
 
 fn stdio_jsonrpc_success(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
@@ -1943,6 +2066,476 @@ fn stdio_status_is_live_ready(retrieval_mode: Option<&str>, degraded_reason: Opt
     retrieval_mode == Some("full") && degraded_reason.is_none()
 }
 
+struct StdioToolExecutionV3 {
+    response: serde_json::Value,
+    packet_diagnostics: Option<codestory_runtime::PacketDiagnosticProjectionV3>,
+    publication_meta: Option<serde_json::Value>,
+}
+
+fn project_stdio_tool_execution_v3(
+    runtime: &RuntimeContext,
+    state: &mut StdioServerState,
+    request: &serde_json::Value,
+    prepared: &PreparedStdioToolCall,
+    tool_name: &str,
+) -> std::result::Result<StdioToolExecutionV3, ApiError> {
+    let mut response = if tool_name == "search" {
+        handle_stdio_search_v3(runtime, request)
+    } else {
+        handle_stdio_tool_call(runtime, state, request, prepared)
+    };
+    let Some(result) = response.get("result").cloned() else {
+        return Ok(StdioToolExecutionV3 {
+            response,
+            packet_diagnostics: None,
+            publication_meta: None,
+        });
+    };
+    let mut packet_diagnostics = None;
+    let projection = match tool_name {
+        "packet" => {
+            let packet = serde_json::from_value::<codestory_contracts::api::AgentPacketDto>(result)
+                .map_err(|_| {
+                    ApiError::internal("Packet execution returned an invalid internal DTO.")
+                })?;
+            let packet_request = AgentPacketRequestDto {
+                question: request
+                    .pointer("/params/arguments/question")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                budget: stdio_packet_budget(request)
+                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+                task_class: stdio_packet_task_class(request)
+                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+                probes: stdio_packet_probes(request)
+                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+                extra_probes: stdio_packet_extra_probes(request)
+                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+                latency_budget_ms: stdio_packet_latency_budget(request)
+                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
+                parent_packet_id: request
+                    .pointer("/params/arguments/parent_packet_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                option_ids: request
+                    .pointer("/params/arguments/option_ids")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect(),
+                core_generation_id: request
+                    .pointer("/params/arguments/core_generation_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                retrieval_generation: request
+                    .pointer("/params/arguments/retrieval_generation")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            };
+            let product = codestory_runtime::project_packet_v3(
+                &runtime.public_operation,
+                "codestory-stdio",
+                &packet_request,
+                &packet,
+                // The public adapter owns the final representation: only it
+                // knows the negotiated revision, capability URI reservation,
+                // wall-expiry metadata, and served-publication stamp. Keep the
+                // runtime projection complete here; the adapter performs the
+                // same bounded compaction against that exact final shape below.
+                |_| Ok(0),
+            )?;
+            packet_diagnostics = Some(product.diagnostics);
+            serde_json::to_value(product.projection)
+                .map_err(|error| ApiError::internal(error.to_string()))?
+        }
+        "context" => project_stdio_context_result_v3(runtime, &response, result)?,
+        "search" => {
+            let results =
+                serde_json::from_value::<codestory_contracts::api::SearchResultsDto>(result)
+                    .map_err(|_| {
+                        ApiError::internal("Search execution returned an invalid internal DTO.")
+                    })?;
+            serde_json::to_value(codestory_runtime::project_search_v3(
+                &runtime.public_operation,
+                "codestory-stdio",
+                &results,
+            )?)
+            .map_err(|error| ApiError::internal(error.to_string()))?
+        }
+        _ => {
+            return Ok(StdioToolExecutionV3 {
+                response,
+                packet_diagnostics: None,
+                publication_meta: None,
+            });
+        }
+    };
+    response = serde_json::json!({"result": projection});
+    Ok(StdioToolExecutionV3 {
+        response,
+        packet_diagnostics,
+        publication_meta: None,
+    })
+}
+
+fn project_stdio_context_result_v3(
+    runtime: &RuntimeContext,
+    response: &serde_json::Value,
+    result: serde_json::Value,
+) -> std::result::Result<serde_json::Value, ApiError> {
+    let answer = serde_json::from_value::<codestory_contracts::api::AgentAnswerDto>(result)
+        .map_err(|_| ApiError::internal("Context execution returned an invalid internal DTO."))?;
+    let target_symbol_id = response
+        .pointer("/_codestory_context_target_v3/symbol_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::internal("Context execution omitted its resolved v3 target."))?;
+    let target_path = response
+        .pointer("/_codestory_context_target_v3/path")
+        .and_then(serde_json::Value::as_str);
+    serde_json::to_value(codestory_runtime::project_context_v3(
+        &runtime.public_operation,
+        "codestory-stdio",
+        target_path,
+        Some(target_symbol_id),
+        &answer,
+    )?)
+    .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+fn handle_stdio_search_v3(
+    runtime: &RuntimeContext,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    let query = request
+        .pointer("/params/arguments/query")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let repo_text = match request
+        .pointer("/params/arguments/repo_text")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("on") => SearchRepoTextMode::On,
+        Some("off") => SearchRepoTextMode::Off,
+        _ => SearchRepoTextMode::Auto,
+    };
+    let limit_per_source = request
+        .pointer("/params/arguments/limit")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value.clamp(1, 50) as u32)
+        .unwrap_or(10);
+    runtime
+        .browser
+        .search_results(SearchRequest {
+            query,
+            repo_text,
+            limit_per_source,
+            expand_search_plan: false,
+            hybrid_weights: None,
+            hybrid_limits: None,
+        })
+        .map(|result| serde_json::json!({"result": result}))
+        .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
+}
+
+fn reserve_packet_diagnostics_capability_v3(
+    root: &mut serde_json::Value,
+    wall_expiry_epoch_ms: u64,
+) -> std::result::Result<(), ()> {
+    if root.pointer("/diagnostics/availability") != Some(&serde_json::json!("available")) {
+        return Ok(());
+    }
+    let packet_id = root
+        .pointer("/identity/packet_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(())?
+        .to_owned();
+    let reference = root
+        .pointer_mut("/diagnostics/reference")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or(())?;
+    reference.insert(
+        "uri".to_string(),
+        serde_json::Value::String(format!(
+            "codestory://packet-diagnostics/{packet_id}/{}",
+            "0".repeat(64)
+        )),
+    );
+    reference.insert(
+        "wall_expiry_epoch_ms".to_string(),
+        serde_json::Value::from(wall_expiry_epoch_ms),
+    );
+    Ok(())
+}
+
+fn build_served_tool_result_v3(
+    revision: crate::stdio_v3::McpRevisionV3,
+    tool_name: &str,
+    root: &serde_json::Value,
+    publication_meta: Option<&serde_json::Value>,
+) -> std::result::Result<serde_json::Value, crate::stdio_v3::StdioV3InternalError> {
+    let mut result = crate::stdio_v3::build_tool_result_v3(revision, tool_name, root)?;
+    if revision.profile().structured_content
+        && let Some(publication_meta) = publication_meta
+        && let Some(meta) = result
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        meta.insert(
+            "codestory_publication".to_string(),
+            publication_meta.clone(),
+        );
+    }
+    Ok(result)
+}
+
+fn packet_budget_exceeded_root_v3(
+    complete: &serde_json::Value,
+    required_complete_bytes: usize,
+) -> std::result::Result<serde_json::Value, ()> {
+    let required_complete_bytes = u64::try_from(required_complete_bytes).map_err(|_| ())?;
+    Ok(serde_json::json!({
+        "kind": "budget_exceeded",
+        "schema_version": complete.get("schema_version").cloned().ok_or(())?,
+        "identity": complete.get("identity").cloned().ok_or(())?,
+        "publication": complete.get("publication").cloned().ok_or(())?,
+        "status": "unavailable",
+        "retrieval": complete.get("retrieval").cloned().ok_or(())?,
+        "diagnostics": complete.get("diagnostics").cloned().ok_or(())?,
+        "gaps": [{
+            "identity": {"gap_id": "packet-output-budget-exceeded"},
+            "kind": "output_budget_exceeded",
+            "message": null
+        }],
+        "maximum_bytes": STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
+        "required_complete_bytes": required_complete_bytes
+    }))
+}
+
+fn finalize_packet_projection_for_stdio_v3(
+    root: &mut serde_json::Value,
+    revision: crate::stdio_v3::McpRevisionV3,
+    publication_meta: Option<&serde_json::Value>,
+) -> std::result::Result<usize, crate::stdio_v3::StdioV3InternalError> {
+    let measure = |candidate: &serde_json::Value| {
+        let result = build_served_tool_result_v3(revision, "packet", candidate, publication_meta)?;
+        v3_serialize_call_tool_result(&result)
+            .map(|bytes| bytes.len())
+            .map_err(|error| {
+                crate::stdio_v3::StdioV3InternalError::Serialization(error.to_string())
+            })
+    };
+    let mut required_complete_bytes = measure(root)?;
+    if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+        return Ok(required_complete_bytes);
+    }
+    if root.get("kind").and_then(serde_json::Value::as_str) != Some("complete") {
+        return Err(crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
+            maximum_bytes: STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
+            actual_bytes: required_complete_bytes,
+        });
+    }
+
+    let mut compact = root.clone();
+    let removed_summaries = compact
+        .get_mut("evidence")
+        .and_then(serde_json::Value::as_array_mut)
+        .is_some_and(|evidence| {
+            evidence
+                .iter_mut()
+                .filter_map(serde_json::Value::as_object_mut)
+                .fold(false, |removed, row| {
+                    let had_summary = row.get("summary").is_some_and(|value| !value.is_null());
+                    if had_summary {
+                        row.insert("summary".to_string(), serde_json::Value::Null);
+                    }
+                    had_summary || removed
+                })
+        });
+    if removed_summaries {
+        required_complete_bytes = measure(&compact)?;
+        if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+            *root = compact;
+            return Ok(required_complete_bytes);
+        }
+    }
+
+    let removed_gap_messages = compact
+        .get_mut("gaps")
+        .and_then(serde_json::Value::as_array_mut)
+        .is_some_and(|gaps| {
+            gaps.iter_mut()
+                .filter_map(serde_json::Value::as_object_mut)
+                .fold(false, |removed, row| {
+                    let had_message = row.get("message").is_some_and(|value| !value.is_null());
+                    if had_message {
+                        row.insert("message".to_string(), serde_json::Value::Null);
+                    }
+                    had_message || removed
+                })
+        });
+    if removed_gap_messages {
+        required_complete_bytes = measure(&compact)?;
+        if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+            *root = compact;
+            return Ok(required_complete_bytes);
+        }
+    }
+
+    *root = packet_budget_exceeded_root_v3(&compact, required_complete_bytes).map_err(|_| {
+        crate::stdio_v3::StdioV3InternalError::InvalidProjection(
+            "packet fallback could not retain its mandatory envelope".to_string(),
+        )
+    })?;
+    let fallback_bytes = measure(root)?;
+    if fallback_bytes > STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+        return Err(crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
+            maximum_bytes: STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
+            actual_bytes: fallback_bytes,
+        });
+    }
+    Ok(fallback_bytes)
+}
+
+fn stdio_jsonrpc_tool_execution_v3(
+    id: serde_json::Value,
+    tool_name: &str,
+    revision: crate::stdio_v3::McpRevisionV3,
+    mut execution: StdioToolExecutionV3,
+    diagnostics_registry: &Arc<std::sync::Mutex<crate::stdio_v3::DiagnosticsRegistryV3>>,
+) -> serde_json::Value {
+    let mut expected_packet_bytes = None;
+    let mut registered_diagnostics_uri = None;
+    if let Some(diagnostics) = execution.packet_diagnostics.take() {
+        let wall_expiry_epoch_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .and_then(|now| now.checked_add(10 * 60 * 1_000));
+        let Some(wall_expiry_epoch_ms) = wall_expiry_epoch_ms else {
+            return stdio_jsonrpc_error(id, -32603, "Internal error");
+        };
+        let Some(root) = execution.response.get_mut("result") else {
+            return stdio_jsonrpc_error(id, -32603, "Internal error");
+        };
+        if reserve_packet_diagnostics_capability_v3(root, wall_expiry_epoch_ms).is_err() {
+            return stdio_jsonrpc_error(id, -32603, "Internal error");
+        }
+        if tool_name == "packet" {
+            expected_packet_bytes = match finalize_packet_projection_for_stdio_v3(
+                root,
+                revision,
+                execution.publication_meta.as_ref(),
+            ) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => return crate::stdio_v3::jsonrpc_internal_error_v3(id, &error),
+            };
+        }
+        let grant = diagnostics_registry
+            .lock()
+            .expect("diagnostic registry mutex")
+            .register_at(
+                crate::stdio_v3::DiagnosticsBindingV3 {
+                    packet_id: diagnostics.packet_id,
+                    project_identity: diagnostics.project_identity,
+                    core_generation: diagnostics.core_generation,
+                    core_run: diagnostics.core_run,
+                    retrieval_generation: diagnostics.retrieval_generation,
+                    request_digest: diagnostics.request_digest,
+                    wall_expiry_epoch_ms,
+                },
+                diagnostics.bytes,
+                Instant::now(),
+            );
+        let Ok(grant) = grant else {
+            return stdio_jsonrpc_error(id, -32603, "Internal error");
+        };
+        if crate::stdio_v3::attach_capability_uri_v3(root, &grant).is_err() {
+            diagnostics_registry
+                .lock()
+                .expect("diagnostic registry mutex")
+                .revoke(&grant.uri);
+            return stdio_jsonrpc_error(id, -32603, "Internal error");
+        }
+        registered_diagnostics_uri = Some(grant.uri);
+    }
+
+    if let Some(root) = execution.response.get("result") {
+        return match build_served_tool_result_v3(
+            revision,
+            tool_name,
+            root,
+            execution.publication_meta.as_ref(),
+        ) {
+            Ok(result) => {
+                if let Some(expected) = expected_packet_bytes {
+                    let actual = match v3_serialize_call_tool_result(&result) {
+                        Ok(bytes) => bytes.len(),
+                        Err(error) => {
+                            revoke_packet_diagnostics_v3(
+                                diagnostics_registry,
+                                registered_diagnostics_uri.as_deref(),
+                            );
+                            return crate::stdio_v3::jsonrpc_internal_error_v3(
+                                id,
+                                &crate::stdio_v3::StdioV3InternalError::Serialization(
+                                    error.to_string(),
+                                ),
+                            );
+                        }
+                    };
+                    if actual != expected || actual > STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+                        revoke_packet_diagnostics_v3(
+                            diagnostics_registry,
+                            registered_diagnostics_uri.as_deref(),
+                        );
+                        return crate::stdio_v3::jsonrpc_internal_error_v3(
+                            id,
+                            &crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
+                                maximum_bytes: STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
+                                actual_bytes: actual,
+                            },
+                        );
+                    }
+                }
+                stdio_jsonrpc_success(id, result)
+            }
+            Err(error) => {
+                revoke_packet_diagnostics_v3(
+                    diagnostics_registry,
+                    registered_diagnostics_uri.as_deref(),
+                );
+                crate::stdio_v3::jsonrpc_internal_error_v3(id, &error)
+            }
+        };
+    }
+    if let Some(error) = execution.response.get("error") {
+        return stdio_jsonrpc_success(id, stdio_tool_call_error_v3(error));
+    }
+    stdio_jsonrpc_error(id, -32603, "Internal error")
+}
+
+fn revoke_packet_diagnostics_v3(
+    diagnostics_registry: &Arc<std::sync::Mutex<crate::stdio_v3::DiagnosticsRegistryV3>>,
+    uri: Option<&str>,
+) {
+    if let Some(uri) = uri {
+        diagnostics_registry
+            .lock()
+            .expect("diagnostic registry mutex")
+            .revoke(uri);
+    }
+}
+
+fn stdio_tool_call_error_v3(error: &serde_json::Value) -> serde_json::Value {
+    let text = serde_json::to_string(error).unwrap_or_else(|_| {
+        serde_json::json!({"code":"internal_error","message":"Tool execution failed"}).to_string()
+    });
+    crate::stdio_v3::semantic_tool_error_v3(&text)
+}
+
 /// Render one `tools/call` outcome.
 ///
 /// The publication stamp is not optional: every successful tool payload that an
@@ -1957,22 +2550,6 @@ fn stdio_jsonrpc_tool_call_from_legacy(
     tool_name: &str,
 ) -> serde_json::Value {
     stdio_jsonrpc_tool_call_from_legacy_inner(id, response, publication_meta, tool_name, None)
-}
-
-fn stdio_jsonrpc_tool_call_from_legacy_with_packet_budget(
-    id: serde_json::Value,
-    response: serde_json::Value,
-    publication_meta: serde_json::Value,
-    tool_name: &str,
-    project_root: &Path,
-) -> serde_json::Value {
-    stdio_jsonrpc_tool_call_from_legacy_inner(
-        id,
-        response,
-        publication_meta,
-        tool_name,
-        Some(project_root),
-    )
 }
 
 fn stdio_jsonrpc_tool_call_from_legacy_inner(
@@ -3711,10 +4288,6 @@ fn handle_stdio_packet(
     {
         return serde_json::json!({"error": error});
     }
-    let include_evidence = request
-        .pointer("/params/arguments/include_evidence")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
     let parent_packet_id = request
         .pointer("/params/arguments/parent_packet_id")
         .and_then(|value| value.as_str())
@@ -3743,7 +4316,6 @@ fn handle_stdio_packet(
             task_class,
             probes: &probes,
             extra_probes: &extra_probes,
-            include_evidence,
             latency_budget_ms,
             parent_packet_id: parent_packet_id.as_deref(),
             option_ids: &option_ids,
@@ -3766,7 +4338,6 @@ fn handle_stdio_packet(
             task_class,
             probes,
             extra_probes,
-            include_evidence,
             latency_budget_ms,
             parent_packet_id,
             option_ids,
@@ -3872,7 +4443,6 @@ struct StdioPacketCacheKey {
     task_class: Option<&'static str>,
     probes: Vec<PacketProbeDto>,
     extra_probes: Vec<String>,
-    include_evidence: bool,
     latency_budget_ms: Option<u32>,
     parent_packet_id: Option<String>,
     option_ids: Vec<String>,
@@ -3948,7 +4518,6 @@ struct StdioPacketCacheKeyInput<'a> {
     task_class: Option<PacketTaskClassDto>,
     probes: &'a [PacketProbeDto],
     extra_probes: &'a [String],
-    include_evidence: bool,
     latency_budget_ms: Option<u32>,
     parent_packet_id: Option<&'a str>,
     option_ids: &'a [String],
@@ -3964,7 +4533,6 @@ fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCac
         task_class: input.task_class.map(stdio_packet_task_class_label),
         probes: input.probes.to_vec(),
         extra_probes: input.extra_probes.to_vec(),
-        include_evidence: input.include_evidence,
         latency_budget_ms: input.latency_budget_ms,
         parent_packet_id: input.parent_packet_id.map(str::to_string),
         option_ids: input.option_ids.to_vec(),
@@ -4633,12 +5201,15 @@ fn handle_stdio_context(
     runtime: &RuntimeContext,
     request: &serde_json::Value,
 ) -> serde_json::Value {
-    let (target_label, focus_node_id) = match stdio_context_target(runtime, request) {
+    let target = match stdio_context_target(runtime, request) {
         Ok(target) => target,
         Err(error) => {
             return serde_json::json!({"error": stdio_typed_error_value(runtime, &error)});
         }
     };
+    let target_label = target.label;
+    let focus_node_id = target.node_id;
+    let target_path = target.path;
     let max_results = request
         .pointer("/params/arguments/max_results")
         .and_then(|value| value.as_u64())
@@ -4670,7 +5241,13 @@ fn handle_stdio_context(
                     target_label.replace('`', "'")
                 )),
             );
-            serde_json::json!({"result": context_packet_json(&result)})
+            serde_json::json!({
+                "result": result,
+                "_codestory_context_target_v3": {
+                    "symbol_id": focus_node_id.0,
+                    "path": target_path
+                }
+            })
         })
         .unwrap_or_else(|error| serde_json::json!({"error": stdio_api_error_value(error)}))
 }
@@ -4783,10 +5360,17 @@ fn stdio_api_error_value(error: ApiError) -> serde_json::Value {
         .unwrap_or_else(|_| serde_json::json!({"message": map_api_error(error).to_string()}))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StdioContextTargetV3 {
+    label: String,
+    node_id: NodeId,
+    path: Option<String>,
+}
+
 fn stdio_context_target(
     runtime: &RuntimeContext,
     request: &serde_json::Value,
-) -> Result<(String, NodeId)> {
+) -> Result<StdioContextTargetV3> {
     let has_id = request
         .pointer("/params/arguments/id")
         .and_then(|value| value.as_str())
@@ -4829,13 +5413,18 @@ fn stdio_context_target(
                 ),
             )));
         }
-        return Ok((bookmark.node_label, bookmark.node_id));
+        return Ok(StdioContextTargetV3 {
+            label: bookmark.node_label,
+            node_id: bookmark.node_id,
+            path: bookmark.file_path,
+        });
     }
     resolve_target(runtime, stdio_target_selection(request), None).map(|target| {
-        (
-            target.selected.display_name.clone(),
-            target.selected.node_id.clone(),
-        )
+        StdioContextTargetV3 {
+            label: target.selected.display_name.clone(),
+            node_id: target.selected.node_id.clone(),
+            path: target.selected.file_path.clone(),
+        }
     })
 }
 
@@ -6711,7 +7300,7 @@ fn read_stdio_agent_guide_resource() -> serde_json::Value {
             "Call the matching tool first. Orientation may use ground; it is not required first.",
             "Use packet for broad task questions and context after selecting a concrete target.",
             "When a tool reports preparing, wait retry_after_ms and retry that same tool. Do not ask the user to repair CodeStory.",
-            "Treat Supported, NotEstablished, and Unavailable packets as terminal. DrillOnce means repeat the exact original question and execute the listed option_ids once against the pinned generation, then answer. Do not search to close English flow families.",
+            "Read packet evidence availability directly. For a generation-bound continuation when availability is continuation_available, repeat the original question with parent_packet_id=continuation.continuation_id, continuation.gap_ids as option_ids, and the core and retrieval generation ids from publication. Follow it at most once, then answer from evidence rows and state every remaining gap.",
             "Use continuation links from search or definition results before broadening retrieval.",
             "Keep search limits bounded; stdio search clamps limit to 1..50.",
             "Treat repo-text hits as navigation clues and search hits as discovery clues until backed by graph or source evidence."
@@ -7021,12 +7610,485 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+    use uuid::Uuid;
 
     fn fixture_json_sha256(value: &serde_json::Value) -> String {
         format!(
             "{:x}",
             Sha256::digest(serde_json::to_vec(value).expect("serialize v2 fixture"))
         )
+    }
+
+    fn diagnostic_binding(packet_id: String) -> crate::stdio_v3::DiagnosticsBindingV3 {
+        crate::stdio_v3::DiagnosticsBindingV3 {
+            packet_id,
+            project_identity: "project-1".to_string(),
+            core_generation: "core-1".to_string(),
+            core_run: "run-1".to_string(),
+            retrieval_generation: Some("retrieval-1".to_string()),
+            request_digest: "a".repeat(64),
+            wall_expiry_epoch_ms: 1_725_000_000_000,
+        }
+    }
+
+    fn diagnostic_resource_read(
+        session: &mut StdioServerSession,
+        id: &str,
+        uri: &str,
+    ) -> serde_json::Value {
+        handle_stdio_message(
+            session,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "resources/read",
+                "params": {"uri": uri}
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("diagnostic resource response")
+    }
+
+    #[test]
+    fn packet_diagnostic_native_wire_classifies_every_capability_failure() {
+        let unavailable = |response: &serde_json::Value| {
+            assert_eq!(
+                response.pointer("/error/code"),
+                Some(&json!(-32002)),
+                "{response}"
+            );
+            assert_eq!(
+                response.pointer("/error/data/code"),
+                Some(&json!("diagnostics_capability_unavailable")),
+                "{response}"
+            );
+        };
+
+        let mut session = StdioServerSession::new(None);
+        let missing = format!(
+            "codestory://packet-diagnostics/{}/{}",
+            Uuid::new_v4(),
+            "0".repeat(64)
+        );
+        unavailable(&diagnostic_resource_read(&mut session, "missing", &missing));
+
+        let now = Instant::now();
+        let expired = session
+            .diagnostics_v3
+            .lock()
+            .unwrap()
+            .register_at(
+                diagnostic_binding(Uuid::new_v4().to_string()),
+                br#"{"expired":true}"#.to_vec(),
+                now - Duration::from_secs(601),
+            )
+            .unwrap();
+        unavailable(&diagnostic_resource_read(
+            &mut session,
+            "expired",
+            &expired.uri,
+        ));
+
+        let valid = session
+            .diagnostics_v3
+            .lock()
+            .unwrap()
+            .register_at(
+                diagnostic_binding(Uuid::new_v4().to_string()),
+                br#"{"valid":true}"#.to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+        let mut tampered = valid.uri.clone();
+        let final_byte = tampered.pop().unwrap();
+        tampered.push(if final_byte == '0' { '1' } else { '0' });
+        unavailable(&diagnostic_resource_read(
+            &mut session,
+            "tampered",
+            &tampered,
+        ));
+
+        let evicted = session
+            .diagnostics_v3
+            .lock()
+            .unwrap()
+            .register_at(
+                diagnostic_binding(Uuid::new_v4().to_string()),
+                vec![1],
+                Instant::now(),
+            )
+            .unwrap();
+        for _ in 0..8 {
+            session
+                .diagnostics_v3
+                .lock()
+                .unwrap()
+                .register_at(
+                    diagnostic_binding(Uuid::new_v4().to_string()),
+                    vec![2],
+                    Instant::now(),
+                )
+                .unwrap();
+        }
+        unavailable(&diagnostic_resource_read(
+            &mut session,
+            "evicted",
+            &evicted.uri,
+        ));
+
+        let mut other_session = StdioServerSession::new(None);
+        unavailable(&diagnostic_resource_read(
+            &mut other_session,
+            "cross-session",
+            &valid.uri,
+        ));
+
+        let malformed = diagnostic_resource_read(
+            &mut session,
+            "malformed",
+            "codestory://packet-diagnostics/not-a-uuid/nope",
+        );
+        assert_eq!(
+            malformed.pointer("/error/code"),
+            Some(&json!(-32602)),
+            "{malformed}"
+        );
+
+        let invalid_utf8 = session
+            .diagnostics_v3
+            .lock()
+            .unwrap()
+            .register_at(
+                diagnostic_binding(Uuid::new_v4().to_string()),
+                vec![0xff],
+                Instant::now(),
+            )
+            .unwrap();
+        let internal = diagnostic_resource_read(&mut session, "internal", &invalid_utf8.uri);
+        assert_eq!(
+            internal.pointer("/error/code"),
+            Some(&json!(-32603)),
+            "{internal}"
+        );
+    }
+
+    #[test]
+    fn packet_measurement_matches_the_final_revision_native_result_metadata() {
+        let root = json!({
+            "kind":"complete",
+            "schema_version":3,
+            "identity":{
+                "packet_id":Uuid::new_v4().to_string(),
+                "request_id":"request-1",
+                "question_sha256":"a".repeat(64)
+            },
+            "publication":{
+                "core":{
+                    "project_id":"project-1",
+                    "generation_id":"core-generation-1",
+                    "run_id":"core-run-1"
+                },
+                "retrieval":null
+            },
+            "status":"available",
+            "retrieval":{"state":"full","generation_id":"retrieval-generation-1"},
+            "evidence":[{
+                "identity":{"evidence_id":"evidence-1"},
+                "kind":"exact_source",
+                "path":"src/quote-\"-slash-\\-control-\u{0000}-café-🦀.rs",
+                "symbol_id":null,
+                "start_line":1,
+                "end_line":1,
+                "summary":"quote=\" slash=\\ newline=\n nul=\u{0000} multibyte=é🦀"
+            }],
+            "gaps":[],
+            "continuation":null,
+            "diagnostics":{
+                "availability":"available",
+                "reference":{
+                    "artifact_id":"artifact-1",
+                    "sha256":"b".repeat(64),
+                    "byte_length":123
+                }
+            }
+        });
+        let candidate: codestory_contracts::packet_projection_v3::PacketProjectionV3Dto =
+            serde_json::from_value(root).expect("packet projection fixture");
+        let publication_meta = json!({
+            "schema_version":3,
+            "minimum_compatible_schema_version":3,
+            "core_publication":{
+                "generation_id":"core-generation-with-escaped-\"-metadata",
+                "run_id":"core-run-1"
+            },
+            "retrieval_publication":{
+                "retrieval_generation":"retrieval-generation-with-multibyte-é🦀"
+            },
+            "operation":{"operation_id":"public-operation-123456789","attempt":2}
+        });
+
+        for revision in crate::stdio_v3::McpRevisionV3::all() {
+            let mut final_root = serde_json::to_value(&candidate).unwrap();
+            reserve_packet_diagnostics_capability_v3(&mut final_root, 1_725_000_600_123).unwrap();
+            let measured = finalize_packet_projection_for_stdio_v3(
+                &mut final_root,
+                *revision,
+                Some(&publication_meta),
+            )
+            .unwrap();
+            let final_result = build_served_tool_result_v3(
+                *revision,
+                "packet",
+                &final_root,
+                Some(&publication_meta),
+            )
+            .unwrap();
+            let emitted = v3_serialize_call_tool_result(&final_result).unwrap();
+            assert_eq!(
+                measured,
+                emitted.len(),
+                "{revision:?} measurement must include the exact served-publication metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn packet_final_result_cap_boundaries_are_exact_for_old_and_modern_profiles() {
+        fn root_with_padding(ascii_padding: usize, controls: usize) -> serde_json::Value {
+            let hostile = "quote-\"-slash-\\-control-\u{0000}-café-🦀-";
+            let row_count = 8;
+            let per_row = ascii_padding / row_count;
+            let remainder = ascii_padding % row_count;
+            let evidence = (0..row_count)
+                .map(|index| {
+                    let padding = per_row + usize::from(index < remainder);
+                    let controls = if index == 0 {
+                        "\n".repeat(controls)
+                    } else {
+                        String::new()
+                    };
+                    json!({
+                        "identity":{"evidence_id":format!("evidence-{index}")},
+                        "kind":"exact_source",
+                        "path":format!(
+                            "src/{index}-{hostile}{controls}{}.rs",
+                            "x".repeat(padding)
+                        ),
+                        "symbol_id":null,
+                        "start_line":1,
+                        "end_line":1,
+                        "summary":null
+                    })
+                })
+                .collect::<Vec<_>>();
+            let root = json!({
+                "kind":"complete",
+                "schema_version":3,
+                "identity":{
+                    "packet_id":"b96ac0cc-e552-4c35-a0ba-c83b9ead67de",
+                    "request_id":"request-1",
+                    "question_sha256":"a".repeat(64)
+                },
+                "publication":{
+                    "core":{
+                        "project_id":"project-1",
+                        "generation_id":"core-generation-1",
+                        "run_id":"core-run-1"
+                    },
+                    "retrieval":null
+                },
+                "status":"available",
+                "retrieval":{"state":"full","generation_id":"retrieval-generation-1"},
+                "evidence":evidence,
+                "gaps":[],
+                "continuation":null,
+                "diagnostics":{
+                    "availability":"available",
+                    "reference":{
+                        "artifact_id":"artifact-1",
+                        "sha256":"b".repeat(64),
+                        "byte_length":123
+                    }
+                }
+            });
+            serde_json::from_value::<
+                codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
+            >(root.clone())
+            .expect("boundary fixture remains inside every closed DTO bound");
+            root
+        }
+
+        fn served_size(
+            revision: crate::stdio_v3::McpRevisionV3,
+            root: &serde_json::Value,
+            publication_meta: &serde_json::Value,
+        ) -> usize {
+            let result =
+                build_served_tool_result_v3(revision, "packet", root, Some(publication_meta))
+                    .expect("valid complete packet result");
+            v3_serialize_call_tool_result(&result)
+                .expect("serialize complete packet result")
+                .len()
+        }
+
+        fn root_at_size(
+            revision: crate::stdio_v3::McpRevisionV3,
+            target: usize,
+            publication_meta: &serde_json::Value,
+        ) -> serde_json::Value {
+            for controls in 0..=8 {
+                let mut root = root_with_padding(0, controls);
+                reserve_packet_diagnostics_capability_v3(&mut root, 1_725_000_600_123).unwrap();
+                let base = served_size(revision, &root, publication_meta);
+                if base > target {
+                    continue;
+                }
+                let mut one_more = root_with_padding(1, controls);
+                reserve_packet_diagnostics_capability_v3(&mut one_more, 1_725_000_600_123).unwrap();
+                let per_ascii = served_size(revision, &one_more, publication_meta) - base;
+                let remaining = target - base;
+                if !remaining.is_multiple_of(per_ascii) {
+                    continue;
+                }
+                let mut exact = root_with_padding(remaining / per_ascii, controls);
+                reserve_packet_diagnostics_capability_v3(&mut exact, 1_725_000_600_123).unwrap();
+                assert_eq!(served_size(revision, &exact, publication_meta), target);
+                return exact;
+            }
+            panic!("could not construct an exact {target}-byte result for {revision:?}")
+        }
+
+        let publication_meta = json!({
+            "schema_version":3,
+            "minimum_compatible_schema_version":3,
+            "core_publication":{
+                "generation_id":"core-generation-with-escaped-\"-metadata",
+                "run_id":"core-run-1"
+            },
+            "retrieval_publication":{
+                "retrieval_generation":"retrieval-generation-with-multibyte-é🦀"
+            },
+            "operation":{"operation_id":"public-operation-123456789","attempt":2}
+        });
+
+        for revision in crate::stdio_v3::McpRevisionV3::all() {
+            for target in [
+                STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 - 1,
+                STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
+                STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1,
+            ] {
+                let mut root = root_at_size(*revision, target, &publication_meta);
+                let mut wire_root = root.clone();
+                let wire_reference = wire_root
+                    .pointer_mut("/diagnostics/reference")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("diagnostic reference");
+                wire_reference.remove("uri");
+                wire_reference.remove("wall_expiry_epoch_ms");
+                let measured = finalize_packet_projection_for_stdio_v3(
+                    &mut root,
+                    *revision,
+                    Some(&publication_meta),
+                )
+                .expect("complete or typed fallback fits");
+                let result = build_served_tool_result_v3(
+                    *revision,
+                    "packet",
+                    &root,
+                    Some(&publication_meta),
+                )
+                .unwrap();
+                let emitted = v3_serialize_call_tool_result(&result).unwrap();
+                assert_eq!(emitted.len(), measured);
+                assert!(emitted.len() <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
+                let text_root: serde_json::Value = serde_json::from_str(
+                    result["content"][0]["text"]
+                        .as_str()
+                        .expect("JSON text mirror"),
+                )
+                .unwrap();
+                assert_eq!(
+                    text_root.pointer("/diagnostics/reference/wall_expiry_epoch_ms"),
+                    Some(&json!(1_725_000_600_123_u64))
+                );
+                if revision.profile().structured_content {
+                    assert_eq!(result["structuredContent"], text_root);
+                } else {
+                    assert!(result.get("structuredContent").is_none());
+                }
+                if target <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+                    assert_eq!(root["kind"], "complete");
+                    assert_eq!(emitted.len(), target);
+                } else {
+                    assert_eq!(root["kind"], "budget_exceeded");
+                    assert_eq!(root["status"], "unavailable");
+                    assert_eq!(root["required_complete_bytes"], target);
+                    assert_eq!(root["gaps"].as_array().unwrap().len(), 1);
+                    assert_eq!(root["gaps"][0]["kind"], "output_budget_exceeded");
+                    assert!(root.get("evidence").is_none());
+                    assert!(root.get("continuation").is_none());
+                }
+
+                let diagnostic_bytes = vec![7; 123];
+                wire_root["diagnostics"]["reference"]["sha256"] =
+                    json!(format!("{:x}", Sha256::digest(&diagnostic_bytes)));
+                let registry = Arc::new(std::sync::Mutex::new(
+                    crate::stdio_v3::DiagnosticsRegistryV3::new(),
+                ));
+                let response = stdio_jsonrpc_tool_execution_v3(
+                    json!(format!("{revision:?}-{target}")),
+                    "packet",
+                    *revision,
+                    StdioToolExecutionV3 {
+                        response: json!({"result":wire_root}),
+                        packet_diagnostics: Some(codestory_runtime::PacketDiagnosticProjectionV3 {
+                            bytes: diagnostic_bytes,
+                            packet_id: "b96ac0cc-e552-4c35-a0ba-c83b9ead67de".to_string(),
+                            project_identity: "project-1".to_string(),
+                            core_generation: "core-generation-1".to_string(),
+                            core_run: "core-run-1".to_string(),
+                            retrieval_generation: Some("retrieval-generation-1".to_string()),
+                            request_digest: "a".repeat(64),
+                        }),
+                        publication_meta: Some(publication_meta.clone()),
+                    },
+                    &registry,
+                );
+                assert!(response.get("error").is_none(), "{revision:?}: {response}");
+                let actual_result = response.get("result").expect("emitted CallToolResult");
+                let actual_emitted = v3_serialize_call_tool_result(actual_result).unwrap();
+                assert!(
+                    actual_emitted.len() <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
+                    "{revision:?} emitted {} bytes for a {target}-byte candidate",
+                    actual_emitted.len()
+                );
+                let actual_text: serde_json::Value = serde_json::from_str(
+                    actual_result["content"][0]["text"]
+                        .as_str()
+                        .expect("emitted JSON text mirror"),
+                )
+                .unwrap();
+                assert_eq!(
+                    actual_text["kind"],
+                    if target <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+                        json!("complete")
+                    } else {
+                        json!("budget_exceeded")
+                    }
+                );
+                assert!(
+                    actual_text
+                        .pointer("/diagnostics/reference/wall_expiry_epoch_ms")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some(),
+                    "the actually emitted descriptor retains its authenticated wall expiry"
+                );
+                if revision.profile().structured_content {
+                    assert_eq!(actual_result["structuredContent"], actual_text);
+                }
+            }
+        }
     }
 
     #[test]
@@ -7409,7 +8471,6 @@ mod tests {
             task_class: Some(PacketTaskClassDto::ArchitectureExplanation),
             probes: &[],
             extra_probes: &[],
-            include_evidence: true,
             latency_budget_ms: Some(15_000),
             parent_packet_id: None,
             option_ids: &[],
@@ -9049,13 +10110,12 @@ version = "0.11.20"
             json!(true),
             "full publication class must not read as packet-ready when degraded: {compact}"
         );
-        let schema = stdio_tools_list_json()["result"]["tools"]
-            .as_array()
-            .expect("tools")
-            .iter()
-            .find(|tool| tool["name"] == "status")
-            .expect("status tool")["outputSchema"]
-            .clone();
+        let schema =
+            crate::stdio_v3::tools_for_revision_v3(crate::stdio_v3::McpRevisionV3::preferred())
+                .iter()
+                .find(|tool| tool["name"] == "status")
+                .expect("status tool")["outputSchema"]
+                .clone();
         let properties = schema["properties"]
             .as_object()
             .expect("status outputSchema properties");
@@ -9435,13 +10495,6 @@ version = "0.11.20"
         assert_ne!(
             base,
             stdio_packet_cache_key(StdioPacketCacheKeyInput {
-                include_evidence: false,
-                ..base_packet_cache_key_input("Explain packet caching.")
-            })
-        );
-        assert_ne!(
-            base,
-            stdio_packet_cache_key(StdioPacketCacheKeyInput {
                 latency_budget_ms: Some(30_000),
                 ..base_packet_cache_key_input("Explain packet caching.")
             })
@@ -9626,7 +10679,7 @@ version = "0.11.20"
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/schema_version"),
-            Some(&json!(2))
+            Some(&json!(3))
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/contract_runtime/cli_version"),
@@ -9637,10 +10690,11 @@ version = "0.11.20"
     #[test]
     fn stdio_degraded_packet_without_publication_still_carries_contract_stamp() {
         let payload = json!({
-            "sufficiency": {
-                "status": "partial",
-                "covered_claims": [{"proof_status": "reported"}]
-            }
+            "kind": "complete",
+            "schema_version": 3,
+            "status": "unavailable",
+            "evidence": [],
+            "gaps": []
         });
         let meta = stdio_served_publication_meta(
             &StdioServerState::default(),
@@ -9667,18 +10721,17 @@ version = "0.11.20"
         )
         .expect("canonical CLI/HTTP envelope");
 
-        // The payload above carries `proof_status: "reported"`, the value EV-5
-        // added. The literal is deliberate: a consumer told "schema 2" is being
-        // told which vocabulary this word belongs to, so the number cannot be
-        // allowed to drift behind a self-referential constant.
+        // Keep this literal independent from the contract constant: this test
+        // catches a public adapter that stamps the evidence-only vocabulary as
+        // an older schema.
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/schema_version"),
-            Some(&json!(2))
+            Some(&json!(3))
         );
         assert_eq!(
             response
                 .pointer("/result/_meta/codestory_publication/minimum_compatible_schema_version"),
-            Some(&json!(2))
+            Some(&json!(3))
         );
         assert_eq!(
             response.pointer("/result/_meta/codestory_publication/core_publication"),
@@ -9752,25 +10805,25 @@ version = "0.11.20"
             json!("agreed")
         );
 
-        let unsupported = initialize(json!({"protocolVersion": "2025-06-18"}));
+        let unsupported = initialize(json!({"protocolVersion": "2099-01-01"}));
         assert_eq!(
             unsupported["protocolVersion"],
-            json!("2024-11-05"),
+            json!("2025-11-25"),
             "an unimplemented revision must not be echoed as supported"
         );
         assert_eq!(
             unsupported["_meta"]["codestory_protocol"],
             json!({
-                "requested": "2025-06-18",
-                "negotiated": "2024-11-05",
-                "supported": ["2024-11-05"],
+                "requested": "2099-01-01",
+                "negotiated": "2025-11-25",
+                "supported": ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
                 "status": "unsupported_client_revision",
                 "compatible": false
             })
         );
 
         let defaulted = initialize(json!({}));
-        assert_eq!(defaulted["protocolVersion"], json!("2024-11-05"));
+        assert_eq!(defaulted["protocolVersion"], json!("2025-11-25"));
         assert_eq!(
             defaulted["_meta"]["codestory_protocol"]["status"],
             json!("defaulted")
@@ -9779,8 +10832,8 @@ version = "0.11.20"
         // The launcher reads this stamp out of the frame it suppresses, so it
         // must be the same contract-only stamp every other adapter publishes.
         let stamp = &agreed["_meta"]["codestory_publication"];
-        assert_eq!(stamp["schema_version"], json!(2));
-        assert_eq!(stamp["minimum_compatible_schema_version"], json!(2));
+        assert_eq!(stamp["schema_version"], json!(3));
+        assert_eq!(stamp["minimum_compatible_schema_version"], json!(3));
         assert_eq!(stamp["served_from"], json!("contract_only"));
         assert_eq!(
             stamp["contract_runtime"]["cli_version"],
@@ -9998,13 +11051,8 @@ version = "0.11.20"
             ),
             source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
         };
-        let mut session = StdioServerSession {
-            active_project: None,
-            retained_projects: VecDeque::new(),
-            project_required: true,
-            startup,
-            tainted_project: None,
-        };
+        let mut session = StdioServerSession::new(None);
+        session.startup = startup;
         let mut response = handle_stdio_message(
             &mut session,
             &json!({
@@ -10604,7 +11652,11 @@ version = "0.11.20"
                 &Arc::new(AtomicBool::new(false)),
             )
             .expect("valid affected response");
-            assert_eq!(response.pointer("/result/isError"), None, "{response}");
+            assert_eq!(
+                response.pointer("/result/isError"),
+                Some(&json!(false)),
+                "{response}"
+            );
             assert_eq!(
                 response.pointer("/result/structuredContent/changed_paths"),
                 Some(&json!(["src/lib.rs"]))
@@ -10720,8 +11772,17 @@ version = "0.11.20"
                 &Arc::new(AtomicBool::new(false)),
             )
             .expect("invalid affected response");
+            assert_eq!(response.pointer("/result/isError"), Some(&json!(true)));
+            assert!(response.pointer("/result/structuredContent").is_none());
+            let error = serde_json::from_str::<serde_json::Value>(
+                response
+                    .pointer("/result/content/0/text")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("text-only v3 semantic error"),
+            )
+            .expect("semantic error JSON");
             assert_eq!(
-                response.pointer("/result/structuredContent/code"),
+                error.get("code"),
                 Some(&json!("invalid_argument")),
                 "{response}"
             );
@@ -11470,7 +12531,7 @@ version = "0.11.20"
         )
         .expect("status response");
 
-        assert_eq!(response.pointer("/result/isError"), None);
+        assert_eq!(response.pointer("/result/isError"), Some(&json!(false)));
         assert!(
             !cold_cache_root.exists(),
             "cold status must not create project cache storage"
@@ -11507,6 +12568,277 @@ version = "0.11.20"
             !cold_cache_root.exists(),
             "cold project resource must not create project cache storage"
         );
+    }
+
+    #[test]
+    fn context_query_and_bookmark_select_the_same_exact_target() {
+        let project = tempfile::tempdir().expect("project");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(
+            project.path().join("context_target.rs"),
+            "pub fn exact_context_target() -> usize { 7 }\npub fn context_decoy() -> usize { 9 }\n",
+        )
+        .expect("write context target fixture");
+        let runtime = RuntimeContext::new_inspect_only(&args::ProjectArgs {
+            project: project.path().to_path_buf(),
+            cache_dir: Some(cache.path().to_path_buf()),
+        })
+        .expect("runtime context");
+        runtime
+            .ensure_open(args::RefreshMode::Full)
+            .expect("publish context target fixture");
+
+        let query_target = stdio_context_target(
+            &runtime,
+            &json!({
+                "params": {"arguments": {"query": "exact_context_target"}}
+            }),
+        )
+        .expect("resolve query target");
+        assert_eq!(query_target.label, "exact_context_target");
+        assert!(
+            query_target
+                .path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).ends_with("context_target.rs"))
+        );
+
+        let category = runtime
+            .bookmarks
+            .create_category(codestory_contracts::api::CreateBookmarkCategoryRequest {
+                name: "Context targets".to_string(),
+            })
+            .expect("create bookmark category");
+        let bookmark = runtime
+            .bookmarks
+            .create_bookmark(codestory_contracts::api::CreateBookmarkRequest {
+                category_id: category.id,
+                node_id: query_target.node_id.clone(),
+                comment: Some("exact target".to_string()),
+            })
+            .expect("create target bookmark");
+
+        let bookmark_target = stdio_context_target(
+            &runtime,
+            &json!({
+                "params": {"arguments": {"bookmark": bookmark.id}}
+            }),
+        )
+        .expect("resolve bookmark target");
+        assert_eq!(bookmark_target, query_target);
+
+        let id_target = stdio_context_target(
+            &runtime,
+            &json!({
+                "params": {"arguments": {"id": query_target.node_id.0}}
+            }),
+        )
+        .expect("resolve stable id target");
+        assert_eq!(id_target, query_target);
+    }
+
+    #[test]
+    fn native_context_query_and_bookmark_keep_the_exact_resolved_target() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("metadata.rs"),
+            "mod exact_native_context_target {}\n",
+        )
+        .expect("write zero-dense context fixture");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(project.path())
+                .args(args)
+                .status()
+                .expect("run context git fixture command");
+            assert!(status.success(), "git fixture command failed: {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "codestory-tests@example.com"]);
+        git(&["config", "user.name", "CodeStory Tests"]);
+        git(&["add", "metadata.rs"]);
+        git(&["commit", "-qm", "context fixture"]);
+
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio-cache")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar-cache"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        session
+            .select_project(project.path().to_str())
+            .expect("select context project");
+        let (expected, bookmark_id) = {
+            let active = session.active_project.as_ref().expect("active project");
+            active
+                .runtime
+                .ensure_open(args::RefreshMode::Full)
+                .expect("publish context core");
+            codestory_retrieval::test_support::publish_zero_dense_pinned_query_fixture(
+                &active.runtime.project_root,
+                &active.runtime.storage_path,
+                active.runtime.sidecar.as_raw_config_for_test(),
+            )
+            .expect("publish strict context retrieval fixture");
+            active
+                .runtime
+                .activation
+                .use_published_retrieval_fixture_for_test();
+            let expected = stdio_context_target(
+                &active.runtime,
+                &json!({"params":{"arguments":{"query":"exact_native_context_target"}}}),
+            )
+            .expect("resolve exact native query target");
+            let category = active
+                .runtime
+                .bookmarks
+                .create_category(codestory_contracts::api::CreateBookmarkCategoryRequest {
+                    name: "Native context".to_string(),
+                })
+                .expect("create native category");
+            let bookmark = active
+                .runtime
+                .bookmarks
+                .create_bookmark(codestory_contracts::api::CreateBookmarkRequest {
+                    category_id: category.id,
+                    node_id: expected.node_id.clone(),
+                    comment: None,
+                })
+                .expect("create native bookmark");
+
+            let no_citation_answer = json!({
+                "answer_id":"context-answer-no-citations",
+                "prompt":"exact_native_context_target",
+                "summary":"fixture",
+                "source_coverage":[],
+                "sections":[],
+                "citations":[],
+                "subgraph_ids":[],
+                "retrieval_version":"fixture",
+                "graphs":[],
+                "retrieval_trace":{
+                    "request_id":"context-request-no-citations",
+                    "resolved_profile":"investigate",
+                    "policy_mode":"latency_first",
+                    "total_latency_ms":0,
+                    "sla_missed":false,
+                    "semantic_fallback_count":0,
+                    "semantic_fallbacks":[],
+                    "semantic_stage_timeout_zero_hits":0,
+                    "semantic_abstained_count":0,
+                    "annotations":[],
+                    "steps":[],
+                    "packet_sidecar_diagnostics":[]
+                }
+            });
+            for (label, selector) in [
+                ("query", json!({"query":"exact_native_context_target"})),
+                ("bookmark", json!({"bookmark":bookmark.id})),
+            ] {
+                let request = json!({"params":{"arguments":selector}});
+                let target = stdio_context_target(&active.runtime, &request)
+                    .expect("resolve no-citation context target");
+                let internal = json!({
+                    "_codestory_context_target_v3": {
+                        "symbol_id": target.node_id.0,
+                        "path": target.path
+                    }
+                });
+                let projected = active
+                    .runtime
+                    .public_operation
+                    .run_observational_with_cancel(
+                        "context-no-citation-test",
+                        Arc::new(AtomicBool::new(false)),
+                        || {
+                            project_stdio_context_result_v3(
+                                &active.runtime,
+                                &internal,
+                                no_citation_answer.clone(),
+                            )
+                        },
+                    )
+                    .expect("project no-citation context response")
+                    .value;
+                assert_eq!(
+                    projected.pointer("/target/symbol_id"),
+                    Some(&json!(expected.node_id.0)),
+                    "{label}: {projected}"
+                );
+                assert_eq!(
+                    projected
+                        .pointer("/target/path")
+                        .and_then(serde_json::Value::as_str),
+                    expected.path.as_deref(),
+                    "{label}: {projected}"
+                );
+                assert_eq!(projected.pointer("/evidence"), Some(&json!([])));
+            }
+            (expected, bookmark.id)
+        };
+
+        handle_stdio_message(
+            &mut session,
+            &json!({
+                "jsonrpc":"2.0",
+                "id":"init-context-target",
+                "method":"initialize",
+                "params":{"protocolVersion":"2025-11-25"}
+            })
+            .to_string(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .expect("initialize context session");
+
+        for (id, selector) in [
+            ("query", json!({"query":"exact_native_context_target"})),
+            ("bookmark", json!({"bookmark":bookmark_id})),
+        ] {
+            let mut arguments = selector.as_object().unwrap().clone();
+            arguments.insert(
+                "project".to_string(),
+                json!(project.path().to_string_lossy()),
+            );
+            let response = handle_stdio_message(
+                &mut session,
+                &json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{"name":"context","arguments":arguments}
+                })
+                .to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .expect("native context response");
+            assert_eq!(
+                response.pointer("/result/isError"),
+                Some(&json!(false)),
+                "{response}"
+            );
+            assert_eq!(
+                response
+                    .pointer("/result/structuredContent/target/symbol_id")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected.node_id.0.as_str()),
+                "{id}: {response}"
+            );
+            assert_eq!(
+                response
+                    .pointer("/result/structuredContent/target/path")
+                    .and_then(serde_json::Value::as_str),
+                expected.path.as_deref(),
+                "{id}: {response}"
+            );
+        }
     }
 
     #[test]

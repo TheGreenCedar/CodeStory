@@ -1,7 +1,7 @@
-//! Dark, immutable v3 packet execution capture.
+//! Immutable v3 packet execution capture.
 
-// The record remains intentionally unreachable from production until the
-// atomic v3 surface cut. `test-support` consumers exercise the callable seam.
+// Public evidence projection and sealed qualification both consume this
+// capture; neither may mutate the finalized execution it records.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
@@ -1094,32 +1094,29 @@ mod tests {
             "ordered probe semantics must survive canonicalization"
         );
 
-        let mut current_request = AgentPacketRequestDto {
+        let current_request = AgentPacketRequestDto {
             question: "hello".to_owned(),
             budget: PacketBudgetModeDto::Standard,
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: None,
             option_ids: Vec::new(),
             core_generation_id: None,
             retrieval_generation: None,
         };
-        let with_evidence = PacketRequestFingerprintV3::from_current_request(
-            &current_request,
-            PacketProfileV3::Auto,
-        );
-        current_request.include_evidence = false;
-        let without_evidence = PacketRequestFingerprintV3::from_current_request(
+        let fingerprint = PacketRequestFingerprintV3::from_current_request(
             &current_request,
             PacketProfileV3::Auto,
         );
         assert_eq!(
-            fingerprint_request_v3(&with_evidence).unwrap(),
-            fingerprint_request_v3(&without_evidence).unwrap(),
-            "the removed include_evidence flag is outside the v3 request fingerprint"
+            fingerprint_request_v3(&fingerprint)
+                .unwrap()
+                .request_sha256
+                .as_str()
+                .len(),
+            64
         );
     }
 

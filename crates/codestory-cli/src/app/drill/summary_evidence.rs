@@ -240,8 +240,8 @@ fn drill_summary_bridges(output: &DrillOutput) -> DrillSummaryBridgesOutput {
 }
 
 fn drill_summary_source_truth(output: &DrillOutput) -> DrillSummarySourceTruthOutput {
-    let disposition = &output.evidence_packet.disposition;
-    let support_count = output.evidence_packet.support.len();
+    let disposition = &output.legacy_evidence_packet.disposition;
+    let support_count = output.legacy_evidence_packet.support.len();
     let mut target_files: Vec<_> = output
         .verification_targets
         .iter()
@@ -281,8 +281,8 @@ fn drill_summary_open_gaps(
     source_truth: &DrillSummarySourceTruthOutput,
     stale_freshness: bool,
 ) -> DrillSummaryOpenGapsOutput {
-    let disposition = &output.evidence_packet.disposition;
-    let support_count = output.evidence_packet.support.len();
+    let disposition = &output.legacy_evidence_packet.disposition;
+    let support_count = output.legacy_evidence_packet.support.len();
     let open_gap_friendly = !disposition.omission_receipts.is_empty()
         || disposition.kind == PacketDispositionKindDto::DrillOnce
         || source_truth.required
@@ -322,7 +322,7 @@ pub(in crate::app) fn drill_packet_claim_readiness(
     status: PacketDispositionKindDto,
 ) -> ClaimReadinessDto {
     match status {
-        PacketDispositionKindDto::Supported => ClaimReadinessDto::Supported,
+        PacketDispositionKindDto::Supported => ClaimReadinessDto::Anchored,
         PacketDispositionKindDto::DrillOnce => ClaimReadinessDto::Partial,
         PacketDispositionKindDto::NotEstablished | PacketDispositionKindDto::Unavailable => {
             ClaimReadinessDto::NeedsSourceRead

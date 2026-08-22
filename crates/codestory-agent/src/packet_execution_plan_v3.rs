@@ -1,9 +1,7 @@
-//! Dark, pure v3 packet evidence planning.
+//! Pure v3 packet evidence planning.
 //!
-//! The module is compiled only for unit tests and the internal `test-support`
-//! feature. It translates the narrow historical inputs needed by the v3
-//! compatibility proof and evaluates an execution ledger without performing
-//! retrieval or changing the current packet compiler.
+//! It translates finalized planner inputs into a closed execution ledger
+//! without performing retrieval or changing the packet compiler's facts.
 
 use std::collections::{BTreeMap, BTreeSet};
 

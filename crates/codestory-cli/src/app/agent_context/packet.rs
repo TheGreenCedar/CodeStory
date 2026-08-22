@@ -2,22 +2,24 @@ use super::super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
 use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
 use crate::args;
 use crate::args::PacketCommand;
-use crate::output::{
-    REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, emit_public_operation,
-    render_context_markdown, render_public_operation_json_content,
-};
+use crate::output::{REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, emit_public_operation};
+#[cfg(test)]
+use crate::output::{render_context_markdown, render_public_operation_json_content};
 use crate::runtime;
 use crate::runtime::map_api_error;
 use anyhow::Result;
-use codestory_contracts::api::{
-    AgentPacketDto, AgentPacketRequestDto, PacketBudgetModeDto, PacketDispositionKindDto,
-    PacketTaskClassDto,
+#[cfg(test)]
+use codestory_contracts::api::{AgentPacketDto, PacketBudgetModeDto, PacketTaskClassDto};
+use codestory_contracts::api::{AgentPacketRequestDto, PacketDispositionKindDto};
+use codestory_contracts::packet_projection_v3::{
+    EvidenceAvailabilityV3Dto, PacketProjectionV3Dto, RetrievalStateV3Dto,
 };
 use std::fmt::Write as _;
 
 pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
+    preflight_output_file(cmd.diagnostics_out.as_deref())?;
     args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
         .map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } = open_agent_surface(
@@ -28,36 +30,147 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
         "packet",
     )?;
 
-    let mut operation = runtime.run_public_operation("packet", || {
-        runtime
+    let request = packet_request_from_command(&cmd);
+    let operation = runtime.run_public_operation("packet", || {
+        let packet = runtime
             .browser
-            .packet(packet_request_from_command(&cmd))
-            .map_err(map_api_error)
+            .packet(request.clone())
+            .map_err(map_api_error)?;
+        codestory_runtime::project_packet_v3(
+            &runtime.public_operation,
+            "codestory-cli",
+            &request,
+            &packet,
+            |candidate| {
+                serde_json::to_vec(candidate)
+                    .map(|bytes| bytes.len())
+                    .map_err(|_| ())
+            },
+        )
+        .map_err(map_api_error)
     })?;
-    let executable = std::env::current_exe()?;
-
-    let step_trace = if cmd.step_trace_out.is_some() {
-        let trace = codestory_runtime::packet_step_trace_json(&operation.value.answer);
-        Some(serde_json::to_string_pretty(&trace)?)
-    } else {
-        None
-    };
-    if cmd.format == args::OutputFormat::Json {
-        enforce_packet_cli_json_output_budget(&runtime.project_root, &mut operation, &executable)?;
-    } else {
-        codestory_runtime::bind_packet_follow_up_program(
-            &runtime.project_root,
-            &mut operation.value,
-            &executable,
-        );
+    if let Some(path) = cmd.diagnostics_out.as_deref() {
+        if std::fs::symlink_metadata(path).is_ok() {
+            anyhow::bail!(
+                "packet diagnostics destination already exists: {}",
+                path.display()
+            );
+        }
+        codestory_workspace::atomic_file::publish_new_private_file_atomic(
+            path,
+            "codestory-packet-diagnostics",
+            &operation.value.diagnostics.bytes,
+        )
+        .map_err(anyhow::Error::new)?;
     }
-    if let (Some(path), Some(trace)) = (&cmd.step_trace_out, step_trace) {
-        std::fs::write(path, trace)?;
-    }
-    let markdown = render_packet_markdown(&runtime.project_root, &operation.value);
-    let rendered = RenderedPublicOutput::structured(&operation.value, markdown)?;
+    let markdown = render_packet_projection_markdown(&operation.value.projection);
+    let rendered = RenderedPublicOutput::structured(&operation.value.projection, markdown)?;
     let operation = runtime::map_public_operation(operation, |_| rendered);
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
+}
+
+fn render_packet_projection_markdown(packet: &PacketProjectionV3Dto) -> String {
+    let mut markdown = String::from("# Packet evidence\n\n");
+    match packet {
+        PacketProjectionV3Dto::Complete {
+            identity,
+            status,
+            retrieval,
+            evidence,
+            gaps,
+            continuation,
+            diagnostics,
+            ..
+        } => {
+            let _ = writeln!(markdown, "packet_id: `{}`", identity.packet_id.as_str());
+            let _ = writeln!(
+                markdown,
+                "availability: `{}`",
+                evidence_status_label(status)
+            );
+            let _ = writeln!(
+                markdown,
+                "retrieval: `{}`",
+                retrieval_state_label(&retrieval.state)
+            );
+            if !evidence.as_slice().is_empty() {
+                let _ = writeln!(markdown, "\n## Evidence");
+                let _ = writeln!(markdown, "{REPO_CONTENT_BOUNDARY_LINE}");
+                for row in evidence.as_slice() {
+                    let summary = row
+                        .summary
+                        .as_ref()
+                        .map_or("evidence row", |value| value.as_str());
+                    let location = row.path.as_ref().map_or("", |value| value.as_str());
+                    let _ = writeln!(markdown, "- {summary} ({location})");
+                }
+            }
+            if !gaps.as_slice().is_empty() {
+                let _ = writeln!(markdown, "\n## Gaps");
+                for gap in gaps.as_slice() {
+                    let message = gap
+                        .message
+                        .as_ref()
+                        .map_or("additional evidence required", |value| value.as_str());
+                    let _ = writeln!(markdown, "- {message}");
+                }
+            }
+            if let Some(continuation) = continuation {
+                let _ = writeln!(
+                    markdown,
+                    "\ncontinuation: `{}` (remaining_rounds={})",
+                    continuation.continuation_id.as_str(),
+                    continuation.remaining_rounds
+                );
+            }
+            if let codestory_contracts::packet_projection_v3::DiagnosticsCapabilityV3Dto::Available { reference } = diagnostics {
+                let _ = writeln!(
+                    markdown,
+                    "diagnostics_sha256: `{}`",
+                    reference.sha256.as_str()
+                );
+            }
+        }
+        PacketProjectionV3Dto::BudgetExceeded {
+            identity,
+            gaps,
+            maximum_bytes,
+            required_complete_bytes,
+            ..
+        } => {
+            let _ = writeln!(markdown, "packet_id: `{}`", identity.packet_id.as_str());
+            let _ = writeln!(markdown, "availability: `unavailable`");
+            for gap in gaps.as_slice() {
+                let _ = writeln!(
+                    markdown,
+                    "gap: `output_budget_exceeded` (`{}`)",
+                    gap.identity.gap_id.as_str()
+                );
+            }
+            let _ = writeln!(
+                markdown,
+                "result_budget: `{maximum_bytes}` bytes; complete projection required `{required_complete_bytes}` bytes"
+            );
+        }
+    }
+    markdown
+}
+
+fn evidence_status_label(status: &EvidenceAvailabilityV3Dto) -> &'static str {
+    match status {
+        EvidenceAvailabilityV3Dto::Available => "available",
+        EvidenceAvailabilityV3Dto::ContinuationAvailable => "continuation_available",
+        EvidenceAvailabilityV3Dto::NoUsefulEvidence => "no_useful_evidence",
+        EvidenceAvailabilityV3Dto::Unavailable => "unavailable",
+    }
+}
+
+fn retrieval_state_label(state: &RetrievalStateV3Dto) -> &'static str {
+    match state {
+        RetrievalStateV3Dto::Full => "full",
+        RetrievalStateV3Dto::Degraded => "degraded",
+        RetrievalStateV3Dto::Unavailable => "unavailable",
+    }
 }
 
 pub(in crate::app) fn packet_request_from_command(cmd: &PacketCommand) -> AgentPacketRequestDto {
@@ -67,7 +180,6 @@ pub(in crate::app) fn packet_request_from_command(cmd: &PacketCommand) -> AgentP
         task_class: cmd.task_class.map(Into::into),
         probes: cmd.probes.clone(),
         extra_probes: cmd.extra_probes.clone(),
-        include_evidence: !cmd.no_evidence,
         latency_budget_ms: cmd.latency_budget_ms,
         parent_packet_id: cmd.parent_packet_id.clone(),
         option_ids: cmd.option_ids.clone(),
@@ -76,6 +188,7 @@ pub(in crate::app) fn packet_request_from_command(cmd: &PacketCommand) -> AgentP
     }
 }
 
+#[cfg(test)]
 pub(in crate::app) fn enforce_packet_cli_json_output_budget(
     project_root: &std::path::Path,
     operation: &mut codestory_runtime::PublicOperation<AgentPacketDto>,
@@ -113,6 +226,7 @@ pub(in crate::app) fn enforce_packet_cli_json_output_budget(
     Ok(())
 }
 
+#[cfg(test)]
 pub(in crate::app) fn render_packet_markdown(
     project_root: &std::path::Path,
     packet: &AgentPacketDto,
@@ -169,6 +283,7 @@ pub(in crate::app) fn render_packet_markdown(
     markdown
 }
 
+#[cfg(test)]
 fn append_packet_operator_header(markdown: &mut String, packet: &AgentPacketDto) {
     let _ = writeln!(markdown, "## Status");
     let _ = writeln!(
@@ -194,6 +309,7 @@ fn append_packet_operator_header(markdown: &mut String, packet: &AgentPacketDto)
     let _ = writeln!(markdown, "proof_tier: packet_evidence");
 }
 
+#[cfg(test)]
 pub(super) fn packet_operator_status(kind: PacketDispositionKindDto) -> &'static str {
     match kind {
         PacketDispositionKindDto::Supported => "ready",
@@ -204,6 +320,7 @@ pub(super) fn packet_operator_status(kind: PacketDispositionKindDto) -> &'static
     }
 }
 
+#[cfg(test)]
 pub(super) fn packet_budget_omitted_sections(packet: &AgentPacketDto) -> String {
     if packet.budget.omitted_sections.is_empty() {
         "none".to_string()
@@ -212,6 +329,7 @@ pub(super) fn packet_budget_omitted_sections(packet: &AgentPacketDto) -> String 
     }
 }
 
+#[cfg(test)]
 fn packet_operator_next_action(packet: &AgentPacketDto) -> String {
     match packet.disposition.kind {
         PacketDispositionKindDto::Supported | PacketDispositionKindDto::NotEstablished => {
@@ -233,6 +351,7 @@ fn packet_operator_next_action(packet: &AgentPacketDto) -> String {
     }
 }
 
+#[cfg(test)]
 pub(in crate::app) fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'static str {
     match mode {
         PacketBudgetModeDto::Tiny => "tiny",
@@ -242,6 +361,7 @@ pub(in crate::app) fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'s
     }
 }
 
+#[cfg(test)]
 pub(in crate::app) fn packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str {
     match task_class {
         PacketTaskClassDto::ArchitectureExplanation => "architecture_explanation",
@@ -254,6 +374,7 @@ pub(in crate::app) fn packet_task_class_label(task_class: PacketTaskClassDto) ->
     }
 }
 
+#[cfg(test)]
 pub(crate) fn packet_disposition_label(kind: PacketDispositionKindDto) -> &'static str {
     match kind {
         PacketDispositionKindDto::Supported => "supported",
@@ -264,7 +385,12 @@ pub(crate) fn packet_disposition_label(kind: PacketDispositionKindDto) -> &'stat
 }
 
 pub(crate) fn packet_sufficiency_label(kind: PacketDispositionKindDto) -> &'static str {
-    packet_disposition_label(kind)
+    match kind {
+        PacketDispositionKindDto::Supported => "available",
+        PacketDispositionKindDto::DrillOnce => "continuation_available",
+        PacketDispositionKindDto::NotEstablished => "no_useful_evidence",
+        PacketDispositionKindDto::Unavailable => "unavailable",
+    }
 }
 
 #[cfg(test)]

@@ -47,14 +47,6 @@ fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
     }
 }
 
-fn from_api_repo_text_mode(mode: SearchRepoTextMode) -> RepoTextMode {
-    match mode {
-        SearchRepoTextMode::Auto => RepoTextMode::Auto,
-        SearchRepoTextMode::On => RepoTextMode::On,
-        SearchRepoTextMode::Off => RepoTextMode::Off,
-    }
-}
-
 fn drill_read_only_jobs(requested: usize, refresh: args::RefreshMode) -> usize {
     if refresh == args::RefreshMode::None {
         normalize_drill_jobs(requested)

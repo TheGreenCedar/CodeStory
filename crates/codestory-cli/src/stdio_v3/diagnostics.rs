@@ -13,8 +13,10 @@ pub(crate) const DIAGNOSTIC_REGISTRY_MAX_ENTRIES_V3: usize = 8;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiagnosticsBindingV3 {
     pub(crate) packet_id: String,
-    pub(crate) project_id: String,
-    pub(crate) publication_id: String,
+    pub(crate) project_identity: String,
+    pub(crate) core_generation: String,
+    pub(crate) core_run: String,
+    pub(crate) retrieval_generation: Option<String>,
     pub(crate) request_digest: String,
     pub(crate) wall_expiry_epoch_ms: u64,
 }
@@ -24,6 +26,7 @@ pub(crate) struct DiagnosticsGrantV3 {
     pub(crate) uri: String,
     pub(crate) byte_length: usize,
     pub(crate) sha256: String,
+    pub(crate) wall_expiry_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,8 +98,26 @@ impl DiagnosticsRegistryV3 {
             binding.packet_id,
             hex_v3(&token)
         );
-        let bytes: Arc<[u8]> = bytes.into();
         self.prune_expired_at(now);
+        if let Some(index) = self.entries.iter().position(|entry| {
+            entry.packet_id == binding.packet_id && constant_time_eq_v3(&entry.token, &token)
+        }) {
+            if self.entries[index].bytes.as_ref() != bytes.as_slice() {
+                return Err(DiagnosticsReadErrorV3::Internal);
+            }
+            let entry = self
+                .entries
+                .remove(index)
+                .expect("matched immutable diagnostic entry");
+            self.entries.push_back(entry);
+            return Ok(DiagnosticsGrantV3 {
+                uri,
+                byte_length,
+                sha256,
+                wall_expiry_epoch_ms: binding.wall_expiry_epoch_ms,
+            });
+        }
+        let bytes: Arc<[u8]> = bytes.into();
         while self.entries.len() >= DIAGNOSTIC_REGISTRY_MAX_ENTRIES_V3
             || self.retained_bytes + bytes.len() > DIAGNOSTIC_REGISTRY_MAX_BYTES_V3
         {
@@ -113,6 +134,7 @@ impl DiagnosticsRegistryV3 {
             uri,
             byte_length,
             sha256,
+            wall_expiry_epoch_ms: binding.wall_expiry_epoch_ms,
         })
     }
 
@@ -122,11 +144,9 @@ impl DiagnosticsRegistryV3 {
         now: Instant,
     ) -> Result<Arc<[u8]>, DiagnosticsReadErrorV3> {
         let (packet_id, supplied_token) = parse_capability_uri_v3(uri)?;
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.packet_id == packet_id)
-        else {
+        let Some(index) = self.entries.iter().position(|entry| {
+            entry.packet_id == packet_id && constant_time_eq_v3(&entry.token, &supplied_token)
+        }) else {
             return Err(DiagnosticsReadErrorV3::CapabilityUnavailable);
         };
         if now >= self.entries[index].expires_at {
@@ -137,11 +157,29 @@ impl DiagnosticsRegistryV3 {
             self.retained_bytes -= expired.bytes.len();
             return Err(DiagnosticsReadErrorV3::CapabilityUnavailable);
         }
-        let entry = &self.entries[index];
-        if !constant_time_eq_v3(&entry.token, &supplied_token) {
-            return Err(DiagnosticsReadErrorV3::CapabilityUnavailable);
-        }
-        Ok(Arc::clone(&entry.bytes))
+        let entry = self
+            .entries
+            .remove(index)
+            .expect("validated diagnostic entry index");
+        let bytes = Arc::clone(&entry.bytes);
+        self.entries.push_back(entry);
+        Ok(bytes)
+    }
+
+    pub(crate) fn revoke(&mut self, uri: &str) {
+        let Ok((packet_id, token)) = parse_capability_uri_v3(uri) else {
+            return;
+        };
+        let Some(index) = self.entries.iter().position(|entry| {
+            entry.packet_id == packet_id && constant_time_eq_v3(&entry.token, &token)
+        }) else {
+            return;
+        };
+        let entry = self
+            .entries
+            .remove(index)
+            .expect("matched diagnostic entry index");
+        self.retained_bytes -= entry.bytes.len();
     }
 
     #[cfg(test)]
@@ -191,22 +229,38 @@ pub(crate) fn attach_capability_uri_v3(
         return Err(DiagnosticsReadErrorV3::Internal);
     }
     reference.insert("uri".to_string(), Value::String(grant.uri.clone()));
+    reference.insert(
+        "wall_expiry_epoch_ms".to_string(),
+        Value::from(grant.wall_expiry_epoch_ms),
+    );
     Ok(())
 }
 
 fn capability_token_v3(secret: &[u8; 32], binding: &DiagnosticsBindingV3) -> [u8; 32] {
     let mut message = Vec::new();
     message.extend_from_slice(b"codestory.packet-diagnostics.v3\0");
+    let retrieval_generation = binding.retrieval_generation.as_deref().map_or_else(
+        || vec![0],
+        |generation| {
+            let mut encoded = Vec::with_capacity(generation.len() + 1);
+            encoded.push(1);
+            encoded.extend_from_slice(generation.as_bytes());
+            encoded
+        },
+    );
+    let wall_expiry = binding.wall_expiry_epoch_ms.to_be_bytes();
     for field in [
         binding.packet_id.as_bytes(),
-        binding.project_id.as_bytes(),
-        binding.publication_id.as_bytes(),
+        binding.project_identity.as_bytes(),
+        binding.core_generation.as_bytes(),
+        binding.core_run.as_bytes(),
+        retrieval_generation.as_slice(),
         binding.request_digest.as_bytes(),
+        wall_expiry.as_slice(),
     ] {
         message.extend_from_slice(&(field.len() as u64).to_be_bytes());
         message.extend_from_slice(field);
     }
-    message.extend_from_slice(&binding.wall_expiry_epoch_ms.to_be_bytes());
     hmac_sha256_v3(secret, &message)
 }
 
@@ -304,6 +358,7 @@ fn hex_v3(bytes: &[u8]) -> String {
 mod tests {
     use std::time::Duration;
 
+    use serde_json::json;
     use uuid::Uuid;
 
     use super::*;
@@ -311,8 +366,10 @@ mod tests {
     fn binding(packet_id: String, wall_expiry_epoch_ms: u64) -> DiagnosticsBindingV3 {
         DiagnosticsBindingV3 {
             packet_id,
-            project_id: "project-1".into(),
-            publication_id: "core-1/retrieval-1".into(),
+            project_identity: "project-1".into(),
+            core_generation: "core-1".into(),
+            core_run: "run-1".into(),
+            retrieval_generation: Some("retrieval-1".into()),
             request_digest: "a".repeat(64),
             wall_expiry_epoch_ms,
         }
@@ -336,6 +393,7 @@ mod tests {
             .expect("registered capability");
         assert_eq!(grant.byte_length, bytes.len());
         assert_eq!(grant.sha256.len(), 64);
+        assert_eq!(grant.wall_expiry_epoch_ms, 99_000);
         assert!(grant.uri.starts_with("codestory://packet-diagnostics/"));
         let first = registry
             .read_at(&grant.uri, now)
@@ -345,6 +403,56 @@ mod tests {
             .expect("read before monotonic expiry");
         assert_eq!(&*first, bytes);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn repeated_packet_capabilities_match_the_full_authenticated_uri() {
+        let now = Instant::now();
+        let packet_id = Uuid::new_v4().to_string();
+        let mut registry = DiagnosticsRegistryV3::new_with_secret([4; 32]);
+        let first = registry
+            .register_at(binding(packet_id.clone(), 99_000), vec![1], now)
+            .unwrap();
+        let second = registry
+            .register_at(binding(packet_id, 100_000), vec![2], now)
+            .unwrap();
+        assert_ne!(first.uri, second.uri);
+        assert_eq!(
+            &*registry
+                .read_at(&second.uri, now)
+                .expect("later capability with the same packet id"),
+            &[2]
+        );
+        assert_eq!(
+            &*registry
+                .read_at(&first.uri, now)
+                .expect("earlier capability remains independently readable"),
+            &[1]
+        );
+    }
+
+    #[test]
+    fn identical_reemission_reuses_the_immutable_capability_without_extending_expiry() {
+        let now = Instant::now();
+        let packet_id = Uuid::new_v4().to_string();
+        let binding = binding(packet_id, 99_000);
+        let mut registry = DiagnosticsRegistryV3::new_with_secret([6; 32]);
+        let first = registry.register_at(binding.clone(), vec![1], now).unwrap();
+        let second = registry
+            .register_at(binding.clone(), vec![1], now + Duration::from_micros(500))
+            .unwrap();
+        assert_eq!(first.uri, second.uri);
+        assert_eq!(registry.entry_count(), 1);
+        assert_eq!(
+            registry.register_at(binding, vec![2], now + Duration::from_micros(750)),
+            Err(DiagnosticsReadErrorV3::Internal),
+            "one capability identity cannot alias different immutable bytes"
+        );
+        assert_eq!(
+            registry.read_at(&second.uri, now + Duration::from_secs(600)),
+            Err(DiagnosticsReadErrorV3::CapabilityUnavailable),
+            "re-emission cannot extend an already minted capability"
+        );
     }
 
     #[test]
@@ -431,5 +539,217 @@ mod tests {
             registry.register_at(binding(Uuid::nil().to_string(), 1), vec![1], Instant::now(),),
             Err(DiagnosticsReadErrorV3::Internal)
         );
+    }
+
+    #[test]
+    fn capability_binding_keeps_publication_components_distinct() {
+        fn binding_from_parts(
+            packet_id: &str,
+            project_id: &str,
+            core_generation: &str,
+            core_run: &str,
+            retrieval_generation: Option<&str>,
+            request_digest: &str,
+            wall_expiry_epoch_ms: u64,
+        ) -> DiagnosticsBindingV3 {
+            DiagnosticsBindingV3 {
+                packet_id: packet_id.to_owned(),
+                project_identity: project_id.to_owned(),
+                core_generation: core_generation.to_owned(),
+                core_run: core_run.to_owned(),
+                retrieval_generation: retrieval_generation.map(str::to_owned),
+                request_digest: request_digest.to_owned(),
+                wall_expiry_epoch_ms,
+            }
+        }
+
+        let packet_id = Uuid::new_v4().to_string();
+        let base = binding_from_parts(
+            &packet_id,
+            "project/identity",
+            "core/generation",
+            "core-run-a",
+            Some("retrieval/generation"),
+            &"a".repeat(64),
+            99_000,
+        );
+        let base_token = capability_token_v3(&[7; 32], &base);
+        let mut mutations = Vec::new();
+        let mut changed = base.clone();
+        changed.packet_id = Uuid::new_v4().to_string();
+        mutations.push(("packet_id", changed));
+        let mut changed = base.clone();
+        changed.project_identity.push_str("-changed");
+        mutations.push(("project_identity", changed));
+        let mut changed = base.clone();
+        changed.core_generation.push_str("-changed");
+        mutations.push(("core_generation", changed));
+        let mut changed = base.clone();
+        changed.core_run.push_str("-changed");
+        mutations.push(("core_run", changed));
+        let mut changed = base.clone();
+        changed.retrieval_generation = None;
+        mutations.push(("retrieval_generation", changed));
+        let mut changed = base.clone();
+        changed.request_digest = "b".repeat(64);
+        mutations.push(("request_digest", changed));
+        let mut changed = base.clone();
+        changed.wall_expiry_epoch_ms += 1;
+        mutations.push(("wall_expiry_epoch_ms", changed));
+        for (field, changed) in mutations {
+            assert_ne!(
+                base_token,
+                capability_token_v3(&[7; 32], &changed),
+                "mutating {field} must change the capability token"
+            );
+        }
+        let core_run_only = binding_from_parts(
+            &packet_id,
+            "project/identity",
+            "core/generation",
+            "core-run-b",
+            Some("retrieval/generation"),
+            &"a".repeat(64),
+            99_000,
+        );
+        assert_ne!(
+            capability_token_v3(&[7; 32], &base),
+            capability_token_v3(&[7; 32], &core_run_only),
+            "core run is part of the authenticated publication identity"
+        );
+
+        let delimiter_left = binding_from_parts(
+            &packet_id,
+            "project/identity",
+            "core/segment",
+            "run",
+            Some("retrieval"),
+            &"a".repeat(64),
+            99_000,
+        );
+        let delimiter_right = binding_from_parts(
+            &packet_id,
+            "project/identity",
+            "core",
+            "segment/run",
+            Some("retrieval"),
+            &"a".repeat(64),
+            99_000,
+        );
+        assert_eq!(
+            format!(
+                "{}/{}/{}",
+                delimiter_left.core_generation,
+                delimiter_left.core_run,
+                delimiter_left.retrieval_generation.as_deref().unwrap()
+            ),
+            format!(
+                "{}/{}/{}",
+                delimiter_right.core_generation,
+                delimiter_right.core_run,
+                delimiter_right.retrieval_generation.as_deref().unwrap()
+            ),
+            "the hostile inputs deliberately collide under slash concatenation"
+        );
+        assert_ne!(
+            capability_token_v3(&[7; 32], &delimiter_left),
+            capability_token_v3(&[7; 32], &delimiter_right),
+            "delimiter-containing publication components stay independently framed"
+        );
+    }
+
+    #[test]
+    fn successful_read_refreshes_lru_order_without_extending_expiry() {
+        let now = Instant::now();
+        let mut registry = DiagnosticsRegistryV3::new_with_secret([11; 32]);
+        let mut grants = Vec::new();
+        for index in 0..DIAGNOSTIC_REGISTRY_MAX_ENTRIES_V3 {
+            grants.push(
+                registry
+                    .register_at(
+                        binding(Uuid::new_v4().to_string(), index as u64),
+                        vec![index as u8],
+                        now,
+                    )
+                    .unwrap(),
+            );
+        }
+        let oldest_bytes = registry
+            .read_at(&grants[0].uri, now + Duration::from_secs(599))
+            .expect("oldest entry read just before expiry");
+        registry
+            .register_at(
+                binding(Uuid::new_v4().to_string(), 9),
+                vec![9],
+                now + Duration::from_secs(599),
+            )
+            .unwrap();
+
+        assert_eq!(
+            registry.read_at(&grants[1].uri, now + Duration::from_secs(599)),
+            Err(DiagnosticsReadErrorV3::CapabilityUnavailable),
+            "least recently used entry is evicted"
+        );
+        assert_eq!(
+            &*registry
+                .read_at(&grants[0].uri, now + Duration::from_secs(599))
+                .expect("recently read oldest entry survives ninth insert"),
+            &*oldest_bytes
+        );
+        assert_eq!(
+            registry.read_at(&grants[0].uri, now + Duration::from_secs(600)),
+            Err(DiagnosticsReadErrorV3::CapabilityUnavailable),
+            "LRU refresh never extends the absolute monotonic expiry"
+        );
+    }
+
+    #[test]
+    fn capability_reference_exposes_the_authenticated_wall_expiry() {
+        let now = Instant::now();
+        let wall_expiry_epoch_ms = 1_725_000_000_123;
+        let mut registry = DiagnosticsRegistryV3::new_with_secret([13; 32]);
+        let grant = registry
+            .register_at(
+                binding(Uuid::new_v4().to_string(), wall_expiry_epoch_ms),
+                br#"{"rows":[]}"#.to_vec(),
+                now,
+            )
+            .unwrap();
+        let mut projection = json!({
+            "diagnostics": {
+                "availability": "available",
+                "reference": {
+                    "artifact_id": "artifact-1",
+                    "sha256": grant.sha256,
+                    "byte_length": grant.byte_length
+                }
+            }
+        });
+        attach_capability_uri_v3(&mut projection, &grant).unwrap();
+        assert_eq!(
+            projection.pointer("/diagnostics/reference/wall_expiry_epoch_ms"),
+            Some(&json!(wall_expiry_epoch_ms))
+        );
+    }
+
+    #[test]
+    fn descriptive_wall_expiry_never_authorizes_a_capability() {
+        let now = Instant::now();
+        let mut registry = DiagnosticsRegistryV3::new_with_secret([15; 32]);
+        let day_ms = 24 * 60 * 60 * 1_000;
+        for wall_expiry_epoch_ms in [1_725_000_000_000 - day_ms, 1_725_000_000_000 + day_ms] {
+            let grant = registry
+                .register_at(
+                    binding(Uuid::new_v4().to_string(), wall_expiry_epoch_ms),
+                    vec![1],
+                    now,
+                )
+                .unwrap();
+            assert!(registry.read_at(&grant.uri, now).is_ok());
+            assert_eq!(
+                registry.read_at(&grant.uri, now + Duration::from_secs(600)),
+                Err(DiagnosticsReadErrorV3::CapabilityUnavailable)
+            );
+        }
     }
 }

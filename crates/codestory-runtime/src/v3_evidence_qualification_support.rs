@@ -42,7 +42,6 @@ pub fn real_projection_fixtures(
         task_class: None,
         probes: Vec::new(),
         extra_probes: Vec::new(),
-        include_evidence: true,
         latency_budget_ms: None,
         parent_packet_id: None,
         option_ids: Vec::new(),
