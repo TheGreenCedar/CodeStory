@@ -63,8 +63,21 @@ type SameFileCacheKey = (i64, String, String);
 type SameModuleCacheKey = (String, String, String);
 type NameCacheKey = (String, String);
 type RelativeImportCacheKey = (String, String, String, String);
+const REFERENCE_SINK_EDGE_KINDS: [EdgeKind; 11] = [
+    EdgeKind::TYPE_USAGE,
+    EdgeKind::USAGE,
+    EdgeKind::CALL,
+    EdgeKind::INHERITANCE,
+    EdgeKind::OVERRIDE,
+    EdgeKind::TYPE_ARGUMENT,
+    EdgeKind::TEMPLATE_SPECIALIZATION,
+    EdgeKind::INCLUDE,
+    EdgeKind::IMPORT,
+    EdgeKind::MACRO_USAGE,
+    EdgeKind::ANNOTATION_USAGE,
+];
 /// Version for cached resolution-support snapshots.
-pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 5;
+pub const RESOLUTION_SUPPORT_SNAPSHOT_VERSION: i64 = 6;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SemanticResolutionRequestKey {
@@ -99,6 +112,7 @@ struct CandidateNode {
     serialized_name: String,
     serialized_name_ascii_lower: String,
     qualified_name: Option<String>,
+    is_declaration: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +122,7 @@ struct CandidateNodeSnapshot {
     file_path: Option<String>,
     serialized_name: String,
     qualified_name: Option<String>,
+    is_declaration: bool,
 }
 
 #[derive(Default, Debug)]
@@ -1801,6 +1816,7 @@ impl CandidateIndex {
     }
 
     fn load_nodes(conn: &rusqlite::Connection, kinds: &[i32]) -> Result<Vec<CandidateNode>> {
+        let reference_node_ids = Self::load_reference_node_ids(conn)?;
         let kind_clause = kind_clause(kinds);
         let query = format!(
             "SELECT n.id, n.file_node_id, n.serialized_name, n.qualified_name, file_node.serialized_name
@@ -1814,14 +1830,16 @@ impl CandidateIndex {
         let rows = stmt.query_map([], |row| {
             let serialized_name: String = row.get(2)?;
             let file_path: Option<String> = row.get(4)?;
+            let id = row.get(0)?;
             Ok(CandidateNode {
-                id: row.get(0)?,
+                id,
                 file_node_id: row.get(1)?,
                 normalized_file_path: file_path.as_deref().and_then(normalize_resolution_path),
                 file_path,
                 serialized_name_ascii_lower: serialized_name.to_ascii_lowercase(),
                 serialized_name,
                 qualified_name: row.get(3)?,
+                is_declaration: !reference_node_ids.contains(&id),
             })
         })?;
 
@@ -1831,6 +1849,40 @@ impl CandidateIndex {
         }
 
         Ok(nodes)
+    }
+
+    fn load_reference_node_ids(conn: &rusqlite::Connection) -> Result<HashSet<i64>> {
+        let has_edge_table = conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'edge'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_edge_table {
+            return Ok(HashSet::new());
+        }
+
+        let reference_kinds = REFERENCE_SINK_EDGE_KINDS.map(|kind| kind as i32);
+        let query = format!(
+            "SELECT DISTINCT reference_node.id
+             FROM node reference_node
+             JOIN edge reference_edge ON reference_edge.target_node_id = reference_node.id
+             WHERE reference_edge.kind IN ({})
+               AND (
+                   reference_edge.resolved_target_node_id IS NULL
+                   OR reference_edge.resolved_target_node_id != reference_edge.target_node_id
+               )
+               AND (
+                   reference_edge.line IS NULL
+                   OR reference_node.start_line IS NULL
+                   OR reference_edge.line = reference_node.start_line
+               )",
+            kind_clause(&reference_kinds)
+        );
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<rusqlite::Result<HashSet<_>>>()?)
     }
 
     fn from_snapshot_nodes_with_import_bindings(
@@ -1868,6 +1920,7 @@ impl CandidateIndex {
                 file_path: node.file_path.clone(),
                 serialized_name: node.serialized_name.clone(),
                 qualified_name: node.qualified_name.clone(),
+                is_declaration: node.is_declaration,
             })
             .collect()
     }
@@ -1881,6 +1934,7 @@ impl CandidateIndex {
                 file_path: node.file_path.clone(),
                 serialized_name: node.serialized_name.clone(),
                 qualified_name: node.qualified_name.clone(),
+                is_declaration: node.is_declaration,
             })
             .collect()
     }
@@ -1914,6 +1968,7 @@ impl CandidateIndex {
                 serialized_name_ascii_lower: node.serialized_name.to_ascii_lowercase(),
                 serialized_name: node.serialized_name,
                 qualified_name: node.qualified_name,
+                is_declaration: node.is_declaration,
             })
             .collect()
     }
@@ -2716,12 +2771,25 @@ impl CandidateIndex {
 
     fn first_in_file(&self, candidates: Option<&Vec<usize>>, file_id: i64) -> Option<i64> {
         candidates.and_then(|candidates| {
-            let mut matches = candidates.iter().filter_map(|idx| {
-                let node = &self.nodes[*idx];
-                (node.file_node_id == Some(file_id)).then_some(node.id)
-            });
-            let candidate = matches.next()?;
-            matches.next().is_none().then_some(candidate)
+            let same_file = candidates
+                .iter()
+                .filter_map(|idx| {
+                    let node = &self.nodes[*idx];
+                    (node.file_node_id == Some(file_id)).then_some(node)
+                })
+                .collect::<Vec<_>>();
+            let mut declarations = same_file
+                .iter()
+                .filter_map(|node| node.is_declaration.then_some(node.id));
+            let candidate = declarations.next();
+            if declarations.next().is_some() {
+                return None;
+            }
+            candidate.or_else(|| {
+                let mut references = same_file.iter().map(|node| node.id);
+                let candidate = references.next()?;
+                references.next().is_none().then_some(candidate)
+            })
         })
     }
 
@@ -3847,6 +3915,7 @@ mod tests {
             serialized_name: "Client".to_string(),
             serialized_name_ascii_lower: "client".to_string(),
             qualified_name: Some("Client".to_string()),
+            is_declaration: true,
         }]);
 
         assert_eq!(
@@ -3875,6 +3944,7 @@ mod tests {
                 serialized_name: format!("Noise{idx}.unrelated"),
                 serialized_name_ascii_lower: format!("noise{idx}.unrelated"),
                 qualified_name: None,
+                is_declaration: true,
             })
             .collect::<Vec<_>>();
         nodes.push(CandidateNode {
@@ -3885,6 +3955,7 @@ mod tests {
             serialized_name: "Storage.open".to_string(),
             serialized_name_ascii_lower: "storage.open".to_string(),
             qualified_name: None,
+            is_declaration: true,
         });
         let index = CandidateIndex::from_nodes(nodes);
 

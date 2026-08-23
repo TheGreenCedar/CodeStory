@@ -10792,18 +10792,41 @@ fn rewrite_override_placeholders(file_id: NodeId, nodes: &mut Vec<Node>, edges: 
     }
 }
 
+fn canonical_declaration_ordinal(node: &Node) -> Option<usize> {
+    node.canonical_id
+        .as_deref()?
+        .rsplit_once(DECLARATION_ORDINAL_SEPARATOR)?
+        .1
+        .parse()
+        .ok()
+}
+
+fn should_replace_reference_candidate(candidate: &Node, current: &Node) -> bool {
+    canonical_declaration_ordinal(candidate)
+        .cmp(&canonical_declaration_ordinal(current))
+        .then_with(|| {
+            candidate
+                .start_line
+                .unwrap_or(u32::MAX)
+                .cmp(&current.start_line.unwrap_or(u32::MAX))
+                .then_with(|| node_span_width(current).cmp(&node_span_width(candidate)))
+        })
+        .is_lt()
+}
+
 fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
     let node_by_id = nodes
         .iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
-    let mut best_by_key = HashMap::<(NodeKind, String), NodeId>::new();
+    let mut earliest_by_key = HashMap::<(NodeKind, String), NodeId>::new();
+    let mut declaration_by_key = HashMap::<(NodeKind, String), NodeId>::new();
     for node in nodes {
         let key = (
             node.kind,
             short_member_name(&node.serialized_name).to_string(),
         );
-        let replace = best_by_key
+        let replace_earliest = earliest_by_key
             .get(&key)
             .and_then(|current_id| node_by_id.get(current_id))
             .map(|current| {
@@ -10814,8 +10837,16 @@ fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
                     .is_lt()
             })
             .unwrap_or(true);
-        if replace {
-            best_by_key.insert(key, node.id);
+        if replace_earliest {
+            earliest_by_key.insert(key.clone(), node.id);
+        }
+        let replace_declaration = declaration_by_key
+            .get(&key)
+            .and_then(|current_id| node_by_id.get(current_id))
+            .map(|current| should_replace_reference_candidate(node, current))
+            .unwrap_or(true);
+        if replace_declaration {
+            declaration_by_key.insert(key, node.id);
         }
     }
 
@@ -10830,7 +10861,12 @@ fn reconcile_tsx_usage_targets(nodes: &[Node], edges: &mut [Edge]) {
             target_node.kind,
             short_member_name(&target_node.serialized_name).to_string(),
         );
-        let Some(candidate_id) = best_by_key.get(&key).copied() else {
+        let candidates = if edge.kind == EdgeKind::USAGE {
+            &declaration_by_key
+        } else {
+            &earliest_by_key
+        };
+        let Some(candidate_id) = candidates.get(&key).copied() else {
             continue;
         };
         edge.target = candidate_id;
@@ -10874,13 +10910,7 @@ fn prune_tsx_duplicate_reference_nodes(
         let should_replace = best_by_key
             .get(&key)
             .and_then(|current_id| node_by_id.get(current_id))
-            .map(|current| {
-                node.start_line
-                    .unwrap_or(u32::MAX)
-                    .cmp(&current.start_line.unwrap_or(u32::MAX))
-                    .then_with(|| node_span_width(current).cmp(&node_span_width(node)))
-                    .is_lt()
-            })
+            .map(|current| should_replace_reference_candidate(node, current))
             .unwrap_or(true);
         if should_replace {
             best_by_key.insert(key, node.id);
@@ -15075,18 +15105,9 @@ pub fn index_file(
                 (attr.as_str() == "kind")
                     .then(|| value.as_str().ok())
                     .flatten()
+                    .and_then(edge_kind_from_str)
             });
-            if matches!(
-                relation,
-                Some(
-                    "CALL"
-                        | "IMPORT"
-                        | "INHERITANCE"
-                        | "OVERRIDE"
-                        | "TYPE_USAGE"
-                        | "ANNOTATION_USAGE"
-                )
-            ) {
+            if relation.is_some_and(graph_relation_sink_is_reference) {
                 reference_graph_nodes.insert(sink_ref);
             }
         }
@@ -15277,8 +15298,16 @@ pub fn index_file(
                 end_line_1 = override_span.end_line;
                 end_col_1 = override_span.end_col;
             }
-            let canonical_seed =
-                format!("{}:{}:{}:{}", file_name, name_str, start_line, start_col_1);
+            let canonical_seed = if matches!(
+                canonical_role,
+                CanonicalNodeRole::Definition
+                    | CanonicalNodeRole::Declaration
+                    | CanonicalNodeRole::ForwardDeclaration
+            ) {
+                format!("{}:{}:{}:{}", file_name, name_str, start_line, start_col_1)
+            } else {
+                format!("{}:{}:{}", file_name, name_str, start_line)
+            };
             let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
             let effective_access = access_kind.or_else(|| {
@@ -15941,6 +15970,23 @@ fn edge_kind_from_str(kind: &str) -> Option<EdgeKind> {
         "ANNOTATION_USAGE" => Some(EdgeKind::ANNOTATION_USAGE),
         "UNKNOWN" => Some(EdgeKind::UNKNOWN),
         _ => None,
+    }
+}
+
+fn graph_relation_sink_is_reference(kind: EdgeKind) -> bool {
+    match kind {
+        EdgeKind::MEMBER | EdgeKind::UNKNOWN => false,
+        EdgeKind::TYPE_USAGE
+        | EdgeKind::USAGE
+        | EdgeKind::CALL
+        | EdgeKind::INHERITANCE
+        | EdgeKind::OVERRIDE
+        | EdgeKind::TYPE_ARGUMENT
+        | EdgeKind::TEMPLATE_SPECIALIZATION
+        | EdgeKind::INCLUDE
+        | EdgeKind::IMPORT
+        | EdgeKind::MACRO_USAGE
+        | EdgeKind::ANNOTATION_USAGE => true,
     }
 }
 
