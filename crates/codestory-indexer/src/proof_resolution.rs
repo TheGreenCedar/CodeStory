@@ -1,5 +1,6 @@
 use crate::cache::{
-    CachedCallResolutionInput, CachedDirectExport, CachedIndexArtifact, CachedInherentMethod,
+    CachedCallResolutionInput, CachedClassBinding, CachedClassDeclaration, CachedClassMethod,
+    CachedDeclarationKind, CachedDirectExport, CachedIndexArtifact, CachedInherentMethod,
     CachedResolutionBinding, CachedResolutionFile, CachedTopLevelDeclaration,
 };
 use crate::source_content_hash;
@@ -20,9 +21,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node as TsNode, Tree};
 
-const ADAPTER_VERSION: &str = "reference-v5";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 3;
+const ADAPTER_VERSION: &str = "reference-v7";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 5;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
+    ("javascript", ADAPTER_VERSION),
     ("rust", ADAPTER_VERSION),
     ("tsx", ADAPTER_VERSION),
     ("typescript", ADAPTER_VERSION),
@@ -50,37 +52,26 @@ pub(crate) fn collect_call_resolution_inputs(
     let complete = !tree.root_node().has_error();
     let mut lookup_input_complete = complete;
     let source_sha256 = source_content_hash(source.as_bytes());
-    let direct_exports = if matches!(language, "typescript" | "tsx") {
-        match collect_typescript_direct_exports(tree, source, file_id, nodes) {
-            Some(exports) => exports,
-            None => {
-                lookup_input_complete = false;
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-    if matches!(language, "typescript" | "tsx")
-        && contains_dynamic_construct(tree.root_node(), source)
-    {
-        lookup_input_complete = false;
-    }
+    let javascript_index = is_javascript_language(language)
+        .then(|| JavascriptResolutionIndex::build(tree, source, file_id, nodes));
+    let (direct_exports, export_poison_all, poisoned_export_names) =
+        if let Some(index) = &javascript_index {
+            index.collect_direct_exports(source)
+        } else {
+            (Vec::new(), false, Vec::new())
+        };
     if language == "rust" && rust_file_has_item_domain_macro_invocation(tree.root_node()) {
         lookup_input_complete = false;
     }
     if language == "rust" && rust_file_has_attribute_domain(tree.root_node()) {
         lookup_input_complete = false;
     }
-    let typescript_module =
-        matches!(language, "typescript" | "tsx") && typescript_file_is_module(tree.root_node());
-    if matches!(language, "typescript" | "tsx")
-        && typescript_module
-        && !typescript_module_root_is_closed(tree.root_node(), source)
-    {
-        lookup_input_complete = false;
-    }
-    let top_level_declarations = if matches!(language, "typescript" | "tsx" | "rust") {
+    let typescript_module = javascript_index
+        .as_ref()
+        .is_some_and(|index| index.ecmascript_module);
+    let top_level_declarations = if let Some(index) = &javascript_index {
+        index.cached_top_level_declarations()
+    } else if language == "rust" {
         match collect_top_level_declarations(tree, source, language, file_id, nodes) {
             Some(declarations) => declarations,
             None => {
@@ -103,7 +94,7 @@ pub(crate) fn collect_call_resolution_inputs(
         Vec::new()
     };
     let mut calls = Vec::new();
-    collect_calls(tree.root_node(), source, &mut |callee, form, raw_target| {
+    let mut emit_call = |callee: TsNode<'_>, form: CalleeForm, raw_target: String| {
         let mut callsite = ExactCallsite {
             file_id: FileId(file_id.0),
             source_sha256: source_sha256.clone(),
@@ -116,8 +107,10 @@ pub(crate) fn collect_call_resolution_inputs(
         };
         let (caller, mut binding) = if language == "rust" {
             resolve_rust_syntax_claim(tree, source, file_id, nodes, callee, form, &raw_target)
+        } else if let Some(index) = &javascript_index {
+            index.resolve_syntax_claim(source, callee, form, &raw_target)
         } else {
-            resolve_typescript_syntax_claim(tree, source, file_id, nodes, callee, form, &raw_target)
+            (None, CachedResolutionBinding::Unsupported)
         };
         if !lookup_input_complete {
             binding = CachedResolutionBinding::IncompleteDomain;
@@ -133,7 +126,14 @@ pub(crate) fn collect_call_resolution_inputs(
             adapter_version: ADAPTER_VERSION.to_string(),
             parser_fingerprint: parser_fingerprint.to_string(),
         });
-    });
+    };
+    if let Some(index) = &javascript_index {
+        for call in &index.calls {
+            emit_call(call.callee, call.form, call.raw_target.clone());
+        }
+    } else {
+        collect_calls(tree.root_node(), source, &mut emit_call);
+    }
     calls.sort_by_key(|input| (input.callsite.start_byte, input.callsite.end_byte_exclusive));
     CollectedResolutionInputs {
         calls,
@@ -148,7 +148,12 @@ pub(crate) fn collect_call_resolution_inputs(
             typescript_module,
             top_level_declarations,
             inherent_methods,
+            classes: javascript_index
+                .as_ref()
+                .map_or_else(Vec::new, |index| index.cached_classes()),
             direct_exports,
+            export_poison_all,
+            poisoned_export_names,
         }),
     }
 }
@@ -157,6 +162,10 @@ fn is_installed_language(language: &str) -> bool {
     INSTALLED_ADAPTERS
         .iter()
         .any(|(installed, _)| *installed == language)
+}
+
+fn is_javascript_language(language: &str) -> bool {
+    matches!(language, "javascript" | "typescript" | "tsx")
 }
 
 fn expected_parser_fingerprint(path: &Path, language: &str) -> Option<String> {
@@ -222,7 +231,13 @@ fn classify_callee<'tree>(
         }
         "member_expression" => {
             let property = function.child_by_field_name("property")?;
-            Some((property, CalleeForm::ExplicitReceiver, text(property)?))
+            let receiver = function.child_by_field_name("object")?;
+            let form = if receiver.kind() == "this" {
+                CalleeForm::ImplicitReceiver
+            } else {
+                CalleeForm::ExplicitReceiver
+            };
+            Some((property, form, text(property)?))
         }
         "scoped_identifier" => {
             let name = function.child_by_field_name("name")?;
@@ -243,82 +258,1432 @@ fn classify_callee<'tree>(
     }
 }
 
-fn resolve_typescript_syntax_claim(
-    tree: &Tree,
-    source: &str,
-    file_id: NodeId,
-    nodes: &[Node],
-    callee: TsNode<'_>,
+#[derive(Debug, Clone)]
+struct IndexedJavascriptCall<'tree> {
+    callee: TsNode<'tree>,
     form: CalleeForm,
-    raw_target: &str,
-) -> (Option<NodeId>, CachedResolutionBinding) {
-    let Some(callable) = enclosing_ancestor(callee, &["function_declaration"]) else {
-        return (None, CachedResolutionBinding::MissingBinding);
-    };
-    let Some(caller) = map_callable_declaration(nodes, file_id, callable, source) else {
-        return (None, CachedResolutionBinding::Ambiguous);
-    };
-    if !typescript_callable_is_top_level(callable) {
-        return (Some(caller), CachedResolutionBinding::Unsupported);
-    }
-    if !typescript_file_is_module(tree.root_node()) {
-        return (Some(caller), CachedResolutionBinding::Unsupported);
-    }
-    if form != CalleeForm::Identifier {
-        return (Some(caller), CachedResolutionBinding::Unsupported);
-    }
-    if !typescript_callable_domain_is_closed(callable) {
-        return (Some(caller), CachedResolutionBinding::IncompleteDomain);
-    }
-    if contains_dynamic_construct(tree.root_node(), source)
-        || callable_has_shadow_or_write("typescript", callable, callee, raw_target, source)
-        || root_has_write(tree.root_node(), raw_target, source)
-    {
-        return (Some(caller), CachedResolutionBinding::Ambiguous);
-    }
-    let local = top_level_typescript_functions(tree.root_node())
-        .into_iter()
-        .filter(|declaration| declaration_name(*declaration, source) == Some(raw_target))
-        .collect::<Vec<_>>();
-    let imports = typescript_import_bindings(tree.root_node(), source)
-        .into_iter()
-        .filter(|binding| binding.local_name == raw_target)
-        .collect::<Vec<_>>();
-    if local.len() + imports.len() > 1 {
-        return (Some(caller), CachedResolutionBinding::Ambiguous);
-    }
-    if let Some(declaration) = local.first().copied() {
-        return (
-            Some(caller),
-            map_callable_declaration(nodes, file_id, declaration, source)
-                .map(|declaration| CachedResolutionBinding::SameFile { declaration })
-                .unwrap_or(CachedResolutionBinding::Ambiguous),
-        );
-    }
-    if let Some(binding) = imports.into_iter().next() {
-        let import_nodes = nodes
+    raw_target: String,
+}
+
+#[derive(Debug, Clone)]
+enum JavascriptBindingKind {
+    SameFile {
+        declaration: NodeId,
+    },
+    Class {
+        owner: NodeId,
+    },
+    StaticImport {
+        import: NodeId,
+        module_specifier: String,
+        imported_name: String,
+        is_default: bool,
+    },
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct JavascriptBinding {
+    name: String,
+    scope_start: usize,
+    scope_end: usize,
+    scope_depth: usize,
+    kind: JavascriptBindingKind,
+}
+
+#[derive(Debug, Clone)]
+struct JavascriptWrite {
+    name: String,
+    scope_start: usize,
+    scope_end: usize,
+    scope_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JavascriptReceiverKind {
+    Constructor,
+    ExplicitType,
+}
+
+#[derive(Debug, Clone)]
+struct JavascriptReceiverBinding {
+    class_name: String,
+    scope_start: usize,
+    scope_end: usize,
+    scope_depth: usize,
+    kind: JavascriptReceiverKind,
+}
+
+struct JavascriptResolutionIndex<'tree> {
+    calls: Vec<IndexedJavascriptCall<'tree>>,
+    bindings: HashMap<String, Vec<JavascriptBinding>>,
+    writes: HashMap<String, Vec<JavascriptWrite>>,
+    top_level_declarations: Vec<CachedTopLevelDeclaration>,
+    classes: Vec<CachedClassDeclaration>,
+    receiver_bindings: HashMap<String, Vec<JavascriptReceiverBinding>>,
+    callable_nodes: HashMap<(u32, String), Vec<NodeId>>,
+    class_nodes: HashMap<(u32, String), Vec<NodeId>>,
+    import_nodes: HashMap<(u32, u32, String), Vec<NodeId>>,
+    mutated_members: HashMap<(String, String), Vec<(usize, usize)>>,
+    dynamically_mutated_owners: HashMap<String, Vec<(usize, usize)>>,
+    dynamic_breaker_scopes: HashSet<(usize, usize)>,
+    module_dynamic_breaker: bool,
+    export_statements: Vec<TsNode<'tree>>,
+    ecmascript_module: bool,
+}
+
+impl<'tree> JavascriptResolutionIndex<'tree> {
+    fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
+        let root = tree.root_node();
+        let mut callable_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        let mut class_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        let mut import_nodes = HashMap::<(u32, u32, String), Vec<NodeId>>::new();
+        for node in nodes
             .iter()
-            .filter(|node| {
-                node.file_node_id == Some(file_id)
-                    && node.start_line == Some(binding.line)
-                    && node.start_col == Some(binding.column)
-                    && node.serialized_name == binding.local_name
+            .filter(|node| node.file_node_id == Some(file_id))
+        {
+            if let Some(line) = node.start_line {
+                let name = graph_leaf_name(&node.serialized_name).to_string();
+                if matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+                    callable_nodes
+                        .entry((line, name.clone()))
+                        .or_default()
+                        .push(node.id);
+                } else if node.kind == NodeKind::CLASS {
+                    class_nodes
+                        .entry((line, name.clone()))
+                        .or_default()
+                        .push(node.id);
+                }
+                if let Some(column) = node.start_col {
+                    import_nodes
+                        .entry((line, column, node.serialized_name.clone()))
+                        .or_default()
+                        .push(node.id);
+                }
+            }
+        }
+        let mut result = Self {
+            calls: Vec::new(),
+            bindings: HashMap::new(),
+            writes: HashMap::new(),
+            top_level_declarations: Vec::new(),
+            classes: Vec::new(),
+            receiver_bindings: HashMap::new(),
+            callable_nodes,
+            class_nodes,
+            import_nodes,
+            mutated_members: HashMap::new(),
+            dynamically_mutated_owners: HashMap::new(),
+            dynamic_breaker_scopes: HashSet::new(),
+            module_dynamic_breaker: false,
+            export_statements: Vec::new(),
+            ecmascript_module: typescript_file_is_module(root),
+        };
+        walk_nodes(root, &mut |node| {
+            if node.kind() == "export_statement" {
+                result.export_statements.push(node);
+            }
+            if node.kind() == "call_expression"
+                && let Some(function) = node.child_by_field_name("function")
+                && let Some((callee, mut form, raw_target)) = classify_callee(function, source)
+            {
+                if node.child_by_field_name("arguments").is_none()
+                    || source.as_bytes().get(function.end_byte()) == Some(&b'`')
+                    || has_direct_named_child_kind(node, "optional_chain")
+                    || has_direct_named_child_kind(function, "optional_chain")
+                {
+                    form = CalleeForm::DynamicAccess;
+                }
+                result.calls.push(IndexedJavascriptCall {
+                    callee,
+                    form,
+                    raw_target,
+                });
+            }
+            result.collect_dynamic_breaker(node, root, source);
+            result.collect_reflection_mutation(node, root, source);
+            result.collect_binding(node, root, source);
+            result.collect_write(node, root, source);
+        });
+        result
+            .calls
+            .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        result.top_level_declarations.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        result
+    }
+
+    fn collect_binding(&mut self, node: TsNode<'tree>, root: TsNode<'tree>, source: &str) {
+        if node.kind() == "import_alias" {
+            let mut cursor = node.walk();
+            if let Some(name) = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+                .and_then(|name| node_text(name, source))
+            {
+                self.push_binding(name.to_string(), root, 0, JavascriptBindingKind::Other);
+            }
+            return;
+        }
+        if node.kind() == "import_statement" {
+            let supported = typescript_import_bindings_for_statement(node, source);
+            let mut supported_by_name = supported
+                .unwrap_or_default()
+                .into_iter()
+                .map(|binding| (binding.local_name.clone(), binding))
+                .collect::<HashMap<_, _>>();
+            let mut names = Vec::new();
+            collect_javascript_pattern_names(node, source, &mut names);
+            names.sort();
+            names.dedup();
+            for name in names {
+                let kind = if let Some(binding) = supported_by_name.remove(&name) {
+                    let import_nodes = self.import_nodes.get(&(
+                        binding.line,
+                        binding.column,
+                        binding.local_name.clone(),
+                    ));
+                    if let Some([import]) = import_nodes.map(Vec::as_slice) {
+                        JavascriptBindingKind::StaticImport {
+                            import: *import,
+                            module_specifier: binding.module_specifier,
+                            imported_name: binding.imported_name,
+                            is_default: binding.is_default,
+                        }
+                    } else {
+                        JavascriptBindingKind::Other
+                    }
+                } else {
+                    JavascriptBindingKind::Other
+                };
+                self.push_binding(name, root, 0, kind);
+            }
+            return;
+        }
+
+        if matches!(
+            node.kind(),
+            "function_declaration"
+                | "generator_function_declaration"
+                | "function_signature"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "enum_declaration"
+                | "interface_declaration"
+                | "type_alias_declaration"
+                | "internal_module"
+                | "module"
+        ) {
+            let Some(name_node) = node.child_by_field_name("name") else {
+                return;
+            };
+            let Some(name) = node_text(name_node, source).map(str::to_string) else {
+                return;
+            };
+            let (scope, depth) = javascript_binding_scope(node, root, source);
+            let direct_callable = node.kind() == "function_declaration"
+                && javascript_declaration_is_direct_module(node)
+                && !javascript_declaration_is_decorated(node)
+                && self.map_callable_declaration(node, source).is_some();
+            let direct_class = node.kind() == "class_declaration"
+                && javascript_declaration_is_direct_module(node)
+                && javascript_class_is_closed(node)
+                && self.map_class_declaration(node, source).is_some();
+            let kind = if direct_callable {
+                let declaration = self
+                    .map_callable_declaration(node, source)
+                    .expect("direct callable mapping was checked");
+                self.top_level_declarations.push(CachedTopLevelDeclaration {
+                    name: name.clone(),
+                    declaration,
+                });
+                JavascriptBindingKind::SameFile { declaration }
+            } else if direct_class {
+                let owner = self
+                    .map_class_declaration(node, source)
+                    .expect("direct class mapping was checked");
+                if let Some(methods) = javascript_class_methods(node, &self.callable_nodes, source)
+                {
+                    self.classes.push(CachedClassDeclaration {
+                        name: name.clone(),
+                        declaration: owner,
+                        methods,
+                    });
+                }
+                JavascriptBindingKind::Class { owner }
+            } else {
+                JavascriptBindingKind::Other
+            };
+            self.push_binding(name, scope, depth, kind);
+            return;
+        }
+
+        if node.kind() == "variable_declarator" {
+            let Some(pattern) = node.child_by_field_name("name") else {
+                return;
+            };
+            let mut names = Vec::new();
+            collect_javascript_pattern_names(pattern, source, &mut names);
+            let (scope, depth) = javascript_binding_scope(node, root, source);
+            let direct_arrow = javascript_const_arrow(node, source)
+                .filter(|_arrow| javascript_declaration_is_direct_module(node) && names.len() == 1)
+                .and_then(|arrow| {
+                    self.map_callable_declaration(arrow, source)
+                        .map(|declaration| (arrow, declaration))
+                });
+            for name in names {
+                let kind = if let Some((_, declaration)) = direct_arrow {
+                    self.top_level_declarations.push(CachedTopLevelDeclaration {
+                        name: name.clone(),
+                        declaration,
+                    });
+                    JavascriptBindingKind::SameFile { declaration }
+                } else {
+                    JavascriptBindingKind::Other
+                };
+                self.push_binding(name, scope, depth, kind);
+            }
+            if pattern.kind() == "identifier"
+                && let Some(receiver_name) = node_text(pattern, source)
+            {
+                if let Some(class_name) = javascript_direct_constructor_name(node, source) {
+                    self.push_receiver_binding(
+                        receiver_name.to_string(),
+                        class_name,
+                        scope,
+                        depth,
+                        JavascriptReceiverKind::Constructor,
+                    );
+                } else if let Some(class_name) = typescript_variable_annotation(node, source) {
+                    self.push_receiver_binding(
+                        receiver_name.to_string(),
+                        class_name,
+                        scope,
+                        depth,
+                        JavascriptReceiverKind::ExplicitType,
+                    );
+                }
+            }
+            return;
+        }
+
+        if node.kind() == "formal_parameters" {
+            let Some(callable) = node.parent() else {
+                return;
+            };
+            let mut names = Vec::new();
+            collect_javascript_pattern_names(node, source, &mut names);
+            let depth = javascript_scope_depth(callable);
+            for name in names {
+                self.push_binding(name, callable, depth, JavascriptBindingKind::Other);
+            }
+            collect_typescript_typed_parameters(node, source, &mut |name, class_name| {
+                self.push_receiver_binding(
+                    name,
+                    class_name,
+                    callable,
+                    depth,
+                    JavascriptReceiverKind::ExplicitType,
+                );
+            });
+            return;
+        }
+
+        if node.kind() == "arrow_function"
+            && let Some(parameter) = node.child_by_field_name("parameter")
+        {
+            let mut names = Vec::new();
+            collect_javascript_pattern_names(parameter, source, &mut names);
+            let depth = javascript_scope_depth(node);
+            for name in names {
+                self.push_binding(name, node, depth, JavascriptBindingKind::Other);
+            }
+        }
+
+        if node.kind() == "catch_clause"
+            && let Some(parameter) = node.child_by_field_name("parameter")
+        {
+            let mut names = Vec::new();
+            collect_javascript_pattern_names(parameter, source, &mut names);
+            let depth = javascript_scope_depth(node);
+            for name in names {
+                self.push_binding(name, node, depth, JavascriptBindingKind::Other);
+            }
+        }
+    }
+
+    fn collect_write(&mut self, node: TsNode<'tree>, root: TsNode<'tree>, source: &str) {
+        let Some(target) = typescript_write_target(node) else {
+            return;
+        };
+        let Some(target) = target else {
+            let scope = javascript_governing_scope(node, root);
+            self.dynamic_breaker_scopes
+                .insert((scope.start_byte(), scope.end_byte()));
+            self.module_dynamic_breaker |= scope.id() == root.id();
+            return;
+        };
+        if matches!(target.kind(), "member_expression" | "subscript_expression") {
+            self.collect_member_mutation(target, root, source);
+            return;
+        }
+        let mut names = Vec::new();
+        collect_javascript_pattern_names(target, source, &mut names);
+        let (scope, depth) = javascript_binding_scope(node, root, source);
+        for name in names {
+            self.writes
+                .entry(name.clone())
+                .or_default()
+                .push(JavascriptWrite {
+                    name,
+                    scope_start: scope.start_byte(),
+                    scope_end: scope.end_byte(),
+                    scope_depth: depth,
+                });
+        }
+    }
+
+    fn collect_member_mutation(
+        &mut self,
+        target: TsNode<'tree>,
+        root: TsNode<'tree>,
+        source: &str,
+    ) {
+        let Some(object) = target.child_by_field_name("object") else {
+            return;
+        };
+        let Some(owner) = javascript_mutation_owner(object, source) else {
+            return;
+        };
+        let property = target
+            .child_by_field_name("property")
+            .or_else(|| target.child_by_field_name("index"));
+        let scope = javascript_governing_scope(target, root);
+        let range = (scope.start_byte(), scope.end_byte());
+        if target.kind() == "member_expression"
+            && let Some(property) = property
+            && matches!(property.kind(), "property_identifier" | "identifier")
+            && let Some(member) = node_text(property, source)
+        {
+            if member == "prototype" {
+                self.dynamically_mutated_owners
+                    .entry(format!("{owner}.prototype"))
+                    .or_default()
+                    .push(range);
+            } else if member == "__proto__" {
+                self.dynamically_mutated_owners
+                    .entry(owner)
+                    .or_default()
+                    .push(range);
+            } else {
+                self.mutated_members
+                    .entry((owner, member.to_string()))
+                    .or_default()
+                    .push(range);
+            }
+        } else if let Some(member) =
+            property.and_then(|property| simple_typescript_string(property, source))
+        {
+            self.mutated_members
+                .entry((owner, member.to_string()))
+                .or_default()
+                .push(range);
+        } else {
+            self.dynamically_mutated_owners
+                .entry(owner)
+                .or_default()
+                .push(range);
+        }
+    }
+
+    fn collect_reflection_mutation(
+        &mut self,
+        node: TsNode<'tree>,
+        root: TsNode<'tree>,
+        source: &str,
+    ) {
+        if node.kind() != "call_expression" {
+            return;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return;
+        };
+        let Some(function) = node_text(function, source) else {
+            return;
+        };
+        let Some(arguments) = node.child_by_field_name("arguments") else {
+            return;
+        };
+        let mut cursor = arguments.walk();
+        let arguments = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+        let Some(owner) = arguments
+            .first()
+            .and_then(|target| javascript_mutation_owner(*target, source))
+        else {
+            return;
+        };
+        let scope = javascript_governing_scope(node, root);
+        let range = (scope.start_byte(), scope.end_byte());
+        match function {
+            "Object.defineProperty" | "Reflect.defineProperty" => {
+                if let Some(member) = arguments
+                    .get(1)
+                    .and_then(|property| simple_typescript_string(*property, source))
+                {
+                    if member == "prototype" {
+                        self.dynamically_mutated_owners
+                            .entry(format!("{owner}.prototype"))
+                            .or_default()
+                            .push(range);
+                    } else if member == "__proto__" {
+                        self.dynamically_mutated_owners
+                            .entry(owner)
+                            .or_default()
+                            .push(range);
+                    } else {
+                        self.mutated_members
+                            .entry((owner, member.to_string()))
+                            .or_default()
+                            .push(range);
+                    }
+                } else {
+                    self.dynamically_mutated_owners
+                        .entry(owner)
+                        .or_default()
+                        .push(range);
+                }
+            }
+            "Object.assign" | "Object.setPrototypeOf" => {
+                self.dynamically_mutated_owners
+                    .entry(owner)
+                    .or_default()
+                    .push(range);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_dynamic_breaker(&mut self, node: TsNode<'tree>, root: TsNode<'tree>, source: &str) {
+        let is_eval = node.kind() == "call_expression"
+            && node
+                .child_by_field_name("function")
+                .and_then(|function| node_text(function, source))
+                == Some("eval");
+        if node.kind() != "with_statement" && !is_eval {
+            return;
+        }
+        let scope = javascript_governing_scope(node, root);
+        self.dynamic_breaker_scopes
+            .insert((scope.start_byte(), scope.end_byte()));
+        self.module_dynamic_breaker |= scope.id() == root.id();
+    }
+
+    fn push_binding(
+        &mut self,
+        name: String,
+        scope: TsNode<'tree>,
+        scope_depth: usize,
+        kind: JavascriptBindingKind,
+    ) {
+        self.bindings
+            .entry(name.clone())
+            .or_default()
+            .push(JavascriptBinding {
+                name,
+                scope_start: scope.start_byte(),
+                scope_end: scope.end_byte(),
+                scope_depth,
+                kind,
+            });
+    }
+
+    fn push_receiver_binding(
+        &mut self,
+        name: String,
+        class_name: String,
+        scope: TsNode<'tree>,
+        scope_depth: usize,
+        kind: JavascriptReceiverKind,
+    ) {
+        self.receiver_bindings
+            .entry(name)
+            .or_default()
+            .push(JavascriptReceiverBinding {
+                class_name,
+                scope_start: scope.start_byte(),
+                scope_end: scope.end_byte(),
+                scope_depth,
+                kind,
+            });
+    }
+
+    fn cached_top_level_declarations(&self) -> Vec<CachedTopLevelDeclaration> {
+        self.top_level_declarations.clone()
+    }
+
+    fn cached_classes(&self) -> Vec<CachedClassDeclaration> {
+        self.classes.clone()
+    }
+
+    fn map_callable_declaration(&self, declaration: TsNode<'_>, source: &str) -> Option<NodeId> {
+        let name = if declaration.kind() == "arrow_function" {
+            crate::js_like_callable_source_name(declaration, source)?
+        } else {
+            declaration_name(declaration, source)?.to_string()
+        };
+        let line = declaration.start_position().row as u32 + 1;
+        let matches = self.callable_nodes.get(&(line, name))?;
+        (matches.len() == 1).then_some(matches[0])
+    }
+
+    fn map_class_declaration(&self, declaration: TsNode<'_>, source: &str) -> Option<NodeId> {
+        let name = declaration_name(declaration, source)?.to_string();
+        let line = declaration.start_position().row as u32 + 1;
+        let matches = self.class_nodes.get(&(line, name))?;
+        (matches.len() == 1).then_some(matches[0])
+    }
+
+    fn resolve_syntax_claim(
+        &self,
+        source: &str,
+        callee: TsNode<'tree>,
+        form: CalleeForm,
+        raw_target: &str,
+    ) -> (Option<NodeId>, CachedResolutionBinding) {
+        let Some(callable) = javascript_enclosing_callable(callee) else {
+            return (None, CachedResolutionBinding::MissingBinding);
+        };
+        let Some(caller) =
+            javascript_supported_caller(&self.callable_nodes, callable, callee, source)
+        else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        if !self.ecmascript_module {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if javascript_ancestor_range_is_indexed(callee, &self.dynamic_breaker_scopes) {
+            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+        }
+        if form == CalleeForm::ImplicitReceiver {
+            let Some(class) = javascript_enclosing_class(callable).and_then(|owner| {
+                let owner_id = self.map_class_declaration(owner, source)?;
+                self.classes
+                    .iter()
+                    .find(|class| class.declaration == owner_id)
+            }) else {
+                return (Some(caller), CachedResolutionBinding::Unsupported);
+            };
+            let methods = class
+                .methods
+                .iter()
+                .filter(|method| method.name == raw_target)
+                .collect::<Vec<_>>();
+            if self.class_member_domain_is_mutated(
+                &class.name,
+                "this",
+                raw_target,
+                callee.start_byte(),
+            ) {
+                return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+            }
+            return match methods.as_slice() {
+                [method] => (
+                    Some(caller),
+                    CachedResolutionBinding::ImplicitReceiver {
+                        owner: class.declaration,
+                        declaration: method.declaration,
+                        owner_name: class.name.clone(),
+                    },
+                ),
+                [] => (Some(caller), CachedResolutionBinding::MissingBinding),
+                _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+            };
+        }
+        if form == CalleeForm::ExplicitReceiver {
+            let Some(receiver_name) = javascript_member_receiver(callee, source) else {
+                return (Some(caller), CachedResolutionBinding::Unsupported);
+            };
+            let mut receiver_bindings = self
+                .receiver_bindings
+                .get(&receiver_name)
+                .into_iter()
+                .flatten()
+                .filter(|binding| {
+                    binding.scope_start <= callee.start_byte()
+                        && callee.start_byte() < binding.scope_end
+                })
+                .collect::<Vec<_>>();
+            let Some(depth) = receiver_bindings
+                .iter()
+                .map(|binding| binding.scope_depth)
+                .max()
+            else {
+                return (Some(caller), CachedResolutionBinding::Unsupported);
+            };
+            receiver_bindings.retain(|binding| binding.scope_depth == depth);
+            let mut lexical_bindings = self
+                .bindings
+                .get(&receiver_name)
+                .into_iter()
+                .flatten()
+                .filter(|binding| {
+                    binding.scope_start <= callee.start_byte()
+                        && callee.start_byte() < binding.scope_end
+                })
+                .collect::<Vec<_>>();
+            let lexical_depth = lexical_bindings
+                .iter()
+                .map(|binding| binding.scope_depth)
+                .max();
+            if let Some(lexical_depth) = lexical_depth {
+                lexical_bindings.retain(|binding| binding.scope_depth == lexical_depth);
+            }
+            if receiver_bindings.len() != 1
+                || lexical_depth != Some(depth)
+                || lexical_bindings.len() != 1
+                || self.writes.get(&receiver_name).is_some_and(|writes| {
+                    writes.iter().any(|write| {
+                        write.scope_start <= callee.start_byte()
+                            && callee.start_byte() < write.scope_end
+                    })
+                })
+            {
+                return (Some(caller), CachedResolutionBinding::Ambiguous);
+            }
+            let receiver = receiver_bindings[0];
+            if self.class_member_domain_is_mutated(
+                &receiver.class_name,
+                &receiver_name,
+                raw_target,
+                callee.start_byte(),
+            ) {
+                return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+            }
+            let Some(class_binding) =
+                self.resolve_class_binding(&receiver.class_name, callee.start_byte())
+            else {
+                return (Some(caller), CachedResolutionBinding::Ambiguous);
+            };
+            let binding = match receiver.kind {
+                JavascriptReceiverKind::Constructor => {
+                    CachedResolutionBinding::ConstructorBinding {
+                        class_binding,
+                        method_name: raw_target.to_string(),
+                    }
+                }
+                JavascriptReceiverKind::ExplicitType => {
+                    CachedResolutionBinding::ExplicitReceiverType {
+                        class_binding,
+                        method_name: raw_target.to_string(),
+                    }
+                }
+            };
+            return (Some(caller), binding);
+        }
+        if form != CalleeForm::Identifier {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        let Some(candidates) = self.bindings.get(raw_target) else {
+            return (Some(caller), CachedResolutionBinding::MissingBinding);
+        };
+        let mut visible = candidates
+            .iter()
+            .filter(|binding| {
+                binding.scope_start <= callee.start_byte()
+                    && callee.start_byte() < binding.scope_end
             })
             .collect::<Vec<_>>();
-        if import_nodes.len() != 1 {
+        let Some(depth) = visible.iter().map(|binding| binding.scope_depth).max() else {
+            return (Some(caller), CachedResolutionBinding::MissingBinding);
+        };
+        visible.retain(|binding| binding.scope_depth == depth);
+        if visible.len() != 1 {
             return (Some(caller), CachedResolutionBinding::Ambiguous);
         }
-        return (
-            Some(caller),
-            CachedResolutionBinding::StaticImport {
-                import: import_nodes[0].id,
-                module_specifier: binding.module_specifier,
-                imported_name: binding.imported_name,
-                is_default: binding.is_default,
+        let binding = visible[0];
+        if self.writes.get(raw_target).is_some_and(|writes| {
+            writes.iter().any(|write| {
+                write.name == binding.name
+                    && write.scope_start <= callee.start_byte()
+                    && callee.start_byte() < write.scope_end
+            })
+        }) {
+            return (Some(caller), CachedResolutionBinding::Ambiguous);
+        }
+        let binding = match &binding.kind {
+            JavascriptBindingKind::SameFile { declaration } => CachedResolutionBinding::SameFile {
+                declaration: *declaration,
             },
-        );
+            JavascriptBindingKind::StaticImport {
+                import,
+                module_specifier,
+                imported_name,
+                is_default,
+            } => CachedResolutionBinding::StaticImport {
+                import: *import,
+                module_specifier: module_specifier.clone(),
+                imported_name: imported_name.clone(),
+                is_default: *is_default,
+            },
+            JavascriptBindingKind::Class { .. } => CachedResolutionBinding::Unsupported,
+            JavascriptBindingKind::Other => CachedResolutionBinding::Ambiguous,
+        };
+        (Some(caller), binding)
     }
-    (Some(caller), CachedResolutionBinding::MissingBinding)
+
+    fn resolve_class_binding(
+        &self,
+        class_name: &str,
+        call_byte: usize,
+    ) -> Option<CachedClassBinding> {
+        let candidates = self.bindings.get(class_name)?;
+        let mut visible = candidates
+            .iter()
+            .filter(|binding| binding.scope_start <= call_byte && call_byte < binding.scope_end)
+            .collect::<Vec<_>>();
+        let depth = visible.iter().map(|binding| binding.scope_depth).max()?;
+        visible.retain(|binding| binding.scope_depth == depth);
+        let [binding] = visible.as_slice() else {
+            return None;
+        };
+        if self.writes.get(class_name).is_some_and(|writes| {
+            writes
+                .iter()
+                .any(|write| write.scope_start <= call_byte && call_byte < write.scope_end)
+        }) {
+            return None;
+        }
+        match &binding.kind {
+            JavascriptBindingKind::Class { owner } => Some(CachedClassBinding::SameFile {
+                owner: *owner,
+                owner_name: class_name.to_string(),
+            }),
+            JavascriptBindingKind::StaticImport {
+                import,
+                module_specifier,
+                imported_name,
+                is_default,
+            } => Some(CachedClassBinding::StaticImport {
+                import: *import,
+                module_specifier: module_specifier.clone(),
+                imported_name: imported_name.clone(),
+                is_default: *is_default,
+            }),
+            JavascriptBindingKind::SameFile { .. } | JavascriptBindingKind::Other => None,
+        }
+    }
+
+    fn class_member_domain_is_mutated(
+        &self,
+        class_name: &str,
+        receiver_name: &str,
+        method_name: &str,
+        call_byte: usize,
+    ) -> bool {
+        let prototype = format!("{class_name}.prototype");
+        self.mutated_members
+            .get(&(receiver_name.to_string(), method_name.to_string()))
+            .is_some_and(|ranges| javascript_ranges_contain(ranges, call_byte))
+            || self
+                .mutated_members
+                .get(&(prototype.clone(), method_name.to_string()))
+                .is_some_and(|ranges| javascript_ranges_contain(ranges, call_byte))
+            || self
+                .dynamically_mutated_owners
+                .get(receiver_name)
+                .is_some_and(|ranges| javascript_ranges_contain(ranges, call_byte))
+            || self
+                .dynamically_mutated_owners
+                .get(&prototype)
+                .is_some_and(|ranges| javascript_ranges_contain(ranges, call_byte))
+            || self
+                .dynamically_mutated_owners
+                .get(class_name)
+                .is_some_and(|ranges| javascript_ranges_contain(ranges, call_byte))
+    }
+
+    fn collect_direct_exports(&self, source: &str) -> (Vec<CachedDirectExport>, bool, Vec<String>) {
+        let mut exports = Vec::new();
+        let mut poison_all = self.module_dynamic_breaker;
+        let mut poisoned_names = HashSet::new();
+        let assignment_names = self
+            .export_statements
+            .iter()
+            .filter_map(|statement| javascript_export_assignment_name(*statement, source))
+            .collect::<HashSet<_>>();
+        poisoned_names.extend(assignment_names.iter().cloned());
+        for statement in &self.export_statements {
+            let Some((name, _declaration_node, is_default)) =
+                javascript_direct_export(*statement, source)
+            else {
+                let (statement_poison_all, statement_names) =
+                    javascript_export_poison(*statement, source);
+                poison_all |= statement_poison_all;
+                poisoned_names.extend(statement_names);
+                continue;
+            };
+            if assignment_names.contains(name.as_str()) {
+                continue;
+            }
+            let Some(bindings) = self.bindings.get(&name) else {
+                continue;
+            };
+            let module_bindings = bindings
+                .iter()
+                .filter(|binding| binding.scope_depth == 0)
+                .collect::<Vec<_>>();
+            if module_bindings.len() != 1
+                || self
+                    .writes
+                    .get(&name)
+                    .is_some_and(|writes| writes.iter().any(|write| write.scope_depth == 0))
+            {
+                poisoned_names.insert(if is_default {
+                    "default".to_string()
+                } else {
+                    name
+                });
+                continue;
+            }
+            let (declaration, declaration_kind) = match module_bindings[0].kind {
+                JavascriptBindingKind::SameFile { declaration } => {
+                    (declaration, CachedDeclarationKind::Callable)
+                }
+                JavascriptBindingKind::Class { owner } => (owner, CachedDeclarationKind::Class),
+                _ => continue,
+            };
+            exports.push(CachedDirectExport {
+                exported_name: if is_default { "default" } else { &name }.to_string(),
+                declaration,
+                is_default,
+                declaration_kind,
+            });
+        }
+        exports.sort_by(|left, right| {
+            left.exported_name
+                .cmp(&right.exported_name)
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        for pair in exports.windows(2) {
+            if pair[0].exported_name == pair[1].exported_name
+                && pair[0].is_default == pair[1].is_default
+            {
+                poisoned_names.insert(pair[0].exported_name.clone());
+            }
+        }
+        exports.retain(|export| !poisoned_names.contains(&export.exported_name));
+        let mut poisoned_names = poisoned_names.into_iter().collect::<Vec<_>>();
+        poisoned_names.sort();
+        (exports, poison_all, poisoned_names)
+    }
+}
+
+fn javascript_export_assignment_name(statement: TsNode<'_>, source: &str) -> Option<String> {
+    let surface = node_text(statement, source)?.trim();
+    let name = surface
+        .strip_prefix("export")?
+        .trim_start()
+        .strip_prefix('=')?;
+    let name = name.trim().trim_end_matches(';').trim();
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|character| character == '_' || character == '$' || character.is_alphanumeric()))
+    .then(|| name.to_string())
+}
+
+fn javascript_export_poison(statement: TsNode<'_>, source: &str) -> (bool, Vec<String>) {
+    if has_direct_unnamed_token(statement, "*") {
+        return (true, Vec::new());
+    }
+    if let Some(name) = javascript_export_assignment_name(statement, source) {
+        return (false, vec![name]);
+    }
+    let mut names = Vec::new();
+    let mut cursor = statement.walk();
+    if let Some(clause) = statement
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "export_clause")
+    {
+        let mut clause_cursor = clause.walk();
+        for specifier in clause
+            .named_children(&mut clause_cursor)
+            .filter(|child| child.kind() == "export_specifier")
+        {
+            let exported = specifier
+                .child_by_field_name("alias")
+                .or_else(|| specifier.child_by_field_name("name"));
+            if let Some(name) = exported.and_then(|node| {
+                simple_typescript_string(node, source).or_else(|| node_text(node, source))
+            }) {
+                names.push(name.to_string());
+            } else {
+                return (true, Vec::new());
+            }
+        }
+        return (false, names);
+    }
+    if let Some(declaration) = statement.child_by_field_name("declaration") {
+        if export_statement_has_default_token(statement) == Some(true) {
+            return (false, vec!["default".to_string()]);
+        }
+        if let Some(name) = declaration_name(declaration, source) {
+            return (false, vec![name.to_string()]);
+        }
+        if matches!(
+            declaration.kind(),
+            "lexical_declaration" | "variable_declaration"
+        ) {
+            let mut declaration_cursor = declaration.walk();
+            for declarator in declaration
+                .named_children(&mut declaration_cursor)
+                .filter(|child| child.kind() == "variable_declarator")
+            {
+                if let Some(pattern) = declarator.child_by_field_name("name") {
+                    collect_javascript_pattern_names(pattern, source, &mut names);
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        return if names.is_empty() {
+            (true, Vec::new())
+        } else {
+            (false, names)
+        };
+    }
+    if export_statement_has_default_token(statement) == Some(true) {
+        return (false, vec!["default".to_string()]);
+    }
+    (true, Vec::new())
+}
+
+fn has_direct_unnamed_token(node: TsNode<'_>, token: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .any(|child| !child.is_named() && child.kind() == token)
+}
+
+fn javascript_variable_keyword(mut node: TsNode<'_>) -> Option<&'static str> {
+    loop {
+        if matches!(node.kind(), "lexical_declaration" | "variable_declaration") {
+            return ["const", "let", "var"]
+                .into_iter()
+                .find(|keyword| has_direct_unnamed_token(node, keyword));
+        }
+        node = node.parent()?;
+    }
+}
+
+fn javascript_method_has_unsupported_modifier(method: TsNode<'_>) -> bool {
+    ["static", "get", "set", "*"]
+        .into_iter()
+        .any(|token| has_direct_unnamed_token(method, token))
+}
+
+fn javascript_mutation_owner(node: TsNode<'_>, source: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" | "this" => node_text(node, source).map(str::to_string),
+        "member_expression" => {
+            let object = node.child_by_field_name("object")?;
+            let property = node.child_by_field_name("property")?;
+            if !matches!(property.kind(), "property_identifier" | "identifier") {
+                return None;
+            }
+            Some(format!(
+                "{}.{}",
+                javascript_mutation_owner(object, source)?,
+                node_text(property, source)?
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn javascript_governing_scope<'tree>(
+    mut node: TsNode<'tree>,
+    root: TsNode<'tree>,
+) -> TsNode<'tree> {
+    while let Some(parent) = node.parent() {
+        if javascript_node_is_callable(parent) {
+            return parent;
+        }
+        node = parent;
+    }
+    root
+}
+
+fn javascript_ancestor_range_is_indexed(
+    mut node: TsNode<'_>,
+    ranges: &HashSet<(usize, usize)>,
+) -> bool {
+    loop {
+        if ranges.contains(&(node.start_byte(), node.end_byte())) {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
+}
+
+fn javascript_ranges_contain(ranges: &[(usize, usize)], byte: usize) -> bool {
+    ranges
+        .iter()
+        .any(|(start, end)| *start <= byte && byte < *end)
+}
+
+fn collect_javascript_pattern_names(node: TsNode<'_>, source: &str, names: &mut Vec<String>) {
+    if matches!(
+        node.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    ) {
+        if let Some(name) = node_text(node, source) {
+            names.push(name.to_string());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_javascript_pattern_names(child, source, names);
+    }
+}
+
+fn javascript_binding_scope<'tree>(
+    node: TsNode<'tree>,
+    root: TsNode<'tree>,
+    _source: &str,
+) -> (TsNode<'tree>, usize) {
+    let is_var = javascript_variable_keyword(node) == Some("var");
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.id() == root.id() {
+            return (root, 0);
+        }
+        if is_var && javascript_node_is_callable(parent) {
+            return (parent, javascript_scope_depth(parent));
+        }
+        if !is_var && matches!(parent.kind(), "statement_block" | "class_body") {
+            return (parent, javascript_scope_depth(parent));
+        }
+        if javascript_node_is_callable(parent) {
+            return (parent, javascript_scope_depth(parent));
+        }
+        current = parent;
+    }
+    (root, 0)
+}
+
+fn javascript_scope_depth(mut node: TsNode<'_>) -> usize {
+    let mut depth = 0;
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "statement_block" | "class_body")
+            || javascript_node_is_callable(parent)
+        {
+            depth += 1;
+        }
+        node = parent;
+    }
+    depth
+}
+
+fn javascript_node_is_callable(node: TsNode<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "generator_function_declaration"
+            | "generator_function"
+            | "arrow_function"
+            | "method_definition"
+    )
+}
+
+fn javascript_declaration_is_direct_module(mut node: TsNode<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "program" => return true,
+            "export_statement"
+            | "lexical_declaration"
+            | "variable_declaration"
+            | "variable_declarator" => {
+                node = parent;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+fn javascript_const_arrow<'tree>(
+    declarator: TsNode<'tree>,
+    _source: &str,
+) -> Option<TsNode<'tree>> {
+    if javascript_variable_keyword(declarator) != Some("const") {
+        return None;
+    }
+    declarator
+        .child_by_field_name("value")
+        .filter(|value| value.kind() == "arrow_function")
+}
+
+fn javascript_enclosing_callable(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    while let Some(parent) = node.parent() {
+        if javascript_node_is_callable(parent) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn javascript_supported_caller(
+    callable_nodes: &HashMap<(u32, String), Vec<NodeId>>,
+    callable: TsNode<'_>,
+    callee: TsNode<'_>,
+    source: &str,
+) -> Option<NodeId> {
+    if let Some(body) = callable.child_by_field_name("body")
+        && callee.start_byte() < body.start_byte()
+    {
+        return None;
+    }
+    let supported = match callable.kind() {
+        "function_declaration" => javascript_declaration_is_direct_module(callable),
+        "arrow_function" => {
+            callable
+                .parent()
+                .is_some_and(|parent| javascript_const_arrow(parent, source) == Some(callable))
+                && javascript_declaration_is_direct_module(callable)
+        }
+        "method_definition" => {
+            javascript_enclosing_class(callable).is_some_and(|class| {
+                javascript_declaration_is_direct_module(class) && javascript_class_is_closed(class)
+            }) && !javascript_method_has_unsupported_modifier(callable)
+                && !has_direct_named_child_kind(callable, "decorator")
+        }
+        _ => false,
+    };
+    if !supported {
+        return None;
+    }
+    let name = if callable.kind() == "arrow_function" {
+        crate::js_like_callable_source_name(callable, source)?
+    } else {
+        declaration_name(callable, source)?.to_string()
+    };
+    let line = callable.start_position().row as u32 + 1;
+    let matches = callable_nodes.get(&(line, name))?;
+    (matches.len() == 1).then_some(matches[0])
+}
+
+fn javascript_direct_export<'tree>(
+    statement: TsNode<'tree>,
+    source: &str,
+) -> Option<(String, TsNode<'tree>, bool)> {
+    if statement.child_by_field_name("source").is_some() {
+        return None;
+    }
+    let declaration = statement.child_by_field_name("declaration").or_else(|| {
+        let mut cursor = statement.walk();
+        statement.named_children(&mut cursor).find(|child| {
+            matches!(
+                child.kind(),
+                "function_declaration"
+                    | "class_declaration"
+                    | "lexical_declaration"
+                    | "variable_declaration"
+            )
+        })
+    })?;
+    let is_default = export_statement_has_default_token(statement)?;
+    match declaration.kind() {
+        "function_declaration" => Some((
+            declaration_name(declaration, source)?.to_string(),
+            declaration,
+            is_default,
+        )),
+        "class_declaration" => Some((
+            declaration_name(declaration, source)?.to_string(),
+            declaration,
+            is_default,
+        )),
+        "lexical_declaration" => {
+            if is_default {
+                return None;
+            }
+            let mut cursor = declaration.walk();
+            let declarators = declaration
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "variable_declarator")
+                .collect::<Vec<_>>();
+            let [declarator] = declarators.as_slice() else {
+                return None;
+            };
+            let name = declarator.child_by_field_name("name")?;
+            if name.kind() != "identifier" {
+                return None;
+            }
+            Some((
+                node_text(name, source)?.to_string(),
+                javascript_const_arrow(*declarator, source)?,
+                false,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn javascript_class_is_closed(class: TsNode<'_>) -> bool {
+    !javascript_declaration_is_decorated(class)
+        && !has_direct_named_child_kind(class, "class_heritage")
+        && class.child_by_field_name("body").is_some()
+}
+
+fn javascript_declaration_is_decorated(declaration: TsNode<'_>) -> bool {
+    has_direct_named_child_kind(declaration, "decorator")
+        || declaration.parent().is_some_and(|parent| {
+            parent.kind() == "export_statement" && has_direct_named_child_kind(parent, "decorator")
+        })
+}
+
+fn javascript_class_methods(
+    class: TsNode<'_>,
+    callable_nodes: &HashMap<(u32, String), Vec<NodeId>>,
+    source: &str,
+) -> Option<Vec<CachedClassMethod>> {
+    let body = class.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    let mut methods = Vec::new();
+    for child in body.named_children(&mut cursor) {
+        if child.kind() != "method_definition" {
+            continue;
+        }
+        let name_node = child.child_by_field_name("name")?;
+        let name = node_text(name_node, source)?;
+        if !matches!(name_node.kind(), "property_identifier" | "identifier")
+            || name.starts_with('#')
+            || javascript_method_has_unsupported_modifier(child)
+            || has_direct_named_child_kind(child, "decorator")
+            || child.child_by_field_name("body").is_none()
+        {
+            continue;
+        }
+        let line = child.start_position().row as u32 + 1;
+        let declarations = callable_nodes.get(&(line, name.to_string()))?;
+        let [declaration] = declarations.as_slice() else {
+            return None;
+        };
+        methods.push(CachedClassMethod {
+            name: name.to_string(),
+            declaration: *declaration,
+        });
+    }
+    methods.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.declaration.cmp(&right.declaration))
+    });
+    if methods.windows(2).any(|pair| pair[0].name == pair[1].name) {
+        return None;
+    }
+    Some(methods)
+}
+
+fn javascript_direct_constructor_name(declarator: TsNode<'_>, source: &str) -> Option<String> {
+    javascript_const_arrow_guard(declarator, source)?;
+    let value = declarator.child_by_field_name("value")?;
+    if value.kind() != "new_expression" {
+        return None;
+    }
+    let constructor = value.child_by_field_name("constructor")?;
+    (constructor.kind() == "identifier")
+        .then(|| node_text(constructor, source).map(str::to_string))?
+}
+
+fn javascript_const_arrow_guard(declarator: TsNode<'_>, source: &str) -> Option<()> {
+    let _ = source;
+    (javascript_variable_keyword(declarator) == Some("const")).then_some(())
+}
+
+fn typescript_variable_annotation(declarator: TsNode<'_>, source: &str) -> Option<String> {
+    javascript_const_arrow_guard(declarator, source)?;
+    let head = node_text(declarator, source)?.split('=').next()?.trim();
+    let (_, annotation) = head.split_once(':')?;
+    simple_typescript_class_type(annotation)
+}
+
+fn collect_typescript_typed_parameters(
+    parameters: TsNode<'_>,
+    source: &str,
+    emit: &mut impl FnMut(String, String),
+) {
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "required_parameter" {
+            continue;
+        }
+        let Some(name_node) = parameter
+            .child_by_field_name("pattern")
+            .or_else(|| parameter.child_by_field_name("name"))
+            .filter(|name| name.kind() == "identifier")
+        else {
+            continue;
+        };
+        let Some(type_node) = parameter.child_by_field_name("type") else {
+            continue;
+        };
+        let Some(name) = node_text(name_node, source) else {
+            continue;
+        };
+        let Some(class_name) = node_text(type_node, source).and_then(simple_typescript_class_type)
+        else {
+            continue;
+        };
+        emit(name.to_string(), class_name);
+    }
+}
+
+fn simple_typescript_class_type(surface: &str) -> Option<String> {
+    let name = surface.trim().trim_start_matches(':').trim();
+    (!matches!(name, "any" | "unknown")
+        && !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()))
+    .then(|| name.to_string())
+}
+
+fn javascript_member_receiver(callee: TsNode<'_>, source: &str) -> Option<String> {
+    let member = callee
+        .parent()
+        .filter(|parent| parent.kind() == "member_expression")?;
+    if has_direct_named_child_kind(member, "optional_chain") {
+        return None;
+    }
+    let object = member.child_by_field_name("object")?;
+    (object.kind() == "identifier").then(|| node_text(object, source).map(str::to_string))?
+}
+
+fn has_direct_named_child_kind(node: TsNode<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == kind)
+}
+
+fn javascript_enclosing_class(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "class_declaration" {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
 }
 
 fn resolve_rust_syntax_claim(
@@ -431,7 +1796,11 @@ fn map_callable_declaration(
     declaration: TsNode<'_>,
     source: &str,
 ) -> Option<NodeId> {
-    let name = declaration_name(declaration, source)?;
+    let name = if declaration.kind() == "arrow_function" {
+        crate::js_like_callable_source_name(declaration, source)?
+    } else {
+        declaration_name(declaration, source)?.to_string()
+    };
     let line = declaration.start_position().row as u32 + 1;
     let matches = nodes
         .iter()
@@ -452,24 +1821,6 @@ fn graph_leaf_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn top_level_typescript_functions(root: TsNode<'_>) -> Vec<TsNode<'_>> {
-    let mut result = Vec::new();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.kind() == "function_declaration" {
-            result.push(child);
-        } else if child.kind() == "export_statement" {
-            let mut nested_cursor = child.walk();
-            result.extend(
-                child
-                    .named_children(&mut nested_cursor)
-                    .filter(|nested| nested.kind() == "function_declaration"),
-            );
-        }
-    }
-    result
-}
-
 fn top_level_rust_functions(root: TsNode<'_>) -> Vec<TsNode<'_>> {
     let mut cursor = root.walk();
     root.named_children(&mut cursor)
@@ -477,141 +1828,10 @@ fn top_level_rust_functions(root: TsNode<'_>) -> Vec<TsNode<'_>> {
         .collect()
 }
 
-fn typescript_callable_is_top_level(callable: TsNode<'_>) -> bool {
-    match callable.parent().map(|parent| parent.kind()) {
-        Some("program") => true,
-        Some("export_statement") => callable
-            .parent()
-            .and_then(|export| export.parent())
-            .is_some_and(|parent| parent.kind() == "program"),
-        _ => false,
-    }
-}
-
 fn typescript_file_is_module(root: TsNode<'_>) -> bool {
     let mut cursor = root.walk();
     root.named_children(&mut cursor)
         .any(|child| matches!(child.kind(), "import_statement" | "export_statement"))
-}
-
-fn typescript_module_root_is_closed(root: TsNode<'_>, source: &str) -> bool {
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor)
-        .all(|child| match child.kind() {
-            "comment" | "empty_statement" => true,
-            "function_declaration" => typescript_direct_function_shape_is_closed(child),
-            "import_statement" => typescript_import_bindings_for_statement(child, source).is_some(),
-            "export_statement" => typescript_direct_export_shape(child).is_some(),
-            _ => false,
-        })
-}
-
-fn typescript_direct_function_shape_is_closed(declaration: TsNode<'_>) -> bool {
-    let Some(name) = declaration.child_by_field_name("name") else {
-        return false;
-    };
-    let Some(parameters) = declaration.child_by_field_name("parameters") else {
-        return false;
-    };
-    let Some(body) = declaration.child_by_field_name("body") else {
-        return false;
-    };
-    if name.kind() != "identifier"
-        || parameters.kind() != "formal_parameters"
-        || body.kind() != "statement_block"
-    {
-        return false;
-    }
-    let allowed = [name.id(), parameters.id(), body.id()];
-    let mut cursor = declaration.walk();
-    declaration
-        .named_children(&mut cursor)
-        .all(|child| child.kind() == "comment" || allowed.contains(&child.id()))
-}
-
-fn typescript_callable_domain_is_closed(callable: TsNode<'_>) -> bool {
-    if !typescript_direct_function_shape_is_closed(callable) {
-        return false;
-    }
-    let Some(parameters) = callable.child_by_field_name("parameters") else {
-        return false;
-    };
-    let mut parameter_cursor = parameters.walk();
-    if parameters
-        .named_children(&mut parameter_cursor)
-        .any(|child| child.kind() != "comment")
-    {
-        return false;
-    }
-    let Some(body) = callable.child_by_field_name("body") else {
-        return false;
-    };
-    let mut body_cursor = body.walk();
-    body.named_children(&mut body_cursor)
-        .all(typescript_safe_direct_call_statement)
-}
-
-fn typescript_safe_direct_call_statement(statement: TsNode<'_>) -> bool {
-    if matches!(statement.kind(), "comment" | "empty_statement") {
-        return true;
-    }
-    if statement.kind() != "expression_statement" {
-        return false;
-    }
-    let mut statement_cursor = statement.walk();
-    let expressions = statement
-        .named_children(&mut statement_cursor)
-        .filter(|child| child.kind() != "comment")
-        .collect::<Vec<_>>();
-    let [call] = expressions.as_slice() else {
-        return false;
-    };
-    if call.kind() != "call_expression" {
-        return false;
-    }
-    let Some(function) = call.child_by_field_name("function") else {
-        return false;
-    };
-    let Some(arguments) = call.child_by_field_name("arguments") else {
-        return false;
-    };
-    if function.kind() != "identifier" || arguments.kind() != "arguments" {
-        return false;
-    }
-    let allowed = [function.id(), arguments.id()];
-    let mut call_cursor = call.walk();
-    if !call
-        .named_children(&mut call_cursor)
-        .all(|child| child.kind() == "comment" || allowed.contains(&child.id()))
-    {
-        return false;
-    }
-    let mut argument_cursor = arguments.walk();
-    arguments
-        .named_children(&mut argument_cursor)
-        .all(|child| child.kind() == "comment")
-}
-
-fn typescript_direct_export_shape(statement: TsNode<'_>) -> Option<(TsNode<'_>, bool)> {
-    if statement.child_by_field_name("source").is_some()
-        || statement.child_by_field_name("value").is_some()
-    {
-        return None;
-    }
-    let declaration = statement.child_by_field_name("declaration")?;
-    if declaration.kind() != "function_declaration"
-        || !typescript_direct_function_shape_is_closed(declaration)
-    {
-        return None;
-    }
-    let mut cursor = statement.walk();
-    if !statement
-        .named_children(&mut cursor)
-        .all(|child| child.kind() == "comment" || child.id() == declaration.id())
-    {
-        return None;
-    }
-    Some((declaration, export_statement_has_default_token(statement)?))
 }
 
 fn rust_callable_is_in_root_module(callable: TsNode<'_>) -> bool {
@@ -755,21 +1975,6 @@ fn callable_has_shadow_or_write(
     found
 }
 
-fn root_has_write(root: TsNode<'_>, name: &str, source: &str) -> bool {
-    let mut found = false;
-    walk_nodes(root, &mut |node| {
-        if found {
-            return;
-        }
-        if let Some(target) = typescript_write_target(node) {
-            found = target
-                .map(|target| subtree_binds(target, name, source))
-                .unwrap_or(true);
-        }
-    });
-    found
-}
-
 fn rust_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
     let mut cursor = root.walk();
     root.named_children(&mut cursor).any(|node| {
@@ -885,20 +2090,7 @@ fn subtree_binds(node: TsNode<'_>, name: &str, source: &str) -> bool {
     found
 }
 
-fn contains_dynamic_construct(root: TsNode<'_>, source: &str) -> bool {
-    let mut found = false;
-    walk_nodes(root, &mut |node| {
-        found |= node.kind() == "with_statement"
-            || (node.kind() == "call_expression"
-                && node
-                    .child_by_field_name("function")
-                    .and_then(|function| node_text(function, source))
-                    == Some("eval"));
-    });
-    found
-}
-
-fn walk_nodes(node: TsNode<'_>, visit: &mut impl FnMut(TsNode<'_>)) {
+fn walk_nodes<'tree>(node: TsNode<'tree>, visit: &mut impl FnMut(TsNode<'tree>)) {
     visit(node);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -914,20 +2106,6 @@ struct TypescriptImportBinding {
     is_default: bool,
     line: u32,
     column: u32,
-}
-
-fn typescript_import_bindings(root: TsNode<'_>, source: &str) -> Vec<TypescriptImportBinding> {
-    let mut result = Vec::new();
-    let mut cursor = root.walk();
-    for statement in root
-        .named_children(&mut cursor)
-        .filter(|child| child.kind() == "import_statement")
-    {
-        result.extend(
-            typescript_import_bindings_for_statement(statement, source).unwrap_or_default(),
-        );
-    }
-    result
 }
 
 fn typescript_import_bindings_for_statement(
@@ -1060,54 +2238,6 @@ fn contains_unnamed_token(node: TsNode<'_>, token: &str) -> bool {
     found
 }
 
-fn collect_typescript_direct_exports(
-    tree: &Tree,
-    source: &str,
-    file_id: NodeId,
-    nodes: &[Node],
-) -> Option<Vec<CachedDirectExport>> {
-    if contains_dynamic_construct(tree.root_node(), source) {
-        return None;
-    }
-    let mut exports = Vec::new();
-    let mut cursor = tree.root_node().walk();
-    for statement in tree.root_node().named_children(&mut cursor) {
-        if statement.kind() != "export_statement" {
-            continue;
-        }
-        let (declaration, is_default) = typescript_direct_export_shape(statement)?;
-        let name = declaration_name(declaration, source)?;
-        let declaration_count = top_level_typescript_functions(tree.root_node())
-            .into_iter()
-            .filter(|candidate| declaration_name(*candidate, source) == Some(name))
-            .count();
-        let import_count = typescript_import_bindings(tree.root_node(), source)
-            .into_iter()
-            .filter(|binding| binding.local_name == name)
-            .count();
-        if root_has_write(tree.root_node(), name, source) || declaration_count + import_count != 1 {
-            continue;
-        }
-        let node_id = map_callable_declaration(nodes, file_id, declaration, source)?;
-        exports.push(CachedDirectExport {
-            exported_name: if is_default { "default" } else { name }.to_string(),
-            declaration: node_id,
-            is_default,
-        });
-    }
-    exports.sort_by(|left, right| {
-        left.exported_name
-            .cmp(&right.exported_name)
-            .then(left.declaration.cmp(&right.declaration))
-    });
-    if exports.windows(2).any(|pair| {
-        pair[0].exported_name == pair[1].exported_name && pair[0].is_default == pair[1].is_default
-    }) {
-        return None;
-    }
-    Some(exports)
-}
-
 fn export_statement_has_default_token(statement: TsNode<'_>) -> Option<bool> {
     let mut cursor = statement.walk();
     let defaults = statement
@@ -1124,11 +2254,8 @@ fn collect_top_level_declarations(
     file_id: NodeId,
     nodes: &[Node],
 ) -> Option<Vec<CachedTopLevelDeclaration>> {
-    let declarations = if language == "rust" {
-        top_level_rust_functions(tree.root_node())
-    } else {
-        top_level_typescript_functions(tree.root_node())
-    };
+    debug_assert_eq!(language, "rust");
+    let declarations = top_level_rust_functions(tree.root_node());
     let mut result = Vec::with_capacity(declarations.len());
     for declaration in declarations {
         let name = declaration_name(declaration, source)?.to_string();
@@ -1248,6 +2375,7 @@ pub fn rematerialize_proof_resolution_projection(
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
     let edges = store.get_edges()?;
+    let exact_evidence_validation = ExactEvidenceValidationIndex::prepare(&edges);
     let governed = files
         .iter()
         .filter(|file| file.indexed && is_installed_language(&file.language))
@@ -1454,6 +2582,7 @@ pub fn rematerialize_proof_resolution_projection(
         &governed_by_id,
         &record_by_file_id,
     )?;
+    enforce_exact_evidence_corroboration(&mut claims, &node_by_id, &exact_evidence_validation);
     let exact_claim_indices = claims
         .iter()
         .enumerate()
@@ -1477,11 +2606,22 @@ pub fn rematerialize_proof_resolution_projection(
             }
         })
         .collect::<Vec<_>>();
+    let constructor_evidence_nodes = claims
+        .iter()
+        .flat_map(|claim| claim.evidence_chain.iter())
+        .filter_map(|evidence| match evidence {
+            ResolutionEvidence::ConstructorBinding { constructor } => Some(*constructor),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
     let ordinary_edge_indices = edges
         .iter()
         .enumerate()
         .filter_map(|(index, edge)| {
-            (edge.kind == EdgeKind::CALL && node_by_id.contains_key(&edge.target)).then_some(index)
+            (edge.kind == EdgeKind::CALL
+                && node_by_id.contains_key(&edge.target)
+                && !constructor_evidence_nodes.contains(&edge.effective_target()))
+            .then_some(index)
         })
         .collect::<Vec<_>>();
     let edge_correlation_inputs = ordinary_edge_indices
@@ -1489,14 +2629,24 @@ pub fn rematerialize_proof_resolution_projection(
         .map(|index| {
             let edge = &edges[*index];
             let raw = node_by_id[&edge.target];
+            let direct_member_edge = edge.target == edge.effective_target()
+                && (raw.kind == NodeKind::METHOD || raw.file_node_id != edge.file_node_id);
             OrdinaryCallEdgeCorrelationInput {
                 file_id: edge.file_node_id.map(|file| FileId(file.0)),
                 line: edge.line,
                 caller: edge.effective_source(),
                 target: edge.effective_target(),
                 raw_edge_target: edge.target,
-                raw_file_id: raw.file_node_id.map(|file| FileId(file.0)),
-                raw_line: raw.start_line,
+                raw_file_id: if direct_member_edge {
+                    edge.file_node_id.map(|file| FileId(file.0))
+                } else {
+                    raw.file_node_id.map(|file| FileId(file.0))
+                },
+                raw_line: if direct_member_edge {
+                    edge.line
+                } else {
+                    raw.start_line
+                },
                 raw_target: graph_leaf_name(&raw.serialized_name),
                 callsite_identity: edge.callsite_identity.as_deref(),
                 semantic_exact: edge.resolved_target == Some(edge.effective_target())
@@ -1543,43 +2693,88 @@ pub fn rematerialize_proof_resolution_projection(
         .map_err(Into::into)
 }
 
+#[derive(Clone, Copy)]
+enum RelativeImportResolution<'a> {
+    Unique(&'a ResolutionCacheRecord),
+    Missing,
+    Incomplete,
+}
+
 fn resolve_relative_import<'a>(
     source_record: &ResolutionCacheRecord,
     module_specifier: &str,
     records: &'a HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
-) -> Result<Option<&'a ResolutionCacheRecord>> {
+) -> Result<RelativeImportResolution<'a>> {
     let Some(parent) = source_record.path.parent() else {
-        return Ok(None);
+        return Ok(RelativeImportResolution::Missing);
     };
     let base = parent.join(module_specifier);
     let candidates = if base.extension().is_some() {
+        let supported = match source_record.file.language.as_str() {
+            "typescript" | "tsx" => ["ts", "tsx", "mts", "cts"].as_slice(),
+            "javascript" => ["js", "jsx", "mjs", "cjs"].as_slice(),
+            _ => &[],
+        };
+        let extension = base.extension().and_then(|extension| extension.to_str());
+        if !extension.is_some_and(|extension| supported.contains(&extension))
+            || base
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".d.ts"))
+        {
+            return Ok(RelativeImportResolution::Missing);
+        }
         vec![base]
     } else {
-        vec![
-            base.with_extension("ts"),
-            base.with_extension("tsx"),
-            base.join("index.ts"),
-            base.join("index.tsx"),
-        ]
+        match source_record.file.language.as_str() {
+            "typescript" | "tsx" => vec![
+                base.with_extension("ts"),
+                base.with_extension("tsx"),
+                base.join("index.ts"),
+                base.join("index.tsx"),
+            ],
+            "javascript" => vec![
+                base.with_extension("js"),
+                base.with_extension("jsx"),
+                base.join("index.js"),
+                base.join("index.jsx"),
+            ],
+            _ => return Ok(RelativeImportResolution::Missing),
+        }
     };
     let mut matches = Vec::new();
+    let mut uncovered = false;
     for candidate in candidates {
-        if candidate.is_absolute() && !candidate.exists() {
-            continue;
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                uncovered = true;
+                continue;
+            }
         }
-        let key = workspace_path_identity(&candidate).with_context(|| {
-            format!(
-                "proof resolution native identity is unavailable for import candidate {}",
-                candidate.display()
-            )
-        })?;
+        let key = match workspace_path_identity(&candidate) {
+            Ok(key) => key,
+            Err(_) => {
+                uncovered = true;
+                continue;
+            }
+        };
         if let Some(record) = records.get(&key) {
             matches.push(*record);
+        } else {
+            uncovered = true;
         }
     }
     matches.sort_by_key(|record| record.file.file_id);
     matches.dedup_by_key(|record| record.file.file_id);
-    Ok((matches.len() == 1).then_some(matches[0]))
+    Ok(if uncovered || matches.len() > 1 {
+        RelativeImportResolution::Incomplete
+    } else if let [record] = matches.as_slice() {
+        RelativeImportResolution::Unique(record)
+    } else {
+        RelativeImportResolution::Missing
+    })
 }
 
 #[derive(Debug)]
@@ -1591,6 +2786,232 @@ struct ResolvedSyntaxClaim {
     reason: ProofResolutionReason,
     evidence_chain: Vec<ResolutionEvidence>,
     exact_node_file_expectations: Vec<(NodeId, FileId)>,
+}
+
+struct ExactEvidenceValidationIndex {
+    import_relation_counts: HashMap<(NodeId, NodeId, NodeId), usize>,
+    member_relation_counts: HashMap<(NodeId, NodeId), usize>,
+}
+
+impl ExactEvidenceValidationIndex {
+    fn prepare(edges: &[Edge]) -> Self {
+        let mut import_relation_counts = HashMap::new();
+        let mut member_relation_counts = HashMap::new();
+        for edge in edges {
+            if edge.kind == EdgeKind::IMPORT
+                && let (Some(file_id), Some(target)) = (edge.file_node_id, edge.resolved_target)
+            {
+                *import_relation_counts
+                    .entry((file_id, edge.source, target))
+                    .or_default() += 1;
+            }
+            if edge.kind == EdgeKind::MEMBER {
+                *member_relation_counts
+                    .entry((edge.effective_source(), edge.effective_target()))
+                    .or_default() += 1;
+            }
+        }
+        Self {
+            import_relation_counts,
+            member_relation_counts,
+        }
+    }
+
+    fn claim_has_literal_corroboration(
+        &self,
+        claim: &ResolvedSyntaxClaim,
+        nodes: &HashMap<NodeId, &Node>,
+    ) -> bool {
+        let Some(target) = claim.target else {
+            return false;
+        };
+        let Some(target_node) = nodes.get(&target) else {
+            return false;
+        };
+        let source_file = NodeId(claim.input.callsite.file_id.0);
+        match (
+            claim.input.callsite.callee_form,
+            claim.evidence_chain.as_slice(),
+        ) {
+            (CalleeForm::Identifier, [ResolutionEvidence::SameFileDeclaration { declaration }]) => {
+                *declaration == target && target_node.file_node_id == Some(source_file)
+            }
+            (
+                CalleeForm::NamedImport,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration,
+                    },
+                ],
+            ) => {
+                *declaration == target
+                    && nodes.get(import).is_some_and(|import_node| {
+                        import_node.file_node_id == Some(source_file)
+                            && graph_leaf_name(&import_node.serialized_name)
+                                == claim.input.callsite.raw_target
+                    })
+                    && self
+                        .import_relation_counts
+                        .get(&(source_file, *import, target))
+                        .copied()
+                        == Some(1)
+            }
+            (
+                CalleeForm::ImplicitReceiver,
+                [
+                    ResolutionEvidence::ImplicitReceiver { owner },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) => {
+                *declaration == target
+                    && target_node.kind == NodeKind::METHOD
+                    && target_node.file_node_id == Some(source_file)
+                    && nodes.get(owner).is_some_and(|owner_node| {
+                        matches!(owner_node.kind, NodeKind::STRUCT | NodeKind::CLASS)
+                            && owner_node.file_node_id == Some(source_file)
+                    })
+                    && self
+                        .member_relation_counts
+                        .get(&(*owner, claim.caller))
+                        .copied()
+                        == Some(1)
+                    && self.member_relation_counts.get(&(*owner, target)).copied() == Some(1)
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *constructor == *receiver_type => self.local_receiver_is_correlated(
+                source_file,
+                *constructor,
+                *declaration,
+                target,
+                target_node,
+                nodes,
+            ),
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) => self.local_receiver_is_correlated(
+                source_file,
+                *receiver_type,
+                *declaration,
+                target,
+                target_node,
+                nodes,
+            ),
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *owner == *constructor && *owner == *receiver_type && *declaration == target => {
+                self.imported_receiver_is_correlated(
+                    source_file,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                    nodes,
+                )
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *owner == *receiver_type && *declaration == target => self
+                .imported_receiver_is_correlated(
+                    source_file,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                    nodes,
+                ),
+            _ => false,
+        }
+    }
+
+    fn local_receiver_is_correlated(
+        &self,
+        source_file: NodeId,
+        owner: NodeId,
+        declaration: NodeId,
+        target: NodeId,
+        target_node: &Node,
+        nodes: &HashMap<NodeId, &Node>,
+    ) -> bool {
+        declaration == target
+            && target_node.kind == NodeKind::METHOD
+            && nodes.get(&owner).is_some_and(|owner_node| {
+                owner_node.kind == NodeKind::CLASS
+                    && owner_node.file_node_id == Some(source_file)
+                    && owner_node.file_node_id == target_node.file_node_id
+            })
+            && self.member_relation_counts.get(&(owner, target)).copied() == Some(1)
+    }
+
+    fn imported_receiver_is_correlated(
+        &self,
+        source_file: NodeId,
+        import: NodeId,
+        owner: NodeId,
+        target: NodeId,
+        target_node: &Node,
+        nodes: &HashMap<NodeId, &Node>,
+    ) -> bool {
+        target_node.kind == NodeKind::METHOD
+            && nodes
+                .get(&import)
+                .is_some_and(|import_node| import_node.file_node_id == Some(source_file))
+            && nodes.get(&owner).is_some_and(|owner_node| {
+                owner_node.kind == NodeKind::CLASS
+                    && owner_node.file_node_id == target_node.file_node_id
+            })
+            && self
+                .import_relation_counts
+                .get(&(source_file, import, owner))
+                .copied()
+                == Some(1)
+            && self.member_relation_counts.get(&(owner, target)).copied() == Some(1)
+    }
+}
+
+fn enforce_exact_evidence_corroboration(
+    claims: &mut [ResolvedSyntaxClaim],
+    nodes: &HashMap<NodeId, &Node>,
+    validation: &ExactEvidenceValidationIndex,
+) {
+    for claim in claims
+        .iter_mut()
+        .filter(|claim| claim.status == ProofResolutionStatus::Exact)
+    {
+        if !validation.claim_has_literal_corroboration(claim, nodes) {
+            claim.status = ProofResolutionStatus::IncompleteDomain;
+            claim.reason = ProofResolutionReason::LookupDomainIncomplete;
+            claim.target = None;
+            claim.evidence_chain.clear();
+        }
+    }
 }
 
 fn resolve_syntax_claim(
@@ -1644,26 +3065,39 @@ fn resolve_syntax_claim(
             declaration,
             owner_name,
         } => {
-            let rust_records = all_records
-                .iter()
-                .filter(|record| record.file.language == "rust")
-                .collect::<Vec<_>>();
-            let matching_methods = rust_records
-                .iter()
-                .flat_map(|record| record.file.inherent_methods.iter())
-                .filter(|method| {
-                    method.owner_name == *owner_name
-                        && method.method_name == input.callsite.raw_target
-                })
-                .collect::<Vec<_>>();
-            if rust_records
-                .iter()
-                .any(|record| !record.file.lookup_input_complete)
+            let matching_method_count = if source_record.file.language == "rust" {
+                all_records
+                    .iter()
+                    .filter(|record| record.file.language == "rust")
+                    .flat_map(|record| record.file.inherent_methods.iter())
+                    .filter(|method| {
+                        method.owner_name == *owner_name
+                            && method.method_name == input.callsite.raw_target
+                            && method.declaration == *declaration
+                    })
+                    .count()
+            } else {
+                source_record
+                    .file
+                    .classes
+                    .iter()
+                    .filter(|class| class.name == *owner_name && class.declaration == *owner)
+                    .flat_map(|class| class.methods.iter())
+                    .filter(|method| {
+                        method.name == input.callsite.raw_target
+                            && method.declaration == *declaration
+                    })
+                    .count()
+            };
+            if source_record.file.language == "rust"
+                && all_records
+                    .iter()
+                    .filter(|record| record.file.language == "rust")
+                    .any(|record| !record.file.lookup_input_complete)
             {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
-            } else if matching_methods.len() != 1 || matching_methods[0].declaration != *declaration
-            {
+            } else if matching_method_count != 1 {
                 status = ProofResolutionStatus::Ambiguous;
                 reason = ProofResolutionReason::MultipleBindings;
             } else {
@@ -1684,16 +3118,34 @@ fn resolve_syntax_claim(
             imported_name,
             is_default,
         } => {
-            let target_record = resolve_relative_import(source_record, module_specifier, records)?;
+            let target_resolution =
+                resolve_relative_import(source_record, module_specifier, records)?;
+            let target_record = match target_resolution {
+                RelativeImportResolution::Unique(record) => Some(record),
+                RelativeImportResolution::Missing | RelativeImportResolution::Incomplete => None,
+            };
+            let target_domain_poisoned = target_record.is_some_and(|record| {
+                record.file.export_poison_all
+                    || record
+                        .file
+                        .poisoned_export_names
+                        .iter()
+                        .any(|name| name == imported_name)
+            });
             let declarations = target_record
-                .filter(|record| record.file.lookup_input_complete)
+                .filter(|record| record.file.lookup_input_complete && !target_domain_poisoned)
                 .into_iter()
                 .flat_map(|record| record.file.direct_exports.iter())
                 .filter(|export| {
-                    export.is_default == *is_default && export.exported_name == *imported_name
+                    export.is_default == *is_default
+                        && export.exported_name == *imported_name
+                        && export.declaration_kind == CachedDeclarationKind::Callable
                 })
                 .collect::<Vec<_>>();
-            if let [declaration] = declarations.as_slice() {
+            if target_domain_poisoned {
+                status = ProofResolutionStatus::IncompleteDomain;
+                reason = ProofResolutionReason::LookupDomainIncomplete;
+            } else if let [declaration] = declarations.as_slice() {
                 let target_file_id = FileId(
                     target_record
                         .expect("one direct export requires a resolved target record")
@@ -1710,7 +3162,9 @@ fn resolve_syntax_claim(
                 });
                 exact_node_file_expectations.push((*import, input.callsite.file_id));
                 exact_node_file_expectations.push((declaration.declaration, target_file_id));
-            } else if target_record.is_some_and(|record| !record.file.lookup_input_complete) {
+            } else if matches!(target_resolution, RelativeImportResolution::Incomplete)
+                || target_record.is_some_and(|record| !record.file.lookup_input_complete)
+            {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
             } else if declarations.len() > 1 {
@@ -1736,6 +3190,176 @@ fn resolve_syntax_claim(
         CachedResolutionBinding::IncompleteDomain => {
             status = ProofResolutionStatus::IncompleteDomain;
             reason = ProofResolutionReason::LookupDomainIncomplete;
+        }
+        CachedResolutionBinding::ConstructorBinding {
+            class_binding,
+            method_name,
+        }
+        | CachedResolutionBinding::ExplicitReceiverType {
+            class_binding,
+            method_name,
+        } => {
+            let constructor_binding = matches!(
+                &input.binding,
+                CachedResolutionBinding::ConstructorBinding { .. }
+            );
+            let (target_record, import, owner) = match class_binding {
+                CachedClassBinding::SameFile { owner, owner_name } => {
+                    let matches = source_record
+                        .file
+                        .classes
+                        .iter()
+                        .filter(|class| class.declaration == *owner && class.name == *owner_name)
+                        .collect::<Vec<_>>();
+                    if matches.len() != 1 {
+                        status = ProofResolutionStatus::Ambiguous;
+                        reason = ProofResolutionReason::MultipleBindings;
+                        return Ok(ResolvedSyntaxClaim {
+                            input,
+                            caller,
+                            target,
+                            status,
+                            reason,
+                            evidence_chain,
+                            exact_node_file_expectations,
+                        });
+                    }
+                    (source_record, None, *owner)
+                }
+                CachedClassBinding::StaticImport {
+                    import,
+                    module_specifier,
+                    imported_name,
+                    is_default,
+                } => {
+                    let target_record =
+                        match resolve_relative_import(source_record, module_specifier, records)? {
+                            RelativeImportResolution::Unique(record) => record,
+                            RelativeImportResolution::Missing => {
+                                status = ProofResolutionStatus::MissingBinding;
+                                reason = ProofResolutionReason::MissingBinding;
+                                return Ok(ResolvedSyntaxClaim {
+                                    input,
+                                    caller,
+                                    target,
+                                    status,
+                                    reason,
+                                    evidence_chain,
+                                    exact_node_file_expectations,
+                                });
+                            }
+                            RelativeImportResolution::Incomplete => {
+                                status = ProofResolutionStatus::IncompleteDomain;
+                                reason = ProofResolutionReason::LookupDomainIncomplete;
+                                return Ok(ResolvedSyntaxClaim {
+                                    input,
+                                    caller,
+                                    target,
+                                    status,
+                                    reason,
+                                    evidence_chain,
+                                    exact_node_file_expectations,
+                                });
+                            }
+                        };
+                    if target_record.file.export_poison_all
+                        || target_record
+                            .file
+                            .poisoned_export_names
+                            .iter()
+                            .any(|name| name == imported_name)
+                        || !target_record.file.lookup_input_complete
+                    {
+                        status = ProofResolutionStatus::IncompleteDomain;
+                        reason = ProofResolutionReason::LookupDomainIncomplete;
+                        return Ok(ResolvedSyntaxClaim {
+                            input,
+                            caller,
+                            target,
+                            status,
+                            reason,
+                            evidence_chain,
+                            exact_node_file_expectations,
+                        });
+                    }
+                    let owners = target_record
+                        .file
+                        .direct_exports
+                        .iter()
+                        .filter(|export| {
+                            export.is_default == *is_default
+                                && export.exported_name == *imported_name
+                                && export.declaration_kind == CachedDeclarationKind::Class
+                        })
+                        .collect::<Vec<_>>();
+                    let [export] = owners.as_slice() else {
+                        status = if owners.is_empty() {
+                            ProofResolutionStatus::MissingBinding
+                        } else {
+                            ProofResolutionStatus::Ambiguous
+                        };
+                        reason = if owners.is_empty() {
+                            ProofResolutionReason::MissingBinding
+                        } else {
+                            ProofResolutionReason::MultipleBindings
+                        };
+                        return Ok(ResolvedSyntaxClaim {
+                            input,
+                            caller,
+                            target,
+                            status,
+                            reason,
+                            evidence_chain,
+                            exact_node_file_expectations,
+                        });
+                    };
+                    (target_record, Some(*import), export.declaration)
+                }
+            };
+            let methods = target_record
+                .file
+                .classes
+                .iter()
+                .filter(|class| class.declaration == owner)
+                .flat_map(|class| class.methods.iter())
+                .filter(|method| method.name == *method_name)
+                .collect::<Vec<_>>();
+            if let [method] = methods.as_slice() {
+                let target_file_id = FileId(target_record.file.file_id.0);
+                status = ProofResolutionStatus::Exact;
+                reason = ProofResolutionReason::ExactResolution;
+                target = Some(method.declaration);
+                if let Some(import) = import {
+                    evidence_chain.push(ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    });
+                    exact_node_file_expectations.push((import, input.callsite.file_id));
+                }
+                if constructor_binding {
+                    evidence_chain
+                        .push(ResolutionEvidence::ConstructorBinding { constructor: owner });
+                }
+                evidence_chain.push(ResolutionEvidence::ExplicitReceiverType {
+                    receiver_type: owner,
+                });
+                evidence_chain.push(ResolutionEvidence::SameFileDeclaration {
+                    declaration: method.declaration,
+                });
+                exact_node_file_expectations.push((owner, target_file_id));
+                exact_node_file_expectations.push((method.declaration, target_file_id));
+            } else {
+                status = if methods.is_empty() {
+                    ProofResolutionStatus::MissingBinding
+                } else {
+                    ProofResolutionStatus::Ambiguous
+                };
+                reason = if methods.is_empty() {
+                    ProofResolutionReason::MissingBinding
+                } else {
+                    ProofResolutionReason::MultipleBindings
+                };
+            }
         }
     }
     if !source_file.complete

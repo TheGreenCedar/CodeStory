@@ -8,9 +8,9 @@ use codestory_store::FileInfo;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
-// Bumped to 5 because parser artifacts now retain compact call-resolution
-// inputs used to rematerialize the private proof authorization overlay.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 5;
+// Bumped to 6 because JavaScript joins the private proof adapter roster and
+// ECMAScript bindings are now collected with name-specific closure semantics.
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 7;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -58,10 +58,33 @@ pub(crate) enum CachedResolutionBinding {
         declaration: NodeId,
         owner_name: String,
     },
+    ConstructorBinding {
+        class_binding: CachedClassBinding,
+        method_name: String,
+    },
+    ExplicitReceiverType {
+        class_binding: CachedClassBinding,
+        method_name: String,
+    },
     Ambiguous,
     MissingBinding,
     Unsupported,
     IncompleteDomain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CachedClassBinding {
+    SameFile {
+        owner: NodeId,
+        owner_name: String,
+    },
+    StaticImport {
+        import: NodeId,
+        module_specifier: String,
+        imported_name: String,
+        is_default: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +99,13 @@ pub(crate) struct CachedResolutionFile {
     pub typescript_module: bool,
     pub top_level_declarations: Vec<CachedTopLevelDeclaration>,
     pub inherent_methods: Vec<CachedInherentMethod>,
+    #[serde(default)]
+    pub classes: Vec<CachedClassDeclaration>,
     pub direct_exports: Vec<CachedDirectExport>,
+    #[serde(default)]
+    pub export_poison_all: bool,
+    #[serde(default)]
+    pub poisoned_export_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,10 +122,33 @@ pub(crate) struct CachedInherentMethod {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedClassDeclaration {
+    pub name: String,
+    pub declaration: NodeId,
+    pub methods: Vec<CachedClassMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedClassMethod {
+    pub name: String,
+    pub declaration: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CachedDirectExport {
     pub exported_name: String,
     pub declaration: NodeId,
     pub is_default: bool,
+    #[serde(default)]
+    pub declaration_kind: CachedDeclarationKind,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CachedDeclarationKind {
+    #[default]
+    Callable,
+    Class,
 }
 
 impl CachedIndexArtifact {
@@ -111,7 +163,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 3,
+            resolution_input_schema_version: 5,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,
