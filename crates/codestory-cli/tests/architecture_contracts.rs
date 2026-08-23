@@ -1298,10 +1298,15 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
         ),
         (
             "packet planner",
-            read_source_tree("crates/codestory-agent/src")
-                .replace(&read("crates/codestory-agent/src/indexed_source_call_path_v1.rs"), ""),
+            read_source_tree("crates/codestory-agent/src").replace(
+                &read("crates/codestory-agent/src/indexed_source_call_path_v1.rs"),
+                "",
+            ),
         ),
-        ("search", read_source_tree("crates/codestory-runtime/src/search")),
+        (
+            "search",
+            read_source_tree("crates/codestory-runtime/src/search"),
+        ),
         (
             "packet runtime",
             read_source_tree("crates/codestory-runtime/src/agent"),
@@ -1310,10 +1315,36 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
             "context",
             read("crates/codestory-cli/src/app/agent_context/context.rs"),
         ),
+        (
+            "runtime navigation and graph consumers",
+            read_source_tree_excluding_many(
+                "crates/codestory-runtime/src",
+                &[
+                    "index_commit.rs",
+                    "index_full.rs",
+                    "indexed_source_call_path_v1.rs",
+                    "proof_qualification_support.rs",
+                    "semantic_republish.rs",
+                    "tests.rs",
+                    "v3_evidence_qualification_support.rs",
+                ],
+            ),
+        ),
+        (
+            "store trail navigation",
+            read("crates/codestory-store/src/storage_impl/trail.rs"),
+        ),
+        (
+            "CLI navigation adapters",
+            read_source_tree("crates/codestory-cli/src"),
+        ),
     ] {
         for forbidden in [
+            "proof_resolution",
             "proof_resolution_fact",
             "CallResolutionFact",
+            "ProofResolutionStatus",
+            "ResolutionEvidence",
             "get_exact_proof_resolution_fact_by_edge",
             "get_proof_resolution_facts",
             "get_proof_resolution_publication",

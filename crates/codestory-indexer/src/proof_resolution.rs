@@ -14,12 +14,12 @@ use codestory_contracts::proof_resolution::{
 };
 use codestory_store::{IndexPublicationRecord, ProofResolutionPublication, Store};
 use codestory_workspace::{WorkspacePathIdentity, workspace_path_identity};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node as TsNode, Tree};
 
-const ADAPTER_VERSION: &str = "reference-v2";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 3;
+const ADAPTER_VERSION: &str = "reference-v3";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 4;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("rust", ADAPTER_VERSION),
     ("tsx", ADAPTER_VERSION),
@@ -66,6 +66,18 @@ pub(crate) fn collect_call_resolution_inputs(
     }
     let typescript_module =
         matches!(language, "typescript" | "tsx") && typescript_file_is_module(tree.root_node());
+    let (typescript_project_value_mutations, typescript_project_value_mutations_complete) =
+        if matches!(language, "typescript" | "tsx") {
+            match collect_typescript_project_value_mutations(tree.root_node(), source) {
+                Some(mutations) => (mutations, true),
+                None => {
+                    lookup_input_complete = false;
+                    (Vec::new(), false)
+                }
+            }
+        } else {
+            (Vec::new(), false)
+        };
     let top_level_declarations = if matches!(language, "typescript" | "tsx" | "rust") {
         match collect_top_level_declarations(tree, source, language, file_id, nodes) {
             Some(declarations) => declarations,
@@ -132,6 +144,8 @@ pub(crate) fn collect_call_resolution_inputs(
             complete,
             lookup_input_complete,
             typescript_module,
+            typescript_project_value_mutations,
+            typescript_project_value_mutations_complete,
             top_level_declarations,
             inherent_methods,
             direct_exports,
@@ -155,6 +169,8 @@ pub(crate) fn cached_resolution_inputs_are_current(
                 file.language == language
                     && file.adapter_version == ADAPTER_VERSION
                     && file.parser_fingerprint.len() == 64
+                    && (!matches!(language, "typescript" | "tsx")
+                        || file.typescript_project_value_mutations_complete)
             }))
 }
 
@@ -239,7 +255,7 @@ fn resolve_typescript_syntax_claim(
         return (Some(caller), CachedResolutionBinding::Unsupported);
     }
     if contains_dynamic_construct(tree.root_node(), source)
-        || callable_has_shadow_or_write(callable, callee, raw_target, source)
+        || callable_has_shadow_or_write("typescript", callable, callee, raw_target, source)
         || root_has_write(tree.root_node(), raw_target, source)
         || typescript_root_has_competing_value_binding(tree.root_node(), raw_target, source)
     {
@@ -308,7 +324,7 @@ fn resolve_rust_syntax_claim(
     if !rust_callable_is_in_root_module(callable) {
         return (Some(caller), CachedResolutionBinding::Unsupported);
     }
-    if callable_has_shadow_or_write(callable, callee, raw_target, source)
+    if callable_has_shadow_or_write("rust", callable, callee, raw_target, source)
         || rust_root_has_competing_value_binding(tree.root_node(), raw_target, source)
     {
         return (Some(caller), CachedResolutionBinding::Ambiguous);
@@ -527,6 +543,7 @@ fn simple_inherent_impl_owner<'a>(impl_item: TsNode<'_>, source: &'a str) -> Opt
 }
 
 fn callable_has_shadow_or_write(
+    language: &str,
     callable: TsNode<'_>,
     callee: TsNode<'_>,
     name: &str,
@@ -537,47 +554,36 @@ fn callable_has_shadow_or_write(
         if found || node.id() == callee.id() {
             return;
         }
-        let relevant = matches!(
-            node.kind(),
-            "required_parameter"
-                | "optional_parameter"
-                | "rest_pattern"
-                | "formal_parameters"
-                | "parameters"
-                | "parameter"
-                | "variable_declarator"
-                | "lexical_declaration"
-                | "variable_declaration"
-                | "let_declaration"
-                | "const_item"
-                | "static_item"
-                | "use_declaration"
-                | "class_declaration"
-                | "struct_item"
-                | "closure_parameters"
-        ) || (node.id() != callable.id()
-            && matches!(node.kind(), "function_item" | "function_declaration"));
-        if relevant && subtree_binds(node, name, source) {
-            found = true;
-            return;
+        let write_target = match language {
+            "rust" => rust_write_target(node),
+            _ => typescript_write_target(node),
+        };
+        if let Some(target) = write_target {
+            found = target
+                .map(|target| subtree_binds(target, name, source))
+                .unwrap_or(true);
+            if found {
+                return;
+            }
         }
-        if node.kind() == "catch_clause"
-            && node
-                .child_by_field_name("parameter")
-                .is_some_and(|parameter| subtree_binds(parameter, name, source))
-        {
-            found = true;
-            return;
-        }
-        if matches!(
-            node.kind(),
-            "assignment_expression" | "augmented_assignment_expression" | "update_expression"
-        ) && node
-            .child_by_field_name("left")
-            .or_else(|| node.child_by_field_name("argument"))
-            .is_some_and(|left| subtree_binds(left, name, source))
-        {
-            found = true;
+        let binding_regions = match language {
+            "rust" => rust_binding_regions(node),
+            _ => typescript_binding_regions(node),
+        };
+        match binding_regions {
+            Err(()) => found = true,
+            Ok(Some(regions)) => {
+                let binds_outer_callable = node.id() != callable.id()
+                    || !matches!(node.kind(), "function_item" | "function_declaration");
+                if binds_outer_callable
+                    && regions
+                        .into_iter()
+                        .any(|region| subtree_binds(region, name, source))
+                {
+                    found = true;
+                }
+            }
+            Ok(None) => {}
         }
     });
     found
@@ -589,30 +595,42 @@ fn root_has_write(root: TsNode<'_>, name: &str, source: &str) -> bool {
         if found {
             return;
         }
-        if matches!(
-            node.kind(),
-            "assignment_expression" | "augmented_assignment_expression" | "update_expression"
-        ) && node
-            .child_by_field_name("left")
-            .or_else(|| node.child_by_field_name("argument"))
-            .is_some_and(|left| subtree_binds(left, name, source))
-        {
-            found = true;
+        if let Some(target) = typescript_write_target(node) {
+            found = target
+                .map(|target| subtree_binds(target, name, source))
+                .unwrap_or(true);
         }
     });
     found
 }
 
 fn typescript_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
+    let supported_import_lines = typescript_import_bindings(root, source)
+        .into_iter()
+        .filter(|binding| binding.local_name == name)
+        .map(|binding| binding.line)
+        .collect::<HashSet<_>>();
     let mut found = false;
     walk_nodes(root, &mut |node| {
         if found {
             return;
         }
-        if matches!(node.kind(), "variable_declarator" | "class_declaration")
-            && subtree_binds(node, name, source)
-        {
-            found = true;
+        if node.kind() == "function_declaration" && typescript_callable_is_top_level(node) {
+            return;
+        }
+        match typescript_binding_regions(node) {
+            Err(()) => found = true,
+            Ok(Some(regions)) => {
+                if node.kind() == "import_statement"
+                    && supported_import_lines.contains(&(node.start_position().row as u32 + 1))
+                {
+                    return;
+                }
+                found = regions
+                    .into_iter()
+                    .any(|region| subtree_binds(region, name, source));
+            }
+            Ok(None) => {}
         }
     });
     found
@@ -621,11 +639,156 @@ fn typescript_root_has_competing_value_binding(root: TsNode<'_>, name: &str, sou
 fn rust_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
     let mut cursor = root.walk();
     root.named_children(&mut cursor).any(|node| {
-        matches!(
-            node.kind(),
-            "const_item" | "static_item" | "use_declaration" | "struct_item"
-        ) && subtree_binds(node, name, source)
+        if node.kind() == "function_item" {
+            return false;
+        }
+        match rust_binding_regions(node) {
+            Err(()) => true,
+            Ok(Some(regions)) => regions
+                .into_iter()
+                .any(|region| subtree_binds(region, name, source)),
+            Ok(None) => false,
+        }
     })
+}
+
+fn typescript_write_target(node: TsNode<'_>) -> Option<Option<TsNode<'_>>> {
+    match node.kind() {
+        "assignment_expression" | "augmented_assignment_expression" => {
+            Some(node.child_by_field_name("left"))
+        }
+        "update_expression" => Some(node.child_by_field_name("argument")),
+        "for_in_statement" => Some(node.child_by_field_name("left")),
+        _ => None,
+    }
+}
+
+fn rust_write_target(node: TsNode<'_>) -> Option<Option<TsNode<'_>>> {
+    match node.kind() {
+        "assignment_expression" | "compound_assignment_expr" => {
+            Some(node.child_by_field_name("left"))
+        }
+        _ => None,
+    }
+}
+
+fn typescript_binding_regions(node: TsNode<'_>) -> Result<Option<Vec<TsNode<'_>>>, ()> {
+    let required = |field| {
+        node.child_by_field_name(field)
+            .map(|child| vec![child])
+            .ok_or(())
+    };
+    let optional = |field| {
+        Ok(node
+            .child_by_field_name(field)
+            .into_iter()
+            .collect::<Vec<_>>())
+    };
+    let one_of = |fields: &[&str]| {
+        let regions = fields
+            .iter()
+            .filter_map(|field| node.child_by_field_name(field))
+            .collect::<Vec<_>>();
+        (!regions.is_empty()).then_some(regions).ok_or(())
+    };
+    match node.kind() {
+        "variable_declarator" => required("name").map(Some),
+        "required_parameter" | "optional_parameter" => one_of(&["name", "pattern"]).map(Some),
+        "arrow_function" => one_of(&["parameter", "parameters"]).map(Some),
+        "formal_parameters" | "rest_pattern" => Ok(Some(vec![node])),
+        "catch_clause" => optional("parameter").map(Some),
+        "function_declaration"
+        | "generator_function_declaration"
+        | "function_signature"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "enum_declaration"
+        | "internal_module"
+        | "module" => required("name").map(Some),
+        "function_expression" | "generator_function" | "class" => optional("name").map(Some),
+        "import_statement" => Ok(Some(vec![node])),
+        _ => Ok(None),
+    }
+}
+
+fn rust_binding_regions(node: TsNode<'_>) -> Result<Option<Vec<TsNode<'_>>>, ()> {
+    let required = |field| {
+        node.child_by_field_name(field)
+            .map(|child| vec![child])
+            .ok_or(())
+    };
+    let optional = |field| {
+        Ok(node
+            .child_by_field_name(field)
+            .into_iter()
+            .collect::<Vec<_>>())
+    };
+    match node.kind() {
+        "parameter" => required("pattern").map(Some),
+        "variadic_parameter" => optional("pattern").map(Some),
+        "closure_parameters" => Ok(Some(vec![node])),
+        "let_declaration" | "let_condition" | "for_expression" | "match_arm" => {
+            required("pattern").map(Some)
+        }
+        "function_item" | "const_item" | "const_parameter" | "static_item" | "struct_item"
+        | "enum_variant" => required("name").map(Some),
+        "use_declaration" => required("argument").map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn collect_typescript_project_value_mutations(
+    root: TsNode<'_>,
+    source: &str,
+) -> Option<Vec<String>> {
+    let mut names = BTreeSet::new();
+    let mut complete = true;
+    walk_nodes(root, &mut |node| {
+        if !complete {
+            return;
+        }
+        if let Some(target) = typescript_write_target(node) {
+            let Some(target) = target else {
+                complete = false;
+                return;
+            };
+            complete &= collect_subtree_value_names(target, source, &mut names);
+        }
+        if node.kind() == "function_declaration" && typescript_callable_is_top_level(node) {
+            return;
+        }
+        match typescript_binding_regions(node) {
+            Err(()) => complete = false,
+            Ok(Some(regions)) => {
+                for region in regions {
+                    complete &= collect_subtree_value_names(region, source, &mut names);
+                }
+            }
+            Ok(None) => {}
+        }
+    });
+    complete.then(|| names.into_iter().collect())
+}
+
+fn collect_subtree_value_names(
+    node: TsNode<'_>,
+    source: &str,
+    names: &mut BTreeSet<String>,
+) -> bool {
+    let mut complete = true;
+    walk_nodes(node, &mut |child| {
+        if matches!(
+            child.kind(),
+            "identifier" | "type_identifier" | "shorthand_property_identifier_pattern"
+        ) {
+            if let Some(name) = node_text(child, source) {
+                names.insert(name.to_string());
+            } else {
+                complete = false;
+            }
+        }
+    });
+    complete
 }
 
 fn subtree_binds(node: TsNode<'_>, name: &str, source: &str) -> bool {
@@ -1035,6 +1198,18 @@ pub fn rematerialize_proof_resolution_projection(
             || record.file.complete != indexed_file.complete
             || record.file.adapter_version != ADAPTER_VERSION
             || record.file.parser_fingerprint.len() != 64
+            || (matches!(record.file.language.as_str(), "typescript" | "tsx")
+                && !record.file.typescript_project_value_mutations_complete)
+            || record
+                .file
+                .typescript_project_value_mutations
+                .iter()
+                .any(|name| name.is_empty())
+            || record
+                .file
+                .typescript_project_value_mutations
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
             || record.calls.iter().any(|call| {
                 call.callsite.file_id != FileId(indexed_file.id)
                     || call.callsite.source_sha256 != stored_hash
@@ -1206,10 +1381,20 @@ fn resolve_input(
                 .flat_map(|record| record.file.top_level_declarations.iter())
                 .filter(|binding| binding.name == input.callsite.raw_target)
                 .collect::<Vec<_>>();
+            let script_value_mutated = !source_record.file.typescript_module
+                && matches!(source_record.file.language.as_str(), "typescript" | "tsx")
+                && script_bindings.iter().any(|record| {
+                    record
+                        .file
+                        .typescript_project_value_mutations
+                        .binary_search(&input.callsite.raw_target)
+                        .is_ok()
+                });
             let script_ambiguous = !source_record.file.typescript_module
                 && matches!(source_record.file.language.as_str(), "typescript" | "tsx")
                 && (script_declarations.len() != 1
-                    || script_declarations[0].declaration != declaration);
+                    || script_declarations[0].declaration != declaration
+                    || script_value_mutated);
             if script_domain_incomplete {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;

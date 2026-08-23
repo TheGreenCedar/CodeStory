@@ -303,6 +303,73 @@ fn typescript_exact_rejects_project_writes_shadows_and_script_global_ambiguity()
             "import { target } from './dynamic_exporter';\nexport function caller() { target(); }\n",
         ),
     ])?;
+    assert_only_call_is_not_exact(&[(
+        "src/for_of_write.ts",
+        "function target() {}\nexport function caller() { for (target of [() => {}]) {} target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/for_in_destructure.ts",
+        "function target() {}\nexport function caller() { for ([target] in { 0: [() => {}] }) {} target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/logical_assignment.ts",
+        "function target() {}\nfunction other() {}\nexport function caller() { target ||= other; target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/update.ts",
+        "function target() {}\nexport function caller() { target++; target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/loop_binding.ts",
+        "function target() {}\nexport function caller() { for (const [target] of [[() => {}]]) { target(); } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/arrow_parameter.ts",
+        "function target() {}\nexport function caller() { const invoke = target => target(); invoke(() => {}); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/named_function_expression.ts",
+        "function target() {}\nexport function caller() { const invoke = function target() { target(); }; invoke(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/enum_binding.ts",
+        "function target() {}\nenum target { Value }\nexport function caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/exported_loop.ts",
+            "export function target() {}\nfor (target of [() => {}]) {}\n",
+        ),
+        (
+            "src/importer.ts",
+            "import { target } from './exported_loop';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_not_exact(&[
+        ("src/exported.ts", "export function target() {}\n"),
+        ("src/other.ts", "export const value = 1;\n"),
+        (
+            "src/import_collision.ts",
+            "import { target } from './exported';\nimport * as target from './other';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    for (path, mutation) in [
+        ("assignment", "target = () => {};"),
+        ("update", "target++;"),
+        ("destructuring", "[target] = [() => {}];"),
+        ("for_of", "for (target of [() => {}]) {}"),
+        ("for_in", "for ([target] in { 0: [() => {}] }) {}"),
+        ("binding", "let target = () => {};"),
+    ] {
+        let mutation_file = format!("src/{path}.ts");
+        assert_only_call_is_not_exact(&[
+            (
+                "src/main.ts",
+                "function target() {}\nfunction caller() { target(); }\n",
+            ),
+            (&mutation_file, mutation),
+        ])?;
+    }
     Ok(())
 }
 
@@ -339,6 +406,34 @@ fn rust_exact_rejects_lexical_module_and_inherent_lookup_ambiguity() -> anyhow::
     assert_only_call_is_not_exact(&[(
         "src/static_value.rs",
         "fn original() {}\nstatic target: fn() = original;\nfn target() {}\nfn caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/for_pattern.rs",
+        "fn target() {}\nfn caller() { for target in [|| {}] { target(); } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/if_let_pattern.rs",
+        "fn target() {}\nfn caller() { if let Some(target) = Some(|| {}) { target(); } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/while_let_pattern.rs",
+        "fn target() {}\nfn caller() { while let Some(target) = Some(|| {}) { target(); break; } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/match_pattern.rs",
+        "fn target() {}\nfn caller() { match Some(|| {}) { Some(target) => target(), None => {} } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/closure_pattern.rs",
+        "fn target() {}\nfn caller() { let invoke = |target: fn()| target(); invoke(|| {}); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/compound_write.rs",
+        "fn target() {}\nfn other() {}\nfn caller() { target += other; target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/const_generic.rs",
+        "fn target() {}\nfn caller<const target: usize>() { target(); }\n",
     )])?;
     Ok(())
 }
@@ -565,6 +660,39 @@ fn complete_projection_rejects_parser_completeness_mismatch() -> anyhow::Result<
 
     let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
         .expect_err("parser completeness disagreement must invalidate cache coverage");
+    assert!(error.to_string().contains("stale"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn complete_projection_rejects_a_missing_script_write_summary() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/main.ts",
+            "function target() {}\nfunction caller() { target(); }\n",
+        )],
+    )?;
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    artifact["resolution_file"]
+        .as_object_mut()
+        .expect("resolution file object")
+        .remove("typescript_project_value_mutations_complete");
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
+        .expect_err("a schema-v4 script record cannot omit its write-domain receipt");
     assert!(error.to_string().contains("stale"), "{error}");
     Ok(())
 }
