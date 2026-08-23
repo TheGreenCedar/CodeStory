@@ -2,13 +2,13 @@ node CLASS name=ArtificialPlayer qn=ArtificialPlayer canonical=game.dart:Artific
 node CLASS name=Field qn=Field canonical=game.dart:Field line=19 col=1 end=34:2 file=FILE:game.dart@1
 node CLASS name=GameObject qn=GameObject canonical=game.dart:GameObject line=15 col=1 end=17:2 file=FILE:game.dart@1
 node CLASS name=HumanPlayer qn=HumanPlayer canonical=game.dart:HumanPlayer line=40 col=1 end=44:2 file=FILE:game.dart@1
-node CLASS name=Player qn=Player canonical=game.dart:Player line=36 col=1 end=38:2 file=FILE:game.dart@1
 node CLASS name=TicTacToe qn=TicTacToe canonical=game.dart:TicTacToe line=60 col=1 end=68:2 file=FILE:game.dart@1
 node FILE name=game.dart qn=game.dart canonical=game.dart:game.dart:1 line=1 col=1 end=73:0 file=FILE:game.dart@1
 node FUNCTION name=main qn=main canonical=game.dart:main#0 line=70 col=1 end=70:12 file=FILE:game.dart@1
 node FUNCTION name=numberIn qn=numberIn canonical=game.dart:numberIn#0 line=3 col=1 end=3:15 file=FILE:game.dart@1
 node FUNCTION name=numberOut qn=numberOut canonical=game.dart:numberOut#0 line=7 col=1 end=7:24 file=FILE:game.dart@1
 node FUNCTION name=stringOut qn=stringOut canonical=game.dart:stringOut#0 line=11 col=1 end=11:29 file=FILE:game.dart@1
+node INTERFACE name=Player qn=Player canonical=game.dart:Player line=36 col=1 end=38:2 file=FILE:game.dart@1
 node METHOD name=ArtificialPlayer.minMax qn=ArtificialPlayer.minMax canonical=game.dart:ArtificialPlayer.minMax#0 line=47 col=3 end=47:48 file=FILE:game.dart@1
 node METHOD name=ArtificialPlayer.turn qn=ArtificialPlayer.turn canonical=game.dart:ArtificialPlayer.turn#0 line=54 col=3 end=54:36 file=FILE:game.dart@1
 node METHOD name=Field.makeMove qn=Field.makeMove canonical=game.dart:Field.makeMove#0 line=26 col=3 end=26:45 file=FILE:game.dart@1
@@ -37,9 +37,9 @@ edge CALL src=METHOD:HumanPlayer.turn@41 dst=METHOD:Field.makeMove@26 resolved_s
 edge CALL src=METHOD:TicTacToe.run@63 dst=FUNCTION:numberIn@3 resolved_src=- resolved_dst=FUNCTION:numberIn@3 line=64 confidence=1.0000 certainty=Certain callsite=h0:64:1:h5 candidates=[]
 edge CALL src=METHOD:TicTacToe.run@63 dst=FUNCTION:stringOut@11 resolved_src=- resolved_dst=FUNCTION:stringOut@11 line=65 confidence=1.0000 certainty=Certain callsite=h0:65:1:h6 candidates=[]
 edge IMPORT src=MODULE:'dart:math'@1 dst=MODULE:'dart:math'@1 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge INHERITANCE src=CLASS:ArtificialPlayer@46 dst=CLASS:Player@36 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:ArtificialPlayer@46 dst=INTERFACE:Player@36 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge INHERITANCE src=CLASS:Field@19 dst=CLASS:GameObject@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge INHERITANCE src=CLASS:HumanPlayer@40 dst=CLASS:Player@36 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge INHERITANCE src=CLASS:HumanPlayer@40 dst=INTERFACE:Player@36 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge INHERITANCE src=CLASS:TicTacToe@60 dst=CLASS:GameObject@15 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:ArtificialPlayer@46 dst=METHOD:ArtificialPlayer.minMax@47 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:ArtificialPlayer@46 dst=METHOD:ArtificialPlayer.turn@54 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
@@ -47,8 +47,8 @@ edge MEMBER src=CLASS:Field@19 dst=METHOD:Field.makeMove@26 resolved_src=- resol
 edge MEMBER src=CLASS:Field@19 dst=METHOD:Field.sameInRow@22 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:GameObject@15 dst=METHOD:GameObject.announce@16 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:HumanPlayer@40 dst=METHOD:HumanPlayer.turn@41 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
-edge MEMBER src=CLASS:Player@36 dst=METHOD:Player.turn@37 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 edge MEMBER src=CLASS:TicTacToe@60 dst=METHOD:TicTacToe.run@63 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
+edge MEMBER src=INTERFACE:Player@36 dst=METHOD:Player.turn@37 resolved_src=- resolved_dst=- line=0 confidence=- certainty=Certain callsite=- candidates=[]
 file path=game.dart language=dart lines=73 complete=true role=Source
 occurrence element=CLASS:ArtificialPlayer@46 kind=DEFINITION span=46:1-58:2
 occurrence element=CLASS:Field@19 kind=DEFINITION span=19:1-34:2
@@ -56,14 +56,14 @@ occurrence element=CLASS:GameObject@15 kind=DEFINITION span=15:1-17:2
 occurrence element=CLASS:GameObject@15 kind=DEFINITION span=19:21-19:31
 occurrence element=CLASS:GameObject@15 kind=DEFINITION span=60:25-60:35
 occurrence element=CLASS:HumanPlayer@40 kind=DEFINITION span=40:1-44:2
-occurrence element=CLASS:Player@36 kind=DEFINITION span=36:1-38:2
-occurrence element=CLASS:Player@36 kind=DEFINITION span=40:30-40:36
-occurrence element=CLASS:Player@36 kind=DEFINITION span=46:35-46:41
 occurrence element=CLASS:TicTacToe@60 kind=DEFINITION span=60:1-68:2
 occurrence element=FUNCTION:main@70 kind=DEFINITION span=70:1-70:12
 occurrence element=FUNCTION:numberIn@3 kind=DEFINITION span=3:1-3:15
 occurrence element=FUNCTION:numberOut@7 kind=DEFINITION span=7:1-7:24
 occurrence element=FUNCTION:stringOut@11 kind=DEFINITION span=11:1-11:29
+occurrence element=INTERFACE:Player@36 kind=DEFINITION span=36:1-38:2
+occurrence element=INTERFACE:Player@36 kind=DEFINITION span=40:30-40:36
+occurrence element=INTERFACE:Player@36 kind=DEFINITION span=46:35-46:41
 occurrence element=METHOD:ArtificialPlayer.minMax@47 kind=DEFINITION span=47:3-47:48
 occurrence element=METHOD:ArtificialPlayer.turn@54 kind=DEFINITION span=54:3-54:36
 occurrence element=METHOD:Field.makeMove@26 kind=DEFINITION span=26:3-26:45
@@ -105,4 +105,4 @@ callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_ke
 callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "14:HumanPlayer.turn", node_id: NodeId(-1216559423763927890), signature_hash: -1551097434895889655, normalized_signature: Some("shape:7164779443168732580"), body_hash: 1703219438516552849, start_line: 41, end_line: 41 }
 callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "14:Player.turn", node_id: NodeId(3983705973672247437), signature_hash: -1091959065548758310, normalized_signature: Some("outline:-5083272169020481154"), body_hash: -1041864639719970143, start_line: 37, end_line: 37 }
 callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "14:TicTacToe.run", node_id: NodeId(1973322840329670188), signature_hash: 5136661510898306809, normalized_signature: Some("shape:255436906924033835"), body_hash: -3295100025934209292, start_line: 63, end_line: 63 }
-callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "__file_structural__", node_id: NodeId(8885278408206200492), signature_hash: 2287920920165368531, normalized_signature: None, body_hash: 3370140181310454568, start_line: 1, end_line: 73 }
+callable_state CallableProjectionState { file_id: 8885278408206200492, symbol_key: "__file_structural__", node_id: NodeId(8885278408206200492), signature_hash: 5848371559775392870, normalized_signature: None, body_hash: 1113860019240585771, start_line: 1, end_line: 73 }

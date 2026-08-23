@@ -10594,10 +10594,21 @@ fn canonicalize_nodes_with_file_identity(
             id_remap.insert(node.id, new_id);
         }
 
+        // The canonical role selects the authoritative source anchor, while a
+        // type reference can still carry the more specific semantic kind.
+        let semantic_type_kind = nodes
+            .iter()
+            .filter(|node| is_type_like_kind(node.kind))
+            .max_by_key(|node| type_anchor_priority(node.kind))
+            .map(|node| node.kind);
+
         let mut node = nodes
             .into_iter()
             .max_by(|left, right| compare_canonical_node_candidates(left, right, canonical_roles))
             .unwrap_or_default();
+        if let Some(kind) = semantic_type_kind {
+            node.kind = kind;
+        }
         let selected_role = canonical_roles
             .get(&node.id)
             .copied()
