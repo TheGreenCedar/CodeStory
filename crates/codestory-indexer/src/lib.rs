@@ -3965,7 +3965,7 @@ fn source_content_hash(bytes: &[u8]) -> String {
 
 fn resolution_parser_fingerprint(language_config: &LanguageConfig) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"codestory-proof-parser-rules-v2\0");
+    hasher.update(b"codestory-proof-parser-rules-v3\0");
     hasher.update(language_config.language_name.as_bytes());
     hasher.update(language_config.language.abi_version().to_be_bytes());
     hasher.update(language_config.graph_query.as_bytes());

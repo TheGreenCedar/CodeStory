@@ -1169,9 +1169,9 @@ pub(crate) fn report() -> Value {
                 "fact_count":row["counts"]["syntax_calls"],
                 "fact_digest":SHA,
                 "adapter_roster":[
-                    {"language":"rust","adapter_version":"reference-v3"},
-                    {"language":"tsx","adapter_version":"reference-v3"},
-                    {"language":"typescript","adapter_version":"reference-v3"}
+                    {"language":"rust","adapter_version":"reference-v4"},
+                    {"language":"tsx","adapter_version":"reference-v4"},
+                    {"language":"typescript","adapter_version":"reference-v4"}
                 ]
             })
         })

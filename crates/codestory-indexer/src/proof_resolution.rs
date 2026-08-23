@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node as TsNode, Tree};
 
-const ADAPTER_VERSION: &str = "reference-v3";
+const ADAPTER_VERSION: &str = "reference-v4";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 3;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("rust", ADAPTER_VERSION),
@@ -69,6 +69,12 @@ pub(crate) fn collect_call_resolution_inputs(
     }
     let typescript_module =
         matches!(language, "typescript" | "tsx") && typescript_file_is_module(tree.root_node());
+    if matches!(language, "typescript" | "tsx")
+        && typescript_module
+        && !typescript_module_root_is_closed(tree.root_node(), source)
+    {
+        lookup_input_complete = false;
+    }
     let top_level_declarations = if matches!(language, "typescript" | "tsx" | "rust") {
         match collect_top_level_declarations(tree, source, language, file_id, nodes) {
             Some(declarations) => declarations,
@@ -256,10 +262,12 @@ fn resolve_typescript_syntax_claim(
     if form != CalleeForm::Identifier {
         return (Some(caller), CachedResolutionBinding::Unsupported);
     }
+    if !typescript_callable_domain_is_closed(callable) {
+        return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+    }
     if contains_dynamic_construct(tree.root_node(), source)
         || callable_has_shadow_or_write("typescript", callable, callee, raw_target, source)
         || root_has_write(tree.root_node(), raw_target, source)
-        || typescript_root_has_competing_value_binding(tree.root_node(), raw_target, source)
     {
         return (Some(caller), CachedResolutionBinding::Ambiguous);
     }
@@ -481,6 +489,126 @@ fn typescript_file_is_module(root: TsNode<'_>) -> bool {
         .any(|child| matches!(child.kind(), "import_statement" | "export_statement"))
 }
 
+fn typescript_module_root_is_closed(root: TsNode<'_>, source: &str) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .all(|child| match child.kind() {
+            "comment" | "empty_statement" => true,
+            "function_declaration" => typescript_direct_function_shape_is_closed(child),
+            "import_statement" => typescript_import_bindings_for_statement(child, source).is_some(),
+            "export_statement" => typescript_direct_export_shape(child).is_some(),
+            _ => false,
+        })
+}
+
+fn typescript_direct_function_shape_is_closed(declaration: TsNode<'_>) -> bool {
+    let Some(name) = declaration.child_by_field_name("name") else {
+        return false;
+    };
+    let Some(parameters) = declaration.child_by_field_name("parameters") else {
+        return false;
+    };
+    let Some(body) = declaration.child_by_field_name("body") else {
+        return false;
+    };
+    if name.kind() != "identifier"
+        || parameters.kind() != "formal_parameters"
+        || body.kind() != "statement_block"
+    {
+        return false;
+    }
+    let allowed = [name.id(), parameters.id(), body.id()];
+    let mut cursor = declaration.walk();
+    declaration
+        .named_children(&mut cursor)
+        .all(|child| child.kind() == "comment" || allowed.contains(&child.id()))
+}
+
+fn typescript_callable_domain_is_closed(callable: TsNode<'_>) -> bool {
+    if !typescript_direct_function_shape_is_closed(callable) {
+        return false;
+    }
+    let Some(parameters) = callable.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut parameter_cursor = parameters.walk();
+    if parameters
+        .named_children(&mut parameter_cursor)
+        .any(|child| child.kind() != "comment")
+    {
+        return false;
+    }
+    let Some(body) = callable.child_by_field_name("body") else {
+        return false;
+    };
+    let mut body_cursor = body.walk();
+    body.named_children(&mut body_cursor)
+        .all(typescript_safe_direct_call_statement)
+}
+
+fn typescript_safe_direct_call_statement(statement: TsNode<'_>) -> bool {
+    if matches!(statement.kind(), "comment" | "empty_statement") {
+        return true;
+    }
+    if statement.kind() != "expression_statement" {
+        return false;
+    }
+    let mut statement_cursor = statement.walk();
+    let expressions = statement
+        .named_children(&mut statement_cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [call] = expressions.as_slice() else {
+        return false;
+    };
+    if call.kind() != "call_expression" {
+        return false;
+    }
+    let Some(function) = call.child_by_field_name("function") else {
+        return false;
+    };
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return false;
+    };
+    if function.kind() != "identifier" || arguments.kind() != "arguments" {
+        return false;
+    }
+    let allowed = [function.id(), arguments.id()];
+    let mut call_cursor = call.walk();
+    if !call
+        .named_children(&mut call_cursor)
+        .all(|child| child.kind() == "comment" || allowed.contains(&child.id()))
+    {
+        return false;
+    }
+    let mut argument_cursor = arguments.walk();
+    arguments
+        .named_children(&mut argument_cursor)
+        .all(|child| child.kind() == "comment")
+}
+
+fn typescript_direct_export_shape(statement: TsNode<'_>) -> Option<(TsNode<'_>, bool)> {
+    if statement.child_by_field_name("source").is_some()
+        || statement.child_by_field_name("value").is_some()
+    {
+        return None;
+    }
+    let declaration = statement.child_by_field_name("declaration")?;
+    if declaration.kind() != "function_declaration"
+        || !typescript_direct_function_shape_is_closed(declaration)
+    {
+        return None;
+    }
+    let mut cursor = statement.walk();
+    if !statement
+        .named_children(&mut cursor)
+        .all(|child| child.kind() == "comment" || child.id() == declaration.id())
+    {
+        return None;
+    }
+    Some((declaration, export_statement_has_default_token(statement)?))
+}
+
 fn rust_callable_is_in_root_module(callable: TsNode<'_>) -> bool {
     match callable.parent().map(|parent| parent.kind()) {
         Some("source_file") => true,
@@ -631,63 +759,6 @@ fn root_has_write(root: TsNode<'_>, name: &str, source: &str) -> bool {
         }
     });
     found
-}
-
-fn typescript_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
-    let supported_import_lines = typescript_import_bindings(root, source)
-        .into_iter()
-        .filter(|binding| binding.local_name == name)
-        .map(|binding| binding.line)
-        .collect::<HashSet<_>>();
-    let mut found = false;
-    walk_nodes(root, &mut |node| {
-        if found {
-            return;
-        }
-        if node.kind() == "function_declaration" && typescript_callable_is_top_level(node) {
-            return;
-        }
-        match typescript_binding_regions(node) {
-            Err(()) => found = true,
-            Ok(Some(regions)) => {
-                if node.kind() == "import_statement"
-                    && supported_import_lines.contains(&(node.start_position().row as u32 + 1))
-                {
-                    return;
-                }
-                found = regions
-                    .into_iter()
-                    .any(|region| subtree_binds(region, name, source));
-            }
-            Ok(None) => {}
-        }
-    });
-    found
-}
-
-fn typescript_root_has_competing_export_binding(
-    root: TsNode<'_>,
-    exported_declaration: TsNode<'_>,
-    name: &str,
-    source: &str,
-) -> Result<bool, ()> {
-    let mut found = false;
-    let mut complete = true;
-    walk_nodes(root, &mut |node| {
-        if found || !complete || node.id() == exported_declaration.id() {
-            return;
-        }
-        match typescript_binding_regions(node) {
-            Err(()) => complete = false,
-            Ok(Some(regions)) => {
-                found = regions
-                    .into_iter()
-                    .any(|region| subtree_binds(region, name, source));
-            }
-            Ok(None) => {}
-        }
-    });
-    complete.then_some(found).ok_or(())
 }
 
 fn rust_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
@@ -843,73 +914,141 @@ fn typescript_import_bindings(root: TsNode<'_>, source: &str) -> Vec<TypescriptI
         .named_children(&mut cursor)
         .filter(|child| child.kind() == "import_statement")
     {
-        let Some(text) = node_text(statement, source) else {
-            continue;
-        };
-        if text.contains("import type") || text.contains('*') {
-            continue;
-        }
-        let Some((clause, module_tail)) = text
-            .trim()
-            .strip_prefix("import ")
-            .and_then(|rest| rest.rsplit_once(" from "))
-        else {
-            continue;
-        };
-        let module_specifier = module_tail
-            .trim()
-            .trim_end_matches(';')
-            .trim_matches(['\'', '"'])
-            .to_string();
-        if !module_specifier.starts_with("./") && !module_specifier.starts_with("../") {
-            continue;
-        }
-        let clause = clause.trim();
-        let mut parsed = Vec::<(String, String, bool)>::new();
-        if clause.starts_with('{') && clause.ends_with('}') {
-            for item in clause[1..clause.len() - 1].split(',') {
-                let parts = item.split_whitespace().collect::<Vec<_>>();
-                match parts.as_slice() {
-                    [name] if !name.is_empty() => {
-                        parsed.push(((*name).to_string(), (*name).to_string(), false))
-                    }
-                    [imported, "as", local] => {
-                        parsed.push(((*local).to_string(), (*imported).to_string(), false))
-                    }
-                    _ => {}
-                }
-            }
-        } else if !clause.contains(',')
-            && clause
-                .chars()
-                .all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
-        {
-            parsed.push((clause.to_string(), "default".to_string(), true));
-        }
-        for (local_name, imported_name, is_default) in parsed {
-            let statement_start = statement.start_byte();
-            let Some(offset) = source[statement_start..statement.end_byte()].find(&local_name)
-            else {
-                continue;
-            };
-            let absolute = statement_start + offset;
-            let prefix = &source[..absolute];
-            let line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
-            let column = absolute
-                .saturating_sub(prefix.rfind('\n').map(|index| index + 1).unwrap_or(0))
-                as u32
-                + 1;
-            result.push(TypescriptImportBinding {
-                local_name,
-                imported_name,
-                module_specifier: module_specifier.clone(),
-                is_default,
-                line,
-                column,
-            });
-        }
+        result.extend(
+            typescript_import_bindings_for_statement(statement, source).unwrap_or_default(),
+        );
     }
     result
+}
+
+fn typescript_import_bindings_for_statement(
+    statement: TsNode<'_>,
+    source: &str,
+) -> Option<Vec<TypescriptImportBinding>> {
+    let source_node = statement.child_by_field_name("source")?;
+    let module_specifier = simple_typescript_string(source_node, source)?;
+    if !module_specifier.starts_with("./") && !module_specifier.starts_with("../") {
+        return None;
+    }
+    if contains_unnamed_token(statement, "type") {
+        return None;
+    }
+    let mut statement_cursor = statement.walk();
+    let clauses = statement
+        .named_children(&mut statement_cursor)
+        .filter(|child| child.kind() != "comment" && child.id() != source_node.id())
+        .collect::<Vec<_>>();
+    let [clause] = clauses.as_slice() else {
+        return None;
+    };
+    if clause.kind() != "import_clause" {
+        return None;
+    }
+    let mut clause_cursor = clause.walk();
+    let entries = clause
+        .named_children(&mut clause_cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [entry] = entries.as_slice() else {
+        return None;
+    };
+    let mut bindings = Vec::new();
+    match entry.kind() {
+        "identifier" => bindings.push(typescript_import_binding(
+            *entry,
+            "default",
+            module_specifier,
+            true,
+            source,
+        )?),
+        "named_imports" => {
+            let mut imports_cursor = entry.walk();
+            let specifiers = entry
+                .named_children(&mut imports_cursor)
+                .filter(|child| child.kind() != "comment")
+                .collect::<Vec<_>>();
+            if specifiers.is_empty()
+                || specifiers
+                    .iter()
+                    .any(|specifier| specifier.kind() != "import_specifier")
+            {
+                return None;
+            }
+            for specifier in specifiers {
+                let imported = specifier.child_by_field_name("name")?;
+                if imported.kind() != "identifier" {
+                    return None;
+                }
+                let local = specifier.child_by_field_name("alias").unwrap_or(imported);
+                if local.kind() != "identifier" {
+                    return None;
+                }
+                let imported_name = node_text(imported, source)?;
+                bindings.push(typescript_import_binding(
+                    local,
+                    imported_name,
+                    module_specifier,
+                    false,
+                    source,
+                )?);
+            }
+        }
+        _ => return None,
+    }
+    Some(bindings)
+}
+
+fn typescript_import_binding(
+    local: TsNode<'_>,
+    imported_name: &str,
+    module_specifier: &str,
+    is_default: bool,
+    source: &str,
+) -> Option<TypescriptImportBinding> {
+    let local_name = node_text(local, source)?;
+    if !typescript_identifier_is_supported(local_name) {
+        return None;
+    }
+    Some(TypescriptImportBinding {
+        local_name: local_name.to_string(),
+        imported_name: imported_name.to_string(),
+        module_specifier: module_specifier.to_string(),
+        is_default,
+        line: local.start_position().row as u32 + 1,
+        column: local.start_position().column as u32 + 1,
+    })
+}
+
+fn typescript_identifier_is_supported(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier
+            .chars()
+            .all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
+fn simple_typescript_string<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    let literal = node_text(node, source)?;
+    let quote = literal.as_bytes().first().copied()?;
+    if !matches!(quote, b'\'' | b'"') || literal.as_bytes().last().copied()? != quote {
+        return None;
+    }
+    let value = literal.get(1..literal.len().checked_sub(1)?)?;
+    (!value.contains('\\')).then_some(value)
+}
+
+fn contains_unnamed_token(node: TsNode<'_>, token: &str) -> bool {
+    let mut found = false;
+    let mut visit = |current: TsNode<'_>| {
+        let mut cursor = current.walk();
+        for child in current.children(&mut cursor) {
+            if !child.is_named() && child.kind() == token {
+                found = true;
+                return;
+            }
+        }
+    };
+    walk_nodes(node, &mut visit);
+    found
 }
 
 fn collect_typescript_direct_exports(
@@ -927,24 +1066,17 @@ fn collect_typescript_direct_exports(
         if statement.kind() != "export_statement" {
             continue;
         }
-        let declaration = statement.child_by_field_name("declaration")?;
-        if declaration.kind() != "function_declaration"
-            || statement.child_by_field_name("source").is_some()
-            || statement.child_by_field_name("value").is_some()
-        {
-            return None;
-        }
-        let is_default = export_statement_has_default_token(statement)?;
+        let (declaration, is_default) = typescript_direct_export_shape(statement)?;
         let name = declaration_name(declaration, source)?;
-        if root_has_write(tree.root_node(), name, source)
-            || typescript_root_has_competing_export_binding(
-                tree.root_node(),
-                declaration,
-                name,
-                source,
-            )
-            .ok()?
-        {
+        let declaration_count = top_level_typescript_functions(tree.root_node())
+            .into_iter()
+            .filter(|candidate| declaration_name(*candidate, source) == Some(name))
+            .count();
+        let import_count = typescript_import_bindings(tree.root_node(), source)
+            .into_iter()
+            .filter(|binding| binding.local_name == name)
+            .count();
+        if root_has_write(tree.root_node(), name, source) || declaration_count + import_count != 1 {
             continue;
         }
         let node_id = map_callable_declaration(nodes, file_id, declaration, source)?;

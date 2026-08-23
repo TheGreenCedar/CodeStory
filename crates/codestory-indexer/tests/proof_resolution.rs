@@ -78,10 +78,6 @@ fn typescript_and_rust_reference_calls_rematerialize_exact_facts() -> anyhow::Re
                 "import defaultTarget from './defaulted';\nexport function defaultCaller() { defaultTarget(); }\n",
             ),
             (
-                "src/module_global_reflection.ts",
-                "function other() {}\nexport function moduleReflectiveTarget() {}\nObject.defineProperty(globalThis, \"moduleReflectiveTarget\", { value: other });\nexport function moduleReflectiveCaller() { moduleReflectiveTarget(); }\n",
-            ),
-            (
                 "src/lib.rs",
                 "fn rust_target() {}\nstruct Worker;\nimpl Worker {\n    fn step(&self) {}\n    fn run(&self) { self.step(); rust_target(); }\n}\n",
             ),
@@ -103,7 +99,6 @@ fn typescript_and_rust_reference_calls_rematerialize_exact_facts() -> anyhow::Re
         "localTarget",
         "importedTarget",
         "defaultTarget",
-        "moduleReflectiveTarget",
         "step",
         "rust_target",
     ] {
@@ -554,6 +549,72 @@ fn typescript_direct_export_requires_a_unique_module_value_binding() -> anyhow::
         (
             "src/importer.ts",
             "import target from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn typescript_exact_requires_a_closed_module_root() -> anyhow::Result<()> {
+    assert_only_call_is_not_exact(&[
+        ("src/exported.ts", "export function target() {}\n"),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nimport target = Other.other;\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/exported.ts",
+            "import target = Other.other;\nexport function target() {}\n",
+        ),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+
+    for unsupported_root in [
+        "namespace Other {}\n",
+        "module Other {}\n",
+        "const unrelated = 1;\n",
+        "using resource = acquire;\n",
+        "class Other {}\n",
+        "enum Other { Value }\n",
+        "declare function other(): void;\n",
+        "function other(): void;\n",
+        "export { other } from './other';\n",
+        "export = target;\n",
+        "Object.defineProperty(globalThis, 'unrelated', { value: 1 });\n",
+    ] {
+        let importer = format!(
+            "import {{ target }} from './exported';\n{unsupported_root}export function caller() {{ target(); }}\n"
+        );
+        assert_only_call_is_not_exact(&[
+            ("src/exported.ts", "export function target() {}\n"),
+            ("src/other.ts", "export function other() {}\n"),
+            ("src/importer.ts", importer.as_str()),
+        ])?;
+
+        let exporter = format!("export function target() {{}}\n{unsupported_root}");
+        assert_only_call_is_not_exact(&[
+            ("src/exported.ts", exporter.as_str()),
+            ("src/other.ts", "export function other() {}\n"),
+            (
+                "src/importer.ts",
+                "import { target } from './exported';\nexport function caller() { target(); }\n",
+            ),
+        ])?;
+    }
+
+    assert_only_call_is_exact(&[
+        (
+            "src/exported.ts",
+            "/* inert */\n;\nexport async function target() {}\n",
+        ),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\n// inert\n;\nexport function caller() { target(); }\n",
         ),
     ])?;
     Ok(())
