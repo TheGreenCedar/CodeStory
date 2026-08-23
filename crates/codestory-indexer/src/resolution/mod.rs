@@ -2716,10 +2716,12 @@ impl CandidateIndex {
 
     fn first_in_file(&self, candidates: Option<&Vec<usize>>, file_id: i64) -> Option<i64> {
         candidates.and_then(|candidates| {
-            candidates.iter().find_map(|idx| {
+            let mut matches = candidates.iter().filter_map(|idx| {
                 let node = &self.nodes[*idx];
                 (node.file_node_id == Some(file_id)).then_some(node.id)
-            })
+            });
+            let candidate = matches.next()?;
+            matches.next().is_none().then_some(candidate)
         })
     }
 

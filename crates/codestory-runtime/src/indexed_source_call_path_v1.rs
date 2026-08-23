@@ -121,6 +121,10 @@ pub enum CandidateGate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepQualificationOutcome {
+    SelectorBlocked {
+        selector_index: usize,
+        outcome: SelectorGateOutcome,
+    },
     Admitted {
         edge_ids: Vec<codestory_contracts::graph::EdgeId>,
     },
@@ -474,6 +478,20 @@ where
     {
         gaps.sort();
         gaps.dedup();
+        let blocking_selector = selectors
+            .iter()
+            .find(|selector| !matches!(selector.outcome, SelectorGateOutcome::Resolved { .. }))
+            .expect("selector early return has a blocking selector");
+        let steps = (0..contract.spec().steps().len())
+            .map(|step_index| StepQualificationTrace {
+                step_index,
+                candidate_edge_ids: Vec::new(),
+                outcome: StepQualificationOutcome::SelectorBlocked {
+                    selector_index: blocking_selector.selector_index,
+                    outcome: blocking_selector.outcome.clone(),
+                },
+            })
+            .collect();
         return Ok(ObservedBuiltCallPathFacts {
             built: BuiltCallPathFacts {
                 publication: proof_publication,
@@ -485,7 +503,7 @@ where
             trace: ProofQualificationTrace {
                 selectors,
                 selector_early_return: true,
-                steps: Vec::new(),
+                steps,
                 finalization: FinalizationTrace::NotRun,
             },
         });
@@ -673,6 +691,7 @@ where
                 target: target.clone(),
                 certainty: ResolutionCertainty::Certain,
                 callsite_identity: admitted.callsite_identity,
+                column_or_ordinal: admitted.column_or_ordinal,
                 containment,
                 line_window,
             });
@@ -1829,7 +1848,18 @@ mod tests {
             selector_observed.trace.selectors[0].outcome,
             SelectorGateOutcome::Failed(SelectorFailure::Missing)
         );
-        assert!(selector_observed.trace.steps.is_empty());
+        assert_eq!(
+            selector_observed.trace.steps.len(),
+            selector_contract.spec().steps().len(),
+            "selector early returns must classify every attempted positive step"
+        );
+        assert_eq!(
+            selector_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::SelectorBlocked {
+                selector_index: 0,
+                outcome: SelectorGateOutcome::Failed(SelectorFailure::Missing),
+            }
+        );
 
         let mut raw_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
         raw_fixture

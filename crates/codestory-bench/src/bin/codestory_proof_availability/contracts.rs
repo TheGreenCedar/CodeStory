@@ -1158,14 +1158,14 @@ fn frozen_role_thresholds(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectorFailureV1 {
     Missing,
     Ambiguous,
     NonCallable,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum UnavailableReasonV1 {
     ValidatedContractHashMismatch,
@@ -1173,7 +1173,7 @@ pub enum UnavailableReasonV1 {
     SourceNotBoundToPublication,
     ProofFactsUnavailable,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SelectorGateOutcomeV1 {
     Resolved {
@@ -1322,6 +1322,10 @@ pub struct CandidateFailureHistogramV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StepQualificationOutcomeV1 {
+    SelectorBlocked {
+        selector_index: u64,
+        outcome: SelectorGateOutcomeV1,
+    },
     Admitted {
         #[serde(with = "i64_decimal::vec")]
         #[schemars(with = "Vec<String>")]
@@ -1485,6 +1489,10 @@ impl From<codestory_runtime::proof_qualification_support::StepQualificationOutco
         value: codestory_runtime::proof_qualification_support::StepQualificationOutcome,
     ) -> Self {
         match value {
+            codestory_runtime::proof_qualification_support::StepQualificationOutcome::SelectorBlocked { selector_index, outcome } => Self::SelectorBlocked {
+                selector_index: u64::try_from(selector_index).expect("bounded proof selector index fits u64"),
+                outcome: outcome.into(),
+            },
             codestory_runtime::proof_qualification_support::StepQualificationOutcome::Admitted { edge_ids } => Self::Admitted { edge_ids: edge_ids.into_iter().map(|id| id.0).collect() },
             codestory_runtime::proof_qualification_support::StepQualificationOutcome::FirstZeroSurvivor { gate, histogram } => Self::FirstZeroSurvivor { gate: gate.into(), histogram: histogram.into_iter().map(Into::into).collect() },
             codestory_runtime::proof_qualification_support::StepQualificationOutcome::CandidateLimitExceeded { maximum_candidate_edges, observed_candidate_edges_at_least } => Self::CandidateLimitExceeded { maximum_candidate_edges, observed_candidate_edges_at_least },
@@ -2747,10 +2755,18 @@ pub struct FailureBucketV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FunnelOutcomeV1 {
+    SelectorBlocked {
+        selector_index: u64,
+        outcome: SelectorGateOutcomeV1,
+    },
     Admitted,
     FirstZeroSurvivor {
         gate: CandidateGateV1,
         histogram: Vec<CandidateFailureHistogramV1>,
+    },
+    CandidateLimitExceeded {
+        maximum_candidate_edges: u32,
+        observed_candidate_edges_at_least: u32,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3127,6 +3143,7 @@ impl QualificationSummaryV1 {
                     .all(|(index, selector)| selector.selector_index == index as u64)
                 || c.proof_trace.selectors.len() != usize::from(c.attempted_step_count) + 1
                 || !valid_selector_trace(&c.proof_trace)
+                || !valid_selector_step_trace(&c.proof_trace)
                 || !c.proof_trace.steps.iter().all(|step| {
                     step.step_index < u64::from(c.attempted_step_count) && valid_step_trace(step)
                 })
@@ -3193,6 +3210,13 @@ impl QualificationSummaryV1 {
             }
             for step in &c.proof_trace.steps {
                 let outcome = match &step.outcome {
+                    StepQualificationOutcomeV1::SelectorBlocked {
+                        selector_index,
+                        outcome,
+                    } => Some(FunnelOutcomeV1::SelectorBlocked {
+                        selector_index: *selector_index,
+                        outcome: outcome.clone(),
+                    }),
                     StepQualificationOutcomeV1::Admitted { .. } => Some(FunnelOutcomeV1::Admitted),
                     StepQualificationOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
                         Some(FunnelOutcomeV1::FirstZeroSurvivor {
@@ -3200,7 +3224,13 @@ impl QualificationSummaryV1 {
                             histogram: histogram.clone(),
                         })
                     }
-                    StepQualificationOutcomeV1::CandidateLimitExceeded { .. } => None,
+                    StepQualificationOutcomeV1::CandidateLimitExceeded {
+                        maximum_candidate_edges,
+                        observed_candidate_edges_at_least,
+                    } => Some(FunnelOutcomeV1::CandidateLimitExceeded {
+                        maximum_candidate_edges: *maximum_candidate_edges,
+                        observed_candidate_edges_at_least: *observed_candidate_edges_at_least,
+                    }),
                 };
                 if let Some(outcome) = outcome {
                     expected_classified = expected_classified
@@ -3705,6 +3735,14 @@ fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
         .copied()
         .collect::<BTreeSet<_>>();
     match &trace.outcome {
+        StepQualificationOutcomeV1::SelectorBlocked { outcome, .. } => {
+            trace.candidate_edge_ids.is_empty()
+                && matches!(
+                    outcome,
+                    SelectorGateOutcomeV1::Failed { .. }
+                        | SelectorGateOutcomeV1::Unavailable { .. }
+                )
+        }
         StepQualificationOutcomeV1::Admitted { edge_ids } => {
             !edge_ids.is_empty()
                 && strictly_ascending(edge_ids)
@@ -3780,12 +3818,31 @@ fn valid_selector_trace(trace: &ProofQualificationTraceV1) -> bool {
     }
 }
 
+fn valid_selector_step_trace(trace: &ProofQualificationTraceV1) -> bool {
+    trace.steps.iter().all(|step| match &step.outcome {
+        StepQualificationOutcomeV1::SelectorBlocked {
+            selector_index,
+            outcome,
+        } => {
+            trace.selector_early_return
+                && trace.selectors.iter().any(|selector| {
+                    selector.selector_index == *selector_index && selector.outcome == *outcome
+                })
+        }
+        _ => !trace.selector_early_return,
+    })
+}
+
 fn strictly_ascending(values: &[i64]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn valid_funnel_outcome(outcome: &FunnelOutcomeV1) -> bool {
     match outcome {
+        FunnelOutcomeV1::SelectorBlocked { outcome, .. } => matches!(
+            outcome,
+            SelectorGateOutcomeV1::Failed { .. } | SelectorGateOutcomeV1::Unavailable { .. }
+        ),
         FunnelOutcomeV1::Admitted => true,
         FunnelOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
             let mut candidate_edge_ids = histogram
@@ -3802,6 +3859,14 @@ fn valid_funnel_outcome(outcome: &FunnelOutcomeV1) -> bool {
                     histogram: histogram.clone(),
                 },
             })
+        }
+        FunnelOutcomeV1::CandidateLimitExceeded {
+            maximum_candidate_edges,
+            observed_candidate_edges_at_least,
+        } => {
+            usize::try_from(*maximum_candidate_edges).ok() == Some(MAX_CANDIDATE_EDGES_PER_STEP)
+                && usize::try_from(*observed_candidate_edges_at_least).ok()
+                    == MAX_CANDIDATE_EDGES_PER_STEP.checked_add(1)
         }
     }
 }
@@ -5274,6 +5339,9 @@ fn semantic_contract_bounds(schema: &mut Value, document: SchemaDocument) {
                 Some(0),
                 Some(6),
             );
+            for definition in ["StepQualificationOutcomeV1", "FunnelOutcomeV1"] {
+                set_recursive_field_bounds(schema, definition, "selector_index", Some(0), Some(6));
+            }
             set_bounds(
                 schema,
                 Some("ReceiptEvidenceV1"),

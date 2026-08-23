@@ -433,6 +433,13 @@ fn build_failure_funnel(cases: &[CaseReportV1]) -> Result<FailureFunnelReportV1>
             .context("proof_availability_unclassified_overflow")?;
         for step in &case.proof_trace.steps {
             let outcome = match &step.outcome {
+                StepQualificationOutcomeV1::SelectorBlocked {
+                    selector_index,
+                    outcome,
+                } => Some(FunnelOutcomeV1::SelectorBlocked {
+                    selector_index: *selector_index,
+                    outcome: outcome.clone(),
+                }),
                 StepQualificationOutcomeV1::Admitted { .. } => Some(FunnelOutcomeV1::Admitted),
                 StepQualificationOutcomeV1::FirstZeroSurvivor { gate, histogram } => {
                     Some(FunnelOutcomeV1::FirstZeroSurvivor {
@@ -440,7 +447,13 @@ fn build_failure_funnel(cases: &[CaseReportV1]) -> Result<FailureFunnelReportV1>
                         histogram: histogram.clone(),
                     })
                 }
-                StepQualificationOutcomeV1::CandidateLimitExceeded { .. } => None,
+                StepQualificationOutcomeV1::CandidateLimitExceeded {
+                    maximum_candidate_edges,
+                    observed_candidate_edges_at_least,
+                } => Some(FunnelOutcomeV1::CandidateLimitExceeded {
+                    maximum_candidate_edges: *maximum_candidate_edges,
+                    observed_candidate_edges_at_least: *observed_candidate_edges_at_least,
+                }),
             };
             if let Some(outcome) = outcome {
                 classified = classified

@@ -7,11 +7,9 @@ use codestory_store::FileInfo;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
-// Bumped to 3 with the position-free callable projection format: a cached
-// artifact from version 2 carries node ids minted from declaration lines and
-// projection rows whose `signature_hash` still binds a position, so reusing one
-// would mix two identity formats inside a single file.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 3;
+// Bumped to 4 because declaration-first canonical ordinals and column-distinct
+// temporary identities change parser-backed node ids.
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 4;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 

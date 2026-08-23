@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId, ResolutionCertainty};
@@ -88,6 +89,7 @@ pub struct IndexedCallEdgeReceipt {
     pub target: ResolvedNodeIdentity,
     pub certainty: ResolutionCertainty,
     pub callsite_identity: String,
+    pub column_or_ordinal: u32,
     pub containment: CallableContainmentEvidence,
     pub line_window: IndexedLineWindow,
 }
@@ -1492,6 +1494,15 @@ pub fn check_call_path(
     hashes: &ProofHashes,
     facts: &[VerifiedProofFact],
 ) -> ProofDisposition {
+    check_call_path_with_receipt_order(contract, hashes, facts, None)
+}
+
+fn check_call_path_with_receipt_order(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    facts: &[VerifiedProofFact],
+    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
+) -> ProofDisposition {
     if hashes != &contract.bound_hashes {
         return ProofDisposition::Unavailable {
             contract_digest: hashes.contract_digest.clone(),
@@ -1524,7 +1535,7 @@ pub fn check_call_path(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if let Some(path) = find_path(contract, &direct_facts, PathPolicy::Strict) {
+    if let Some(path) = find_path(contract, &direct_facts, PathPolicy::Strict, receipt_order) {
         return ProofDisposition::ContractProven {
             contract_digest: hashes.contract_digest.clone(),
             receipts: path.into_iter().map(|fact| fact.receipt.clone()).collect(),
@@ -1534,6 +1545,7 @@ pub fn check_call_path(
         contract,
         &direct_facts,
         PathPolicy::AllowProjectionExclusions,
+        receipt_order,
     ) {
         let step_index = first_projection_conflict(contract, &path).unwrap_or(0);
         return ProofDisposition::Unknown {
@@ -1545,7 +1557,7 @@ pub fn check_call_path(
                 .collect(),
         };
     }
-    let mut reachable = reachable_prefixes(contract, &direct_facts);
+    let mut reachable = reachable_prefixes(contract, &direct_facts, receipt_order);
     for source in facts.iter().filter_map(|fact| match fact {
         #[cfg(any(test, feature = "test-support"))]
         VerifiedProofFact::CertifiedAbsence(fact) => Some(&fact.source),
@@ -1603,7 +1615,7 @@ pub fn check_call_path(
         return ProofDisposition::Unknown {
             contract_digest: hashes.contract_digest.clone(),
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
-            connected_receipts: longest_clean_prefix(&reachable),
+            connected_receipts: longest_clean_prefix(&reachable, receipt_order),
         };
     }
     let mut clean_states = reachable
@@ -1611,10 +1623,13 @@ pub fn check_call_path(
         .filter(|state| state.projection_conflict_step.is_none())
         .collect::<Vec<_>>();
     clean_states.sort_by(|left, right| {
-        right
-            .step_index
-            .cmp(&left.step_index)
-            .then_with(|| left.connected_receipts.cmp(&right.connected_receipts))
+        right.step_index.cmp(&left.step_index).then_with(|| {
+            compare_receipt_sequences(
+                &left.connected_receipts,
+                &right.connected_receipts,
+                receipt_order,
+            )
+        })
     });
     for state in clean_states {
         if state.step_index >= contract.spec.steps.len() || state.projection_conflict_step.is_some()
@@ -1667,7 +1682,7 @@ pub fn check_call_path(
         return ProofDisposition::Unknown {
             contract_digest: hashes.contract_digest.clone(),
             gaps: vec![ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index }],
-            connected_receipts: longest_clean_prefix(&reachable),
+            connected_receipts: longest_clean_prefix(&reachable, receipt_order),
         };
     }
     let step_index = reachable
@@ -1697,7 +1712,7 @@ pub fn check_call_path(
         } else {
             ProofGap::MissingDirectCallReceipt { step_index }
         }],
-        connected_receipts: longest_clean_prefix(&reachable),
+        connected_receipts: longest_clean_prefix(&reachable, receipt_order),
     }
 }
 
@@ -1711,9 +1726,11 @@ fn find_path<'a>(
     contract: &ValidatedCallPathContract,
     facts: &[&'a VerifiedDirectCallFact],
     policy: PathPolicy,
+    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
 ) -> Option<Vec<&'a VerifiedDirectCallFact>> {
     let mut ordered = facts.to_vec();
-    ordered.sort_by(|left, right| left.receipt.cmp(&right.receipt));
+    ordered
+        .sort_by(|left, right| compare_receipt_refs(&left.receipt, &right.receipt, receipt_order));
     search_path(
         contract,
         &ordered,
@@ -1820,9 +1837,10 @@ struct PrefixState {
 fn reachable_prefixes(
     contract: &ValidatedCallPathContract,
     facts: &[&VerifiedDirectCallFact],
+    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
 ) -> Vec<PrefixState> {
     let mut facts = facts.to_vec();
-    facts.sort_by(|left, right| left.receipt.cmp(&right.receipt));
+    facts.sort_by(|left, right| compare_receipt_refs(&left.receipt, &right.receipt, receipt_order));
     let initial_nodes = facts
         .iter()
         .filter(|fact| symbol_selector_matches(&contract.spec.start, &fact.source))
@@ -1881,13 +1899,43 @@ fn reachable_prefixes(
     all
 }
 
-fn longest_clean_prefix(states: &[PrefixState]) -> Vec<ReceiptRef> {
+fn longest_clean_prefix(
+    states: &[PrefixState],
+    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
+) -> Vec<ReceiptRef> {
     states
         .iter()
         .filter(|state| state.projection_conflict_step.is_none())
         .map(|state| state.connected_receipts.clone())
-        .min_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)))
+        .min_by(|left, right| {
+            right
+                .len()
+                .cmp(&left.len())
+                .then_with(|| compare_receipt_sequences(left, right, receipt_order))
+        })
         .unwrap_or_default()
+}
+
+fn compare_receipt_refs(
+    left: &ReceiptRef,
+    right: &ReceiptRef,
+    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
+) -> Ordering {
+    receipt_order
+        .and_then(|order| order.get(left).zip(order.get(right)))
+        .map_or_else(|| left.cmp(right), |(left, right)| left.cmp(right))
+}
+
+fn compare_receipt_sequences(
+    left: &[ReceiptRef],
+    right: &[ReceiptRef],
+    receipt_order: Option<&BTreeMap<ReceiptRef, usize>>,
+) -> Ordering {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| compare_receipt_refs(left, right, receipt_order))
+        .find(|ordering| *ordering != Ordering::Equal)
+        .unwrap_or_else(|| left.len().cmp(&right.len()))
 }
 
 pub const INTERNAL_PROOF_CAP_BYTES: usize = 64 * 1024;
@@ -2067,6 +2115,41 @@ fn indexed_receipt_matches_fact(
         && receipt.target == fact.target
 }
 
+fn indexed_receipt_source_order(
+    left: &IndexedCallEdgeReceipt,
+    right: &IndexedCallEdgeReceipt,
+) -> Ordering {
+    left.line_window
+        .project_file_components
+        .cmp(&right.line_window.project_file_components)
+        .then_with(|| {
+            left.line_window
+                .anchor_line
+                .cmp(&right.line_window.anchor_line)
+        })
+        .then_with(|| left.column_or_ordinal.cmp(&right.column_or_ordinal))
+        .then_with(|| {
+            match (
+                left.receipt.edge_id.parse::<i64>(),
+                right.receipt.edge_id.parse::<i64>(),
+            ) {
+                (Ok(left), Ok(right)) => left.cmp(&right),
+                _ => left.receipt.edge_id.cmp(&right.receipt.edge_id),
+            }
+        })
+        .then_with(|| left.receipt.receipt_id.cmp(&right.receipt.receipt_id))
+}
+
+fn authoritative_receipt_order(receipts: &[IndexedCallEdgeReceipt]) -> BTreeMap<ReceiptRef, usize> {
+    let mut receipts = receipts.iter().collect::<Vec<_>>();
+    receipts.sort_by(|left, right| indexed_receipt_source_order(left, right));
+    receipts
+        .into_iter()
+        .enumerate()
+        .map(|(rank, receipt)| (receipt.receipt.clone(), rank))
+        .collect()
+}
+
 fn integrate_built_disposition(
     contract: &ValidatedCallPathContract,
     hashes: &ProofHashes,
@@ -2080,7 +2163,8 @@ fn integrate_built_disposition(
             .cloned()
             .map(|reason| VerifiedProofFact::Unavailable(UnavailableProofFact { reason })),
     );
-    let raw = check_call_path(contract, hashes, &facts);
+    let receipt_order = authoritative_receipt_order(&built.receipts);
+    let raw = check_call_path_with_receipt_order(contract, hashes, &facts, Some(&receipt_order));
     if matches!(
         raw,
         ProofDisposition::Unavailable { .. } | ProofDisposition::ContractRefuted { .. }
@@ -2669,6 +2753,7 @@ mod tests {
             target: node(target),
             certainty: ResolutionCertainty::Certain,
             callsite_identity: format!("{index}:{}:0:{}|rust", index + 1, index + 2),
+            column_or_ordinal: 0,
             containment: CallableContainmentEvidence {
                 file_node_id: NodeId(i64::try_from(index + 1).unwrap()),
                 owner_node_id: NodeId(i64::try_from(index + 10).unwrap()),
@@ -2919,6 +3004,95 @@ mod tests {
                 }],
             }
         );
+    }
+
+    #[test]
+    fn authoritative_receipts_follow_authenticated_source_order() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B"]);
+        let mut earlier = indexed_receipt(0, "A", "B", "first();\n".to_owned());
+        earlier.receipt = ReceiptRef {
+            receipt_id: "receipt-z".to_owned(),
+            edge_id: "200".to_owned(),
+        };
+        earlier.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
+        earlier.line_window.anchor_line = 10;
+        earlier.callsite_identity = "1:10:7:2|rust".to_owned();
+
+        let mut later = indexed_receipt(1, "A", "B", "second();\n".to_owned());
+        later.receipt = ReceiptRef {
+            receipt_id: "receipt-a".to_owned(),
+            edge_id: "100".to_owned(),
+        };
+        later.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
+        later.line_window.anchor_line = 20;
+        later.callsite_identity = "1:20:3:2|rust".to_owned();
+
+        let integrated = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![later, earlier.clone()], Vec::new(), Vec::new()),
+        );
+        assert_eq!(
+            integrated.authoritative_receipts(),
+            [earlier],
+            "receipt and edge identifiers must not outrank earlier source coordinates"
+        );
+
+        let mut lower_column = indexed_receipt(2, "A", "B", "column_two();\n".to_owned());
+        lower_column.receipt = ReceiptRef {
+            receipt_id: "receipt-z-column".to_owned(),
+            edge_id: "200".to_owned(),
+        };
+        lower_column.line_window.project_file_components =
+            vec!["src".to_owned(), "same.rs".to_owned()];
+        lower_column.line_window.anchor_line = 30;
+        lower_column.column_or_ordinal = 2;
+        let mut higher_column = indexed_receipt(3, "A", "B", "column_nine();\n".to_owned());
+        higher_column.receipt = ReceiptRef {
+            receipt_id: "receipt-a-column".to_owned(),
+            edge_id: "100".to_owned(),
+        };
+        higher_column.line_window.project_file_components =
+            lower_column.line_window.project_file_components.clone();
+        higher_column.line_window.anchor_line = 30;
+        higher_column.column_or_ordinal = 9;
+        let integrated = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![higher_column, lower_column.clone()],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        assert_eq!(integrated.authoritative_receipts(), [lower_column]);
+
+        let mut edge_two = indexed_receipt(4, "A", "B", "edge_two();\n".to_owned());
+        edge_two.receipt = ReceiptRef {
+            receipt_id: "receipt-z-edge".to_owned(),
+            edge_id: "2".to_owned(),
+        };
+        edge_two.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
+        edge_two.line_window.anchor_line = 40;
+        edge_two.column_or_ordinal = 4;
+        let mut edge_ten = indexed_receipt(5, "A", "B", "edge_ten();\n".to_owned());
+        edge_ten.receipt = ReceiptRef {
+            receipt_id: "receipt-a-edge".to_owned(),
+            edge_id: "10".to_owned(),
+        };
+        edge_ten.line_window.project_file_components =
+            edge_two.line_window.project_file_components.clone();
+        edge_ten.line_window.anchor_line = 40;
+        edge_ten.column_or_ordinal = 4;
+        let integrated = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![edge_ten, edge_two.clone()], Vec::new(), Vec::new()),
+        );
+        assert_eq!(integrated.authoritative_receipts(), [edge_two]);
     }
 
     #[test]

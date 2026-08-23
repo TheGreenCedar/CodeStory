@@ -21,7 +21,7 @@ use codestory_store::{
     IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
 };
 use crossbeam_channel::{Receiver, SendTimeoutError, bounded};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -198,7 +198,7 @@ struct TagDefinition {
 #[derive(Default)]
 struct TagDefinitionIndex {
     by_key: HashMap<TagDefinitionKey, TagDefinition>,
-    fallback_index: HashMap<(String, u32), TagDefinitionKey>,
+    fallback_index: HashMap<(String, u32), Vec<TagDefinitionKey>>,
 }
 
 fn make_language_config(
@@ -224,7 +224,16 @@ impl TagDefinitionIndex {
             Some(existing) if !should_replace_tag_definition(existing, &definition) => {}
             _ => {
                 self.fallback_index
-                    .insert((key.name.clone(), key.start_line), key.clone());
+                    .entry((key.name.clone(), key.start_line))
+                    .or_default()
+                    .push(key.clone());
+                if let Some(keys) = self
+                    .fallback_index
+                    .get_mut(&(key.name.clone(), key.start_line))
+                {
+                    keys.sort_by_key(|key| key.start_col);
+                    keys.dedup();
+                }
                 self.by_key.insert(key, definition);
             }
         }
@@ -243,15 +252,33 @@ impl TagDefinitionIndex {
                 start_col,
             };
             if let Some(definition) = self.by_key.remove(&exact_key) {
-                self.fallback_index.remove(&(name.to_string(), start_line));
+                self.remove_fallback_key(name, start_line, &exact_key);
                 return Some(definition);
             }
         }
 
-        let fallback_key = self
-            .fallback_index
-            .remove(&(name.to_string(), start_line))?;
+        let lookup = (name.to_string(), start_line);
+        let fallback_key = {
+            let keys = self.fallback_index.get_mut(&lookup)?;
+            let index = start_col
+                .and_then(|start_col| keys.iter().position(|key| key.start_col >= start_col))
+                .unwrap_or(0);
+            keys.remove(index)
+        };
+        if self.fallback_index.get(&lookup).is_some_and(Vec::is_empty) {
+            self.fallback_index.remove(&lookup);
+        }
         self.by_key.remove(&fallback_key)
+    }
+
+    fn remove_fallback_key(&mut self, name: &str, start_line: u32, key: &TagDefinitionKey) {
+        let lookup = (name.to_string(), start_line);
+        if let Some(keys) = self.fallback_index.get_mut(&lookup) {
+            keys.retain(|candidate| candidate != key);
+            if keys.is_empty() {
+                self.fallback_index.remove(&lookup);
+            }
+        }
     }
 
     fn into_remaining(self) -> Vec<TagDefinition> {
@@ -10342,9 +10369,11 @@ fn qualified_name_delimiter(language_name: &str) -> &'static str {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CanonicalNodeRole {
+    Definition,
     Declaration,
     ForwardDeclaration,
     ImplAnchor,
+    Reference,
     Unspecified,
 }
 
@@ -10359,10 +10388,11 @@ fn canonical_role_from_graph_attr(value: &str) -> CanonicalNodeRole {
 
 fn canonical_role_priority(role: CanonicalNodeRole) -> u8 {
     match role {
+        CanonicalNodeRole::Definition => 4,
         CanonicalNodeRole::Declaration => 3,
         CanonicalNodeRole::Unspecified => 2,
         CanonicalNodeRole::ForwardDeclaration => 1,
-        CanonicalNodeRole::ImplAnchor => 0,
+        CanonicalNodeRole::ImplAnchor | CanonicalNodeRole::Reference => 0,
     }
 }
 
@@ -10466,7 +10496,7 @@ fn preserved_canonical_id(node: &Node) -> Option<&str> {
     })
 }
 
-/// Declaration ordinals for every qualified name that needs a discriminator.
+/// Canonical ordinals for every qualified name that needs a discriminator.
 ///
 /// Two callables in one file can share a qualified name — Java and C++
 /// overloads, an unresolved call placeholder beside the function it names, a
@@ -10476,13 +10506,15 @@ fn preserved_canonical_id(node: &Node) -> Option<&str> {
 /// incremental indexing could only replace the whole file (CR-008) and every
 /// annotation anchored to it was destroyed (ARCH-001).
 ///
-/// The ordinal is the rank of the declaration's line among the distinct lines
-/// that share its qualified name, so it is invariant under any edit that moves
-/// declarations without reordering them. Declarations that share a line still
-/// share an id, exactly as the line-suffixed form grouped them: this is a
-/// relabelling of the same groups, not a regrouping.
-fn declaration_ordinals(nodes: &[Node]) -> HashMap<String, BTreeMap<u32, usize>> {
-    let mut lines_by_name: HashMap<String, BTreeSet<u32>> = HashMap::new();
+/// Declarations receive the first source-ordered ordinals for their qualified
+/// name. Reference/placeholder nodes are ordered only after that declaration
+/// range, so adding or moving a callsite cannot rename a declaration. Columns
+/// keep distinct declarations on the same line distinct.
+fn canonical_node_ordinals(
+    nodes: &[Node],
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+) -> HashMap<NodeId, usize> {
+    let mut nodes_by_name: HashMap<String, Vec<&Node>> = HashMap::new();
     for node in nodes {
         if preserved_canonical_id(node).is_some() || !node_needs_declaration_ordinal(node) {
             continue;
@@ -10491,22 +10523,36 @@ fn declaration_ordinals(nodes: &[Node]) -> HashMap<String, BTreeMap<u32, usize>>
             .qualified_name
             .clone()
             .unwrap_or_else(|| node.serialized_name.clone());
-        lines_by_name
-            .entry(qualified_name)
-            .or_default()
-            .insert(node.start_line.unwrap_or(1));
+        nodes_by_name.entry(qualified_name).or_default().push(node);
     }
-    lines_by_name
-        .into_iter()
-        .map(|(qualified_name, lines)| {
-            let ordinals = lines
-                .into_iter()
-                .enumerate()
-                .map(|(ordinal, line)| (line, ordinal))
-                .collect::<BTreeMap<_, _>>();
-            (qualified_name, ordinals)
-        })
-        .collect()
+    let mut ordinals = HashMap::new();
+    for nodes in nodes_by_name.values_mut() {
+        nodes.sort_by_key(|node| {
+            (
+                node.start_line.unwrap_or(u32::MAX),
+                node.start_col.unwrap_or(u32::MAX),
+                node.end_line.unwrap_or(u32::MAX),
+                node.end_col.unwrap_or(u32::MAX),
+                node.kind as i32,
+                node.id,
+            )
+        });
+        let (declarations, references): (Vec<_>, Vec<_>) =
+            nodes.iter().copied().partition(|node| {
+                matches!(
+                    canonical_roles.get(&node.id),
+                    Some(
+                        CanonicalNodeRole::Definition
+                            | CanonicalNodeRole::Declaration
+                            | CanonicalNodeRole::ForwardDeclaration
+                    )
+                )
+            });
+        for (ordinal, node) in declarations.into_iter().chain(references).enumerate() {
+            ordinals.insert(node.id, ordinal);
+        }
+    }
+    ordinals
 }
 
 fn canonicalize_nodes_with_file_identity(
@@ -10517,7 +10563,7 @@ fn canonicalize_nodes_with_file_identity(
 ) -> (Vec<Node>, HashMap<NodeId, NodeId>) {
     let mut id_remap = HashMap::<NodeId, NodeId>::new();
     let mut grouped_nodes = BTreeMap::<String, Vec<Node>>::new();
-    let ordinals_by_name = declaration_ordinals(&final_nodes);
+    let ordinals_by_node = canonical_node_ordinals(&final_nodes, canonical_roles);
 
     for mut node in final_nodes {
         let qualified_name = node
@@ -10534,11 +10580,7 @@ fn canonicalize_nodes_with_file_identity(
                 } else if node.kind == NodeKind::FILE {
                     format!("{file_identity}:{file_identity}:1")
                 } else {
-                    let start_line = node.start_line.unwrap_or(1);
-                    let ordinal = ordinals_by_name
-                        .get(&qualified_name)
-                        .and_then(|ordinals| ordinals.get(&start_line).copied())
-                        .unwrap_or(0);
+                    let ordinal = ordinals_by_node.get(&node.id).copied().unwrap_or(0);
                     format!("{file_name}:{qualified_name}{DECLARATION_ORDINAL_SEPARATOR}{ordinal}")
                 }
             });
@@ -15026,6 +15068,30 @@ pub fn index_file(
         .execute(&tree, source, &config, &NoCancellation)
         .map_err(|e| anyhow!("Graph execution error: {:?}", e))?;
 
+    let mut reference_graph_nodes = HashSet::new();
+    for source_ref in graph.iter_nodes() {
+        for (sink_ref, edge) in graph[source_ref].iter_edges() {
+            let relation = edge.attributes.iter().find_map(|(attr, value)| {
+                (attr.as_str() == "kind")
+                    .then(|| value.as_str().ok())
+                    .flatten()
+            });
+            if matches!(
+                relation,
+                Some(
+                    "CALL"
+                        | "IMPORT"
+                        | "INHERITANCE"
+                        | "OVERRIDE"
+                        | "TYPE_USAGE"
+                        | "ANNOTATION_USAGE"
+                )
+            ) {
+                reference_graph_nodes.insert(sink_ref);
+            }
+        }
+    }
+
     let mut result_files = Vec::new();
     let mut result_nodes = Vec::new();
     let mut result_edges = Vec::new();
@@ -15092,6 +15158,13 @@ pub fn index_file(
                 "rust_impl_expr" => rust_impl_expr = true,
                 _ => {}
             }
+        }
+        if canonical_role == CanonicalNodeRole::Unspecified {
+            canonical_role = if reference_graph_nodes.contains(&node_id) {
+                CanonicalNodeRole::Reference
+            } else {
+                CanonicalNodeRole::Definition
+            };
         }
         let has_token_surface_edge = node_data.iter_edges().any(|(_, edge)| {
             edge.attributes
@@ -15204,7 +15277,8 @@ pub fn index_file(
                 end_line_1 = override_span.end_line;
                 end_col_1 = override_span.end_col;
             }
-            let canonical_seed = format!("{}:{}:{}", file_name, name_str, start_line);
+            let canonical_seed =
+                format!("{}:{}:{}:{}", file_name, name_str, start_line, start_col_1);
             let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
             let effective_access = access_kind.or_else(|| {
@@ -15247,8 +15321,8 @@ pub fn index_file(
 
     for definition in tag_definitions.into_remaining() {
         let canonical_seed = format!(
-            "{}:{}:{}",
-            file_name, definition.key.name, definition.key.start_line
+            "{}:{}:{}:{}",
+            file_name, definition.key.name, definition.key.start_line, definition.key.start_col
         );
         let nid = NodeId(generate_id(&canonical_seed));
         unique_nodes.entry(nid).or_insert_with(|| Node {
@@ -15261,9 +15335,14 @@ pub fn index_file(
             end_col: Some(definition.end_col),
             ..Default::default()
         });
-        if definition.canonical_role != CanonicalNodeRole::Unspecified {
-            canonical_role_by_node_id.insert(nid, definition.canonical_role);
-        }
+        canonical_role_by_node_id.insert(
+            nid,
+            if definition.canonical_role == CanonicalNodeRole::Unspecified {
+                CanonicalNodeRole::Definition
+            } else {
+                definition.canonical_role
+            },
+        );
         if let Some(access) = definition.access {
             component_access_by_node_id.insert(nid, access);
         }
