@@ -9,7 +9,7 @@ use std::fmt;
 
 pub const CORPUS_SCHEMA: &str = "codestory.proof-availability-corpus/v1";
 pub const PATH_FILE_SCHEMA: &str = "codestory.proof-availability-path-file/v1";
-pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v3";
+pub const REPORT_SCHEMA: &str = "codestory.proof-availability-report/v4";
 pub const THRESHOLDS_SCHEMA: &str = "codestory.proof-availability-thresholds/v1";
 pub const DECISION_REPORT_SCHEMA: &str = "codestory.proof-availability-decision/v1";
 pub const PRESCRIBED_BUILD_ARGV: [&str; 8] = [
@@ -1218,9 +1218,6 @@ impl From<codestory_agent::proof_qualification_support::RawAdmissionFailure>
     fn from(value: codestory_agent::proof_qualification_support::RawAdmissionFailure) -> Self {
         match value {
             codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind => Self::WrongKind,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyAbsent => Self::CertaintyAbsent,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyProbable => Self::CertaintyProbable,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyUncertain => Self::CertaintyUncertain,
             codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource => Self::WrongEffectiveSource,
             codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget => Self::WrongEffectiveTarget,
             codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget => Self::MissingExactResolvedTarget,
@@ -1259,6 +1256,7 @@ pub enum SourceBindingFailureV1 {
     StoredHashAbsent,
     WorkingTreeReadFailed,
     WorkingTreeHashMismatch,
+    ExactCallsiteMismatch,
     InvalidUtf8,
     LineMissing,
     LineOverLimit,
@@ -1275,6 +1273,27 @@ impl From<codestory_runtime::proof_qualification_support::SourceBindingFailure>
             codestory_runtime::proof_qualification_support::SourceBindingFailure::InvalidUtf8 => Self::InvalidUtf8,
             codestory_runtime::proof_qualification_support::SourceBindingFailure::LineMissing => Self::LineMissing,
             codestory_runtime::proof_qualification_support::SourceBindingFailure::LineOverLimit => Self::LineOverLimit,
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::ExactCallsiteMismatch => Self::ExactCallsiteMismatch,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResolutionFactFailureV1 {
+    Missing,
+    Inconsistent,
+}
+impl From<codestory_runtime::proof_qualification_support::ResolutionFactFailure>
+    for ResolutionFactFailureV1
+{
+    fn from(value: codestory_runtime::proof_qualification_support::ResolutionFactFailure) -> Self {
+        match value {
+            codestory_runtime::proof_qualification_support::ResolutionFactFailure::Missing => {
+                Self::Missing
+            }
+            codestory_runtime::proof_qualification_support::ResolutionFactFailure::Inconsistent => {
+                Self::Inconsistent
+            }
         }
     }
 }
@@ -1300,6 +1319,7 @@ impl From<codestory_runtime::proof_qualification_support::FinalizationFailure>
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CandidateGateV1 {
     RawAdmission,
+    ResolutionFact,
     Containment,
     SourceBinding,
     Line,
@@ -1308,6 +1328,7 @@ pub enum CandidateGateV1 {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CandidateFailureV1 {
     RawAdmission { reason: RawAdmissionFailureV1 },
+    ResolutionFact { reason: ResolutionFactFailureV1 },
     Containment { reason: ContainmentFailureV1 },
     SourceBinding { reason: SourceBindingFailureV1 },
 }
@@ -1388,6 +1409,7 @@ impl From<codestory_agent::proof_qualification_support::UnavailableReason> for U
             codestory_agent::proof_qualification_support::UnavailableReason::PublicationPinMismatch => Self::PublicationPinMismatch,
             codestory_agent::proof_qualification_support::UnavailableReason::SourceNotBoundToPublication => Self::SourceNotBoundToPublication,
             codestory_agent::proof_qualification_support::UnavailableReason::ProofFactsUnavailable => Self::ProofFactsUnavailable,
+            codestory_agent::proof_qualification_support::UnavailableReason::ProofSemanticProjectionUnavailable => Self::ProofFactsUnavailable,
         }
     }
 }
@@ -1436,6 +1458,9 @@ impl From<codestory_runtime::proof_qualification_support::CandidateGate> for Can
             codestory_runtime::proof_qualification_support::CandidateGate::RawAdmission => {
                 Self::RawAdmission
             }
+            codestory_runtime::proof_qualification_support::CandidateGate::ResolutionFact => {
+                Self::ResolutionFact
+            }
             codestory_runtime::proof_qualification_support::CandidateGate::Containment => {
                 Self::Containment
             }
@@ -1453,6 +1478,11 @@ impl From<codestory_runtime::proof_qualification_support::CandidateFailure> for 
             codestory_runtime::proof_qualification_support::CandidateFailure::RawAdmission(
                 reason,
             ) => Self::RawAdmission {
+                reason: reason.into(),
+            },
+            codestory_runtime::proof_qualification_support::CandidateFailure::ResolutionFact(
+                reason,
+            ) => Self::ResolutionFact {
                 reason: reason.into(),
             },
             codestory_runtime::proof_qualification_support::CandidateFailure::Containment(
@@ -2376,16 +2406,6 @@ pub(crate) fn resolved_canonical_id_binding_sha256(
 pub enum ReceiptCertaintyV1 {
     Certain,
 }
-impl TryFrom<codestory_contracts::graph::ResolutionCertainty> for ReceiptCertaintyV1 {
-    type Error = anyhow::Error;
-
-    fn try_from(value: codestory_contracts::graph::ResolutionCertainty) -> Result<Self> {
-        match value {
-            codestory_contracts::graph::ResolutionCertainty::Certain => Ok(Self::Certain),
-            _ => bail!("proof_availability_receipt_certainty_invalid"),
-        }
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CallableContainmentEvidenceV1 {
@@ -2421,6 +2441,10 @@ impl ObservedReceiptV1 {
         receipt: &codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt,
         oracle_comparison: ReceiptOracleComparisonV1,
     ) -> Result<Self> {
+        if receipt.resolution_fact_id.len() != 64 || receipt.resolution_evidence_sha256.len() != 64
+        {
+            bail!("proof_availability_resolution_fact_receipt_invalid")
+        }
         let observed = Self {
             receipt_id: receipt.receipt.receipt_id.clone(),
             step_index,
@@ -2431,7 +2455,7 @@ impl ObservedReceiptV1 {
                 .map_err(|_| anyhow::anyhow!("proof_availability_receipt_edge_id_invalid"))?,
             source: (&receipt.source).try_into()?,
             target: (&receipt.target).try_into()?,
-            certainty: receipt.certainty.try_into()?,
+            certainty: ReceiptCertaintyV1::Certain,
             callsite_identity: receipt.callsite_identity.clone(),
             callsite_line: receipt.line_window.anchor_line,
             containment: CallableContainmentEvidenceV1 {
@@ -2777,6 +2801,220 @@ pub struct FailureFunnelReportV1 {
     pub unclassified_positive_steps: u16,
     pub buckets: Vec<FailureBucketV1>,
 }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionAdapterReportV1 {
+    pub language: String,
+    pub adapter_version: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionProjectionReceiptV1 {
+    pub repository_id: String,
+    pub core_generation_id: String,
+    pub core_run_id: String,
+    #[serde(with = "i64_decimal")]
+    #[schemars(with = "String")]
+    pub core_published_at_epoch_ms: i64,
+    pub fact_schema_version: u32,
+    pub fact_count: u64,
+    pub fact_digest: String,
+    pub adapter_roster: Vec<ResolutionAdapterReportV1>,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionFunnelCountsV1 {
+    pub syntax_calls: u64,
+    pub adapter_supported: u64,
+    pub exact: u64,
+    pub ambiguous: u64,
+    pub missing_binding: u64,
+    pub incomplete_domain: u64,
+    pub unsupported: u64,
+    pub exact_call_linked: u64,
+    pub proof_shape_admitted: u64,
+    pub authoritative_receipts: u64,
+    pub complete_proofs: u64,
+}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionFunnelConversionsV1 {
+    pub adapter_supported_per_syntax_milli: u16,
+    pub exact_per_adapter_supported_milli: u16,
+    pub exact_call_linked_per_exact_milli: u16,
+    pub proof_shape_admitted_per_exact_call_linked_milli: u16,
+    pub authoritative_receipts_per_proof_shape_admitted_milli: u16,
+    pub complete_proofs_per_authoritative_receipts_milli: u16,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionFunnelRowV1 {
+    pub repository_id: String,
+    pub language: String,
+    pub callee_form: Option<String>,
+    pub primary_evidence_kind: Option<String>,
+    pub counts: ResolutionFunnelCountsV1,
+    pub conversions: ResolutionFunnelConversionsV1,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionFunnelReportV1 {
+    pub projections: Vec<ResolutionProjectionReceiptV1>,
+    pub rows: Vec<ResolutionFunnelRowV1>,
+}
+
+pub(crate) fn resolution_funnel_conversions(
+    counts: &ResolutionFunnelCountsV1,
+) -> Result<ResolutionFunnelConversionsV1> {
+    Ok(ResolutionFunnelConversionsV1 {
+        adapter_supported_per_syntax_milli: ratio_milli(
+            counts.adapter_supported,
+            counts.syntax_calls,
+        )?,
+        exact_per_adapter_supported_milli: ratio_milli(counts.exact, counts.adapter_supported)?,
+        exact_call_linked_per_exact_milli: ratio_milli(counts.exact_call_linked, counts.exact)?,
+        proof_shape_admitted_per_exact_call_linked_milli: ratio_milli(
+            counts.proof_shape_admitted,
+            counts.exact_call_linked,
+        )?,
+        authoritative_receipts_per_proof_shape_admitted_milli: ratio_milli(
+            counts.authoritative_receipts,
+            counts.proof_shape_admitted,
+        )?,
+        complete_proofs_per_authoritative_receipts_milli: ratio_milli(
+            counts.complete_proofs,
+            counts.authoritative_receipts,
+        )?,
+    })
+}
+
+pub(crate) fn sort_resolution_funnel(report: &mut ResolutionFunnelReportV1) {
+    report
+        .projections
+        .sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
+    for projection in &mut report.projections {
+        projection.adapter_roster.sort_by(|left, right| {
+            left.language
+                .cmp(&right.language)
+                .then(left.adapter_version.cmp(&right.adapter_version))
+        });
+    }
+    report.rows.sort_by(|left, right| {
+        (
+            left.repository_id.as_str(),
+            left.language.as_str(),
+            left.callee_form.as_deref(),
+            left.primary_evidence_kind.as_deref(),
+        )
+            .cmp(&(
+                right.repository_id.as_str(),
+                right.language.as_str(),
+                right.callee_form.as_deref(),
+                right.primary_evidence_kind.as_deref(),
+            ))
+    });
+}
+
+fn valid_resolution_funnel(
+    report: &ResolutionFunnelReportV1,
+    projects: &[ProjectMaterializationEvidenceV1],
+) -> bool {
+    let project_by_repository = projects
+        .iter()
+        .map(|project| (project.repository_id.as_str(), project))
+        .collect::<BTreeMap<_, _>>();
+    if report.projections.len() != projects.len()
+        || !unique(
+            report
+                .projections
+                .iter()
+                .map(|projection| projection.repository_id.as_str()),
+        )
+        || report
+            .projections
+            .iter()
+            .map(|projection| projection.repository_id.as_str())
+            .collect::<BTreeSet<_>>()
+            != project_by_repository
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        || report
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.repository_id.as_str(),
+                    row.language.as_str(),
+                    row.callee_form.as_deref(),
+                    row.primary_evidence_kind.as_deref(),
+                )
+            })
+            .collect::<BTreeSet<_>>()
+            .len()
+            != report.rows.len()
+    {
+        return false;
+    }
+    for projection in &report.projections {
+        let Some(project) = project_by_repository.get(projection.repository_id.as_str()) else {
+            return false;
+        };
+        if projection.core_generation_id != project.identity.core_generation_id
+            || projection.core_run_id != project.identity.core_run_id
+            || projection.core_published_at_epoch_ms < 0
+            || projection.fact_schema_version
+                != codestory_contracts::proof_resolution::PROOF_RESOLUTION_FACT_SCHEMA_VERSION
+            || !hash(&projection.fact_digest)
+            || projection.adapter_roster.is_empty()
+            || projection
+                .adapter_roster
+                .iter()
+                .map(|adapter| (adapter.language.as_str(), adapter.adapter_version.as_str()))
+                .collect::<BTreeSet<_>>()
+                .len()
+                != projection.adapter_roster.len()
+            || projection.adapter_roster.iter().any(|adapter| {
+                !sanitized_atom(&adapter.language) || !sanitized_atom(&adapter.adapter_version)
+            })
+        {
+            return false;
+        }
+        let fact_count = report
+            .rows
+            .iter()
+            .filter(|row| row.repository_id == projection.repository_id)
+            .try_fold(0u64, |total, row| {
+                total.checked_add(row.counts.syntax_calls)
+            });
+        if fact_count != Some(projection.fact_count) {
+            return false;
+        }
+    }
+    report.rows.iter().all(|row| {
+        let counts = &row.counts;
+        let status_partition = counts
+            .exact
+            .checked_add(counts.ambiguous)
+            .and_then(|value| value.checked_add(counts.missing_binding))
+            .and_then(|value| value.checked_add(counts.incomplete_domain))
+            .and_then(|value| value.checked_add(counts.unsupported));
+        project_by_repository.contains_key(row.repository_id.as_str())
+            && sanitized_atom(&row.language)
+            && row.callee_form.as_deref().is_none_or(sanitized_atom)
+            && row
+                .primary_evidence_kind
+                .as_deref()
+                .is_none_or(sanitized_atom)
+            && status_partition == Some(counts.syntax_calls)
+            && counts.adapter_supported == counts.syntax_calls.saturating_sub(counts.unsupported)
+            && counts.exact_call_linked == counts.exact
+            && counts.complete_proofs <= counts.authoritative_receipts
+            && counts.authoritative_receipts <= counts.proof_shape_admitted
+            && counts.proof_shape_admitted <= counts.exact_call_linked
+            && resolution_funnel_conversions(counts).ok().as_ref() == Some(&row.conversions)
+    })
+}
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActivationOutcomeV1 {
@@ -2947,6 +3185,7 @@ pub struct QualificationSummaryV1 {
     pub trails: Vec<TrailReportV1>,
     pub cases: Vec<CaseReportV1>,
     pub failure_funnel: FailureFunnelReportV1,
+    pub resolution_funnel: ResolutionFunnelReportV1,
 }
 impl QualificationSummaryV1 {
     pub fn from_json(value: Value) -> Result<Self> {
@@ -2994,6 +3233,7 @@ impl QualificationSummaryV1 {
             || self.environment.invocation.corpus_sha256 != self.provenance.corpus_sha256
             || self.environment.invocation.thresholds_sha256 != self.provenance.thresholds_sha256
             || !sanitized_environment(&self.environment)
+            || !valid_resolution_funnel(&self.resolution_funnel, &self.environment.projects)
             || self.environment.projects.len() != 4
             || !unique(
                 self.environment
@@ -3047,6 +3287,7 @@ impl QualificationSummaryV1 {
                 &self.trails,
                 &self.cases,
                 &self.failure_funnel,
+                &self.resolution_funnel,
             )?
         {
             bail!("proof_availability_results_digest_invalid")
@@ -3459,6 +3700,7 @@ struct ResultsEvidenceV1<'a> {
     trails: &'a [TrailReportV1],
     cases: &'a [CaseReportV1],
     failure_funnel: &'a FailureFunnelReportV1,
+    resolution_funnel: &'a ResolutionFunnelReportV1,
 }
 
 pub(crate) fn results_evidence_sha256(
@@ -3467,6 +3709,7 @@ pub(crate) fn results_evidence_sha256(
     trails: &[TrailReportV1],
     cases: &[CaseReportV1],
     failure_funnel: &FailureFunnelReportV1,
+    resolution_funnel: &ResolutionFunnelReportV1,
 ) -> Result<String> {
     let mut environment = environment.clone();
     environment
@@ -3487,14 +3730,17 @@ pub(crate) fn results_evidence_sha256(
                     .expect("closed funnel outcome serializes"),
             )
     });
+    let mut resolution_funnel = resolution_funnel.clone();
+    sort_resolution_funnel(&mut resolution_funnel);
     canonical_artifact_sha256(
-        b"codestory.proof-availability-results-evidence/v3\0",
+        b"codestory.proof-availability-results-evidence/v4\0",
         &ResultsEvidenceV1 {
             environment: &environment,
             inventory: &inventory,
             trails: &trails,
             cases: &cases,
             failure_funnel: &failure_funnel,
+            resolution_funnel: &resolution_funnel,
         },
     )
 }
@@ -3507,6 +3753,7 @@ pub(crate) fn results_evidence_sha256_from_json(value: &Value) -> Result<String>
         trails: Vec<TrailReportV1>,
         cases: Vec<CaseReportV1>,
         failure_funnel: FailureFunnelReportV1,
+        resolution_funnel: ResolutionFunnelReportV1,
     }
     let evidence: EvidenceFields = serde_json::from_value(value.clone())?;
     results_evidence_sha256(
@@ -3515,6 +3762,7 @@ pub(crate) fn results_evidence_sha256_from_json(value: &Value) -> Result<String>
         &evidence.trails,
         &evidence.cases,
         &evidence.failure_funnel,
+        &evidence.resolution_funnel,
     )
 }
 
@@ -3768,6 +4016,9 @@ fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
                                     CandidateGateV1::RawAdmission,
                                     CandidateFailureV1::RawAdmission { .. },
                                 ) | (
+                                    CandidateGateV1::ResolutionFact,
+                                    CandidateFailureV1::ResolutionFact { .. },
+                                ) | (
                                     CandidateGateV1::Containment,
                                     CandidateFailureV1::Containment { .. },
                                 ) | (
@@ -3783,7 +4034,8 @@ fn valid_step_trace(trace: &StepQualificationTraceV1) -> bool {
                                     CandidateGateV1::Line,
                                     CandidateFailureV1::SourceBinding {
                                         reason: SourceBindingFailureV1::LineMissing
-                                            | SourceBindingFailureV1::LineOverLimit,
+                                            | SourceBindingFailureV1::LineOverLimit
+                                            | SourceBindingFailureV1::ExactCallsiteMismatch,
                                     },
                                 )
                             )
@@ -4242,11 +4494,13 @@ fn gap_cause_matches_trace(gap: ActualProofGapV1, trace: &ProofQualificationTrac
             selector_failure_matches(trace, selector_index, SelectorFailureV1::NonCallable)
         }
         ActualProofGapV1::DirectCallMissing { step_index } => {
-            first_zero_gate_matches(trace, step_index, &CandidateGateV1::RawAdmission)
+            (first_zero_gate_matches(trace, step_index, &CandidateGateV1::RawAdmission)
+                || first_zero_gate_matches(trace, step_index, &CandidateGateV1::ResolutionFact))
                 && !recursive_selector_pair(trace, step_index)
         }
         ActualProofGapV1::RecursiveCallNotRepresentable { step_index } => {
-            first_zero_gate_matches(trace, step_index, &CandidateGateV1::RawAdmission)
+            (first_zero_gate_matches(trace, step_index, &CandidateGateV1::RawAdmission)
+                || first_zero_gate_matches(trace, step_index, &CandidateGateV1::ResolutionFact))
                 && recursive_selector_pair(trace, step_index)
         }
         ActualProofGapV1::SourceWindowTooLarge { step_index } => source_failure_matches(
@@ -4338,6 +4592,12 @@ fn first_zero_gate_matches(
                     ..
                 },
                 CandidateGateV1::RawAdmission
+            ) | (
+                StepQualificationOutcomeV1::FirstZeroSurvivor {
+                    gate: CandidateGateV1::ResolutionFact,
+                    ..
+                },
+                CandidateGateV1::ResolutionFact
             ) | (
                 StepQualificationOutcomeV1::FirstZeroSurvivor {
                     gate: CandidateGateV1::Containment,

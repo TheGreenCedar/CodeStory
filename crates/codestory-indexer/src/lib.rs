@@ -44,6 +44,7 @@ mod framework_routes;
 pub mod intermediate_storage;
 mod language_configs;
 mod languages;
+mod proof_resolution;
 
 /// SRC-C2 fence classification: lives in its own file because
 /// `codestory-indexer`'s own source is indexed by
@@ -62,6 +63,9 @@ use cache::{
 };
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
+pub use proof_resolution::{
+    build_funnel as build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+};
 use symbol_table::SymbolTable;
 
 pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
@@ -3132,7 +3136,13 @@ impl WorkspaceIndexer {
 
         match cache_access.get_parser(cache_path, cache_key, &mut stats.parser_artifact_cache) {
             Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
-                Ok(artifact) => {
+                Ok(artifact)
+                    if proof_resolution::cached_resolution_inputs_are_current(
+                        &artifact,
+                        language_config.language_name,
+                        &resolution_parser_fingerprint(&language_config),
+                    ) =>
+                {
                     let mut artifact = rebase_cached_index_artifact(
                         artifact,
                         &full_path,
@@ -3218,7 +3228,7 @@ impl WorkspaceIndexer {
                     }
                     Ok(PreparedIndexWork::Immediate(local_storage))
                 }
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     stats.artifact_cache_invalid_entries += 1;
                     stats.artifact_cache_misses += 1;
                     stats.parser_artifact_cache.misses += 1;
@@ -3648,7 +3658,7 @@ impl WorkspaceIndexer {
         prepared_input: &PreparedIndexInput,
         symbol_table: &Arc<SymbolTable>,
     ) -> PreparedIndexJobResult {
-        let index_result = index_file(
+        let index_result = index_file_with_resolution_inputs(
             &prepared_input.full_path,
             &prepared_input.source,
             &prepared_input.language_config,
@@ -3672,11 +3682,15 @@ impl WorkspaceIndexer {
             };
 
         match index_result {
-            Ok(mut index_result) => {
+            Ok((mut index_result, call_resolution_inputs, resolution_file)) => {
                 if let Some(file_info) = index_result.files.first_mut() {
                     file_info.modification_time = modification_time;
                 }
-                let artifact = CachedIndexArtifact::from_index_result(index_result);
+                let artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
+                    index_result,
+                    call_resolution_inputs,
+                    resolution_file,
+                );
                 let cache_write = prepared_input
                     .artifact_cache_path
                     .as_ref()
@@ -3947,6 +3961,28 @@ impl WorkspaceIndexer {
 
 fn source_content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn resolution_parser_fingerprint(language_config: &LanguageConfig) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-proof-parser-rules-v4\0");
+    hasher.update(language_config.language_name.as_bytes());
+    hasher.update(language_config.language.abi_version().to_be_bytes());
+    hasher.update(language_config.graph_query.as_bytes());
+    if let Some(tags_query) = language_config.tags_query {
+        hasher.update(tags_query.as_bytes());
+    }
+    for id in 0..language_config.language.node_kind_count() {
+        hasher.update((id as u64).to_be_bytes());
+        if let Some(kind) = language_config.language.node_kind_for_id(id as u16) {
+            hasher.update(kind.as_bytes());
+        }
+        hasher.update([
+            u8::from(language_config.language.node_kind_is_named(id as u16)),
+            u8::from(language_config.language.node_kind_is_visible(id as u16)),
+        ]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn verify_source_snapshot(path: &Path, expected_hash: &str) -> Result<i64> {
@@ -4237,6 +4273,62 @@ fn rebase_cached_index_artifact(
         .collect();
     artifact.impl_anchor_node_ids.sort_unstable();
     artifact.impl_anchor_node_ids.dedup();
+    for input in &mut artifact.call_resolution_inputs {
+        input.callsite.file_id = codestory_contracts::proof_resolution::FileId(new_file_id.0);
+        input.caller = input
+            .caller
+            .map(|caller| id_remap.get(&caller).copied().unwrap_or(caller));
+        use cache::CachedResolutionBinding;
+        input.binding = match input.binding.clone() {
+            CachedResolutionBinding::SameFile { declaration } => {
+                CachedResolutionBinding::SameFile {
+                    declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                }
+            }
+            CachedResolutionBinding::StaticImport {
+                import,
+                module_specifier,
+                imported_name,
+                is_default,
+            } => CachedResolutionBinding::StaticImport {
+                import: id_remap.get(&import).copied().unwrap_or(import),
+                module_specifier,
+                imported_name,
+                is_default,
+            },
+            CachedResolutionBinding::ImplicitReceiver {
+                owner,
+                declaration,
+                owner_name,
+            } => CachedResolutionBinding::ImplicitReceiver {
+                owner: id_remap.get(&owner).copied().unwrap_or(owner),
+                declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                owner_name,
+            },
+            other => other,
+        };
+    }
+    if let Some(resolution_file) = &mut artifact.resolution_file {
+        resolution_file.file_id = new_file_id;
+        for export in &mut resolution_file.direct_exports {
+            export.declaration = id_remap
+                .get(&export.declaration)
+                .copied()
+                .unwrap_or(export.declaration);
+        }
+        for declaration in &mut resolution_file.top_level_declarations {
+            declaration.declaration = id_remap
+                .get(&declaration.declaration)
+                .copied()
+                .unwrap_or(declaration.declaration);
+        }
+        for method in &mut resolution_file.inherent_methods {
+            method.declaration = id_remap
+                .get(&method.declaration)
+                .copied()
+                .unwrap_or(method.declaration);
+        }
+    }
 
     if let Some(file_info) = artifact.files.first_mut() {
         file_info.id = new_file_id.0;
@@ -15072,6 +15164,27 @@ pub fn index_file(
     compilation_info: Option<compilation_database::CompilationInfo>,
     symbol_table: Option<Arc<SymbolTable>>,
 ) -> Result<IndexResult> {
+    index_file_with_resolution_inputs(
+        path,
+        source,
+        language_config,
+        compilation_info,
+        symbol_table,
+    )
+    .map(|(result, _, _)| result)
+}
+
+fn index_file_with_resolution_inputs(
+    path: &Path,
+    source: &str,
+    language_config: &LanguageConfig,
+    compilation_info: Option<compilation_database::CompilationInfo>,
+    symbol_table: Option<Arc<SymbolTable>>,
+) -> Result<(
+    IndexResult,
+    Vec<cache::CachedCallResolutionInput>,
+    Option<cache::CachedResolutionFile>,
+)> {
     let flags = index_feature_flags();
     let is_jsx_like_file = path
         .extension()
@@ -15727,15 +15840,28 @@ pub fn index_file(
         }
     }
 
-    Ok(IndexResult {
-        files: result_files,
-        nodes: final_nodes,
-        edges: result_edges,
-        occurrences: result_occurrences,
-        component_access,
-        callable_projection_states,
-        impl_anchor_node_ids,
-    })
+    let resolution_inputs = proof_resolution::collect_call_resolution_inputs(
+        &tree,
+        source,
+        language_config.language_name,
+        &resolution_parser_fingerprint(language_config),
+        file_id,
+        &final_nodes,
+    );
+
+    Ok((
+        IndexResult {
+            files: result_files,
+            nodes: final_nodes,
+            edges: result_edges,
+            occurrences: result_occurrences,
+            component_access,
+            callable_projection_states,
+            impl_anchor_node_ids,
+        },
+        resolution_inputs.calls,
+        resolution_inputs.file,
+    ))
 }
 
 /// Return the public language-support profile for a file extension.

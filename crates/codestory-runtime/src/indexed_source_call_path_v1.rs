@@ -40,7 +40,8 @@ use codestory_agent::proof_qualification_test_support::{
     check_built_call_path_integration, diagnose_raw_call_edge, project_internal_call_path_result,
 };
 use codestory_contracts::api::ApiError;
-use codestory_contracts::graph::{Node, NodeId, NodeKind, ResolutionCertainty};
+use codestory_contracts::graph::{Node, NodeId, NodeKind};
+use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
 use codestory_store::{FileInfo, IndexPublicationRecord, Store};
 use codestory_workspace::{
     ProjectRelativePathResolution, WorkspacePathIdentity, project_identity_v3,
@@ -94,6 +95,7 @@ pub enum SourceBindingFailure {
     WorkingTreeReadFailed,
     WorkingTreeHashMismatch,
     InvalidUtf8,
+    ExactCallsiteMismatch,
     LineMissing,
     LineOverLimit,
 }
@@ -101,8 +103,15 @@ pub enum SourceBindingFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CandidateFailure {
     RawAdmission(RawAdmissionFailure),
+    ResolutionFact(ResolutionFactFailure),
     Containment(ContainmentFailure),
     SourceBinding(SourceBindingFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResolutionFactFailure {
+    Missing,
+    Inconsistent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +123,7 @@ pub struct CandidateFailureHistogram {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateGate {
     RawAdmission,
+    ResolutionFact,
     Containment,
     SourceBinding,
     Line,
@@ -183,10 +193,12 @@ pub struct ObservedIntegratedProjectedCallPathResult {
 struct StepTraceAccumulator {
     candidate_edge_ids: Vec<codestory_contracts::graph::EdgeId>,
     raw_survivors: Vec<codestory_contracts::graph::EdgeId>,
+    resolution_fact_survivors: Vec<codestory_contracts::graph::EdgeId>,
     containment_survivors: Vec<codestory_contracts::graph::EdgeId>,
     source_survivors: Vec<codestory_contracts::graph::EdgeId>,
     admitted: Vec<codestory_contracts::graph::EdgeId>,
     raw_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+    resolution_fact_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
     containment_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
     source_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
     line_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
@@ -211,6 +223,17 @@ impl StepTraceAccumulator {
     ) {
         self.containment_failures
             .entry(CandidateFailure::Containment(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn reject_resolution_fact(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: ResolutionFactFailure,
+    ) {
+        self.resolution_fact_failures
+            .entry(CandidateFailure::ResolutionFact(reason))
             .or_default()
             .push(edge_id);
     }
@@ -246,6 +269,11 @@ impl StepTraceAccumulator {
             StepQualificationOutcome::FirstZeroSurvivor {
                 gate: CandidateGate::RawAdmission,
                 histogram: failure_histogram(self.raw_failures),
+            }
+        } else if self.resolution_fact_survivors.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::ResolutionFact,
+                histogram: failure_histogram(self.resolution_fact_failures),
             }
         } else if self.containment_survivors.is_empty() {
             StepQualificationOutcome::FirstZeroSurvivor {
@@ -353,6 +381,26 @@ where
         generation_id: publication.generation_id.clone(),
         run_id: publication.run_id.clone(),
     };
+    if store
+        .validate_proof_resolution_publication(publication)
+        .is_err()
+    {
+        return Ok(ObservedBuiltCallPathFacts {
+            built: BuiltCallPathFacts {
+                publication: proof_publication,
+                facts: Vec::new(),
+                receipts: Vec::new(),
+                gaps: Vec::new(),
+                unavailable: vec![UnavailableReason::ProofSemanticProjectionUnavailable],
+            },
+            trace: ProofQualificationTrace {
+                selectors: Vec::new(),
+                selector_early_return: true,
+                steps: Vec::new(),
+                finalization: FinalizationTrace::NotRun,
+            },
+        });
+    }
     let files = store.files().inventory().map_err(store_error)?;
     let file_rows = store.files().get_files().map_err(store_error)?;
     let mut path_identities = OperationPathIdentityResolver::native();
@@ -584,6 +632,20 @@ where
                     continue;
                 }
             };
+            let Some(resolution_fact) = store
+                .get_exact_proof_resolution_fact_by_edge(edge.id)
+                .map_err(store_error)?
+            else {
+                step_trace.reject_resolution_fact(edge.id, ResolutionFactFailure::Missing);
+                continue;
+            };
+            if !resolution_fact_matches_raw_edge(&resolution_fact, &admitted, source_id, target_id)
+            {
+                step_unavailable.push(UnavailableReason::ProofSemanticProjectionUnavailable);
+                step_trace.reject_resolution_fact(edge.id, ResolutionFactFailure::Inconsistent);
+                continue;
+            }
+            step_trace.resolution_fact_survivors.push(edge.id);
             if !is_callable(source_node.kind) || !is_callable(target_node.kind) {
                 step_trace.reject_containment(edge.id, ContainmentFailure::Missing);
                 continue;
@@ -632,6 +694,11 @@ where
                 step_trace.reject_source(edge.id, SourceBindingFailure::StoredHashAbsent);
                 continue;
             };
+            if resolution_fact.callsite.source_sha256 != indexed_hash {
+                step_unavailable.push(UnavailableReason::ProofSemanticProjectionUnavailable);
+                step_trace.reject_source(edge.id, SourceBindingFailure::StoredHashAbsent);
+                continue;
+            }
             let bound = match bind_source_once(
                 project_root,
                 file_row,
@@ -658,6 +725,25 @@ where
                 step_trace.reject_line(edge.id, SourceBindingFailure::LineMissing);
                 continue;
             };
+            let exact_start = usize::try_from(resolution_fact.callsite.start_byte).ok();
+            let exact_end = usize::try_from(resolution_fact.callsite.end_byte_exclusive).ok();
+            let expected_exact_start = resolution_fact
+                .callsite
+                .column
+                .checked_sub(1)
+                .and_then(|column| usize::try_from(column).ok())
+                .and_then(|column| byte_start.checked_add(column));
+            if exact_start != expected_exact_start
+                || exact_end.is_none_or(|end| end > byte_end)
+                || exact_start
+                    .zip(exact_end)
+                    .and_then(|(start, end)| bound.bytes.get(start..end))
+                    != Some(resolution_fact.callsite.raw_target.as_bytes())
+            {
+                step_unavailable.push(UnavailableReason::ProofSemanticProjectionUnavailable);
+                step_trace.reject_line(edge.id, SourceBindingFailure::ExactCallsiteMismatch);
+                continue;
+            }
             if byte_end - byte_start > MAX_LINE_WINDOW_BYTES {
                 step_gaps.push(FactBuildGap::SourceWindowTooLarge { step_index });
                 step_trace.reject_line(edge.id, SourceBindingFailure::LineOverLimit);
@@ -680,6 +766,7 @@ where
                 source_id.0,
                 target_id.0,
                 indexed_hash,
+                &resolution_fact,
             );
             let receipt_ref = ReceiptRef {
                 receipt_id,
@@ -689,7 +776,9 @@ where
                 receipt: receipt_ref.clone(),
                 source: source.clone(),
                 target: target.clone(),
-                certainty: ResolutionCertainty::Certain,
+                resolution_fact_id: resolution_fact.fact_id,
+                resolution_evidence_sha256: resolution_fact.provenance.evidence_sha256,
+                exact_callsite_start_byte: resolution_fact.callsite.start_byte,
                 callsite_identity: admitted.callsite_identity,
                 column_or_ordinal: admitted.column_or_ordinal,
                 containment,
@@ -1250,6 +1339,7 @@ fn receipt_id(
     source_id: i64,
     target_id: i64,
     indexed_hash: &str,
+    resolution_fact: &CallResolutionFact,
 ) -> String {
     let mut digest = Sha256::new();
     digest.update(RECEIPT_DOMAIN);
@@ -1264,11 +1354,31 @@ fn receipt_id(
         indexed_hash.as_bytes(),
         &admitted.line.to_le_bytes(),
         admitted.callsite_identity.as_bytes(),
+        resolution_fact.fact_id.as_bytes(),
+        resolution_fact.provenance.evidence_sha256.as_bytes(),
+        &resolution_fact.callsite.start_byte.to_le_bytes(),
     ] {
         digest.update((part.len() as u64).to_le_bytes());
         digest.update(part);
     }
     format!("indexed-call-edge:{:x}", digest.finalize())
+}
+
+fn resolution_fact_matches_raw_edge(
+    fact: &CallResolutionFact,
+    admitted: &AdmittedRawCallEdge,
+    source: NodeId,
+    target: NodeId,
+) -> bool {
+    fact.status == ProofResolutionStatus::Exact
+        && fact.edge_id == Some(admitted.edge_id)
+        && fact.caller == source
+        && fact.target == Some(target)
+        && fact.raw_edge_target == Some(admitted.raw_target)
+        && fact.raw_callsite_identity.as_deref() == Some(admitted.callsite_identity.as_str())
+        && fact.callsite.file_id.0 == admitted.file_node_id.0
+        && fact.callsite.line == admitted.line
+        && fact.lookup_domain_complete
 }
 
 fn stored_absolute(project_root: &Path, stored: &Path) -> Option<PathBuf> {
@@ -1316,11 +1426,17 @@ mod tests {
     };
     use codestory_contracts::api::IndexMode;
     use codestory_contracts::events::EventBus;
-    use codestory_contracts::graph::{
-        CallableProjectionState, Edge, EdgeId, EdgeKind, Node, ResolutionCertainty,
+    use codestory_contracts::graph::{CallableProjectionState, Edge, EdgeId, EdgeKind, Node};
+    use codestory_contracts::proof_resolution::{
+        CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
+        ExactCallsite, FileId, INTERNAL_RESOLUTION_PRODUCER, PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+        ProofResolutionAdapter, ProofResolutionProjection, ProofResolutionReason,
+        ResolutionEvidence, ResolutionProvenance,
     };
-    use codestory_indexer::WorkspaceIndexer;
-    use codestory_store::{FileInfo, FileRole, IndexPublicationMode};
+    use codestory_indexer::{
+        WorkspaceIndexer, build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+    };
+    use codestory_store::{FileInfo, FileRole, IndexPublicationMode, seal_call_resolution_fact};
     use codestory_workspace::{BuildMode, RefreshInfo};
     use serde_json::json;
     use tempfile::TempDir;
@@ -1530,20 +1646,42 @@ mod tests {
         store
             .insert_node(&node(3, NodeKind::FUNCTION, "target", "target-id", 1, 2, 2))
             .unwrap();
+        let target_column = bytes
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| {
+                line.windows("target".len())
+                    .position(|window| window == b"target")
+            })
+            .and_then(|column| u32::try_from(column + 1).ok())
+            .unwrap_or(1);
+        store
+            .insert_node(&Node {
+                id: NodeId(30),
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "target".to_owned(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(NodeId(1)),
+                start_line: Some(1),
+                start_col: Some(target_column),
+                end_line: Some(1),
+                end_col: target_column.checked_add(6),
+            })
+            .unwrap();
         store
             .insert_edge(&Edge {
                 id: EdgeId(10),
                 source: NodeId(2),
-                target: NodeId(3),
+                target: NodeId(30),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
-                callsite_identity: Some("1:1:0:3|rust".to_owned()),
+                callsite_identity: Some("1:1:1:30|rust".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         store
@@ -1560,6 +1698,7 @@ mod tests {
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: 1,
         };
+        publish_manual_resolution_facts(&mut store, &publication, &[EdgeId(10)]);
         let project_id = project_identity_v3(&root).project_id;
         Fixture {
             _root: temp,
@@ -1572,6 +1711,119 @@ mod tests {
         }
     }
 
+    fn publish_manual_resolution_facts(
+        store: &mut Store,
+        publication: &IndexPublicationRecord,
+        edge_ids: &[EdgeId],
+    ) {
+        let nodes = store
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let facts: Vec<CallResolutionFact> = store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge_ids.contains(&edge.id))
+            .map(|edge| {
+                let file_id = edge.file_node_id.unwrap();
+                let source_sha256 = store.get_file_content_hash(file_id.0).unwrap().unwrap();
+                let caller = edge.effective_source();
+                let target = edge.effective_target();
+                let column_or_ordinal: u32 = edge
+                    .callsite_identity
+                    .as_deref()
+                    .and_then(|identity| identity.split(':').nth(2))
+                    .and_then(|column| column.parse().ok())
+                    .unwrap();
+                let column = store
+                    .get_node(edge.target)
+                    .unwrap()
+                    .and_then(|node| node.start_col)
+                    .unwrap_or(column_or_ordinal);
+                let raw_target = nodes
+                    .get(&edge.target)
+                    .map(|node| node.serialized_name.clone())
+                    .unwrap_or_else(|| "target".to_owned());
+                let file_path = store
+                    .get_files()
+                    .unwrap()
+                    .into_iter()
+                    .find(|file| file.id == file_id.0)
+                    .unwrap()
+                    .path;
+                let source = fs::read(file_path).unwrap();
+                let call_line = edge.line.unwrap();
+                let line_start = if call_line == 1 {
+                    0
+                } else {
+                    source
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, byte)| **byte == b'\n')
+                        .nth(call_line.saturating_sub(2) as usize)
+                        .map_or(0, |(index, _)| index + 1)
+                };
+                let expected_start = line_start + column.saturating_sub(1) as usize;
+                let start_byte = expected_start as u64;
+                seal_call_resolution_fact(CallResolutionFact {
+                    fact_id: String::new(),
+                    edge_id: Some(edge.id),
+                    raw_edge_target: Some(edge.target),
+                    raw_callsite_identity: edge.callsite_identity.clone(),
+                    callsite: ExactCallsite {
+                        file_id: FileId(file_id.0),
+                        source_sha256: source_sha256.clone(),
+                        start_byte,
+                        end_byte_exclusive: start_byte + raw_target.len() as u64,
+                        line: edge.line.unwrap(),
+                        column,
+                        callee_form: CalleeForm::Identifier,
+                        raw_target,
+                    },
+                    caller,
+                    target: Some(target),
+                    status: ProofResolutionStatus::Exact,
+                    reason: ProofResolutionReason::ExactResolution,
+                    evidence_chain: vec![ResolutionEvidence::SameFileDeclaration {
+                        declaration: target,
+                    }],
+                    lookup_domain_complete: true,
+                    provenance: ResolutionProvenance {
+                        producer: INTERNAL_RESOLUTION_PRODUCER.to_owned(),
+                        fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+                        algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
+                        language_adapter: "rust".to_owned(),
+                        language_adapter_version: "test-v1".to_owned(),
+                        parser_fingerprint: "2".repeat(64),
+                        dependency_file_hashes: vec![DependencyFileHash {
+                            file_id: FileId(file_id.0),
+                            source_sha256,
+                        }],
+                        evidence_sha256: String::new(),
+                    },
+                })
+                .unwrap()
+            })
+            .collect();
+        let funnel = build_proof_resolution_funnel(&facts);
+        store
+            .replace_proof_resolution_projection(
+                publication,
+                &ProofResolutionProjection {
+                    adapter_roster: vec![ProofResolutionAdapter {
+                        language: "rust".to_owned(),
+                        adapter_version: "test-v1".to_owned(),
+                    }],
+                    facts,
+                    funnel,
+                },
+            )
+            .unwrap();
+    }
+
     fn add_duplicate_call_edges(fixture: &mut Fixture, count: u32) {
         for offset in 0..count {
             fixture
@@ -1582,13 +1834,12 @@ mod tests {
                     target: NodeId(3),
                     kind: EdgeKind::CALL,
                     file_node_id: Some(NodeId(1)),
-                    line: Some(1),
+                    line: Some(2),
                     resolved_source: Some(NodeId(2)),
                     resolved_target: Some(NodeId(3)),
-                    confidence: Some(1.0),
-                    certainty: Some(ResolutionCertainty::Certain),
-                    callsite_identity: Some(format!("1:1:{}:3|rust", offset + 1)),
+                    callsite_identity: Some(format!("1:2:{}:3|rust", offset + 1)),
                     candidate_targets: Vec::new(),
+                    ..Default::default()
                 })
                 .unwrap();
         }
@@ -1627,76 +1878,22 @@ mod tests {
                 None,
             )
             .unwrap();
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "source-built-generation-1".to_owned(),
+            run_id: "source-built-run-1".to_owned(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        rematerialize_proof_resolution_projection(&mut store, &publication).unwrap();
         SourceBuiltFixture {
             _root: temp,
             root: root.clone(),
             source_path,
             store,
-            publication: IndexPublicationRecord {
-                generation: 1,
-                generation_id: "source-built-generation-1".to_owned(),
-                run_id: "source-built-run-1".to_owned(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            },
+            publication,
             project_id: project_identity_v3(&root).project_id,
         }
-    }
-
-    fn store_with_adversarial_call_edge_ids(fixture: &SourceBuiltFixture) -> Store {
-        let mut edges = fixture.store.get_edges().unwrap();
-        let mut call_offsets = edges
-            .iter()
-            .enumerate()
-            .filter(|(_, edge)| edge.kind == EdgeKind::CALL)
-            .map(|(offset, edge)| {
-                let RawCallEdgeAdmission::Admitted(admitted) =
-                    admit_raw_call_edge(edge, edge.effective_source(), edge.effective_target())
-                else {
-                    panic!("source-built call edge must be admitted: {edge:?}");
-                };
-                (offset, admitted.column_or_ordinal)
-            })
-            .collect::<Vec<_>>();
-        call_offsets.sort_by_key(|(_, ordinal)| *ordinal);
-        assert_eq!(call_offsets.len(), 2, "two real source-built calls");
-        assert_eq!(
-            call_offsets
-                .iter()
-                .map(|(_, ordinal)| *ordinal)
-                .collect::<Vec<_>>(),
-            [1, 2],
-            "the real indexer must authenticate source occurrence order"
-        );
-        edges[call_offsets[0].0].id = EdgeId(200);
-        edges[call_offsets[1].0].id = EdgeId(100);
-
-        let mut store = Store::new_in_memory().unwrap();
-        let files = fixture.store.files().get_files().unwrap();
-        for file in &files {
-            store.insert_file(file).unwrap();
-            let content_hash = fixture.store.get_file_content_hash(file.id).unwrap();
-            store
-                .update_file_metadata(file, content_hash.as_deref())
-                .unwrap();
-        }
-        store
-            .insert_nodes_batch(&fixture.store.get_nodes().unwrap())
-            .unwrap();
-        store.insert_edges_batch(&edges).unwrap();
-        store
-            .insert_occurrences_batch(&fixture.store.get_occurrences().unwrap())
-            .unwrap();
-        for file in files {
-            let projections = fixture
-                .store
-                .get_callable_projection_states_for_file(file.id)
-                .unwrap();
-            store
-                .upsert_callable_projection_states(&projections)
-                .unwrap();
-        }
-        store
     }
 
     fn source_callable(store: &Store, terminal_name: &str) -> Node {
@@ -1840,14 +2037,11 @@ mod tests {
             exact_observed.trace.steps[0].candidate_edge_ids.len(),
             MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
         );
-        assert_eq!(
-            exact_observed.built.receipts.len(),
-            MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
-        );
+        assert_eq!(exact_observed.built.receipts.len(), 1);
         assert!(matches!(
             &exact_observed.trace.steps[0].outcome,
             StepQualificationOutcome::Admitted { edge_ids }
-                if edge_ids.len() == MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
+                if edge_ids == &[EdgeId(10)]
         ));
 
         let mut over = fixture(b"fn source() { target(); }\nfn target() {}\n");
@@ -1940,10 +2134,9 @@ mod tests {
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(4)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
                 callsite_identity: Some("1:1:0:4|alternatives".to_owned()),
                 candidate_targets: vec![NodeId(3)],
+                ..Default::default()
             },
             Edge {
                 id: EdgeId(20),
@@ -1954,10 +2147,9 @@ mod tests {
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(4)),
-                confidence: Some(0.7),
-                certainty: Some(ResolutionCertainty::Probable),
                 callsite_identity: Some("1:1:0:4|probable".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             },
         ] {
             raw_fixture.store.insert_edge(&edge).unwrap();
@@ -1988,27 +2180,11 @@ mod tests {
                 step_index: 0,
                 candidate_edge_ids: vec![EdgeId(10), EdgeId(20), EdgeId(30)],
                 outcome: StepQualificationOutcome::FirstZeroSurvivor {
-                    gate: CandidateGate::RawAdmission,
-                    histogram: vec![
-                        CandidateFailureHistogram {
-                            reason: CandidateFailure::RawAdmission(
-                                RawAdmissionFailure::CertaintyProbable,
-                            ),
-                            edge_ids: vec![EdgeId(20)],
-                        },
-                        CandidateFailureHistogram {
-                            reason: CandidateFailure::RawAdmission(
-                                RawAdmissionFailure::WrongEffectiveTarget,
-                            ),
-                            edge_ids: vec![EdgeId(10)],
-                        },
-                        CandidateFailureHistogram {
-                            reason: CandidateFailure::RawAdmission(
-                                RawAdmissionFailure::CandidateAlternativesRetained,
-                            ),
-                            edge_ids: vec![EdgeId(30)],
-                        },
-                    ],
+                    gate: CandidateGate::ResolutionFact,
+                    histogram: vec![CandidateFailureHistogram {
+                        reason: CandidateFailure::ResolutionFact(ResolutionFactFailure::Missing,),
+                        edge_ids: vec![EdgeId(20)],
+                    }],
                 },
             }
         );
@@ -2077,15 +2253,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(source_observed.built, source_product);
+        assert!(source_observed.trace.selector_early_return);
+        assert!(source_observed.trace.steps.is_empty());
         assert_eq!(
-            source_observed.trace.steps[0].outcome,
-            StepQualificationOutcome::FirstZeroSurvivor {
-                gate: CandidateGate::SourceBinding,
-                histogram: vec![CandidateFailureHistogram {
-                    reason: CandidateFailure::SourceBinding(SourceBindingFailure::StoredHashAbsent,),
-                    edge_ids: vec![EdgeId(10)],
-                }],
-            }
+            source_observed.built.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
         );
 
         let mut line_fixture = fixture(b"fn source() { target(); }\nfn target() {}");
@@ -2104,10 +2276,9 @@ mod tests {
                 line: Some(3),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(4)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
                 callsite_identity: Some("1:3:0:4|out-of-range".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         line_fixture
@@ -2137,9 +2308,9 @@ mod tests {
         assert_eq!(
             line_observed.trace.steps[0].outcome,
             StepQualificationOutcome::FirstZeroSurvivor {
-                gate: CandidateGate::Line,
+                gate: CandidateGate::ResolutionFact,
                 histogram: vec![CandidateFailureHistogram {
-                    reason: CandidateFailure::SourceBinding(SourceBindingFailure::LineMissing),
+                    reason: CandidateFailure::ResolutionFact(ResolutionFactFailure::Missing),
                     edge_ids: vec![EdgeId(14)],
                 }],
             }
@@ -2360,15 +2531,131 @@ mod tests {
     }
 
     #[test]
-    fn source_built_same_line_calls_use_source_order_before_adversarial_edge_ids() {
-        let mut fixture = source_built_fixture_with_extension(
-            "cpp",
-            "int target(int value) { return value; }\n\
-             int source() { return target(1) + target(2); }\n",
+    fn source_built_resealed_span_cannot_move_to_an_identical_same_line_token() {
+        let source_text = "fn target() {}\n\
+                           fn source() { target(); let _label = \"target\"; }\n";
+        let mut fixture = source_built_fixture(source_text);
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let (contract, _hashes, _rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+        let manifest = fixture
+            .store
+            .get_proof_resolution_publication()
+            .unwrap()
+            .unwrap();
+        let mut facts = fixture.store.get_proof_resolution_facts().unwrap();
+        let exact = facts
+            .iter_mut()
+            .find(|fact| fact.status == ProofResolutionStatus::Exact)
+            .expect("one exact source-built call");
+        let authentic_start = exact.callsite.start_byte;
+        let shifted_start = u64::try_from(source_text.rfind("target").unwrap()).unwrap();
+        assert!(shifted_start > authentic_start);
+        exact.callsite.start_byte = shifted_start;
+        exact.callsite.end_byte_exclusive = shifted_start + exact.callsite.raw_target.len() as u64;
+        *exact = seal_call_resolution_fact(exact.clone()).unwrap();
+        let funnel = build_proof_resolution_funnel(&facts);
+        fixture
+            .store
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM proof_resolution_fact; DELETE FROM proof_resolution_publication;",
+            )
+            .unwrap();
+        fixture
+            .store
+            .replace_proof_resolution_projection(
+                &fixture.publication,
+                &ProofResolutionProjection {
+                    adapter_roster: manifest.adapter_roster,
+                    facts,
+                    funnel,
+                },
+            )
+            .expect("the store cannot inspect source bytes, so runtime must close the span");
+
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed.built.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
+        );
+        assert!(observed.built.receipts.is_empty());
+        assert!(matches!(
+            observed.trace.steps[0].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Line,
+                ref histogram,
+            } if histogram.iter().any(|failure| {
+                failure.reason
+                    == CandidateFailure::SourceBinding(
+                        SourceBindingFailure::ExactCallsiteMismatch,
+                    )
+            })
+        ));
+    }
+
+    #[test]
+    fn source_built_same_line_repeated_calls_build_distinct_receipts() {
+        let fixture = source_built_fixture(
+            "fn target() {}\n\
+             fn source() { target(); target(); }\n",
         );
         let source = source_callable(&fixture.store, "source");
         let target = source_callable(&fixture.store, "target");
-        fixture.store = store_with_adversarial_call_edge_ids(&fixture);
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+
+        let result = evaluate_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let receipts = &result.built_facts().receipts;
+        assert_eq!(receipts.len(), 2, "one receipt per exact repeated callsite");
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.receipt.edge_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "repeated callsites must not reuse an ordinary edge"
+        );
+        let earliest = receipts
+            .iter()
+            .min_by_key(|receipt| receipt.exact_callsite_start_byte)
+            .unwrap();
+        assert!(matches!(
+            result.disposition(),
+            ProofDisposition::ContractProven { receipts, .. }
+                if receipts == &[earliest.receipt.clone()]
+        ));
+    }
+
+    #[test]
+    fn source_built_exact_span_accepts_byte_columns_after_multibyte_and_crlf_lines() {
+        let source_text = "fn target() {}\r\nfn source() { let _accent = \"é\"; target(); }\r\n";
+        let fixture = source_built_fixture(source_text);
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
         let (contract, hashes, rendering) =
             validated_contract(canonical_id(&source), &[canonical_id(&target)]);
 
@@ -2386,12 +2673,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.built_facts().receipts.len(), 2);
         assert!(matches!(
             result.disposition(),
-            ProofDisposition::ContractProven { receipts, .. }
-                if receipts.len() == 1 && receipts[0].edge_id == "200"
+            ProofDisposition::ContractProven { .. }
         ));
+        assert_eq!(
+            result.built_facts().receipts[0].exact_callsite_start_byte,
+            u64::try_from(source_text.rfind("target").unwrap()).unwrap()
+        );
     }
 
     #[test]
@@ -2509,11 +2798,9 @@ mod tests {
             .into_iter()
             .find(|edge| edge.kind == EdgeKind::CALL)
             .unwrap();
-        let mut uncertain = raw_edge.clone();
-        uncertain.certainty = Some(ResolutionCertainty::Uncertain);
         let mut ambiguous = raw_edge.clone();
         ambiguous.candidate_targets = vec![nodes[2].id];
-        for (mutation, edge) in [("uncertain", &uncertain), ("ambiguous", &ambiguous)] {
+        for (mutation, edge) in [("ambiguous", &ambiguous)] {
             assert_eq!(
                 admit_raw_call_edge(edge, edge.effective_source(), edge.effective_target()),
                 RawCallEdgeAdmission::Rejected
@@ -2865,13 +3152,12 @@ mod tests {
                 target: NodeId(3),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
-                line: Some(1),
+                line: Some(2),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
-                callsite_identity: Some("1:1:1:3|rust".to_owned()),
+                callsite_identity: Some("1:2:1:3|rust".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         fixture
@@ -2900,10 +3186,9 @@ mod tests {
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
                 callsite_identity: Some("6:1:0:3|wrong-file".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         let reads = Cell::new(0);
@@ -2921,14 +3206,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(reads.get(), 1);
-        assert_eq!(built.facts.len(), 2);
+        assert_eq!(built.facts.len(), 1);
         assert!(built.gaps.is_empty());
         assert!(built.unavailable.is_empty());
-        assert_eq!(built.receipts.len(), 2);
+        assert_eq!(built.receipts.len(), 1);
         let receipt = &built.receipts[0];
         assert_eq!(receipt.receipt.edge_id, "10");
-        assert_eq!(receipt.certainty, ResolutionCertainty::Certain);
-        assert_eq!(receipt.callsite_identity, "1:1:0:3|rust");
+        assert_eq!(receipt.resolution_fact_id.len(), 64);
+        assert_eq!(receipt.resolution_evidence_sha256.len(), 64);
+        assert_eq!(receipt.callsite_identity, "1:1:1:30|rust");
         assert_eq!(receipt.containment.owner_node_id, NodeId(2));
         assert_eq!(receipt.line_window.kind, "indexed_line_v1");
         assert_eq!(receipt.line_window.text, "fn source() { target(); }\r\n");
@@ -2972,7 +3258,7 @@ mod tests {
         assert_eq!(reads.get(), 0);
         assert_eq!(
             missing_result.unavailable,
-            vec![UnavailableReason::SourceNotBoundToPublication]
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
         );
 
         let hash_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
@@ -3024,13 +3310,12 @@ mod tests {
                 target: NodeId(3),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
-                line: Some(1),
+                line: Some(2),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
-                callsite_identity: Some("1:1:1:3|second-callsite".to_owned()),
+                callsite_identity: Some("1:2:1:3|second-callsite".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         fs::write(&fixture.source_path, [0xff, b'\n']).unwrap();
@@ -3155,10 +3440,9 @@ mod tests {
                 line: Some(3),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(4)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
                 callsite_identity: Some("1:3:0:4|out-of-range".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         fixture
@@ -3177,7 +3461,7 @@ mod tests {
         assert!(built.facts.is_empty());
         assert_eq!(
             built.gaps,
-            vec![FactBuildGap::SourceLineOutOfRange { step_index: 0 }]
+            vec![FactBuildGap::DirectCallMissing { step_index: 0 }]
         );
     }
 
@@ -3187,7 +3471,9 @@ mod tests {
             (MAX_LINE_WINDOW_BYTES, true),
             (MAX_LINE_WINDOW_BYTES + 1, false),
         ] {
-            let fixture = fixture(&vec![b'a'; length]);
+            let mut bytes = vec![b'a'; length];
+            bytes[.."target".len()].copy_from_slice(b"target");
+            let fixture = fixture(&bytes);
             let built = build_from_store(
                 &fixture.store,
                 &fixture.root,
@@ -3224,10 +3510,9 @@ mod tests {
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(2)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
                 callsite_identity: Some("1:1:0:2|synthetic".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         let recursive = contract("source-id", &["source-id"]);
@@ -3240,8 +3525,11 @@ mod tests {
             |path| fs::read(path),
         )
         .unwrap();
-        assert_eq!(self_edge.facts.len(), 1);
-        assert!(self_edge.gaps.is_empty());
+        assert!(self_edge.facts.is_empty());
+        assert_eq!(
+            self_edge.gaps,
+            vec![FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 }]
+        );
 
         let missing = contract("target-id", &["source-id"]);
         let absent = build_from_store(

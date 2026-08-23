@@ -576,6 +576,23 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
+              "const": "resolution_fact",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/ResolutionFactFailureV1"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
               "const": "containment",
               "type": "string"
             },
@@ -611,6 +628,7 @@
     "CandidateGateV1": {
       "enum": [
         "raw_admission",
+        "resolution_fact",
         "containment",
         "source_binding",
         "line"
@@ -2060,6 +2078,258 @@
       ],
       "type": "object"
     },
+    "ResolutionAdapterReportV1": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_version": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "language",
+        "adapter_version"
+      ],
+      "type": "object"
+    },
+    "ResolutionFactFailureV1": {
+      "enum": [
+        "missing",
+        "inconsistent"
+      ],
+      "type": "string"
+    },
+    "ResolutionFunnelConversionsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_supported_per_syntax_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "authoritative_receipts_per_proof_shape_admitted_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "complete_proofs_per_authoritative_receipts_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exact_call_linked_per_exact_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exact_per_adapter_supported_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "proof_shape_admitted_per_exact_call_linked_milli": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "adapter_supported_per_syntax_milli",
+        "exact_per_adapter_supported_milli",
+        "exact_call_linked_per_exact_milli",
+        "proof_shape_admitted_per_exact_call_linked_milli",
+        "authoritative_receipts_per_proof_shape_admitted_milli",
+        "complete_proofs_per_authoritative_receipts_milli"
+      ],
+      "type": "object"
+    },
+    "ResolutionFunnelCountsV1": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_supported": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ambiguous": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "authoritative_receipts": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "complete_proofs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exact": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exact_call_linked": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "incomplete_domain": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "missing_binding": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "proof_shape_admitted": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "syntax_calls": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unsupported": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "syntax_calls",
+        "adapter_supported",
+        "exact",
+        "ambiguous",
+        "missing_binding",
+        "incomplete_domain",
+        "unsupported",
+        "exact_call_linked",
+        "proof_shape_admitted",
+        "authoritative_receipts",
+        "complete_proofs"
+      ],
+      "type": "object"
+    },
+    "ResolutionFunnelReportV1": {
+      "additionalProperties": false,
+      "properties": {
+        "projections": {
+          "items": {
+            "$ref": "#/$defs/ResolutionProjectionReceiptV1"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "items": {
+            "$ref": "#/$defs/ResolutionFunnelRowV1"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "projections",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "ResolutionFunnelRowV1": {
+      "additionalProperties": false,
+      "properties": {
+        "callee_form": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conversions": {
+          "$ref": "#/$defs/ResolutionFunnelConversionsV1"
+        },
+        "counts": {
+          "$ref": "#/$defs/ResolutionFunnelCountsV1"
+        },
+        "language": {
+          "type": "string"
+        },
+        "primary_evidence_kind": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repository_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository_id",
+        "language",
+        "counts",
+        "conversions"
+      ],
+      "type": "object"
+    },
+    "ResolutionProjectionReceiptV1": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_roster": {
+          "items": {
+            "$ref": "#/$defs/ResolutionAdapterReportV1"
+          },
+          "type": "array"
+        },
+        "core_generation_id": {
+          "type": "string"
+        },
+        "core_published_at_epoch_ms": {
+          "type": "string"
+        },
+        "core_run_id": {
+          "type": "string"
+        },
+        "fact_count": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fact_digest": {
+          "type": "string"
+        },
+        "fact_schema_version": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "repository_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "repository_id",
+        "core_generation_id",
+        "core_run_id",
+        "core_published_at_epoch_ms",
+        "fact_schema_version",
+        "fact_count",
+        "fact_digest",
+        "adapter_roster"
+      ],
+      "type": "object"
+    },
     "ResolvedNodeIdentityV1": {
       "additionalProperties": false,
       "properties": {
@@ -2181,6 +2451,7 @@
         "stored_hash_absent",
         "working_tree_read_failed",
         "working_tree_hash_mismatch",
+        "exact_callsite_mismatch",
         "invalid_utf8",
         "line_missing",
         "line_over_limit"
@@ -2567,7 +2838,7 @@
       "type": "string"
     }
   },
-  "$id": "codestory.proof-availability-report/v3",
+  "$id": "codestory.proof-availability-report/v4",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -2600,8 +2871,11 @@
       "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$",
       "type": "string"
     },
+    "resolution_funnel": {
+      "$ref": "#/$defs/ResolutionFunnelReportV1"
+    },
     "schema": {
-      "const": "codestory.proof-availability-report/v3",
+      "const": "codestory.proof-availability-report/v4",
       "type": "string"
     },
     "trails": {
@@ -2621,7 +2895,8 @@
     "inventory",
     "trails",
     "cases",
-    "failure_funnel"
+    "failure_funnel",
+    "resolution_funnel"
   ],
   "title": "QualificationSummaryV1",
   "type": "object"

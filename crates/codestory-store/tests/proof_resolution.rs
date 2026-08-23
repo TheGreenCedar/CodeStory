@@ -1,0 +1,775 @@
+use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
+use codestory_contracts::proof_resolution::{
+    CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
+    ExactCallsite, FileId, INTERNAL_RESOLUTION_PRODUCER, PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+    ProofResolutionAdapter, ProofResolutionFunnelCounts, ProofResolutionFunnelRow,
+    ProofResolutionProjection, ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence,
+    ResolutionEvidenceKind, ResolutionProvenance,
+};
+use codestory_store::{
+    FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
+    seal_call_resolution_fact,
+};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+fn publication() -> IndexPublicationRecord {
+    IndexPublicationRecord {
+        generation: 1,
+        generation_id: "generation-1".to_owned(),
+        run_id: "run-1".to_owned(),
+        mode: IndexPublicationMode::Full,
+        published_at_epoch_ms: 123,
+    }
+}
+
+fn exact_fact(edge_id: EdgeId) -> CallResolutionFact {
+    seal_call_resolution_fact(CallResolutionFact {
+        fact_id: String::new(),
+        edge_id: Some(edge_id),
+        raw_edge_target: Some(NodeId(4)),
+        raw_callsite_identity: Some("1:2:1:4".to_owned()),
+        callsite: ExactCallsite {
+            file_id: FileId(1),
+            source_sha256: "a".repeat(64),
+            start_byte: 24,
+            end_byte_exclusive: 32,
+            line: 2,
+            column: 15,
+            callee_form: CalleeForm::Identifier,
+            raw_target: "callee".to_owned(),
+        },
+        caller: NodeId(2),
+        target: Some(NodeId(3)),
+        status: ProofResolutionStatus::Exact,
+        reason: ProofResolutionReason::ExactResolution,
+        evidence_chain: vec![ResolutionEvidence::SameFileDeclaration {
+            declaration: NodeId(3),
+        }],
+        lookup_domain_complete: true,
+        provenance: ResolutionProvenance {
+            producer: INTERNAL_RESOLUTION_PRODUCER.to_owned(),
+            fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+            algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
+            language_adapter: "rust".to_owned(),
+            language_adapter_version: "rust-exact-v1".to_owned(),
+            parser_fingerprint: "1".repeat(64),
+            dependency_file_hashes: vec![DependencyFileHash {
+                file_id: FileId(1),
+                source_sha256: "a".repeat(64),
+            }],
+            evidence_sha256: String::new(),
+        },
+    })
+    .expect("seal fact")
+}
+
+fn repeated_exact_fact(index: u32) -> CallResolutionFact {
+    let mut fact = exact_fact(EdgeId(7 + i64::from(index)));
+    fact.raw_callsite_identity = Some(format!("1:2:{}:4", index + 1));
+    fact.callsite.start_byte = 24 + u64::from(index) * 10;
+    fact.callsite.end_byte_exclusive = fact.callsite.start_byte + 6;
+    fact.callsite.column = 15 + index * 10;
+    seal_call_resolution_fact(fact).expect("seal repeated fact")
+}
+
+fn incomplete_domain_fact() -> CallResolutionFact {
+    let mut fact = exact_fact(EdgeId(7));
+    fact.edge_id = None;
+    fact.raw_edge_target = None;
+    fact.raw_callsite_identity = None;
+    fact.target = None;
+    fact.status = ProofResolutionStatus::IncompleteDomain;
+    fact.reason = ProofResolutionReason::LookupDomainIncomplete;
+    fact.evidence_chain.clear();
+    fact.lookup_domain_complete = false;
+    seal_call_resolution_fact(fact).expect("seal incomplete-domain fact")
+}
+
+fn projection(facts: Vec<CallResolutionFact>) -> ProofResolutionProjection {
+    let exact_count = u64::try_from(facts.len()).expect("test fact count fits u64");
+    ProofResolutionProjection {
+        adapter_roster: vec![ProofResolutionAdapter {
+            language: "rust".to_owned(),
+            adapter_version: "rust-exact-v1".to_owned(),
+        }],
+        facts,
+        funnel: vec![ProofResolutionFunnelRow {
+            language: "rust".to_owned(),
+            callee_form: Some(CalleeForm::Identifier),
+            evidence_kind: Some(ResolutionEvidenceKind::SameFileDeclaration),
+            counts: ProofResolutionFunnelCounts {
+                syntax_calls: exact_count,
+                adapter_supported: exact_count,
+                exact: exact_count,
+                ambiguous: 0,
+                missing_binding: 0,
+                incomplete_domain: 0,
+                unsupported: 0,
+                exact_call_linked: exact_count,
+                proof_shape_admitted: 0,
+                authoritative_receipts: 0,
+                complete_proofs: 0,
+            },
+        }],
+    }
+}
+
+fn incomplete_domain_projection() -> ProofResolutionProjection {
+    ProofResolutionProjection {
+        adapter_roster: vec![ProofResolutionAdapter {
+            language: "rust".to_owned(),
+            adapter_version: "rust-exact-v1".to_owned(),
+        }],
+        facts: vec![incomplete_domain_fact()],
+        funnel: vec![ProofResolutionFunnelRow {
+            language: "rust".to_owned(),
+            callee_form: Some(CalleeForm::Identifier),
+            evidence_kind: None,
+            counts: ProofResolutionFunnelCounts {
+                syntax_calls: 1,
+                adapter_supported: 1,
+                exact: 0,
+                ambiguous: 0,
+                missing_binding: 0,
+                incomplete_domain: 1,
+                unsupported: 0,
+                exact_call_linked: 0,
+                proof_shape_admitted: 0,
+                authoritative_receipts: 0,
+                complete_proofs: 0,
+            },
+        }],
+    }
+}
+
+fn seed_exact_graph(store: &mut Store) {
+    let file = FileInfo {
+        id: 1,
+        path: "src/lib.rs".into(),
+        language: "rust".to_owned(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 2,
+        file_role: FileRole::Source,
+    };
+    store.insert_file(&file).expect("file");
+    store
+        .update_file_metadata(&file, Some(&"a".repeat(64)))
+        .expect("source hash");
+    for node in [
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_owned(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(2),
+            start_col: Some(1),
+            end_line: Some(2),
+            end_col: Some(40),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "callee".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(1),
+            start_col: Some(1),
+            end_line: Some(1),
+            end_col: Some(20),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "callee".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(2),
+            start_col: Some(15),
+            end_line: Some(2),
+            end_col: Some(21),
+            ..Default::default()
+        },
+    ] {
+        store.insert_node(&node).expect("node");
+    }
+    store
+        .insert_edge(&Edge {
+            id: EdgeId(7),
+            source: NodeId(2),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(3)),
+            callsite_identity: Some("1:2:1:4".to_owned()),
+            ..Default::default()
+        })
+        .expect("edge");
+}
+
+fn seed_repeated_exact_graph(store: &mut Store, fact_count: u32) {
+    seed_exact_graph(store);
+    for index in 1..fact_count {
+        store
+            .insert_edge(&Edge {
+                id: EdgeId(7 + i64::from(index)),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(2),
+                resolved_target: Some(NodeId(3)),
+                callsite_identity: Some(format!("1:2:{}:4", index + 1)),
+                ..Default::default()
+            })
+            .expect("repeated call edge");
+    }
+}
+
+fn graph_read_authorizations_for_projection(fact_count: u32) -> usize {
+    let mut store = Store::new_in_memory().expect("store");
+    seed_repeated_exact_graph(&mut store, fact_count);
+    let graph_reads = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&graph_reads);
+    store
+        .get_connection()
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Read {
+                    table_name: "file" | "node" | "edge",
+                    ..
+                }
+            ) {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+            Authorization::Allow
+        }))
+        .expect("install graph read observer");
+
+    let facts = (0..fact_count).map(repeated_exact_fact).collect();
+    store
+        .replace_proof_resolution_projection(&publication(), &projection(facts))
+        .expect("publish repeated exact facts");
+    store
+        .get_connection()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .expect("remove graph read observer");
+    graph_reads.load(Ordering::Relaxed)
+}
+
+#[test]
+fn schema_32_migration_creates_no_synthetic_proof_publication() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("codestory.db");
+    let store = Store::open(&path).expect("store");
+
+    assert_eq!(codestory_store::CURRENT_SCHEMA_VERSION, 32);
+    assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+}
+
+#[test]
+fn exact_projection_round_trips_with_matching_raw_call_and_deterministic_digest() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("codestory.db");
+    let mut store = Store::open(&path).expect("store");
+    seed_exact_graph(&mut store);
+    let publication = publication();
+    let projection = projection(vec![exact_fact(EdgeId(7))]);
+
+    let first = store
+        .replace_proof_resolution_projection(&publication, &projection)
+        .expect("publish proof projection");
+    store
+        .validate_proof_resolution_publication(&publication)
+        .expect("validate projection");
+    let loaded = store
+        .get_exact_proof_resolution_fact_by_edge(EdgeId(7))
+        .expect("read exact fact")
+        .expect("exact fact");
+
+    assert_eq!(loaded, projection.facts[0]);
+    assert_eq!(first.fact_count, 1);
+    assert_eq!(first.fact_digest.len(), 64);
+    assert_eq!(
+        first,
+        store.get_proof_resolution_publication().unwrap().unwrap()
+    );
+}
+
+#[test]
+fn projection_validation_prepares_graph_reads_once_for_all_exact_facts() {
+    let one_fact_reads = graph_read_authorizations_for_projection(1);
+    let eight_fact_reads = graph_read_authorizations_for_projection(8);
+
+    assert!(one_fact_reads > 0, "the graph read observer must be active");
+    assert_eq!(
+        eight_fact_reads, one_fact_reads,
+        "graph-table reads must be prepared once per projection, not once per fact"
+    );
+}
+
+#[test]
+fn exact_projection_rejects_digest_and_graph_mismatches_without_partial_rows() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("codestory.db");
+    let mut store = Store::open(&path).expect("store");
+    seed_exact_graph(&mut store);
+    let publication = publication();
+    let mut fact = exact_fact(EdgeId(7));
+    fact.provenance.evidence_sha256 = "0".repeat(64);
+
+    let error = store
+        .replace_proof_resolution_projection(&publication, &projection(vec![fact]))
+        .expect_err("digest mismatch must fail");
+    assert!(error.to_string().contains("evidence digest"), "{error}");
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+    assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
+
+    let mut endpoint_mismatch = exact_fact(EdgeId(7));
+    endpoint_mismatch.target = Some(NodeId(2));
+    endpoint_mismatch.evidence_chain = vec![ResolutionEvidence::SameFileDeclaration {
+        declaration: NodeId(2),
+    }];
+    let endpoint_mismatch = seal_call_resolution_fact(endpoint_mismatch).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication, &projection(vec![endpoint_mismatch]))
+        .expect_err("graph mismatch must fail");
+    assert!(error.to_string().contains("ordinary CALL edge"), "{error}");
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+    assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
+
+    let mut callsite_mismatch = exact_fact(EdgeId(7));
+    callsite_mismatch.raw_callsite_identity = Some("1:2:2:4".to_owned());
+    let callsite_mismatch = seal_call_resolution_fact(callsite_mismatch).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication, &projection(vec![callsite_mismatch]))
+        .expect_err("callsite mismatch must fail");
+    assert!(error.to_string().contains("callsite identity"), "{error}");
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+
+    let mut hash_mismatch = exact_fact(EdgeId(7));
+    hash_mismatch.callsite.source_sha256 = "b".repeat(64);
+    hash_mismatch.provenance.dependency_file_hashes[0].source_sha256 = "b".repeat(64);
+    let hash_mismatch = seal_call_resolution_fact(hash_mismatch).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication, &projection(vec![hash_mismatch]))
+        .expect_err("source hash mismatch must fail");
+    assert!(error.to_string().contains("source hash"), "{error}");
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+}
+
+#[test]
+fn resealed_but_semantically_false_evidence_and_funnel_are_rejected() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+
+    let mut wrong_same_file = exact_fact(EdgeId(7));
+    wrong_same_file.evidence_chain = vec![ResolutionEvidence::SameFileDeclaration {
+        declaration: NodeId(2),
+    }];
+    let wrong_same_file = seal_call_resolution_fact(wrong_same_file).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &projection(vec![wrong_same_file]))
+        .expect_err("resealed false same-file evidence must fail");
+    assert!(error.to_string().contains("semantic validator"), "{error}");
+
+    let mut unused_variant = exact_fact(EdgeId(7));
+    unused_variant.evidence_chain = vec![ResolutionEvidence::ConstructorBinding {
+        constructor: NodeId(3),
+    }];
+    let unused_variant = seal_call_resolution_fact(unused_variant).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &projection(vec![unused_variant]))
+        .expect_err("unused evidence variants must fail closed");
+    assert!(error.to_string().contains("semantic validator"), "{error}");
+
+    let mut wrong_import = exact_fact(EdgeId(7));
+    wrong_import.callsite.callee_form = CalleeForm::NamedImport;
+    wrong_import.evidence_chain = vec![ResolutionEvidence::StaticImportBinding {
+        import: NodeId(2),
+        declaration: NodeId(3),
+    }];
+    let wrong_import = seal_call_resolution_fact(wrong_import).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &projection(vec![wrong_import]))
+        .expect_err("unrelated import evidence must fail");
+    assert!(error.to_string().contains("StaticImportBinding"), "{error}");
+
+    let mut unrelated_import = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut unrelated_import);
+    unrelated_import
+        .insert_edge(&Edge {
+            id: EdgeId(8),
+            source: NodeId(2),
+            target: NodeId(3),
+            kind: EdgeKind::IMPORT,
+            file_node_id: Some(NodeId(1)),
+            resolved_target: Some(NodeId(3)),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut wrong_named_import = exact_fact(EdgeId(7));
+    wrong_named_import.callsite.callee_form = CalleeForm::NamedImport;
+    wrong_named_import.evidence_chain = vec![ResolutionEvidence::StaticImportBinding {
+        import: NodeId(2),
+        declaration: NodeId(3),
+    }];
+    let wrong_named_import = seal_call_resolution_fact(wrong_named_import).unwrap();
+    let mut wrong_named_import_projection = projection(vec![wrong_named_import]);
+    wrong_named_import_projection.funnel[0].callee_form = Some(CalleeForm::NamedImport);
+    wrong_named_import_projection.funnel[0].evidence_kind =
+        Some(ResolutionEvidenceKind::StaticImportBinding);
+    let error = unrelated_import
+        .replace_proof_resolution_projection(&publication(), &wrong_named_import_projection)
+        .expect_err("an unrelated source node must not authenticate an import binding");
+    assert!(error.to_string().contains("StaticImportBinding"), "{error}");
+
+    let mut cross_file_receiver = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut cross_file_receiver);
+    let target_file = FileInfo {
+        id: 5,
+        path: "src/other.rs".into(),
+        language: "rust".to_owned(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    };
+    cross_file_receiver.insert_file(&target_file).unwrap();
+    cross_file_receiver
+        .update_file_metadata(&target_file, Some(&"b".repeat(64)))
+        .unwrap();
+    cross_file_receiver
+        .insert_node(&Node {
+            id: NodeId(5),
+            kind: NodeKind::FILE,
+            serialized_name: "src/other.rs".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut target = cross_file_receiver.get_node(NodeId(3)).unwrap().unwrap();
+    cross_file_receiver
+        .get_connection()
+        .execute("DELETE FROM edge WHERE id = 7", [])
+        .unwrap();
+    target.file_node_id = Some(NodeId(5));
+    cross_file_receiver.insert_node(&target).unwrap();
+    cross_file_receiver
+        .insert_edge(&Edge {
+            id: EdgeId(7),
+            source: NodeId(2),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(3)),
+            callsite_identity: Some("1:2:1:4".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    cross_file_receiver
+        .insert_node(&Node {
+            id: NodeId(6),
+            kind: NodeKind::STRUCT,
+            serialized_name: "Owner".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        })
+        .unwrap();
+    for (id, member) in [(8, NodeId(2)), (9, NodeId(3))] {
+        cross_file_receiver
+            .insert_edge(&Edge {
+                id: EdgeId(id),
+                source: NodeId(6),
+                target: member,
+                kind: EdgeKind::MEMBER,
+                file_node_id: Some(NodeId(1)),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let mut wrong_receiver = exact_fact(EdgeId(7));
+    wrong_receiver.callsite.callee_form = CalleeForm::ImplicitReceiver;
+    wrong_receiver.evidence_chain = vec![
+        ResolutionEvidence::ImplicitReceiver { owner: NodeId(6) },
+        ResolutionEvidence::SameFileDeclaration {
+            declaration: NodeId(3),
+        },
+    ];
+    wrong_receiver
+        .provenance
+        .dependency_file_hashes
+        .push(DependencyFileHash {
+            file_id: FileId(5),
+            source_sha256: "b".repeat(64),
+        });
+    let wrong_receiver = seal_call_resolution_fact(wrong_receiver).unwrap();
+    assert_eq!(
+        wrong_receiver.provenance.dependency_file_hashes,
+        vec![
+            DependencyFileHash {
+                file_id: FileId(1),
+                source_sha256: "a".repeat(64),
+            },
+            DependencyFileHash {
+                file_id: FileId(5),
+                source_sha256: "b".repeat(64),
+            },
+        ]
+    );
+    assert_eq!(
+        cross_file_receiver
+            .get_node(NodeId(3))
+            .unwrap()
+            .unwrap()
+            .file_node_id,
+        Some(NodeId(5))
+    );
+    let mut wrong_receiver_projection = projection(vec![wrong_receiver]);
+    wrong_receiver_projection.funnel[0].callee_form = Some(CalleeForm::ImplicitReceiver);
+    wrong_receiver_projection.funnel[0].evidence_kind =
+        Some(ResolutionEvidenceKind::ImplicitReceiver);
+    let error = cross_file_receiver
+        .replace_proof_resolution_projection(&publication(), &wrong_receiver_projection)
+        .expect_err("implicit receiver evidence cannot claim a cross-file same-file declaration");
+    assert!(error.to_string().contains("ImplicitReceiver"), "{error}");
+
+    let mut wrong_funnel = projection(vec![exact_fact(EdgeId(7))]);
+    wrong_funnel.funnel[0].counts.syntax_calls = 2;
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &wrong_funnel)
+        .expect_err("funnel mismatch must fail");
+    assert!(error.to_string().contains("funnel"), "{error}");
+}
+
+#[test]
+fn resealed_raw_callsite_and_incomplete_dependency_mutations_are_rejected() {
+    let mut wrong_placeholder = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut wrong_placeholder);
+    let mut placeholder = wrong_placeholder.get_node(NodeId(4)).unwrap().unwrap();
+    placeholder.serialized_name = "other".to_owned();
+    wrong_placeholder.insert_node(&placeholder).unwrap();
+    let error = wrong_placeholder
+        .replace_proof_resolution_projection(
+            &publication(),
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .expect_err("raw placeholder spelling mismatch must fail");
+    assert!(error.to_string().contains("placeholder"), "{error}");
+
+    let mut incomplete = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut incomplete);
+    incomplete
+        .get_connection()
+        .execute("UPDATE file SET complete = 0 WHERE id = 1", [])
+        .unwrap();
+    let error = incomplete
+        .replace_proof_resolution_projection(
+            &publication(),
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .expect_err("incomplete dependency file must fail");
+    assert!(error.to_string().contains("indexed-complete"), "{error}");
+
+    let mut inconsistent_file = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut inconsistent_file);
+    inconsistent_file
+        .get_connection()
+        .execute(
+            "UPDATE edge SET callsite_identity = '9:2:1:4' WHERE id = 7",
+            [],
+        )
+        .unwrap();
+    let mut fact = exact_fact(EdgeId(7));
+    fact.raw_callsite_identity = Some("9:2:1:4".to_owned());
+    let fact = seal_call_resolution_fact(fact).unwrap();
+    let error = inconsistent_file
+        .replace_proof_resolution_projection(&publication(), &projection(vec![fact]))
+        .expect_err("callsite identity file must match the exact syntax span");
+    assert!(error.to_string().contains("callsite identity"), "{error}");
+}
+
+#[test]
+fn incomplete_domain_fact_allows_hashed_indexed_parser_incomplete_source() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    store
+        .get_connection()
+        .execute("UPDATE file SET complete = 0 WHERE id = 1", [])
+        .unwrap();
+
+    let receipt = store
+        .replace_proof_resolution_projection(&publication(), &incomplete_domain_projection())
+        .expect("parser incompleteness is a fact status, not publication corruption");
+
+    assert_eq!(receipt.fact_count, 1);
+    let facts = store.get_proof_resolution_facts().unwrap();
+    assert_eq!(facts[0].status, ProofResolutionStatus::IncompleteDomain);
+    assert_eq!(facts[0].provenance.dependency_file_hashes.len(), 1);
+}
+
+#[test]
+fn incomplete_domain_fact_still_rejects_unindexed_missing_or_mismatched_source_identity() {
+    let mut unindexed = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut unindexed);
+    unindexed
+        .get_connection()
+        .execute("UPDATE file SET indexed = 0 WHERE id = 1", [])
+        .unwrap();
+    let error = unindexed
+        .replace_proof_resolution_projection(&publication(), &incomplete_domain_projection())
+        .expect_err("non-Exact cannot authenticate an unindexed source");
+    assert!(error.to_string().contains("indexed-complete"), "{error}");
+
+    let mut missing_hash = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut missing_hash);
+    missing_hash
+        .get_connection()
+        .execute("UPDATE file SET content_hash = NULL WHERE id = 1", [])
+        .unwrap();
+    let error = missing_hash
+        .replace_proof_resolution_projection(&publication(), &incomplete_domain_projection())
+        .expect_err("non-Exact source hash absence is integrity corruption");
+    assert!(error.to_string().contains("source hash"), "{error}");
+
+    let mut mismatched_hash = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut mismatched_hash);
+    mismatched_hash
+        .get_connection()
+        .execute(
+            "UPDATE file SET content_hash = ?1 WHERE id = 1",
+            ["b".repeat(64)],
+        )
+        .unwrap();
+    let error = mismatched_hash
+        .replace_proof_resolution_projection(&publication(), &incomplete_domain_projection())
+        .expect_err("non-Exact source hash mismatch is integrity corruption");
+    assert!(error.to_string().contains("source hash"), "{error}");
+}
+
+#[test]
+fn publication_digest_authenticates_roster_and_funnel() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let publication = publication();
+    store
+        .replace_proof_resolution_projection(&publication, &projection(vec![exact_fact(EdgeId(7))]))
+        .unwrap();
+    store
+        .get_connection()
+        .execute(
+            "UPDATE proof_resolution_publication SET funnel_json = '[]' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    let error = store
+        .validate_proof_resolution_publication(&publication)
+        .expect_err("resealed publication metadata mutation must fail");
+    assert!(error.to_string().contains("digest"), "{error}");
+}
+
+#[test]
+fn failed_replacement_and_stale_validation_preserve_the_previous_complete_publication() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let first_publication = publication();
+    let first = store
+        .replace_proof_resolution_projection(
+            &first_publication,
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .unwrap();
+
+    let second_publication = IndexPublicationRecord {
+        generation: 2,
+        generation_id: "generation-2".to_owned(),
+        run_id: "run-2".to_owned(),
+        mode: IndexPublicationMode::Incremental,
+        published_at_epoch_ms: 456,
+    };
+    let mut corrupt = exact_fact(EdgeId(7));
+    corrupt.provenance.evidence_sha256 = "0".repeat(64);
+    store
+        .replace_proof_resolution_projection(&second_publication, &projection(vec![corrupt]))
+        .expect_err("failed staged replacement");
+
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(first.clone())
+    );
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 1);
+    let stale = store
+        .validate_proof_resolution_publication(&second_publication)
+        .expect_err("stale proof publication must be unavailable");
+    assert!(stale.to_string().contains("does not match"), "{stale}");
+    store
+        .validate_proof_resolution_publication(&first_publication)
+        .unwrap();
+}
+
+#[test]
+fn incremental_fence_invalidates_proof_overlay_before_graph_mutation() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    store
+        .replace_proof_resolution_projection(
+            &publication(),
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .unwrap();
+
+    store.begin_incremental_run().unwrap();
+
+    assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+    store
+        .get_connection()
+        .execute("DELETE FROM edge WHERE id = 7", [])
+        .expect("the staged graph may mutate after proof invalidation");
+}
+
+#[test]
+fn failed_incremental_fence_preserves_the_complete_proof_overlay() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let proof = store
+        .replace_proof_resolution_projection(
+            &publication(),
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .unwrap();
+    store
+        .get_connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_incomplete_begin
+             BEFORE INSERT ON incomplete_index_run
+             BEGIN SELECT RAISE(ABORT, 'forced marker insert failure'); END;",
+        )
+        .unwrap();
+
+    store.begin_incremental_run().expect_err("fence must fail");
+
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(proof)
+    );
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 1);
+    store
+        .validate_proof_resolution_publication(&publication())
+        .expect("the prior proof overlay survived rollback");
+}

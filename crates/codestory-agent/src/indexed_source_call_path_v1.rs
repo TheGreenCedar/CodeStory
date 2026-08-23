@@ -16,7 +16,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
-use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId, ResolutionCertainty};
+use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -47,9 +47,6 @@ pub enum RawCallEdgeAdmission {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RawAdmissionFailure {
     WrongKind,
-    CertaintyAbsent,
-    CertaintyProbable,
-    CertaintyUncertain,
     WrongEffectiveSource,
     WrongEffectiveTarget,
     MissingExactResolvedTarget,
@@ -87,7 +84,9 @@ pub struct IndexedCallEdgeReceipt {
     pub receipt: ReceiptRef,
     pub source: ResolvedNodeIdentity,
     pub target: ResolvedNodeIdentity,
-    pub certainty: ResolutionCertainty,
+    pub resolution_fact_id: String,
+    pub resolution_evidence_sha256: String,
+    pub exact_callsite_start_byte: u64,
     pub callsite_identity: String,
     pub column_or_ordinal: u32,
     pub containment: CallableContainmentEvidence,
@@ -124,7 +123,7 @@ pub struct BuiltCallPathFacts {
 }
 
 /// Admit one persisted edge as direct-call evidence without rewriting either
-/// endpoint or deriving certainty from its diagnostic confidence score.
+/// endpoint. Exact-proof authorization is a separate receipt gate in runtime.
 pub fn admit_raw_call_edge(
     edge: &Edge,
     expected_source: NodeId,
@@ -143,16 +142,6 @@ pub fn diagnose_raw_call_edge(
 ) -> Result<AdmittedRawCallEdge, RawAdmissionFailure> {
     if edge.kind != EdgeKind::CALL {
         return Err(RawAdmissionFailure::WrongKind);
-    }
-    match edge.certainty {
-        Some(ResolutionCertainty::Certain) => {}
-        None => return Err(RawAdmissionFailure::CertaintyAbsent),
-        Some(ResolutionCertainty::Probable) => {
-            return Err(RawAdmissionFailure::CertaintyProbable);
-        }
-        Some(ResolutionCertainty::Uncertain) => {
-            return Err(RawAdmissionFailure::CertaintyUncertain);
-        }
     }
     if edge.effective_source() != expected_source {
         return Err(RawAdmissionFailure::WrongEffectiveSource);
@@ -1487,6 +1476,7 @@ pub enum UnavailableReason {
     PublicationPinMismatch,
     SourceNotBoundToPublication,
     ProofFactsUnavailable,
+    ProofSemanticProjectionUnavailable,
 }
 
 pub fn check_call_path(
@@ -2064,7 +2054,8 @@ fn validate_built_publication_and_receipts(
         }
     }
     for receipt in &built.receipts {
-        if receipt.certainty != ResolutionCertainty::Certain
+        if receipt.resolution_fact_id.len() != 64
+            || receipt.resolution_evidence_sha256.len() != 64
             || !node_matches_publication(&receipt.source, publication)
             || !node_matches_publication(&receipt.target, publication)
         {
@@ -2123,11 +2114,9 @@ fn indexed_receipt_source_order(
         .project_file_components
         .cmp(&right.line_window.project_file_components)
         .then_with(|| {
-            left.line_window
-                .anchor_line
-                .cmp(&right.line_window.anchor_line)
+            left.exact_callsite_start_byte
+                .cmp(&right.exact_callsite_start_byte)
         })
-        .then_with(|| left.column_or_ordinal.cmp(&right.column_or_ordinal))
         .then_with(|| {
             match (
                 left.receipt.edge_id.parse::<i64>(),
@@ -2494,6 +2483,9 @@ fn unavailable_reason_name(reason: &UnavailableReason) -> &'static str {
         UnavailableReason::PublicationPinMismatch => "publication_pin_mismatch",
         UnavailableReason::SourceNotBoundToPublication => "source_not_bound_to_publication",
         UnavailableReason::ProofFactsUnavailable => "proof_facts_unavailable",
+        UnavailableReason::ProofSemanticProjectionUnavailable => {
+            "proof_semantic_projection_unavailable"
+        }
     }
 }
 
@@ -2582,11 +2574,9 @@ fn indexed_receipt_json(receipt: &IndexedCallEdgeReceipt) -> Value {
         "receipt": receipt_ref_json(&receipt.receipt),
         "source": resolved_node_json(&receipt.source),
         "target": resolved_node_json(&receipt.target),
-        "certainty": match receipt.certainty {
-            ResolutionCertainty::Certain => "certain",
-            ResolutionCertainty::Probable => "probable",
-            ResolutionCertainty::Uncertain => "uncertain",
-        },
+        "resolution_fact_id": receipt.resolution_fact_id,
+        "resolution_evidence_sha256": receipt.resolution_evidence_sha256,
+        "exact_callsite_start_byte": receipt.exact_callsite_start_byte,
         "callsite_identity": receipt.callsite_identity,
         "containment": {
             "file_node_id": receipt.containment.file_node_id.0.to_string(),
@@ -2625,7 +2615,7 @@ fn serialized_json_size(value: &Value) -> Result<usize, InternalProjectionError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId, ResolutionCertainty};
+    use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
 
     const MAX_SOURCE_RECEIPT_LINE_BYTES: usize = 8_192;
 
@@ -2751,7 +2741,9 @@ mod tests {
             },
             source: node(source),
             target: node(target),
-            certainty: ResolutionCertainty::Certain,
+            resolution_fact_id: format!("{:064x}", index + 1),
+            resolution_evidence_sha256: format!("{:064x}", index + 2),
+            exact_callsite_start_byte: (index * 10) as u64,
             callsite_identity: format!("{index}:{}:0:{}|rust", index + 1, index + 2),
             column_or_ordinal: 0,
             containment: CallableContainmentEvidence {
@@ -3009,65 +3001,70 @@ mod tests {
     #[test]
     fn authoritative_receipts_follow_authenticated_source_order() {
         let (contract, hashes, rendering) = validate_for_projection(&["B"]);
-        let mut earlier = indexed_receipt(0, "A", "B", "first();\n".to_owned());
-        earlier.receipt = ReceiptRef {
-            receipt_id: "receipt-z".to_owned(),
+        let mut earlier_file = indexed_receipt(0, "A", "B", "first();\n".to_owned());
+        earlier_file.receipt = ReceiptRef {
+            receipt_id: "receipt-z-file".to_owned(),
             edge_id: "200".to_owned(),
         };
-        earlier.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
-        earlier.line_window.anchor_line = 10;
-        earlier.callsite_identity = "1:10:7:2|rust".to_owned();
+        earlier_file.line_window.project_file_components =
+            vec!["src".to_owned(), "a.rs".to_owned()];
+        earlier_file.containment.file_node_id = NodeId(99);
+        earlier_file.exact_callsite_start_byte = 40;
 
-        let mut later = indexed_receipt(1, "A", "B", "second();\n".to_owned());
-        later.receipt = ReceiptRef {
-            receipt_id: "receipt-a".to_owned(),
+        let mut later_file = indexed_receipt(1, "A", "B", "second();\n".to_owned());
+        later_file.receipt = ReceiptRef {
+            receipt_id: "receipt-a-file".to_owned(),
             edge_id: "100".to_owned(),
         };
-        later.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
-        later.line_window.anchor_line = 20;
-        later.callsite_identity = "1:20:3:2|rust".to_owned();
+        later_file.line_window.project_file_components = vec!["src".to_owned(), "z.rs".to_owned()];
+        later_file.containment.file_node_id = NodeId(1);
+        later_file.exact_callsite_start_byte = 40;
 
-        let integrated = checked_integration(
-            &contract,
-            &hashes,
-            &rendering,
-            built_from_receipts(vec![later, earlier.clone()], Vec::new(), Vec::new()),
-        );
-        assert_eq!(
-            integrated.authoritative_receipts(),
-            [earlier],
-            "receipt and edge identifiers must not outrank earlier source coordinates"
-        );
-
-        let mut lower_column = indexed_receipt(2, "A", "B", "column_two();\n".to_owned());
-        lower_column.receipt = ReceiptRef {
-            receipt_id: "receipt-z-column".to_owned(),
-            edge_id: "200".to_owned(),
-        };
-        lower_column.line_window.project_file_components =
-            vec!["src".to_owned(), "same.rs".to_owned()];
-        lower_column.line_window.anchor_line = 30;
-        lower_column.column_or_ordinal = 2;
-        let mut higher_column = indexed_receipt(3, "A", "B", "column_nine();\n".to_owned());
-        higher_column.receipt = ReceiptRef {
-            receipt_id: "receipt-a-column".to_owned(),
-            edge_id: "100".to_owned(),
-        };
-        higher_column.line_window.project_file_components =
-            lower_column.line_window.project_file_components.clone();
-        higher_column.line_window.anchor_line = 30;
-        higher_column.column_or_ordinal = 9;
         let integrated = checked_integration(
             &contract,
             &hashes,
             &rendering,
             built_from_receipts(
-                vec![higher_column, lower_column.clone()],
+                vec![later_file, earlier_file.clone()],
                 Vec::new(),
                 Vec::new(),
             ),
         );
-        assert_eq!(integrated.authoritative_receipts(), [lower_column]);
+        assert_eq!(
+            integrated.authoritative_receipts(),
+            [earlier_file],
+            "native-bound project file identity must outrank graph file and edge identifiers"
+        );
+
+        let mut earlier_byte = indexed_receipt(2, "A", "B", "earlier();\n".to_owned());
+        earlier_byte.receipt = ReceiptRef {
+            receipt_id: "receipt-z-byte".to_owned(),
+            edge_id: "200".to_owned(),
+        };
+        earlier_byte.line_window.project_file_components =
+            vec!["src".to_owned(), "same.rs".to_owned()];
+        earlier_byte.containment.file_node_id = NodeId(99);
+        earlier_byte.exact_callsite_start_byte = 20;
+        let mut later_byte = indexed_receipt(3, "A", "B", "later();\n".to_owned());
+        later_byte.receipt = ReceiptRef {
+            receipt_id: "receipt-a-byte".to_owned(),
+            edge_id: "100".to_owned(),
+        };
+        later_byte.line_window.project_file_components =
+            earlier_byte.line_window.project_file_components.clone();
+        later_byte.containment.file_node_id = NodeId(1);
+        later_byte.exact_callsite_start_byte = 40;
+        let integrated = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![later_byte, earlier_byte.clone()],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        assert_eq!(integrated.authoritative_receipts(), [earlier_byte]);
 
         let mut edge_two = indexed_receipt(4, "A", "B", "edge_two();\n".to_owned());
         edge_two.receipt = ReceiptRef {
@@ -3075,8 +3072,8 @@ mod tests {
             edge_id: "2".to_owned(),
         };
         edge_two.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
-        edge_two.line_window.anchor_line = 40;
-        edge_two.column_or_ordinal = 4;
+        edge_two.containment.file_node_id = NodeId(7);
+        edge_two.exact_callsite_start_byte = 40;
         let mut edge_ten = indexed_receipt(5, "A", "B", "edge_ten();\n".to_owned());
         edge_ten.receipt = ReceiptRef {
             receipt_id: "receipt-a-edge".to_owned(),
@@ -3084,8 +3081,8 @@ mod tests {
         };
         edge_ten.line_window.project_file_components =
             edge_two.line_window.project_file_components.clone();
-        edge_ten.line_window.anchor_line = 40;
-        edge_ten.column_or_ordinal = 4;
+        edge_ten.containment.file_node_id = NodeId(7);
+        edge_ten.exact_callsite_start_byte = 40;
         let integrated = checked_integration(
             &contract,
             &hashes,
@@ -3457,7 +3454,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_call_edge_admission_requires_the_persisted_certain_canonical_identity() {
+    fn raw_call_edge_admission_requires_the_persisted_canonical_identity() {
         let edge = Edge {
             id: EdgeId(41),
             source: NodeId(7),
@@ -3467,10 +3464,9 @@ mod tests {
             line: Some(12),
             resolved_source: Some(NodeId(11)),
             resolved_target: Some(NodeId(23)),
-            confidence: Some(1.0),
-            certainty: Some(ResolutionCertainty::Certain),
             callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
             candidate_targets: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -3483,13 +3479,6 @@ mod tests {
                 raw_target: NodeId(19),
                 callsite_identity: "-3:12:0:19|collector-marker".to_owned(),
             })
-        );
-
-        let mut probable = edge;
-        probable.certainty = Some(ResolutionCertainty::Probable);
-        assert_eq!(
-            admit_raw_call_edge(&probable, NodeId(11), NodeId(23)),
-            RawCallEdgeAdmission::Rejected
         );
     }
 
@@ -3510,10 +3499,9 @@ mod tests {
             line: Some(12),
             resolved_source: Some(NodeId(11)),
             resolved_target: Some(NodeId(23)),
-            confidence: Some(1.0),
-            certainty: Some(ResolutionCertainty::Certain),
             callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
             candidate_targets: Vec::new(),
+            ..Default::default()
         };
         let admitted = AdmittedRawCallEdge {
             edge_id: EdgeId(41),
@@ -3537,21 +3525,6 @@ mod tests {
                 "wrong kind",
                 RawAdmissionFailure::WrongKind,
                 Box::new(|edge, _, _| edge.kind = EdgeKind::USAGE),
-            ),
-            (
-                "certainty absent",
-                RawAdmissionFailure::CertaintyAbsent,
-                Box::new(|edge, _, _| edge.certainty = None),
-            ),
-            (
-                "certainty probable",
-                RawAdmissionFailure::CertaintyProbable,
-                Box::new(|edge, _, _| edge.certainty = Some(ResolutionCertainty::Probable)),
-            ),
-            (
-                "certainty uncertain",
-                RawAdmissionFailure::CertaintyUncertain,
-                Box::new(|edge, _, _| edge.certainty = Some(ResolutionCertainty::Uncertain)),
             ),
             (
                 "wrong effective source",
@@ -3644,18 +3617,12 @@ mod tests {
             line: Some(12),
             resolved_source: Some(NodeId(11)),
             resolved_target: Some(NodeId(23)),
-            confidence: Some(1.0),
-            certainty: Some(ResolutionCertainty::Certain),
             callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
             candidate_targets: Vec::new(),
+            ..Default::default()
         };
         let mut mutations: Vec<EdgeMutation> = vec![
             ("wrong kind", Box::new(|edge| edge.kind = EdgeKind::USAGE)),
-            ("missing certainty", Box::new(|edge| edge.certainty = None)),
-            (
-                "probable certainty",
-                Box::new(|edge| edge.certainty = Some(ResolutionCertainty::Probable)),
-            ),
             (
                 "wrong raw source",
                 Box::new(|edge| {

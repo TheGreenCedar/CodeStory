@@ -3,9 +3,10 @@ use super::contracts::{
     CohortPathFileV1, CorpusV1, DECISION_REPORT_SCHEMA, EnvironmentReportV1, FailureFunnelReportV1,
     FunnelOutcomeV1, InventoryReportV1, ProductDispositionKindV1, ProductRefutationBasisV1,
     ProjectedReceiptReferenceV1, ProvenanceV1, QualificationSummaryV1, REPORT_SCHEMA,
-    ReceiptOracleComparisonV1, RoleThresholdsV1, StepQualificationOutcomeV1, ThresholdsV1,
-    TrailReportV1, TransportErrorV1, TransportEvidenceV1, canonical_corpus_sha256,
-    canonical_observations_sha256, canonical_thresholds_sha256, results_evidence_sha256,
+    ReceiptOracleComparisonV1, ResolutionFunnelReportV1, ResolutionFunnelRowV1, RoleThresholdsV1,
+    StepQualificationOutcomeV1, ThresholdsV1, TrailReportV1, TransportErrorV1, TransportEvidenceV1,
+    canonical_corpus_sha256, canonical_observations_sha256, canonical_thresholds_sha256,
+    results_evidence_sha256, sort_resolution_funnel,
 };
 use super::thresholds::{derive_observations, evaluate_activation_decision};
 use anyhow::{Context, Result, bail};
@@ -28,13 +29,14 @@ use std::path::{Path, PathBuf};
 ))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) const PUBLIC_ARTIFACT_NAMES: [&str; 8] = [
+pub(crate) const PUBLIC_ARTIFACT_NAMES: [&str; 9] = [
     "cases.json",
     "decision.json",
     "environment.json",
     "failure-funnel.json",
     "findings.md",
     "inventory.json",
+    "resolution-funnel.json",
     "summary.json",
     "trails.json",
 ];
@@ -75,6 +77,7 @@ pub(crate) enum PublicArtifactName {
     Trails,
     Cases,
     FailureFunnel,
+    ResolutionFunnel,
     Summary,
     Decision,
     Findings,
@@ -88,6 +91,7 @@ impl PublicArtifactName {
             Self::Trails => "trails.json",
             Self::Cases => "cases.json",
             Self::FailureFunnel => "failure-funnel.json",
+            Self::ResolutionFunnel => "resolution-funnel.json",
             Self::Summary => "summary.json",
             Self::Decision => "decision.json",
             Self::Findings => "findings.md",
@@ -1094,6 +1098,7 @@ pub(crate) struct QualificationReportInputV1 {
     pub trails: Vec<TrailReportV1>,
     pub cases: Vec<CaseReportV1>,
     pub failure_funnel: FailureFunnelReportV1,
+    pub resolution_funnel: ResolutionFunnelReportV1,
 }
 
 #[derive(Debug, Clone)]
@@ -1103,6 +1108,7 @@ pub(crate) struct PublicArtifactBundle {
     trails: Value,
     cases: Value,
     failure_funnel: Value,
+    resolution_funnel: Value,
     summary: Value,
     decision: Value,
     findings: String,
@@ -1118,6 +1124,10 @@ impl PublicArtifactBundle {
             (
                 "failure-funnel.json",
                 canonical_json_file(&self.failure_funnel)?,
+            ),
+            (
+                "resolution-funnel.json",
+                canonical_json_file(&self.resolution_funnel)?,
             ),
             ("summary.json", canonical_json_file(&self.summary)?),
             ("decision.json", canonical_json_file(&self.decision)?),
@@ -1201,6 +1211,7 @@ pub(crate) fn build_summary(
         &mut input.trails,
         &mut input.cases,
         &mut input.failure_funnel,
+        &mut input.resolution_funnel,
     )?;
     let corpus_sha256 = canonical_corpus_sha256(corpus)?;
     let thresholds_sha256 = canonical_thresholds_sha256(thresholds)?;
@@ -1215,6 +1226,7 @@ pub(crate) fn build_summary(
         &input.trails,
         &input.cases,
         &input.failure_funnel,
+        &input.resolution_funnel,
     )?;
     let summary = QualificationSummaryV1 {
         schema: REPORT_SCHEMA.to_owned(),
@@ -1232,6 +1244,7 @@ pub(crate) fn build_summary(
         trails: input.trails,
         cases: input.cases,
         failure_funnel: input.failure_funnel,
+        resolution_funnel: input.resolution_funnel,
     };
     summary.validate_against_inputs(corpus, thresholds)?;
     Ok(summary)
@@ -1319,6 +1332,12 @@ pub(crate) fn build_public_artifacts(
             )
         })?,
         failure_funnel: serde_json::to_value(&summary.failure_funnel).map_err(|_| {
+            PublicArtifactBuildFailure::closed(
+                PublicArtifactBuildStage::Serialization,
+                PublicArtifactBuildReason::Serialization,
+            )
+        })?,
+        resolution_funnel: serde_json::to_value(&summary.resolution_funnel).map_err(|_| {
             PublicArtifactBuildFailure::closed(
                 PublicArtifactBuildStage::Serialization,
                 PublicArtifactBuildReason::Serialization,
@@ -1426,6 +1445,7 @@ pub(crate) fn verify_published(
     let (trails_value, _) = read_json("trails.json")?;
     let (cases_value, _) = read_json("cases.json")?;
     let (funnel_value, _) = read_json("failure-funnel.json")?;
+    let (resolution_funnel_value, _) = read_json("resolution-funnel.json")?;
     let (summary_value, _) = read_json("summary.json")?;
     let (decision_value, _) = read_json("decision.json")?;
     let findings_bytes = read_bounded(&destination.join("findings.md"))?;
@@ -1441,6 +1461,7 @@ pub(crate) fn verify_published(
         trails: serde_json::from_value(trails_value)?,
         cases: serde_json::from_value(cases_value)?,
         failure_funnel: serde_json::from_value(funnel_value)?,
+        resolution_funnel: serde_json::from_value(resolution_funnel_value)?,
     };
     if canonical_json_file(&summary)? != canonical_json_file(&reconstructed)? {
         bail!("proof_availability_split_artifact_mismatch")
@@ -1456,6 +1477,7 @@ pub(crate) fn verify_published(
             trails: reconstructed.trails.clone(),
             cases: reconstructed.cases.clone(),
             failure_funnel: reconstructed.failure_funnel.clone(),
+            resolution_funnel: reconstructed.resolution_funnel.clone(),
         },
         corpus,
         thresholds,
@@ -1472,6 +1494,7 @@ pub(crate) fn verify_published(
         trails: serde_json::to_value(&recomputed.trails)?,
         cases: serde_json::to_value(&recomputed.cases)?,
         failure_funnel: serde_json::to_value(&recomputed.failure_funnel)?,
+        resolution_funnel: serde_json::to_value(&recomputed.resolution_funnel)?,
         summary: serde_json::to_value(&recomputed)?,
         decision: decision_value.clone(),
         findings: String::from_utf8(findings_bytes)?,
@@ -1501,6 +1524,7 @@ fn sort_evidence(
     trails: &mut [TrailReportV1],
     cases: &mut [CaseReportV1],
     failure_funnel: &mut FailureFunnelReportV1,
+    resolution_funnel: &mut ResolutionFunnelReportV1,
 ) -> Result<()> {
     environment
         .projects
@@ -1592,6 +1616,7 @@ fn sort_evidence(
             .expect("closed funnel outcome serializes")
             .cmp(&canonical_json_file(&right.outcome).expect("closed funnel outcome serializes"))
     });
+    sort_resolution_funnel(resolution_funnel);
     Ok(())
 }
 
@@ -1693,6 +1718,7 @@ struct FindingsDocumentV1 {
     cohort_full_proofs: Vec<(String, u64)>,
     inventory: Vec<InventoryReportV1>,
     trails: Vec<TrailReportV1>,
+    resolution_funnel: Vec<ResolutionFunnelRowV1>,
     thresholds_id: String,
     methodology_sha256: String,
     hard_gate_summary: String,
@@ -1786,6 +1812,7 @@ fn render_findings(
         cohort_full_proofs: cohort_full_proofs.into_iter().collect(),
         inventory,
         trails,
+        resolution_funnel: summary.resolution_funnel.rows.clone(),
         thresholds_id: thresholds.thresholds_id.clone(),
         methodology_sha256: thresholds.methodology_sha256.clone(),
         hard_gate_summary: format!(
@@ -1893,6 +1920,16 @@ fn render_findings_document(document: &FindingsDocumentV1) -> Result<String> {
     for trail in &document.trails {
         require_findings_atom(&trail.repository_id)?;
     }
+    for row in &document.resolution_funnel {
+        require_findings_atom(&row.repository_id)?;
+        require_findings_atom(&row.language)?;
+        if let Some(value) = &row.callee_form {
+            require_findings_atom(value)?;
+        }
+        if let Some(value) = &row.primary_evidence_kind {
+            require_findings_atom(value)?;
+        }
+    }
     for role in &document.roles {
         require_findings_atom(&role.role)?;
     }
@@ -1925,6 +1962,23 @@ fn render_findings_document(document: &FindingsDocumentV1) -> Result<String> {
             inventory.exact_resolved_rows,
             inventory.admitted_rows,
             inventory.unresolved_placeholder_rows,
+        ));
+    }
+    text.push_str("\n### Authenticated exact-resolution funnel\n\n| Cohort | Language | Callee form | Primary evidence | Syntax | Supported | Exact | Linked | Shape | Authoritative | Complete participant |\n| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+    for row in &document.resolution_funnel {
+        text.push_str(&format!(
+            "| `{}` | `{}` | `{}` | `{}` | {} | {} | {} | {} | {} | {} | {} |\n",
+            row.repository_id,
+            row.language,
+            row.callee_form.as_deref().unwrap_or("none"),
+            row.primary_evidence_kind.as_deref().unwrap_or("none"),
+            row.counts.syntax_calls,
+            row.counts.adapter_supported,
+            row.counts.exact,
+            row.counts.exact_call_linked,
+            row.counts.proof_shape_admitted,
+            row.counts.authoritative_receipts,
+            row.counts.complete_proofs,
         ));
     }
     text.push_str("\n### Raw edge-distinct trails\n\n| Cohort | Length | Effective endpoints | Exact resolved | Strictly admitted |\n| --- | ---: | ---: | ---: | ---: |\n");
@@ -2055,6 +2109,10 @@ fn validate_public_bundle_for_build(
         (PublicArtifactName::Trails, &bundle.trails),
         (PublicArtifactName::Cases, &bundle.cases),
         (PublicArtifactName::FailureFunnel, &bundle.failure_funnel),
+        (
+            PublicArtifactName::ResolutionFunnel,
+            &bundle.resolution_funnel,
+        ),
         (PublicArtifactName::Summary, &bundle.summary),
         (PublicArtifactName::Decision, &bundle.decision),
     ] {
@@ -2185,7 +2243,7 @@ fn fixed_json_pointer_segment(segment: &str) -> Option<&'static str> {
 }
 
 fn fixed_json_pointer_segments() -> impl Iterator<Item = &'static str> {
-    const FIXED: &str = "actionable_exact_gap actionable_incomplete_gap actual actual_bytes admitted_rows after_step_count architecture attempted_positive_steps attempted_step_count authoritative_receipts automatic_thresholds_met basis binary_name binary_sha256 boundary buckets build byte_end byte_start caller callsite_identity callsite_line candidate_edge_ids canonical_id canonical_id_binding_sha256 cargo_profile case_id cases certainty certified_absence classified_positive_steps code cohorts complete_projection_bytes complete_response_p95_bytes connected_receipts containment contract_digest contract_proven core_generation core_generation_id core_run_id corpus_sha256 count database_sha256 decision denominator detail edge_count edge_id edge_ids effective_endpoint effective_endpoint_rows elapsed_ns end_byte end_line enumeration_receipt_id environment environment_id error evidence exact_resolved exact_resolved_rows exclude_from_projection extractor_capability_receipt_id failed_gates failure failure_funnel false_contract_proven file_byte_length file_count file_node_id finalization freshness full_or_useful_partial full_proof_wilson full_proofs gap gaps gate gate_id hard_gates histogram identity incomplete_provenance indexed_sha256 invalid_results inventory invocation kind length lengths line_window lower lower_milli maximum_bytes maximum_candidate_edges maximum_response_bytes measurements message milli mismatches missing_oracle_steps mutated_spec mutation_id negative_mutations node_count node_id non_exact_authoritative_receipts numerator observations observations_sha256 observed observed_candidate_edges_at_least observed_receipts observed_sha256 operation oracle_comparison oracle_step oracle_step_index os outcome over_cap_results owner_node_id path path_id pinned positive_step_recall prescribed_argv product_disposition product_disposition_mismatches profile prohibit_traversal_through prohibition_index project_file_components project_id projection projection_bytes projects proof_trace provenance qualification_id qualification_source_commit qualification_source_tree qualified_name range reason reasons receipt_evidence receipt_file_sha256 receipt_id receipt_line_window receipts recorded_at repository_id required results_sha256 revision rust_host rustc_vv schema selector selector_early_return selector_index selectors sha256 source source_commit source_dirty source_head source_tree stage stage_durations_ms start start_byte start_line step_index steps store_schema stored_call_rows strictly_admitted symbol target text thresholds_sha256 trails transport transport_errors transport_p95 unclassified_positive_steps unclassified_step_indices unknown_response_p95_bytes unknown_warm_p95_ms unresolved_placeholder_rows upper validation warm_end_to_end_ms wilson";
+    const FIXED: &str = "actionable_exact_gap actionable_incomplete_gap actual actual_bytes adapter_roster adapter_supported adapter_supported_per_syntax_milli adapter_version admitted_rows after_step_count ambiguous architecture attempted_positive_steps attempted_step_count authoritative_receipts authoritative_receipts_per_proof_shape_admitted_milli automatic_thresholds_met basis binary_name binary_sha256 boundary buckets build byte_end byte_start callee_form caller callsite_identity callsite_line candidate_edge_ids canonical_id canonical_id_binding_sha256 cargo_profile case_id cases certainty certified_absence classified_positive_steps code cohorts complete_projection_bytes complete_proofs complete_proofs_per_authoritative_receipts_milli complete_response_p95_bytes connected_receipts containment contract_digest contract_proven conversions core_generation core_generation_id core_published_at_epoch_ms core_run_id corpus_sha256 count counts database_sha256 decision denominator detail edge_count edge_id edge_ids effective_endpoint effective_endpoint_rows elapsed_ns end_byte end_line enumeration_receipt_id environment environment_id error evidence exact exact_call_linked exact_call_linked_per_exact_milli exact_per_adapter_supported_milli exact_resolved exact_resolved_rows exclude_from_projection extractor_capability_receipt_id fact_count fact_digest fact_schema_version failed_gates failure failure_funnel false_contract_proven file_byte_length file_count file_node_id finalization freshness full_or_useful_partial full_proof_wilson full_proofs gap gaps gate gate_id hard_gates histogram identity incomplete_domain incomplete_provenance indexed_sha256 invalid_results inventory invocation kind language length lengths line_window lower lower_milli maximum_bytes maximum_candidate_edges maximum_response_bytes measurements message milli mismatches missing_binding missing_oracle_steps mutated_spec mutation_id negative_mutations node_count node_id non_exact_authoritative_receipts numerator observations observations_sha256 observed observed_candidate_edges_at_least observed_receipts observed_sha256 operation oracle_comparison oracle_step oracle_step_index os outcome over_cap_results owner_node_id path path_id pinned positive_step_recall prescribed_argv primary_evidence_kind product_disposition product_disposition_mismatches profile prohibit_traversal_through prohibition_index project_file_components project_id projection projection_bytes projections projects proof_shape_admitted proof_shape_admitted_per_exact_call_linked_milli proof_trace provenance qualification_id qualification_source_commit qualification_source_tree qualified_name range reason reasons receipt_evidence receipt_file_sha256 receipt_id receipt_line_window receipts recorded_at repository_id required resolution_funnel results_sha256 revision rows rust_host rustc_vv schema selector selector_early_return selector_index selectors sha256 source source_commit source_dirty source_head source_tree stage stage_durations_ms start start_byte start_line step_index steps store_schema stored_call_rows strictly_admitted symbol syntax_calls target text thresholds_sha256 trails transport transport_errors transport_p95 unclassified_positive_steps unclassified_step_indices unknown_response_p95_bytes unknown_warm_p95_ms unresolved_placeholder_rows unsupported upper validation warm_end_to_end_ms wilson";
     FIXED.split_ascii_whitespace()
 }
 
@@ -2196,6 +2254,7 @@ fn validate_public_bundle(bundle: &PublicArtifactBundle, policy: &PublicLeakPoli
         &bundle.trails,
         &bundle.cases,
         &bundle.failure_funnel,
+        &bundle.resolution_funnel,
         &bundle.summary,
         &bundle.decision,
     ] {
@@ -2537,6 +2596,7 @@ mod tests {
             trails: json!([]),
             cases: json!([]),
             failure_funnel: json!({}),
+            resolution_funnel: json!({}),
             summary: json!({}),
             decision: json!({}),
             findings: "# Findings\n\nNone.\n".to_owned(),
@@ -2996,7 +3056,7 @@ mod tests {
             ),
         )
         .expect("every field of a legitimate closed transport error is publishable");
-        assert_eq!(fs::read_dir(destination).unwrap().count(), 8);
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 9);
     }
 
     #[cfg(all(
@@ -3090,6 +3150,7 @@ mod tests {
                 trails: parsed.trails,
                 cases: parsed.cases,
                 failure_funnel: parsed.failure_funnel,
+                resolution_funnel: parsed.resolution_funnel,
             },
             &corpus,
             &thresholds,
@@ -3122,7 +3183,7 @@ mod tests {
             &PublicLeakPolicy::default(),
         )
         .expect("split readback must preserve every exact graph ID");
-        assert_eq!(fs::read_dir(destination).unwrap().count(), 8);
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 9);
     }
 
     fn assert_fixed_object_keys(value: &Value) {
@@ -3160,7 +3221,7 @@ mod tests {
             CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow,
             PinnedNodeIdentity, ReceiptRef, ResolvedNodeIdentity,
         };
-        use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+        use codestory_contracts::graph::NodeId;
 
         const SOURCE_CANONICAL_ID: &str = "/Users/private/worktree/src/caller.rs::caller";
         const TARGET_CANONICAL_ID: &str = r"C:\private\worktree\src\target.rs::target";
@@ -3199,7 +3260,9 @@ mod tests {
             },
             source: resolved(&prior.source, SOURCE_CANONICAL_ID),
             target: resolved(&prior.target, TARGET_CANONICAL_ID),
-            certainty: ResolutionCertainty::Certain,
+            resolution_fact_id: "a".repeat(64),
+            resolution_evidence_sha256: "b".repeat(64),
+            exact_callsite_start_byte: 0,
             callsite_identity: prior.callsite_identity.clone(),
             column_or_ordinal: 0,
             containment: CallableContainmentEvidence {
@@ -3239,6 +3302,7 @@ mod tests {
                 trails: parsed.trails,
                 cases: parsed.cases,
                 failure_funnel: parsed.failure_funnel,
+                resolution_funnel: parsed.resolution_funnel,
             },
             &corpus,
             &thresholds,
@@ -3280,7 +3344,7 @@ mod tests {
             &PublicLeakPolicy::default(),
         )
         .unwrap();
-        assert_eq!(fs::read_dir(destination).unwrap().count(), 8);
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 9);
     }
 
     #[cfg(all(
@@ -3696,7 +3760,7 @@ mod tests {
     }
 
     #[test]
-    fn publishing_is_whole_directory_no_replace_and_exactly_eight_files() {
+    fn publishing_is_whole_directory_no_replace_and_exactly_nine_files() {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("result");
         publish_bundle(
@@ -3851,6 +3915,7 @@ mod tests {
                     strictly_admitted: 7,
                 }],
             }],
+            resolution_funnel: vec![],
             thresholds_id: "thresholds-v1".into(),
             methodology_sha256: "1".repeat(64),
             hard_gate_summary: "false_proofs<=0; exact_receipts=true; certified_absence<=0; complete_funnel=true; complete_provenance=true; invalid<=0; over_cap<=0; transport_errors<=0; maximum_bytes<=65536; each_cohort=true; disposition_match=true".into(),

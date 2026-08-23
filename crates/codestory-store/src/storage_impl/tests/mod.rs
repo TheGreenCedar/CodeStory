@@ -4569,6 +4569,29 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
 
     let category_id = storage.create_bookmark_category("Favorites")?;
     let _ = storage.add_bookmark(category_id, function_node.id, Some("keep"))?;
+    storage.conn.execute(
+        "INSERT INTO proof_resolution_fact (
+            fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+            file_id, source_sha256, start_byte, end_byte_exclusive,
+            line, column, callee_form, raw_target, caller_node_id,
+            target_node_id, status, reason, evidence_json, dependency_json,
+            lookup_domain_complete, producer, fact_schema_version, algorithm,
+            language_adapter, language_adapter_version, parser_fingerprint,
+            evidence_digest
+         ) VALUES (?1, NULL, NULL, NULL, 500, ?2, 1, 2, 1, 1,
+            'identifier', 'missing', 501, NULL, 'missing_binding',
+            'missing_binding', '[]', '[]', 1, 'codestory-internal', 1,
+            'exact-call-resolution-v1', 'rust', 'test', ?2, ?2)",
+        params!["1".repeat(64), "2".repeat(64)],
+    )?;
+    storage.conn.execute(
+        "INSERT INTO proof_resolution_publication (
+            id, core_generation_id, core_run_id, fact_schema_version,
+            adapter_roster_json, complete, fact_count, fact_digest,
+            funnel_json, published_at_epoch_ms
+         ) VALUES (1, 'generation', 'run', 1, '[]', 1, 1, ?1, '[]', 1)",
+        ["3".repeat(64)],
+    )?;
 
     // Ensure cache is warm before clear.
     assert!(storage.get_node(function_node.id)?.is_some());
@@ -4577,6 +4600,8 @@ fn test_clear_removes_fk_dependents_and_cache() -> Result<(), StorageError> {
 
     for table in [
         "occurrence",
+        "proof_resolution_publication",
+        "proof_resolution_fact",
         "edge",
         "llm_symbol_doc",
         "symbol_summary",
@@ -6020,6 +6045,134 @@ fn seed_promotion_file(path: &Path, id: i64, name: &str) -> Result<(), StorageEr
     seed_promotion_file_with_identity(path, id, name, true)
 }
 
+#[test]
+fn promotion_rejects_a_corrupt_candidate_proof_projection() {
+    let live_path = unique_temp_db_path("proof-bound-promotion-live");
+    let staged_path = unique_temp_db_path("proof-bound-promotion-staged");
+    seed_promotion_file(&live_path, 1, "old.rs").expect("seed live");
+    seed_promotion_file(&staged_path, 2, "new.rs").expect("seed staged");
+    {
+        let mut storage = Storage::open(&staged_path).expect("open staged");
+        let publication = storage.get_complete_index_publication().unwrap().unwrap();
+        storage
+            .replace_proof_resolution_projection(
+                &publication,
+                &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                    adapter_roster: vec![
+                        codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                            language: "rust".to_string(),
+                            adapter_version: "test".to_string(),
+                        },
+                    ],
+                    facts: Vec::new(),
+                    funnel: Vec::new(),
+                },
+            )
+            .expect("publish empty proof projection");
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_publication SET fact_digest = ?1 WHERE id = 1",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        storage.finalize_staged_snapshot().unwrap();
+    }
+
+    let error = Storage::promote_staged_snapshot(&staged_path, &live_path)
+        .expect_err("corrupt candidate proof projection must reject promotion");
+    assert!(error.to_string().contains("proof resolution"), "{error}");
+    assert_eq!(
+        Storage::open(&live_path)
+            .unwrap()
+            .get_complete_index_publication()
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+
+    cleanup_sqlite_sidecars(&live_path).unwrap();
+    cleanup_sqlite_sidecars(&staged_path).unwrap();
+}
+
+#[test]
+fn proof_rollback_identity_preserves_valid_absence_and_authenticates_receipts() {
+    let path = unique_temp_db_path("proof-rollback-identity");
+    seed_promotion_file(&path, 1, "old.rs").expect("seed publication");
+    let mut storage = Storage::open(&path).expect("open publication");
+    let publication = storage.get_complete_index_publication().unwrap().unwrap();
+    assert_eq!(
+        read_proof_resolution_rollback_identity(&path, &publication).unwrap(),
+        None,
+        "schema 32 may explicitly carry no proof projection"
+    );
+
+    let receipt = storage
+        .replace_proof_resolution_projection(
+            &publication,
+            &codestory_contracts::proof_resolution::ProofResolutionProjection {
+                adapter_roster: vec![
+                    codestory_contracts::proof_resolution::ProofResolutionAdapter {
+                        language: "rust".to_string(),
+                        adapter_version: "test".to_string(),
+                    },
+                ],
+                facts: Vec::new(),
+                funnel: Vec::new(),
+            },
+        )
+        .expect("publish empty authenticated projection");
+    storage.finalize_staged_snapshot().unwrap();
+    let identity = read_proof_resolution_rollback_identity(&path, &publication)
+        .unwrap()
+        .expect("authenticated projection identity");
+    assert_eq!(identity.core_generation_id, publication.generation_id);
+    assert_eq!(identity.core_run_id, publication.run_id);
+    assert_eq!(
+        identity.core_published_at_epoch_ms,
+        publication.published_at_epoch_ms
+    );
+    assert_eq!(identity.fact_count, 0);
+    assert_eq!(identity.fact_digest, receipt.fact_digest);
+
+    storage
+        .get_connection()
+        .execute("DELETE FROM proof_resolution_publication", [])
+        .unwrap();
+    drop(storage);
+    assert_eq!(
+        read_proof_resolution_rollback_identity(&path, &publication).unwrap(),
+        None,
+        "removing an empty receipt preserves authenticated absence"
+    );
+
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+    conn.execute(
+        "INSERT INTO proof_resolution_fact (
+            fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+            file_id, source_sha256, start_byte, end_byte_exclusive,
+            line, column, callee_form, raw_target, caller_node_id,
+            target_node_id, status, reason, evidence_json, dependency_json,
+            lookup_domain_complete, producer, fact_schema_version, algorithm,
+            language_adapter, language_adapter_version, parser_fingerprint,
+            evidence_digest
+         ) VALUES (?1, NULL, NULL, NULL, 999, ?2, 1, 2, 1, 1,
+            'identifier', 'missing', 999, NULL, 'missing_binding',
+            'missing_binding', '[]', '[]', 1, 'codestory-internal', 1,
+            'exact-call-resolution-v1', 'rust', 'test', ?2, ?2)",
+        params!["1".repeat(64), "2".repeat(64)],
+    )
+    .unwrap();
+    drop(conn);
+    let error = read_proof_resolution_rollback_identity(&path, &publication)
+        .expect_err("facts without a receipt must fail closed");
+    assert!(error.to_string().contains("no publication"), "{error}");
+
+    cleanup_sqlite_sidecars(&path).unwrap();
+}
+
 fn publish_bound_test_structural_cache(path: &Path) -> Result<(), StorageError> {
     let mut storage = Storage::open(path)?;
     let file = storage
@@ -6212,6 +6365,15 @@ fn promotion_journal(
             candidate_path,
             &candidate,
         )?,
+        previous_proof_resolution: previous
+            .as_ref()
+            .map(|publication| read_proof_resolution_rollback_identity(previous_path, publication))
+            .transpose()?
+            .flatten(),
+        candidate_proof_resolution: read_proof_resolution_rollback_identity(
+            candidate_path,
+            &candidate,
+        )?,
         previous,
         candidate,
     })
@@ -6232,6 +6394,10 @@ fn promotion_journal_for_version(
         journal.previous_structural_text = None;
         journal.candidate_structural_text = None;
     }
+    if version < PROMOTION_JOURNAL_VERSION {
+        journal.previous_proof_resolution = None;
+        journal.candidate_proof_resolution = None;
+    }
     Ok(journal)
 }
 
@@ -6240,6 +6406,12 @@ fn restamp_complete_promotion_fixture(
     schema_version: u32,
 ) -> Result<(), StorageError> {
     let conn = Connection::open(path)?;
+    if schema_version < SCHEMA_VERSION {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS proof_resolution_publication;
+             DROP TABLE IF EXISTS proof_resolution_fact;",
+        )?;
+    }
     if schema_version < STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION {
         conn.execute_batch(
             "DROP TABLE IF EXISTS structural_text_unit;
@@ -6333,7 +6505,11 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
         RecoveryDatabaseContract::Journal(STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION);
     let structural_policy_journal =
         RecoveryDatabaseContract::Journal(STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION);
-    let semantic_projection_journal = RecoveryDatabaseContract::Journal(PROMOTION_JOURNAL_VERSION);
+    let semantic_projection_journal =
+        RecoveryDatabaseContract::Journal(SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION);
+    let annotation_sidecar_journal =
+        RecoveryDatabaseContract::Journal(ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION);
+    let proof_resolution_journal = RecoveryDatabaseContract::Journal(PROMOTION_JOURNAL_VERSION);
     let legacy_backup = RecoveryDatabaseContract::LegacyBackup;
 
     for schema_version in
@@ -6358,7 +6534,24 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
         semantic_projection_journal
             .supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
     );
-    assert!(semantic_projection_journal.supports_complete_schema(SCHEMA_VERSION));
+    assert!(
+        semantic_projection_journal
+            .supports_complete_schema(SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(
+        !semantic_projection_journal
+            .supports_complete_schema(ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(
+        annotation_sidecar_journal
+            .supports_complete_schema(ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(!annotation_sidecar_journal.supports_complete_schema(SCHEMA_VERSION));
+    assert!(
+        proof_resolution_journal
+            .supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION)
+    );
+    assert!(proof_resolution_journal.supports_complete_schema(SCHEMA_VERSION));
     assert!(current.supports_complete_schema(STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION));
     assert!(current.supports_complete_schema(SCHEMA_VERSION));
     assert!(legacy_journal.supports_complete_schema(SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION));
@@ -6381,6 +6574,14 @@ fn recovery_schema_contracts_match_their_durable_journal_generations() {
         ),
         (
             semantic_projection_journal,
+            STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
+        ),
+        (
+            annotation_sidecar_journal,
+            STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
+        ),
+        (
+            proof_resolution_journal,
             STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION - 1,
         ),
         (legacy_backup, LEGACY_PROMOTION_MIN_SCHEMA_VERSION - 1),
@@ -6869,6 +7070,12 @@ fn promotion_recovery_rejects_unsupported_and_unmarked_schema_identities() {
             "unsupported schema version",
         ),
         (
+            "invalid-v6-schema32",
+            ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION,
+            SCHEMA_VERSION,
+            "unsupported schema version",
+        ),
+        (
             "unmarked-incomplete-v2",
             SOURCE_POLICY_PROMOTION_JOURNAL_VERSION,
             INCOMPLETE_INCREMENTAL_SCHEMA_VERSION,
@@ -7293,6 +7500,8 @@ fn legacy_committed_journal_without_source_policy_identity_recovers_for_runtime_
             candidate_source_policy: None,
             previous_structural_text: None,
             candidate_structural_text: None,
+            previous_proof_resolution: None,
+            candidate_proof_resolution: None,
         },
     )
     .expect("write legacy committed journal");
@@ -10725,7 +10934,7 @@ fn the_annotation_cutover_marker_is_inseparable_from_the_schema_barrier() -> Res
     // database instead of writing the retained legacy annotation tables.
     let storage = Storage::new_in_memory()?;
 
-    assert_eq!(CURRENT_SCHEMA_VERSION, 31);
+    assert_eq!(CURRENT_SCHEMA_VERSION, 32);
     let (sidecar_version, cutover_at) = storage
         .annotation_sidecar_cutover()?
         .expect("a current-schema database is stamped with the cutover marker");
@@ -11191,6 +11400,8 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
         read_source_policy_exclusion_rollback_identity(&staged_path, &candidate)?;
     let candidate_structural_text =
         read_structural_text_unit_rollback_identity(&staged_path, &candidate)?;
+    let candidate_proof_resolution =
+        read_proof_resolution_rollback_identity(&staged_path, &candidate)?;
     let candidate_image = promotion_database_image(&staged_path)?.expect("candidate image");
 
     let mut live_conn = Connection::open(sqlite_path::open_path(&live_path))?;
@@ -11208,6 +11419,7 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
             &candidate,
             &candidate_source_policy,
             &candidate_structural_text,
+            &candidate_proof_resolution,
             Some(candidate_image),
         )?,
         PromotedValidation::ReusedCandidateReceipt,
@@ -11220,6 +11432,7 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
             &candidate,
             &candidate_source_policy,
             &candidate_structural_text,
+            &candidate_proof_resolution,
             None,
         )?,
         PromotedValidation::Revalidated,
@@ -11241,6 +11454,7 @@ fn promoted_receipt_reuse_is_sealed_to_the_restored_bytes() -> Result<(), Storag
         &candidate,
         &candidate_source_policy,
         &candidate_structural_text,
+        &candidate_proof_resolution,
         Some(candidate_image),
     )
     .expect_err("a corrupted restore must fail the post-restore fence");

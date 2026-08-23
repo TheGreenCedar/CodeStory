@@ -18,7 +18,7 @@ use contracts::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const COMMIT: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -205,6 +205,7 @@ fn task11a_results_digest_is_non_circular_order_stable_and_evidence_complete() {
         &parsed.trails,
         &parsed.cases,
         &parsed.failure_funnel,
+        &parsed.resolution_funnel,
     )
     .expect("results evidence digest");
 
@@ -220,6 +221,7 @@ fn task11a_results_digest_is_non_circular_order_stable_and_evidence_complete() {
             &reordered.trails,
             &reordered.cases,
             &reordered.failure_funnel,
+            &reordered.resolution_funnel,
         )
         .unwrap(),
         expected
@@ -234,6 +236,7 @@ fn task11a_results_digest_is_non_circular_order_stable_and_evidence_complete() {
             &changed_case.trails,
             &changed_case.cases,
             &changed_case.failure_funnel,
+            &changed_case.resolution_funnel,
         )
         .unwrap(),
         expected
@@ -248,6 +251,7 @@ fn task11a_results_digest_is_non_circular_order_stable_and_evidence_complete() {
             &changed_timestamp.trails,
             &changed_timestamp.cases,
             &changed_timestamp.failure_funnel,
+            &changed_timestamp.resolution_funnel,
         )
         .unwrap(),
         expected,
@@ -265,10 +269,33 @@ fn task11a_results_digest_is_non_circular_order_stable_and_evidence_complete() {
             &parsed.trails,
             &parsed.cases,
             &parsed.failure_funnel,
+            &parsed.resolution_funnel,
         )
         .unwrap(),
         presentation_only["provenance"]["results_sha256"]
     );
+}
+
+#[test]
+fn resolution_funnel_rejects_non_nested_counts_status_drift_and_rate_drift() {
+    let mut non_nested = report();
+    non_nested["resolution_funnel"]["rows"][0]["counts"]["authoritative_receipts"] = json!(313);
+    rebind_results_digest(&mut non_nested);
+    QualificationSummaryV1::from_json(non_nested)
+        .expect_err("authoritative receipts cannot exceed proof-shape admission");
+
+    let mut status_drift = report();
+    status_drift["resolution_funnel"]["rows"][0]["counts"]["ambiguous"] = json!(1);
+    rebind_results_digest(&mut status_drift);
+    QualificationSummaryV1::from_json(status_drift)
+        .expect_err("status partition must equal syntax calls");
+
+    let mut rate_drift = report();
+    rate_drift["resolution_funnel"]["rows"][0]["conversions"]["exact_per_adapter_supported_milli"] =
+        json!(999);
+    rebind_results_digest(&mut rate_drift);
+    QualificationSummaryV1::from_json(rate_drift)
+        .expect_err("reported conversions must be recomputed from counts");
 }
 
 #[test]
@@ -1086,14 +1113,78 @@ pub(crate) fn report() -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let resolution_rows = cohort_ids
+        .iter()
+        .map(|repository_id| {
+            let fact_count = cases
+                .iter()
+                .filter(|case| case["repository_id"] == json!(repository_id))
+                .flat_map(|case| {
+                    case["proof_trace"]["steps"]
+                        .as_array()
+                        .expect("steps")
+                        .iter()
+                })
+                .flat_map(|step| {
+                    step["outcome"]["edge_ids"]
+                        .as_array()
+                        .expect("admitted edge ids")
+                        .iter()
+                        .filter_map(Value::as_str)
+                })
+                .collect::<BTreeSet<_>>()
+                .len() as u64;
+            json!({
+                "repository_id":repository_id,
+                "language":"rust",
+                "callee_form":"identifier",
+                "primary_evidence_kind":"same_file_declaration",
+                "counts":{
+                    "syntax_calls":fact_count,"adapter_supported":fact_count,"exact":fact_count,
+                    "ambiguous":0,"missing_binding":0,"incomplete_domain":0,"unsupported":0,
+                    "exact_call_linked":fact_count,"proof_shape_admitted":fact_count,
+                    "authoritative_receipts":fact_count,"complete_proofs":fact_count
+                },
+                "conversions":{
+                    "adapter_supported_per_syntax_milli":1000,
+                    "exact_per_adapter_supported_milli":1000,
+                    "exact_call_linked_per_exact_milli":1000,
+                    "proof_shape_admitted_per_exact_call_linked_milli":1000,
+                    "authoritative_receipts_per_proof_shape_admitted_milli":1000,
+                    "complete_proofs_per_authoritative_receipts_milli":1000
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let resolution_projections = resolution_rows
+        .iter()
+        .map(|row| {
+            let repository_id = row["repository_id"].as_str().expect("repository id");
+            json!({
+                "repository_id":repository_id,
+                "core_generation_id":format!("generation-{repository_id}"),
+                "core_run_id":format!("run-{repository_id}"),
+                "core_published_at_epoch_ms":"1",
+                "fact_schema_version":1,
+                "fact_count":row["counts"]["syntax_calls"],
+                "fact_digest":SHA,
+                "adapter_roster":[
+                    {"language":"rust","adapter_version":"reference-v5"},
+                    {"language":"tsx","adapter_version":"reference-v5"},
+                    {"language":"typescript","adapter_version":"reference-v5"}
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
     let mut report = json!({
-      "schema":"codestory.proof-availability-report/v3","qualification_id":"20260821T000000Z-bbbbbbbbbbbb",
+      "schema":"codestory.proof-availability-report/v4","qualification_id":"20260821T000000Z-bbbbbbbbbbbb",
       "provenance":{"source_commit":COMMIT,"source_tree":COMMIT,"binary_sha256":SHA,"corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash,"results_sha256":SHA},
       "environment":{"qualification_id":"20260821T000000Z-bbbbbbbbbbbb","environment_id":"macos-arm64","os":"macos","architecture":"aarch64","rust_host":"aarch64-apple-darwin","binary_sha256":SHA,"qualification_source_commit":COMMIT,"qualification_source_tree":COMMIT,"recorded_at":"2026-08-21T12:34:56Z","build":{"source_commit":COMMIT,"source_tree":COMMIT,"source_dirty":false,"rustc_vv":"rustc 1.91.0\nbinary: rustc\nhost: aarch64-apple-darwin\n","cargo_profile":"release","prescribed_argv":["cargo","build","--release","--locked","-p","codestory-bench","--bin","codestory-proof-availability"]},"invocation":{"binary_name":"codestory-proof-availability","operation":"run","profile":"local_core_only","corpus_sha256":corpus_hash,"thresholds_sha256":threshold_hash},"projects":frozen["cohorts"].as_array().unwrap().iter().map(|cohort|{let id=cohort["repository_id"].as_str().unwrap();json!({"repository_id":id,"source_head":cohort["commit"],"source_tree":SHA,"store_schema":"codestory-store/v1","file_count":10,"node_count":20,"edge_count":30,"freshness":"fresh","database_sha256":SHA,"core_generation":1,"identity":{"project_id":format!("project-{id}"),"core_generation_id":format!("generation-{id}"),"core_run_id":format!("run-{id}")}})}).collect::<Vec<_>>()},
       "inventory":cohort_ids.iter().map(|id|json!({"repository_id":id,"stored_call_rows":"10","effective_endpoint_rows":"10","exact_resolved_rows":"8","admitted_rows":"7","unresolved_placeholder_rows":"2"})).collect::<Vec<_>>(),
       "trails":cohort_ids.iter().map(|id|json!({"repository_id":id,"lengths":[{"length":1,"effective_endpoint":"10","exact_resolved":"8","strictly_admitted":"7"},{"length":2,"effective_endpoint":"9","exact_resolved":"7","strictly_admitted":"6"},{"length":3,"effective_endpoint":"8","exact_resolved":"6","strictly_admitted":"5"},{"length":4,"effective_endpoint":"7","exact_resolved":"5","strictly_admitted":"4"},{"length":5,"effective_endpoint":"6","exact_resolved":"4","strictly_admitted":"3"},{"length":6,"effective_endpoint":"5","exact_resolved":"3","strictly_admitted":"2"}]})).collect::<Vec<_>>(),
       "cases":cases,
-      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"outcome":{"kind":"admitted"},"count":"312"}]}
+      "failure_funnel":{"attempted_positive_steps":312,"classified_positive_steps":312,"unclassified_positive_steps":0,"buckets":[{"outcome":{"kind":"admitted"},"count":"312"}]},
+      "resolution_funnel":{"projections":resolution_projections,"rows":resolution_rows}
     });
     report["provenance"]["results_sha256"] =
         json!(contracts::results_evidence_sha256_from_json(&report).unwrap());
@@ -1221,7 +1312,9 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
         },
         source: identity("1", &oracle.caller),
         target: identity("2", &oracle.target),
-        certainty: codestory_contracts::graph::ResolutionCertainty::Certain,
+        resolution_fact_id: "a".repeat(64),
+        resolution_evidence_sha256: "b".repeat(64),
+        exact_callsite_start_byte: 0,
         callsite_identity: "1:1:0:2|fixture".into(),
         column_or_ordinal: 0,
         containment: codestory_agent::proof_qualification_support::CallableContainmentEvidence {
@@ -1327,7 +1420,7 @@ fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity,
     };
-    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+    use codestory_contracts::graph::NodeId;
 
     let path_file =
         CohortPathFileV1::from_json(cohort_path_file("codestory-rust")).expect("oracle path file");
@@ -1363,7 +1456,9 @@ fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
         },
         source: identity("-1", source_raw, &oracle.caller.symbol),
         target: identity("-2", target_raw, &oracle.target.symbol),
-        certainty: ResolutionCertainty::Certain,
+        resolution_fact_id: "a".repeat(64),
+        resolution_evidence_sha256: "b".repeat(64),
+        exact_callsite_start_byte: 0,
         callsite_identity: format!("-3:{}:0:-2|fixture", oracle.callsite_line),
         column_or_ordinal: 0,
         containment: CallableContainmentEvidence {
@@ -2359,11 +2454,11 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
     };
-    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+    use codestory_contracts::graph::NodeId;
     use codestory_runtime::proof_qualification_support::{
         CandidateFailure, CandidateGate, ContainmentFailure, FinalizationFailure,
-        FinalizationTrace, ProofQualificationTrace, SelectorFailure, SelectorGateOutcome,
-        SelectorQualificationTrace, SourceBindingFailure,
+        FinalizationTrace, ProofQualificationTrace, ResolutionFactFailure, SelectorFailure,
+        SelectorGateOutcome, SelectorQualificationTrace, SourceBindingFailure,
     };
 
     let trace = ProofQualificationTrace {
@@ -2413,12 +2508,36 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
 
     for gate in [
         CandidateGate::RawAdmission,
+        CandidateGate::ResolutionFact,
         CandidateGate::Containment,
         CandidateGate::SourceBinding,
         CandidateGate::Line,
     ] {
         let _: CandidateGateV1 = gate.into();
     }
+    assert_eq!(
+        serde_json::to_value(CandidateGateV1::from(CandidateGate::ResolutionFact)).unwrap(),
+        json!("resolution_fact")
+    );
+    for (reason, expected) in [
+        (ResolutionFactFailure::Missing, "missing"),
+        (ResolutionFactFailure::Inconsistent, "inconsistent"),
+    ] {
+        assert_eq!(
+            serde_json::to_value(CandidateFailureV1::from(CandidateFailure::ResolutionFact(
+                reason,
+            )))
+            .unwrap(),
+            json!({ "kind": "resolution_fact", "reason": expected })
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(CandidateFailureV1::from(CandidateFailure::SourceBinding(
+            SourceBindingFailure::ExactCallsiteMismatch,
+        )))
+        .unwrap(),
+        json!({ "kind": "source_binding", "reason": "exact_callsite_mismatch" })
+    );
     for failure in [
         SelectorFailure::Missing,
         SelectorFailure::Ambiguous,
@@ -2431,14 +2550,12 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         UnavailableReason::PublicationPinMismatch,
         UnavailableReason::SourceNotBoundToPublication,
         UnavailableReason::ProofFactsUnavailable,
+        UnavailableReason::ProofSemanticProjectionUnavailable,
     ] {
         let _: SelectorGateOutcomeV1 = SelectorGateOutcome::Unavailable(unavailable).into();
     }
     for reason in [
         codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyAbsent,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyProbable,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyUncertain,
         codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource,
         codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget,
         codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget,
@@ -2467,6 +2584,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         SourceBindingFailure::InvalidUtf8,
         SourceBindingFailure::LineMissing,
         SourceBindingFailure::LineOverLimit,
+        SourceBindingFailure::ExactCallsiteMismatch,
     ] {
         let _: CandidateFailureV1 = CandidateFailure::SourceBinding(reason).into();
     }
@@ -2520,7 +2638,9 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         },
         source: identity("-1", "codestory-rust-l1-0::start"),
         target: identity("-2", "codestory-rust-l1-0::target_0"),
-        certainty: ResolutionCertainty::Certain,
+        resolution_fact_id: "a".repeat(64),
+        resolution_evidence_sha256: "b".repeat(64),
+        exact_callsite_start_byte: 0,
         callsite_identity: "-3:1:0:-2|fixture".into(),
         column_or_ordinal: 0,
         containment: CallableContainmentEvidence {
@@ -2665,15 +2785,15 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         ["src", "area0", "file0.rs"]
     );
 
-    let mut probable = task6_receipt;
-    probable.certainty = ResolutionCertainty::Probable;
+    let mut unbound = task6_receipt;
+    unbound.resolution_fact_id.clear();
     let comparison: ReceiptOracleComparisonV1 = serde_json::from_value(
         report()["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]
             .clone(),
     )
     .expect("oracle comparison");
-    ObservedReceiptV1::from_task6(0, &probable, comparison)
-        .expect_err("Task 6 receipts must retain and require Certain certainty");
+    ObservedReceiptV1::from_task6(0, &unbound, comparison)
+        .expect_err("Task 6 receipts must retain an authenticated exact-resolution fact");
 }
 
 #[test]
@@ -2682,7 +2802,7 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity,
     };
-    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+    use codestory_contracts::graph::NodeId;
 
     const RAW_TARGET: i64 = -8_657_445_931_347_514_024;
     const RESOLVED_TARGET: i64 = -8_657_442_632_812_629_391;
@@ -2716,7 +2836,9 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
         },
         source: identity(-1, &oracle.caller),
         target: identity(RESOLVED_TARGET, &oracle.target),
-        certainty: ResolutionCertainty::Certain,
+        resolution_fact_id: "a".repeat(64),
+        resolution_evidence_sha256: "b".repeat(64),
+        exact_callsite_start_byte: 0,
         callsite_identity: callsite_identity.clone(),
         column_or_ordinal: 0,
         containment: CallableContainmentEvidence {
@@ -3281,7 +3403,13 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
     let report_schema = contracts::schema_json(SchemaDocument::Report);
     assert_eq!(
         report_schema["$id"],
-        "codestory.proof-availability-report/v3"
+        "codestory.proof-availability-report/v4"
+    );
+    assert!(
+        report_schema["properties"]
+            .get("resolution_funnel")
+            .is_some(),
+        "the current report must carry the authenticated exact-resolution funnel"
     );
     fn assert_exact_graph_id_schema(value: &Value) {
         match value {
