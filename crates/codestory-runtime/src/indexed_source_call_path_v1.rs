@@ -1834,10 +1834,10 @@ mod tests {
                     target: NodeId(3),
                     kind: EdgeKind::CALL,
                     file_node_id: Some(NodeId(1)),
-                    line: Some(1),
+                    line: Some(2),
                     resolved_source: Some(NodeId(2)),
                     resolved_target: Some(NodeId(3)),
-                    callsite_identity: Some(format!("1:1:{}:3|rust", offset + 1)),
+                    callsite_identity: Some(format!("1:2:{}:3|rust", offset + 1)),
                     candidate_targets: Vec::new(),
                     ..Default::default()
                 })
@@ -2605,6 +2605,52 @@ mod tests {
     }
 
     #[test]
+    fn source_built_same_line_repeated_calls_build_distinct_receipts() {
+        let fixture = source_built_fixture(
+            "fn target() {}\n\
+             fn source() { target(); target(); }\n",
+        );
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+
+        let result = evaluate_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let receipts = &result.built_facts().receipts;
+        assert_eq!(receipts.len(), 2, "one receipt per exact repeated callsite");
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.receipt.edge_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "repeated callsites must not reuse an ordinary edge"
+        );
+        let earliest = receipts
+            .iter()
+            .min_by_key(|receipt| receipt.exact_callsite_start_byte)
+            .unwrap();
+        assert!(matches!(
+            result.disposition(),
+            ProofDisposition::ContractProven { receipts, .. }
+                if receipts == &[earliest.receipt.clone()]
+        ));
+    }
+
+    #[test]
     fn source_built_exact_span_accepts_byte_columns_after_multibyte_and_crlf_lines() {
         let source_text = "fn target() {}\r\nfn source() { let _accent = \"é\"; target(); }\r\n";
         let fixture = source_built_fixture(source_text);
@@ -3106,10 +3152,10 @@ mod tests {
                 target: NodeId(3),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
-                line: Some(1),
+                line: Some(2),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                callsite_identity: Some("1:1:1:3|rust".to_owned()),
+                callsite_identity: Some("1:2:1:3|rust".to_owned()),
                 candidate_targets: Vec::new(),
                 ..Default::default()
             })
@@ -3264,10 +3310,10 @@ mod tests {
                 target: NodeId(3),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
-                line: Some(1),
+                line: Some(2),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                callsite_identity: Some("1:1:1:3|second-callsite".to_owned()),
+                callsite_identity: Some("1:2:1:3|second-callsite".to_owned()),
                 candidate_targets: Vec::new(),
                 ..Default::default()
             })

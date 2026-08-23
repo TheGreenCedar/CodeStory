@@ -7,10 +7,12 @@ use anyhow::{Context, Result, anyhow};
 use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{
     CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
-    ExactCallsite, FileId, INTERNAL_RESOLUTION_PRODUCER, PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
-    ProofResolutionAdapter, ProofResolutionFunnelCounts, ProofResolutionFunnelRow,
-    ProofResolutionProjection, ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence,
-    ResolutionEvidenceKind, ResolutionProvenance,
+    ExactCallsite, ExactCallsiteCorrelationFailure, ExactSyntaxCallsiteCorrelationInput, FileId,
+    INTERNAL_RESOLUTION_PRODUCER, OrdinaryCallEdgeCorrelationInput,
+    PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ProofResolutionAdapter, ProofResolutionFunnelCounts,
+    ProofResolutionFunnelRow, ProofResolutionProjection, ProofResolutionReason,
+    ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind, ResolutionProvenance,
+    correlate_exact_syntax_callsites,
 };
 use codestory_store::{IndexPublicationRecord, ProofResolutionPublication, Store};
 use codestory_workspace::{WorkspacePathIdentity, workspace_path_identity};
@@ -1428,17 +1430,80 @@ pub fn rematerialize_proof_resolution_projection(
             "proof resolution projection has duplicate exact callsites"
         ));
     }
-    let mut facts = Vec::with_capacity(inputs.len());
-    for (source_record, input) in inputs {
-        facts.push(resolve_input(
+    let claims = inputs
+        .into_iter()
+        .map(|(source_record, input)| {
+            resolve_syntax_claim(&file_by_id, &record_by_path, &records, source_record, input)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let exact_claim_indices = claims
+        .iter()
+        .enumerate()
+        .filter_map(|(index, claim)| {
+            (claim.status == ProofResolutionStatus::Exact).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let syntax_correlation_inputs = exact_claim_indices
+        .iter()
+        .map(|index| {
+            let claim = &claims[*index];
+            ExactSyntaxCallsiteCorrelationInput {
+                file_id: claim.input.callsite.file_id,
+                line: claim.input.callsite.line,
+                start_byte: claim.input.callsite.start_byte,
+                end_byte_exclusive: claim.input.callsite.end_byte_exclusive,
+                column: claim.input.callsite.column,
+                caller: claim.caller,
+                target: claim.target.expect("Exact syntax claim has a target"),
+                raw_target: &claim.input.callsite.raw_target,
+            }
+        })
+        .collect::<Vec<_>>();
+    let ordinary_edge_indices = edges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, edge)| {
+            (edge.kind == EdgeKind::CALL && node_by_id.contains_key(&edge.target)).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let edge_correlation_inputs = ordinary_edge_indices
+        .iter()
+        .map(|index| {
+            let edge = &edges[*index];
+            let raw = node_by_id[&edge.target];
+            OrdinaryCallEdgeCorrelationInput {
+                file_id: edge.file_node_id.map(|file| FileId(file.0)),
+                line: edge.line,
+                caller: edge.effective_source(),
+                target: edge.effective_target(),
+                raw_edge_target: edge.target,
+                raw_file_id: raw.file_node_id.map(|file| FileId(file.0)),
+                raw_line: raw.start_line,
+                raw_target: graph_leaf_name(&raw.serialized_name),
+                callsite_identity: edge.callsite_identity.as_deref(),
+                semantic_exact: edge.resolved_target == Some(edge.effective_target())
+                    && edge.candidate_targets.is_empty(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let correlations =
+        correlate_exact_syntax_callsites(&syntax_correlation_inputs, &edge_correlation_inputs)
+            .into_iter()
+            .map(|result| result.map(|edge_index| ordinary_edge_indices[edge_index]))
+            .collect::<Vec<_>>();
+    let mut claim_correlations = vec![None; claims.len()];
+    for (correlation_index, claim_index) in exact_claim_indices.iter().copied().enumerate() {
+        claim_correlations[claim_index] = Some(correlations[correlation_index]);
+    }
+    let mut facts = Vec::with_capacity(claims.len());
+    for claim_index in 0..claims.len() {
+        facts.push(seal_resolved_claim(
             store,
-            &file_by_id,
             &node_by_id,
             &edges,
-            &record_by_path,
-            &records,
-            source_record,
-            input,
+            &claims,
+            claim_index,
+            claim_correlations[claim_index],
         )?);
     }
     let funnel = build_funnel(&facts);
@@ -1499,16 +1564,23 @@ fn resolve_relative_import<'a>(
     Ok((matches.len() == 1).then_some(matches[0]))
 }
 
-fn resolve_input(
-    store: &Store,
+#[derive(Debug)]
+struct ResolvedSyntaxClaim {
+    input: CachedCallResolutionInput,
+    caller: NodeId,
+    target: Option<NodeId>,
+    status: ProofResolutionStatus,
+    reason: ProofResolutionReason,
+    evidence_chain: Vec<ResolutionEvidence>,
+}
+
+fn resolve_syntax_claim(
     files: &HashMap<i64, &codestory_store::FileInfo>,
-    nodes: &HashMap<NodeId, &Node>,
-    edges: &[Edge],
     records: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
     all_records: &[ResolutionCacheRecord],
     source_record: &ResolutionCacheRecord,
     input: CachedCallResolutionInput,
-) -> Result<CallResolutionFact> {
+) -> Result<ResolvedSyntaxClaim> {
     let source_file = files
         .get(&input.callsite.file_id.0)
         .ok_or_else(|| anyhow!("proof callsite file is missing"))?;
@@ -1517,7 +1589,7 @@ fn resolve_input(
     let mut target = None;
     let mut evidence_chain = Vec::new();
     let caller = input.caller.unwrap_or(NodeId(input.callsite.file_id.0));
-    match input.binding {
+    match &input.binding {
         CachedResolutionBinding::SameFile { declaration } => {
             let declaration_is_recorded =
                 source_record
@@ -1526,7 +1598,7 @@ fn resolve_input(
                     .iter()
                     .any(|binding| {
                         binding.name == input.callsite.raw_target
-                            && binding.declaration == declaration
+                            && binding.declaration == *declaration
                     });
             let typescript_script =
                 matches!(source_record.file.language.as_str(), "typescript" | "tsx")
@@ -1540,8 +1612,10 @@ fn resolve_input(
             } else {
                 status = ProofResolutionStatus::Exact;
                 reason = ProofResolutionReason::ExactResolution;
-                target = Some(declaration);
-                evidence_chain.push(ResolutionEvidence::SameFileDeclaration { declaration });
+                target = Some(*declaration);
+                evidence_chain.push(ResolutionEvidence::SameFileDeclaration {
+                    declaration: *declaration,
+                });
             }
         }
         CachedResolutionBinding::ImplicitReceiver {
@@ -1557,7 +1631,7 @@ fn resolve_input(
                 .iter()
                 .flat_map(|record| record.file.inherent_methods.iter())
                 .filter(|method| {
-                    method.owner_name == owner_name
+                    method.owner_name == *owner_name
                         && method.method_name == input.callsite.raw_target
                 })
                 .collect::<Vec<_>>();
@@ -1567,16 +1641,18 @@ fn resolve_input(
             {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
-            } else if matching_methods.len() != 1 || matching_methods[0].declaration != declaration
+            } else if matching_methods.len() != 1 || matching_methods[0].declaration != *declaration
             {
                 status = ProofResolutionStatus::Ambiguous;
                 reason = ProofResolutionReason::MultipleBindings;
             } else {
                 status = ProofResolutionStatus::Exact;
                 reason = ProofResolutionReason::ExactResolution;
-                target = Some(declaration);
-                evidence_chain.push(ResolutionEvidence::ImplicitReceiver { owner });
-                evidence_chain.push(ResolutionEvidence::SameFileDeclaration { declaration });
+                target = Some(*declaration);
+                evidence_chain.push(ResolutionEvidence::ImplicitReceiver { owner: *owner });
+                evidence_chain.push(ResolutionEvidence::SameFileDeclaration {
+                    declaration: *declaration,
+                });
             }
         }
         CachedResolutionBinding::StaticImport {
@@ -1591,7 +1667,7 @@ fn resolve_input(
                 .into_iter()
                 .flat_map(|record| record.file.direct_exports.iter())
                 .filter(|export| {
-                    export.is_default == is_default && export.exported_name == imported_name
+                    export.is_default == *is_default && export.exported_name == *imported_name
                 })
                 .collect::<Vec<_>>();
             if let [declaration] = declarations.as_slice() {
@@ -1599,7 +1675,7 @@ fn resolve_input(
                 reason = ProofResolutionReason::ExactResolution;
                 target = Some(declaration.declaration);
                 evidence_chain.push(ResolutionEvidence::StaticImportBinding {
-                    import,
+                    import: *import,
                     declaration: declaration.declaration,
                 });
             } else if target_record.is_some_and(|record| !record.file.lookup_input_complete) {
@@ -1639,49 +1715,51 @@ fn resolve_input(
         target = None;
         evidence_chain.clear();
     }
-    let mut edge = None;
-    if status == ProofResolutionStatus::Exact {
-        let exact_target = target.expect("exact syntax claim has a target");
-        let matching = edges
-            .iter()
-            .filter(|candidate| {
-                let raw_target_matches_span = nodes.get(&candidate.target).is_some_and(|raw| {
-                    raw.file_node_id == Some(NodeId(input.callsite.file_id.0))
-                        && raw.start_line == Some(input.callsite.line)
-                        && raw.start_col == Some(input.callsite.column)
-                        && graph_leaf_name(&raw.serialized_name) == input.callsite.raw_target
-                });
-                candidate.kind == EdgeKind::CALL
-                    && candidate.file_node_id == Some(NodeId(input.callsite.file_id.0))
-                    && candidate.line == Some(input.callsite.line)
-                    && candidate.effective_source() == caller
-                    && candidate.resolved_target == Some(exact_target)
-                    && candidate.effective_target() == exact_target
-                    && candidate.candidate_targets.is_empty()
-                    && candidate
-                        .callsite_identity
-                        .as_deref()
-                        .is_some_and(|identity| !identity.is_empty())
-                    && raw_target_matches_span
-            })
-            .collect::<Vec<_>>();
-        if matching.len() == 1 {
-            edge = Some(matching[0]);
-        } else {
-            status = if matching.len() > 1 {
-                ProofResolutionStatus::Ambiguous
-            } else {
-                ProofResolutionStatus::MissingBinding
-            };
-            reason = if matching.len() > 1 {
-                ProofResolutionReason::MultipleBindings
-            } else {
-                ProofResolutionReason::MissingBinding
-            };
-            target = None;
-            evidence_chain.clear();
+    Ok(ResolvedSyntaxClaim {
+        input,
+        caller,
+        target,
+        status,
+        reason,
+        evidence_chain,
+    })
+}
+
+fn seal_resolved_claim(
+    store: &Store,
+    nodes: &HashMap<NodeId, &Node>,
+    edges: &[Edge],
+    claims: &[ResolvedSyntaxClaim],
+    claim_index: usize,
+    correlation: Option<Result<usize, ExactCallsiteCorrelationFailure>>,
+) -> Result<CallResolutionFact> {
+    let claim = &claims[claim_index];
+    let mut status = claim.status;
+    let mut reason = claim.reason;
+    let mut target = claim.target;
+    let mut evidence_chain = claim.evidence_chain.clone();
+    let edge = if status == ProofResolutionStatus::Exact {
+        match correlation.expect("Exact syntax claim has a correlation result") {
+            Ok(edge_index) => Some(&edges[edge_index]),
+            Err(ExactCallsiteCorrelationFailure::Ambiguous) => {
+                status = ProofResolutionStatus::Ambiguous;
+                reason = ProofResolutionReason::MultipleBindings;
+                target = None;
+                evidence_chain.clear();
+                None
+            }
+            Err(ExactCallsiteCorrelationFailure::Missing) => {
+                status = ProofResolutionStatus::MissingBinding;
+                reason = ProofResolutionReason::MissingBinding;
+                target = None;
+                evidence_chain.clear();
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
+    let input = &claim.input;
     let mut dependency_ids = HashSet::from([NodeId(input.callsite.file_id.0)]);
     for node_id in evidence_chain
         .iter()
@@ -1710,8 +1788,8 @@ fn resolve_input(
         edge_id: edge.map(|edge| edge.id),
         raw_edge_target: edge.map(|edge| edge.target),
         raw_callsite_identity: edge.and_then(|edge| edge.callsite_identity.clone()),
-        callsite: input.callsite,
-        caller,
+        callsite: input.callsite.clone(),
+        caller: claim.caller,
         target,
         status,
         reason,
@@ -1721,9 +1799,9 @@ fn resolve_input(
             producer: INTERNAL_RESOLUTION_PRODUCER.to_string(),
             fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
             algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_string(),
-            language_adapter: input.language,
-            language_adapter_version: input.adapter_version,
-            parser_fingerprint: input.parser_fingerprint,
+            language_adapter: input.language.clone(),
+            language_adapter_version: input.adapter_version.clone(),
+            parser_fingerprint: input.parser_fingerprint.clone(),
             dependency_file_hashes,
             evidence_sha256: String::new(),
         },

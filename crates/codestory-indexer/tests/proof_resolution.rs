@@ -1,5 +1,5 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{EdgeKind, NodeKind};
+use codestory_contracts::graph::{EdgeId, EdgeKind, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{
     ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
 };
@@ -50,6 +50,176 @@ fn index_files(
         None,
     )?;
     Ok(paths)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RepeatedCallGraphMutation {
+    DuplicateOrdinal,
+    OrdinalGap,
+    ExtraEdge,
+    ExtraInput,
+    OpaqueIdentity,
+    WrongIdentityFile,
+    WrongIdentityLine,
+    WrongIdentityRawTarget,
+    CandidatesRetained,
+    CrossSource,
+    CrossTarget,
+    TwoValidRawPlaceholderGroups,
+}
+
+fn rewrite_callsite_identity(identity: &str, field: usize, value: i64) -> String {
+    let (base, markers) = identity.split_once('|').unwrap_or((identity, ""));
+    let mut fields = base.split(':').map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(fields.len(), 4, "test fixture identity is canonical");
+    fields[field] = value.to_string();
+    let mut rewritten = fields.join(":");
+    if !markers.is_empty() {
+        rewritten.push('|');
+        rewritten.push_str(markers);
+    }
+    rewritten
+}
+
+fn repeated_call_facts_after_graph_mutation(
+    mutation: RepeatedCallGraphMutation,
+) -> anyhow::Result<Vec<codestory_contracts::proof_resolution::CallResolutionFact>> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/lib.rs",
+            "fn target() {}\nfn source() { target(); target(); }\n",
+        )],
+    )?;
+    let mut calls = store
+        .get_edges()?
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(2))
+        .collect::<Vec<_>>();
+    calls.sort_by_key(|edge| {
+        edge.callsite_identity
+            .as_deref()
+            .and_then(|identity| identity.split('|').next())
+            .and_then(|identity| identity.split(':').nth(2))
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(u32::MAX)
+    });
+    assert_eq!(calls.len(), 2, "real repeated-call graph fixture");
+    let connection = store.get_connection();
+    match mutation {
+        RepeatedCallGraphMutation::DuplicateOrdinal => {
+            connection.execute(
+                "UPDATE edge SET callsite_identity = ?1 WHERE id = ?2",
+                (
+                    calls[0].callsite_identity.as_deref().unwrap(),
+                    calls[1].id.0,
+                ),
+            )?;
+        }
+        RepeatedCallGraphMutation::OrdinalGap => {
+            let identity =
+                rewrite_callsite_identity(calls[1].callsite_identity.as_deref().unwrap(), 2, 3);
+            connection.execute(
+                "UPDATE edge SET callsite_identity = ?1 WHERE id = ?2",
+                (identity, calls[1].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::ExtraEdge => {
+            let mut extra = calls[1].clone();
+            extra.id = EdgeId(9_000_000_000_000_000_000);
+            extra.callsite_identity = Some(rewrite_callsite_identity(
+                extra.callsite_identity.as_deref().unwrap(),
+                2,
+                3,
+            ));
+            store.insert_edge(&extra)?;
+        }
+        RepeatedCallGraphMutation::ExtraInput => {
+            connection.execute("DELETE FROM edge WHERE id = ?1", [calls[1].id.0])?;
+        }
+        RepeatedCallGraphMutation::OpaqueIdentity => {
+            connection.execute(
+                "UPDATE edge SET callsite_identity = 'opaque' WHERE id = ?1",
+                [calls[1].id.0],
+            )?;
+        }
+        RepeatedCallGraphMutation::WrongIdentityFile => {
+            let identity = rewrite_callsite_identity(
+                calls[0].callsite_identity.as_deref().unwrap(),
+                0,
+                calls[0].file_node_id.unwrap().0.wrapping_add(1),
+            );
+            connection.execute(
+                "UPDATE edge SET callsite_identity = ?1 WHERE id = ?2",
+                (identity, calls[0].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::WrongIdentityLine => {
+            let identity =
+                rewrite_callsite_identity(calls[0].callsite_identity.as_deref().unwrap(), 1, 99);
+            connection.execute(
+                "UPDATE edge SET callsite_identity = ?1 WHERE id = ?2",
+                (identity, calls[0].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::WrongIdentityRawTarget => {
+            let identity = rewrite_callsite_identity(
+                calls[0].callsite_identity.as_deref().unwrap(),
+                3,
+                calls[0].target.0.wrapping_add(1),
+            );
+            connection.execute(
+                "UPDATE edge SET callsite_identity = ?1 WHERE id = ?2",
+                (identity, calls[0].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::CandidatesRetained => {
+            connection.execute(
+                "UPDATE edge SET candidate_target_node_ids = ?1 WHERE id = ?2",
+                (
+                    format!("[{}]", calls[0].effective_target().0),
+                    calls[0].id.0,
+                ),
+            )?;
+        }
+        RepeatedCallGraphMutation::CrossSource => {
+            connection.execute(
+                "UPDATE edge SET resolved_source_node_id = ?1 WHERE id = ?2",
+                (calls[0].file_node_id.unwrap().0, calls[0].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::CrossTarget => {
+            connection.execute(
+                "UPDATE edge SET resolved_target_node_id = ?1 WHERE id = ?2",
+                (calls[0].effective_source().0, calls[0].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::TwoValidRawPlaceholderGroups => {
+            let mut raw = store.get_node(calls[0].target)?.unwrap();
+            raw.id = NodeId(8_999_999_999_999_999_999);
+            store.insert_node(&raw)?;
+            for (index, call) in calls.iter().enumerate() {
+                let mut duplicate = call.clone();
+                duplicate.id = EdgeId(8_999_999_999_999_999_990 + index as i64);
+                duplicate.target = raw.id;
+                duplicate.callsite_identity = Some(rewrite_callsite_identity(
+                    duplicate.callsite_identity.as_deref().unwrap(),
+                    3,
+                    raw.id.0,
+                ));
+                store.insert_edge(&duplicate)?;
+            }
+        }
+    }
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    Ok(store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect())
 }
 
 #[test]
@@ -184,6 +354,80 @@ fn typescript_and_rust_reference_calls_rematerialize_exact_facts() -> anyhow::Re
                 && row.counts.authoritative_receipts == 0
                 && row.counts.complete_proofs == 0)
     );
+    Ok(())
+}
+
+#[test]
+fn rust_same_line_repeated_calls_correlate_to_distinct_ordinary_edges() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/lib.rs",
+            "fn target() {}\nfn source() { target(); target(); }\n",
+        )],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let repeated = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+
+    assert_eq!(repeated.len(), 2, "one syntax fact per repeated callsite");
+    assert!(
+        repeated
+            .iter()
+            .all(|fact| fact.status == ProofResolutionStatus::Exact),
+        "both parser-derived callsites must correlate independently: {repeated:#?}"
+    );
+    assert_eq!(
+        repeated
+            .iter()
+            .filter_map(|fact| fact.edge_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2,
+        "each Exact syntax fact needs its own ordinary CALL edge"
+    );
+    assert_eq!(
+        repeated
+            .iter()
+            .map(|fact| (fact.callsite.start_byte, fact.callsite.column))
+            .collect::<Vec<_>>(),
+        [(29, 15), (39, 25)]
+    );
+    Ok(())
+}
+
+#[test]
+fn repeated_call_correlation_rejects_incomplete_or_noncanonical_domains() -> anyhow::Result<()> {
+    for mutation in [
+        RepeatedCallGraphMutation::DuplicateOrdinal,
+        RepeatedCallGraphMutation::OrdinalGap,
+        RepeatedCallGraphMutation::ExtraEdge,
+        RepeatedCallGraphMutation::ExtraInput,
+        RepeatedCallGraphMutation::OpaqueIdentity,
+        RepeatedCallGraphMutation::WrongIdentityFile,
+        RepeatedCallGraphMutation::WrongIdentityLine,
+        RepeatedCallGraphMutation::WrongIdentityRawTarget,
+        RepeatedCallGraphMutation::CandidatesRetained,
+        RepeatedCallGraphMutation::CrossSource,
+        RepeatedCallGraphMutation::CrossTarget,
+        RepeatedCallGraphMutation::TwoValidRawPlaceholderGroups,
+    ] {
+        let facts = repeated_call_facts_after_graph_mutation(mutation)?;
+        assert_eq!(facts.len(), 2, "one syntax fact per callsite: {mutation:?}");
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "malformed complete correlation domain retained Exact for {mutation:?}: {facts:#?}"
+        );
+    }
     Ok(())
 }
 

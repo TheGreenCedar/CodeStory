@@ -1,10 +1,12 @@
 use super::*;
 use codestory_contracts::proof_resolution::{
     CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
-    ExactCallsite, FileId, INTERNAL_RESOLUTION_PRODUCER, PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
-    ProofResolutionAdapter, ProofResolutionFunnelCounts, ProofResolutionFunnelRow,
-    ProofResolutionProjection, ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence,
-    ResolutionEvidenceKind, ResolutionProvenance,
+    ExactCallsite, ExactCallsiteCorrelationFailure, ExactSyntaxCallsiteCorrelationInput, FileId,
+    INTERNAL_RESOLUTION_PRODUCER, OrdinaryCallEdgeCorrelationInput,
+    PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ProofResolutionAdapter, ProofResolutionFunnelCounts,
+    ProofResolutionFunnelRow, ProofResolutionProjection, ProofResolutionReason,
+    ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind, ResolutionProvenance,
+    correlate_exact_syntax_callsites,
 };
 
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-evidence-v1\0";
@@ -336,8 +338,91 @@ impl Storage {
         Ok(facts)
     }
 
-    fn validate_fact_against_graph(&self, fact: &CallResolutionFact) -> Result<(), StorageError> {
-        validate_fact_seal(fact)?;
+    fn validate_facts_against_graph(
+        &self,
+        facts: &[CallResolutionFact],
+    ) -> Result<(), StorageError> {
+        for fact in facts {
+            validate_fact_seal(fact)?;
+        }
+        let graph_edges = self.get_edges()?;
+        let nodes = self
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let exact_fact_indices = facts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, fact)| {
+                (fact.status == ProofResolutionStatus::Exact).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let syntax_inputs = exact_fact_indices
+            .iter()
+            .map(|index| {
+                let fact = &facts[*index];
+                ExactSyntaxCallsiteCorrelationInput {
+                    file_id: fact.callsite.file_id,
+                    line: fact.callsite.line,
+                    start_byte: fact.callsite.start_byte,
+                    end_byte_exclusive: fact.callsite.end_byte_exclusive,
+                    column: fact.callsite.column,
+                    caller: fact.caller,
+                    target: fact.target.expect("Exact shape requires a target"),
+                    raw_target: &fact.callsite.raw_target,
+                }
+            })
+            .collect::<Vec<_>>();
+        let ordinary_edge_indices = graph_edges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, edge)| {
+                (edge.kind == EdgeKind::CALL && nodes.contains_key(&edge.target)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let edge_inputs = ordinary_edge_indices
+            .iter()
+            .map(|index| {
+                let edge = &graph_edges[*index];
+                let raw = &nodes[&edge.target];
+                OrdinaryCallEdgeCorrelationInput {
+                    file_id: edge.file_node_id.map(|file| FileId(file.0)),
+                    line: edge.line,
+                    caller: edge.effective_source(),
+                    target: edge.effective_target(),
+                    raw_edge_target: edge.target,
+                    raw_file_id: raw.file_node_id.map(|file| FileId(file.0)),
+                    raw_line: raw.start_line,
+                    raw_target: graph_leaf_name(&raw.serialized_name),
+                    callsite_identity: edge.callsite_identity.as_deref(),
+                    semantic_exact: edge.resolved_target == Some(edge.effective_target())
+                        && edge.candidate_targets.is_empty(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let correlations = correlate_exact_syntax_callsites(&syntax_inputs, &edge_inputs)
+            .into_iter()
+            .map(|result| {
+                result.map(|edge_index| graph_edges[ordinary_edge_indices[edge_index]].id)
+            })
+            .collect::<Vec<_>>();
+        let mut fact_correlations = vec![None; facts.len()];
+        for (correlation_index, fact_index) in exact_fact_indices.iter().copied().enumerate() {
+            fact_correlations[fact_index] = Some(correlations[correlation_index]);
+        }
+        for (fact_index, fact) in facts.iter().enumerate() {
+            self.validate_fact_against_graph(fact, &graph_edges, fact_correlations[fact_index])?;
+        }
+        Ok(())
+    }
+
+    fn validate_fact_against_graph(
+        &self,
+        fact: &CallResolutionFact,
+        graph_edges: &[Edge],
+        correlation: Option<Result<EdgeId, ExactCallsiteCorrelationFailure>>,
+    ) -> Result<(), StorageError> {
         let stored_source_hash = self
             .get_file_content_hash(fact.callsite.file_id.0)?
             .ok_or_else(|| proof_error("callsite file has no publication-bound source hash"))?;
@@ -435,14 +520,25 @@ impl Storage {
             .ok_or_else(|| proof_error("raw CALL placeholder node is missing"))?;
         if raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0))
             || raw_placeholder.start_line != Some(fact.callsite.line)
-            || raw_placeholder.start_col != Some(fact.callsite.column)
             || graph_leaf_name(&raw_placeholder.serialized_name) != fact.callsite.raw_target
         {
             return Err(proof_error(
-                "raw CALL callsite placeholder does not match file, line, column, and target spelling",
+                "raw CALL callsite placeholder does not match file, line, and target spelling",
             ));
         }
-        let graph_edges = self.get_edges()?;
+        match correlation.expect("Exact fact has a correlation result") {
+            Ok(edge_id) if Some(edge_id) == fact.edge_id => {}
+            Ok(_) => {
+                return Err(proof_error(
+                    "Exact fact binds the wrong ordinary edge for its canonical callsite",
+                ));
+            }
+            Err(_) => {
+                return Err(proof_error(
+                    "matching ordinary CALL edge canonical callsite identity does not form one complete mapping",
+                ));
+            }
+        }
         match (fact.callsite.callee_form, fact.evidence_chain.as_slice()) {
             (CalleeForm::Identifier, [ResolutionEvidence::SameFileDeclaration { declaration }])
                 if *declaration == target =>
@@ -525,7 +621,7 @@ impl Storage {
             }
         }
         let edge = graph_edges
-            .into_iter()
+            .iter()
             .find(|edge| edge.id == edge_id)
             .ok_or_else(|| proof_error("matching ordinary CALL edge is missing"))?;
         if edge.kind != EdgeKind::CALL
@@ -602,9 +698,7 @@ impl Storage {
                     right.fact_id.as_str(),
                 ))
         });
-        for fact in &facts {
-            self.validate_fact_against_graph(fact)?;
-        }
+        self.validate_facts_against_graph(&facts)?;
         if facts.windows(2).any(|pair| {
             pair[0].callsite.file_id == pair[1].callsite.file_id
                 && pair[0].callsite.start_byte == pair[1].callsite.start_byte
@@ -787,9 +881,7 @@ impl Storage {
                 "fact rows do not match their publication digest",
             ));
         }
-        for fact in &facts {
-            self.validate_fact_against_graph(fact)?;
-        }
+        self.validate_facts_against_graph(&facts)?;
         Ok(manifest)
     }
 
