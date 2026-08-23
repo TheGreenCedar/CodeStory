@@ -592,7 +592,7 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
 /// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
 /// that, so adding a module to the crate without extending this list fails
 /// loudly instead of silently escaping every contract built on it.
-const AGENT_PLANNING_MODULES: [&str; 27] = [
+const AGENT_PLANNING_MODULES: [&str; 28] = [
     "citation.rs",
     "packet_citations.rs",
     "packet_claim_profile_registry.rs",
@@ -605,6 +605,7 @@ const AGENT_PLANNING_MODULES: [&str; 27] = [
     "packet_evidence_carriers.rs",
     "packet_evidence_roles.rs",
     "packet_execution_graphs.rs",
+    "packet_execution_plan_v3.rs",
     "packet_flow_requirements.rs",
     "packet_freshness.rs",
     "packet_obligations.rs",
@@ -634,77 +635,54 @@ const AGENT_PLANNING_MODULES: [&str; 27] = [
 ///   import-DAG guard a file no product build links.
 /// - `indexed_source_call_path_v1.rs` is the dark v3 proof kernel. Task 2 keeps
 ///   it behind the same test-support gate until the atomic public v3 cut.
-/// - `packet_execution_plan_v3.rs` is the dark v3 evidence-planning ledger.
-///   Task 3A keeps its callable surface behind test support and the sealed Q1
-///   evidence-only compile feature; it is not one of the 27 production
-///   packet-planning modules.
-const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 4] = [
-    "lib.rs",
-    "eval_probes.rs",
-    "indexed_source_call_path_v1.rs",
-    "packet_execution_plan_v3.rs",
-];
+const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 3] =
+    ["lib.rs", "eval_probes.rs", "indexed_source_call_path_v1.rs"];
 
 #[test]
-fn dark_packet_execution_plan_v3_stays_inert_and_unshipped() {
+fn packet_execution_plan_v3_is_the_public_evidence_planning_boundary() {
     let agent_lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
-        agent_lib.contains(
-            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\n#[doc(hidden)]\npub mod packet_execution_plan_v3;"
-        ),
-        "the v3 evidence planner must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
+        agent_lib.contains("pub mod packet_execution_plan_v3;"),
+        "the v3 evidence planner must compile in the public product graph"
     );
     assert!(
-        AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"packet_execution_plan_v3.rs"),
-        "the dark v3 evidence planner must not count as a production planning module"
+        AGENT_PLANNING_MODULES.contains(&"packet_execution_plan_v3.rs"),
+        "the v3 evidence planner must count as a production planning module"
     );
-
-    let surfaces = [
-        (
-            "runtime source",
-            read_source_tree_excluding_many(
-                "crates/codestory-runtime/src",
-                &[
-                    "agent/packet_execution_record_v3.rs",
-                    "agent/packet_projection_v3.rs",
-                    "v3_evidence_qualification_support.rs",
-                ],
-            ),
-        ),
-        ("CLI source", read_source_tree("crates/codestory-cli/src")),
-        (
-            "current public API DTO source",
-            format!(
-                "{}\n{}",
-                read("crates/codestory-contracts/src/api.rs"),
-                read_source_tree("crates/codestory-contracts/src/api")
-            ),
-        ),
-        (
-            "current wire source",
-            read("crates/codestory-contracts/src/wire.rs"),
-        ),
-        (
-            "generated MCP catalog",
-            read("plugins/codestory/generated-mcp-catalog.json"),
-        ),
-    ];
-    for (surface, source) in surfaces {
-        for forbidden in [
-            "packet_execution_plan_v3",
-            "PacketExecutionPlanV3",
-            "PacketProjectionV3Dto",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "{surface} references dark Task-3A vocabulary via {forbidden}"
-            );
-        }
-    }
+    let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
+    let packet_request = source_between(
+        &current_dto,
+        "pub struct AgentPacketRequestDto",
+        "pub struct PacketBudgetLimitsDto",
+    );
+    assert!(!packet_request.contains("include_evidence"));
 }
 
 #[test]
-fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
+fn packet_v3_record_projection_and_public_facade_are_product_wired() {
+    let modules = read("crates/codestory-runtime/src/agent/mod.rs");
+    assert!(modules.contains("pub(crate) mod packet_execution_record_v3;"));
+    assert!(modules.contains("pub(crate) mod packet_projection_v3;"));
+    let runtime = read("crates/codestory-runtime/src/lib.rs");
+    assert!(runtime.contains("mod evidence_projection_v3;"));
+    assert!(runtime.contains("pub use evidence_projection_v3::"));
+    for surface in [
+        "crates/codestory-cli/src/stdio_transport.rs",
+        "crates/codestory-cli/src/http_transport.rs",
+        "crates/codestory-cli/src/app/search_command.rs",
+        "crates/codestory-cli/src/app/agent_context/packet.rs",
+        "crates/codestory-cli/src/app/agent_context/context.rs",
+    ] {
+        let source = read(surface);
+        assert!(
+            source.contains("project_") && source.contains("_v3"),
+            "{surface} must project through the public evidence-only v3 facade"
+        );
+    }
+}
+
+#[allow(dead_code)]
+fn legacy_dark_packet_v3_preparation_stays_inert_and_unshipped() {
     let runtime_agent_modules = read("crates/codestory-runtime/src/agent/mod.rs");
     assert!(
         runtime_agent_modules.contains(
@@ -863,10 +841,8 @@ fn dark_packet_v3_preparation_stays_inert_and_unshipped() {
 fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     let cli_lib = read("crates/codestory-cli/src/lib.rs");
     assert!(
-        cli_lib.contains(
-            "#[cfg(any(\n    test,\n    feature = \"proof-qualification-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\n#[allow(dead_code)]\nmod stdio_v3;"
-        ),
-        "the revision-native transport facade must stay behind the sealed benchmark feature"
+        cli_lib.contains("mod stdio_v3;"),
+        "the revision-native evidence transport must compile in the public product graph"
     );
 
     let facade = read_source_tree("crates/codestory-cli/src/stdio_v3");
@@ -896,7 +872,6 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     for forbidden in [
         "measure_revision_native_proof_result_v3",
         "RevisionNativeToolResultMeasurementV3",
-        "stdio_v3::",
     ] {
         assert!(
             !production_cli.contains(forbidden),
@@ -1142,7 +1117,7 @@ fn sealed_discovery_contracts_drive_the_inert_launcher_session() {
 const launcher = require(process.argv[1]);
 const contracts = JSON.parse(process.argv[2]);
 process.stdout.write(JSON.stringify(
-  launcher._test.darkV3LauncherSession('2025-06-18', contracts),
+  launcher._test.v3LauncherSession('2025-06-18', contracts),
 ));
 "#;
     let output = Command::new("node")
@@ -1302,13 +1277,12 @@ fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
 }
 
 fn dark_call_path_release_surface_violations() -> Vec<String> {
-    const DARK_TOKENS: [&str; 6] = [
+    const DARK_TOKENS: [&str; 5] = [
         "indexed_source_call_path_v1",
         "ValidatedCallPathContract",
         "InternalProjection",
         "InternalCorePublicationIdentity",
         "IntegratedProjectedCallPathResult",
-        "output_budget_exceeded",
     ];
     let mut surfaces = vec![
         (
@@ -2431,10 +2405,7 @@ fn evidence_only_v3_support_is_feature_separate_from_proof_qualification() {
     );
 
     for (path, expected) in [
-        (
-            "crates/codestory-agent/Cargo.toml",
-            BTreeSet::from(["dep:serde_json_canonicalizer"]),
-        ),
+        ("crates/codestory-agent/Cargo.toml", BTreeSet::new()),
         (
             "crates/codestory-runtime/Cargo.toml",
             BTreeSet::from(["codestory-agent/v3-evidence-separation-support"]),

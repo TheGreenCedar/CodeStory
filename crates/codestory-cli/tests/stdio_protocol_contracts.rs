@@ -49,7 +49,7 @@ const GROUNDING_ORIENTATION_UNCERTAINTY_WIRE_VALUES: [&str; 7] = {
 };
 
 #[test]
-fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
+fn public_v3_outcome_c_negotiates_revision_native_evidence_only_discovery() {
     let profiles: Value = serde_json::from_str(include_str!("fixtures/mcp_protocol_profiles.json"))
         .expect("compatibility profile fixture json");
     let revisions = profiles
@@ -66,8 +66,12 @@ fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
     );
     assert_eq!(
         codestory_contracts::wire::SUPPORTED_MCP_PROTOCOL_VERSIONS,
-        ["2024-11-05"],
-        "profiles are test data only until the public cut changes negotiation"
+        ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+        "the public v3 cut must advertise exactly the four implemented revisions"
+    );
+    assert_eq!(
+        codestory_contracts::wire::PREFERRED_MCP_PROTOCOL_VERSION,
+        "2025-11-25"
     );
     let batch_contracts = profiles["profiles"]
         .as_array()
@@ -100,8 +104,298 @@ fn compatibility_profile_fixture_keeps_future_revisions_unselectable_in_v2() {
             ("2025-06-18", "reject_invalid_request", 4),
             ("2025-11-25", "reject_invalid_request", 4),
         ],
-        "the fixture owns the future batch and result-form contracts without enabling them"
+        "the fixture owns the public batch and result-form contracts"
     );
+
+    for revision in revisions {
+        let fixture = unindexed_fixture();
+        let mut server = spawn_stdio_server(&fixture);
+        let initialized = send_json(
+            &mut server,
+            json!({
+                "jsonrpc": "2.0",
+                "id": format!("init-{revision}"),
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": revision,
+                    "capabilities": {},
+                    "clientInfo": {"name": "v3-red", "version": "0"}
+                }
+            }),
+        );
+        let initialized = assert_success_envelope(&initialized, json!(format!("init-{revision}")));
+        assert_eq!(initialized["protocolVersion"], revision);
+        assert_eq!(
+            initialized.pointer("/_meta/codestory_protocol/supported"),
+            Some(&json!([
+                "2024-11-05",
+                "2025-03-26",
+                "2025-06-18",
+                "2025-11-25"
+            ]))
+        );
+        assert_eq!(
+            initialized.pointer("/_meta/codestory_protocol/preferred"),
+            Some(&json!("2025-11-25"))
+        );
+        let digest = initialized
+            .pointer("/_meta/codestory_protocol/discovery_contract_sha256")
+            .and_then(Value::as_str)
+            .expect("initialize must bind the evidence-only discovery contract");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            initialized.pointer("/_meta/codestory_publication/schema_version"),
+            Some(&json!(3))
+        );
+        assert_eq!(
+            initialized.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
+            Some(&json!(3))
+        );
+
+        let listed = send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"list","method":"tools/list"}),
+        );
+        let tools = assert_success_envelope(&listed, json!("list"))["tools"]
+            .as_array()
+            .expect("tools array");
+        assert_eq!(tools.len(), 20);
+        for route in ["packet", "context", "search"] {
+            assert_eq!(
+                tools.iter().filter(|tool| tool["name"] == route).count(),
+                1,
+                "{route} must register exactly once"
+            );
+        }
+        assert!(!tools.iter().any(|tool| tool["name"] == "prove_call_path"));
+        let packet = tools
+            .iter()
+            .find(|tool| tool["name"] == "packet")
+            .expect("packet tool");
+        let status = tools
+            .iter()
+            .find(|tool| tool["name"] == "status")
+            .expect("status tool");
+        assert!(
+            packet
+                .pointer("/inputSchema/properties/include_evidence")
+                .is_none(),
+            "packet include_evidence was removed from v3"
+        );
+        if revision >= "2025-03-26" {
+            assert_eq!(
+                status.pointer("/annotations/readOnlyHint"),
+                Some(&json!(true)),
+                "observational annotations must remain additive in {revision}"
+            );
+            assert!(
+                packet.pointer("/annotations/readOnlyHint").is_none(),
+                "activation-capable packet must not claim read-only behavior in {revision}"
+            );
+            assert!(
+                packet.get("annotations").is_some(),
+                "March annotations must remain present in {revision}"
+            );
+        } else {
+            assert!(status.get("annotations").is_none());
+            assert!(packet.get("annotations").is_none());
+        }
+        if revision >= "2025-06-18" {
+            let output = packet.get("outputSchema").expect("modern output schema");
+            assert_eq!(output["type"], "object");
+            assert!(output.get("additionalProperties").is_none());
+            assert!(!output.to_string().contains("disposition"));
+            assert!(!output.to_string().contains("supported"));
+        } else {
+            assert!(packet.get("outputSchema").is_none());
+        }
+
+        let invalid = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"removed-include-evidence",
+                "method":"tools/call",
+                "params": {
+                    "name":"packet",
+                    "arguments": {
+                        "project": fixture.workspace.path(),
+                        "question":"Explain dispatch.",
+                        "include_evidence": true
+                    }
+                }
+            }),
+        );
+        assert_eq!(invalid.pointer("/error/code"), Some(&json!(-32602)));
+    }
+}
+
+#[test]
+fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let fixture = unindexed_fixture();
+        let mut server = spawn_stdio_server(&fixture);
+        let initialized = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"initialize",
+                "method":"initialize",
+                "params":{"protocolVersion":revision}
+            }),
+        );
+        assert_eq!(
+            assert_success_envelope(&initialized, json!("initialize"))["protocolVersion"],
+            revision
+        );
+        let project = fixture.workspace.path();
+        let exact_path_probes = (0..16)
+            .map(|index| json!({"kind":"exact_path","path":format!("src/{index}.rs")}))
+            .collect::<Vec<_>>();
+        let mut overflow_probes = exact_path_probes.clone();
+        overflow_probes.push(json!({"kind":"exact_path","path":"src/overflow.rs"}));
+        let cases = vec![
+            (
+                "status-project-type",
+                "status",
+                json!({"project":7}),
+                "/arguments/project",
+                "invalid_type",
+            ),
+            (
+                "packet-root-type",
+                "packet",
+                json!([]),
+                "/arguments",
+                "invalid_type",
+            ),
+            (
+                "packet-question-required",
+                "packet",
+                json!({"project":project}),
+                "/arguments/question",
+                "missing_required",
+            ),
+            (
+                "packet-question-type",
+                "packet",
+                json!({"project":project,"question":7}),
+                "/arguments/question",
+                "invalid_type",
+            ),
+            (
+                "packet-question-bound",
+                "packet",
+                json!({"project":project,"question":""}),
+                "/arguments/question",
+                "below_min_length",
+            ),
+            (
+                "packet-budget-enum",
+                "packet",
+                json!({"project":project,"question":"why","budget":"impossible"}),
+                "/arguments/budget",
+                "invalid_enum_value",
+            ),
+            (
+                "packet-tagged-probe",
+                "packet",
+                json!({"project":project,"question":"why","probes":[{"kind":"exact_path","id":"wrong"}]}),
+                "/arguments/probes/0",
+                "invalid_selector",
+            ),
+            (
+                "packet-array-bound",
+                "packet",
+                json!({"project":project,"question":"why","probes":overflow_probes}),
+                "/arguments/probes",
+                "above_max_items",
+            ),
+            (
+                "packet-string-bound",
+                "packet",
+                json!({"project":project,"question":"why","probes":[{"kind":"exact_path","path":"x".repeat(241)}]}),
+                "/arguments/probes/0",
+                "invalid_selector",
+            ),
+            (
+                "packet-combined-bound",
+                "packet",
+                json!({"project":project,"question":"why","probes":exact_path_probes,"extra_probes":["overflow"]}),
+                "/arguments",
+                "combined_item_limit",
+            ),
+            (
+                "context-selector-required",
+                "context",
+                json!({"project":project}),
+                "/arguments",
+                "invalid_selector",
+            ),
+            (
+                "context-selector-exclusive",
+                "context",
+                json!({"project":project,"query":"entry","id":"node-1"}),
+                "/arguments",
+                "invalid_selector",
+            ),
+            (
+                "search-query-type",
+                "search",
+                json!({"project":project,"query":7}),
+                "/arguments/query",
+                "invalid_type",
+            ),
+            (
+                "search-limit-bound",
+                "search",
+                json!({"project":project,"query":"entry","limit":0}),
+                "/arguments/limit",
+                "below_minimum",
+            ),
+            (
+                "search-additional-property",
+                "search",
+                json!({"project":project,"query":"entry","extra":true}),
+                "/arguments/extra",
+                "unknown_property",
+            ),
+        ];
+
+        for (id, tool, arguments, pointer, violation_code) in cases {
+            let response = send_json(
+                &mut server,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{"name":tool,"arguments":arguments}
+                }),
+            );
+            assert_invalid_params(&response, json!(id), tool, pointer, violation_code);
+        }
+    }
+}
+
+#[test]
+fn public_v3_packet_cli_exposes_diagnostics_without_evidence_or_proof_switches() {
+    let output = test_support::cli_command()
+        .args(["packet", "--help"])
+        .output()
+        .expect("run packet help");
+    assert!(
+        output.status.success(),
+        "packet help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8(output.stdout).expect("UTF-8 packet help");
+    assert!(
+        help.contains("--diagnostics-out <DIAGNOSTICS_OUT>"),
+        "{help}"
+    );
+    assert!(!help.contains("--no-evidence"), "{help}");
+    assert!(!help.contains("prove-call-path"), "{help}");
 }
 
 struct StdioFixture {
@@ -480,7 +774,7 @@ fn initialize_stdio_server(server: &mut StdioServer, id: &str) {
             "id": id,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": {"name": "contract-test", "version": "0"}
             }
@@ -527,7 +821,7 @@ fn assert_tool_success(response: &Value, id: Value) -> &Value {
         .expect("tools/call success should include structuredContent")
 }
 
-fn assert_tool_error(response: &Value, id: Value) -> &Value {
+fn assert_tool_error(response: &Value, id: Value) -> Value {
     let result = assert_success_envelope(response, id);
     assert_eq!(
         result.get("isError").and_then(Value::as_bool),
@@ -535,34 +829,55 @@ fn assert_tool_error(response: &Value, id: Value) -> &Value {
         "tools/call execution errors should be returned as CallToolResult errors: {response}"
     );
     assert_tool_text_content(result, response);
-    result
-        .get("structuredContent")
-        .expect("tools/call error should include structuredContent")
+    assert!(
+        result.get("structuredContent").is_none(),
+        "v3 tool errors must never carry structuredContent: {response}"
+    );
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .expect("tool error text");
+    serde_json::from_str(text).unwrap_or_else(|_| json!({"message": text}))
 }
 
-fn tool_result_code(response: &Value) -> Option<&str> {
-    response
+fn tool_result_code(response: &Value) -> Option<String> {
+    if response.pointer("/result/structuredContent/kind") == Some(&json!("preparing")) {
+        return Some("codestory_preparing".to_string());
+    }
+    if let Some(code) = response
         .pointer("/result/structuredContent/code")
         .and_then(Value::as_str)
+    {
+        return Some(code.to_string());
+    }
+    response
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|value| {
+            if value.get("kind") == Some(&json!("preparing")) {
+                Some("codestory_preparing".to_string())
+            } else {
+                value.get("code").and_then(Value::as_str).map(str::to_owned)
+            }
+        })
 }
 
-fn assert_tool_preparing(response: &Value, id: Value) -> &Value {
-    let result = assert_success_envelope(response, id);
-    assert!(
-        result.get("isError").and_then(Value::as_bool) != Some(true),
-        "preparing tools/call should be a successful structured result: {response}"
-    );
-    assert_tool_text_content(result, response);
-    let content = result
-        .get("structuredContent")
-        .expect("preparing tools/call should include structuredContent");
-    assert_eq!(content["code"], json!("codestory_preparing"));
+fn assert_tool_preparing(response: &Value, id: Value) -> Value {
+    let content = assert_tool_success(response, id).clone();
+    assert_eq!(content["kind"], json!("preparing"));
     assert_eq!(content["state"], json!("preparing"));
+    assert!(
+        content["retry_after_ms"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    assert!(content["operation"].is_object());
     content
 }
 
-fn assert_tool_preparing_or_unavailable(response: &Value, id: Value) -> &Value {
-    if tool_result_code(response) == Some("codestory_preparing") {
+fn assert_tool_preparing_or_unavailable(response: &Value, id: Value) -> Value {
+    if tool_result_code(response).as_deref() == Some("codestory_preparing") {
         assert_tool_preparing(response, id)
     } else {
         assert_tool_error(response, id)
@@ -1008,24 +1323,31 @@ fn project_resource_uri(base_uri: &str, project: &Path) -> String {
 fn assert_tool_safety_metadata(tool: &Value) {
     let name = tool["name"].as_str().expect("tool name");
     let observational = name == "status";
+    let safety = tool
+        .pointer("/_meta/com.thegreencedar.codestory~1safety")
+        .unwrap_or_else(|| panic!("{name} should include namespaced safety metadata: {tool}"));
     let annotations = tool
         .get("annotations")
-        .unwrap_or_else(|| panic!("{name} should include MCP-style annotations: {tool}"));
-    let safety = tool
-        .get("safety")
-        .or_else(|| tool.get("metadata"))
-        .unwrap_or_else(|| panic!("{name} should include safety metadata: {tool}"));
+        .unwrap_or_else(|| panic!("{name} should retain additive MCP annotations: {tool}"));
+    assert!(tool.get("title").and_then(Value::as_str).is_some());
+    assert!(tool.get("outputSchema").is_some());
+    assert!(tool.get("safety").is_none());
+    assert!(tool.get("metadata").is_none());
 
-    // Every tool is read-only with respect to the caller's repository, activation or not:
-    // managed activation writes only to a per-user cache outside the checkout. A
-    // non-read-only hint is auto-cancelled by non-interactive clients, which silently
-    // disabled 19 of these 20 tools. Managed activation stays disclosed via `effect`,
-    // `sideEffects`, and `activatesProject`, asserted below.
-    assert!(
-        annotations.get("readOnlyHint").and_then(Value::as_bool) == Some(true)
-            && safety.get("readOnly").and_then(Value::as_bool) == Some(true),
-        "{name} should report repository-read-only regardless of managed activation: {tool}"
-    );
+    assert_eq!(annotations["destructiveHint"], false);
+    assert_eq!(annotations["idempotentHint"], true);
+    assert_eq!(annotations["openWorldHint"], !observational);
+    if observational {
+        assert_eq!(annotations["readOnlyHint"], true);
+    } else {
+        assert!(
+            annotations.get("readOnlyHint").is_none(),
+            "activation-capable {name} must not claim observational behavior: {tool}"
+        );
+    }
+
+    // Managed activation stays explicit in the vendor effect metadata while
+    // standard readOnlyHint is reserved for the truly observational status tool.
     assert_eq!(
         safety.get("effect").and_then(Value::as_str),
         Some(if observational {
@@ -1051,13 +1373,11 @@ fn assert_tool_safety_metadata(tool: &Value) {
         "{name} should not ask the user to confirm managed local preparation: {tool}"
     );
     assert!(
-        annotations.get("destructiveHint").and_then(Value::as_bool) == Some(false)
-            || contains_bool_recursive(safety, &["destructive", "destructiveHint"], false),
+        contains_bool_recursive(safety, &["destructive", "destructiveHint"], false),
         "{name} should declare non-destructive behavior: {tool}"
     );
     assert!(
-        annotations.get("idempotentHint").and_then(Value::as_bool) == Some(true)
-            || contains_bool_recursive(safety, &["idempotent", "idempotentHint"], true),
+        contains_bool_recursive(safety, &["idempotent", "idempotentHint"], true),
         "{name} should declare idempotent behavior: {tool}"
     );
     assert_eq!(
@@ -1069,11 +1389,6 @@ fn assert_tool_safety_metadata(tool: &Value) {
         safety.get("openWorld").and_then(Value::as_bool),
         Some(!observational),
         "{name} should disclose automatic managed downloads: {tool}"
-    );
-    assert_eq!(
-        annotations.get("openWorldHint").and_then(Value::as_bool),
-        Some(!observational),
-        "{name} annotations should match managed network behavior: {tool}"
     );
 }
 
@@ -1151,23 +1466,49 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
     let agreed = assert_success_envelope(&agreed, json!("init-agreed"));
     assert_eq!(agreed.get("protocolVersion"), Some(&json!("2024-11-05")));
     assert_eq!(
-        agreed.pointer("/_meta/codestory_protocol"),
-        Some(&json!({
-            "requested": "2024-11-05",
-            "negotiated": "2024-11-05",
-            "supported": ["2024-11-05"],
-            "status": "agreed",
-            "compatible": true
-        })),
+        agreed.pointer("/_meta/codestory_protocol/requested"),
+        Some(&json!("2024-11-05")),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/negotiated"),
+        Some(&json!("2024-11-05")),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/supported"),
+        Some(&json!([
+            "2024-11-05",
+            "2025-03-26",
+            "2025-06-18",
+            "2025-11-25"
+        ])),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/preferred"),
+        Some(&json!("2025-11-25")),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/status"),
+        Some(&json!("agreed")),
+    );
+    assert_eq!(
+        agreed.pointer("/_meta/codestory_protocol/compatible"),
+        Some(&json!(true)),
+    );
+    assert_eq!(
+        agreed
+            .pointer("/_meta/codestory_protocol/discovery_contract_sha256")
+            .and_then(Value::as_str)
+            .map(str::len),
+        Some(64),
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(2)),
-        "the session-start stamp publishes the v0.17.0 response schema: {agreed}"
+        Some(&json!(3)),
+        "the session-start stamp publishes the evidence-only v3 response schema: {agreed}"
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-        Some(&json!(2)),
+        Some(&json!(3)),
     );
     assert_eq!(
         agreed.pointer("/_meta/codestory_publication/served_from"),
@@ -1186,7 +1527,7 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
             "id": "init-unsupported",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": "2030-01-01",
                 "capabilities": {},
                 "clientInfo": {"name": "contract-test", "version": "0"}
             }
@@ -1195,18 +1536,24 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
     let unsupported = assert_success_envelope(&unsupported, json!("init-unsupported"));
     assert_eq!(
         unsupported.get("protocolVersion"),
-        Some(&json!("2024-11-05")),
+        Some(&json!("2025-11-25")),
         "an unimplemented revision must not be echoed back as supported: {unsupported}"
     );
     assert_eq!(
-        unsupported.pointer("/_meta/codestory_protocol"),
-        Some(&json!({
-            "requested": "2025-06-18",
-            "negotiated": "2024-11-05",
-            "supported": ["2024-11-05"],
-            "status": "unsupported_client_revision",
-            "compatible": false
-        })),
+        unsupported.pointer("/_meta/codestory_protocol/requested"),
+        Some(&json!("2030-01-01")),
+    );
+    assert_eq!(
+        unsupported.pointer("/_meta/codestory_protocol/negotiated"),
+        Some(&json!("2025-11-25")),
+    );
+    assert_eq!(
+        unsupported.pointer("/_meta/codestory_protocol/status"),
+        Some(&json!("unsupported_client_revision")),
+    );
+    assert_eq!(
+        unsupported.pointer("/_meta/codestory_protocol/compatible"),
+        Some(&json!(false)),
     );
 
     let defaulted = send_json(
@@ -1219,7 +1566,7 @@ fn initialize_negotiates_the_protocol_revision_and_stamps_the_wire_contract() {
         }),
     );
     let defaulted = assert_success_envelope(&defaulted, json!("init-defaulted"));
-    assert_eq!(defaulted.get("protocolVersion"), Some(&json!("2024-11-05")));
+    assert_eq!(defaulted.get("protocolVersion"), Some(&json!("2025-11-25")));
     assert_eq!(
         defaulted.pointer("/_meta/codestory_protocol/status"),
         Some(&json!("defaulted")),
@@ -1259,12 +1606,12 @@ fn tool_results_carry_the_publication_schema_that_defines_their_vocabulary() {
     let result = assert_success_envelope(&response, json!("ground-stamp"));
     assert_eq!(
         result.pointer("/_meta/codestory_publication/schema_version"),
-        Some(&json!(2)),
+        Some(&json!(3)),
         "a served payload must name the schema its vocabulary belongs to: {response}"
     );
     assert_eq!(
         result.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-        Some(&json!(2)),
+        Some(&json!(3)),
     );
     assert_eq!(
         result.pointer("/_meta/codestory_publication/served_from"),
@@ -1362,7 +1709,7 @@ fn stdio_status_observes_unbuilt_index_and_ground_activates_it() {
             "id": "init-unindexed",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-11-25",
                 "capabilities": {},
                 "clientInfo": {"name": "contract-test", "version": "0"}
             }
@@ -1888,28 +2235,20 @@ fn multi_project_packet_repairs_keep_operation_identity_project_scoped() {
     for (index, project) in projects.iter().enumerate() {
         let id = format!("multi-packet-{index}");
         let response = send_json(&mut server, packet_request(&id, project.path()));
-        let error = assert_tool_preparing(&response, json!(id));
-        assert_eq!(error["cause_code"], json!("cache_busy"));
-        assert_eq!(error["retry_tool"], json!("packet"));
-        assert!(error["retry_after_ms"].as_u64().is_some());
-        assert!(
-            error["recommended_next_calls"]
-                .as_array()
-                .is_some_and(|calls| {
-                    calls.iter().any(|call| {
-                        call["method"] == "tools/call"
-                            && call["tool"] == "packet"
-                            && call["arguments"]["project"] == json!(project.path())
-                    }) && !calls.iter().any(|call| {
-                        call["tool"] == "affected"
-                            || call["tool"] == "status"
-                            || call["method"] == "resources/read"
-                    })
-                }),
-            "preparing packet must retry the same tool without status or placeholder affected: {error}"
+        let preparing = assert_tool_preparing(&response, json!(id));
+        assert!(preparing["retry_after_ms"].as_u64().is_some());
+        assert_eq!(
+            preparing
+                .as_object()
+                .expect("preparing result object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["kind", "operation", "retry_after_ms", "state"]),
+            "preparing is a closed successful v3 result, not a legacy error envelope: {preparing}"
         );
         operation_ids.push(
-            error["operation"]["operation_id"]
+            preparing["operation"]["operation_id"]
                 .as_str()
                 .expect("project activation operation id")
                 .to_string(),
@@ -2006,11 +2345,11 @@ fn tool_catalog_keeps_stable_product_tool_names() {
         .expect("packet description");
     assert!(
         packet_description.contains("broad structural questions")
-            && packet_description.contains("compiled support units")
-            && packet_description.contains("one-round drill")
-            && packet_description.contains("option_ids")
+            && packet_description.contains("closed evidence rows")
+            && packet_description.contains("typed availability and gaps")
+            && packet_description.contains("generation-bound continuation")
             && packet_description.contains("before source snippets"),
-        "packet description should route broad questions to compiled support and a typed stop/drill: {packet_description}"
+        "packet description should route broad questions to the evidence-only v3 contract: {packet_description}"
     );
     let search_description = tool_by_name(&tools, "search")["description"]
         .as_str()
@@ -2156,10 +2495,9 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
             "edit_planning",
         ],
     );
-    assert_eq!(
-        schema_property(packet, "include_evidence").get("default"),
-        Some(&json!(true)),
-        "packet.include_evidence should document the stdio default: {packet}"
+    assert!(
+        packet.pointer("/properties/include_evidence").is_none(),
+        "packet.include_evidence must be absent from the v3 contract: {packet}"
     );
 
     let ground = tool_input_schema(&tools, "ground");
@@ -2472,7 +2810,90 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
 }
 
 #[test]
-fn tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
+fn tool_catalog_exposes_closed_v3_evidence_output_schemas() {
+    let fixture = indexed_fixture();
+    let mut server = spawn_stdio_server(&fixture);
+    let tools = assert_success_envelope(
+        &send_json(
+            &mut server,
+            json!({"jsonrpc":"2.0","id":"catalog-v3-outputs","method":"tools/list"}),
+        ),
+        json!("catalog-v3-outputs"),
+    )
+    .clone();
+
+    for name in ["packet", "context", "search"] {
+        let schema = tool_output_schema(&tools, name);
+        assert_eq!(schema["type"], json!("object"));
+        assert!(
+            !schema.to_string().contains("disposition"),
+            "{name}: {schema}"
+        );
+        assert!(
+            !schema.to_string().contains("proof_status"),
+            "{name}: {schema}"
+        );
+        assert!(
+            !schema.to_string().contains("supported"),
+            "{name}: {schema}"
+        );
+    }
+
+    let packet = tool_output_schema(&tools, "packet");
+    let packet_complete = packet
+        .pointer("/oneOf/0/allOf/0/oneOf/0")
+        .unwrap_or_else(|| panic!("packet success branch: {packet}"));
+    assert_eq!(packet_complete["additionalProperties"], json!(false));
+    for field in [
+        "kind",
+        "schema_version",
+        "identity",
+        "publication",
+        "status",
+        "retrieval",
+        "evidence",
+        "gaps",
+        "continuation",
+        "diagnostics",
+    ] {
+        assert!(
+            required_fields(packet_complete).contains(field),
+            "packet {field}: {packet}"
+        );
+    }
+
+    for name in ["context", "search"] {
+        let schema = tool_output_schema(&tools, name);
+        let success = schema
+            .pointer("/oneOf/0/allOf/0")
+            .unwrap_or_else(|| panic!("{name} success branch: {schema}"));
+        assert_eq!(success["additionalProperties"], json!(false));
+        for field in [
+            "kind",
+            "schema_version",
+            "identity",
+            "publication",
+            "status",
+            "evidence",
+            "gaps",
+            "continuation",
+            "diagnostics",
+        ] {
+            assert!(
+                required_fields(success).contains(field),
+                "{name} {field}: {schema}"
+            );
+        }
+        if name == "search" {
+            assert!(required_fields(success).contains("retrieval"), "{schema}");
+        } else {
+            assert!(required_fields(success).contains("target"), "{schema}");
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn legacy_tool_catalog_exposes_output_schemas_for_stable_dto_backed_tools() {
     let fixture = indexed_fixture();
     let mut server = spawn_stdio_server(&fixture);
 
@@ -3396,13 +3817,10 @@ fn affected_tool_maps_preferred_paths_without_sidecars() {
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
         .expect("affected compact text");
-    assert!(text.contains("tool: affected"));
-    assert!(text.contains("matched_file_count: 1"));
-    assert!(text.contains("count.changed_paths: 61"));
-    assert!(text.contains("structuredContent: available"));
-    assert!(
-        text.len() < 4 * 1024,
-        "tool text should stay compact while structuredContent carries the bounded result"
+    assert_eq!(
+        serde_json::from_str::<Value>(text).expect("modern tool text is JSON"),
+        *result,
+        "modern profiles mirror structuredContent as identical JSON text"
     );
 }
 
@@ -4147,12 +4565,10 @@ fn resources_read_status_reports_browser_readiness_and_next_calls() {
         assert_success_envelope(&compact_response, json!("compact-status-tool")),
         &compact_response,
     );
-    assert!(compact_text.contains("tool: status"));
-    assert!(compact_text.contains("state: working_locally"));
-    assert!(compact_text.contains("capability.local_navigation: ready"));
-    assert!(compact_text.contains("next_action:"));
-    assert!(compact_text.contains("retrieval_mode:"));
-    assert!(compact_text.contains("live_ready:"));
+    assert_eq!(
+        serde_json::from_str::<Value>(compact_text).expect("modern status text is JSON"),
+        *compact,
+    );
     let local_summary = "Local repository navigation is ready.";
     assert_eq!(
         status.to_string().matches(local_summary).count(),
@@ -5380,7 +5796,10 @@ fn tools_call_local_graph_refreshes_long_lived_index_after_source_mutation() {
         json!("tool-refresh-catalog"),
     )
     .clone();
-    let snippet_output_schema = tool_output_schema(&tools, "snippet").clone();
+    let snippet_output_schema = tool_output_schema(&tools, "snippet")
+        .pointer("/oneOf/0/allOf/0")
+        .expect("snippet successful output schema")
+        .clone();
 
     let ground_before = send_json(
         &mut server,
@@ -5780,11 +6199,11 @@ fn resources_read_agent_guide_describes_default_browser_loop_and_safety() {
         "agent guide should distinguish discovery clues from evidence: {guide}"
     );
     assert!(
-        guide_text.contains("supported")
-            && guide_text.contains("drillonce")
-            && guide_text.contains("option_ids")
-            && guide_text.contains("terminal"),
-        "agent guide should name the typed stop/drill contract: {guide}"
+        guide_text.contains("evidence availability")
+            && guide_text.contains("generation-bound continuation")
+            && guide_text.contains("evidence rows")
+            && guide_text.contains("remaining gap"),
+        "agent guide should name the evidence-only availability contract: {guide}"
     );
     assert!(
         guide_text.contains("direct_source_reads")
@@ -5865,7 +6284,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
     // prove -- an embedded model, and a per-user embedding server able to satisfy the
     // device policy. Both outcomes have a contract, and both are asserted; what must never
     // happen is broad search degrading without local navigation surviving it.
-    if activation_terminated(error) {
+    if activation_terminated(&error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
         assert!(
             error["cause_code"]
@@ -5879,9 +6298,8 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
             json!("unavailable")
         );
     } else {
-        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["kind"], json!("preparing"));
         assert_eq!(error["state"], json!("preparing"));
-        assert_eq!(error["retry_tool"], json!("search"));
         assert_eq!(
             error["operation"]["capabilities"]["broad_search"],
             json!("retryable")
@@ -5921,7 +6339,7 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
     );
     let error =
         assert_tool_preparing_or_unavailable(&response, json!("migration-search-preparing"));
-    if activation_terminated(error) {
+    if activation_terminated(&error) {
         assert_eq!(error["code"], json!("codestory_unavailable"));
         assert!(
             error["cause_code"]
@@ -5931,9 +6349,8 @@ fn cold_ground_uses_local_capability_while_search_prepares_embedding_runtime() {
         );
         assert_eq!(error["retry_tool"], Value::Null);
     } else {
-        assert_eq!(error["code"], json!("codestory_preparing"));
+        assert_eq!(error["kind"], json!("preparing"));
         assert_eq!(error["state"], json!("preparing"));
-        assert_eq!(error["retry_tool"], json!("search"));
     }
 }
 
@@ -5963,17 +6380,17 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
     };
 
     let first = send_json(&mut server, packet_request("packet-search-repair-first"));
-    let first_error = if tool_result_code(&first) == Some("codestory_preparing") {
+    let first_error = if tool_result_code(&first).as_deref() == Some("codestory_preparing") {
         assert_tool_preparing(&first, json!("packet-search-repair-first"))
     } else if first.pointer("/result/isError") != Some(&json!(true)) {
         assert_tool_success(&first, json!("packet-search-repair-first"));
         return;
     } else {
         let first_error = assert_tool_error(&first, json!("packet-search-repair-first"));
-        if activation_terminated(first_error) {
+        if activation_terminated(&first_error) {
             assert_search_repaired_before_terminal_activation(
                 &mut server,
-                first_error,
+                &first_error,
                 &search_generations,
                 "packet-search-repair-first",
             );
@@ -5981,10 +6398,8 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         }
         first_error
     };
-    assert_eq!(first_error["code"], json!("codestory_preparing"));
-    assert_eq!(first_error["retry_tool"], json!("packet"));
+    assert_eq!(first_error["kind"], json!("preparing"));
     assert!(first_error["retry_after_ms"].as_u64().is_some());
-    assert!(first_error["cause_code"].as_str().is_some());
     let operation_id = first_error["operation"]["operation_id"]
         .as_str()
         .expect("stable activation operation id")
@@ -5996,9 +6411,8 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
         thread::sleep(Duration::from_millis(retry_after_ms.min(1_000)));
         let id = format!("packet-search-repair-retry-{attempt}");
         let response = send_json(&mut server, packet_request(&id));
-        if tool_result_code(&response) == Some("codestory_preparing") {
+        if tool_result_code(&response).as_deref() == Some("codestory_preparing") {
             let error = assert_tool_preparing(&response, json!(id));
-            assert_eq!(error["retry_tool"], json!("packet"));
             assert_eq!(
                 error["operation"]["operation_id"],
                 json!(operation_id),
@@ -6017,10 +6431,10 @@ fn packet_repairs_a_missing_search_generation_before_rendering_same_tool_retry()
             return;
         }
         let error = assert_tool_error(&response, json!(id));
-        if activation_terminated(error) {
+        if activation_terminated(&error) {
             assert_search_repaired_before_terminal_activation(
                 &mut server,
-                error,
+                &error,
                 &search_generations,
                 &id,
             );

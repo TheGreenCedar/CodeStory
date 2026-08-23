@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Packet, context, and search now return closed CodeStory schema-3 evidence
+  projections. They report concrete evidence, gaps, retrieval state, and one
+  bounded continuation without claiming that an arbitrary natural-language
+  answer is proved. Packet diagnostics can be written separately with
+  `--diagnostics-out` or read through a short-lived session capability.
+- MCP discovery and results now match the negotiated 2024, March 2025, June
+  2025, or November 2025 protocol profile. Older profiles receive JSON text;
+  modern profiles receive matching structured content and JSON text. Invalid
+  packet fields fail as invalid arguments, and packet no longer accepts
+  `include_evidence` or `--no-evidence`.
 - TypeScript and JavaScript config files can now be indexed when they use JSONC comments or trailing commas. Ordinary JSON stays strict, and malformed config changes leave the previous complete index available.
 
 ## 0.17.4

@@ -1898,11 +1898,6 @@ impl PublicOperationService {
         })
     }
 
-    #[cfg(any(
-        test,
-        feature = "test-support",
-        feature = "v3-evidence-separation-support"
-    ))]
     pub(crate) fn active_project_identity_v3(
         &self,
     ) -> Result<codestory_workspace::ProjectIdentityV3, ApiError> {
@@ -3484,7 +3479,6 @@ pub(crate) mod activation_tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: Some(30_000),
             parent_packet_id: None,
             option_ids: Vec::new(),

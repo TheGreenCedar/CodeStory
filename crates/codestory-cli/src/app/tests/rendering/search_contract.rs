@@ -80,7 +80,7 @@ fn build_search_output_preserves_separate_provenance_groups() {
 }
 
 #[test]
-fn cli_search_and_resolution_keep_structural_evidence_metadata() {
+fn cli_search_and_resolution_keep_structural_metadata_while_drill_omits_truth_authority() {
     let root = Path::new("C:/repo");
     let manifest = SearchHit {
         node_id: NodeId("cargo-package".to_string()),
@@ -221,7 +221,7 @@ fn cli_search_and_resolution_keep_structural_evidence_metadata() {
         drill_hit.resolution_status,
         Some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly)
     );
-    assert_eq!(drill_hit.eligible_for_sufficiency, Some(false));
+    assert_eq!(drill_hit.eligible_for_sufficiency, None);
 }
 
 #[test]

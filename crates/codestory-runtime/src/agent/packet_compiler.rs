@@ -827,7 +827,6 @@ mod tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: Some(packet.packet_id.clone()),
             option_ids: drill
@@ -893,7 +892,6 @@ mod tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: Some(packet.packet_id.clone()),
             option_ids: vec!["omitted_mandatory_support:symbol%3ARouter.use".to_string()],
@@ -1224,7 +1222,6 @@ mod tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: Some(packet.packet_id.clone()),
             option_ids: vec!["bounded_source_read:src%2Funread.rs".to_string()],

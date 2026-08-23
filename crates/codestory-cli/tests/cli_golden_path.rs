@@ -232,6 +232,391 @@ fn run_stdio_request(workspace: &Path, cache_dir: &Path, request: &str) -> Value
     serde_json::from_str(line).expect("parse stdio response")
 }
 
+#[derive(Debug)]
+enum StdioToolPayload {
+    SchemaV3Structured(Value),
+    SchemaV3Text(Value),
+    FrozenV2Preparing(Value),
+    FrozenV2Error(Value),
+}
+
+impl StdioToolPayload {
+    fn value(&self) -> &Value {
+        match self {
+            Self::SchemaV3Structured(value)
+            | Self::SchemaV3Text(value)
+            | Self::FrozenV2Preparing(value)
+            | Self::FrozenV2Error(value) => value,
+        }
+    }
+
+    fn is_preparing(&self) -> bool {
+        matches!(self, Self::SchemaV3Structured(value) | Self::SchemaV3Text(value) if value["kind"] == "preparing")
+            || matches!(self, Self::FrozenV2Preparing(_))
+    }
+}
+
+fn stdio_tool_text(result: &serde_json::Map<String, Value>) -> Result<&str, String> {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|content| content.get("text"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "stdio tool result must include string TextContent".to_string())
+}
+
+fn validate_schema_v3_preparing(
+    result: &serde_json::Map<String, Value>,
+    payload: &Value,
+) -> Result<(), String> {
+    if result.get("isError") != Some(&Value::Bool(false)) {
+        return Err("schema-v3 preparing result must set isError=false".to_string());
+    }
+    if payload.get("state").and_then(Value::as_str) != Some("preparing") {
+        return Err("schema-v3 preparing result must set state=preparing".to_string());
+    }
+    if payload
+        .get("retry_after_ms")
+        .and_then(Value::as_u64)
+        .is_none_or(|retry_after_ms| retry_after_ms == 0)
+    {
+        return Err("schema-v3 preparing result must include a positive retry delay".to_string());
+    }
+    if !payload.get("operation").is_some_and(Value::is_object) {
+        return Err("schema-v3 preparing result must include an operation object".to_string());
+    }
+    Ok(())
+}
+
+fn decode_stdio_tool_payload(response: &Value) -> Result<StdioToolPayload, String> {
+    let result = response
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "stdio response must include an object tool result".to_string())?;
+
+    match result.get("structuredContent") {
+        Some(structured) if structured.get("kind").is_some() => {
+            let kind = structured
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "modern stdio tool kind must be a string".to_string())?;
+            let text = stdio_tool_text(result)?;
+            let text_payload = serde_json::from_str::<Value>(text)
+                .map_err(|error| format!("modern stdio tool text mirror must be JSON: {error}"))?;
+            if structured != &text_payload {
+                return Err("modern structured and text payload mirrors must agree".to_string());
+            }
+            if kind == "preparing" {
+                validate_schema_v3_preparing(result, structured)?;
+            }
+            Ok(StdioToolPayload::SchemaV3Structured(structured.clone()))
+        }
+        Some(structured)
+            if structured.get("code").and_then(Value::as_str) == Some("codestory_preparing") =>
+        {
+            stdio_tool_text(result)?;
+            if !matches!(result.get("isError"), None | Some(Value::Bool(false))) {
+                return Err("legacy preparing result must not set isError=true".to_string());
+            }
+            Ok(StdioToolPayload::FrozenV2Preparing(structured.clone()))
+        }
+        Some(structured) if structured.get("code").and_then(Value::as_str).is_some() => {
+            stdio_tool_text(result)?;
+            if result.get("isError") != Some(&Value::Bool(true)) {
+                return Err("legacy structured semantic error must set isError=true".to_string());
+            }
+            Ok(StdioToolPayload::FrozenV2Error(structured.clone()))
+        }
+        Some(_) => Err("unrecognized structured stdio tool result shape".to_string()),
+        None => {
+            let text = stdio_tool_text(result)?;
+            let payload = serde_json::from_str::<Value>(text)
+                .map_err(|error| format!("stdio semantic error text must be JSON: {error}"))?;
+            if !payload.is_object() {
+                return Err("stdio text-only payload must be a JSON object".to_string());
+            }
+            if payload.get("kind").and_then(Value::as_str) == Some("preparing") {
+                validate_schema_v3_preparing(result, &payload)?;
+            } else if result.get("isError") != Some(&Value::Bool(true)) {
+                return Err("stdio text-only semantic error must set isError=true".to_string());
+            }
+            Ok(StdioToolPayload::SchemaV3Text(payload))
+        }
+    }
+}
+
+fn stdio_tool_payload(response: &Value) -> StdioToolPayload {
+    decode_stdio_tool_payload(response).unwrap_or_else(|error| panic!("{error}: {response:#}"))
+}
+
+#[test]
+fn stdio_tool_payload_rejects_invalid_modern_result_boundaries() {
+    let accepted_hostile_cases = [
+        (
+            "mismatched mirror",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":251,"operation":{}}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "malformed mirror",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    },
+                    "content": [{"type": "text", "text": "{"}]
+                }
+            }),
+        ),
+        (
+            "modern preparing missing text mirror",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    }
+                }
+            }),
+        ),
+        (
+            "modern preparing missing isError",
+            serde_json::json!({
+                "result": {
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "modern preparing missing operation",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250}"#
+                    }]
+                }
+            }),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, response)| {
+        decode_stdio_tool_payload(&response).is_ok().then_some(name)
+    })
+    .collect::<Vec<_>>();
+
+    assert!(
+        accepted_hostile_cases.is_empty(),
+        "decoder accepted hostile dual-mirror cases: {accepted_hostile_cases:?}"
+    );
+}
+
+#[test]
+fn stdio_tool_payload_accepts_revision_native_preparing_and_text_only_errors() {
+    let frozen_transcripts: Value = serde_json::from_str(include_str!(
+        "../../../scripts/tests/fixtures/codestory-v2-transcripts.json"
+    ))
+    .expect("frozen v2 transcript fixture");
+    let frozen_v2 = serde_json::json!({
+        "result": frozen_transcripts["native_v2"]["preparing"].clone()
+    });
+    assert_eq!(
+        frozen_v2.pointer("/result/content/0/text"),
+        Some(&serde_json::json!("CodeStory is preparing managed search.")),
+        "fixture must retain the frozen human TextContent"
+    );
+    let frozen_v2 = stdio_tool_payload(&frozen_v2);
+    assert!(matches!(frozen_v2, StdioToolPayload::FrozenV2Preparing(_)));
+    assert_eq!(frozen_v2.value()["code"], "codestory_preparing");
+
+    let modern = serde_json::json!({
+        "result": {
+            "isError": false,
+            "structuredContent": {
+                "kind": "preparing",
+                "state": "preparing",
+                "retry_after_ms": 250,
+                "operation": {}
+            },
+            "content": [{
+                "type": "text",
+                "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+            }]
+        }
+    });
+    let modern = stdio_tool_payload(&modern);
+    assert!(matches!(modern, StdioToolPayload::SchemaV3Structured(_)));
+    assert_eq!(modern.value()["kind"], "preparing");
+
+    let modern_text_only = serde_json::json!({
+        "result": {
+            "isError": false,
+            "content": [{
+                "type": "text",
+                "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+            }]
+        }
+    });
+    let modern_text_only = stdio_tool_payload(&modern_text_only);
+    assert!(matches!(
+        modern_text_only,
+        StdioToolPayload::SchemaV3Text(_)
+    ));
+    assert_eq!(modern_text_only.value()["kind"], "preparing");
+
+    for fixture_name in ["unavailable", "tool_error"] {
+        let legacy_error = serde_json::json!({
+            "result": frozen_transcripts["native_v2"][fixture_name].clone()
+        });
+        let legacy_error = stdio_tool_payload(&legacy_error);
+        assert!(matches!(legacy_error, StdioToolPayload::FrozenV2Error(_)));
+        assert!(legacy_error.value()["code"].as_str().is_some());
+    }
+
+    let unavailable = serde_json::json!({
+        "result": {
+            "isError": true,
+            "content": [{
+                "type": "text",
+                "text": r#"{"code":"codestory_unavailable","state":"unavailable"}"#
+            }]
+        }
+    });
+    let unavailable = stdio_tool_payload(&unavailable);
+    assert!(matches!(unavailable, StdioToolPayload::SchemaV3Text(_)));
+    assert_eq!(unavailable.value()["code"], "codestory_unavailable");
+}
+
+#[test]
+fn stdio_tool_payload_rejects_invalid_result_state_and_text_error_boundaries() {
+    let accepted_hostile_cases = [
+        (
+            "modern preparing marked error",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "structuredContent": {
+                        "kind": "preparing",
+                        "state": "preparing",
+                        "retry_after_ms": 250,
+                        "operation": {}
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "text-only error marked successful",
+            serde_json::json!({
+                "result": {
+                    "isError": false,
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"code":"codestory_unavailable","state":"unavailable"}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "malformed text-only error",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "content": [{"type": "text", "text": "{"}]
+                }
+            }),
+        ),
+        (
+            "text-only preparing marked error",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "content": [{
+                        "type": "text",
+                        "text": r#"{"kind":"preparing","state":"preparing","retry_after_ms":250,"operation":{}}"#
+                    }]
+                }
+            }),
+        ),
+        (
+            "text-only semantic error is not an object",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "content": [{"type": "text", "text": "[]"}]
+                }
+            }),
+        ),
+        (
+            "legacy preparing marked error",
+            serde_json::json!({
+                "result": {
+                    "isError": true,
+                    "structuredContent": {
+                        "code": "codestory_preparing",
+                        "message": "CodeStory is preparing managed search.",
+                        "state": "preparing",
+                        "retry_after_ms": 250
+                    },
+                    "content": [{
+                        "type": "text",
+                        "text": "CodeStory is preparing managed search."
+                    }]
+                }
+            }),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, response)| {
+        decode_stdio_tool_payload(&response).is_ok().then_some(name)
+    })
+    .collect::<Vec<_>>();
+
+    assert!(
+        accepted_hostile_cases.is_empty(),
+        "decoder accepted hostile result-state cases: {accepted_hostile_cases:?}"
+    );
+}
+
 fn string_field<'a>(value: &'a Value, path: &[&str]) -> &'a str {
     value_at_path(value, path)
         .as_str()
@@ -2233,20 +2618,33 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
     })
     .to_string();
     let stdio = run_stdio_request(workspace, cache_dir, &request);
-    let structured = &stdio["result"]["structuredContent"];
-    let code = structured["code"].as_str();
+    let decoded = stdio_tool_payload(&stdio);
+    let payload = decoded.value();
+    let code = payload["code"].as_str();
+    let preparing = decoded.is_preparing();
     assert!(
-        matches!(
-            code,
-            Some("codestory_tool_blocked" | "codestory_preparing" | "codestory_unavailable")
-        ),
-        "stdio context --id should fail closed with a typed retrieval error: {stdio:#}"
+        preparing
+            || matches!(
+                code,
+                Some("codestory_tool_blocked" | "codestory_unavailable")
+            ),
+        "stdio context --id should fail closed with a typed unavailable or preparing result: {stdio:#}"
     );
-    if code == Some("codestory_preparing") {
+    if preparing {
         assert_ne!(
-            stdio["result"].get("isError"),
-            Some(&serde_json::json!(true)),
+            stdio["result"].get("isError").and_then(Value::as_bool),
+            Some(true),
             "preparing should be a successful structured result: {stdio:#}"
+        );
+        assert_eq!(
+            payload["state"], "preparing",
+            "preparing should retain the revision-native state tag: {stdio:#}"
+        );
+        assert!(
+            payload["retry_after_ms"]
+                .as_u64()
+                .is_some_and(|retry_after_ms| retry_after_ms > 0),
+            "preparing should include a positive retry delay: {stdio:#}"
         );
     } else {
         assert_eq!(
@@ -2255,7 +2653,7 @@ fn assert_stdio_context_id_fails_closed_without_full_sidecars(
         );
     }
     if code == Some("codestory_tool_blocked") {
-        let status = structured["status"].as_str();
+        let status = payload["status"].as_str();
         assert!(
             status.is_some_and(|status| matches!(status, "repair_setup" | "blocked")),
             "stdio context --id should fail closed before serving context: {stdio:#}"

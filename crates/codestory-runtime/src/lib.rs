@@ -65,12 +65,14 @@ use uuid::Uuid;
 
 mod affected;
 mod agent;
+mod evidence_projection_v3;
 mod index_commit;
 mod index_coverage;
 mod index_freshness;
 mod index_full;
 mod index_incremental;
 mod index_timings;
+#[allow(unused_imports)]
 #[cfg(any(
     test,
     feature = "test-support",
@@ -104,6 +106,10 @@ use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{
     bind_packet_follow_up_program, enforce_packet_output_budget_for_representation,
     packet_step_trace_json, plan_packet,
+};
+pub use evidence_projection_v3::{
+    PacketDiagnosticProjectionV3, PacketEvidenceProductV3, project_context_v3, project_packet_v3,
+    project_search_v3,
 };
 
 #[cfg(feature = "test-support")]

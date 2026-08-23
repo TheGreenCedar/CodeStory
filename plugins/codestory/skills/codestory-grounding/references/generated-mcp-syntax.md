@@ -21,7 +21,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | Tool | Required besides `project` | Optional | Notes |
 | --- | --- | --- | --- |
 | `status` | | | Observational. Do not call first. |
-| `packet` | `question` | `budget`, `task_class`, `probes`, `extra_probes`, `include_evidence`, `latency_budget_ms`, DrillOnce `parent_packet_id` / `option_ids` / generation pins | Broad questions. |
+| `packet` | `question` | `budget`, `task_class`, `probes`, `extra_probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Broad evidence questions. No `include_evidence`. |
 | `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery, not packet recovery. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
 | `files` | | `language`, `path`, `role`, `limit` | Refreshes the local map before dispatch. No `refresh` field. |
@@ -49,3 +49,17 @@ project-free.
 
 Host prompts `explain_symbol`, `trace_callflow`, and `impact_analysis` exist
 only if the host exposes them. Prefer the matching tool.
+
+## Wire profiles
+
+CodeStory supports MCP revisions `2024-11-05`, `2025-03-26`, `2025-06-18`,
+and `2025-11-25`, preferring the newest. The 2024 profile lists only
+`name`/`description`/`inputSchema`; March adds annotations; June and November
+add `title`, `outputSchema`, and Tool `_meta`. Older profiles return one JSON
+text object. Modern profiles return schema-valid structured content and the
+identical JSON text object. Tool errors are text-only in every profile.
+
+CodeStory publication stamps use schema 3 with minimum compatible schema 3.
+Each negotiated profile has its own discovery digest. The 2024 and March
+profiles accept ordered JSON-RPC batches and omit notification responses; June
+and November reject arrays with `-32600`.

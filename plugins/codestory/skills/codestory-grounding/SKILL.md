@@ -57,7 +57,7 @@ plugin result unless the user explicitly asks.
 | Follow a call path | `callers`, `callees`, `trace`, or `trail`. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node. |
 | Review change impact | `affected` with explicit Git-changed `paths` (or `changed_paths` / `change_records`). Never omit the path source. |
 | One graph node | `get_node`, `definition`, `references`, or `symbols`. |
-| Broad structural question | `packet`; stop on Supported, NotEstablished, or Unavailable. For DrillOnce, call `packet` again once with the exact original `question`, `parent_packet_id`, and the listed `option_ids`. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
+| Broad structural question | `packet`; answer only from its evidence rows, name its gaps, and stop unless it returns one bounded continuation. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
 
 ## Evidence Rules
 
@@ -67,20 +67,24 @@ plugin result unless the user explicitly asks.
   plugin unavailability.
 - Local repository-map output is navigation evidence. Broad packet/search
   output is stronger only when the response reports full retrieval readiness.
-- When `packet` reports `supported`, `not_established`, or `unavailable`, stop.
-  For `supported`, answer from the compiled support units. For
-  `not_established`, answer every claim those units directly establish, then
-  name the material links or claims that remain unproven; do not turn a partial
-  chain into a complete one. For `unavailable`, report the typed preparation
-  reason. Do not search to recover.
-- When `packet` reports `drill_once`, call `packet` once more with the exact
-  original `question`, `parent_packet_id`, and the listed `option_ids` (and the
-  pinned generation ids when present). Then answer. Do not start a free-form
-  `search` / `context` / `trail` / `snippet` loop from packet.
+- `packet`, `context`, and `search` report evidence availability, not whether a
+  claim is true. Cite only the returned evidence rows and state every material
+  returned gap. Never turn `available` into authority for a claim the rows do
+  not establish.
+- When `packet.status=continuation_available`, execute only the returned bounded
+  continuation, once, against its pinned publication: repeat the question with
+  `parent_packet_id=continuation.continuation_id`, use
+  `continuation.gap_ids` as `option_ids`, and copy the core/retrieval generation
+  IDs from `publication`. Then answer from the combined evidence and gaps. Do
+  not start a free-form `search` / `context` / `trail` / `snippet` recovery
+  loop from packet.
+- `no_useful_evidence` and `unavailable` are terminal. For the former, report
+  the material evidence gap; for the latter, use ordinary source inspection and
+  report that broad retrieval could not serve the request.
 - `affected` is planning evidence, not a guarantee that every runtime effect was
   found.
 - Tagged probes select exact or additional evidence work. They do not choose
-  route order or replace the packet disposition.
+  route order or replace the packet availability and gap fields.
 - Do not paste empty grounding output as context. If a repository truly has no
   supported files, fall back to ordinary inspection or resolve the intended
   root when it is ambiguous.

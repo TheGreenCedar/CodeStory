@@ -29,4 +29,7 @@ CLI flags. Every call requires `project` (absolute repository root).
 - Treat `context` output as incomplete when it reports weak hits, semantic
   stale/partial/failed states, missing snippets, no citations, or unresolved
   graph edges.
+- Evidence line bounds are nullable when the producer supplied only a path.
+  `symbol_id` is present only for a resolvable citation; null values preserve
+  uncertainty and must not be interpreted as line 1 or a followable symbol.
 - `doctor` and manual retrieval indexing are maintainer diagnosis surfaces.

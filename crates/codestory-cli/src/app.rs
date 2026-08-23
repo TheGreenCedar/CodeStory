@@ -47,14 +47,6 @@ fn to_api_repo_text_mode(mode: RepoTextMode) -> SearchRepoTextMode {
     }
 }
 
-fn from_api_repo_text_mode(mode: SearchRepoTextMode) -> RepoTextMode {
-    match mode {
-        SearchRepoTextMode::Auto => RepoTextMode::Auto,
-        SearchRepoTextMode::On => RepoTextMode::On,
-        SearchRepoTextMode::Off => RepoTextMode::Off,
-    }
-}
-
 fn drill_read_only_jobs(requested: usize, refresh: args::RefreshMode) -> usize {
     if refresh == args::RefreshMode::None {
         normalize_drill_jobs(requested)
@@ -94,7 +86,6 @@ mod search_command;
 mod server;
 mod source_commands;
 
-pub(crate) use agent_context::packet_sufficiency_label;
 #[cfg(test)]
 use agent_context::{
     build_task_brief_output, packet_budget_mode_label, packet_task_class_label,
