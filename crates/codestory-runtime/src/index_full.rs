@@ -331,6 +331,29 @@ fn run_full_refresh_indexer(
     let mut preparation = StagedPreparation::new(staged);
     #[cfg(test)]
     run_full_refresh_staged_store_hook(preparation.staged_mut().store_mut());
+    let staged_proof_fact_count = preparation
+        .staged_mut()
+        .store_mut()
+        .proof_resolution_fact_count()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect the fresh full-refresh proof overlay: {error}"
+            ))
+        })?;
+    let staged_proof_publication = preparation
+        .staged_mut()
+        .store_mut()
+        .get_proof_resolution_publication()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect the fresh full-refresh proof overlay: {error}"
+            ))
+        })?;
+    if staged_proof_fact_count != 0 || staged_proof_publication.is_some() {
+        return Err(ApiError::internal(
+            "Fresh full-refresh storage contains a proof overlay before graph mutation",
+        ));
+    }
     let copied_structural_artifacts = if live_state.has_verified_publication {
         match preparation
             .staged_mut()

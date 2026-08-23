@@ -387,6 +387,16 @@ impl Storage {
             ));
         }
         for dependency in &fact.provenance.dependency_file_hashes {
+            let dependency_file = self
+                .get_files()?
+                .into_iter()
+                .find(|file| file.id == dependency.file_id.0)
+                .ok_or_else(|| proof_error("dependency file record is missing"))?;
+            if !dependency_file.indexed || !dependency_file.complete {
+                return Err(proof_error(
+                    "dependency file is not indexed-complete in the graph",
+                ));
+            }
             let stored = self
                 .get_file_content_hash(dependency.file_id.0)?
                 .ok_or_else(|| {
@@ -414,6 +424,24 @@ impl Storage {
             .raw_callsite_identity
             .as_deref()
             .expect("shape validation requires raw callsite identity");
+        let target_node = self
+            .get_node(target)?
+            .ok_or_else(|| proof_error("exact target node is missing"))?;
+        if target_node.file_node_id.is_none() {
+            return Err(proof_error("exact target has no indexed dependency file"));
+        }
+        let raw_placeholder = self
+            .get_node(raw_edge_target)?
+            .ok_or_else(|| proof_error("raw CALL placeholder node is missing"))?;
+        if raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+            || raw_placeholder.start_line != Some(fact.callsite.line)
+            || raw_placeholder.start_col != Some(fact.callsite.column)
+            || graph_leaf_name(&raw_placeholder.serialized_name) != fact.callsite.raw_target
+        {
+            return Err(proof_error(
+                "raw CALL callsite placeholder does not match file, line, column, and target spelling",
+            ));
+        }
         let graph_edges = self.get_edges()?;
         match (fact.callsite.callee_form, fact.evidence_chain.as_slice()) {
             (CalleeForm::Identifier, [ResolutionEvidence::SameFileDeclaration { declaration }])
@@ -441,6 +469,7 @@ impl Storage {
                     .get_node(*import)?
                     .ok_or_else(|| proof_error("static import binding is missing"))?;
                 if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                    || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
                     || graph_edges
                         .iter()
                         .filter(|candidate| {
@@ -480,6 +509,7 @@ impl Storage {
                 };
                 if !matches!(owner_node.kind, NodeKind::STRUCT | NodeKind::CLASS)
                     || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                    || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                     || !member(fact.caller)
                     || !member(target)
                 {
@@ -523,12 +553,12 @@ impl Storage {
         let mut fields = callsite.split('|').next().unwrap_or_default().split(':');
         let parsed_file = fields.next().and_then(|value| value.parse::<i64>().ok());
         let parsed_line = fields.next().and_then(|value| value.parse::<u32>().ok());
-        let parsed_column = fields.next().and_then(|value| value.parse::<u32>().ok());
+        let parsed_discriminator = fields.next().and_then(|value| value.parse::<u32>().ok());
         let parsed_raw_target = fields.next().and_then(|value| value.parse::<i64>().ok());
         if fields.next().is_some()
             || parsed_file != Some(fact.callsite.file_id.0)
             || parsed_line != Some(fact.callsite.line)
-            || parsed_column.is_none()
+            || parsed_discriminator.is_none()
             || parsed_raw_target != Some(raw_edge_target.0)
         {
             return Err(proof_error(
@@ -804,6 +834,12 @@ impl Storage {
         tx.commit()?;
         self.validate_proof_resolution_publication(next).map(Some)
     }
+}
+
+fn graph_leaf_name(name: &str) -> &str {
+    name.rsplit(['.', ':'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(name)
 }
 
 fn publication_integrity_digest(

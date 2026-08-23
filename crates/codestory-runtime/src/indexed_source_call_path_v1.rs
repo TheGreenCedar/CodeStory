@@ -1641,16 +1641,30 @@ mod tests {
             .insert_node(&node(3, NodeKind::FUNCTION, "target", "target-id", 1, 2, 2))
             .unwrap();
         store
+            .insert_node(&Node {
+                id: NodeId(30),
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "target".to_owned(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(NodeId(1)),
+                start_line: Some(1),
+                start_col: Some(1),
+                end_line: Some(1),
+                end_col: Some(1),
+            })
+            .unwrap();
+        store
             .insert_edge(&Edge {
                 id: EdgeId(10),
                 source: NodeId(2),
-                target: NodeId(3),
+                target: NodeId(30),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                callsite_identity: Some("1:1:1:3|rust".to_owned()),
+                callsite_identity: Some("1:1:1:30|rust".to_owned()),
                 candidate_targets: Vec::new(),
                 ..Default::default()
             })
@@ -3148,7 +3162,7 @@ mod tests {
         assert_eq!(receipt.receipt.edge_id, "10");
         assert_eq!(receipt.resolution_fact_id.len(), 64);
         assert_eq!(receipt.resolution_evidence_sha256.len(), 64);
-        assert_eq!(receipt.callsite_identity, "1:1:1:3|rust");
+        assert_eq!(receipt.callsite_identity, "1:1:1:30|rust");
         assert_eq!(receipt.containment.owner_node_id, NodeId(2));
         assert_eq!(receipt.line_window.kind, "indexed_line_v1");
         assert_eq!(receipt.line_window.text, "fn source() { target(); }\r\n");

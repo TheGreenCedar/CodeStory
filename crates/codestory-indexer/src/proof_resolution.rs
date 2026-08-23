@@ -1,6 +1,6 @@
 use crate::cache::{
-    CachedCallResolutionInput, CachedDirectExport, CachedIndexArtifact, CachedResolutionBinding,
-    CachedResolutionFile,
+    CachedCallResolutionInput, CachedDirectExport, CachedIndexArtifact, CachedInherentMethod,
+    CachedResolutionBinding, CachedResolutionFile, CachedTopLevelDeclaration,
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
@@ -13,12 +13,13 @@ use codestory_contracts::proof_resolution::{
     ResolutionEvidenceKind, ResolutionProvenance,
 };
 use codestory_store::{IndexPublicationRecord, ProofResolutionPublication, Store};
+use codestory_workspace::{WorkspacePathIdentity, workspace_path_identity};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node as TsNode, Tree};
 
 const ADAPTER_VERSION: &str = "reference-v2";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 2;
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 3;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("rust", ADAPTER_VERSION),
     ("tsx", ADAPTER_VERSION),
@@ -45,9 +46,45 @@ pub(crate) fn collect_call_resolution_inputs(
         };
     }
     let complete = !tree.root_node().has_error();
+    let mut lookup_input_complete = complete;
     let source_sha256 = source_content_hash(source.as_bytes());
     let direct_exports = if matches!(language, "typescript" | "tsx") {
-        collect_typescript_direct_exports(tree, source, file_id, nodes)
+        match collect_typescript_direct_exports(tree, source, file_id, nodes) {
+            Some(exports) => exports,
+            None => {
+                lookup_input_complete = false;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    if matches!(language, "typescript" | "tsx")
+        && contains_dynamic_construct(tree.root_node(), source)
+    {
+        lookup_input_complete = false;
+    }
+    let typescript_module =
+        matches!(language, "typescript" | "tsx") && typescript_file_is_module(tree.root_node());
+    let top_level_declarations = if matches!(language, "typescript" | "tsx" | "rust") {
+        match collect_top_level_declarations(tree, source, language, file_id, nodes) {
+            Some(declarations) => declarations,
+            None => {
+                lookup_input_complete = false;
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let inherent_methods = if language == "rust" {
+        match collect_rust_inherent_methods(tree, source, file_id, nodes) {
+            Some(methods) => methods,
+            None => {
+                lookup_input_complete = false;
+                Vec::new()
+            }
+        }
     } else {
         Vec::new()
     };
@@ -68,7 +105,7 @@ pub(crate) fn collect_call_resolution_inputs(
         } else {
             resolve_typescript_syntax_claim(tree, source, file_id, nodes, callee, form, &raw_target)
         };
-        if !complete {
+        if !lookup_input_complete {
             binding = CachedResolutionBinding::IncompleteDomain;
         }
         if matches!(binding, CachedResolutionBinding::StaticImport { .. }) {
@@ -93,6 +130,10 @@ pub(crate) fn collect_call_resolution_inputs(
             adapter_version: ADAPTER_VERSION.to_string(),
             parser_fingerprint: parser_fingerprint.to_string(),
             complete,
+            lookup_input_complete,
+            typescript_module,
+            top_level_declarations,
+            inherent_methods,
             direct_exports,
         }),
     }
@@ -191,11 +232,16 @@ fn resolve_typescript_syntax_claim(
     let Some(caller) = map_callable_declaration(nodes, file_id, callable, source) else {
         return (None, CachedResolutionBinding::Ambiguous);
     };
+    if !typescript_callable_is_top_level(callable) {
+        return (Some(caller), CachedResolutionBinding::Unsupported);
+    }
     if form != CalleeForm::Identifier {
         return (Some(caller), CachedResolutionBinding::Unsupported);
     }
     if contains_dynamic_construct(tree.root_node(), source)
         || callable_has_shadow_or_write(callable, callee, raw_target, source)
+        || root_has_write(tree.root_node(), raw_target, source)
+        || typescript_root_has_competing_value_binding(tree.root_node(), raw_target, source)
     {
         return (Some(caller), CachedResolutionBinding::Ambiguous);
     }
@@ -259,7 +305,12 @@ fn resolve_rust_syntax_claim(
     let Some(caller) = map_callable_declaration(nodes, file_id, callable, source) else {
         return (None, CachedResolutionBinding::Ambiguous);
     };
-    if callable_has_shadow_or_write(callable, callee, raw_target, source) {
+    if !rust_callable_is_in_root_module(callable) {
+        return (Some(caller), CachedResolutionBinding::Unsupported);
+    }
+    if callable_has_shadow_or_write(callable, callee, raw_target, source)
+        || rust_root_has_competing_value_binding(tree.root_node(), raw_target, source)
+    {
         return (Some(caller), CachedResolutionBinding::Ambiguous);
     }
     if form == CalleeForm::Identifier {
@@ -299,7 +350,13 @@ fn resolve_rust_syntax_claim(
         .into_iter()
         .filter(|method| declaration_name(*method, source) == Some(raw_target))
         .collect::<Vec<_>>();
-    if owner_nodes.len() != 1 || methods.len() != 1 {
+    let project_visible_methods = collect_simple_inherent_method_nodes(tree.root_node(), source)
+        .into_iter()
+        .filter(|(owner, method)| {
+            *owner == owner_name && declaration_name(*method, source) == Some(raw_target)
+        })
+        .collect::<Vec<_>>();
+    if owner_nodes.len() != 1 || methods.len() != 1 || project_visible_methods.len() != 1 {
         return (Some(caller), CachedResolutionBinding::Ambiguous);
     }
     let Some(declaration) = map_callable_declaration(nodes, file_id, methods[0], source) else {
@@ -310,6 +367,7 @@ fn resolve_rust_syntax_claim(
         CachedResolutionBinding::ImplicitReceiver {
             owner: owner_nodes[0].id,
             declaration,
+            owner_name: owner_name.to_string(),
         },
     )
 }
@@ -385,6 +443,39 @@ fn top_level_rust_functions(root: TsNode<'_>) -> Vec<TsNode<'_>> {
         .collect()
 }
 
+fn typescript_callable_is_top_level(callable: TsNode<'_>) -> bool {
+    match callable.parent().map(|parent| parent.kind()) {
+        Some("program") => true,
+        Some("export_statement") => callable
+            .parent()
+            .and_then(|export| export.parent())
+            .is_some_and(|parent| parent.kind() == "program"),
+        _ => false,
+    }
+}
+
+fn typescript_file_is_module(root: TsNode<'_>) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .any(|child| matches!(child.kind(), "import_statement" | "export_statement"))
+}
+
+fn rust_callable_is_in_root_module(callable: TsNode<'_>) -> bool {
+    match callable.parent().map(|parent| parent.kind()) {
+        Some("source_file") => true,
+        Some("declaration_list") => callable
+            .parent()
+            .and_then(|body| body.parent())
+            .is_some_and(|owner| {
+                owner.kind() == "impl_item"
+                    && owner
+                        .parent()
+                        .is_some_and(|parent| parent.kind() == "source_file")
+            }),
+        _ => false,
+    }
+}
+
 fn direct_impl_functions(impl_item: TsNode<'_>) -> Vec<TsNode<'_>> {
     let Some(body) = impl_item.child_by_field_name("body") else {
         return Vec::new();
@@ -393,6 +484,28 @@ fn direct_impl_functions(impl_item: TsNode<'_>) -> Vec<TsNode<'_>> {
     body.named_children(&mut cursor)
         .filter(|child| child.kind() == "function_item")
         .collect()
+}
+
+fn collect_simple_inherent_method_nodes<'tree, 'source>(
+    root: TsNode<'tree>,
+    source: &'source str,
+) -> Vec<(&'source str, TsNode<'tree>)> {
+    let mut methods = Vec::new();
+    let mut cursor = root.walk();
+    for item in root.named_children(&mut cursor) {
+        if item.kind() != "impl_item" {
+            continue;
+        }
+        let Some(owner) = simple_inherent_impl_owner(item, source) else {
+            continue;
+        };
+        methods.extend(
+            direct_impl_functions(item)
+                .into_iter()
+                .map(|method| (owner, method)),
+        );
+    }
+    methods
 }
 
 fn simple_inherent_impl_owner<'a>(impl_item: TsNode<'_>, source: &'a str) -> Option<&'a str> {
@@ -430,13 +543,29 @@ fn callable_has_shadow_or_write(
                 | "optional_parameter"
                 | "rest_pattern"
                 | "formal_parameters"
+                | "parameters"
+                | "parameter"
                 | "variable_declarator"
                 | "lexical_declaration"
                 | "variable_declaration"
                 | "let_declaration"
+                | "const_item"
+                | "static_item"
+                | "use_declaration"
+                | "class_declaration"
+                | "struct_item"
                 | "closure_parameters"
-        );
+        ) || (node.id() != callable.id()
+            && matches!(node.kind(), "function_item" | "function_declaration"));
         if relevant && subtree_binds(node, name, source) {
+            found = true;
+            return;
+        }
+        if node.kind() == "catch_clause"
+            && node
+                .child_by_field_name("parameter")
+                .is_some_and(|parameter| subtree_binds(parameter, name, source))
+        {
             found = true;
             return;
         }
@@ -446,8 +575,7 @@ fn callable_has_shadow_or_write(
         ) && node
             .child_by_field_name("left")
             .or_else(|| node.child_by_field_name("argument"))
-            .and_then(|left| node_text(left, source))
-            .is_some_and(|left| left.trim() == name)
+            .is_some_and(|left| subtree_binds(left, name, source))
         {
             found = true;
         }
@@ -455,12 +583,57 @@ fn callable_has_shadow_or_write(
     found
 }
 
+fn root_has_write(root: TsNode<'_>, name: &str, source: &str) -> bool {
+    let mut found = false;
+    walk_nodes(root, &mut |node| {
+        if found {
+            return;
+        }
+        if matches!(
+            node.kind(),
+            "assignment_expression" | "augmented_assignment_expression" | "update_expression"
+        ) && node
+            .child_by_field_name("left")
+            .or_else(|| node.child_by_field_name("argument"))
+            .is_some_and(|left| subtree_binds(left, name, source))
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+fn typescript_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
+    let mut found = false;
+    walk_nodes(root, &mut |node| {
+        if found {
+            return;
+        }
+        if matches!(node.kind(), "variable_declarator" | "class_declaration")
+            && subtree_binds(node, name, source)
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+fn rust_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor).any(|node| {
+        matches!(
+            node.kind(),
+            "const_item" | "static_item" | "use_declaration" | "struct_item"
+        ) && subtree_binds(node, name, source)
+    })
+}
+
 fn subtree_binds(node: TsNode<'_>, name: &str, source: &str) -> bool {
     let mut found = false;
     walk_nodes(node, &mut |child| {
         if matches!(
             child.kind(),
-            "identifier" | "shorthand_property_identifier_pattern"
+            "identifier" | "type_identifier" | "shorthand_property_identifier_pattern"
         ) && node_text(child, source) == Some(name)
         {
             found = true;
@@ -581,7 +754,10 @@ fn collect_typescript_direct_exports(
     source: &str,
     file_id: NodeId,
     nodes: &[Node],
-) -> Vec<CachedDirectExport> {
+) -> Option<Vec<CachedDirectExport>> {
+    if contains_dynamic_construct(tree.root_node(), source) {
+        return None;
+    }
     let mut exports = Vec::new();
     let mut cursor = tree.root_node().walk();
     for statement in tree.root_node().named_children(&mut cursor) {
@@ -601,12 +777,11 @@ fn collect_typescript_direct_exports(
             continue;
         }
         let declaration = declarations[0];
-        let Some(name) = declaration_name(declaration, source) else {
+        let name = declaration_name(declaration, source)?;
+        if root_has_write(tree.root_node(), name, source) {
             continue;
-        };
-        let Some(node_id) = map_callable_declaration(nodes, file_id, declaration, source) else {
-            continue;
-        };
+        }
+        let node_id = map_callable_declaration(nodes, file_id, declaration, source)?;
         exports.push(CachedDirectExport {
             exported_name: if is_default { "default" } else { name }.to_string(),
             declaration: node_id,
@@ -618,13 +793,117 @@ fn collect_typescript_direct_exports(
             .cmp(&right.exported_name)
             .then(left.declaration.cmp(&right.declaration))
     });
-    exports
+    Some(exports)
+}
+
+fn collect_top_level_declarations(
+    tree: &Tree,
+    source: &str,
+    language: &str,
+    file_id: NodeId,
+    nodes: &[Node],
+) -> Option<Vec<CachedTopLevelDeclaration>> {
+    let declarations = if language == "rust" {
+        top_level_rust_functions(tree.root_node())
+    } else {
+        top_level_typescript_functions(tree.root_node())
+    };
+    let mut result = Vec::with_capacity(declarations.len());
+    for declaration in declarations {
+        let name = declaration_name(declaration, source)?.to_string();
+        let declaration = map_callable_declaration(nodes, file_id, declaration, source)?;
+        result.push(CachedTopLevelDeclaration { name, declaration });
+    }
+    result.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.declaration.cmp(&right.declaration))
+    });
+    Some(result)
+}
+
+fn collect_rust_inherent_methods(
+    tree: &Tree,
+    source: &str,
+    file_id: NodeId,
+    nodes: &[Node],
+) -> Option<Vec<CachedInherentMethod>> {
+    let methods = collect_simple_inherent_method_nodes(tree.root_node(), source);
+    let mut result = Vec::with_capacity(methods.len());
+    for (owner_name, method) in methods {
+        result.push(CachedInherentMethod {
+            owner_name: owner_name.to_string(),
+            method_name: declaration_name(method, source)?.to_string(),
+            declaration: map_callable_declaration(nodes, file_id, method, source)?,
+        });
+    }
+    result.sort_by(|left, right| {
+        left.owner_name
+            .cmp(&right.owner_name)
+            .then(left.method_name.cmp(&right.method_name))
+            .then(left.declaration.cmp(&right.declaration))
+    });
+    Some(result)
 }
 
 struct ResolutionCacheRecord {
     path: PathBuf,
     file: CachedResolutionFile,
     calls: Vec<CachedCallResolutionInput>,
+}
+
+fn cache_entry_identity_for_indexed_file(
+    cache_path: &Path,
+    indexed_path: &Path,
+) -> Result<WorkspacePathIdentity> {
+    let observed_path = if cache_path.is_absolute() {
+        cache_path.to_path_buf()
+    } else {
+        let components = cache_path.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(anyhow!(
+                "proof resolution parser cache path is not a portable project path: {}",
+                cache_path.display()
+            ));
+        }
+        let mut project_root = indexed_path;
+        for _ in &components {
+            project_root = project_root.parent().ok_or_else(|| {
+                anyhow!(
+                    "proof resolution parser cache path has more components than indexed path {}",
+                    indexed_path.display()
+                )
+            })?;
+        }
+        project_root.join(cache_path)
+    };
+    workspace_path_identity(&observed_path).with_context(|| {
+        format!(
+            "proof resolution native identity is unavailable for parser cache path {}",
+            cache_path.display()
+        )
+    })
+}
+
+fn cache_entry_matches_any_governed_file(
+    cache_path: &Path,
+    governed: &[&codestory_store::FileInfo],
+    governed_identities: &HashMap<i64, WorkspacePathIdentity>,
+) -> Result<bool> {
+    for file in governed {
+        let observed = cache_entry_identity_for_indexed_file(cache_path, &file.path)?;
+        if governed_identities
+            .get(&file.id)
+            .is_some_and(|identity| *identity == observed)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn rematerialize_proof_resolution_projection(
@@ -650,27 +929,49 @@ pub fn rematerialize_proof_resolution_projection(
         .iter()
         .map(|file| (file.id, *file))
         .collect::<HashMap<_, _>>();
+    let mut governed_identities = HashMap::<i64, WorkspacePathIdentity>::new();
+    let mut governed_identity_owners = HashMap::<WorkspacePathIdentity, i64>::new();
+    for file in &governed {
+        let identity = workspace_path_identity(&file.path).with_context(|| {
+            format!(
+                "proof resolution native identity is unavailable for {}",
+                file.path.display()
+            )
+        })?;
+        if let Some(previous) = governed_identity_owners.insert(identity.clone(), file.id)
+            && previous != file.id
+        {
+            return Err(anyhow!(
+                "proof resolution native path identity collision between indexed files {previous} and {}",
+                file.id
+            ));
+        }
+        governed_identities.insert(file.id, identity);
+    }
     let mut records_by_id = HashMap::<i64, Vec<ResolutionCacheRecord>>::new();
     for entry in store.get_index_artifact_cache_entries()? {
         let artifact: CachedIndexArtifact = match serde_json::from_slice(&entry.artifact_blob) {
             Ok(artifact) => artifact,
-            Err(error)
-                if governed
-                    .iter()
-                    .any(|file| paths_refer_to_same_project_file(&entry.file_path, &file.path)) =>
-            {
-                return Err(anyhow!(
-                    "proof resolution parser cache is corrupt for {}: {error}",
-                    entry.file_path.display()
-                ));
+            Err(error) => {
+                if cache_entry_matches_any_governed_file(
+                    &entry.file_path,
+                    &governed,
+                    &governed_identities,
+                )? {
+                    return Err(anyhow!(
+                        "proof resolution parser cache is corrupt for {}: {error}",
+                        entry.file_path.display()
+                    ));
+                }
+                continue;
             }
-            Err(_) => continue,
         };
         let Some(file) = artifact.resolution_file else {
-            if governed
-                .iter()
-                .any(|indexed| paths_refer_to_same_project_file(&entry.file_path, &indexed.path))
-            {
+            if cache_entry_matches_any_governed_file(
+                &entry.file_path,
+                &governed,
+                &governed_identities,
+            )? {
                 return Err(anyhow!(
                     "proof resolution parser cache has no file coverage for {}",
                     entry.file_path.display()
@@ -681,13 +982,21 @@ pub fn rematerialize_proof_resolution_projection(
         if !governed_by_id.contains_key(&file.file_id.0) {
             continue;
         }
+        let indexed_file = governed_by_id[&file.file_id.0];
+        let entry_identity =
+            cache_entry_identity_for_indexed_file(&entry.file_path, &indexed_file.path)?;
+        if governed_identities.get(&indexed_file.id) != Some(&entry_identity) {
+            return Err(anyhow!(
+                "proof resolution parser cache native path does not match indexed file {}",
+                indexed_file.path.display()
+            ));
+        }
         if artifact.resolution_input_schema_version != RESOLUTION_INPUT_SCHEMA_VERSION {
             return Err(anyhow!(
                 "proof resolution parser cache has no schema-v{RESOLUTION_INPUT_SCHEMA_VERSION} inputs for {}",
                 entry.file_path.display()
             ));
         }
-        let indexed_file = governed_by_id[&file.file_id.0];
         records_by_id
             .entry(file.file_id.0)
             .or_default()
@@ -742,14 +1051,18 @@ pub fn rematerialize_proof_resolution_projection(
         records.push(record);
     }
     records.sort_by(|left, right| left.path.cmp(&right.path));
-    let record_by_path = records
-        .iter()
-        .filter_map(|record| {
-            native_path_key(&record.path)
-                .ok()
-                .map(|path| (path, record))
-        })
-        .collect::<HashMap<_, _>>();
+    let mut record_by_path = HashMap::new();
+    for record in &records {
+        let identity = governed_identities
+            .get(&record.file.file_id.0)
+            .ok_or_else(|| anyhow!("proof resolution cache record has no native identity"))?
+            .clone();
+        if record_by_path.insert(identity, record).is_some() {
+            return Err(anyhow!(
+                "proof resolution native path identity collision in parser cache records"
+            ));
+        }
+    }
     let mut inputs = records
         .iter()
         .flat_map(|record| record.calls.iter().cloned().map(move |call| (record, call)))
@@ -784,6 +1097,7 @@ pub fn rematerialize_proof_resolution_projection(
             &node_by_id,
             &edges,
             &record_by_path,
+            &records,
             source_record,
             input,
         )?);
@@ -807,41 +1121,10 @@ pub fn rematerialize_proof_resolution_projection(
         .map_err(Into::into)
 }
 
-fn paths_refer_to_same_project_file(left: &Path, right: &Path) -> bool {
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => left == right || left.ends_with(right) || right.ends_with(left),
-    }
-}
-
-fn native_path_key(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return path
-            .canonicalize()
-            .with_context(|| format!("cannot resolve native proof input path {}", path.display()));
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(anyhow!("proof input path escapes the project root"));
-                }
-            }
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                return Err(anyhow!("proof input path has mixed native identity"));
-            }
-        }
-    }
-    Ok(normalized)
-}
-
 fn resolve_relative_import<'a>(
     source_record: &ResolutionCacheRecord,
     module_specifier: &str,
-    records: &'a HashMap<PathBuf, &ResolutionCacheRecord>,
+    records: &'a HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
 ) -> Result<Option<&'a ResolutionCacheRecord>> {
     let Some(parent) = source_record.path.parent() else {
         return Ok(None);
@@ -862,7 +1145,12 @@ fn resolve_relative_import<'a>(
         if candidate.is_absolute() && !candidate.exists() {
             continue;
         }
-        let key = native_path_key(&candidate)?;
+        let key = workspace_path_identity(&candidate).with_context(|| {
+            format!(
+                "proof resolution native identity is unavailable for import candidate {}",
+                candidate.display()
+            )
+        })?;
         if let Some(record) = records.get(&key) {
             matches.push(*record);
         }
@@ -877,7 +1165,8 @@ fn resolve_input(
     files: &HashMap<i64, &codestory_store::FileInfo>,
     nodes: &HashMap<NodeId, &Node>,
     edges: &[Edge],
-    records: &HashMap<PathBuf, &ResolutionCacheRecord>,
+    records: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
+    all_records: &[ResolutionCacheRecord],
     source_record: &ResolutionCacheRecord,
     input: CachedCallResolutionInput,
 ) -> Result<CallResolutionFact> {
@@ -891,17 +1180,83 @@ fn resolve_input(
     let caller = input.caller.unwrap_or(NodeId(input.callsite.file_id.0));
     match input.binding {
         CachedResolutionBinding::SameFile { declaration } => {
-            status = ProofResolutionStatus::Exact;
-            reason = ProofResolutionReason::ExactResolution;
-            target = Some(declaration);
-            evidence_chain.push(ResolutionEvidence::SameFileDeclaration { declaration });
+            let declaration_is_recorded =
+                source_record
+                    .file
+                    .top_level_declarations
+                    .iter()
+                    .any(|binding| {
+                        binding.name == input.callsite.raw_target
+                            && binding.declaration == declaration
+                    });
+            let script_bindings = all_records
+                .iter()
+                .filter(|record| {
+                    matches!(record.file.language.as_str(), "typescript" | "tsx")
+                        && !record.file.typescript_module
+                })
+                .collect::<Vec<_>>();
+            let script_domain_incomplete = !source_record.file.typescript_module
+                && matches!(source_record.file.language.as_str(), "typescript" | "tsx")
+                && script_bindings
+                    .iter()
+                    .any(|record| !record.file.lookup_input_complete);
+            let script_declarations = script_bindings
+                .iter()
+                .flat_map(|record| record.file.top_level_declarations.iter())
+                .filter(|binding| binding.name == input.callsite.raw_target)
+                .collect::<Vec<_>>();
+            let script_ambiguous = !source_record.file.typescript_module
+                && matches!(source_record.file.language.as_str(), "typescript" | "tsx")
+                && (script_declarations.len() != 1
+                    || script_declarations[0].declaration != declaration);
+            if script_domain_incomplete {
+                status = ProofResolutionStatus::IncompleteDomain;
+                reason = ProofResolutionReason::LookupDomainIncomplete;
+            } else if !declaration_is_recorded || script_ambiguous {
+                status = ProofResolutionStatus::Ambiguous;
+                reason = ProofResolutionReason::MultipleBindings;
+            } else {
+                status = ProofResolutionStatus::Exact;
+                reason = ProofResolutionReason::ExactResolution;
+                target = Some(declaration);
+                evidence_chain.push(ResolutionEvidence::SameFileDeclaration { declaration });
+            }
         }
-        CachedResolutionBinding::ImplicitReceiver { owner, declaration } => {
-            status = ProofResolutionStatus::Exact;
-            reason = ProofResolutionReason::ExactResolution;
-            target = Some(declaration);
-            evidence_chain.push(ResolutionEvidence::ImplicitReceiver { owner });
-            evidence_chain.push(ResolutionEvidence::SameFileDeclaration { declaration });
+        CachedResolutionBinding::ImplicitReceiver {
+            owner,
+            declaration,
+            owner_name,
+        } => {
+            let rust_records = all_records
+                .iter()
+                .filter(|record| record.file.language == "rust")
+                .collect::<Vec<_>>();
+            let matching_methods = rust_records
+                .iter()
+                .flat_map(|record| record.file.inherent_methods.iter())
+                .filter(|method| {
+                    method.owner_name == owner_name
+                        && method.method_name == input.callsite.raw_target
+                })
+                .collect::<Vec<_>>();
+            if rust_records
+                .iter()
+                .any(|record| !record.file.lookup_input_complete)
+            {
+                status = ProofResolutionStatus::IncompleteDomain;
+                reason = ProofResolutionReason::LookupDomainIncomplete;
+            } else if matching_methods.len() != 1 || matching_methods[0].declaration != declaration
+            {
+                status = ProofResolutionStatus::Ambiguous;
+                reason = ProofResolutionReason::MultipleBindings;
+            } else {
+                status = ProofResolutionStatus::Exact;
+                reason = ProofResolutionReason::ExactResolution;
+                target = Some(declaration);
+                evidence_chain.push(ResolutionEvidence::ImplicitReceiver { owner });
+                evidence_chain.push(ResolutionEvidence::SameFileDeclaration { declaration });
+            }
         }
         CachedResolutionBinding::StaticImport {
             import,
@@ -911,7 +1266,7 @@ fn resolve_input(
         } => {
             let target_record = resolve_relative_import(source_record, &module_specifier, records)?;
             let declarations = target_record
-                .filter(|record| record.file.complete)
+                .filter(|record| record.file.lookup_input_complete)
                 .into_iter()
                 .flat_map(|record| record.file.direct_exports.iter())
                 .filter(|export| {
@@ -926,7 +1281,7 @@ fn resolve_input(
                     import,
                     declaration: declaration.declaration,
                 });
-            } else if target_record.is_some_and(|record| !record.file.complete) {
+            } else if target_record.is_some_and(|record| !record.file.lookup_input_complete) {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
             } else if declarations.len() > 1 {
@@ -954,7 +1309,10 @@ fn resolve_input(
             reason = ProofResolutionReason::LookupDomainIncomplete;
         }
     }
-    if !source_file.complete || !source_record.file.complete {
+    if !source_file.complete
+        || !source_record.file.complete
+        || !source_record.file.lookup_input_complete
+    {
         status = ProofResolutionStatus::IncompleteDomain;
         reason = ProofResolutionReason::LookupDomainIncomplete;
         target = None;

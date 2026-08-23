@@ -2,9 +2,9 @@ use super::contracts::{
     ActualProductResultV1, CaseReportV1, CohortPathFileV1, FailureBucketV1, FailureFunnelReportV1,
     FunnelOutcomeV1, MissingOracleStepV1, NegativeMutationResultV1, ObservedReceiptV1,
     ProjectMaterializationEvidenceV1, ProofQualificationTraceV1, ReceiptEvidenceBuildOutcomeV1,
-    ReceiptEvidenceV1, ReceiptOracleComparisonV1, ReceiptOracleStepV1, StageDurationsV1,
-    StepQualificationOutcomeV1, ThresholdsV1, TransportErrorV1, TransportEvidenceV1,
-    actionable_exact_gap_for_case, negative_mutation_product_contract,
+    ReceiptEvidenceV1, ReceiptOracleComparisonV1, ReceiptOracleStepV1, ResolutionFunnelReportV1,
+    StageDurationsV1, StepQualificationOutcomeV1, ThresholdsV1, TransportErrorV1,
+    TransportEvidenceV1, actionable_exact_gap_for_case, negative_mutation_product_contract,
     observed_product_disposition_to_report, observed_receipt_from_task6,
     oracle_path_product_contract, require_expected_product_contract_digest,
 };
@@ -15,6 +15,7 @@ use super::materialize::{
     validate_operational_environment,
 };
 use super::report::QualificationReportInputV1;
+use super::resolution_funnel::build_repository_resolution_funnel;
 use super::trails::count_store_trails;
 use anyhow::{Context, Result, bail};
 use codestory_agent::proof_qualification_support::{
@@ -40,6 +41,10 @@ pub(crate) fn run_qualification(
     let mut inventory = Vec::with_capacity(operational.repositories.len());
     let mut trails = Vec::with_capacity(operational.repositories.len());
     let mut cases = Vec::with_capacity(loaded.corpus.positive_request_count as usize);
+    let mut resolution_funnel = ResolutionFunnelReportV1 {
+        projections: Vec::with_capacity(operational.repositories.len()),
+        rows: Vec::new(),
+    };
     for path_file in &loaded.path_files {
         let repository = repository_for(operational, &path_file.repository_id)?;
         let expected_publication = operational
@@ -69,6 +74,7 @@ pub(crate) fn run_qualification(
                 repository.database_path.clone(),
             )
             .map_err(|error| anyhow::anyhow!(error.message))?;
+        let first_case = cases.len();
         for path in &path_file.paths {
             revalidate_case_source(
                 path_file,
@@ -83,6 +89,18 @@ pub(crate) fn run_qualification(
             &repository.checkout_root,
             &repository.project_root,
         )?;
+        let store = Store::open_observational(&repository.database_path)
+            .context("reopen proof availability store for resolution funnel")?;
+        let repository_funnel = build_repository_resolution_funnel(
+            &path_file.repository_id,
+            expected_publication,
+            &store,
+            &cases[first_case..],
+        )?;
+        resolution_funnel
+            .projections
+            .extend(repository_funnel.projections);
+        resolution_funnel.rows.extend(repository_funnel.rows);
     }
     inventory.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
     trails.sort_by(|left, right| left.repository_id.cmp(&right.repository_id));
@@ -97,6 +115,7 @@ pub(crate) fn run_qualification(
         trails,
         cases,
         failure_funnel,
+        resolution_funnel,
     })
 }
 

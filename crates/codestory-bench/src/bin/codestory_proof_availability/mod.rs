@@ -14,6 +14,7 @@ mod corpus;
 mod inventory;
 mod materialize;
 mod report;
+mod resolution_funnel;
 mod runner;
 #[allow(dead_code)] // Tasks 11 and 13 consume the frozen decision evaluator.
 mod thresholds;

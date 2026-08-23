@@ -56,6 +56,7 @@ pub(crate) enum CachedResolutionBinding {
     ImplicitReceiver {
         owner: NodeId,
         declaration: NodeId,
+        owner_name: String,
     },
     Ambiguous,
     MissingBinding,
@@ -71,7 +72,24 @@ pub(crate) struct CachedResolutionFile {
     pub adapter_version: String,
     pub parser_fingerprint: String,
     pub complete: bool,
+    pub lookup_input_complete: bool,
+    pub typescript_module: bool,
+    pub top_level_declarations: Vec<CachedTopLevelDeclaration>,
+    pub inherent_methods: Vec<CachedInherentMethod>,
     pub direct_exports: Vec<CachedDirectExport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedTopLevelDeclaration {
+    pub name: String,
+    pub declaration: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedInherentMethod {
+    pub owner_name: String,
+    pub method_name: String,
+    pub declaration: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +111,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 2,
+            resolution_input_schema_version: 3,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

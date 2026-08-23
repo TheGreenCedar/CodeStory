@@ -111,7 +111,7 @@ contract digest with the digest produced by validating that frozen oracle path.
 Read-only verification recomputes the same expected digest from the frozen
 oracle, so a different well-formed SHA-256 fails before metrics are evaluated.
 
-Public report schema `codestory.proof-availability-report/v3` does not expose
+Public report schema `codestory.proof-availability-report/v4` does not expose
 resolved runtime canonical IDs because those identities may contain host paths.
 Each resolved source and target instead carries
 `canonical_id_binding_sha256`, computed over RFC 8785 canonical JSON containing
@@ -121,9 +121,17 @@ selectors may still use raw canonical IDs; verification recomputes the same
 contextual binding from the selector and receipt pin. Exact graph IDs remain
 signed 64-bit integers inside the runner but are encoded as strict canonical
 signed-decimal JSON strings in public reports. This keeps RFC 8785
-canonicalization from rounding IDs through IEEE-754 numbers. The v3
+canonicalization from rounding IDs through IEEE-754 numbers. The v4
 results-evidence digest binds these commitments under
-`codestory.proof-availability-results-evidence/v3\0`.
+`codestory.proof-availability-results-evidence/v4\0`.
+
+The runner also authenticates the core-bound exact-resolution publication for
+each cohort. `resolution-funnel.json` reports the installed adapter roster and
+publication receipt, then partitions parser-derived facts by language, callee
+form, and primary evidence kind. Later stages are deduplicated by fact identity:
+proof-shape admission comes from admitted exact edges, authoritative receipts
+come from the product result, and complete-proof participation requires an
+evidence-supported `ContractProven` result.
 
 A product finalization failure remains an `Invalid` case row rather than
 aborting the report. It retains the actual trace and both completed mutation
@@ -138,6 +146,7 @@ inventory.json
 trails.json
 cases.json
 failure-funnel.json
+resolution-funnel.json
 summary.json
 decision.json
 findings.md
@@ -166,7 +175,7 @@ gate; the harness does not repair it into an actionable gap.
 
 ## Read-only verification
 
-Verification reads the exact eight-file directory, recomputes corpus, path,
+Verification reads the exact nine-file directory, recomputes corpus, path,
 threshold, results, aggregate, and decision bindings, including the same
 three-way oracle/indexed/observed file-hash comparison, and writes nothing:
 
@@ -180,7 +189,7 @@ three-way oracle/indexed/observed file-hash comparison, and writes nothing:
 This is the complete A/B/C verification contract. There is no runtime input for
 Outcome D. The result directory basename, public environment, summary, and
 verification identity must all equal the same qualification ID. The directory
-still contains exactly the eight artifacts listed above.
+still contains exactly the nine artifacts listed above.
 
 ## Interpretation
 

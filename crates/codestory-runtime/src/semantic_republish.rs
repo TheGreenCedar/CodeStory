@@ -175,7 +175,7 @@ fn prepare_semantic_projection(
     let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
     staged
         .store_mut()
-        .begin_incremental_run()
+        .begin_derived_projection_run()
         .map_err(|error| {
             ApiError::internal(format!(
                 "Failed to fence the staged semantic projection writer: {error}"

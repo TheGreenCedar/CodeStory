@@ -4424,6 +4424,96 @@ fn semantic_projection_republish_rejects_corrupt_proof_and_preserves_old_core() 
 }
 
 #[test]
+fn exact_proof_rematerializes_for_full_and_incremental_edits_and_faults_preserve_live() {
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source = workspace.path().join("main.ts");
+    fs::write(
+        &source,
+        "export function target() {}\nexport function caller() { target(); }\n",
+    )
+    .expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline");
+
+    for (mode, revision) in [(IndexMode::Full, 1), (IndexMode::Incremental, 2)] {
+        let (before_publication, before_proof, before_facts) = {
+            let store = Storage::open(&storage_path).expect("open baseline");
+            let publication = store
+                .get_complete_index_publication()
+                .unwrap()
+                .expect("complete publication");
+            let proof = store
+                .validate_proof_resolution_publication(&publication)
+                .expect("valid proof");
+            (
+                publication,
+                proof,
+                store.get_proof_resolution_facts().unwrap(),
+            )
+        };
+        fs::write(
+            &source,
+            format!(
+                "export function target() {{}}\nexport function caller() {{ target(); }}\n// revision {revision}\n"
+            ),
+        )
+        .expect("edit source");
+        arm_publication_test_fault(
+            PublicationTestBoundary::SearchBuild,
+            PublicationTestAction::Fail,
+        );
+        controller
+            .run_indexing_blocking_without_runtime_refresh(mode)
+            .expect_err("precommit fault must reject candidate");
+        {
+            let store = Storage::open(&storage_path).expect("open preserved core");
+            assert_eq!(
+                store.get_complete_index_publication().unwrap(),
+                Some(before_publication.clone())
+            );
+            assert_eq!(
+                store.get_proof_resolution_publication().unwrap(),
+                Some(before_proof)
+            );
+            assert_eq!(store.get_proof_resolution_facts().unwrap(), before_facts);
+        }
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(mode)
+            .expect("publish edited core");
+        let store = Storage::open(&storage_path).expect("open edited core");
+        let publication = store
+            .get_complete_index_publication()
+            .unwrap()
+            .expect("complete edited publication");
+        assert_ne!(publication.generation_id, before_publication.generation_id);
+        store
+            .validate_proof_resolution_publication(&publication)
+            .expect("rematerialized proof");
+        let facts = store.get_proof_resolution_facts().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].status,
+            codestory_contracts::proof_resolution::ProofResolutionStatus::Exact
+        );
+        assert_ne!(
+            facts[0].callsite.source_sha256,
+            before_facts[0].callsite.source_sha256
+        );
+    }
+}
+
+#[test]
 fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     let _env = hybrid_test_env();
     let workspace = copy_tictactoe_workspace();
@@ -8393,6 +8483,53 @@ fn full_refresh_pipeline_writer_failure_preserves_live_publication() {
             .any(|node| node.serialized_name == "retained_value")
     );
     assert_no_staged_publication_artifacts(&storage_path);
+}
+
+#[test]
+fn full_refresh_rejects_a_nonempty_proof_overlay_before_graph_mutation() {
+    let workspace = tempdir().expect("workspace dir");
+    fs::write(workspace.path().join("lib.rs"), "pub fn value() {}\n").expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline");
+    let baseline = Storage::open(&storage_path)
+        .unwrap()
+        .get_complete_index_publication()
+        .unwrap()
+        .unwrap();
+
+    arm_full_refresh_staged_store_hook(|storage| {
+        storage
+            .get_connection()
+            .execute(
+                "INSERT INTO proof_resolution_publication (
+                    id, core_generation_id, core_run_id, fact_schema_version,
+                    adapter_roster_json, complete, fact_count, fact_digest,
+                    funnel_json, published_at_epoch_ms
+                 ) VALUES (1, 'stale', 'stale', 1, '[]', 1, 0, ?1, '[]', 1)",
+                ["0".repeat(64)],
+            )
+            .expect("inject stale staged proof receipt");
+    });
+    let error = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect_err("full stage must begin without a proof overlay");
+    assert!(error.message.contains("proof overlay"), "{error:?}");
+    assert_eq!(
+        Storage::open(&storage_path)
+            .unwrap()
+            .get_complete_index_publication()
+            .unwrap(),
+        Some(baseline)
+    );
 }
 
 #[test]

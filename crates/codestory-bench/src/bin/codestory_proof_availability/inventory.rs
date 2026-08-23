@@ -275,7 +275,7 @@ mod tests {
         assert_eq!(analysis.report.stored_call_rows, 12);
         assert_eq!(analysis.report.effective_endpoint_rows, 12);
         assert_eq!(analysis.report.exact_resolved_rows, 11);
-        assert_eq!(analysis.report.admitted_rows, 1);
+        assert_eq!(analysis.report.admitted_rows, 4);
         assert_eq!(analysis.report.unresolved_placeholder_rows, 1);
         assert_eq!(analysis.certainty[&CertaintyBucket::Absent], 1);
         assert_eq!(analysis.certainty[&CertaintyBucket::Certain], 9);
@@ -287,9 +287,6 @@ mod tests {
             1
         );
         for reason in [
-            RawAdmissionFailure::CertaintyAbsent,
-            RawAdmissionFailure::CertaintyProbable,
-            RawAdmissionFailure::CertaintyUncertain,
             RawAdmissionFailure::MissingExactResolvedTarget,
             RawAdmissionFailure::CandidateAlternativesRetained,
             RawAdmissionFailure::MissingFileNode,
@@ -312,8 +309,11 @@ mod tests {
         ] {
             assert_eq!(rejection_count(&analysis.rejections, impossible), 0);
         }
-        assert_eq!(analysis.rejections.len(), 14);
-        assert_eq!(analysis.admitted_edge_ids, vec![EdgeId(12)]);
+        assert_eq!(analysis.rejections.len(), 11);
+        assert_eq!(
+            analysis.admitted_edge_ids,
+            vec![EdgeId(1), EdgeId(2), EdgeId(3), EdgeId(12)]
+        );
         Ok(())
     }
 

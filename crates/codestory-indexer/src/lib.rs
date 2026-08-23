@@ -4295,12 +4295,15 @@ fn rebase_cached_index_artifact(
                 imported_name,
                 is_default,
             },
-            CachedResolutionBinding::ImplicitReceiver { owner, declaration } => {
-                CachedResolutionBinding::ImplicitReceiver {
-                    owner: id_remap.get(&owner).copied().unwrap_or(owner),
-                    declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
-                }
-            }
+            CachedResolutionBinding::ImplicitReceiver {
+                owner,
+                declaration,
+                owner_name,
+            } => CachedResolutionBinding::ImplicitReceiver {
+                owner: id_remap.get(&owner).copied().unwrap_or(owner),
+                declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                owner_name,
+            },
             other => other,
         };
     }
@@ -4311,6 +4314,18 @@ fn rebase_cached_index_artifact(
                 .get(&export.declaration)
                 .copied()
                 .unwrap_or(export.declaration);
+        }
+        for declaration in &mut resolution_file.top_level_declarations {
+            declaration.declaration = id_remap
+                .get(&declaration.declaration)
+                .copied()
+                .unwrap_or(declaration.declaration);
+        }
+        for method in &mut resolution_file.inherent_methods {
+            method.declaration = id_remap
+                .get(&method.declaration)
+                .copied()
+                .unwrap_or(method.declaration);
         }
     }
 

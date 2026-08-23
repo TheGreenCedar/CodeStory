@@ -290,12 +290,199 @@ fn resealed_but_semantically_false_evidence_and_funnel_are_rejected() {
         .expect_err("unrelated import evidence must fail");
     assert!(error.to_string().contains("StaticImportBinding"), "{error}");
 
+    let mut unrelated_import = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut unrelated_import);
+    unrelated_import
+        .insert_edge(&Edge {
+            id: EdgeId(8),
+            source: NodeId(2),
+            target: NodeId(3),
+            kind: EdgeKind::IMPORT,
+            file_node_id: Some(NodeId(1)),
+            resolved_target: Some(NodeId(3)),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut wrong_named_import = exact_fact(EdgeId(7));
+    wrong_named_import.callsite.callee_form = CalleeForm::NamedImport;
+    wrong_named_import.evidence_chain = vec![ResolutionEvidence::StaticImportBinding {
+        import: NodeId(2),
+        declaration: NodeId(3),
+    }];
+    let wrong_named_import = seal_call_resolution_fact(wrong_named_import).unwrap();
+    let mut wrong_named_import_projection = projection(vec![wrong_named_import]);
+    wrong_named_import_projection.funnel[0].callee_form = Some(CalleeForm::NamedImport);
+    wrong_named_import_projection.funnel[0].evidence_kind =
+        Some(ResolutionEvidenceKind::StaticImportBinding);
+    let error = unrelated_import
+        .replace_proof_resolution_projection(&publication(), &wrong_named_import_projection)
+        .expect_err("an unrelated source node must not authenticate an import binding");
+    assert!(error.to_string().contains("StaticImportBinding"), "{error}");
+
+    let mut cross_file_receiver = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut cross_file_receiver);
+    let target_file = FileInfo {
+        id: 5,
+        path: "src/other.rs".into(),
+        language: "rust".to_owned(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    };
+    cross_file_receiver.insert_file(&target_file).unwrap();
+    cross_file_receiver
+        .update_file_metadata(&target_file, Some(&"b".repeat(64)))
+        .unwrap();
+    cross_file_receiver
+        .insert_node(&Node {
+            id: NodeId(5),
+            kind: NodeKind::FILE,
+            serialized_name: "src/other.rs".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut target = cross_file_receiver.get_node(NodeId(3)).unwrap().unwrap();
+    cross_file_receiver
+        .get_connection()
+        .execute("DELETE FROM edge WHERE id = 7", [])
+        .unwrap();
+    target.file_node_id = Some(NodeId(5));
+    cross_file_receiver.insert_node(&target).unwrap();
+    cross_file_receiver
+        .insert_edge(&Edge {
+            id: EdgeId(7),
+            source: NodeId(2),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(3)),
+            callsite_identity: Some("1:2:1:4".to_owned()),
+            ..Default::default()
+        })
+        .unwrap();
+    cross_file_receiver
+        .insert_node(&Node {
+            id: NodeId(6),
+            kind: NodeKind::STRUCT,
+            serialized_name: "Owner".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        })
+        .unwrap();
+    for (id, member) in [(8, NodeId(2)), (9, NodeId(3))] {
+        cross_file_receiver
+            .insert_edge(&Edge {
+                id: EdgeId(id),
+                source: NodeId(6),
+                target: member,
+                kind: EdgeKind::MEMBER,
+                file_node_id: Some(NodeId(1)),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    let mut wrong_receiver = exact_fact(EdgeId(7));
+    wrong_receiver.callsite.callee_form = CalleeForm::ImplicitReceiver;
+    wrong_receiver.evidence_chain = vec![
+        ResolutionEvidence::ImplicitReceiver { owner: NodeId(6) },
+        ResolutionEvidence::SameFileDeclaration {
+            declaration: NodeId(3),
+        },
+    ];
+    wrong_receiver
+        .provenance
+        .dependency_file_hashes
+        .push(DependencyFileHash {
+            file_id: FileId(5),
+            source_sha256: "b".repeat(64),
+        });
+    let wrong_receiver = seal_call_resolution_fact(wrong_receiver).unwrap();
+    assert_eq!(
+        wrong_receiver.provenance.dependency_file_hashes,
+        vec![
+            DependencyFileHash {
+                file_id: FileId(1),
+                source_sha256: "a".repeat(64),
+            },
+            DependencyFileHash {
+                file_id: FileId(5),
+                source_sha256: "b".repeat(64),
+            },
+        ]
+    );
+    assert_eq!(
+        cross_file_receiver
+            .get_node(NodeId(3))
+            .unwrap()
+            .unwrap()
+            .file_node_id,
+        Some(NodeId(5))
+    );
+    let mut wrong_receiver_projection = projection(vec![wrong_receiver]);
+    wrong_receiver_projection.funnel[0].callee_form = Some(CalleeForm::ImplicitReceiver);
+    wrong_receiver_projection.funnel[0].evidence_kind =
+        Some(ResolutionEvidenceKind::ImplicitReceiver);
+    let error = cross_file_receiver
+        .replace_proof_resolution_projection(&publication(), &wrong_receiver_projection)
+        .expect_err("implicit receiver evidence cannot claim a cross-file same-file declaration");
+    assert!(error.to_string().contains("ImplicitReceiver"), "{error}");
+
     let mut wrong_funnel = projection(vec![exact_fact(EdgeId(7))]);
     wrong_funnel.funnel[0].counts.syntax_calls = 2;
     let error = store
         .replace_proof_resolution_projection(&publication(), &wrong_funnel)
         .expect_err("funnel mismatch must fail");
     assert!(error.to_string().contains("funnel"), "{error}");
+}
+
+#[test]
+fn resealed_raw_callsite_and_incomplete_dependency_mutations_are_rejected() {
+    let mut wrong_placeholder = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut wrong_placeholder);
+    let mut placeholder = wrong_placeholder.get_node(NodeId(4)).unwrap().unwrap();
+    placeholder.serialized_name = "other".to_owned();
+    wrong_placeholder.insert_node(&placeholder).unwrap();
+    let error = wrong_placeholder
+        .replace_proof_resolution_projection(
+            &publication(),
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .expect_err("raw placeholder spelling mismatch must fail");
+    assert!(error.to_string().contains("placeholder"), "{error}");
+
+    let mut incomplete = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut incomplete);
+    incomplete
+        .get_connection()
+        .execute("UPDATE file SET complete = 0 WHERE id = 1", [])
+        .unwrap();
+    let error = incomplete
+        .replace_proof_resolution_projection(
+            &publication(),
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .expect_err("incomplete dependency file must fail");
+    assert!(error.to_string().contains("indexed-complete"), "{error}");
+
+    let mut inconsistent_file = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut inconsistent_file);
+    inconsistent_file
+        .get_connection()
+        .execute(
+            "UPDATE edge SET callsite_identity = '9:2:1:4' WHERE id = 7",
+            [],
+        )
+        .unwrap();
+    let mut fact = exact_fact(EdgeId(7));
+    fact.raw_callsite_identity = Some("9:2:1:4".to_owned());
+    let fact = seal_call_resolution_fact(fact).unwrap();
+    let error = inconsistent_file
+        .replace_proof_resolution_projection(&publication(), &projection(vec![fact]))
+        .expect_err("callsite identity file must match the exact syntax span");
+    assert!(error.to_string().contains("callsite identity"), "{error}");
 }
 
 #[test]
@@ -356,4 +543,56 @@ fn failed_replacement_and_stale_validation_preserve_the_previous_complete_public
     store
         .validate_proof_resolution_publication(&first_publication)
         .unwrap();
+}
+
+#[test]
+fn incremental_fence_invalidates_proof_overlay_before_graph_mutation() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    store
+        .replace_proof_resolution_projection(
+            &publication(),
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .unwrap();
+
+    store.begin_incremental_run().unwrap();
+
+    assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+    store
+        .get_connection()
+        .execute("DELETE FROM edge WHERE id = 7", [])
+        .expect("the staged graph may mutate after proof invalidation");
+}
+
+#[test]
+fn failed_incremental_fence_preserves_the_complete_proof_overlay() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let proof = store
+        .replace_proof_resolution_projection(
+            &publication(),
+            &projection(vec![exact_fact(EdgeId(7))]),
+        )
+        .unwrap();
+    store
+        .get_connection()
+        .execute_batch(
+            "CREATE TRIGGER fail_incomplete_begin
+             BEFORE INSERT ON incomplete_index_run
+             BEGIN SELECT RAISE(ABORT, 'forced marker insert failure'); END;",
+        )
+        .unwrap();
+
+    store.begin_incremental_run().expect_err("fence must fail");
+
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(proof)
+    );
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 1);
+    store
+        .validate_proof_resolution_publication(&publication())
+        .expect("the prior proof overlay survived rollback");
 }

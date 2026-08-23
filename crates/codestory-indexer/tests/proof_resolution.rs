@@ -228,6 +228,121 @@ fn syntax_claims_reject_shadowing_rebinding_trait_and_generic_inference() -> any
     Ok(())
 }
 
+fn assert_only_call_is_not_exact(files: &[(&str, &str)]) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let called = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    assert_eq!(called.len(), 1, "unexpected target calls: {called:#?}");
+    assert_ne!(
+        called[0].status,
+        ProofResolutionStatus::Exact,
+        "{called:#?}"
+    );
+    assert_eq!(called[0].target, None, "{called:#?}");
+    assert_eq!(called[0].edge_id, None, "{called:#?}");
+    Ok(())
+}
+
+#[test]
+fn typescript_exact_rejects_project_writes_shadows_and_script_global_ambiguity()
+-> anyhow::Result<()> {
+    assert_only_call_is_not_exact(&[(
+        "src/reassigned.ts",
+        "function target() {}\nfunction other() {}\ntarget = other;\nexport function caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/catch_shadow.ts",
+        "function target() {}\nexport function caller() { try {} catch (target) { target(); } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/exported.ts",
+            "export function target() {}\nfunction other() {}\ntarget = other;\n",
+        ),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/first.ts",
+            "function target() {}\nfunction caller() { target(); }\n",
+        ),
+        ("src/second.ts", "function target() {}\n"),
+    ])?;
+    assert_only_call_is_not_exact(&[(
+        "src/nested_function.ts",
+        "function target() {}\nexport function caller() { function target() {} target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/outer_shadow.ts",
+        "function target() {}\nexport function outer(target: () => void) { function caller() { target(); } caller(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/top_level_value.ts",
+        "function target() {}\nfunction other() {}\nlet target = other;\nexport function caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/destructuring_write.ts",
+        "function target() {}\nfunction other() {}\n[target] = [other];\nexport function caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/dynamic_exporter.ts",
+            "export function target() {}\neval('target');\n",
+        ),
+        (
+            "src/dynamic_importer.ts",
+            "import { target } from './dynamic_exporter';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn rust_exact_rejects_lexical_module_and_inherent_lookup_ambiguity() -> anyhow::Result<()> {
+    assert_only_call_is_not_exact(&[(
+        "src/parameter.rs",
+        "fn target() {}\nfn caller(target: fn()) { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/inner_const.rs",
+        "fn target() {}\nfn caller() { const target: fn() = || {}; target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/nested_module.rs",
+        "fn target() {}\nmod m { fn caller() { target(); } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/duplicate_impl.rs",
+        "struct Worker;\nimpl Worker { fn target(&self) {} }\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/inner_function.rs",
+        "fn target() {}\nfn caller() { fn target() {} target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/block_use.rs",
+        "fn target() {}\nmod other { pub fn value() {} }\nfn caller() { use crate::other::value as target; target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/unit_struct.rs",
+        "fn target() {}\nfn caller() { struct target; target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/static_value.rs",
+        "fn original() {}\nstatic target: fn() = original;\nfn target() {}\nfn caller() { target(); }\n",
+    )])?;
+    Ok(())
+}
+
 #[test]
 fn parser_claim_is_independent_of_tampered_navigation_resolution() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
@@ -355,7 +470,8 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     )?;
     duplicate.get_connection().execute(
         "INSERT INTO index_artifact_cache (file_path, cache_key, artifact_blob, updated_at_epoch_ms)
-         SELECT file_path || '.duplicate', cache_key, artifact_blob, updated_at_epoch_ms
+         SELECT (SELECT path FROM file WHERE language = 'typescript'),
+                cache_key, artifact_blob, updated_at_epoch_ms
          FROM index_artifact_cache",
         [],
     )?;
@@ -365,6 +481,115 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
         error.to_string().contains("coverage is duplicated"),
         "{error}"
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_projection_rejects_native_path_identity_collisions() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let first = project.path().join("src/first.ts");
+    fs::create_dir_all(first.parent().unwrap())?;
+    fs::write(
+        &first,
+        "export function target() {}\nexport function caller() { target(); }\n",
+    )?;
+    let alias = project.path().join("src/alias.ts");
+    fs::hard_link(&first, &alias)?;
+    let mut store = Store::new_in_memory()?;
+    WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+        &mut store,
+        &RefreshInfo {
+            mode: BuildMode::Incremental,
+            files_to_index: vec![first, alias],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
+        .expect_err("one native file identity cannot prove two indexed modules");
+    assert!(error.to_string().contains("identity collision"), "{error}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_projection_rejects_unavailable_native_path_identity() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/main.ts",
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )],
+    )?;
+    store.get_connection().execute(
+        "UPDATE file SET path = CAST(x'626164002e7473' AS TEXT) WHERE language = 'typescript'",
+        [],
+    )?;
+
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
+        .expect_err("native identity failure must not publish a complete-domain fact");
+    assert!(error.to_string().contains("native identity"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn complete_projection_rejects_parser_completeness_mismatch() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/main.ts",
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )],
+    )?;
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    artifact["resolution_file"]["complete"] = serde_json::Value::Bool(false);
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
+        .expect_err("parser completeness disagreement must invalidate cache coverage");
+    assert!(error.to_string().contains("stale"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn unrelated_relative_cache_suffix_cannot_impersonate_an_indexed_absolute_path()
+-> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/index.ts",
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )],
+    )?;
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET file_path = 'other/src/index.ts'",
+        [],
+    )?;
+
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
+        .expect_err("a different component path must not impersonate the indexed file");
+    assert!(error.to_string().contains("native path"), "{error}");
     Ok(())
 }
 
@@ -386,7 +611,7 @@ fn non_exact_reference_inputs_keep_closed_fail_closed_statuses() -> anyhow::Resu
             ),
             (
                 "src/incomplete.ts",
-                "export function target() {}\nexport function caller() { target( ; }\n",
+                "export function target() {}\neval('target');\nexport function caller() { target(); }\n",
             ),
             (
                 "src/ambiguous.ts",
