@@ -2,8 +2,9 @@ use super::*;
 use codestory_contracts::proof_resolution::{
     CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
     ExactCallsite, FileId, INTERNAL_RESOLUTION_PRODUCER, PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
-    ProofResolutionAdapter, ProofResolutionFunnelRow, ProofResolutionProjection,
-    ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence, ResolutionProvenance,
+    ProofResolutionAdapter, ProofResolutionFunnelCounts, ProofResolutionFunnelRow,
+    ProofResolutionProjection, ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence,
+    ResolutionEvidenceKind, ResolutionProvenance,
 };
 
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-evidence-v1\0";
@@ -89,7 +90,7 @@ fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<
         || fact.provenance.algorithm != EXACT_CALL_RESOLUTION_ALGORITHM
         || fact.provenance.language_adapter.trim().is_empty()
         || fact.provenance.language_adapter_version.trim().is_empty()
-        || fact.provenance.parser_fingerprint.trim().is_empty()
+        || !is_sha256(&fact.provenance.parser_fingerprint)
     {
         return Err(proof_error(
             "fact provenance is not the internal schema-v1 producer",
@@ -127,6 +128,11 @@ fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<
         ProofResolutionStatus::Exact
             if fact.target.is_none()
                 || fact.edge_id.is_none()
+                || fact.raw_edge_target.is_none()
+                || fact
+                    .raw_callsite_identity
+                    .as_deref()
+                    .is_none_or(str::is_empty)
                 || !fact.lookup_domain_complete
                 || fact.evidence_chain.is_empty() =>
         {
@@ -135,7 +141,10 @@ fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<
             ));
         }
         ProofResolutionStatus::Exact => {}
-        _ if fact.edge_id.is_some() => {
+        _ if fact.edge_id.is_some()
+            || fact.raw_edge_target.is_some()
+            || fact.raw_callsite_identity.is_some() =>
+        {
             return Err(proof_error("only Exact may bind an ordinary CALL edge"));
         }
         _ => {}
@@ -240,7 +249,8 @@ impl Storage {
         &self,
         edge_id: Option<EdgeId>,
     ) -> Result<Vec<CallResolutionFact>, StorageError> {
-        let mut sql = "SELECT fact_id, edge_id, file_id, source_sha256, start_byte,
+        let mut sql = "SELECT fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+                              file_id, source_sha256, start_byte,
                               end_byte_exclusive, line, column, callee_form, raw_target,
                               caller_node_id, target_node_id, status, reason, evidence_json,
                               dependency_json, lookup_domain_complete, producer,
@@ -259,11 +269,11 @@ impl Storage {
         };
         let mut facts = Vec::new();
         while let Some(row) = rows.next()? {
-            let callee_form_text: String = row.get(8)?;
-            let status_text: String = row.get(12)?;
-            let reason_text: String = row.get(13)?;
-            let evidence_json: String = row.get(14)?;
-            let dependency_json: String = row.get(15)?;
+            let callee_form_text: String = row.get(10)?;
+            let status_text: String = row.get(14)?;
+            let reason_text: String = row.get(15)?;
+            let evidence_json: String = row.get(16)?;
+            let dependency_json: String = row.get(17)?;
             let callee_form = CalleeForm::from_label(&callee_form_text)
                 .ok_or_else(|| proof_error("stored callee form is outside the closed domain"))?;
             let status = ProofResolutionStatus::from_label(&status_text)
@@ -281,43 +291,45 @@ impl Storage {
             facts.push(CallResolutionFact {
                 fact_id: row.get(0)?,
                 edge_id: row.get::<_, Option<i64>>(1)?.map(EdgeId),
+                raw_edge_target: row.get::<_, Option<i64>>(2)?.map(NodeId),
+                raw_callsite_identity: row.get(3)?,
                 callsite: ExactCallsite {
-                    file_id: FileId(row.get(2)?),
-                    source_sha256: row.get(3)?,
+                    file_id: FileId(row.get(4)?),
+                    source_sha256: row.get(5)?,
                     start_byte: row
-                        .get::<_, i64>(4)?
+                        .get::<_, i64>(6)?
                         .try_into()
                         .map_err(|_| proof_error("stored callsite start byte is negative"))?,
                     end_byte_exclusive: row
-                        .get::<_, i64>(5)?
+                        .get::<_, i64>(7)?
                         .try_into()
                         .map_err(|_| proof_error("stored callsite end byte is negative"))?,
                     line: row
-                        .get::<_, i64>(6)?
+                        .get::<_, i64>(8)?
                         .try_into()
                         .map_err(|_| proof_error("stored callsite line is outside u32"))?,
                     column: row
-                        .get::<_, i64>(7)?
+                        .get::<_, i64>(9)?
                         .try_into()
                         .map_err(|_| proof_error("stored callsite column is outside u32"))?,
                     callee_form,
-                    raw_target: row.get(9)?,
+                    raw_target: row.get(11)?,
                 },
-                caller: NodeId(row.get(10)?),
-                target: row.get::<_, Option<i64>>(11)?.map(NodeId),
+                caller: NodeId(row.get(12)?),
+                target: row.get::<_, Option<i64>>(13)?.map(NodeId),
                 status,
                 reason,
                 evidence_chain,
-                lookup_domain_complete: row.get::<_, i64>(16)? == 1,
+                lookup_domain_complete: row.get::<_, i64>(18)? == 1,
                 provenance: ResolutionProvenance {
-                    producer: row.get(17)?,
-                    fact_schema_version: row.get::<_, i64>(18)?.max(0) as u32,
-                    algorithm: row.get(19)?,
-                    language_adapter: row.get(20)?,
-                    language_adapter_version: row.get(21)?,
-                    parser_fingerprint: row.get(22)?,
+                    producer: row.get(19)?,
+                    fact_schema_version: row.get::<_, i64>(20)?.max(0) as u32,
+                    algorithm: row.get(21)?,
+                    language_adapter: row.get(22)?,
+                    language_adapter_version: row.get(23)?,
+                    parser_fingerprint: row.get(24)?,
                     dependency_file_hashes,
-                    evidence_sha256: row.get(23)?,
+                    evidence_sha256: row.get(25)?,
                 },
             });
         }
@@ -386,12 +398,103 @@ impl Storage {
         }
 
         if fact.status != ProofResolutionStatus::Exact {
+            if !fact.evidence_chain.is_empty() {
+                return Err(proof_error(
+                    "non-Exact fact cannot carry authoritative evidence",
+                ));
+            }
             return Ok(());
         }
         let edge_id = fact.edge_id.expect("shape validation requires exact edge");
         let target = fact.target.expect("shape validation requires exact target");
-        let edge = self
-            .get_edges()?
+        let raw_edge_target = fact
+            .raw_edge_target
+            .expect("shape validation requires raw edge target");
+        let raw_callsite_identity = fact
+            .raw_callsite_identity
+            .as_deref()
+            .expect("shape validation requires raw callsite identity");
+        let graph_edges = self.get_edges()?;
+        match (fact.callsite.callee_form, fact.evidence_chain.as_slice()) {
+            (CalleeForm::Identifier, [ResolutionEvidence::SameFileDeclaration { declaration }])
+                if *declaration == target =>
+            {
+                let target_node = self
+                    .get_node(target)?
+                    .ok_or_else(|| proof_error("same-file declaration target is missing"))?;
+                if target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0)) {
+                    return Err(proof_error(
+                        "SameFileDeclaration is not the exact target in the source file",
+                    ));
+                }
+            }
+            (
+                CalleeForm::NamedImport,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration,
+                    },
+                ],
+            ) if *declaration == target => {
+                let import_node = self
+                    .get_node(*import)?
+                    .ok_or_else(|| proof_error("static import binding is missing"))?;
+                if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                    || graph_edges
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.kind == EdgeKind::IMPORT
+                                && candidate.file_node_id == Some(NodeId(fact.callsite.file_id.0))
+                                && candidate.source == *import
+                                && candidate.resolved_target == Some(target)
+                        })
+                        .count()
+                        != 1
+                {
+                    return Err(proof_error(
+                        "StaticImportBinding is not the unique source import bound to target",
+                    ));
+                }
+            }
+            (
+                CalleeForm::ImplicitReceiver,
+                [
+                    ResolutionEvidence::ImplicitReceiver { owner },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *declaration == target => {
+                let owner_node = self
+                    .get_node(*owner)?
+                    .ok_or_else(|| proof_error("implicit receiver owner is missing"))?;
+                let member = |member: NodeId| {
+                    graph_edges
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.kind == EdgeKind::MEMBER
+                                && candidate.effective_source() == *owner
+                                && candidate.effective_target() == member
+                        })
+                        .count()
+                        == 1
+                };
+                if !matches!(owner_node.kind, NodeKind::STRUCT | NodeKind::CLASS)
+                    || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                    || !member(fact.caller)
+                    || !member(target)
+                {
+                    return Err(proof_error(
+                        "ImplicitReceiver does not own caller and target through inherent membership",
+                    ));
+                }
+            }
+            _ => {
+                return Err(proof_error(
+                    "typed evidence has no implemented exact semantic validator",
+                ));
+            }
+        }
+        let edge = graph_edges
             .into_iter()
             .find(|edge| edge.id == edge_id)
             .ok_or_else(|| proof_error("matching ordinary CALL edge is missing"))?;
@@ -399,6 +502,7 @@ impl Storage {
             || edge.effective_source() != fact.caller
             || edge.effective_target() != target
             || edge.resolved_target != Some(target)
+            || edge.target != raw_edge_target
             || edge.file_node_id != Some(NodeId(fact.callsite.file_id.0))
             || edge.line != Some(fact.callsite.line)
             || !edge.candidate_targets.is_empty()
@@ -410,9 +514,13 @@ impl Storage {
         let callsite = edge
             .callsite_identity
             .as_deref()
-            .and_then(|identity| identity.split('|').next())
             .ok_or_else(|| proof_error("matching ordinary CALL edge has no exact callsite"))?;
-        let mut fields = callsite.split(':');
+        if callsite != raw_callsite_identity {
+            return Err(proof_error(
+                "matching ordinary CALL edge has a different canonical callsite identity",
+            ));
+        }
+        let mut fields = callsite.split('|').next().unwrap_or_default().split(':');
         let parsed_file = fields.next().and_then(|value| value.parse::<i64>().ok());
         let parsed_line = fields.next().and_then(|value| value.parse::<u32>().ok());
         let parsed_column = fields.next().and_then(|value| value.parse::<u32>().ok());
@@ -420,8 +528,8 @@ impl Storage {
         if fields.next().is_some()
             || parsed_file != Some(fact.callsite.file_id.0)
             || parsed_line != Some(fact.callsite.line)
-            || parsed_column != Some(fact.callsite.column)
-            || parsed_raw_target != Some(edge.target.0)
+            || parsed_column.is_none()
+            || parsed_raw_target != Some(raw_edge_target.0)
         {
             return Err(proof_error(
                 "matching ordinary CALL edge has a different exact callsite identity",
@@ -515,7 +623,13 @@ impl Storage {
         if funnel.iter().any(|row| row.language.trim().is_empty()) {
             return Err(proof_error("funnel contains an empty language"));
         }
-        let fact_digest = publication_fact_digest(&facts)?;
+        let expected_funnel = recompute_funnel(&facts);
+        if funnel != expected_funnel {
+            return Err(proof_error(
+                "funnel does not deterministically match the fact rows",
+            ));
+        }
+        let fact_digest = publication_integrity_digest(&facts, &adapter_roster, &funnel)?;
         let manifest = ProofResolutionPublication {
             core_generation_id: publication.generation_id.clone(),
             core_run_id: publication.run_id.clone(),
@@ -537,7 +651,8 @@ impl Storage {
         {
             let mut statement = tx.prepare(
                 "INSERT INTO proof_resolution_fact (
-                    fact_id, edge_id, file_id, source_sha256, start_byte,
+                    fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+                    file_id, source_sha256, start_byte,
                     end_byte_exclusive, line, column, callee_form, raw_target,
                     caller_node_id, target_node_id, status, reason, evidence_json,
                     dependency_json, lookup_domain_complete, producer,
@@ -545,7 +660,8 @@ impl Storage {
                     language_adapter_version, parser_fingerprint, evidence_digest
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                    ?25, ?26
                  )",
             )?;
             for fact in &facts {
@@ -562,6 +678,8 @@ impl Storage {
                 statement.execute(params![
                     fact.fact_id,
                     fact.edge_id.map(|edge_id| edge_id.0),
+                    fact.raw_edge_target.map(|node_id| node_id.0),
+                    fact.raw_callsite_identity,
                     fact.callsite.file_id.0,
                     fact.callsite.source_sha256,
                     i64::try_from(fact.callsite.start_byte)
@@ -629,8 +747,11 @@ impl Storage {
             ));
         }
         let facts = self.get_proof_resolution_facts()?;
-        if manifest.fact_count != facts.len() as u64
-            || manifest.fact_digest != publication_fact_digest(&facts)?
+        let expected_funnel = recompute_funnel(&facts);
+        if manifest.funnel != expected_funnel
+            || manifest.fact_count != facts.len() as u64
+            || manifest.fact_digest
+                != publication_integrity_digest(&facts, &manifest.adapter_roster, &manifest.funnel)?
         {
             return Err(proof_error(
                 "fact rows do not match their publication digest",
@@ -641,11 +762,69 @@ impl Storage {
         }
         Ok(manifest)
     }
+
+    /// Rebind an already authenticated proof projection to a semantic-only
+    /// core publication. Facts, roster, funnel, and their integrity digest are
+    /// unchanged. A migrated database with no projection remains absent.
+    pub fn rebind_proof_resolution_publication(
+        &mut self,
+        previous: &IndexPublicationRecord,
+        next: &IndexPublicationRecord,
+    ) -> Result<Option<ProofResolutionPublication>, StorageError> {
+        if self.get_proof_resolution_publication()?.is_none() {
+            return Ok(None);
+        }
+        self.validate_proof_resolution_publication(previous)?;
+        if next.generation_id.trim().is_empty()
+            || next.run_id.trim().is_empty()
+            || next.published_at_epoch_ms < 0
+        {
+            return Err(proof_error("new semantic publication identity is invalid"));
+        }
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE proof_resolution_publication
+             SET core_generation_id = ?1, core_run_id = ?2, published_at_epoch_ms = ?3
+             WHERE id = 1 AND core_generation_id = ?4 AND core_run_id = ?5
+               AND published_at_epoch_ms = ?6",
+            params![
+                next.generation_id,
+                next.run_id,
+                next.published_at_epoch_ms,
+                previous.generation_id,
+                previous.run_id,
+                previous.published_at_epoch_ms,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(proof_error(
+                "proof publication changed during semantic identity rebind",
+            ));
+        }
+        tx.commit()?;
+        self.validate_proof_resolution_publication(next).map(Some)
+    }
 }
 
-fn publication_fact_digest(facts: &[CallResolutionFact]) -> Result<String, StorageError> {
+fn publication_integrity_digest(
+    facts: &[CallResolutionFact],
+    adapter_roster: &[ProofResolutionAdapter],
+    funnel: &[ProofResolutionFunnelRow],
+) -> Result<String, StorageError> {
     let mut hasher = Sha256::new();
     hasher.update(PUBLICATION_DIGEST_DOMAIN);
+    for value in [
+        serde_json::to_vec(adapter_roster),
+        serde_json::to_vec(funnel),
+    ] {
+        let bytes = value.map_err(|error| {
+            proof_error(format!(
+                "failed to serialize publication integrity row: {error}"
+            ))
+        })?;
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
     for fact in facts {
         let bytes = serde_json::to_vec(fact)
             .map_err(|error| proof_error(format!("failed to serialize fact row: {error}")))?;
@@ -653,4 +832,56 @@ fn publication_fact_digest(facts: &[CallResolutionFact]) -> Result<String, Stora
         hasher.update(bytes);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRow> {
+    let mut rows = BTreeMap::<
+        (String, Option<CalleeForm>, Option<ResolutionEvidenceKind>),
+        ProofResolutionFunnelCounts,
+    >::new();
+    for fact in facts {
+        let evidence_kind = fact.evidence_chain.first().map(ResolutionEvidence::kind);
+        let counts = rows
+            .entry((
+                fact.provenance.language_adapter.clone(),
+                Some(fact.callsite.callee_form),
+                evidence_kind,
+            ))
+            .or_default();
+        counts.syntax_calls += 1;
+        counts.adapter_supported += u64::from(fact.status != ProofResolutionStatus::Unsupported);
+        match fact.status {
+            ProofResolutionStatus::Exact => counts.exact += 1,
+            ProofResolutionStatus::Ambiguous => counts.ambiguous += 1,
+            ProofResolutionStatus::Unsupported => counts.unsupported += 1,
+            ProofResolutionStatus::MissingBinding => counts.missing_binding += 1,
+            ProofResolutionStatus::IncompleteDomain => counts.incomplete_domain += 1,
+        }
+        counts.exact_call_linked +=
+            u64::from(fact.status == ProofResolutionStatus::Exact && fact.edge_id.is_some());
+    }
+    let mut result = rows
+        .into_iter()
+        .map(
+            |((language, callee_form, evidence_kind), counts)| ProofResolutionFunnelRow {
+                language,
+                callee_form,
+                evidence_kind,
+                counts,
+            },
+        )
+        .collect::<Vec<_>>();
+    result.sort_by(|left, right| {
+        (
+            left.language.as_str(),
+            left.callee_form.map(CalleeForm::as_str),
+            left.evidence_kind.map(|kind| kind.as_str()),
+        )
+            .cmp(&(
+                right.language.as_str(),
+                right.callee_form.map(CalleeForm::as_str),
+                right.evidence_kind.map(|kind| kind.as_str()),
+            ))
+    });
+    result
 }

@@ -1368,9 +1368,10 @@ fn resolution_fact_matches_raw_edge(
         && fact.edge_id == Some(admitted.edge_id)
         && fact.caller == source
         && fact.target == Some(target)
+        && fact.raw_edge_target == Some(admitted.raw_target)
+        && fact.raw_callsite_identity.as_deref() == Some(admitted.callsite_identity.as_str())
         && fact.callsite.file_id.0 == admitted.file_node_id.0
         && fact.callsite.line == admitted.line
-        && fact.callsite.column == admitted.column_or_ordinal
         && fact.lookup_domain_complete
 }
 
@@ -1426,7 +1427,9 @@ mod tests {
         ProofResolutionAdapter, ProofResolutionProjection, ProofResolutionReason,
         ResolutionEvidence, ResolutionProvenance,
     };
-    use codestory_indexer::{WorkspaceIndexer, rematerialize_proof_resolution_projection};
+    use codestory_indexer::{
+        WorkspaceIndexer, build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+    };
     use codestory_store::{FileInfo, FileRole, IndexPublicationMode, seal_call_resolution_fact};
     use codestory_workspace::{BuildMode, RefreshInfo};
     use serde_json::json;
@@ -1690,7 +1693,7 @@ mod tests {
             .into_iter()
             .map(|node| (node.id, node))
             .collect::<HashMap<_, _>>();
-        let facts = store
+        let facts: Vec<CallResolutionFact> = store
             .get_edges()
             .unwrap()
             .into_iter()
@@ -1700,12 +1703,17 @@ mod tests {
                 let source_sha256 = store.get_file_content_hash(file_id.0).unwrap().unwrap();
                 let caller = edge.effective_source();
                 let target = edge.effective_target();
-                let column: u32 = edge
+                let column_or_ordinal: u32 = edge
                     .callsite_identity
                     .as_deref()
                     .and_then(|identity| identity.split(':').nth(2))
                     .and_then(|column| column.parse().ok())
                     .unwrap();
+                let column = store
+                    .get_node(edge.target)
+                    .unwrap()
+                    .and_then(|node| node.start_col)
+                    .unwrap_or(column_or_ordinal);
                 let raw_target = nodes
                     .get(&edge.target)
                     .map(|node| node.serialized_name.clone())
@@ -1730,19 +1738,35 @@ mod tests {
                         .map_or(0, |(index, _)| index + 1)
                 };
                 let expected_start = line_start + column.saturating_sub(1) as usize;
-                let start_byte = if source.get(expected_start..expected_start + raw_target.len())
+                let line_end = source[line_start..]
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map(|offset| line_start + offset)
+                    .unwrap_or(source.len());
+                let occurrences = source[line_start..line_end]
+                    .windows(raw_target.len())
+                    .enumerate()
+                    .filter_map(|(offset, window)| {
+                        (window == raw_target.as_bytes()).then_some(line_start + offset)
+                    })
+                    .collect::<Vec<_>>();
+                let start_byte = if occurrences.len() > 1 {
+                    occurrences
+                        .get(column_or_ordinal.saturating_sub(1) as usize)
+                        .copied()
+                        .unwrap_or(expected_start)
+                } else if source.get(expected_start..expected_start + raw_target.len())
                     == Some(raw_target.as_bytes())
                 {
                     expected_start
                 } else {
-                    source
-                        .windows(raw_target.len())
-                        .position(|window| window == raw_target.as_bytes())
-                        .unwrap_or(0)
+                    occurrences.first().copied().unwrap_or(0)
                 } as u64;
                 seal_call_resolution_fact(CallResolutionFact {
                     fact_id: String::new(),
                     edge_id: Some(edge.id),
+                    raw_edge_target: Some(edge.target),
+                    raw_callsite_identity: edge.callsite_identity.clone(),
                     callsite: ExactCallsite {
                         file_id: FileId(file_id.0),
                         source_sha256: source_sha256.clone(),
@@ -1767,7 +1791,7 @@ mod tests {
                         algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
                         language_adapter: "rust".to_owned(),
                         language_adapter_version: "test-v1".to_owned(),
-                        parser_fingerprint: "runtime-test-parser".to_owned(),
+                        parser_fingerprint: "2".repeat(64),
                         dependency_file_hashes: vec![DependencyFileHash {
                             file_id: FileId(file_id.0),
                             source_sha256,
@@ -1778,6 +1802,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
+        let funnel = build_proof_resolution_funnel(&facts);
         store
             .replace_proof_resolution_projection(
                 publication,
@@ -1787,7 +1812,7 @@ mod tests {
                         adapter_version: "test-v1".to_owned(),
                     }],
                     facts,
-                    funnel: Vec::new(),
+                    funnel,
                 },
             )
             .unwrap();

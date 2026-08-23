@@ -63,7 +63,9 @@ use cache::{
 };
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
-pub use proof_resolution::rematerialize_proof_resolution_projection;
+pub use proof_resolution::{
+    build_funnel as build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+};
 use symbol_table::SymbolTable;
 
 pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
@@ -3134,7 +3136,12 @@ impl WorkspaceIndexer {
 
         match cache_access.get_parser(cache_path, cache_key, &mut stats.parser_artifact_cache) {
             Ok(Some(blob)) => match serde_json::from_slice::<CachedIndexArtifact>(&blob) {
-                Ok(artifact) => {
+                Ok(artifact)
+                    if proof_resolution::cached_resolution_inputs_are_current(
+                        &artifact,
+                        language_config.language_name,
+                    ) =>
+                {
                     let mut artifact = rebase_cached_index_artifact(
                         artifact,
                         &full_path,
@@ -3220,7 +3227,7 @@ impl WorkspaceIndexer {
                     }
                     Ok(PreparedIndexWork::Immediate(local_storage))
                 }
-                Err(_) => {
+                Ok(_) | Err(_) => {
                     stats.artifact_cache_invalid_entries += 1;
                     stats.artifact_cache_misses += 1;
                     stats.parser_artifact_cache.misses += 1;
@@ -3674,13 +3681,14 @@ impl WorkspaceIndexer {
             };
 
         match index_result {
-            Ok((mut index_result, call_resolution_inputs)) => {
+            Ok((mut index_result, call_resolution_inputs, resolution_file)) => {
                 if let Some(file_info) = index_result.files.first_mut() {
                     file_info.modification_time = modification_time;
                 }
                 let artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
                     index_result,
                     call_resolution_inputs,
+                    resolution_file,
                 );
                 let cache_write = prepared_input
                     .artifact_cache_path
@@ -3952,6 +3960,28 @@ impl WorkspaceIndexer {
 
 fn source_content_hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn resolution_parser_fingerprint(language_config: &LanguageConfig) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-proof-parser-rules-v1\0");
+    hasher.update(language_config.language_name.as_bytes());
+    hasher.update(language_config.language.abi_version().to_be_bytes());
+    hasher.update(language_config.graph_query.as_bytes());
+    if let Some(tags_query) = language_config.tags_query {
+        hasher.update(tags_query.as_bytes());
+    }
+    for id in 0..language_config.language.node_kind_count() {
+        hasher.update((id as u64).to_be_bytes());
+        if let Some(kind) = language_config.language.node_kind_for_id(id as u16) {
+            hasher.update(kind.as_bytes());
+        }
+        hasher.update([
+            u8::from(language_config.language.node_kind_is_named(id as u16)),
+            u8::from(language_config.language.node_kind_is_visible(id as u16)),
+        ]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn verify_source_snapshot(path: &Path, expected_hash: &str) -> Result<i64> {
@@ -4244,7 +4274,44 @@ fn rebase_cached_index_artifact(
     artifact.impl_anchor_node_ids.dedup();
     for input in &mut artifact.call_resolution_inputs {
         input.callsite.file_id = codestory_contracts::proof_resolution::FileId(new_file_id.0);
-        input.caller = id_remap.get(&input.caller).copied().unwrap_or(input.caller);
+        input.caller = input
+            .caller
+            .map(|caller| id_remap.get(&caller).copied().unwrap_or(caller));
+        use cache::CachedResolutionBinding;
+        input.binding = match input.binding.clone() {
+            CachedResolutionBinding::SameFile { declaration } => {
+                CachedResolutionBinding::SameFile {
+                    declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                }
+            }
+            CachedResolutionBinding::StaticImport {
+                import,
+                module_specifier,
+                imported_name,
+                is_default,
+            } => CachedResolutionBinding::StaticImport {
+                import: id_remap.get(&import).copied().unwrap_or(import),
+                module_specifier,
+                imported_name,
+                is_default,
+            },
+            CachedResolutionBinding::ImplicitReceiver { owner, declaration } => {
+                CachedResolutionBinding::ImplicitReceiver {
+                    owner: id_remap.get(&owner).copied().unwrap_or(owner),
+                    declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                }
+            }
+            other => other,
+        };
+    }
+    if let Some(resolution_file) = &mut artifact.resolution_file {
+        resolution_file.file_id = new_file_id;
+        for export in &mut resolution_file.direct_exports {
+            export.declaration = id_remap
+                .get(&export.declaration)
+                .copied()
+                .unwrap_or(export.declaration);
+        }
     }
 
     if let Some(file_info) = artifact.files.first_mut() {
@@ -15088,7 +15155,7 @@ pub fn index_file(
         compilation_info,
         symbol_table,
     )
-    .map(|(result, _)| result)
+    .map(|(result, _, _)| result)
 }
 
 fn index_file_with_resolution_inputs(
@@ -15097,7 +15164,11 @@ fn index_file_with_resolution_inputs(
     language_config: &LanguageConfig,
     compilation_info: Option<compilation_database::CompilationInfo>,
     symbol_table: Option<Arc<SymbolTable>>,
-) -> Result<(IndexResult, Vec<cache::CachedCallResolutionInput>)> {
+) -> Result<(
+    IndexResult,
+    Vec<cache::CachedCallResolutionInput>,
+    Option<cache::CachedResolutionFile>,
+)> {
     let flags = index_feature_flags();
     let is_jsx_like_file = path
         .extension()
@@ -15753,13 +15824,13 @@ fn index_file_with_resolution_inputs(
         }
     }
 
-    let call_resolution_inputs = proof_resolution::collect_call_resolution_inputs(
+    let resolution_inputs = proof_resolution::collect_call_resolution_inputs(
         &tree,
         source,
         language_config.language_name,
+        &resolution_parser_fingerprint(language_config),
         file_id,
         &final_nodes,
-        &mut result_edges,
     );
 
     Ok((
@@ -15772,7 +15843,8 @@ fn index_file_with_resolution_inputs(
             callable_projection_states,
             impl_anchor_node_ids,
         },
-        call_resolution_inputs,
+        resolution_inputs.calls,
+        resolution_inputs.file,
     ))
 }
 

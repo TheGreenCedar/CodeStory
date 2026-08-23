@@ -349,6 +349,8 @@ const TABLE_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS proof_resolution_fact (
         fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
         edge_id INTEGER,
+        raw_edge_target_id INTEGER,
+        raw_callsite_identity TEXT,
         file_id INTEGER NOT NULL,
         source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
         start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
@@ -381,9 +383,12 @@ const TABLE_STATEMENTS: &[&str] = &[
         evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
         UNIQUE(file_id, start_byte, end_byte_exclusive),
         CHECK(status != 'exact' OR (
-            target_node_id IS NOT NULL AND edge_id IS NOT NULL AND lookup_domain_complete = 1
+            target_node_id IS NOT NULL AND edge_id IS NOT NULL
+            AND raw_edge_target_id IS NOT NULL AND raw_callsite_identity IS NOT NULL
+            AND lookup_domain_complete = 1
         )),
         FOREIGN KEY(edge_id) REFERENCES edge(id),
+        FOREIGN KEY(raw_edge_target_id) REFERENCES node(id),
         FOREIGN KEY(file_id) REFERENCES file(id),
         FOREIGN KEY(caller_node_id) REFERENCES node(id),
         FOREIGN KEY(target_node_id) REFERENCES node(id)
@@ -1361,9 +1366,11 @@ pub(super) fn migrate_v32_proof_resolution_projection(
 ) -> Result<(), StorageError> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS proof_resolution_fact (
-            fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
-            edge_id INTEGER,
-            file_id INTEGER NOT NULL,
+        fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
+        edge_id INTEGER,
+        raw_edge_target_id INTEGER,
+        raw_callsite_identity TEXT,
+        file_id INTEGER NOT NULL,
             source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
             start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
             end_byte_exclusive INTEGER NOT NULL CHECK(end_byte_exclusive > start_byte),
@@ -1395,9 +1402,12 @@ pub(super) fn migrate_v32_proof_resolution_projection(
             evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
             UNIQUE(file_id, start_byte, end_byte_exclusive),
             CHECK(status != 'exact' OR (
-                target_node_id IS NOT NULL AND edge_id IS NOT NULL AND lookup_domain_complete = 1
+                target_node_id IS NOT NULL AND edge_id IS NOT NULL
+                AND raw_edge_target_id IS NOT NULL AND raw_callsite_identity IS NOT NULL
+                AND lookup_domain_complete = 1
             )),
             FOREIGN KEY(edge_id) REFERENCES edge(id),
+            FOREIGN KEY(raw_edge_target_id) REFERENCES node(id),
             FOREIGN KEY(file_id) REFERENCES file(id),
             FOREIGN KEY(caller_node_id) REFERENCES node(id),
             FOREIGN KEY(target_node_id) REFERENCES node(id)

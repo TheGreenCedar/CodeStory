@@ -25,6 +25,8 @@ fn exact_fact(edge_id: EdgeId) -> CallResolutionFact {
     seal_call_resolution_fact(CallResolutionFact {
         fact_id: String::new(),
         edge_id: Some(edge_id),
+        raw_edge_target: Some(NodeId(4)),
+        raw_callsite_identity: Some("1:2:1:4".to_owned()),
         callsite: ExactCallsite {
             file_id: FileId(1),
             source_sha256: "a".repeat(64),
@@ -49,7 +51,7 @@ fn exact_fact(edge_id: EdgeId) -> CallResolutionFact {
             algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
             language_adapter: "rust".to_owned(),
             language_adapter_version: "rust-exact-v1".to_owned(),
-            parser_fingerprint: "parser-rust-fixture".to_owned(),
+            parser_fingerprint: "1".repeat(64),
             dependency_file_hashes: vec![DependencyFileHash {
                 file_id: FileId(1),
                 source_sha256: "a".repeat(64),
@@ -80,8 +82,8 @@ fn projection(facts: Vec<CallResolutionFact>) -> ProofResolutionProjection {
                 incomplete_domain: 0,
                 unsupported: 0,
                 exact_call_linked: 1,
-                proof_shape_admitted: 1,
-                authoritative_receipts: 1,
+                proof_shape_admitted: 0,
+                authoritative_receipts: 0,
                 complete_proofs: 0,
             },
         }],
@@ -132,6 +134,17 @@ fn seed_exact_graph(store: &mut Store) {
             end_col: Some(20),
             ..Default::default()
         },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "callee".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(2),
+            start_col: Some(15),
+            end_line: Some(2),
+            end_col: Some(21),
+            ..Default::default()
+        },
     ] {
         store.insert_node(&node).expect("node");
     }
@@ -139,12 +152,12 @@ fn seed_exact_graph(store: &mut Store) {
         .insert_edge(&Edge {
             id: EdgeId(7),
             source: NodeId(2),
-            target: NodeId(3),
+            target: NodeId(4),
             kind: EdgeKind::CALL,
             file_node_id: Some(NodeId(1)),
             line: Some(2),
             resolved_target: Some(NodeId(3)),
-            callsite_identity: Some("1:2:15:3".to_owned()),
+            callsite_identity: Some("1:2:1:4".to_owned()),
             ..Default::default()
         })
         .expect("edge");
@@ -209,6 +222,9 @@ fn exact_projection_rejects_digest_and_graph_mismatches_without_partial_rows() {
 
     let mut endpoint_mismatch = exact_fact(EdgeId(7));
     endpoint_mismatch.target = Some(NodeId(2));
+    endpoint_mismatch.evidence_chain = vec![ResolutionEvidence::SameFileDeclaration {
+        declaration: NodeId(2),
+    }];
     let endpoint_mismatch = seal_call_resolution_fact(endpoint_mismatch).unwrap();
     let error = store
         .replace_proof_resolution_projection(&publication, &projection(vec![endpoint_mismatch]))
@@ -218,7 +234,7 @@ fn exact_projection_rejects_digest_and_graph_mismatches_without_partial_rows() {
     assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
 
     let mut callsite_mismatch = exact_fact(EdgeId(7));
-    callsite_mismatch.callsite.column = 16;
+    callsite_mismatch.raw_callsite_identity = Some("1:2:2:4".to_owned());
     let callsite_mismatch = seal_call_resolution_fact(callsite_mismatch).unwrap();
     let error = store
         .replace_proof_resolution_projection(&publication, &projection(vec![callsite_mismatch]))
@@ -235,6 +251,72 @@ fn exact_projection_rejects_digest_and_graph_mismatches_without_partial_rows() {
         .expect_err("source hash mismatch must fail");
     assert!(error.to_string().contains("source hash"), "{error}");
     assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+}
+
+#[test]
+fn resealed_but_semantically_false_evidence_and_funnel_are_rejected() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+
+    let mut wrong_same_file = exact_fact(EdgeId(7));
+    wrong_same_file.evidence_chain = vec![ResolutionEvidence::SameFileDeclaration {
+        declaration: NodeId(2),
+    }];
+    let wrong_same_file = seal_call_resolution_fact(wrong_same_file).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &projection(vec![wrong_same_file]))
+        .expect_err("resealed false same-file evidence must fail");
+    assert!(error.to_string().contains("semantic validator"), "{error}");
+
+    let mut unused_variant = exact_fact(EdgeId(7));
+    unused_variant.evidence_chain = vec![ResolutionEvidence::ConstructorBinding {
+        constructor: NodeId(3),
+    }];
+    let unused_variant = seal_call_resolution_fact(unused_variant).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &projection(vec![unused_variant]))
+        .expect_err("unused evidence variants must fail closed");
+    assert!(error.to_string().contains("semantic validator"), "{error}");
+
+    let mut wrong_import = exact_fact(EdgeId(7));
+    wrong_import.callsite.callee_form = CalleeForm::NamedImport;
+    wrong_import.evidence_chain = vec![ResolutionEvidence::StaticImportBinding {
+        import: NodeId(2),
+        declaration: NodeId(3),
+    }];
+    let wrong_import = seal_call_resolution_fact(wrong_import).unwrap();
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &projection(vec![wrong_import]))
+        .expect_err("unrelated import evidence must fail");
+    assert!(error.to_string().contains("StaticImportBinding"), "{error}");
+
+    let mut wrong_funnel = projection(vec![exact_fact(EdgeId(7))]);
+    wrong_funnel.funnel[0].counts.syntax_calls = 2;
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &wrong_funnel)
+        .expect_err("funnel mismatch must fail");
+    assert!(error.to_string().contains("funnel"), "{error}");
+}
+
+#[test]
+fn publication_digest_authenticates_roster_and_funnel() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let publication = publication();
+    store
+        .replace_proof_resolution_projection(&publication, &projection(vec![exact_fact(EdgeId(7))]))
+        .unwrap();
+    store
+        .get_connection()
+        .execute(
+            "UPDATE proof_resolution_publication SET funnel_json = '[]' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    let error = store
+        .validate_proof_resolution_publication(&publication)
+        .expect_err("resealed publication metadata mutation must fail");
+    assert!(error.to_string().contains("digest"), "{error}");
 }
 
 #[test]

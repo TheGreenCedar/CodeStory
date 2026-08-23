@@ -4315,6 +4315,115 @@ fn republishing_projections_keeps_a_structural_exclusion_publishable() {
 }
 
 #[test]
+fn semantic_projection_republish_rebinds_valid_proof_and_preserves_absence() {
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("main.ts"),
+        "export function target() {}\nexport function caller() { target(); }\n",
+    )
+    .expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core");
+    let (before_publication, before_proof, before_facts) = {
+        let storage = Storage::open(&storage_path).expect("open baseline");
+        let publication = storage.get_complete_index_publication().unwrap().unwrap();
+        let proof = storage
+            .validate_proof_resolution_publication(&publication)
+            .expect("valid baseline proof");
+        let facts = storage.get_proof_resolution_facts().unwrap();
+        (publication, proof, facts)
+    };
+    controller
+        .republish_semantic_projections_blocking()
+        .expect("semantic republish");
+    let after_publication = Storage::database_complete_index_publication(&storage_path)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        after_publication.generation_id,
+        before_publication.generation_id
+    );
+    let storage = Storage::open(&storage_path).expect("open rebound core");
+    let after_proof = storage
+        .validate_proof_resolution_publication(&after_publication)
+        .expect("proof rebound to semantic identity");
+    assert_eq!(after_proof.fact_digest, before_proof.fact_digest);
+    assert_eq!(after_proof.adapter_roster, before_proof.adapter_roster);
+    assert_eq!(after_proof.funnel, before_proof.funnel);
+    assert_eq!(storage.get_proof_resolution_facts().unwrap(), before_facts);
+
+    storage
+        .get_connection()
+        .execute_batch(
+            "DELETE FROM proof_resolution_publication; DELETE FROM proof_resolution_fact;",
+        )
+        .unwrap();
+    drop(storage);
+    controller
+        .republish_semantic_projections_blocking()
+        .expect("semantic republish preserves migrated absence");
+    let storage = Storage::open(&storage_path).unwrap();
+    assert_eq!(storage.get_proof_resolution_publication().unwrap(), None);
+}
+
+#[test]
+fn semantic_projection_republish_rejects_corrupt_proof_and_preserves_old_core() {
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("main.ts"),
+        "export function target() {}\nexport function caller() { target(); }\n",
+    )
+    .expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core");
+    let before = Storage::database_complete_index_publication(&storage_path)
+        .unwrap()
+        .unwrap();
+    let storage = Storage::open(&storage_path).unwrap();
+    storage
+        .get_connection()
+        .execute(
+            "UPDATE proof_resolution_publication SET funnel_json = '[]' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    drop(storage);
+    let error = controller
+        .republish_semantic_projections_blocking()
+        .expect_err("corrupt old proof must reject semantic rebind");
+    assert!(
+        error.message.contains("proof resolution projection"),
+        "{error:?}"
+    );
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
 fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     let _env = hybrid_test_env();
     let workspace = copy_tictactoe_workspace();

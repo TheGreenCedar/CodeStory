@@ -27,29 +27,73 @@ pub(crate) struct CachedIndexArtifact {
     pub impl_anchor_node_ids: Vec<NodeId>,
     #[serde(default)]
     pub call_resolution_inputs: Vec<CachedCallResolutionInput>,
+    #[serde(default)]
+    pub resolution_file: Option<CachedResolutionFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CachedCallResolutionInput {
     pub callsite: ExactCallsite,
-    pub caller: NodeId,
+    pub caller: Option<NodeId>,
+    pub binding: CachedResolutionBinding,
     pub language: String,
     pub adapter_version: String,
     pub parser_fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CachedResolutionBinding {
+    SameFile {
+        declaration: NodeId,
+    },
+    StaticImport {
+        import: NodeId,
+        module_specifier: String,
+        imported_name: String,
+        is_default: bool,
+    },
+    ImplicitReceiver {
+        owner: NodeId,
+        declaration: NodeId,
+    },
+    Ambiguous,
+    MissingBinding,
+    Unsupported,
+    IncompleteDomain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedResolutionFile {
+    pub file_id: NodeId,
+    pub source_sha256: String,
+    pub language: String,
+    pub adapter_version: String,
+    pub parser_fingerprint: String,
+    pub complete: bool,
+    pub direct_exports: Vec<CachedDirectExport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedDirectExport {
+    pub exported_name: String,
+    pub declaration: NodeId,
+    pub is_default: bool,
+}
+
 impl CachedIndexArtifact {
     #[cfg(test)]
     pub(crate) fn from_index_result(index_result: IndexResult) -> Self {
-        Self::from_index_result_with_resolution_inputs(index_result, Vec::new())
+        Self::from_index_result_with_resolution_inputs(index_result, Vec::new(), None)
     }
 
     pub(crate) fn from_index_result_with_resolution_inputs(
         index_result: IndexResult,
         call_resolution_inputs: Vec<CachedCallResolutionInput>,
+        resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 1,
+            resolution_input_schema_version: 2,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,
@@ -58,6 +102,7 @@ impl CachedIndexArtifact {
             callable_projection_states: index_result.callable_projection_states,
             impl_anchor_node_ids: index_result.impl_anchor_node_ids,
             call_resolution_inputs,
+            resolution_file,
         }
     }
 
@@ -515,5 +560,10 @@ mod tests {
         let decoded: CachedIndexArtifact = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.resolution_input_schema_version, 0);
         assert!(decoded.call_resolution_inputs.is_empty());
+        assert!(decoded.resolution_file.is_none());
+        assert!(
+            !crate::proof_resolution::cached_resolution_inputs_are_current(&decoded, "typescript")
+        );
+        assert!(crate::proof_resolution::cached_resolution_inputs_are_current(&decoded, "go"));
     }
 }

@@ -1311,7 +1311,16 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
             read("crates/codestory-cli/src/app/agent_context/context.rs"),
         ),
     ] {
-        for forbidden in ["proof_resolution_fact", "CallResolutionFact"] {
+        for forbidden in [
+            "proof_resolution_fact",
+            "CallResolutionFact",
+            "get_exact_proof_resolution_fact_by_edge",
+            "get_proof_resolution_facts",
+            "get_proof_resolution_publication",
+            "validate_proof_resolution_publication",
+            "replace_proof_resolution_projection",
+            "rebind_proof_resolution_publication",
+        ] {
             assert!(
                 !source.contains(forbidden),
                 "{consumer} crossed the one-way proof overlay via {forbidden}"

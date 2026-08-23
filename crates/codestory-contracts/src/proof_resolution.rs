@@ -240,6 +240,11 @@ pub struct ResolutionProvenance {
 pub struct CallResolutionFact {
     pub fact_id: String,
     pub edge_id: Option<EdgeId>,
+    /// The unchanged raw CALL endpoint captured by the parser-span
+    /// corroboration. This is deliberately distinct from `target`.
+    pub raw_edge_target: Option<NodeId>,
+    /// The unchanged canonical identity carried by the ordinary CALL edge.
+    pub raw_callsite_identity: Option<String>,
     pub callsite: ExactCallsite,
     pub caller: NodeId,
     pub target: Option<NodeId>,
