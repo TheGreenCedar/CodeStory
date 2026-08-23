@@ -9,7 +9,7 @@ const https = require('https');
 const os = require('os');
 const path = require('path');
 const { Transform, pipeline } = require('stream');
-const { TextDecoder } = require('util');
+const { TextDecoder, isDeepStrictEqual } = require('util');
 const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
 const zlib = require('zlib');
 const {
@@ -3893,19 +3893,6 @@ function managedProvisioningOperation() {
   };
 }
 
-function managedProvisioningMessage() {
-  const progress = managedCliDownloadProgressReport();
-  if (!progress || progress.asset === 'SHA256SUMS.txt') {
-    return 'CodeStory is preparing: downloading the runtime. Retry the same tool shortly.';
-  }
-  const received = formatByteSize(progress.received_bytes);
-  const total = progress.total_bytes === null ? null : formatByteSize(progress.total_bytes);
-  const measure = total
-    ? `${progress.percent}% of ${total}`
-    : `${received} so far`;
-  return `CodeStory is preparing: downloading the runtime (${measure}). Retry the same tool shortly.`;
-}
-
 function failOpenToolResult(tool, status, argumentsValue = {}) {
   const preparing = status.managed_retrieval?.state === 'preparing';
   const readiness = Array.isArray(status.readiness) ? status.readiness[0] : null;
@@ -3960,17 +3947,20 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   // The top-level hint repeats the operation snapshot's so one preparing response never carries
   // two disagreeing delays.
   const provisioningOperation = preparing ? managedProvisioningOperation() : null;
-  const structuredContent = preparing ? {
-    code: 'codestory_preparing',
-    message: managedProvisioningMessage(),
-    tool,
-    project,
-    state: 'preparing',
-    retry_tool: tool,
-    retry_after_ms: provisioningOperation.retry_after_ms,
-    operation: provisioningOperation,
-    diagnostics_uri: diagnosticsUri,
-  } : {
+  if (preparing) {
+    const structuredContent = {
+      kind: 'preparing',
+      state: 'preparing',
+      retry_after_ms: provisioningOperation.retry_after_ms,
+      operation: provisioningOperation,
+    };
+    return {
+      content: [{ type: 'text', text: JSON.stringify(structuredContent) }],
+      structuredContent,
+      isError: false,
+    };
+  }
+  const structuredContent = {
     code: 'codestory_unavailable',
     message: failureHint
       ? `CodeStory is unavailable. ${failureHint} Meanwhile, continue with focused source inspection.`
@@ -3990,9 +3980,9 @@ function failOpenToolResult(tool, status, argumentsValue = {}) {
   return result;
 }
 
-function revisionNativeFailOpenToolResult(revision, legacyResult) {
-  const root = legacyResult?.structuredContent;
-  const isError = legacyResult?.isError === true || !isPlainObject(root);
+function revisionNativeFailOpenToolResult(revision, toolResult) {
+  const root = toolResult?.structuredContent;
+  const isError = toolResult?.isError === true || !isPlainObject(root);
   const text = JSON.stringify(
     isPlainObject(root)
       ? root
@@ -4164,6 +4154,251 @@ function shutdownHandoffChild(child, options = {}) {
   };
   child.once?.('exit', clearTimers);
   child.once?.('close', clearTimers);
+}
+
+const failOpenMaxReportedViolations = 8;
+const failOpenValidatedSchemaKeywords = Object.freeze([
+  'additionalProperties',
+  'allOf',
+  'anyOf',
+  'const',
+  'default',
+  'description',
+  'enum',
+  'items',
+  'maxItems',
+  'maxLength',
+  'maximum',
+  'minItems',
+  'minLength',
+  'minimum',
+  'not',
+  'oneOf',
+  'properties',
+  'required',
+  'type',
+]);
+
+function publishedSchemaTypeName(value) {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'array';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'integer' : 'number';
+  return typeof value;
+}
+
+function publishedSchemaTypeMatches(declared, value) {
+  const names = Array.isArray(declared) ? declared : [declared];
+  return names.some((name) => {
+    switch (name) {
+      case 'object': return isPlainObject(value);
+      case 'array': return Array.isArray(value);
+      case 'string': return typeof value === 'string';
+      case 'boolean': return typeof value === 'boolean';
+      case 'integer': return typeof value === 'number' && Number.isInteger(value);
+      case 'number': return typeof value === 'number' && Number.isFinite(value);
+      case 'null': return value === null;
+      default: return false;
+    }
+  });
+}
+
+function renderPublishedSchemaType(declared) {
+  return (Array.isArray(declared) ? declared : [declared]).join(' or ');
+}
+
+function renderPublishedSchemaLiteral(value) {
+  return typeof value === 'string' ? `\`${value}\`` : JSON.stringify(value);
+}
+
+function renderPublishedSchemaVariants(variants) {
+  return variants.map((variant) => {
+    const required = Array.isArray(variant?.required) ? variant.required : [];
+    return required.length > 0
+      ? required.map((name) => `\`${name}\``).join(' + ')
+      : 'the declared variant';
+  }).join(', ');
+}
+
+function publishedSchemaViolation(code, pointer, message) {
+  return { code, pointer, message };
+}
+
+function publishedSchemaAccepts(schema, value) {
+  return validatePublishedSchemaValue(schema, value, '').length === 0;
+}
+
+/**
+ * Interpret the closed JSON Schema subset emitted by generated-mcp-catalog.json.
+ * The selected tools/list profile is the request contract; this deliberately
+ * reads that schema instead of maintaining a second launcher argument grammar.
+ */
+function validatePublishedSchemaValue(schema, value, pointer = '/arguments') {
+  if (!isPlainObject(schema)) return [];
+  const violations = [];
+  const declaredType = schema.type;
+  if (declaredType !== undefined && !publishedSchemaTypeMatches(declaredType, value)) {
+    return [publishedSchemaViolation(
+      'invalid_type',
+      pointer,
+      `expected type ${renderPublishedSchemaType(declaredType)}, received ${publishedSchemaTypeName(value)}`,
+    )];
+  }
+  if (declaredType !== undefined && value === null) return violations;
+
+  if (Object.hasOwn(schema, 'const') && !isDeepStrictEqual(value, schema.const)) {
+    violations.push(publishedSchemaViolation(
+      'invalid_const_value',
+      pointer,
+      `expected ${renderPublishedSchemaLiteral(schema.const)}`,
+    ));
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((allowed) => isDeepStrictEqual(value, allowed))) {
+    violations.push(publishedSchemaViolation(
+      'invalid_enum_value',
+      pointer,
+      `expected one of ${schema.enum.map(renderPublishedSchemaLiteral).join(', ')}`,
+    ));
+  }
+  if (typeof value === 'number') {
+    if (typeof schema.minimum === 'number' && value < schema.minimum) {
+      violations.push(publishedSchemaViolation(
+        'below_minimum', pointer, `expected a value of at least ${schema.minimum}`,
+      ));
+    }
+    if (typeof schema.maximum === 'number' && value > schema.maximum) {
+      violations.push(publishedSchemaViolation(
+        'above_maximum', pointer, `expected a value of at most ${schema.maximum}`,
+      ));
+    }
+  }
+  if (typeof value === 'string') {
+    const length = Array.from(value).length;
+    if (Number.isSafeInteger(schema.minLength) && length < schema.minLength) {
+      violations.push(publishedSchemaViolation(
+        'below_min_length', pointer, `expected at least ${schema.minLength} character(s)`,
+      ));
+    }
+    if (Number.isSafeInteger(schema.maxLength) && length > schema.maxLength) {
+      violations.push(publishedSchemaViolation(
+        'above_max_length', pointer, `expected at most ${schema.maxLength} character(s)`,
+      ));
+    }
+  }
+  if (Array.isArray(value)) {
+    if (Number.isSafeInteger(schema.minItems) && value.length < schema.minItems) {
+      violations.push(publishedSchemaViolation(
+        'below_min_items', pointer, `expected at least ${schema.minItems} item(s)`,
+      ));
+    }
+    if (Number.isSafeInteger(schema.maxItems) && value.length > schema.maxItems) {
+      violations.push(publishedSchemaViolation(
+        'above_max_items', pointer, `expected at most ${schema.maxItems} item(s)`,
+      ));
+    }
+    if (isPlainObject(schema.items)) {
+      value.forEach((item, index) => {
+        violations.push(...validatePublishedSchemaValue(schema.items, item, `${pointer}/${index}`));
+      });
+    }
+  }
+  if (isPlainObject(value)) {
+    const properties = isPlainObject(schema.properties) ? schema.properties : {};
+    if (schema.additionalProperties === false) {
+      for (const name of Object.keys(value)) {
+        if (!Object.hasOwn(properties, name)) {
+          violations.push(publishedSchemaViolation(
+            'unknown_property',
+            `${pointer}/${name}`,
+            'property is not declared by the published tool schema',
+          ));
+        }
+      }
+    }
+    if (Array.isArray(schema.required)) {
+      for (const name of schema.required) {
+        if (typeof name === 'string' && !Object.hasOwn(value, name)) {
+          violations.push(publishedSchemaViolation(
+            'missing_required', `${pointer}/${name}`, 'required property is missing',
+          ));
+        }
+      }
+    }
+    for (const [name, member] of Object.entries(value)) {
+      if (isPlainObject(properties[name])) {
+        violations.push(...validatePublishedSchemaValue(
+          properties[name], member, `${pointer}/${name}`,
+        ));
+      }
+    }
+  }
+
+  if (Array.isArray(schema.anyOf)
+    && !schema.anyOf.some((variant) => publishedSchemaAccepts(variant, value))) {
+    violations.push(publishedSchemaViolation(
+      'unsatisfied_any_of',
+      pointer,
+      `expected at least one of ${renderPublishedSchemaVariants(schema.anyOf)}`,
+    ));
+  }
+  if (Array.isArray(schema.oneOf)) {
+    const matched = schema.oneOf.filter((variant) => publishedSchemaAccepts(variant, value)).length;
+    if (matched !== 1) {
+      violations.push(publishedSchemaViolation(
+        'invalid_selector',
+        pointer,
+        `expected exactly one of ${renderPublishedSchemaVariants(schema.oneOf)}, matched ${matched}`,
+      ));
+    }
+  }
+  if (Array.isArray(schema.allOf)) {
+    const failed = schema.allOf.find((constraint) => !publishedSchemaAccepts(constraint, value));
+    if (failed) {
+      if (schema.allOf.length === 1) {
+        violations.push(...validatePublishedSchemaValue(failed, value, pointer));
+      } else {
+        const names = Array.isArray(failed?.not?.required)
+          ? failed.not.required.map((name) => `\`${name}\``).join(' and ')
+          : '';
+        violations.push(publishedSchemaViolation(
+          names ? 'combined_item_limit' : 'unsatisfied_all_of',
+          pointer,
+          names
+            ? `${names} may hold at most ${schema.allOf.length} item(s) together`
+            : 'value violates a declared combined constraint',
+        ));
+      }
+    }
+  }
+  if (isPlainObject(schema.not) && publishedSchemaAccepts(schema.not, value)) {
+    violations.push(publishedSchemaViolation(
+      'forbidden_combination',
+      pointer,
+      'value matches a combination the tool schema forbids',
+    ));
+  }
+  return violations;
+}
+
+function validateFailOpenToolArguments(tool, argumentsValue) {
+  const value = argumentsValue === null || argumentsValue === undefined ? {} : argumentsValue;
+  return validatePublishedSchemaValue(tool.inputSchema, value, '/arguments')
+    .filter((violation) => !(violation.code === 'missing_required'
+      && violation.pointer === '/arguments/project'));
+}
+
+function failOpenInvalidParamsError(id, tool, violations) {
+  return jsonrpcError(
+    id,
+    -32602,
+    `invalid_params: tool \`${tool}\` rejected ${violations.length} argument violation(s) declared by tools/list`,
+    {
+      code: 'invalid_params',
+      tool,
+      violation_count: violations.length,
+      violations: violations.slice(0, failOpenMaxReportedViolations),
+      next_action: 'correct_arguments_from_tools_list',
+    },
+  );
 }
 
 function runFailOpenMcp(status, options = {}) {
@@ -4402,14 +4637,6 @@ function runFailOpenMcp(status, options = {}) {
     -32600,
     'Invalid Request',
   );
-  const unknownToolArgument = (tool, argumentsValue) => {
-    if (!isPlainObject(argumentsValue)) return null;
-    const properties = tool?.inputSchema?.properties;
-    if (!isPlainObject(properties) || tool?.inputSchema?.additionalProperties !== false) {
-      return null;
-    }
-    return Object.keys(argumentsValue).find((field) => !Object.hasOwn(properties, field)) ?? null;
-  };
   const handleRequest = (request, rawLine, allowHandoff = true) => {
     if (!validateJsonRpcRequest(request)) return invalidRequest(request);
     if (request.method === 'notifications/initialized') {
@@ -4501,23 +4728,19 @@ function runFailOpenMcp(status, options = {}) {
       const toolName = request.params?.name;
       const tool = tools.find((candidate) => candidate.name === toolName);
       const argumentsValue = request.params?.arguments ?? {};
-      const unknownArgument = unknownToolArgument(tool, argumentsValue);
       if (!tool) {
         response = jsonrpcError(request.id, -32602, `unknown tool: ${toolName || '<missing>'}`);
-      } else if (unknownArgument !== null) {
-        response = jsonrpcError(
-          request.id,
-          -32602,
-          `invalid arguments: unknown field ${unknownArgument}`,
-        );
       } else {
-        response = jsonrpcResult(
-          request.id,
-          revisionNativeFailOpenToolResult(
-            negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion,
-            failOpenToolResult(toolName, currentStatus(), argumentsValue),
-          ),
-        );
+        const violations = validateFailOpenToolArguments(tool, argumentsValue);
+        response = violations.length > 0
+          ? failOpenInvalidParamsError(request.id, toolName, violations)
+          : jsonrpcResult(
+            request.id,
+            revisionNativeFailOpenToolResult(
+              negotiatedProtocol?.negotiated ?? managedCliMcpProtocolVersion,
+              failOpenToolResult(toolName, currentStatus(), argumentsValue),
+            ),
+          );
       }
     } else {
       response = jsonrpcError(request.id, -32601, `method not found: ${request.method || '<missing>'}`);
@@ -4890,6 +5113,8 @@ if (require.main === module) {
       trimManagedCliDownloadCache,
       extractArchive,
       failOpenToolResult,
+      failOpenValidatedSchemaKeywords,
+      validatePublishedSchemaValue,
       failOpenToolCatalog,
       failOpenMaxFrameBytes,
       managedCliFailureCode,

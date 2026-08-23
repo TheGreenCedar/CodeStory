@@ -18,7 +18,7 @@
     "/execution_boundaries/0/command": "packet"
   },
   "summary": {
-    "/summary_version": 1,
+    "/summary_version": 2,
     "/project": "C:/repo",
     "/label": "fixture",
     "/question": "How does indexing feed search?",
@@ -30,8 +30,9 @@
     "/mechanical/after/files": 2,
     "/anchors/requested": 1,
     "/anchors/resolved": 1,
-    "/open_gaps/answer_quality_status": "available",
-    "/open_gaps/next_command_count": 0
+    "/open_gaps/availability_status": "available",
+    "/open_gaps/gap_count": 0,
+    "/availability/status": "available"
   },
   "markdown_contains": [
     "# Drill",

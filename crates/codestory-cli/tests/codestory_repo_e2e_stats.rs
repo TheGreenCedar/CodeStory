@@ -1682,7 +1682,7 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
     );
     assert_eq!(u64_field(&suite_json, &["repo_count"]), cases.len() as u64);
     assert_eq!(
-        u64_field(&suite_json, &["blocked_count"]),
+        u64_field(&suite_json, &["unavailable_count"]),
         0,
         "drill-suite should complete every configured repo before its evidence is evaluated: {suite_json:#}"
     );
@@ -1735,57 +1735,38 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             case.name
         );
         assert!(
-            bool_field(repo_json, &["summary", "source_truth", "required"]),
-            "{} suite summary should require source-truth verification",
-            case.name
-        );
-        assert!(
-            u64_field(repo_json, &["summary", "source_truth", "check_count"])
-                >= case.anchors.len() as u64,
-            "{} suite summary should name at least one source-truth check per anchor",
-            case.name
-        );
-        let check_count = u64_field(repo_json, &["summary", "source_truth", "check_count"]);
-        assert_eq!(
             u64_field(
                 repo_json,
-                &["summary", "source_truth", "pending_check_count"]
-            ),
-            check_count,
-            "{} suite summary should keep all generated source-truth checks pending until source reads happen",
+                &["summary", "evidence_review", "target_file_count"]
+            ) >= case.anchors.len() as u64,
+            "{} suite summary should name at least one evidence target per anchor",
             case.name
+        );
+        let target_count = u64_field(
+            repo_json,
+            &["summary", "evidence_review", "target_file_count"],
+        );
+        let follow_up_required = bool_field(
+            repo_json,
+            &["summary", "evidence_review", "follow_up_required"],
         );
         assert_eq!(
             u64_field(
                 repo_json,
-                &["summary", "source_truth", "verified_check_count"]
+                &["summary", "evidence_review", "pending_target_count"]
             ),
-            0,
-            "{} suite summary should not count generated checks as verified before source reads",
+            if follow_up_required { target_count } else { 0 },
+            "{} suite summary should keep evidence-target follow-up aligned with closed-v3 availability",
             case.name
         );
         assert_eq!(
-            u64_field(
-                repo_json,
-                &["summary", "open_gaps", "pending_source_truth_check_count"]
-            ),
-            check_count,
-            "{} suite open-gaps summary should preserve pending source-truth checks",
+            u64_field(repo_json, &["summary", "open_gaps", "pending_target_count"]),
+            if follow_up_required { target_count } else { 0 },
+            "{} suite open-gaps summary should preserve pending evidence targets",
             case.name
         );
-        assert!(
-            u64_field(
-                repo_json,
-                &["summary", "source_truth", "pending_claim_count"]
-            ) > 0,
-            "{} suite summary should keep claim-ledger entries pending",
-            case.name
-        );
-        assert!(
-            u64_field(repo_json, &["summary", "open_gaps", "pending_claim_count"]) > 0,
-            "{} suite open-gaps summary should count pending claims",
-            case.name
-        );
+        assert!(repo_json["summary"].get("source_truth").is_none());
+        assert!(repo_json["summary"].get("verdict").is_none());
 
         let output_dir = PathBuf::from(string_field(repo_json, &["output_dir"]));
         let drill_report_path = output_dir.join("drill-report.json");
@@ -1811,11 +1792,10 @@ fn real_repo_agent_grounding_drill_emits_verification_packets() {
             "{} drill should execute the packet path once",
             case.name
         );
-        assert_packet_plan_names_seed_anchors(case, &drill_json);
         assert_eq!(
             string_field(&drill_json, &["question_search", "status"]),
-            string_field(&drill_json, &["evidence_packet", "sufficiency", "status"]),
-            "{} drill status should be the packet sufficiency decision",
+            string_field(&drill_json, &["evidence_packet", "status"]),
+            "{} drill status should be the closed-v3 packet availability",
             case.name
         );
         assert_compact_bridge_status_handoff(&case.name, repo_json);
@@ -1851,21 +1831,6 @@ fn allow_skip_real_repo_drill_cases() -> bool {
         .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }
 
-fn assert_packet_plan_names_seed_anchors(case: &DrillRepoCase, drill_json: &Value) {
-    let subqueries = json_path(drill_json, &["evidence_packet", "plan", "queries"])
-        .as_array()
-        .expect("packet plan queries");
-    for anchor in &case.anchors {
-        assert!(
-            subqueries
-                .iter()
-                .any(|subquery| subquery["query"].as_str() == Some(anchor.as_str())),
-            "{} packet plan should preserve explicit anchor probe {anchor}: {drill_json:#}",
-            case.name
-        );
-    }
-}
-
 fn assert_compact_bridge_status_handoff(repo_name: &str, repo_json: &Value) {
     let total = u64_field(repo_json, &["summary", "bridges", "total"]);
     let statuses = json_path(repo_json, &["summary", "bridges", "statuses"])
@@ -1876,7 +1841,10 @@ fn assert_compact_bridge_status_handoff(repo_name: &str, repo_json: &Value) {
         total,
         "{repo_name} compact bridge statuses should cover every bridge pair"
     );
-    let blocked = string_field(repo_json, &["summary", "verdict", "status"]) == "blocked";
+    let unavailable =
+        string_field(repo_json, &["summary", "availability", "status"]) == "unavailable";
+    let packet_availability =
+        string_field(repo_json, &["summary", "open_gaps", "availability_status"]);
     for status in statuses {
         for field in ["from_anchor", "to_anchor", "status", "strategy"] {
             assert!(
@@ -1886,11 +1854,11 @@ fn assert_compact_bridge_status_handoff(repo_name: &str, repo_json: &Value) {
                 "{repo_name} compact bridge status should preserve {field}: {status:#}"
             );
         }
-        if !blocked {
+        if !unavailable {
             assert_eq!(
                 status["command_status"].as_str(),
-                Some("ok"),
-                "{repo_name} compact bridge status should preserve command health for usable suite entries: {status:#}"
+                Some(packet_availability),
+                "{repo_name} compact bridge status should preserve packet availability for usable suite entries: {status:#}"
             );
         }
     }
@@ -1910,8 +1878,8 @@ fn assert_anchor_summary_usable(repo_json: &Value, anchor: &str) {
         anchor,
     );
     assert!(
-        u64_field(summary, &["source_truth_target_count"]) > 0,
-        "{anchor} should retain source-truth target pointers"
+        u64_field(summary, &["evidence_target_count"]) > 0,
+        "{anchor} should retain evidence target pointers"
     );
 }
 mod test_support;

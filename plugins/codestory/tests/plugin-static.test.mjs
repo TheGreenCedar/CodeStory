@@ -459,7 +459,10 @@ test("fail-open relay applies revision-native JSON-RPC batch rules", async () =>
     assert.equal(frames[0].result.protocolVersion, revision);
     assert.equal(frames[1].id, "retired-packet-argument");
     assert.equal(frames[1].error.code, -32602);
-    assert.match(frames[1].error.message, /include_evidence/u);
+    assert.equal(frames[1].error.data.code, "invalid_params");
+    assert.ok(frames[1].error.data.violations.some((violation) =>
+      violation.pointer === "/arguments/include_evidence"
+      && violation.code === "unknown_property"));
     if (revision === "2024-11-05" || revision === "2025-03-26") {
       assert.ok(Array.isArray(frames[2]), `${revision} must emit one batch response array`);
       assert.deepEqual(frames[2].map(({ id }) => id), ["tools", "resources"]);
@@ -472,6 +475,185 @@ test("fail-open relay applies revision-native JSON-RPC batch rules", async () =>
     }
     assert.equal(frames.length, 3, `${revision} emitted an unexpected notification response`);
   }
+});
+
+test("fail-open preparing is a successful revision-native result in every profile", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const status = {
+    plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+    runtime: { state: "preparing" },
+    warnings: [],
+    readiness: [],
+    managed_retrieval: { state: "preparing", automatic: true },
+    degraded_reason: "managed_cli_provisioning",
+  };
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `run(${JSON.stringify(status)});`,
+  ].join("");
+
+  for (const revision of ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]) {
+    const input = [
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "initialize",
+        method: "initialize",
+        params: { protocolVersion: revision },
+      }),
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "cold-packet",
+        method: "tools/call",
+        params: {
+          name: "packet",
+          arguments: { project: repoRoot, question: "Explain dispatch." },
+        },
+      }),
+      "",
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["-e", fixture], {
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const frames = result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+    const toolResult = frames[1].result;
+    const text = JSON.parse(toolResult.content[0].text);
+    assert.equal(toolResult.isError, false, `${revision} preparing must not be a tool error`);
+    assert.deepEqual(Object.keys(text).sort(), ["kind", "operation", "retry_after_ms", "state"]);
+    assert.equal(text.kind, "preparing");
+    assert.equal(text.state, "preparing");
+    assert.ok(text.retry_after_ms > 0);
+    assert.equal(typeof text.operation, "object");
+    if (revision === "2024-11-05" || revision === "2025-03-26") {
+      assert.equal(toolResult.structuredContent, undefined);
+    } else {
+      assert.deepEqual(toolResult.structuredContent, text);
+    }
+  }
+});
+
+test("fail-open validates every selected profile input schema before dispatch", () => {
+  const launcher = join(pluginRoot, "scripts", "codestory-mcp.cjs");
+  const status = {
+    plugin_runtime: { plugin_version: "0.17.4", warnings: [] },
+    runtime: { state: "preparing" },
+    warnings: [],
+    readiness: [],
+    managed_retrieval: { state: "preparing", automatic: true },
+    degraded_reason: "managed_cli_provisioning",
+  };
+  const fixture = [
+    `const run=require(${JSON.stringify(launcher)})._test.runFailOpenMcp;`,
+    `run(${JSON.stringify(status)});`,
+  ].join("");
+  const exactPathProbes = Array.from({ length: 16 }, (_, index) => ({
+    kind: "exact_path",
+    path: `src/${index}.rs`,
+  }));
+  const cases = [
+    ["status-project-type", "status", { project: 7 }, "/arguments/project", "invalid_type"],
+    ["packet-root-type", "packet", [], "/arguments", "invalid_type"],
+    ["packet-question-required", "packet", { project: repoRoot }, "/arguments/question", "missing_required"],
+    ["packet-question-type", "packet", { project: repoRoot, question: 7 }, "/arguments/question", "invalid_type"],
+    ["packet-question-bound", "packet", { project: repoRoot, question: "" }, "/arguments/question", "below_min_length"],
+    ["packet-budget-enum", "packet", { project: repoRoot, question: "why", budget: "impossible" }, "/arguments/budget", "invalid_enum_value"],
+    ["packet-tagged-probe", "packet", { project: repoRoot, question: "why", probes: [{ kind: "exact_path", id: "wrong" }] }, "/arguments/probes/0", "invalid_selector"],
+    ["packet-array-bound", "packet", { project: repoRoot, question: "why", probes: [...exactPathProbes, { kind: "exact_path", path: "src/overflow.rs" }] }, "/arguments/probes", "above_max_items"],
+    ["packet-string-bound", "packet", { project: repoRoot, question: "why", probes: [{ kind: "exact_path", path: "x".repeat(241) }] }, "/arguments/probes/0", "invalid_selector"],
+    ["packet-combined-bound", "packet", { project: repoRoot, question: "why", probes: exactPathProbes, extra_probes: ["overflow"] }, "/arguments", "combined_item_limit"],
+    ["context-selector-required", "context", { project: repoRoot }, "/arguments", "invalid_selector"],
+    ["context-selector-exclusive", "context", { project: repoRoot, query: "entry", id: "node-1" }, "/arguments", "invalid_selector"],
+    ["search-query-type", "search", { project: repoRoot, query: 7 }, "/arguments/query", "invalid_type"],
+    ["search-limit-bound", "search", { project: repoRoot, query: "entry", limit: 0 }, "/arguments/limit", "below_minimum"],
+    ["search-additional-property", "search", { project: repoRoot, query: "entry", extra: true }, "/arguments/extra", "unknown_property"],
+  ];
+
+  for (const revision of ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]) {
+    const input = [
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: "initialize",
+        method: "initialize",
+        params: { protocolVersion: revision },
+      }),
+      ...cases.map(([id, tool, argumentsValue]) => JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name: tool, arguments: argumentsValue },
+      })),
+      "",
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["-e", fixture], {
+      input,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const frames = result.stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(frames.length, cases.length + 1, result.stdout);
+    for (const [index, [id, tool, , pointer, code]] of cases.entries()) {
+      const response = frames[index + 1];
+      assert.equal(response.id, id);
+      assert.equal(response.error?.code, -32602, `${revision} ${id}: ${JSON.stringify(response)}`);
+      assert.equal(response.error?.data?.code, "invalid_params");
+      assert.equal(response.error?.data?.tool, tool);
+      assert.ok(
+        response.error?.data?.violations?.some((violation) =>
+          violation.pointer === pointer && violation.code === code),
+        `${revision} ${id} expected ${code} at ${pointer}: ${JSON.stringify(response)}`,
+      );
+    }
+  }
+});
+
+test("fail-open schema interpreter covers const anyOf and allOf", () => {
+  const validate = launcherTest.validatePublishedSchemaValue;
+  assert.equal(typeof validate, "function");
+  const schema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      kind: { type: "string", const: "tagged" },
+      value: { anyOf: [{ type: "string", minLength: 1 }, { type: "integer", minimum: 1 }] },
+    },
+    required: ["kind", "value"],
+    allOf: [{ not: { properties: { value: { const: "forbidden" } }, required: ["value"] } }],
+  };
+  assert.deepEqual(validate(schema, { kind: "tagged", value: 1 }, "/arguments"), []);
+  const violations = validate(schema, { kind: "wrong", value: "forbidden" }, "/arguments");
+  assert.ok(violations.some(({ code, pointer }) => code === "invalid_const_value" && pointer === "/arguments/kind"));
+  assert.ok(violations.some(({ code, pointer }) => code === "forbidden_combination" && pointer === "/arguments"));
+});
+
+test("fail-open schema validation covers every generated input keyword", () => {
+  const found = new Set();
+  const collect = (schema) => {
+    if (!schema || typeof schema !== "object" || Array.isArray(schema)) return;
+    const isSchema = [
+      "type", "properties", "required", "oneOf", "anyOf", "allOf", "not", "items", "enum", "const",
+    ].some((keyword) => Object.hasOwn(schema, keyword));
+    for (const [keyword, value] of Object.entries(schema)) {
+      if (isSchema) found.add(keyword);
+      if (isSchema && keyword === "properties") {
+        Object.values(value).forEach(collect);
+      } else if (Array.isArray(value)) {
+        value.forEach(collect);
+      } else {
+        collect(value);
+      }
+    }
+  };
+  for (const profile of Object.values(generatedCatalog.revisionProfiles)) {
+    profile.tools.forEach((tool) => collect(tool.inputSchema));
+  }
+  const validated = new Set(launcherTest.failOpenValidatedSchemaKeywords);
+  assert.deepEqual(
+    [...found].filter((keyword) => !validated.has(keyword)).sort(),
+    [],
+  );
 });
 
 test("fail-open project resource URIs use the native strict encoding contract", () => {
@@ -4924,14 +5106,16 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       method: "tools/call",
       params: { name: "ground", arguments: { project: repoRoot } },
     });
-    assert.equal(coldGround.result.isError, true);
+    assert.equal(coldGround.result.isError, false);
+    const coldGroundPreparing = toolTextJson(coldGround);
     assert.equal(coldGround.result.structuredContent, undefined);
-    const coldGroundError = toolTextJson(coldGround);
-    assert.equal(coldGroundError.code, "codestory_preparing");
-    assert.equal(coldGroundError.state, "preparing");
-    assert.equal(coldGroundError.retry_tool, "ground");
-    assert.equal(coldGroundError.project, repoRoot);
-    const { progress, ...operationCore } = coldGroundError.operation;
+    assert.deepEqual(
+      Object.keys(coldGroundPreparing).sort(),
+      ["kind", "operation", "retry_after_ms", "state"],
+    );
+    assert.equal(coldGroundPreparing.kind, "preparing");
+    assert.equal(coldGroundPreparing.state, "preparing");
+    const { progress, ...operationCore } = coldGroundPreparing.operation;
     // The gated release server withholds every asset byte here, so no transfer is measurable and
     // the retry hint must be the documented no-signal fallback.
     assert.deepEqual(operationCore, {
@@ -4943,8 +5127,8 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       failure: null,
     });
     assert.equal(
-      coldGroundError.retry_after_ms,
-      coldGroundError.operation.retry_after_ms,
+      coldGroundPreparing.retry_after_ms,
+      coldGroundPreparing.operation.retry_after_ms,
     );
     // Progress appears once a release asset fetch is in flight; the request can land just before
     // the background provisioner gets that far, so null is the only other legal value.
@@ -4955,8 +5139,6 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       );
       assert.equal(typeof progress.received_bytes, "number");
     }
-    assert.doesNotMatch(coldGroundError.message, /status/u);
-
     releaseAssets();
     const managedRoot = join(dataDir, "codestory-cli");
     const probeDeadline = Date.now() + 5000;

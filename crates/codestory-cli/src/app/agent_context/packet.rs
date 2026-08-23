@@ -8,9 +8,11 @@ use crate::output::{render_context_markdown, render_public_operation_json_conten
 use crate::runtime;
 use crate::runtime::map_api_error;
 use anyhow::Result;
+use codestory_contracts::api::AgentPacketRequestDto;
 #[cfg(test)]
-use codestory_contracts::api::{AgentPacketDto, PacketBudgetModeDto, PacketTaskClassDto};
-use codestory_contracts::api::{AgentPacketRequestDto, PacketDispositionKindDto};
+use codestory_contracts::api::{
+    AgentPacketDto, PacketBudgetModeDto, PacketDispositionKindDto, PacketTaskClassDto,
+};
 use codestory_contracts::packet_projection_v3::{
     EvidenceAvailabilityV3Dto, PacketProjectionV3Dto, RetrievalStateV3Dto,
 };
@@ -380,15 +382,6 @@ pub(crate) fn packet_disposition_label(kind: PacketDispositionKindDto) -> &'stat
         PacketDispositionKindDto::Supported => "supported",
         PacketDispositionKindDto::DrillOnce => "drill_once",
         PacketDispositionKindDto::NotEstablished => "not_established",
-        PacketDispositionKindDto::Unavailable => "unavailable",
-    }
-}
-
-pub(crate) fn packet_sufficiency_label(kind: PacketDispositionKindDto) -> &'static str {
-    match kind {
-        PacketDispositionKindDto::Supported => "available",
-        PacketDispositionKindDto::DrillOnce => "continuation_available",
-        PacketDispositionKindDto::NotEstablished => "no_useful_evidence",
         PacketDispositionKindDto::Unavailable => "unavailable",
     }
 }

@@ -385,8 +385,8 @@ pub struct ContextEvidenceRowV3Dto {
     pub identity: EvidenceIdentityV3Dto,
     pub path: PathTextV3,
     pub symbol_id: Option<SymbolIdTextV3>,
-    pub start_line: u32,
-    pub end_line: u32,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
     pub excerpt: Option<ExcerptTextV3>,
 }
 
@@ -734,8 +734,8 @@ mod tests {
                 identity: evidence_identity("context-evidence-1"),
                 path: text("src/lib.rs"),
                 symbol_id: Some(text("crate::entry")),
-                start_line: 4,
-                end_line: 9,
+                start_line: Some(4),
+                end_line: Some(9),
                 excerpt: Some(text("pub fn entry() { runtime(); }")),
             }]),
             gaps: list(vec![gap(GapKindV3Dto::EvidenceMissing)]),

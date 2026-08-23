@@ -1,7 +1,7 @@
 use super::super::artifacts::ensure_dot_only_for_trail;
+use super::super::elapsed_ms;
 use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
 use super::super::rendering::dedupe_verification_targets;
-use super::super::{elapsed_ms, packet_sufficiency_label};
 use super::reporting::{
     DrillReportContents, render_drill_contents, validate_drill_output_dir, write_drill_report_file,
 };
@@ -22,6 +22,7 @@ use codestory_contracts::api::{
     AgentCitationDto, AgentPacketDto, AgentPacketRequestDto, ApiError, IndexingPhaseTimings,
     NodeKind, PacketBudgetModeDto, SearchMatchQualityDto, StorageStatsDto,
 };
+use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
 use std::collections::HashSet;
 use std::time::Instant;
 
@@ -38,21 +39,6 @@ fn warn_on_deprecated_drill_jobs(jobs: Option<usize>) {
     if jobs.is_some() {
         eprintln!("{DEPRECATED_DRILL_JOBS_WARNING}");
     }
-}
-
-pub(in crate::app) fn packet_drill_option_ids(packet: &AgentPacketDto) -> Vec<String> {
-    packet
-        .disposition
-        .drill
-        .as_ref()
-        .map(|drill| {
-            drill
-                .options
-                .iter()
-                .map(|option| option.id.clone())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub(in crate::app) fn run_drill(cmd: DrillCommand) -> Result<()> {
@@ -170,17 +156,18 @@ pub(super) fn execute_drill(
         .projection;
         let question_search_ms = elapsed_ms(packet_timer);
         let evidence_assembly_timer = Instant::now();
-        let citations = drill_packet_citations(&evidence_packet);
+        let citations = drill_packet_citations(&evidence_packet.answer.citations);
         let anchor_outputs =
             drill_packet_anchors(&runtime.project_root, &drill_anchors, &citations);
-        let bridge_outputs = drill_packet_bridges(&runtime.project_root, &evidence_packet);
+        let bridge_outputs =
+            drill_packet_bridges(&runtime.project_root, &citations, &evidence_projection);
         let mut all_verification_targets =
             drill_packet_verification_targets(&runtime.project_root, &citations);
         dedupe_verification_targets(&mut all_verification_targets);
         let next_commands = Vec::new();
         let question_search = Some(DrillCommandStatusOutput {
             command: "packet".to_string(),
-            status: packet_sufficiency_label(evidence_packet.disposition.kind).to_string(),
+            status: drill_packet_availability_label(&evidence_projection).to_string(),
             duration_ms: u64::from(evidence_packet.answer.retrieval_trace.total_latency_ms),
             artifact: None,
             error: None,
@@ -225,7 +212,6 @@ pub(super) fn execute_drill(
             execution_boundaries: drill_execution_boundaries(),
             verification_targets: all_verification_targets,
             evidence_packet: evidence_projection,
-            legacy_evidence_packet: evidence_packet,
             next_commands,
         })
     })
@@ -237,7 +223,7 @@ fn drill_execution_boundaries() -> Vec<DrillExecutionBoundaryOutput> {
         flow: vec![
             "plan question and explicit anchor probes".to_string(),
             "execute one bounded batch retrieval".to_string(),
-            "adapt citations and sufficiency into drill reports".to_string(),
+            "adapt packet evidence availability into drill reports".to_string(),
         ],
         source_files: vec![
             "crates/codestory-runtime/src/agent/orchestrator.rs".to_string(),
@@ -253,8 +239,10 @@ pub(in crate::app) fn execute_drill_packet(
     execute(request).map_err(map_api_error)
 }
 
-pub(in crate::app) fn drill_packet_citations(packet: &AgentPacketDto) -> Vec<AgentCitationDto> {
-    let mut citations = packet.answer.citations.clone();
+pub(in crate::app) fn drill_packet_citations(
+    citations: &[AgentCitationDto],
+) -> Vec<AgentCitationDto> {
+    let mut citations = citations.to_vec();
     let mut seen = HashSet::new();
     citations.retain(|citation| {
         seen.insert((
@@ -345,7 +333,7 @@ pub(in crate::app) fn drill_search_hit_from_packet_citation(
         evidence_tier: citation.evidence_tier,
         evidence_producer: citation.evidence_producer.clone(),
         resolution_status: citation.resolution_status,
-        eligible_for_sufficiency: citation.eligible_for_sufficiency,
+        eligible_for_sufficiency: None,
         score_breakdown: citation.retrieval_score_breakdown.clone(),
         duplicate_of: None,
         excerpt: None,
@@ -375,7 +363,7 @@ pub(super) fn drill_packet_verification_target(
             .clone()
             .unwrap_or_else(|| "packet citation".to_string()),
         path: display::relative_path(project_root, citation.file_path.as_deref()?),
-        line: citation.line.unwrap_or(1),
+        line: citation.line?,
         node_ref: None,
         reason: format!("packet citation for {}", citation.display_name),
     })
@@ -404,9 +392,9 @@ pub(in crate::app) fn drill_packet_verification_targets(
 
 pub(in crate::app) fn drill_packet_bridges(
     project_root: &std::path::Path,
-    packet: &AgentPacketDto,
+    citations: &[AgentCitationDto],
+    projection: &PacketProjectionV3Dto,
 ) -> Vec<DrillBridgeOutput> {
-    let citations = drill_packet_citations(packet);
     let resolvable = citations
         .iter()
         .filter(|citation| drill_packet_citation_is_typed_resolvable(citation))
@@ -435,10 +423,10 @@ pub(in crate::app) fn drill_packet_bridges(
             status: if graph_backed {
                 "graph_path".to_string()
             } else {
-                "source_truth_only".to_string()
+                "evidence_hint_only".to_string()
             },
-            strategy: "packet_claim".to_string(),
-            confidence: if graph_backed { "high" } else { "medium" }.to_string(),
+            strategy: "packet_evidence".to_string(),
+            confidence: if graph_backed { "high" } else { "low" }.to_string(),
             evidence_kind: "packet_citations".to_string(),
             from_node: Some(drill_search_hit_from_packet_citation(
                 project_root,
@@ -454,21 +442,69 @@ pub(in crate::app) fn drill_packet_bridges(
             shared_files: Vec::new(),
             endpoint_files: endpoint_files.clone(),
             evidence_files: endpoint_files,
-            next_commands: packet_drill_option_ids(packet),
-            notes: packet
-                .support
-                .iter()
-                .map(|unit| unit.summary.clone())
-                .collect(),
+            next_commands: Vec::new(),
+            notes: drill_packet_evidence_notes(projection),
         },
         command: DrillCommandStatusOutput {
             command: "packet".to_string(),
-            status: packet_sufficiency_label(packet.disposition.kind).to_string(),
+            status: drill_packet_availability_label(projection).to_string(),
             duration_ms: 0,
             artifact: None,
             error: None,
         },
     }]
+}
+
+pub(in crate::app) fn drill_packet_availability_label(
+    projection: &PacketProjectionV3Dto,
+) -> &'static str {
+    let status = match projection {
+        PacketProjectionV3Dto::Complete { status, .. }
+        | PacketProjectionV3Dto::BudgetExceeded { status, .. } => status,
+    };
+    match status {
+        codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::Available => {
+            "available"
+        }
+        codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::ContinuationAvailable => {
+            "continuation_available"
+        }
+        codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::NoUsefulEvidence => {
+            "no_useful_evidence"
+        }
+        codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::Unavailable => {
+            "unavailable"
+        }
+    }
+}
+
+fn drill_packet_evidence_notes(projection: &PacketProjectionV3Dto) -> Vec<String> {
+    match projection {
+        PacketProjectionV3Dto::Complete { evidence, gaps, .. } => evidence
+            .as_slice()
+            .iter()
+            .filter_map(|row| {
+                row.summary
+                    .as_ref()
+                    .map(|summary| summary.as_str().to_string())
+            })
+            .chain(gaps.as_slice().iter().filter_map(|gap| {
+                gap.message
+                    .as_ref()
+                    .map(|message| format!("gap: {}", message.as_str()))
+            }))
+            .collect(),
+        PacketProjectionV3Dto::BudgetExceeded { gaps, .. } => gaps
+            .as_slice()
+            .iter()
+            .map(|gap| {
+                gap.message.as_ref().map_or_else(
+                    || format!("gap: {:?}", gap.kind).to_ascii_lowercase(),
+                    |message| format!("gap: {}", message.as_str()),
+                )
+            })
+            .collect(),
+    }
 }
 
 pub(super) fn drill_packet_citations_share_graph_evidence(

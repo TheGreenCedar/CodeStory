@@ -31,6 +31,7 @@ pub(crate) const VALIDATED_KEYWORDS: &[&str] = &[
     "additionalProperties",
     "allOf",
     "anyOf",
+    "const",
     "default",
     "description",
     "enum",
@@ -164,12 +165,31 @@ fn validate_value(schema: &Value, value: &Value, pointer: &str, out: &mut Vec<Ar
             return;
         }
     }
+    validate_const(schema, value, pointer, out);
     validate_enum(schema, value, pointer, out);
     validate_number_bounds(schema, value, pointer, out);
     validate_string_length(schema, value, pointer, out);
     validate_array(schema, value, pointer, out);
     validate_object(schema, value, pointer, out);
     validate_combinators(schema, value, pointer, out);
+}
+
+fn validate_const(
+    schema: &Map<String, Value>,
+    value: &Value,
+    pointer: &str,
+    out: &mut Vec<ArgumentViolation>,
+) {
+    let Some(expected) = schema.get("const") else {
+        return;
+    };
+    if expected != value {
+        out.push(ArgumentViolation::new(
+            "invalid_const_value",
+            pointer,
+            format!("expected {}", render_literal(expected)),
+        ));
+    }
 }
 
 fn validate_enum(
@@ -371,11 +391,15 @@ fn validate_combinators(
             .iter()
             .find(|constraint| !accepts(constraint, value))
     {
-        out.push(combined_constraint_violation(
-            constraints.len(),
-            failed,
-            pointer,
-        ));
+        if constraints.len() == 1 {
+            validate_value(failed, value, pointer, out);
+        } else {
+            out.push(combined_constraint_violation(
+                constraints.len(),
+                failed,
+                pointer,
+            ));
+        }
     }
     if let Some(forbidden) = schema.get("not")
         && accepts(forbidden, value)
@@ -560,7 +584,8 @@ mod tests {
                     || members.contains_key("allOf")
                     || members.contains_key("not")
                     || members.contains_key("items")
-                    || members.contains_key("enum");
+                    || members.contains_key("enum")
+                    || members.contains_key("const");
                 for (key, value) in members {
                     if is_schema {
                         found.insert(key.clone());
@@ -662,6 +687,35 @@ mod tests {
                 })
             ),
             vec!["unknown_property", "invalid_selector"]
+        );
+    }
+
+    #[test]
+    fn validator_enforces_const_and_single_all_of_constraints() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "kind": {"type": "string", "const": "tagged"},
+                "value": {"anyOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "integer", "minimum": 1}
+                ]}
+            },
+            "required": ["kind", "value"],
+            "allOf": [{"not": {
+                "properties": {"value": {"const": "forbidden"}},
+                "required": ["value"]
+            }}]
+        });
+
+        assert_eq!(
+            validate_structured_content(&schema, &json!({"kind":"tagged","value":1})),
+            Ok(())
+        );
+        assert_eq!(
+            codes_from_output(&schema, json!({"kind":"wrong","value":"forbidden"})),
+            vec!["invalid_const_value", "forbidden_combination"]
         );
     }
 

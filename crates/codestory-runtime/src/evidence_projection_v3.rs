@@ -152,11 +152,14 @@ pub fn project_context_v3(
         .enumerate()
         .filter_map(|(index, citation)| {
             let path = citation.file_path.as_deref()?;
-            let line = citation.line.unwrap_or(1).max(1);
+            let line = citation.line.filter(|line| *line > 0);
             Some(ContextEvidenceRowV3Dto {
                 identity: evidence_identity(&format!("context-{index}-{}", citation.node_id.0)),
                 path: path_text(path),
-                symbol_id: symbol_text(Some(citation.node_id.0.as_str())),
+                symbol_id: citation
+                    .resolvable
+                    .then(|| symbol_text(Some(citation.node_id.0.as_str())))
+                    .flatten(),
                 start_line: line,
                 end_line: line,
                 excerpt: citation.source_excerpt.as_deref().map(bounded_excerpt),
@@ -709,5 +712,70 @@ mod tests {
                 Some("resolved-node")
             );
         }
+    }
+
+    #[test]
+    fn context_projection_preserves_path_only_unresolved_uncertainty() {
+        let project = tempfile::tempdir().expect("project");
+        let source = project.path().join("unresolved.rs");
+        fs::write(&source, "pub fn unresolved_target() {}\n").expect("source");
+        let storage = project.path().join("codestory.db");
+        let controller = crate::AppController::new();
+        controller
+            .open_project_summary_with_storage_path(project.path().to_path_buf(), storage)
+            .expect("open project");
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .expect("index project");
+        let service = crate::services::PublicOperationService::new(controller);
+        let answer: AgentAnswerDto = serde_json::from_value(json!({
+            "answer_id":"context-answer",
+            "prompt":"unresolved_target",
+            "summary":"fixture",
+            "source_coverage":[],
+            "sections":[],
+            "citations":[{
+                "node_id":"unresolved-node",
+                "display_name":"unresolved_target",
+                "kind":"FUNCTION",
+                "file_path":"unresolved.rs",
+                "line":null,
+                "score":1.0,
+                "origin":"indexed_symbol",
+                "resolvable":false,
+                "evidence_edge_ids":[]
+            }],
+            "subgraph_ids":[],
+            "retrieval_version":"fixture",
+            "graphs":[],
+            "retrieval_trace":{
+                "request_id":"context-request",
+                "resolved_profile":"investigate",
+                "policy_mode":"latency_first",
+                "total_latency_ms":0,
+                "sla_missed":false,
+                "semantic_fallback_count":0,
+                "semantic_fallbacks":[],
+                "semantic_stage_timeout_zero_hits":0,
+                "semantic_abstained_count":0,
+                "annotations":[],
+                "steps":[],
+                "packet_sidecar_diagnostics":[]
+            }
+        }))
+        .expect("answer fixture");
+        let projection = service
+            .run_observational_with_cancel("context", Arc::new(AtomicBool::new(false)), || {
+                project_context_v3(&service, "test", Some("unresolved.rs"), None, &answer)
+            })
+            .expect("project context")
+            .value;
+        let serialized = serde_json::to_value(projection).expect("serialize context");
+        let evidence = &serialized["evidence"][0];
+
+        assert_eq!(evidence["path"], json!("unresolved.rs"));
+        assert_eq!(evidence["start_line"], serde_json::Value::Null);
+        assert_eq!(evidence["end_line"], serde_json::Value::Null);
+        assert_eq!(evidence["symbol_id"], serde_json::Value::Null);
     }
 }

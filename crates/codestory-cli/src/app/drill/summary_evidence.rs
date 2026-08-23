@@ -1,44 +1,56 @@
-use super::super::packet_sufficiency_label;
 use super::summary_decision::{
-    DrillVerdictEvidence, dedupe_and_rank_drill_files, drill_summary_freshness_samples,
-    drill_summary_freshness_status, drill_summary_retrieval_status,
-    drill_summary_source_truth_target_details, drill_summary_stale_file_count, drill_summary_stats,
-    drill_summary_verdict,
+    DrillAvailabilityEvidence, dedupe_and_rank_drill_files, drill_summary_availability,
+    drill_summary_evidence_target_details, drill_summary_freshness_samples,
+    drill_summary_freshness_status, drill_summary_retrieval_status, drill_summary_stale_file_count,
+    drill_summary_stats,
 };
 use crate::args::{
     DrillAnchorOutput, DrillOutput, DrillSummaryAnchorStatusOutput, DrillSummaryAnchorsOutput,
-    DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
-    DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
+    DrillSummaryBridgeStatusOutput, DrillSummaryBridgesOutput, DrillSummaryEvidenceReviewOutput,
+    DrillSummaryMechanicalOutput, DrillSummaryOpenGapsOutput, DrillSummaryOutput,
 };
-use codestory_contracts::api::{
-    ClaimReadinessDto, IndexFreshnessStatusDto, PacketDispositionKindDto,
+use codestory_contracts::api::IndexFreshnessStatusDto;
+use codestory_contracts::packet_projection_v3::{
+    ContinuationStateV3Dto, EvidenceAvailabilityV3Dto, GapKindV3Dto, PacketProjectionV3Dto,
+    ProjectionGapRowV3Dto,
 };
+
+struct DrillPacketEvidenceView<'a> {
+    availability: &'a EvidenceAvailabilityV3Dto,
+    evidence_count: usize,
+    gaps: &'a [ProjectionGapRowV3Dto],
+    continuation: Option<&'a ContinuationStateV3Dto>,
+}
 
 pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
     let anchors = drill_summary_anchors(output);
     let bridges = drill_summary_bridges(output);
-    let source_truth = drill_summary_source_truth(output);
+    let packet = drill_packet_evidence_view(&output.evidence_packet);
     let stale_freshness = output
         .mechanical
         .freshness
         .as_ref()
         .is_some_and(|freshness| freshness.status == IndexFreshnessStatusDto::Stale);
-    let open_gaps = drill_summary_open_gaps(output, &source_truth, stale_freshness);
-    let verdict = drill_summary_verdict(
+    let evidence_review = drill_summary_evidence_review(output, &packet, stale_freshness);
+    let open_gaps = drill_summary_open_gaps(&packet, &evidence_review, stale_freshness);
+    let availability = drill_summary_availability(
         output,
-        DrillVerdictEvidence {
+        DrillAvailabilityEvidence {
             resolved_anchors: anchors.resolved,
             graph_path_bridges: bridges.graph_path,
             partial_bridges: bridges.partial,
             unresolved_or_error_bridges: bridges.unresolved_or_error,
-            needs_source_truth: source_truth.required,
-            open_gap_friendly: open_gaps.open_gap_friendly,
+            packet_availability: packet.availability.clone(),
+            evidence_count: packet.evidence_count,
+            gap_count: packet.gaps.len(),
+            continuation_available: packet.continuation.is_some(),
+            pending_target_count: evidence_review.pending_target_count,
             stale_freshness,
         },
     );
 
     DrillSummaryOutput {
-        summary_version: 1,
+        summary_version: 2,
         project: output.project.clone(),
         label: output.label.clone(),
         question: output.question.clone(),
@@ -48,9 +60,9 @@ pub(super) fn drill_summary(output: &DrillOutput) -> DrillSummaryOutput {
         mechanical: drill_summary_mechanical(output),
         anchors,
         bridges,
-        source_truth,
+        evidence_review,
         open_gaps,
-        verdict,
+        availability,
     }
 }
 
@@ -76,7 +88,7 @@ fn drill_summary_mechanical(output: &DrillOutput) -> DrillSummaryMechanicalOutpu
             output.mechanical.after_edges,
             output.mechanical.after_errors,
         ),
-        index_ready: output.mechanical.after_files > 0 && output.mechanical.after_errors == 0,
+        index_available: output.mechanical.after_files > 0 && output.mechanical.after_errors == 0,
         error_delta: output.mechanical.before_errors.map(|before_errors| {
             i64::from(output.mechanical.after_errors) - i64::from(before_errors)
         }),
@@ -199,7 +211,7 @@ fn drill_summary_anchor_status(anchor: &DrillAnchorOutput) -> DrillSummaryAnchor
         slowest_command_ms: slowest
             .map(|command| command.duration_ms)
             .unwrap_or_default(),
-        source_truth_target_count: anchor.verification_targets.len(),
+        evidence_target_count: anchor.verification_targets.len(),
     }
 }
 
@@ -227,7 +239,8 @@ fn drill_summary_bridges(output: &DrillOutput) -> DrillSummaryBridgesOutput {
     let unresolved_or_error = bridge_statuses
         .iter()
         .filter(|bridge| {
-            drill_bridge_status_is_unresolved(&bridge.status) || bridge.command_status != "ok"
+            drill_bridge_status_is_unresolved(&bridge.status)
+                || drill_bridge_command_status_is_unavailable(&bridge.command_status)
         })
         .count();
     DrillSummaryBridgesOutput {
@@ -239,9 +252,38 @@ fn drill_summary_bridges(output: &DrillOutput) -> DrillSummaryBridgesOutput {
     }
 }
 
-fn drill_summary_source_truth(output: &DrillOutput) -> DrillSummarySourceTruthOutput {
-    let disposition = &output.legacy_evidence_packet.disposition;
-    let support_count = output.legacy_evidence_packet.support.len();
+pub(super) fn drill_bridge_command_status_is_unavailable(status: &str) -> bool {
+    matches!(status, "error" | "unavailable" | "no_useful_evidence")
+}
+
+fn drill_packet_evidence_view(projection: &PacketProjectionV3Dto) -> DrillPacketEvidenceView<'_> {
+    match projection {
+        PacketProjectionV3Dto::Complete {
+            status,
+            evidence,
+            gaps,
+            continuation,
+            ..
+        } => DrillPacketEvidenceView {
+            availability: status,
+            evidence_count: evidence.as_slice().len(),
+            gaps: gaps.as_slice(),
+            continuation: continuation.as_ref(),
+        },
+        PacketProjectionV3Dto::BudgetExceeded { status, gaps, .. } => DrillPacketEvidenceView {
+            availability: status,
+            evidence_count: 0,
+            gaps: gaps.as_slice(),
+            continuation: None,
+        },
+    }
+}
+
+fn drill_summary_evidence_review(
+    output: &DrillOutput,
+    packet: &DrillPacketEvidenceView<'_>,
+    stale_freshness: bool,
+) -> DrillSummaryEvidenceReviewOutput {
     let mut target_files: Vec<_> = output
         .verification_targets
         .iter()
@@ -250,83 +292,50 @@ fn drill_summary_source_truth(output: &DrillOutput) -> DrillSummarySourceTruthOu
     dedupe_and_rank_drill_files(&mut target_files);
     let target_file_count = target_files.len();
     let target_file_details =
-        drill_summary_source_truth_target_details(&target_files, &output.verification_targets);
-    let has_source_truth_checks = !target_files.is_empty();
-    let needs_source_truth = disposition.kind != PacketDispositionKindDto::Supported;
-    DrillSummarySourceTruthOutput {
-        required: needs_source_truth,
-        check_count: target_file_count,
-        pending_check_count: if has_source_truth_checks {
-            usize::from(needs_source_truth) * target_file_count
-        } else {
-            0
-        },
-        verified_check_count: if needs_source_truth {
-            0
-        } else {
-            target_file_count
-        },
+        drill_summary_evidence_target_details(&target_files, &output.verification_targets);
+    let continuation_gap_count = packet
+        .gaps
+        .iter()
+        .filter(|gap| gap.kind == GapKindV3Dto::ContinuationRequired)
+        .count();
+    let follow_up_required = packet.availability != &EvidenceAvailabilityV3Dto::Available
+        || !packet.gaps.is_empty()
+        || packet.continuation.is_some()
+        || stale_freshness;
+    DrillSummaryEvidenceReviewOutput {
+        follow_up_required,
+        evidence_count: packet.evidence_count,
+        gap_count: packet.gaps.len(),
+        continuation_gap_count,
         target_file_count,
         target_files,
         target_file_details,
-        checklist_item_count: 0,
-        claim_count: support_count,
-        pending_claim_count: disposition.omission_receipts.len(),
-        verified_claim_count: support_count,
+        pending_target_count: usize::from(follow_up_required) * target_file_count,
     }
 }
 
 fn drill_summary_open_gaps(
-    output: &DrillOutput,
-    source_truth: &DrillSummarySourceTruthOutput,
+    packet: &DrillPacketEvidenceView<'_>,
+    evidence_review: &DrillSummaryEvidenceReviewOutput,
     stale_freshness: bool,
 ) -> DrillSummaryOpenGapsOutput {
-    let disposition = &output.legacy_evidence_packet.disposition;
-    let support_count = output.legacy_evidence_packet.support.len();
-    let open_gap_friendly = !disposition.omission_receipts.is_empty()
-        || disposition.kind == PacketDispositionKindDto::DrillOnce
-        || source_truth.required
-        || stale_freshness;
     DrillSummaryOpenGapsOutput {
-        overall_status: drill_packet_claim_readiness(disposition.kind),
-        answer_quality_status: packet_sufficiency_label(disposition.kind).to_string(),
-        safe_to_say_count: support_count,
-        inferred_claim_count: 0,
-        needs_verification_count: disposition.omission_receipts.len(),
-        needs_verification_claim_count: disposition.omission_receipts.len(),
-        pending_claim_count: if source_truth.required {
-            disposition.omission_receipts.len()
-        } else {
-            0
-        },
-        pending_source_truth_check_count: if source_truth.required {
-            source_truth.target_file_count
-        } else {
-            0
-        },
-        next_command_count: disposition
-            .drill
-            .as_ref()
-            .map(|drill| drill.options.len())
-            .unwrap_or(0),
-        open_gap_friendly,
-        status: if open_gap_friendly {
-            "open_gaps_explicit".to_string()
+        availability_status: packet.availability.clone(),
+        evidence_count: packet.evidence_count,
+        gap_count: packet.gaps.len(),
+        continuation_gap_count: evidence_review.continuation_gap_count,
+        pending_target_count: evidence_review.pending_target_count,
+        continuation_available: packet.continuation.is_some(),
+        stale_freshness,
+        status: if !packet.gaps.is_empty() {
+            "gaps_reported".to_string()
+        } else if packet.continuation.is_some() {
+            "continuation_reported".to_string()
+        } else if stale_freshness {
+            "stale_observation".to_string()
         } else {
             "no_open_gaps_reported".to_string()
         },
-    }
-}
-
-pub(in crate::app) fn drill_packet_claim_readiness(
-    status: PacketDispositionKindDto,
-) -> ClaimReadinessDto {
-    match status {
-        PacketDispositionKindDto::Supported => ClaimReadinessDto::Anchored,
-        PacketDispositionKindDto::DrillOnce => ClaimReadinessDto::Partial,
-        PacketDispositionKindDto::NotEstablished | PacketDispositionKindDto::Unavailable => {
-            ClaimReadinessDto::NeedsSourceRead
-        }
     }
 }
 
@@ -338,15 +347,7 @@ pub(super) fn drill_bridge_status_is_graph(status: &str) -> bool {
 }
 
 pub(super) fn drill_bridge_status_is_partial(status: &str) -> bool {
-    matches!(
-        status,
-        "shared_file_only"
-            | "evidence_hint_only"
-            | "framework_route"
-            | "component_usage"
-            | "data_collection_usage"
-            | "source_truth_only"
-    )
+    status == "evidence_hint_only"
 }
 
 pub(super) fn drill_bridge_status_is_unresolved(status: &str) -> bool {

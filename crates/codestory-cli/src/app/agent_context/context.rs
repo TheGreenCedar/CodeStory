@@ -91,13 +91,20 @@ fn render_context_projection_markdown(
     if !context.evidence.as_slice().is_empty() {
         let _ = writeln!(markdown, "\n## Evidence");
         for row in context.evidence.as_slice() {
-            let _ = writeln!(
-                markdown,
-                "- {}:{}-{}",
-                row.path.as_str(),
-                row.start_line,
-                row.end_line
-            );
+            match (row.start_line, row.end_line) {
+                (Some(start), Some(end)) => {
+                    let _ = writeln!(markdown, "- {}:{start}-{end}", row.path.as_str());
+                }
+                (Some(start), None) => {
+                    let _ = writeln!(markdown, "- {}:{start}", row.path.as_str());
+                }
+                (None, Some(end)) => {
+                    let _ = writeln!(markdown, "- {} (through line {end})", row.path.as_str());
+                }
+                (None, None) => {
+                    let _ = writeln!(markdown, "- {}", row.path.as_str());
+                }
+            }
         }
     }
     if !context.gaps.as_slice().is_empty() {

@@ -1672,16 +1672,6 @@ fn handle_stdio_request(
                     format!("Unknown tool: {name}"),
                 ));
             }
-            if request
-                .pointer("/params/arguments")
-                .is_some_and(|value| !value.is_object() && !value.is_null())
-            {
-                return Some(stdio_jsonrpc_error(
-                    id,
-                    -32602,
-                    "Invalid params: tool arguments must be an object",
-                ));
-            }
             // Accept the server's own output vocabulary as input before anything reads
             // these arguments, so validation and the handler agree on one spelling.
             // `name` borrows from `request`, so take an owned copy for the mutation.

@@ -86,7 +86,6 @@ mod search_command;
 mod server;
 mod source_commands;
 
-pub(crate) use agent_context::packet_sufficiency_label;
 #[cfg(test)]
 use agent_context::{
     build_task_brief_output, packet_budget_mode_label, packet_task_class_label,

@@ -12,8 +12,8 @@
     "discoveryContracts": {
       "2024-11-05": "afe6f4cd28e40dbe68a22cd088fef8790a0515a67b433b4c47d5ed8e33600961",
       "2025-03-26": "af9179dcdab3f7fee0b8b2b990cfb8ee170dac24e203e789764f68dd9d11ffad",
-      "2025-06-18": "e157e7da08880f58cb797b8a7049e7f1c813624703d453f8c2c5c37a5ead7d02",
-      "2025-11-25": "e8984ec60f67a58568d8578cd277df728e1649d124406c7f70af0a6947e6a47e"
+      "2025-06-18": "33143a34100c4e2381aa72cf716823d9d88145963d306efa1f47b44c918f146f",
+      "2025-11-25": "c7690622aeb7288d57d4973632e1bd2e3a349cfe234285a332d1dd828b3efa3e"
     }
   },
   "revisionProfiles": {
@@ -3649,7 +3649,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "e157e7da08880f58cb797b8a7049e7f1c813624703d453f8c2c5c37a5ead7d02",
+      "discoveryContractSha256": "33143a34100c4e2381aa72cf716823d9d88145963d306efa1f47b44c918f146f",
       "tools": [
         {
           "_meta": {
@@ -9711,7 +9711,10 @@
                           "properties": {
                             "end_line": {
                               "minimum": 0,
-                              "type": "integer"
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
                             },
                             "excerpt": {
                               "type": [
@@ -9736,7 +9739,10 @@
                             },
                             "start_line": {
                               "minimum": 0,
-                              "type": "integer"
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
                             },
                             "symbol_id": {
                               "type": [
@@ -10063,7 +10069,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "e8984ec60f67a58568d8578cd277df728e1649d124406c7f70af0a6947e6a47e",
+      "discoveryContractSha256": "c7690622aeb7288d57d4973632e1bd2e3a349cfe234285a332d1dd828b3efa3e",
       "tools": [
         {
           "_meta": {
@@ -16125,7 +16131,10 @@
                           "properties": {
                             "end_line": {
                               "minimum": 0,
-                              "type": "integer"
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
                             },
                             "excerpt": {
                               "type": [
@@ -16150,7 +16159,10 @@
                             },
                             "start_line": {
                               "minimum": 0,
-                              "type": "integer"
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
                             },
                             "symbol_id": {
                               "type": [
@@ -22538,7 +22550,10 @@
                       "properties": {
                         "end_line": {
                           "minimum": 0,
-                          "type": "integer"
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
                         },
                         "excerpt": {
                           "type": [
@@ -22563,7 +22578,10 @@
                         },
                         "start_line": {
                           "minimum": 0,
-                          "type": "integer"
+                          "type": [
+                            "integer",
+                            "null"
+                          ]
                         },
                         "symbol_id": {
                           "type": [

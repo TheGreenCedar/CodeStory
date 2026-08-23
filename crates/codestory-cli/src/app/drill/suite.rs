@@ -13,14 +13,14 @@ use crate::args;
 use crate::args::{
     DrillCommand, DrillRuntimeTimingsOutput, DrillSuiteCommand, DrillSuiteExpectationOutput,
     DrillSuiteOutput, DrillSuiteRepoOutput, DrillSummaryAnchorStatusOutput,
-    DrillSummaryAnchorsOutput, DrillSummaryBridgesOutput, DrillSummaryMechanicalOutput,
-    DrillSummaryOpenGapsOutput, DrillSummaryOutput, DrillSummarySourceTruthOutput,
-    DrillSummaryVerdictOutput, ProjectArgs,
+    DrillSummaryAnchorsOutput, DrillSummaryAvailabilityOutput, DrillSummaryBridgesOutput,
+    DrillSummaryEvidenceReviewOutput, DrillSummaryMechanicalOutput, DrillSummaryOpenGapsOutput,
+    DrillSummaryOutput, ProjectArgs,
 };
 use crate::runtime::refresh_label;
 use crate::{display, drill_targeting};
 use anyhow::{Context, Result, bail};
-use codestory_contracts::api::ClaimReadinessDto;
+use codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
@@ -35,11 +35,11 @@ pub(in crate::app) fn run_drill_suite(cmd: DrillSuiteCommand) -> Result<()> {
     ));
     write_drill_suite_outputs(cmd.format, &cmd.output_dir, &suite_output)?;
     emit_drill_suite_progress(format!(
-        "done repos={} ready={} degraded={} blocked={} output_dir={}",
+        "done repos={} available={} partial={} unavailable={} output_dir={}",
         suite_output.repo_count,
-        suite_output.ready_count,
-        suite_output.degraded_count,
-        suite_output.blocked_count,
+        suite_output.available_count,
+        suite_output.partial_count,
+        suite_output.unavailable_count,
         suite_output.output_dir
     ));
     let markdown = render_drill_suite_markdown(&suite_output);
@@ -118,8 +118,8 @@ pub(super) fn drill_suite_repo_progress_done_message(
     summary: &DrillSummaryOutput,
 ) -> String {
     format!(
-        "[{index}/{total}] done {slug} verdict={} anchors={}/{} bridges=graph:{} partial:{} unresolved:{} output_dir={}",
-        summary.verdict.status,
+        "[{index}/{total}] done {slug} availability={} anchors={}/{} bridges=graph:{} partial:{} unresolved:{} output_dir={}",
+        summary.availability.status,
         summary.anchors.resolved,
         summary.anchors.requested,
         summary.bridges.graph_path,
@@ -148,12 +148,12 @@ pub(super) fn execute_codestory_real_repo_drill_suite(
     let suite_jobs = drill_suite_case_jobs(cmd.jobs, cmd.refresh, total_cases);
     let repos = run_drill_suite_cases(cmd, cases, suite_jobs);
 
-    let degraded_count = drill_suite_verdict_count(&repos, "degraded");
-    let blocked_count = drill_suite_verdict_count(&repos, "blocked");
-    let ready_count = drill_suite_verdict_count(&repos, "ready");
+    let partial_count = drill_suite_availability_count(&repos, "partial");
+    let unavailable_count = drill_suite_availability_count(&repos, "unavailable");
+    let available_count = drill_suite_availability_count(&repos, "available");
     let next_actions = repos
         .iter()
-        .map(|repo| format!("{}: {}", repo.slug, repo.summary.verdict.next_action))
+        .map(|repo| format!("{}: {}", repo.slug, repo.summary.availability.next_action))
         .collect::<Vec<_>>();
     let retrieval_blockers = drill_suite_retrieval_blockers(&repos);
 
@@ -163,9 +163,9 @@ pub(super) fn execute_codestory_real_repo_drill_suite(
         case_file: display::clean_path_string(&cmd.case_file.to_string_lossy()),
         output_dir: display::clean_path_string(&cmd.output_dir.to_string_lossy()),
         repo_count: repos.len(),
-        degraded_count,
-        blocked_count,
-        ready_count,
+        partial_count,
+        unavailable_count,
+        available_count,
         repos,
         retrieval_blockers,
         next_actions,
@@ -301,10 +301,13 @@ pub(super) fn run_drill_suite_case(
     }
 }
 
-pub(super) fn drill_suite_verdict_count(repos: &[DrillSuiteRepoOutput], status: &str) -> usize {
+pub(super) fn drill_suite_availability_count(
+    repos: &[DrillSuiteRepoOutput],
+    status: &str,
+) -> usize {
     repos
         .iter()
-        .filter(|repo| repo.summary.verdict.status == status)
+        .filter(|repo| repo.summary.availability.status == status)
         .count()
 }
 
@@ -477,7 +480,7 @@ fn blocked_drill_anchor_statuses(case: &DrillSuiteCase) -> Vec<DrillSummaryAncho
             consumer_summary_duration_ms: 0,
             slowest_command: None,
             slowest_command_ms: 0,
-            source_truth_target_count: 0,
+            evidence_target_count: 0,
         })
         .collect()
 }
@@ -491,7 +494,7 @@ fn blocked_drill_summary(
     next_action: String,
 ) -> DrillSummaryOutput {
     DrillSummaryOutput {
-        summary_version: 1,
+        summary_version: 2,
         project,
         label: Some(case.slug.clone()),
         question: Some(case.question.clone()),
@@ -503,7 +506,7 @@ fn blocked_drill_summary(
             before: Some(drill_summary_stats(0, 0, 0, 0)),
             before_unavailable_reason: None,
             after: drill_summary_stats(0, 0, 0, 1),
-            index_ready: false,
+            index_available: false,
             error_delta: Some(1),
             retrieval_status: None,
             freshness_status: Some("unknown".to_string()),
@@ -526,34 +529,28 @@ fn blocked_drill_summary(
             unresolved_or_error: 0,
             statuses: Vec::new(),
         },
-        source_truth: DrillSummarySourceTruthOutput {
-            required: false,
-            check_count: 0,
-            pending_check_count: 0,
-            verified_check_count: 0,
+        evidence_review: DrillSummaryEvidenceReviewOutput {
+            follow_up_required: true,
+            evidence_count: 0,
+            gap_count: 0,
+            continuation_gap_count: 0,
             target_file_count: 0,
             target_files: Vec::new(),
             target_file_details: Vec::new(),
-            checklist_item_count: 0,
-            claim_count: 0,
-            pending_claim_count: 0,
-            verified_claim_count: 0,
+            pending_target_count: 0,
         },
         open_gaps: DrillSummaryOpenGapsOutput {
-            overall_status: ClaimReadinessDto::NeedsSourceRead,
-            answer_quality_status: "blocked_before_evidence".to_string(),
-            safe_to_say_count: 0,
-            inferred_claim_count: 0,
-            needs_verification_count: 1,
-            needs_verification_claim_count: 0,
-            pending_claim_count: 0,
-            pending_source_truth_check_count: 0,
-            next_command_count: 1,
-            open_gap_friendly: true,
-            status: "blocked".to_string(),
+            availability_status: EvidenceAvailabilityV3Dto::Unavailable,
+            evidence_count: 0,
+            gap_count: 0,
+            continuation_gap_count: 0,
+            pending_target_count: 0,
+            continuation_available: false,
+            stale_freshness: false,
+            status: "evidence_collection_unavailable".to_string(),
         },
-        verdict: DrillSummaryVerdictOutput {
-            status: "blocked".to_string(),
+        availability: DrillSummaryAvailabilityOutput {
+            status: "unavailable".to_string(),
             reason: format!("drill failed before evidence collection: {error}"),
             next_action,
         },

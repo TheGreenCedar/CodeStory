@@ -232,6 +232,153 @@ fn public_v3_outcome_c_negotiates_revision_native_evidence_only_discovery() {
 }
 
 #[test]
+fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let fixture = unindexed_fixture();
+        let mut server = spawn_stdio_server(&fixture);
+        let initialized = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"initialize",
+                "method":"initialize",
+                "params":{"protocolVersion":revision}
+            }),
+        );
+        assert_eq!(
+            assert_success_envelope(&initialized, json!("initialize"))["protocolVersion"],
+            revision
+        );
+        let project = fixture.workspace.path();
+        let exact_path_probes = (0..16)
+            .map(|index| json!({"kind":"exact_path","path":format!("src/{index}.rs")}))
+            .collect::<Vec<_>>();
+        let mut overflow_probes = exact_path_probes.clone();
+        overflow_probes.push(json!({"kind":"exact_path","path":"src/overflow.rs"}));
+        let cases = vec![
+            (
+                "status-project-type",
+                "status",
+                json!({"project":7}),
+                "/arguments/project",
+                "invalid_type",
+            ),
+            (
+                "packet-root-type",
+                "packet",
+                json!([]),
+                "/arguments",
+                "invalid_type",
+            ),
+            (
+                "packet-question-required",
+                "packet",
+                json!({"project":project}),
+                "/arguments/question",
+                "missing_required",
+            ),
+            (
+                "packet-question-type",
+                "packet",
+                json!({"project":project,"question":7}),
+                "/arguments/question",
+                "invalid_type",
+            ),
+            (
+                "packet-question-bound",
+                "packet",
+                json!({"project":project,"question":""}),
+                "/arguments/question",
+                "below_min_length",
+            ),
+            (
+                "packet-budget-enum",
+                "packet",
+                json!({"project":project,"question":"why","budget":"impossible"}),
+                "/arguments/budget",
+                "invalid_enum_value",
+            ),
+            (
+                "packet-tagged-probe",
+                "packet",
+                json!({"project":project,"question":"why","probes":[{"kind":"exact_path","id":"wrong"}]}),
+                "/arguments/probes/0",
+                "invalid_selector",
+            ),
+            (
+                "packet-array-bound",
+                "packet",
+                json!({"project":project,"question":"why","probes":overflow_probes}),
+                "/arguments/probes",
+                "above_max_items",
+            ),
+            (
+                "packet-string-bound",
+                "packet",
+                json!({"project":project,"question":"why","probes":[{"kind":"exact_path","path":"x".repeat(241)}]}),
+                "/arguments/probes/0",
+                "invalid_selector",
+            ),
+            (
+                "packet-combined-bound",
+                "packet",
+                json!({"project":project,"question":"why","probes":exact_path_probes,"extra_probes":["overflow"]}),
+                "/arguments",
+                "combined_item_limit",
+            ),
+            (
+                "context-selector-required",
+                "context",
+                json!({"project":project}),
+                "/arguments",
+                "invalid_selector",
+            ),
+            (
+                "context-selector-exclusive",
+                "context",
+                json!({"project":project,"query":"entry","id":"node-1"}),
+                "/arguments",
+                "invalid_selector",
+            ),
+            (
+                "search-query-type",
+                "search",
+                json!({"project":project,"query":7}),
+                "/arguments/query",
+                "invalid_type",
+            ),
+            (
+                "search-limit-bound",
+                "search",
+                json!({"project":project,"query":"entry","limit":0}),
+                "/arguments/limit",
+                "below_minimum",
+            ),
+            (
+                "search-additional-property",
+                "search",
+                json!({"project":project,"query":"entry","extra":true}),
+                "/arguments/extra",
+                "unknown_property",
+            ),
+        ];
+
+        for (id, tool, arguments, pointer, violation_code) in cases {
+            let response = send_json(
+                &mut server,
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":id,
+                    "method":"tools/call",
+                    "params":{"name":tool,"arguments":arguments}
+                }),
+            );
+            assert_invalid_params(&response, json!(id), tool, pointer, violation_code);
+        }
+    }
+}
+
+#[test]
 fn public_v3_packet_cli_exposes_diagnostics_without_evidence_or_proof_switches() {
     let output = test_support::cli_command()
         .args(["packet", "--help"])

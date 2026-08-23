@@ -8,16 +8,16 @@
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use codestory_contracts::api::{
-    AgentPacketDto, BookmarkCategoryDto, BookmarkDto, ClaimReadinessDto, GroundingBudgetDto,
-    IndexDryRunDto, IndexFreshnessDto, IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection,
-    NodeId, NodeKind, PacketBudgetModeDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
-    PacketProbeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
-    ReadinessVerdictDto, RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
-    RetrievalStateDto, SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto,
-    SearchQueryAssessmentDto, SearchTargetDto, SnippetContextDto, SummaryGenerationDto,
-    SymbolContextDto, TrailCallerScope, TrailContextDto, TrailDirection, TrailMode,
-    validate_packet_probe,
+    BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto,
+    IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
+    PacketBudgetModeDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketProbeDto,
+    PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto,
+    RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStateDto,
+    SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto,
+    SearchTargetDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope,
+    TrailContextDto, TrailDirection, TrailMode, validate_packet_probe,
 };
+use codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto;
 use serde::Serialize;
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -2066,7 +2066,7 @@ pub(crate) struct DrillSummaryMechanicalOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) before_unavailable_reason: Option<String>,
     pub(crate) after: DrillSummaryStatsOutput,
-    pub(crate) index_ready: bool,
+    pub(crate) index_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error_delta: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2109,7 +2109,7 @@ pub(crate) struct DrillSummaryAnchorStatusOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) slowest_command: Option<String>,
     pub(crate) slowest_command_ms: u64,
-    pub(crate) source_truth_target_count: usize,
+    pub(crate) evidence_target_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2141,45 +2141,39 @@ pub(crate) struct DrillSummaryBridgesOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSummarySourceTruthTargetOutput {
+pub(crate) struct DrillSummaryEvidenceTargetOutput {
     pub(crate) path: String,
     pub(crate) role: String,
     pub(crate) rank_reason: String,
-    pub(crate) check_reasons: Vec<String>,
+    pub(crate) evidence_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSummarySourceTruthOutput {
-    pub(crate) required: bool,
-    pub(crate) check_count: usize,
-    pub(crate) pending_check_count: usize,
-    pub(crate) verified_check_count: usize,
+pub(crate) struct DrillSummaryEvidenceReviewOutput {
+    pub(crate) follow_up_required: bool,
+    pub(crate) evidence_count: usize,
+    pub(crate) gap_count: usize,
+    pub(crate) continuation_gap_count: usize,
     pub(crate) target_file_count: usize,
     pub(crate) target_files: Vec<String>,
-    pub(crate) target_file_details: Vec<DrillSummarySourceTruthTargetOutput>,
-    pub(crate) checklist_item_count: usize,
-    pub(crate) claim_count: usize,
-    pub(crate) pending_claim_count: usize,
-    pub(crate) verified_claim_count: usize,
+    pub(crate) target_file_details: Vec<DrillSummaryEvidenceTargetOutput>,
+    pub(crate) pending_target_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct DrillSummaryOpenGapsOutput {
-    pub(crate) overall_status: ClaimReadinessDto,
-    pub(crate) answer_quality_status: String,
-    pub(crate) safe_to_say_count: usize,
-    pub(crate) inferred_claim_count: usize,
-    pub(crate) needs_verification_count: usize,
-    pub(crate) needs_verification_claim_count: usize,
-    pub(crate) pending_claim_count: usize,
-    pub(crate) pending_source_truth_check_count: usize,
-    pub(crate) next_command_count: usize,
-    pub(crate) open_gap_friendly: bool,
+    pub(crate) availability_status: EvidenceAvailabilityV3Dto,
+    pub(crate) evidence_count: usize,
+    pub(crate) gap_count: usize,
+    pub(crate) continuation_gap_count: usize,
+    pub(crate) pending_target_count: usize,
+    pub(crate) continuation_available: bool,
+    pub(crate) stale_freshness: bool,
     pub(crate) status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub(crate) struct DrillSummaryVerdictOutput {
+pub(crate) struct DrillSummaryAvailabilityOutput {
     pub(crate) status: String,
     pub(crate) reason: String,
     pub(crate) next_action: String,
@@ -2206,9 +2200,9 @@ pub(crate) struct DrillSummaryOutput {
     pub(crate) mechanical: DrillSummaryMechanicalOutput,
     pub(crate) anchors: DrillSummaryAnchorsOutput,
     pub(crate) bridges: DrillSummaryBridgesOutput,
-    pub(crate) source_truth: DrillSummarySourceTruthOutput,
+    pub(crate) evidence_review: DrillSummaryEvidenceReviewOutput,
     pub(crate) open_gaps: DrillSummaryOpenGapsOutput,
-    pub(crate) verdict: DrillSummaryVerdictOutput,
+    pub(crate) availability: DrillSummaryAvailabilityOutput,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2232,8 +2226,6 @@ pub(crate) struct DrillOutput {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) verification_targets: Vec<VerificationTargetOutput>,
     pub(crate) evidence_packet: codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
-    #[serde(skip)]
-    pub(crate) legacy_evidence_packet: AgentPacketDto,
     pub(crate) next_commands: Vec<String>,
 }
 
@@ -2276,9 +2268,9 @@ pub(crate) struct DrillSuiteOutput {
     pub(crate) case_file: String,
     pub(crate) output_dir: String,
     pub(crate) repo_count: usize,
-    pub(crate) degraded_count: usize,
-    pub(crate) blocked_count: usize,
-    pub(crate) ready_count: usize,
+    pub(crate) partial_count: usize,
+    pub(crate) unavailable_count: usize,
+    pub(crate) available_count: usize,
     pub(crate) repos: Vec<DrillSuiteRepoOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) retrieval_blockers: Vec<DrillSuiteRetrievalBlockerOutput>,

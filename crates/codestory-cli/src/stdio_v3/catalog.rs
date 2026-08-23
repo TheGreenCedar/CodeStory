@@ -376,8 +376,11 @@ fn context_evidence_schema_v3() -> Value {
         ("identity", evidence_identity_schema_v3()),
         ("path", string_schema_v3()),
         ("symbol_id", nullable_schema_v3(string_schema_v3())),
-        ("start_line", unsigned_integer_schema_v3()),
-        ("end_line", unsigned_integer_schema_v3()),
+        (
+            "start_line",
+            nullable_schema_v3(unsigned_integer_schema_v3()),
+        ),
+        ("end_line", nullable_schema_v3(unsigned_integer_schema_v3())),
         ("excerpt", nullable_schema_v3(string_schema_v3())),
     ])
 }
