@@ -665,6 +665,31 @@ fn typescript_root_has_competing_value_binding(root: TsNode<'_>, name: &str, sou
     found
 }
 
+fn typescript_root_has_competing_export_binding(
+    root: TsNode<'_>,
+    exported_declaration: TsNode<'_>,
+    name: &str,
+    source: &str,
+) -> Result<bool, ()> {
+    let mut found = false;
+    let mut complete = true;
+    walk_nodes(root, &mut |node| {
+        if found || !complete || node.id() == exported_declaration.id() {
+            return;
+        }
+        match typescript_binding_regions(node) {
+            Err(()) => complete = false,
+            Ok(Some(regions)) => {
+                found = regions
+                    .into_iter()
+                    .any(|region| subtree_binds(region, name, source));
+            }
+            Ok(None) => {}
+        }
+    });
+    complete.then_some(found).ok_or(())
+}
+
 fn rust_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
     let mut cursor = root.walk();
     root.named_children(&mut cursor).any(|node| {
@@ -911,7 +936,15 @@ fn collect_typescript_direct_exports(
         }
         let is_default = export_statement_has_default_token(statement)?;
         let name = declaration_name(declaration, source)?;
-        if root_has_write(tree.root_node(), name, source) {
+        if root_has_write(tree.root_node(), name, source)
+            || typescript_root_has_competing_export_binding(
+                tree.root_node(),
+                declaration,
+                name,
+                source,
+            )
+            .ok()?
+        {
             continue;
         }
         let node_id = map_callable_declaration(nodes, file_id, declaration, source)?;

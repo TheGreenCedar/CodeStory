@@ -505,6 +505,61 @@ fn typescript_direct_exports_are_classified_from_closed_syntax() -> anyhow::Resu
 }
 
 #[test]
+fn typescript_direct_export_requires_a_unique_module_value_binding() -> anyhow::Result<()> {
+    for competing_binding in [
+        "function other() {}\nvar target = other;\n",
+        "function other() {}\nlet target = other;\n",
+        "function other() {}\nconst target = other;\n",
+        "function other() {}\nconst [target] = [other];\n",
+        "class target {}\n",
+        "enum target { Value }\n",
+        "namespace target {}\n",
+        "import { other as target } from './other';\n",
+        "function target() {}\n",
+        "declare function target(): void;\n",
+        "function target(): void;\n",
+    ] {
+        let exporter = format!("export function target() {{}}\n{competing_binding}");
+        assert_only_call_is_not_exact(&[
+            ("src/exported.ts", exporter.as_str()),
+            ("src/other.ts", "export function other() {}\n"),
+            (
+                "src/importer.ts",
+                "import { target } from './exported';\nexport function caller() { target(); }\n",
+            ),
+        ])?;
+    }
+    assert_only_call_is_not_exact(&[
+        (
+            "src/exported.ts",
+            "export default async function target() {}\nfunction other() {}\nvar target = other;\n",
+        ),
+        (
+            "src/importer.ts",
+            "import target from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_exact(&[
+        ("src/exported.ts", "export async function target() {}\n"),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_exact(&[
+        (
+            "src/exported.ts",
+            "export default async function target() {}\n",
+        ),
+        (
+            "src/importer.ts",
+            "import target from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    Ok(())
+}
+
+#[test]
 fn rust_exact_rejects_lexical_module_and_inherent_lookup_ambiguity() -> anyhow::Result<()> {
     assert_only_call_is_not_exact(&[(
         "src/parameter.rs",
