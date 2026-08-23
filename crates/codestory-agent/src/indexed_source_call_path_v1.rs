@@ -2110,9 +2110,9 @@ fn indexed_receipt_source_order(
     left: &IndexedCallEdgeReceipt,
     right: &IndexedCallEdgeReceipt,
 ) -> Ordering {
-    left.containment
-        .file_node_id
-        .cmp(&right.containment.file_node_id)
+    left.line_window
+        .project_file_components
+        .cmp(&right.line_window.project_file_components)
         .then_with(|| {
             left.exact_callsite_start_byte
                 .cmp(&right.exact_callsite_start_byte)
@@ -3001,65 +3001,70 @@ mod tests {
     #[test]
     fn authoritative_receipts_follow_authenticated_source_order() {
         let (contract, hashes, rendering) = validate_for_projection(&["B"]);
-        let mut earlier = indexed_receipt(0, "A", "B", "first();\n".to_owned());
-        earlier.receipt = ReceiptRef {
-            receipt_id: "receipt-z".to_owned(),
+        let mut earlier_file = indexed_receipt(0, "A", "B", "first();\n".to_owned());
+        earlier_file.receipt = ReceiptRef {
+            receipt_id: "receipt-z-file".to_owned(),
             edge_id: "200".to_owned(),
         };
-        earlier.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
-        earlier.line_window.anchor_line = 10;
-        earlier.callsite_identity = "1:10:7:2|rust".to_owned();
+        earlier_file.line_window.project_file_components =
+            vec!["src".to_owned(), "a.rs".to_owned()];
+        earlier_file.containment.file_node_id = NodeId(99);
+        earlier_file.exact_callsite_start_byte = 40;
 
-        let mut later = indexed_receipt(1, "A", "B", "second();\n".to_owned());
-        later.receipt = ReceiptRef {
-            receipt_id: "receipt-a".to_owned(),
+        let mut later_file = indexed_receipt(1, "A", "B", "second();\n".to_owned());
+        later_file.receipt = ReceiptRef {
+            receipt_id: "receipt-a-file".to_owned(),
             edge_id: "100".to_owned(),
         };
-        later.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
-        later.line_window.anchor_line = 20;
-        later.callsite_identity = "1:20:3:2|rust".to_owned();
+        later_file.line_window.project_file_components = vec!["src".to_owned(), "z.rs".to_owned()];
+        later_file.containment.file_node_id = NodeId(1);
+        later_file.exact_callsite_start_byte = 40;
 
-        let integrated = checked_integration(
-            &contract,
-            &hashes,
-            &rendering,
-            built_from_receipts(vec![later, earlier.clone()], Vec::new(), Vec::new()),
-        );
-        assert_eq!(
-            integrated.authoritative_receipts(),
-            [earlier],
-            "receipt and edge identifiers must not outrank earlier source coordinates"
-        );
-
-        let mut lower_column = indexed_receipt(2, "A", "B", "column_two();\n".to_owned());
-        lower_column.receipt = ReceiptRef {
-            receipt_id: "receipt-z-column".to_owned(),
-            edge_id: "200".to_owned(),
-        };
-        lower_column.line_window.project_file_components =
-            vec!["src".to_owned(), "same.rs".to_owned()];
-        lower_column.line_window.anchor_line = 30;
-        lower_column.column_or_ordinal = 2;
-        let mut higher_column = indexed_receipt(3, "A", "B", "column_nine();\n".to_owned());
-        higher_column.receipt = ReceiptRef {
-            receipt_id: "receipt-a-column".to_owned(),
-            edge_id: "100".to_owned(),
-        };
-        higher_column.line_window.project_file_components =
-            lower_column.line_window.project_file_components.clone();
-        higher_column.line_window.anchor_line = 30;
-        higher_column.column_or_ordinal = 9;
         let integrated = checked_integration(
             &contract,
             &hashes,
             &rendering,
             built_from_receipts(
-                vec![higher_column, lower_column.clone()],
+                vec![later_file, earlier_file.clone()],
                 Vec::new(),
                 Vec::new(),
             ),
         );
-        assert_eq!(integrated.authoritative_receipts(), [lower_column]);
+        assert_eq!(
+            integrated.authoritative_receipts(),
+            [earlier_file],
+            "native-bound project file identity must outrank graph file and edge identifiers"
+        );
+
+        let mut earlier_byte = indexed_receipt(2, "A", "B", "earlier();\n".to_owned());
+        earlier_byte.receipt = ReceiptRef {
+            receipt_id: "receipt-z-byte".to_owned(),
+            edge_id: "200".to_owned(),
+        };
+        earlier_byte.line_window.project_file_components =
+            vec!["src".to_owned(), "same.rs".to_owned()];
+        earlier_byte.containment.file_node_id = NodeId(99);
+        earlier_byte.exact_callsite_start_byte = 20;
+        let mut later_byte = indexed_receipt(3, "A", "B", "later();\n".to_owned());
+        later_byte.receipt = ReceiptRef {
+            receipt_id: "receipt-a-byte".to_owned(),
+            edge_id: "100".to_owned(),
+        };
+        later_byte.line_window.project_file_components =
+            earlier_byte.line_window.project_file_components.clone();
+        later_byte.containment.file_node_id = NodeId(1);
+        later_byte.exact_callsite_start_byte = 40;
+        let integrated = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![later_byte, earlier_byte.clone()],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        assert_eq!(integrated.authoritative_receipts(), [earlier_byte]);
 
         let mut edge_two = indexed_receipt(4, "A", "B", "edge_two();\n".to_owned());
         edge_two.receipt = ReceiptRef {
@@ -3067,8 +3072,8 @@ mod tests {
             edge_id: "2".to_owned(),
         };
         edge_two.line_window.project_file_components = vec!["src".to_owned(), "same.rs".to_owned()];
-        edge_two.line_window.anchor_line = 40;
-        edge_two.column_or_ordinal = 4;
+        edge_two.containment.file_node_id = NodeId(7);
+        edge_two.exact_callsite_start_byte = 40;
         let mut edge_ten = indexed_receipt(5, "A", "B", "edge_ten();\n".to_owned());
         edge_ten.receipt = ReceiptRef {
             receipt_id: "receipt-a-edge".to_owned(),
@@ -3076,8 +3081,8 @@ mod tests {
         };
         edge_ten.line_window.project_file_components =
             edge_two.line_window.project_file_components.clone();
-        edge_ten.line_window.anchor_line = 40;
-        edge_ten.column_or_ordinal = 4;
+        edge_ten.containment.file_node_id = NodeId(7);
+        edge_ten.exact_callsite_start_byte = 40;
         let integrated = checked_integration(
             &contract,
             &hashes,

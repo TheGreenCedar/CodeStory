@@ -727,7 +727,13 @@ where
             };
             let exact_start = usize::try_from(resolution_fact.callsite.start_byte).ok();
             let exact_end = usize::try_from(resolution_fact.callsite.end_byte_exclusive).ok();
-            if exact_start.is_none_or(|start| start < byte_start)
+            let expected_exact_start = resolution_fact
+                .callsite
+                .column
+                .checked_sub(1)
+                .and_then(|column| usize::try_from(column).ok())
+                .and_then(|column| byte_start.checked_add(column));
+            if exact_start != expected_exact_start
                 || exact_end.is_none_or(|end| end > byte_end)
                 || exact_start
                     .zip(exact_end)
@@ -1640,6 +1646,15 @@ mod tests {
         store
             .insert_node(&node(3, NodeKind::FUNCTION, "target", "target-id", 1, 2, 2))
             .unwrap();
+        let target_column = bytes
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| {
+                line.windows("target".len())
+                    .position(|window| window == b"target")
+            })
+            .and_then(|column| u32::try_from(column + 1).ok())
+            .unwrap_or(1);
         store
             .insert_node(&Node {
                 id: NodeId(30),
@@ -1649,9 +1664,9 @@ mod tests {
                 canonical_id: None,
                 file_node_id: Some(NodeId(1)),
                 start_line: Some(1),
-                start_col: Some(1),
+                start_col: Some(target_column),
                 end_line: Some(1),
-                end_col: Some(1),
+                end_col: target_column.checked_add(6),
             })
             .unwrap();
         store
@@ -1752,30 +1767,7 @@ mod tests {
                         .map_or(0, |(index, _)| index + 1)
                 };
                 let expected_start = line_start + column.saturating_sub(1) as usize;
-                let line_end = source[line_start..]
-                    .iter()
-                    .position(|byte| *byte == b'\n')
-                    .map(|offset| line_start + offset)
-                    .unwrap_or(source.len());
-                let occurrences = source[line_start..line_end]
-                    .windows(raw_target.len())
-                    .enumerate()
-                    .filter_map(|(offset, window)| {
-                        (window == raw_target.as_bytes()).then_some(line_start + offset)
-                    })
-                    .collect::<Vec<_>>();
-                let start_byte = if occurrences.len() > 1 {
-                    occurrences
-                        .get(column_or_ordinal.saturating_sub(1) as usize)
-                        .copied()
-                        .unwrap_or(expected_start)
-                } else if source.get(expected_start..expected_start + raw_target.len())
-                    == Some(raw_target.as_bytes())
-                {
-                    expected_start
-                } else {
-                    occurrences.first().copied().unwrap_or(0)
-                } as u64;
+                let start_byte = expected_start as u64;
                 seal_call_resolution_fact(CallResolutionFact {
                     fact_id: String::new(),
                     edge_id: Some(edge.id),
@@ -1902,64 +1894,6 @@ mod tests {
             publication,
             project_id: project_identity_v3(&root).project_id,
         }
-    }
-
-    fn store_with_adversarial_call_edge_ids(fixture: &SourceBuiltFixture) -> Store {
-        let mut edges = fixture.store.get_edges().unwrap();
-        let mut call_offsets = edges
-            .iter()
-            .enumerate()
-            .filter(|(_, edge)| edge.kind == EdgeKind::CALL)
-            .map(|(offset, edge)| {
-                let RawCallEdgeAdmission::Admitted(admitted) =
-                    admit_raw_call_edge(edge, edge.effective_source(), edge.effective_target())
-                else {
-                    panic!("source-built call edge must be admitted: {edge:?}");
-                };
-                (offset, admitted.column_or_ordinal)
-            })
-            .collect::<Vec<_>>();
-        call_offsets.sort_by_key(|(_, ordinal)| *ordinal);
-        assert_eq!(call_offsets.len(), 2, "two real source-built calls");
-        assert!(
-            call_offsets[0].1 < call_offsets[1].1,
-            "the real indexer must authenticate exact source occurrence order"
-        );
-        edges[call_offsets[0].0].id = EdgeId(200);
-        edges[call_offsets[1].0].id = EdgeId(100);
-
-        let mut store = Store::new_in_memory().unwrap();
-        let files = fixture.store.files().get_files().unwrap();
-        for file in &files {
-            store.insert_file(file).unwrap();
-            let content_hash = fixture.store.get_file_content_hash(file.id).unwrap();
-            store
-                .update_file_metadata(file, content_hash.as_deref())
-                .unwrap();
-        }
-        store
-            .insert_nodes_batch(&fixture.store.get_nodes().unwrap())
-            .unwrap();
-        store.insert_edges_batch(&edges).unwrap();
-        store
-            .insert_occurrences_batch(&fixture.store.get_occurrences().unwrap())
-            .unwrap();
-        for file in files {
-            let projections = fixture
-                .store
-                .get_callable_projection_states_for_file(file.id)
-                .unwrap();
-            store
-                .upsert_callable_projection_states(&projections)
-                .unwrap();
-        }
-        let call_edge_ids = edges
-            .iter()
-            .filter(|edge| edge.kind == EdgeKind::CALL)
-            .map(|edge| edge.id)
-            .collect::<Vec<_>>();
-        publish_manual_resolution_facts(&mut store, &fixture.publication, &call_edge_ids);
-        store
     }
 
     fn source_callable(store: &Store, terminal_name: &str) -> Node {
@@ -2597,15 +2531,85 @@ mod tests {
     }
 
     #[test]
-    fn source_built_same_line_calls_use_source_order_before_adversarial_edge_ids() {
-        let mut fixture = source_built_fixture_with_extension(
-            "rs",
-            "fn target(value: i32) -> i32 { value }\n\
-             fn source() -> i32 { target(1) + target(2) }\n",
-        );
+    fn source_built_resealed_span_cannot_move_to_an_identical_same_line_token() {
+        let source_text = "fn target() {}\n\
+                           fn source() { target(); let _label = \"target\"; }\n";
+        let mut fixture = source_built_fixture(source_text);
         let source = source_callable(&fixture.store, "source");
         let target = source_callable(&fixture.store, "target");
-        fixture.store = store_with_adversarial_call_edge_ids(&fixture);
+        let (contract, _hashes, _rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+        let manifest = fixture
+            .store
+            .get_proof_resolution_publication()
+            .unwrap()
+            .unwrap();
+        let mut facts = fixture.store.get_proof_resolution_facts().unwrap();
+        let exact = facts
+            .iter_mut()
+            .find(|fact| fact.status == ProofResolutionStatus::Exact)
+            .expect("one exact source-built call");
+        let authentic_start = exact.callsite.start_byte;
+        let shifted_start = u64::try_from(source_text.rfind("target").unwrap()).unwrap();
+        assert!(shifted_start > authentic_start);
+        exact.callsite.start_byte = shifted_start;
+        exact.callsite.end_byte_exclusive = shifted_start + exact.callsite.raw_target.len() as u64;
+        *exact = seal_call_resolution_fact(exact.clone()).unwrap();
+        let funnel = build_proof_resolution_funnel(&facts);
+        fixture
+            .store
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM proof_resolution_fact; DELETE FROM proof_resolution_publication;",
+            )
+            .unwrap();
+        fixture
+            .store
+            .replace_proof_resolution_projection(
+                &fixture.publication,
+                &ProofResolutionProjection {
+                    adapter_roster: manifest.adapter_roster,
+                    facts,
+                    funnel,
+                },
+            )
+            .expect("the store cannot inspect source bytes, so runtime must close the span");
+
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed.built.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
+        );
+        assert!(observed.built.receipts.is_empty());
+        assert!(matches!(
+            observed.trace.steps[0].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Line,
+                ref histogram,
+            } if histogram.iter().any(|failure| {
+                failure.reason
+                    == CandidateFailure::SourceBinding(
+                        SourceBindingFailure::ExactCallsiteMismatch,
+                    )
+            })
+        ));
+    }
+
+    #[test]
+    fn source_built_exact_span_accepts_byte_columns_after_multibyte_and_crlf_lines() {
+        let source_text = "fn target() {}\r\nfn source() { let _accent = \"é\"; target(); }\r\n";
+        let fixture = source_built_fixture(source_text);
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
         let (contract, hashes, rendering) =
             validated_contract(canonical_id(&source), &[canonical_id(&target)]);
 
@@ -2623,12 +2627,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.built_facts().receipts.len(), 2);
         assert!(matches!(
             result.disposition(),
-            ProofDisposition::ContractProven { receipts, .. }
-                if receipts.len() == 1 && receipts[0].edge_id == "200"
+            ProofDisposition::ContractProven { .. }
         ));
+        assert_eq!(
+            result.built_facts().receipts[0].exact_callsite_start_byte,
+            u64::try_from(source_text.rfind("target").unwrap()).unwrap()
+        );
     }
 
     #[test]
