@@ -10,6 +10,11 @@ use codestory_store::{
     FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
     seal_call_resolution_fact,
 };
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 fn publication() -> IndexPublicationRecord {
     IndexPublicationRecord {
@@ -62,7 +67,17 @@ fn exact_fact(edge_id: EdgeId) -> CallResolutionFact {
     .expect("seal fact")
 }
 
+fn repeated_exact_fact(index: u32) -> CallResolutionFact {
+    let mut fact = exact_fact(EdgeId(7 + i64::from(index)));
+    fact.raw_callsite_identity = Some(format!("1:2:{}:4", index + 1));
+    fact.callsite.start_byte = 24 + u64::from(index) * 10;
+    fact.callsite.end_byte_exclusive = fact.callsite.start_byte + 6;
+    fact.callsite.column = 15 + index * 10;
+    seal_call_resolution_fact(fact).expect("seal repeated fact")
+}
+
 fn projection(facts: Vec<CallResolutionFact>) -> ProofResolutionProjection {
+    let exact_count = u64::try_from(facts.len()).expect("test fact count fits u64");
     ProofResolutionProjection {
         adapter_roster: vec![ProofResolutionAdapter {
             language: "rust".to_owned(),
@@ -74,14 +89,14 @@ fn projection(facts: Vec<CallResolutionFact>) -> ProofResolutionProjection {
             callee_form: Some(CalleeForm::Identifier),
             evidence_kind: Some(ResolutionEvidenceKind::SameFileDeclaration),
             counts: ProofResolutionFunnelCounts {
-                syntax_calls: 1,
-                adapter_supported: 1,
-                exact: 1,
+                syntax_calls: exact_count,
+                adapter_supported: exact_count,
+                exact: exact_count,
                 ambiguous: 0,
                 missing_binding: 0,
                 incomplete_domain: 0,
                 unsupported: 0,
-                exact_call_linked: 1,
+                exact_call_linked: exact_count,
                 proof_shape_admitted: 0,
                 authoritative_receipts: 0,
                 complete_proofs: 0,
@@ -163,6 +178,57 @@ fn seed_exact_graph(store: &mut Store) {
         .expect("edge");
 }
 
+fn seed_repeated_exact_graph(store: &mut Store, fact_count: u32) {
+    seed_exact_graph(store);
+    for index in 1..fact_count {
+        store
+            .insert_edge(&Edge {
+                id: EdgeId(7 + i64::from(index)),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(2),
+                resolved_target: Some(NodeId(3)),
+                callsite_identity: Some(format!("1:2:{}:4", index + 1)),
+                ..Default::default()
+            })
+            .expect("repeated call edge");
+    }
+}
+
+fn graph_read_authorizations_for_projection(fact_count: u32) -> usize {
+    let mut store = Store::new_in_memory().expect("store");
+    seed_repeated_exact_graph(&mut store, fact_count);
+    let graph_reads = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&graph_reads);
+    store
+        .get_connection()
+        .authorizer(Some(move |context: AuthContext<'_>| {
+            if matches!(
+                context.action,
+                AuthAction::Read {
+                    table_name: "file" | "node" | "edge",
+                    ..
+                }
+            ) {
+                observed.fetch_add(1, Ordering::Relaxed);
+            }
+            Authorization::Allow
+        }))
+        .expect("install graph read observer");
+
+    let facts = (0..fact_count).map(repeated_exact_fact).collect();
+    store
+        .replace_proof_resolution_projection(&publication(), &projection(facts))
+        .expect("publish repeated exact facts");
+    store
+        .get_connection()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .expect("remove graph read observer");
+    graph_reads.load(Ordering::Relaxed)
+}
+
 #[test]
 fn schema_32_migration_creates_no_synthetic_proof_publication() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -200,6 +266,18 @@ fn exact_projection_round_trips_with_matching_raw_call_and_deterministic_digest(
     assert_eq!(
         first,
         store.get_proof_resolution_publication().unwrap().unwrap()
+    );
+}
+
+#[test]
+fn projection_validation_prepares_graph_reads_once_for_all_exact_facts() {
+    let one_fact_reads = graph_read_authorizations_for_projection(1);
+    let eight_fact_reads = graph_read_authorizations_for_projection(8);
+
+    assert!(one_fact_reads > 0, "the graph read observer must be active");
+    assert_eq!(
+        eight_fact_reads, one_fact_reads,
+        "graph-table reads must be prepared once per projection, not once per fact"
     );
 }
 

@@ -176,6 +176,60 @@ fn dependency_file_ids(fact: &CallResolutionFact) -> BTreeSet<FileId> {
         .collect()
 }
 
+struct ProofResolutionValidationContext {
+    file_by_id: HashMap<i64, FileInfo>,
+    file_content_hash_by_id: HashMap<i64, String>,
+    node_by_id: HashMap<NodeId, Node>,
+    edges: Vec<Edge>,
+    edge_index_by_id: HashMap<EdgeId, usize>,
+    import_relation_counts: HashMap<(NodeId, NodeId, NodeId), usize>,
+    member_relation_counts: HashMap<(NodeId, NodeId), usize>,
+}
+
+impl ProofResolutionValidationContext {
+    fn prepare(storage: &Storage) -> Result<Self, StorageError> {
+        let file_by_id = storage
+            .get_files()?
+            .into_iter()
+            .map(|file| (file.id, file))
+            .collect();
+        let file_content_hash_by_id = storage.get_file_content_hashes()?;
+        let node_by_id = storage
+            .get_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node))
+            .collect();
+        let edges = storage.get_edges()?;
+        let mut edge_index_by_id = HashMap::with_capacity(edges.len());
+        let mut import_relation_counts = HashMap::new();
+        let mut member_relation_counts = HashMap::new();
+        for (index, edge) in edges.iter().enumerate() {
+            edge_index_by_id.insert(edge.id, index);
+            if edge.kind == EdgeKind::IMPORT
+                && let (Some(file_id), Some(target)) = (edge.file_node_id, edge.resolved_target)
+            {
+                *import_relation_counts
+                    .entry((file_id, edge.source, target))
+                    .or_default() += 1;
+            }
+            if edge.kind == EdgeKind::MEMBER {
+                *member_relation_counts
+                    .entry((edge.effective_source(), edge.effective_target()))
+                    .or_default() += 1;
+            }
+        }
+        Ok(Self {
+            file_by_id,
+            file_content_hash_by_id,
+            node_by_id,
+            edges,
+            edge_index_by_id,
+            import_relation_counts,
+            member_relation_counts,
+        })
+    }
+}
+
 impl Storage {
     pub fn proof_resolution_fact_count(&self) -> Result<u64, StorageError> {
         let count: i64 =
@@ -345,12 +399,7 @@ impl Storage {
         for fact in facts {
             validate_fact_seal(fact)?;
         }
-        let graph_edges = self.get_edges()?;
-        let nodes = self
-            .get_nodes()?
-            .into_iter()
-            .map(|node| (node.id, node))
-            .collect::<HashMap<_, _>>();
+        let context = ProofResolutionValidationContext::prepare(self)?;
         let exact_fact_indices = facts
             .iter()
             .enumerate()
@@ -374,18 +423,20 @@ impl Storage {
                 }
             })
             .collect::<Vec<_>>();
-        let ordinary_edge_indices = graph_edges
+        let ordinary_edge_indices = context
+            .edges
             .iter()
             .enumerate()
             .filter_map(|(index, edge)| {
-                (edge.kind == EdgeKind::CALL && nodes.contains_key(&edge.target)).then_some(index)
+                (edge.kind == EdgeKind::CALL && context.node_by_id.contains_key(&edge.target))
+                    .then_some(index)
             })
             .collect::<Vec<_>>();
         let edge_inputs = ordinary_edge_indices
             .iter()
             .map(|index| {
-                let edge = &graph_edges[*index];
-                let raw = &nodes[&edge.target];
+                let edge = &context.edges[*index];
+                let raw = &context.node_by_id[&edge.target];
                 OrdinaryCallEdgeCorrelationInput {
                     file_id: edge.file_node_id.map(|file| FileId(file.0)),
                     line: edge.line,
@@ -404,7 +455,7 @@ impl Storage {
         let correlations = correlate_exact_syntax_callsites(&syntax_inputs, &edge_inputs)
             .into_iter()
             .map(|result| {
-                result.map(|edge_index| graph_edges[ordinary_edge_indices[edge_index]].id)
+                result.map(|edge_index| context.edges[ordinary_edge_indices[edge_index]].id)
             })
             .collect::<Vec<_>>();
         let mut fact_correlations = vec![None; facts.len()];
@@ -412,27 +463,28 @@ impl Storage {
             fact_correlations[fact_index] = Some(correlations[correlation_index]);
         }
         for (fact_index, fact) in facts.iter().enumerate() {
-            self.validate_fact_against_graph(fact, &graph_edges, fact_correlations[fact_index])?;
+            Self::validate_fact_against_graph(fact, &context, fact_correlations[fact_index])?;
         }
         Ok(())
     }
 
     fn validate_fact_against_graph(
-        &self,
         fact: &CallResolutionFact,
-        graph_edges: &[Edge],
+        context: &ProofResolutionValidationContext,
         correlation: Option<Result<EdgeId, ExactCallsiteCorrelationFailure>>,
     ) -> Result<(), StorageError> {
-        let stored_source_hash = self
-            .get_file_content_hash(fact.callsite.file_id.0)?
+        let stored_source_hash = context
+            .file_content_hash_by_id
+            .get(&fact.callsite.file_id.0)
             .ok_or_else(|| proof_error("callsite file has no publication-bound source hash"))?;
-        if stored_source_hash != fact.callsite.source_sha256 {
+        if stored_source_hash != &fact.callsite.source_sha256 {
             return Err(proof_error(
                 "callsite source hash does not match the graph file",
             ));
         }
-        let caller = self
-            .get_node(fact.caller)?
+        let caller = context
+            .node_by_id
+            .get(&fact.caller)
             .ok_or_else(|| proof_error("caller node is missing"))?;
         if caller.file_node_id != Some(NodeId(fact.callsite.file_id.0))
             || caller
@@ -459,8 +511,9 @@ impl Storage {
         evidence_node_ids.sort_unstable();
         evidence_node_ids.dedup();
         for node_id in evidence_node_ids {
-            let node = self
-                .get_node(node_id)?
+            let node = context
+                .node_by_id
+                .get(&node_id)
                 .ok_or_else(|| proof_error("typed evidence references a missing graph node"))?;
             if let Some(file_id) = node.file_node_id {
                 required_dependency_ids.insert(FileId(file_id.0));
@@ -472,22 +525,22 @@ impl Storage {
             ));
         }
         for dependency in &fact.provenance.dependency_file_hashes {
-            let dependency_file = self
-                .get_files()?
-                .into_iter()
-                .find(|file| file.id == dependency.file_id.0)
+            let dependency_file = context
+                .file_by_id
+                .get(&dependency.file_id.0)
                 .ok_or_else(|| proof_error("dependency file record is missing"))?;
             if !dependency_file.indexed || !dependency_file.complete {
                 return Err(proof_error(
                     "dependency file is not indexed-complete in the graph",
                 ));
             }
-            let stored = self
-                .get_file_content_hash(dependency.file_id.0)?
+            let stored = context
+                .file_content_hash_by_id
+                .get(&dependency.file_id.0)
                 .ok_or_else(|| {
                     proof_error("dependency file has no publication-bound source hash")
                 })?;
-            if stored != dependency.source_sha256 {
+            if stored != &dependency.source_sha256 {
                 return Err(proof_error("dependency file hash does not match the graph"));
             }
         }
@@ -509,14 +562,16 @@ impl Storage {
             .raw_callsite_identity
             .as_deref()
             .expect("shape validation requires raw callsite identity");
-        let target_node = self
-            .get_node(target)?
+        let target_node = context
+            .node_by_id
+            .get(&target)
             .ok_or_else(|| proof_error("exact target node is missing"))?;
         if target_node.file_node_id.is_none() {
             return Err(proof_error("exact target has no indexed dependency file"));
         }
-        let raw_placeholder = self
-            .get_node(raw_edge_target)?
+        let raw_placeholder = context
+            .node_by_id
+            .get(&raw_edge_target)
             .ok_or_else(|| proof_error("raw CALL placeholder node is missing"))?;
         if raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0))
             || raw_placeholder.start_line != Some(fact.callsite.line)
@@ -543,9 +598,6 @@ impl Storage {
             (CalleeForm::Identifier, [ResolutionEvidence::SameFileDeclaration { declaration }])
                 if *declaration == target =>
             {
-                let target_node = self
-                    .get_node(target)?
-                    .ok_or_else(|| proof_error("same-file declaration target is missing"))?;
                 if target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0)) {
                     return Err(proof_error(
                         "SameFileDeclaration is not the exact target in the source file",
@@ -561,21 +613,17 @@ impl Storage {
                     },
                 ],
             ) if *declaration == target => {
-                let import_node = self
-                    .get_node(*import)?
+                let import_node = context
+                    .node_by_id
+                    .get(import)
                     .ok_or_else(|| proof_error("static import binding is missing"))?;
                 if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                     || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
-                    || graph_edges
-                        .iter()
-                        .filter(|candidate| {
-                            candidate.kind == EdgeKind::IMPORT
-                                && candidate.file_node_id == Some(NodeId(fact.callsite.file_id.0))
-                                && candidate.source == *import
-                                && candidate.resolved_target == Some(target)
-                        })
-                        .count()
-                        != 1
+                    || context
+                        .import_relation_counts
+                        .get(&(NodeId(fact.callsite.file_id.0), *import, target))
+                        .copied()
+                        != Some(1)
                 {
                     return Err(proof_error(
                         "StaticImportBinding is not the unique source import bound to target",
@@ -589,25 +637,23 @@ impl Storage {
                     ResolutionEvidence::SameFileDeclaration { declaration },
                 ],
             ) if *declaration == target => {
-                let owner_node = self
-                    .get_node(*owner)?
+                let owner_node = context
+                    .node_by_id
+                    .get(owner)
                     .ok_or_else(|| proof_error("implicit receiver owner is missing"))?;
-                let member = |member: NodeId| {
-                    graph_edges
-                        .iter()
-                        .filter(|candidate| {
-                            candidate.kind == EdgeKind::MEMBER
-                                && candidate.effective_source() == *owner
-                                && candidate.effective_target() == member
-                        })
-                        .count()
-                        == 1
-                };
                 if !matches!(owner_node.kind, NodeKind::STRUCT | NodeKind::CLASS)
                     || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                     || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || !member(fact.caller)
-                    || !member(target)
+                    || context
+                        .member_relation_counts
+                        .get(&(*owner, fact.caller))
+                        .copied()
+                        != Some(1)
+                    || context
+                        .member_relation_counts
+                        .get(&(*owner, target))
+                        .copied()
+                        != Some(1)
                 {
                     return Err(proof_error(
                         "ImplicitReceiver does not own caller and target through inherent membership",
@@ -620,9 +666,10 @@ impl Storage {
                 ));
             }
         }
-        let edge = graph_edges
-            .iter()
-            .find(|edge| edge.id == edge_id)
+        let edge = context
+            .edge_index_by_id
+            .get(&edge_id)
+            .map(|index| &context.edges[*index])
             .ok_or_else(|| proof_error("matching ordinary CALL edge is missing"))?;
         if edge.kind != EdgeKind::CALL
             || edge.effective_source() != fact.caller
