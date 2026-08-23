@@ -1514,14 +1514,14 @@ pub fn rematerialize_proof_resolution_projection(
         claim_correlations[claim_index] = Some(correlations[correlation_index]);
     }
     let mut facts = Vec::with_capacity(claims.len());
-    for claim_index in 0..claims.len() {
+    for (claim_index, correlation) in claim_correlations.into_iter().enumerate() {
         facts.push(seal_resolved_claim(
             &file_content_hash_by_id,
             &node_by_id,
             &edges,
             &claims,
             claim_index,
-            claim_correlations[claim_index],
+            correlation,
         )?);
     }
     let funnel = build_funnel(&facts);
@@ -1684,7 +1684,7 @@ fn resolve_syntax_claim(
             imported_name,
             is_default,
         } => {
-            let target_record = resolve_relative_import(source_record, &module_specifier, records)?;
+            let target_record = resolve_relative_import(source_record, module_specifier, records)?;
             let declarations = target_record
                 .filter(|record| record.file.lookup_input_complete)
                 .into_iter()
