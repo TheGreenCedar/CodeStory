@@ -1236,6 +1236,12 @@ pub fn rematerialize_proof_resolution_projection(
         .iter()
         .map(|file| (file.id, file))
         .collect::<HashMap<_, _>>();
+    let mut file_content_hash_by_id = HashMap::new();
+    for file in &files {
+        if let Some(source_hash) = store.get_file_content_hash(file.id)? {
+            file_content_hash_by_id.insert(file.id, source_hash);
+        }
+    }
     let nodes = store.get_nodes()?;
     let node_by_id = nodes
         .iter()
@@ -1342,8 +1348,8 @@ pub fn rematerialize_proof_resolution_projection(
             ));
         }
         let record = matches.pop().expect("one cache record");
-        let stored_hash = store
-            .get_file_content_hash(indexed_file.id)?
+        let stored_hash = file_content_hash_by_id
+            .get(&indexed_file.id)
             .ok_or_else(|| {
                 anyhow!(
                     "proof resolution indexed file {} has no source hash",
@@ -1373,13 +1379,13 @@ pub fn rematerialize_proof_resolution_projection(
             ));
         }
         if record.file.file_id != NodeId(indexed_file.id)
-            || record.file.source_sha256 != stored_hash
+            || record.file.source_sha256 != *stored_hash
             || record.file.language != indexed_file.language
             || record.file.complete != indexed_file.complete
             || record.file.adapter_version != ADAPTER_VERSION
             || record.calls.iter().any(|call| {
                 call.callsite.file_id != FileId(indexed_file.id)
-                    || call.callsite.source_sha256 != stored_hash
+                    || call.callsite.source_sha256 != *stored_hash
                     || call.language != indexed_file.language
                     || call.adapter_version != record.file.adapter_version
             })
@@ -1430,12 +1436,24 @@ pub fn rematerialize_proof_resolution_projection(
             "proof resolution projection has duplicate exact callsites"
         ));
     }
-    let claims = inputs
+    let record_by_file_id = records
+        .iter()
+        .map(|record| (record.file.file_id.0, record))
+        .collect::<HashMap<_, _>>();
+    let mut claims = inputs
         .into_iter()
         .map(|(source_record, input)| {
             resolve_syntax_claim(&file_by_id, &record_by_path, &records, source_record, input)
         })
         .collect::<Result<Vec<_>>>()?;
+    enforce_exact_dependency_eligibility(
+        &mut claims,
+        &file_by_id,
+        &node_by_id,
+        &file_content_hash_by_id,
+        &governed_by_id,
+        &record_by_file_id,
+    )?;
     let exact_claim_indices = claims
         .iter()
         .enumerate()
@@ -1498,7 +1516,7 @@ pub fn rematerialize_proof_resolution_projection(
     let mut facts = Vec::with_capacity(claims.len());
     for claim_index in 0..claims.len() {
         facts.push(seal_resolved_claim(
-            store,
+            &file_content_hash_by_id,
             &node_by_id,
             &edges,
             &claims,
@@ -1572,6 +1590,7 @@ struct ResolvedSyntaxClaim {
     status: ProofResolutionStatus,
     reason: ProofResolutionReason,
     evidence_chain: Vec<ResolutionEvidence>,
+    exact_node_file_expectations: Vec<(NodeId, FileId)>,
 }
 
 fn resolve_syntax_claim(
@@ -1589,6 +1608,7 @@ fn resolve_syntax_claim(
     let mut target = None;
     let mut evidence_chain = Vec::new();
     let caller = input.caller.unwrap_or(NodeId(input.callsite.file_id.0));
+    let mut exact_node_file_expectations = vec![(caller, input.callsite.file_id)];
     match &input.binding {
         CachedResolutionBinding::SameFile { declaration } => {
             let declaration_is_recorded =
@@ -1616,6 +1636,7 @@ fn resolve_syntax_claim(
                 evidence_chain.push(ResolutionEvidence::SameFileDeclaration {
                     declaration: *declaration,
                 });
+                exact_node_file_expectations.push((*declaration, input.callsite.file_id));
             }
         }
         CachedResolutionBinding::ImplicitReceiver {
@@ -1653,6 +1674,8 @@ fn resolve_syntax_claim(
                 evidence_chain.push(ResolutionEvidence::SameFileDeclaration {
                     declaration: *declaration,
                 });
+                exact_node_file_expectations.push((*owner, input.callsite.file_id));
+                exact_node_file_expectations.push((*declaration, input.callsite.file_id));
             }
         }
         CachedResolutionBinding::StaticImport {
@@ -1671,6 +1694,13 @@ fn resolve_syntax_claim(
                 })
                 .collect::<Vec<_>>();
             if let [declaration] = declarations.as_slice() {
+                let target_file_id = FileId(
+                    target_record
+                        .expect("one direct export requires a resolved target record")
+                        .file
+                        .file_id
+                        .0,
+                );
                 status = ProofResolutionStatus::Exact;
                 reason = ProofResolutionReason::ExactResolution;
                 target = Some(declaration.declaration);
@@ -1678,6 +1708,8 @@ fn resolve_syntax_claim(
                     import: *import,
                     declaration: declaration.declaration,
                 });
+                exact_node_file_expectations.push((*import, input.callsite.file_id));
+                exact_node_file_expectations.push((declaration.declaration, target_file_id));
             } else if target_record.is_some_and(|record| !record.file.lookup_input_complete) {
                 status = ProofResolutionStatus::IncompleteDomain;
                 reason = ProofResolutionReason::LookupDomainIncomplete;
@@ -1722,11 +1754,103 @@ fn resolve_syntax_claim(
         status,
         reason,
         evidence_chain,
+        exact_node_file_expectations,
     })
 }
 
+fn enforce_exact_dependency_eligibility(
+    claims: &mut [ResolvedSyntaxClaim],
+    files: &HashMap<i64, &codestory_store::FileInfo>,
+    nodes: &HashMap<NodeId, &Node>,
+    file_content_hashes: &HashMap<i64, String>,
+    governed_files: &HashMap<i64, &codestory_store::FileInfo>,
+    records: &HashMap<i64, &ResolutionCacheRecord>,
+) -> Result<()> {
+    for claim in claims
+        .iter_mut()
+        .filter(|claim| claim.status == ProofResolutionStatus::Exact)
+    {
+        let mut eligible = true;
+        let mut expected_file_ids = HashSet::from([claim.input.callsite.file_id.0]);
+        for (node_id, expected_file_id) in &claim.exact_node_file_expectations {
+            expected_file_ids.insert(expected_file_id.0);
+            let node = nodes.get(node_id).ok_or_else(|| {
+                anyhow!(
+                    "proof exact dependency node {} is missing from the graph",
+                    node_id.0
+                )
+            })?;
+            let Some(actual_file_id) = node.file_node_id else {
+                if *node_id == claim.caller {
+                    return Err(anyhow!(
+                        "proof exact caller {} has no source-file ownership",
+                        node_id.0
+                    ));
+                }
+                eligible = false;
+                continue;
+            };
+            if !files.contains_key(&actual_file_id.0) {
+                return Err(anyhow!(
+                    "proof exact dependency node {} names missing file {}",
+                    node_id.0,
+                    actual_file_id.0
+                ));
+            }
+            if !file_content_hashes.contains_key(&actual_file_id.0) {
+                return Err(anyhow!(
+                    "proof exact dependency file {} has no source hash",
+                    actual_file_id.0
+                ));
+            }
+            if actual_file_id.0 != expected_file_id.0 {
+                if *node_id == claim.caller {
+                    return Err(anyhow!(
+                        "proof exact caller {} ownership does not match source file {}",
+                        node_id.0,
+                        expected_file_id.0
+                    ));
+                }
+                eligible = false;
+            }
+        }
+        for file_id in expected_file_ids {
+            let file = files
+                .get(&file_id)
+                .ok_or_else(|| anyhow!("proof exact dependency file {file_id} is missing"))?;
+            let source_hash = file_content_hashes.get(&file_id).ok_or_else(|| {
+                anyhow!("proof exact dependency file {file_id} has no source hash")
+            })?;
+            let record = records.get(&file_id);
+            if !file.indexed
+                || !file.complete
+                || !governed_files.contains_key(&file_id)
+                || record.is_none()
+                || record.is_some_and(|record| {
+                    !record.file.complete || !record.file.lookup_input_complete
+                })
+            {
+                eligible = false;
+                continue;
+            }
+            if record.is_some_and(|record| record.file.source_sha256 != *source_hash) {
+                return Err(anyhow!(
+                    "proof exact dependency file {file_id} hash does not match parser coverage"
+                ));
+            }
+        }
+        if !eligible {
+            claim.status = ProofResolutionStatus::IncompleteDomain;
+            claim.reason = ProofResolutionReason::LookupDomainIncomplete;
+            claim.target = None;
+            claim.evidence_chain.clear();
+        }
+    }
+    Ok(())
+}
+
 fn seal_resolved_claim(
-    store: &Store,
+    file_content_hashes: &HashMap<i64, String>,
     nodes: &HashMap<NodeId, &Node>,
     edges: &[Edge],
     claims: &[ResolvedSyntaxClaim],
@@ -1773,8 +1897,9 @@ fn seal_resolved_claim(
     let mut dependency_file_hashes = dependency_ids
         .into_iter()
         .map(|file_id| {
-            let source_sha256 = store
-                .get_file_content_hash(file_id.0)?
+            let source_sha256 = file_content_hashes
+                .get(&file_id.0)
+                .cloned()
                 .ok_or_else(|| anyhow!("proof dependency file {} has no source hash", file_id.0))?;
             Ok(DependencyFileHash {
                 file_id: FileId(file_id.0),

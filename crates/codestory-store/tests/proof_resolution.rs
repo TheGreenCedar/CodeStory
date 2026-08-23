@@ -76,6 +76,19 @@ fn repeated_exact_fact(index: u32) -> CallResolutionFact {
     seal_call_resolution_fact(fact).expect("seal repeated fact")
 }
 
+fn incomplete_domain_fact() -> CallResolutionFact {
+    let mut fact = exact_fact(EdgeId(7));
+    fact.edge_id = None;
+    fact.raw_edge_target = None;
+    fact.raw_callsite_identity = None;
+    fact.target = None;
+    fact.status = ProofResolutionStatus::IncompleteDomain;
+    fact.reason = ProofResolutionReason::LookupDomainIncomplete;
+    fact.evidence_chain.clear();
+    fact.lookup_domain_complete = false;
+    seal_call_resolution_fact(fact).expect("seal incomplete-domain fact")
+}
+
 fn projection(facts: Vec<CallResolutionFact>) -> ProofResolutionProjection {
     let exact_count = u64::try_from(facts.len()).expect("test fact count fits u64");
     ProofResolutionProjection {
@@ -97,6 +110,34 @@ fn projection(facts: Vec<CallResolutionFact>) -> ProofResolutionProjection {
                 incomplete_domain: 0,
                 unsupported: 0,
                 exact_call_linked: exact_count,
+                proof_shape_admitted: 0,
+                authoritative_receipts: 0,
+                complete_proofs: 0,
+            },
+        }],
+    }
+}
+
+fn incomplete_domain_projection() -> ProofResolutionProjection {
+    ProofResolutionProjection {
+        adapter_roster: vec![ProofResolutionAdapter {
+            language: "rust".to_owned(),
+            adapter_version: "rust-exact-v1".to_owned(),
+        }],
+        facts: vec![incomplete_domain_fact()],
+        funnel: vec![ProofResolutionFunnelRow {
+            language: "rust".to_owned(),
+            callee_form: Some(CalleeForm::Identifier),
+            evidence_kind: None,
+            counts: ProofResolutionFunnelCounts {
+                syntax_calls: 1,
+                adapter_supported: 1,
+                exact: 0,
+                ambiguous: 0,
+                missing_binding: 0,
+                incomplete_domain: 1,
+                unsupported: 0,
+                exact_call_linked: 0,
                 proof_shape_admitted: 0,
                 authoritative_receipts: 0,
                 complete_proofs: 0,
@@ -561,6 +602,64 @@ fn resealed_raw_callsite_and_incomplete_dependency_mutations_are_rejected() {
         .replace_proof_resolution_projection(&publication(), &projection(vec![fact]))
         .expect_err("callsite identity file must match the exact syntax span");
     assert!(error.to_string().contains("callsite identity"), "{error}");
+}
+
+#[test]
+fn incomplete_domain_fact_allows_hashed_indexed_parser_incomplete_source() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    store
+        .get_connection()
+        .execute("UPDATE file SET complete = 0 WHERE id = 1", [])
+        .unwrap();
+
+    let receipt = store
+        .replace_proof_resolution_projection(&publication(), &incomplete_domain_projection())
+        .expect("parser incompleteness is a fact status, not publication corruption");
+
+    assert_eq!(receipt.fact_count, 1);
+    let facts = store.get_proof_resolution_facts().unwrap();
+    assert_eq!(facts[0].status, ProofResolutionStatus::IncompleteDomain);
+    assert_eq!(facts[0].provenance.dependency_file_hashes.len(), 1);
+}
+
+#[test]
+fn incomplete_domain_fact_still_rejects_unindexed_missing_or_mismatched_source_identity() {
+    let mut unindexed = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut unindexed);
+    unindexed
+        .get_connection()
+        .execute("UPDATE file SET indexed = 0 WHERE id = 1", [])
+        .unwrap();
+    let error = unindexed
+        .replace_proof_resolution_projection(&publication(), &incomplete_domain_projection())
+        .expect_err("non-Exact cannot authenticate an unindexed source");
+    assert!(error.to_string().contains("indexed-complete"), "{error}");
+
+    let mut missing_hash = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut missing_hash);
+    missing_hash
+        .get_connection()
+        .execute("UPDATE file SET content_hash = NULL WHERE id = 1", [])
+        .unwrap();
+    let error = missing_hash
+        .replace_proof_resolution_projection(&publication(), &incomplete_domain_projection())
+        .expect_err("non-Exact source hash absence is integrity corruption");
+    assert!(error.to_string().contains("source hash"), "{error}");
+
+    let mut mismatched_hash = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut mismatched_hash);
+    mismatched_hash
+        .get_connection()
+        .execute(
+            "UPDATE file SET content_hash = ?1 WHERE id = 1",
+            ["b".repeat(64)],
+        )
+        .unwrap();
+    let error = mismatched_hash
+        .replace_proof_resolution_projection(&publication(), &incomplete_domain_projection())
+        .expect_err("non-Exact source hash mismatch is integrity corruption");
+    assert!(error.to_string().contains("source hash"), "{error}");
 }
 
 #[test]

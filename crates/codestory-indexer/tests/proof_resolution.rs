@@ -1,10 +1,10 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{EdgeId, EdgeKind, NodeId, NodeKind};
+use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{
     ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
 };
 use codestory_indexer::{WorkspaceIndexer, rematerialize_proof_resolution_projection};
-use codestory_store::{IndexPublicationMode, IndexPublicationRecord, Store};
+use codestory_store::{FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store};
 use codestory_workspace::{BuildMode, RefreshInfo};
 use std::collections::HashMap;
 use std::fs;
@@ -1317,5 +1317,242 @@ fn non_exact_reference_inputs_keep_closed_fail_closed_statuses() -> anyhow::Resu
     assert_eq!(status("dynamicCall"), ProofResolutionStatus::Unsupported);
     assert_eq!(status("target"), ProofResolutionStatus::IncompleteDomain);
     assert_eq!(status("duplicate"), ProofResolutionStatus::Ambiguous);
+    Ok(())
+}
+
+#[test]
+fn parser_incomplete_governed_source_publishes_incomplete_domain_fact() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/vite-shaped.ts",
+            "export function target() {}\nexport function caller() { target(); }\n<",
+        )],
+    )?;
+    let indexed_file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.language == "typescript")
+        .expect("typescript file");
+    assert!(indexed_file.indexed);
+    assert!(
+        !indexed_file.complete,
+        "fixture must exercise parser incompleteness"
+    );
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("target call fact");
+    assert_eq!(fact.status, ProofResolutionStatus::IncompleteDomain);
+    assert_eq!(fact.target, None);
+    assert_eq!(fact.edge_id, None);
+    assert!(fact.evidence_chain.is_empty());
+    assert_eq!(fact.provenance.dependency_file_hashes.len(), 1);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ExactDependencyMutation {
+    Caller,
+    SameFileDeclaration,
+    StaticImportBinding,
+    StaticImportDeclaration,
+    ImplicitReceiverOwner,
+    ImplicitReceiverDeclaration,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MutatedDependencyEligibility {
+    IndexedIncomplete,
+    UnindexedComplete,
+    UnsupportedComplete,
+    MissingOwnership,
+}
+
+fn assert_exact_dependency_mutation_downgrades(
+    mutation: ExactDependencyMutation,
+    eligibility: MutatedDependencyEligibility,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let (mut files, target) = match mutation {
+        ExactDependencyMutation::Caller | ExactDependencyMutation::SameFileDeclaration => (
+            vec![(
+                "src/local.ts",
+                "export function target() {}\nexport function caller() { target(); }\n",
+            )],
+            "target",
+        ),
+        ExactDependencyMutation::StaticImportBinding
+        | ExactDependencyMutation::StaticImportDeclaration => (
+            vec![
+                ("src/exported.ts", "export function target() {}\n"),
+                (
+                    "src/importer.ts",
+                    "import { target } from './exported';\nexport function caller() { target(); }\n",
+                ),
+            ],
+            "target",
+        ),
+        ExactDependencyMutation::ImplicitReceiverOwner
+        | ExactDependencyMutation::ImplicitReceiverDeclaration => (
+            vec![(
+                "src/lib.rs",
+                "struct Worker;\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+            )],
+            "target",
+        ),
+    };
+    if matches!(eligibility, MutatedDependencyEligibility::IndexedIncomplete) {
+        files.push(("src/ineligible.ts", "<"));
+    }
+    index_files(project.path(), &mut store, &files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == target)
+        .expect("exact fixture fact");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    let node_id = match mutation {
+        ExactDependencyMutation::Caller => fact.caller,
+        ExactDependencyMutation::SameFileDeclaration => fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::SameFileDeclaration { declaration } => Some(*declaration),
+                _ => None,
+            })
+            .expect("same-file declaration"),
+        ExactDependencyMutation::StaticImportBinding => fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::StaticImportBinding { import, .. } => Some(*import),
+                _ => None,
+            })
+            .expect("static import binding"),
+        ExactDependencyMutation::StaticImportDeclaration => fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::StaticImportBinding { declaration, .. } => Some(*declaration),
+                _ => None,
+            })
+            .expect("static import declaration"),
+        ExactDependencyMutation::ImplicitReceiverOwner => fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::ImplicitReceiver { owner } => Some(*owner),
+                _ => None,
+            })
+            .expect("implicit receiver owner"),
+        ExactDependencyMutation::ImplicitReceiverDeclaration => fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::SameFileDeclaration { declaration } => Some(*declaration),
+                _ => None,
+            })
+            .expect("implicit receiver declaration"),
+    };
+    let mut node = store.get_node(node_id)?.expect("mutated evidence node");
+    if matches!(eligibility, MutatedDependencyEligibility::MissingOwnership) {
+        node.file_node_id = None;
+    } else {
+        let dependency_file_id =
+            if matches!(eligibility, MutatedDependencyEligibility::IndexedIncomplete) {
+                let dependency_file = store
+                    .get_files()?
+                    .into_iter()
+                    .find(|file| file.path.ends_with("src/ineligible.ts"))
+                    .expect("indexed incomplete dependency file");
+                assert!(dependency_file.indexed);
+                assert!(!dependency_file.complete);
+                NodeId(dependency_file.id)
+            } else {
+                let dependency_file_id = NodeId(9_000_001);
+                let (language, indexed) = match eligibility {
+                    MutatedDependencyEligibility::UnindexedComplete => ("typescript", false),
+                    MutatedDependencyEligibility::UnsupportedComplete => ("text", true),
+                    MutatedDependencyEligibility::IndexedIncomplete
+                    | MutatedDependencyEligibility::MissingOwnership => unreachable!(),
+                };
+                let dependency_file = FileInfo {
+                    id: dependency_file_id.0,
+                    path: project.path().join("src/ineligible-dependency.txt"),
+                    language: language.to_owned(),
+                    modification_time: 0,
+                    indexed,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                };
+                store.insert_file(&dependency_file)?;
+                store.update_file_metadata(&dependency_file, Some(&"d".repeat(64)))?;
+                store.insert_node(&Node {
+                    id: dependency_file_id,
+                    kind: NodeKind::FILE,
+                    serialized_name: dependency_file.path.display().to_string(),
+                    ..Default::default()
+                })?;
+                dependency_file_id
+            };
+        node.file_node_id = Some(dependency_file_id);
+    }
+    store.insert_node(&node)?;
+
+    if matches!(mutation, ExactDependencyMutation::Caller) {
+        let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+            .expect_err("caller ownership mismatch is graph/cache integrity corruption");
+        assert!(error.to_string().contains("caller"), "{error}");
+        return Ok(());
+    }
+    rematerialize_proof_resolution_projection(&mut store, &publication(2))?;
+    let downgraded = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == target)
+        .expect("downgraded fixture fact");
+    assert_eq!(
+        downgraded.status,
+        ProofResolutionStatus::IncompleteDomain,
+        "{mutation:?} {eligibility:?}: {downgraded:#?}"
+    );
+    assert_eq!(downgraded.target, None);
+    assert_eq!(downgraded.edge_id, None);
+    assert!(downgraded.evidence_chain.is_empty());
+    Ok(())
+}
+
+#[test]
+fn exact_dependency_domains_require_complete_governed_ownership() -> anyhow::Result<()> {
+    let mutations = [
+        ExactDependencyMutation::Caller,
+        ExactDependencyMutation::SameFileDeclaration,
+        ExactDependencyMutation::StaticImportBinding,
+        ExactDependencyMutation::StaticImportDeclaration,
+        ExactDependencyMutation::ImplicitReceiverOwner,
+        ExactDependencyMutation::ImplicitReceiverDeclaration,
+    ];
+    let eligibility_classes = [
+        MutatedDependencyEligibility::IndexedIncomplete,
+        MutatedDependencyEligibility::UnindexedComplete,
+        MutatedDependencyEligibility::UnsupportedComplete,
+        MutatedDependencyEligibility::MissingOwnership,
+    ];
+    for mutation in mutations {
+        for eligibility in eligibility_classes {
+            assert_exact_dependency_mutation_downgrades(mutation, eligibility)?;
+        }
+    }
     Ok(())
 }

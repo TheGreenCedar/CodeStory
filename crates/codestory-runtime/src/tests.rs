@@ -4514,6 +4514,50 @@ fn exact_proof_rematerializes_for_full_and_incremental_edits_and_faults_preserve
 }
 
 #[test]
+fn full_refresh_publishes_incomplete_proof_domain_for_parser_incomplete_source() {
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("main.ts"),
+        "export function target() {}\nexport function caller() { target(); }\n<",
+    )
+    .expect("write parser-incomplete source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("parser incompleteness must not abort proof publication");
+
+    let storage = Storage::open(&storage_path).expect("open published core");
+    let publication = storage
+        .get_complete_index_publication()
+        .unwrap()
+        .expect("complete core publication");
+    storage
+        .validate_proof_resolution_publication(&publication)
+        .expect("complete proof projection");
+    let facts = storage.get_proof_resolution_facts().unwrap();
+    let fact = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("target call fact");
+    assert_eq!(
+        fact.status,
+        codestory_contracts::proof_resolution::ProofResolutionStatus::IncompleteDomain
+    );
+    assert!(fact.evidence_chain.is_empty());
+    assert_eq!(fact.target, None);
+    assert_eq!(fact.edge_id, None);
+}
+
+#[test]
 fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     let _env = hybrid_test_env();
     let workspace = copy_tictactoe_workspace();

@@ -529,7 +529,9 @@ impl Storage {
                 .file_by_id
                 .get(&dependency.file_id.0)
                 .ok_or_else(|| proof_error("dependency file record is missing"))?;
-            if !dependency_file.indexed || !dependency_file.complete {
+            if !dependency_file.indexed
+                || (fact.status == ProofResolutionStatus::Exact && !dependency_file.complete)
+            {
                 return Err(proof_error(
                     "dependency file is not indexed-complete in the graph",
                 ));
