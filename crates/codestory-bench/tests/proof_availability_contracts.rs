@@ -1110,10 +1110,6 @@ fn rebuild_funnel(value: &mut Value) {
             .expect("unclassified")
             .len() as u64;
         for step in case["proof_trace"]["steps"].as_array().expect("steps") {
-            if step["outcome"]["kind"] == "candidate_limit_exceeded" {
-                unclassified += 1;
-                continue;
-            }
             let outcome: FunnelOutcomeV1 =
                 serde_json::from_value(step["outcome"].clone()).expect("closed funnel outcome");
             let key = serde_json::to_string(&outcome).expect("outcome key");
@@ -1227,6 +1223,7 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
         target: identity("2", &oracle.target),
         certainty: codestory_contracts::graph::ResolutionCertainty::Certain,
         callsite_identity: "1:1:0:2|fixture".into(),
+        column_or_ordinal: 0,
         containment: codestory_agent::proof_qualification_support::CallableContainmentEvidence {
             file_node_id: codestory_contracts::graph::NodeId(10),
             owner_node_id: codestory_contracts::graph::NodeId(1),
@@ -1368,6 +1365,7 @@ fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
         target: identity("-2", target_raw, &oracle.target.symbol),
         certainty: ResolutionCertainty::Certain,
         callsite_identity: format!("-3:{}:0:-2|fixture", oracle.callsite_line),
+        column_or_ordinal: 0,
         containment: CallableContainmentEvidence {
             file_node_id: NodeId(-3),
             owner_node_id: NodeId(-1),
@@ -2524,6 +2522,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         target: identity("-2", "codestory-rust-l1-0::target_0"),
         certainty: ResolutionCertainty::Certain,
         callsite_identity: "-3:1:0:-2|fixture".into(),
+        column_or_ordinal: 0,
         containment: CallableContainmentEvidence {
             file_node_id: NodeId(-3),
             owner_node_id: NodeId(-1),
@@ -2719,6 +2718,7 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
         target: identity(RESOLVED_TARGET, &oracle.target),
         certainty: ResolutionCertainty::Certain,
         callsite_identity: callsite_identity.clone(),
+        column_or_ordinal: 0,
         containment: CallableContainmentEvidence {
             file_node_id: NodeId(-3),
             owner_node_id: NodeId(-1),
@@ -2898,12 +2898,22 @@ fn make_non_proven_case(value: &mut Value, disposition: &str, gap: Option<&str>)
                 case["proof_trace"]["selectors"][0]["outcome"] =
                     json!({"kind":"failed","reason":reason});
                 case["proof_trace"]["selector_early_return"] = json!(true);
-                case["proof_trace"]["steps"] = json!([]);
-                case["unclassified_step_indices"] = Value::Array(
+                case["proof_trace"]["steps"] = Value::Array(
                     (0..case["attempted_step_count"].as_u64().unwrap())
-                        .map(|index| json!(index))
+                        .map(|step_index| {
+                            json!({
+                                "step_index":step_index,
+                                "candidate_edge_ids":[],
+                                "outcome":{
+                                    "kind":"selector_blocked",
+                                    "selector_index":0,
+                                    "outcome":{"kind":"failed","reason":reason}
+                                }
+                            })
+                        })
                         .collect(),
                 );
+                case["unclassified_step_indices"] = json!([]);
             }
             Some("relation_missing") => {
                 case["proof_trace"]["steps"][0]["candidate_edge_ids"] = json!([]);
@@ -2990,8 +3000,22 @@ fn set_six_step_selector_unknown_case(value: &mut Value, matching_trace: bool) {
             selector["outcome"] = json!({"kind":"failed","reason":"missing"});
         }
         case["proof_trace"]["selector_early_return"] = json!(true);
-        case["proof_trace"]["steps"] = json!([]);
-        case["unclassified_step_indices"] = json!([0, 1, 2, 3, 4, 5]);
+        case["proof_trace"]["steps"] = Value::Array(
+            (0..6)
+                .map(|step_index| {
+                    json!({
+                        "step_index":step_index,
+                        "candidate_edge_ids":[],
+                        "outcome":{
+                            "kind":"selector_blocked",
+                            "selector_index":0,
+                            "outcome":{"kind":"failed","reason":"missing"}
+                        }
+                    })
+                })
+                .collect(),
+        );
+        case["unclassified_step_indices"] = json!([]);
         case["receipt_evidence"]["observed_receipts"] = json!([]);
         case["actionable_exact_gap"] = json!({
             "gap":{"kind":"selector_missing","selector_index":0},
@@ -3416,12 +3440,12 @@ fn schemas_have_semantic_constants_patterns_and_bounds() {
     );
     assert_eq!(
         contracts::schema_json(SchemaDocument::Report)["$defs"]["StepQualificationOutcomeV1"]["oneOf"]
-            [2]["properties"]["maximum_candidate_edges"]["const"],
+            [3]["properties"]["maximum_candidate_edges"]["const"],
         MAX_CANDIDATE_EDGES_PER_STEP
     );
     assert_eq!(
         contracts::schema_json(SchemaDocument::Report)["$defs"]["StepQualificationOutcomeV1"]["oneOf"]
-            [2]["properties"]["observed_candidate_edges_at_least"]["const"],
+            [3]["properties"]["observed_candidate_edges_at_least"]["const"],
         MAX_CANDIDATE_EDGES_PER_STEP + 1
     );
     assert_eq!(
@@ -4306,9 +4330,17 @@ fn candidate_and_observed_receipt_bounds_cover_exact_cap_and_cap_plus_one() {
     rebuild_funnel(&mut truncated);
     rebind_results_digest(&mut truncated);
     let parsed = QualificationSummaryV1::from_json(truncated)
-        .expect("cap + 1 becomes a typed unclassified observation, never a partial proof");
-    assert_eq!(parsed.failure_funnel.classified_positive_steps, 311);
-    assert_eq!(parsed.failure_funnel.unclassified_positive_steps, 1);
+        .expect("cap + 1 remains a typed, classified observation, never a partial proof");
+    assert_eq!(parsed.failure_funnel.classified_positive_steps, 312);
+    assert_eq!(parsed.failure_funnel.unclassified_positive_steps, 0);
+    assert!(parsed.failure_funnel.buckets.iter().any(|bucket| matches!(
+        &bucket.outcome,
+        FunnelOutcomeV1::CandidateLimitExceeded {
+            maximum_candidate_edges,
+            observed_candidate_edges_at_least,
+        } if *maximum_candidate_edges == MAX_CANDIDATE_EDGES_PER_STEP as u32
+            && *observed_candidate_edges_at_least == MAX_CANDIDATE_EDGES_PER_STEP as u32 + 1
+    )));
     assert!(
         parsed.cases[0]
             .evaluable_facts()

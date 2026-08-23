@@ -1519,6 +1519,7 @@ fn sort_evidence(
         for step in &mut case.proof_trace.steps {
             step.candidate_edge_ids.sort_unstable();
             match &mut step.outcome {
+                StepQualificationOutcomeV1::SelectorBlocked { .. } => {}
                 StepQualificationOutcomeV1::Admitted { edge_ids } => edge_ids.sort_unstable(),
                 StepQualificationOutcomeV1::FirstZeroSurvivor { histogram, .. } => {
                     for bucket in histogram.iter_mut() {
@@ -3200,6 +3201,7 @@ mod tests {
             target: resolved(&prior.target, TARGET_CANONICAL_ID),
             certainty: ResolutionCertainty::Certain,
             callsite_identity: prior.callsite_identity.clone(),
+            column_or_ordinal: 0,
             containment: CallableContainmentEvidence {
                 file_node_id: NodeId(prior.containment.file_node_id),
                 owner_node_id: NodeId(prior.containment.owner_node_id),

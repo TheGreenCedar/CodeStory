@@ -1091,6 +1091,30 @@
           "additionalProperties": false,
           "properties": {
             "kind": {
+              "const": "selector_blocked",
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/$defs/SelectorGateOutcomeV1"
+            },
+            "selector_index": {
+              "format": "uint64",
+              "maximum": 6,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "selector_index",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
               "const": "admitted",
               "type": "string"
             }
@@ -1121,6 +1145,33 @@
             "kind",
             "gate",
             "histogram"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "candidate_limit_exceeded",
+              "type": "string"
+            },
+            "maximum_candidate_edges": {
+              "const": 128,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observed_candidate_edges_at_least": {
+              "const": 129,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "maximum_candidate_edges",
+            "observed_candidate_edges_at_least"
           ],
           "type": "object"
         }
@@ -2158,6 +2209,30 @@
     },
     "StepQualificationOutcomeV1": {
       "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "selector_blocked",
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/$defs/SelectorGateOutcomeV1"
+            },
+            "selector_index": {
+              "format": "uint64",
+              "maximum": 6,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "selector_index",
+            "outcome"
+          ],
+          "type": "object"
+        },
         {
           "additionalProperties": false,
           "properties": {

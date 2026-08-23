@@ -121,6 +121,10 @@ pub enum CandidateGate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepQualificationOutcome {
+    SelectorBlocked {
+        selector_index: usize,
+        outcome: SelectorGateOutcome,
+    },
     Admitted {
         edge_ids: Vec<codestory_contracts::graph::EdgeId>,
     },
@@ -474,6 +478,20 @@ where
     {
         gaps.sort();
         gaps.dedup();
+        let blocking_selector = selectors
+            .iter()
+            .find(|selector| !matches!(selector.outcome, SelectorGateOutcome::Resolved { .. }))
+            .expect("selector early return has a blocking selector");
+        let steps = (0..contract.spec().steps().len())
+            .map(|step_index| StepQualificationTrace {
+                step_index,
+                candidate_edge_ids: Vec::new(),
+                outcome: StepQualificationOutcome::SelectorBlocked {
+                    selector_index: blocking_selector.selector_index,
+                    outcome: blocking_selector.outcome.clone(),
+                },
+            })
+            .collect();
         return Ok(ObservedBuiltCallPathFacts {
             built: BuiltCallPathFacts {
                 publication: proof_publication,
@@ -485,7 +503,7 @@ where
             trace: ProofQualificationTrace {
                 selectors,
                 selector_early_return: true,
-                steps: Vec::new(),
+                steps,
                 finalization: FinalizationTrace::NotRun,
             },
         });
@@ -673,6 +691,7 @@ where
                 target: target.clone(),
                 certainty: ResolutionCertainty::Certain,
                 callsite_identity: admitted.callsite_identity,
+                column_or_ordinal: admitted.column_or_ordinal,
                 containment,
                 line_window,
             });
@@ -1585,9 +1604,13 @@ mod tests {
     }
 
     fn source_built_fixture(source: &str) -> SourceBuiltFixture {
+        source_built_fixture_with_extension("rs", source)
+    }
+
+    fn source_built_fixture_with_extension(extension: &str, source: &str) -> SourceBuiltFixture {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        let source_path = root.join("src/lib.rs");
+        let source_path = root.join(format!("src/lib.{extension}"));
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
         fs::write(&source_path, source).unwrap();
         let mut store = Store::new_in_memory().unwrap();
@@ -1618,6 +1641,62 @@ mod tests {
             },
             project_id: project_identity_v3(&root).project_id,
         }
+    }
+
+    fn store_with_adversarial_call_edge_ids(fixture: &SourceBuiltFixture) -> Store {
+        let mut edges = fixture.store.get_edges().unwrap();
+        let mut call_offsets = edges
+            .iter()
+            .enumerate()
+            .filter(|(_, edge)| edge.kind == EdgeKind::CALL)
+            .map(|(offset, edge)| {
+                let RawCallEdgeAdmission::Admitted(admitted) =
+                    admit_raw_call_edge(edge, edge.effective_source(), edge.effective_target())
+                else {
+                    panic!("source-built call edge must be admitted: {edge:?}");
+                };
+                (offset, admitted.column_or_ordinal)
+            })
+            .collect::<Vec<_>>();
+        call_offsets.sort_by_key(|(_, ordinal)| *ordinal);
+        assert_eq!(call_offsets.len(), 2, "two real source-built calls");
+        assert_eq!(
+            call_offsets
+                .iter()
+                .map(|(_, ordinal)| *ordinal)
+                .collect::<Vec<_>>(),
+            [1, 2],
+            "the real indexer must authenticate source occurrence order"
+        );
+        edges[call_offsets[0].0].id = EdgeId(200);
+        edges[call_offsets[1].0].id = EdgeId(100);
+
+        let mut store = Store::new_in_memory().unwrap();
+        let files = fixture.store.files().get_files().unwrap();
+        for file in &files {
+            store.insert_file(file).unwrap();
+            let content_hash = fixture.store.get_file_content_hash(file.id).unwrap();
+            store
+                .update_file_metadata(file, content_hash.as_deref())
+                .unwrap();
+        }
+        store
+            .insert_nodes_batch(&fixture.store.get_nodes().unwrap())
+            .unwrap();
+        store.insert_edges_batch(&edges).unwrap();
+        store
+            .insert_occurrences_batch(&fixture.store.get_occurrences().unwrap())
+            .unwrap();
+        for file in files {
+            let projections = fixture
+                .store
+                .get_callable_projection_states_for_file(file.id)
+                .unwrap();
+            store
+                .upsert_callable_projection_states(&projections)
+                .unwrap();
+        }
+        store
     }
 
     fn source_callable(store: &Store, terminal_name: &str) -> Node {
@@ -1829,7 +1908,18 @@ mod tests {
             selector_observed.trace.selectors[0].outcome,
             SelectorGateOutcome::Failed(SelectorFailure::Missing)
         );
-        assert!(selector_observed.trace.steps.is_empty());
+        assert_eq!(
+            selector_observed.trace.steps.len(),
+            selector_contract.spec().steps().len(),
+            "selector early returns must classify every attempted positive step"
+        );
+        assert_eq!(
+            selector_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::SelectorBlocked {
+                selector_index: 0,
+                outcome: SelectorGateOutcome::Failed(SelectorFailure::Missing),
+            }
+        );
 
         let mut raw_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
         raw_fixture
@@ -2266,6 +2356,41 @@ mod tests {
         assert!(matches!(
             six_result.disposition(),
             ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 6
+        ));
+    }
+
+    #[test]
+    fn source_built_same_line_calls_use_source_order_before_adversarial_edge_ids() {
+        let mut fixture = source_built_fixture_with_extension(
+            "cpp",
+            "int target(int value) { return value; }\n\
+             int source() { return target(1) + target(2); }\n",
+        );
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        fixture.store = store_with_adversarial_call_edge_ids(&fixture);
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+
+        let result = evaluate_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert_eq!(result.built_facts().receipts.len(), 2);
+        assert!(matches!(
+            result.disposition(),
+            ProofDisposition::ContractProven { receipts, .. }
+                if receipts.len() == 1 && receipts[0].edge_id == "200"
         ));
     }
 

@@ -51,7 +51,7 @@ node METHOD name=HumanPlayer::new qn=HumanPlayer::new canonical=game.rs:HumanPla
 node METHOD name=HumanPlayer::token qn=HumanPlayer::token canonical=game.rs:HumanPlayer::token#1 line=234 col=5 end=236:6 file=FILE:game.rs@1
 node METHOD name=HumanPlayer::turn qn=HumanPlayer::turn canonical=game.rs:HumanPlayer::turn#0 line=242 col=5 end=252:6 file=FILE:game.rs@1
 node METHOD name=Move::new qn=Move::new canonical=game.rs:Move::new#0 line=20 col=5 end=22:6 file=FILE:game.rs@1
-node METHOD name=TicTacToe::_reset qn=TicTacToe::_reset canonical=game.rs:TicTacToe::_reset#1 line=381 col=5 end=384:6 file=FILE:game.rs@1
+node METHOD name=TicTacToe::_reset qn=TicTacToe::_reset canonical=game.rs:TicTacToe::_reset#0 line=381 col=5 end=384:6 file=FILE:game.rs@1
 node METHOD name=TicTacToe::_select_player qn=TicTacToe::_select_player canonical=game.rs:TicTacToe::_select_player#0 line=386 col=5 end=396:6 file=FILE:game.rs@1
 node METHOD name=TicTacToe::new qn=TicTacToe::new canonical=game.rs:TicTacToe::new#0 line=341 col=5 end=346:6 file=FILE:game.rs@1
 node METHOD name=TicTacToe::run qn=TicTacToe::run canonical=game.rs:TicTacToe::run#0 line=357 col=5 end=379:6 file=FILE:game.rs@1
@@ -97,7 +97,7 @@ node UNKNOWN name=HumanPlayer::input qn=HumanPlayer::input canonical=game.rs:Hum
 node UNKNOWN name=HumanPlayer::name qn=HumanPlayer::name canonical=game.rs:HumanPlayer::name#2 line=243 col=25 end=243:29 file=FILE:game.rs@1
 node UNKNOWN name=Some qn=Some canonical=game.rs:Some#0 line=352 col=27 end=352:31 file=FILE:game.rs@1
 node UNKNOWN name=Some qn=Some canonical=game.rs:Some#1 line=353 col=27 end=353:31 file=FILE:game.rs@1
-node UNKNOWN name=TicTacToe::_reset qn=TicTacToe::_reset canonical=game.rs:TicTacToe::_reset#0 line=349 col=14 end=349:20 file=FILE:game.rs@1
+node UNKNOWN name=TicTacToe::_reset qn=TicTacToe::_reset canonical=game.rs:TicTacToe::_reset#1 line=349 col=14 end=349:20 file=FILE:game.rs@1
 node UNKNOWN name=TicTacToe::run qn=TicTacToe::run canonical=game.rs:TicTacToe::run#1 line=402 col=19 end=402:22 file=FILE:game.rs@1
 node UNKNOWN name=TicTacToe::start qn=TicTacToe::start canonical=game.rs:TicTacToe::start#1 line=401 col=21 end=401:26 file=FILE:game.rs@1
 node UNKNOWN name=_select_player qn=_select_player canonical=game.rs:_select_player#0 line=352 col=47 end=352:61 file=FILE:game.rs@1
@@ -582,9 +582,9 @@ callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_ke
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::token", node_id: NodeId(-3696673067763237953), signature_hash: -4145182955680989547, normalized_signature: Some("outline:-5084961018881034800"), body_hash: 5193478975743913452, start_line: 234, end_line: 236 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:HumanPlayer::turn", node_id: NodeId(327278224409134922), signature_hash: 6721508572757190989, normalized_signature: Some("shape:8513084851038306077"), body_hash: 109083041645832615, start_line: 242, end_line: 252 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:Move::new", node_id: NodeId(4066721651839289536), signature_hash: 8604151747431733291, normalized_signature: Some("outline:-5084961018881034800"), body_hash: -3485106463615946218, start_line: 20, end_line: 22 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::_reset", node_id: NodeId(5660321273152979622), signature_hash: 7763690723086356648, normalized_signature: Some("shape:-1573210411411388912"), body_hash: -2905685995511014240, start_line: 381, end_line: 384 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::_reset", node_id: NodeId(5660322372664607833), signature_hash: 7763690723086356648, normalized_signature: Some("shape:-1573210411411388912"), body_hash: 373548078559217769, start_line: 381, end_line: 384 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::_select_player", node_id: NodeId(4168591660714761050), signature_hash: 1002606463558740773, normalized_signature: Some("shape:7499507996931683220"), body_hash: -3558011022905031035, start_line: 386, end_line: 396 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::new", node_id: NodeId(563112724262018819), signature_hash: -8233056051072368200, normalized_signature: Some("shape:1245673671842322152"), body_hash: 2011658721269736863, start_line: 341, end_line: 346 }
 callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::run", node_id: NodeId(-2453614164726301164), signature_hash: 4486076148756622909, normalized_signature: Some("shape:-2410817221752893665"), body_hash: -947248371780451052, start_line: 357, end_line: 379 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::start", node_id: NodeId(-5507076206210224715), signature_hash: 3488513926873607814, normalized_signature: Some("shape:-3869663712193211021"), body_hash: -1924503603722736328, start_line: 348, end_line: 355 }
-callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "__file_structural__", node_id: NodeId(2795638767924858044), signature_hash: -454741427543139641, normalized_signature: None, body_hash: 3014801225490565687, start_line: 1, end_line: 404 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "14:TicTacToe::start", node_id: NodeId(-5507076206210224715), signature_hash: 3488513926873607814, normalized_signature: Some("shape:-5347693484080979009"), body_hash: -9073835866527848709, start_line: 348, end_line: 355 }
+callable_state CallableProjectionState { file_id: 2795638767924858044, symbol_key: "__file_structural__", node_id: NodeId(2795638767924858044), signature_hash: 281086338136038793, normalized_signature: None, body_hash: -8798782598953478983, start_line: 1, end_line: 404 }
