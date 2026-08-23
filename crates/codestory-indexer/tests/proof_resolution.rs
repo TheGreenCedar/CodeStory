@@ -1001,6 +1001,35 @@ fn rust_macro_expansion_domains_are_never_exact() -> anyhow::Result<()> {
 }
 
 #[test]
+fn rust_attribute_domains_are_never_exact() -> anyhow::Result<()> {
+    for source in [
+        "#[unresolved_attribute_macro]\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "fn target() {}\n#[unresolved_attribute_macro]\nfn caller() { target(); }\n",
+        "#![cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "#[unresolved_attribute_macro]\nstruct Marker;\nfn target() {}\nfn caller() { target(); }\n",
+        "fn target() {}\nfn caller() { #![cfg(any())] target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    for source in [
+        "struct Worker;\n#[unresolved_attribute_macro]\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        "struct Worker;\nimpl Worker { #[cfg(any())] fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        "struct Worker;\nimpl Worker { fn target(&self) {} #[unresolved_attribute_macro] fn caller(&self) { self.target(); } }\n",
+        "struct Worker;\nimpl Worker { #[unresolved_attribute_macro] const MARKER: usize = 0; fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+
+    assert_only_call_is_exact(&[("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n")])?;
+    assert_only_call_is_exact(&[(
+        "src/lib.rs",
+        "struct Worker;\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+    )])?;
+    Ok(())
+}
+
+#[test]
 fn non_exact_reference_inputs_keep_closed_fail_closed_statuses() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;

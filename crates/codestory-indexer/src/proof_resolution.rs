@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node as TsNode, Tree};
 
-const ADAPTER_VERSION: &str = "reference-v4";
+const ADAPTER_VERSION: &str = "reference-v5";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 3;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("rust", ADAPTER_VERSION),
@@ -65,6 +65,9 @@ pub(crate) fn collect_call_resolution_inputs(
         lookup_input_complete = false;
     }
     if language == "rust" && rust_file_has_item_domain_macro_invocation(tree.root_node()) {
+        lookup_input_complete = false;
+    }
+    if language == "rust" && rust_file_has_attribute_domain(tree.root_node()) {
         lookup_input_complete = false;
     }
     let typescript_module =
@@ -647,6 +650,10 @@ fn rust_file_has_item_domain_macro_invocation(root: TsNode<'_>) -> bool {
         found = true;
     });
     found
+}
+
+fn rust_file_has_attribute_domain(root: TsNode<'_>) -> bool {
+    contains_node_kind(root, "attribute_item") || contains_node_kind(root, "inner_attribute_item")
 }
 
 fn direct_impl_functions(impl_item: TsNode<'_>) -> Vec<TsNode<'_>> {
