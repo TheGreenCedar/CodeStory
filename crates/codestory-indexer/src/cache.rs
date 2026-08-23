@@ -3,18 +3,21 @@ use crate::{IndexResult, LanguageConfig, intermediate_storage::IntermediateStora
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, Node, NodeId, Occurrence,
 };
+use codestory_contracts::proof_resolution::ExactCallsite;
 use codestory_store::FileInfo;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
-// Bumped to 4 because declaration-first canonical ordinals and column-distinct
-// temporary identities change parser-backed node ids.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 4;
+// Bumped to 5 because parser artifacts now retain compact call-resolution
+// inputs used to rematerialize the private proof authorization overlay.
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 5;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedIndexArtifact {
+    #[serde(default)]
+    pub resolution_input_schema_version: u32,
     pub files: Vec<FileInfo>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -22,11 +25,31 @@ pub(crate) struct CachedIndexArtifact {
     pub component_access: Vec<(NodeId, AccessKind)>,
     pub callable_projection_states: Vec<CallableProjectionState>,
     pub impl_anchor_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    pub call_resolution_inputs: Vec<CachedCallResolutionInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCallResolutionInput {
+    pub callsite: ExactCallsite,
+    pub caller: NodeId,
+    pub language: String,
+    pub adapter_version: String,
+    pub parser_fingerprint: String,
 }
 
 impl CachedIndexArtifact {
+    #[cfg(test)]
     pub(crate) fn from_index_result(index_result: IndexResult) -> Self {
+        Self::from_index_result_with_resolution_inputs(index_result, Vec::new())
+    }
+
+    pub(crate) fn from_index_result_with_resolution_inputs(
+        index_result: IndexResult,
+        call_resolution_inputs: Vec<CachedCallResolutionInput>,
+    ) -> Self {
         Self {
+            resolution_input_schema_version: 1,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,
@@ -34,6 +57,7 @@ impl CachedIndexArtifact {
             component_access: index_result.component_access,
             callable_projection_states: index_result.callable_projection_states,
             impl_anchor_node_ids: index_result.impl_anchor_node_ids,
+            call_resolution_inputs,
         }
     }
 
@@ -474,5 +498,22 @@ mod tests {
             assert!(key.is_none(), "{flag} must fail closed");
         }
         Ok(())
+    }
+
+    #[test]
+    fn parser_cache_without_resolution_inputs_decodes_as_an_empty_legacy_projection() {
+        let legacy = serde_json::json!({
+            "files": [],
+            "nodes": [],
+            "edges": [],
+            "occurrences": [],
+            "component_access": [],
+            "callable_projection_states": [],
+            "impl_anchor_node_ids": []
+        });
+
+        let decoded: CachedIndexArtifact = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.resolution_input_schema_version, 0);
+        assert!(decoded.call_resolution_inputs.is_empty());
     }
 }

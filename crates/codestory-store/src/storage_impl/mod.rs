@@ -31,6 +31,7 @@ use thiserror::Error;
 
 mod bookmarks;
 mod helpers;
+mod proof_resolution;
 mod retrieval_manifest;
 mod row_mapping;
 mod schema;
@@ -46,8 +47,9 @@ use helpers::{
 };
 
 pub use helpers::{StoredVectorEncoding, stored_vector_encoding};
+pub use proof_resolution::{ProofResolutionPublication, seal_call_resolution_fact};
 
-const SCHEMA_VERSION: u32 = 31;
+const SCHEMA_VERSION: u32 = 32;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -2666,6 +2668,17 @@ pub struct FileContentHash {
     pub content_hash: String,
 }
 
+/// Opaque parser-cache payload retained for one source path.
+///
+/// The store deliberately does not interpret this blob. Indexer-owned
+/// publication builders use the complete ordered set to rematerialize private
+/// derived projections after core graph construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexArtifactCacheEntry {
+    pub file_path: PathBuf,
+    pub artifact_blob: Vec<u8>,
+}
+
 pub const STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION: u32 = 1;
 pub const STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION: u32 = 1;
 pub const STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE: &str = "native_v1";
@@ -4729,6 +4742,24 @@ impl Storage {
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
         get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
+    pub fn get_index_artifact_cache_entries(
+        &self,
+    ) -> Result<Vec<IndexArtifactCacheEntry>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_path, artifact_blob
+             FROM index_artifact_cache
+             ORDER BY file_path",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(IndexArtifactCacheEntry {
+                file_path: PathBuf::from(row.get::<_, String>(0)?),
+                artifact_blob: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn get_structural_text_artifact_cache(

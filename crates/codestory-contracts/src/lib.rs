@@ -19,6 +19,7 @@ pub mod grounding;
 pub mod language_support;
 pub mod owned_artifacts;
 pub mod packet_projection_v3;
+pub mod proof_resolution;
 pub mod query;
 pub mod trail;
 pub mod validation_receipts;

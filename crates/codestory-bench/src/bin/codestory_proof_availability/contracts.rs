@@ -1218,9 +1218,6 @@ impl From<codestory_agent::proof_qualification_support::RawAdmissionFailure>
     fn from(value: codestory_agent::proof_qualification_support::RawAdmissionFailure) -> Self {
         match value {
             codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind => Self::WrongKind,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyAbsent => Self::CertaintyAbsent,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyProbable => Self::CertaintyProbable,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyUncertain => Self::CertaintyUncertain,
             codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource => Self::WrongEffectiveSource,
             codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget => Self::WrongEffectiveTarget,
             codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget => Self::MissingExactResolvedTarget,
@@ -1275,6 +1272,7 @@ impl From<codestory_runtime::proof_qualification_support::SourceBindingFailure>
             codestory_runtime::proof_qualification_support::SourceBindingFailure::InvalidUtf8 => Self::InvalidUtf8,
             codestory_runtime::proof_qualification_support::SourceBindingFailure::LineMissing => Self::LineMissing,
             codestory_runtime::proof_qualification_support::SourceBindingFailure::LineOverLimit => Self::LineOverLimit,
+            codestory_runtime::proof_qualification_support::SourceBindingFailure::ExactCallsiteMismatch => Self::WorkingTreeHashMismatch,
         }
     }
 }
@@ -1388,6 +1386,7 @@ impl From<codestory_agent::proof_qualification_support::UnavailableReason> for U
             codestory_agent::proof_qualification_support::UnavailableReason::PublicationPinMismatch => Self::PublicationPinMismatch,
             codestory_agent::proof_qualification_support::UnavailableReason::SourceNotBoundToPublication => Self::SourceNotBoundToPublication,
             codestory_agent::proof_qualification_support::UnavailableReason::ProofFactsUnavailable => Self::ProofFactsUnavailable,
+            codestory_agent::proof_qualification_support::UnavailableReason::ProofSemanticProjectionUnavailable => Self::ProofFactsUnavailable,
         }
     }
 }
@@ -1436,6 +1435,9 @@ impl From<codestory_runtime::proof_qualification_support::CandidateGate> for Can
             codestory_runtime::proof_qualification_support::CandidateGate::RawAdmission => {
                 Self::RawAdmission
             }
+            codestory_runtime::proof_qualification_support::CandidateGate::ResolutionFact => {
+                Self::RawAdmission
+            }
             codestory_runtime::proof_qualification_support::CandidateGate::Containment => {
                 Self::Containment
             }
@@ -1454,6 +1456,14 @@ impl From<codestory_runtime::proof_qualification_support::CandidateFailure> for 
                 reason,
             ) => Self::RawAdmission {
                 reason: reason.into(),
+            },
+            codestory_runtime::proof_qualification_support::CandidateFailure::ResolutionFact(
+                reason,
+            ) => Self::RawAdmission {
+                reason: match reason {
+                    codestory_runtime::proof_qualification_support::ResolutionFactFailure::Missing => RawAdmissionFailureV1::MissingExactResolvedTarget,
+                    codestory_runtime::proof_qualification_support::ResolutionFactFailure::Inconsistent => RawAdmissionFailureV1::InvalidOrLegacyCallsiteIdentity,
+                },
             },
             codestory_runtime::proof_qualification_support::CandidateFailure::Containment(
                 reason,
@@ -2376,16 +2386,6 @@ pub(crate) fn resolved_canonical_id_binding_sha256(
 pub enum ReceiptCertaintyV1 {
     Certain,
 }
-impl TryFrom<codestory_contracts::graph::ResolutionCertainty> for ReceiptCertaintyV1 {
-    type Error = anyhow::Error;
-
-    fn try_from(value: codestory_contracts::graph::ResolutionCertainty) -> Result<Self> {
-        match value {
-            codestory_contracts::graph::ResolutionCertainty::Certain => Ok(Self::Certain),
-            _ => bail!("proof_availability_receipt_certainty_invalid"),
-        }
-    }
-}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CallableContainmentEvidenceV1 {
@@ -2421,6 +2421,10 @@ impl ObservedReceiptV1 {
         receipt: &codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt,
         oracle_comparison: ReceiptOracleComparisonV1,
     ) -> Result<Self> {
+        if receipt.resolution_fact_id.len() != 64 || receipt.resolution_evidence_sha256.len() != 64
+        {
+            bail!("proof_availability_resolution_fact_receipt_invalid")
+        }
         let observed = Self {
             receipt_id: receipt.receipt.receipt_id.clone(),
             step_index,
@@ -2431,7 +2435,7 @@ impl ObservedReceiptV1 {
                 .map_err(|_| anyhow::anyhow!("proof_availability_receipt_edge_id_invalid"))?,
             source: (&receipt.source).try_into()?,
             target: (&receipt.target).try_into()?,
-            certainty: receipt.certainty.try_into()?,
+            certainty: ReceiptCertaintyV1::Certain,
             callsite_identity: receipt.callsite_identity.clone(),
             callsite_line: receipt.line_window.anchor_line,
             containment: CallableContainmentEvidenceV1 {

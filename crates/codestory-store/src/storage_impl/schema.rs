@@ -346,6 +346,60 @@ const TABLE_STATEMENTS: &[&str] = &[
         artifact_blob BLOB NOT NULL,
         updated_at_epoch_ms INTEGER NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS proof_resolution_fact (
+        fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
+        edge_id INTEGER,
+        file_id INTEGER NOT NULL,
+        source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+        start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+        end_byte_exclusive INTEGER NOT NULL CHECK(end_byte_exclusive > start_byte),
+        line INTEGER NOT NULL CHECK(line > 0),
+        column INTEGER NOT NULL CHECK(column > 0),
+        callee_form TEXT NOT NULL CHECK(callee_form IN (
+            'identifier', 'named_import', 'qualified_path', 'explicit_receiver',
+            'implicit_receiver', 'constructor', 'dynamic_access'
+        )),
+        raw_target TEXT NOT NULL CHECK(length(raw_target) > 0),
+        caller_node_id INTEGER NOT NULL,
+        target_node_id INTEGER,
+        status TEXT NOT NULL CHECK(status IN (
+            'exact', 'ambiguous', 'unsupported', 'missing_binding', 'incomplete_domain'
+        )),
+        reason TEXT NOT NULL CHECK(reason IN (
+            'exact_resolution', 'multiple_bindings', 'unsupported_construct',
+            'missing_binding', 'lookup_domain_incomplete'
+        )),
+        evidence_json TEXT NOT NULL,
+        dependency_json TEXT NOT NULL,
+        lookup_domain_complete INTEGER NOT NULL CHECK(lookup_domain_complete IN (0, 1)),
+        producer TEXT NOT NULL,
+        fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+        algorithm TEXT NOT NULL,
+        language_adapter TEXT NOT NULL,
+        language_adapter_version TEXT NOT NULL,
+        parser_fingerprint TEXT NOT NULL,
+        evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+        UNIQUE(file_id, start_byte, end_byte_exclusive),
+        CHECK(status != 'exact' OR (
+            target_node_id IS NOT NULL AND edge_id IS NOT NULL AND lookup_domain_complete = 1
+        )),
+        FOREIGN KEY(edge_id) REFERENCES edge(id),
+        FOREIGN KEY(file_id) REFERENCES file(id),
+        FOREIGN KEY(caller_node_id) REFERENCES node(id),
+        FOREIGN KEY(target_node_id) REFERENCES node(id)
+    )",
+    "CREATE TABLE IF NOT EXISTS proof_resolution_publication (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+        core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+        fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+        adapter_roster_json TEXT NOT NULL,
+        complete INTEGER NOT NULL CHECK(complete = 1),
+        fact_count INTEGER NOT NULL CHECK(fact_count >= 0),
+        fact_digest TEXT NOT NULL CHECK(length(fact_digest) = 64),
+        funnel_json TEXT NOT NULL,
+        published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+    )",
     "CREATE TABLE IF NOT EXISTS resolution_support_snapshot (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         snapshot_version INTEGER NOT NULL,
@@ -450,6 +504,10 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_callable_projection_state_file_node ON callable_projection_state(file_id, node_id)",
     "CREATE INDEX IF NOT EXISTS idx_index_artifact_cache_key
      ON index_artifact_cache(cache_key)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_proof_resolution_exact_edge
+     ON proof_resolution_fact(edge_id) WHERE status = 'exact'",
+    "CREATE INDEX IF NOT EXISTS idx_proof_resolution_caller_target
+     ON proof_resolution_fact(caller_node_id, target_node_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_file
      ON structural_text_unit(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_content
@@ -716,6 +774,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     migrate_v31_annotation_sidecar_cutover(&storage.conn)?;
     if stored_version < 31 {
         storage.set_schema_version(31)?;
+    }
+    migrate_v32_proof_resolution_projection(&storage.conn)?;
+    if stored_version < 32 {
+        storage.set_schema_version(32)?;
     }
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
@@ -1285,6 +1347,87 @@ pub(super) fn migrate_v31_annotation_sidecar_cutover(
             crate::annotations::ANNOTATION_SCHEMA_VERSION,
             current_epoch_ms()
         ],
+    )?;
+    Ok(())
+}
+
+/// Add the exact-resolution overlay without manufacturing a completeness row.
+///
+/// Navigation can keep using a migrated schema-31 graph, but proof remains
+/// unavailable until an indexing run rematerializes facts and writes the lone
+/// complete publication receipt.
+pub(super) fn migrate_v32_proof_resolution_projection(
+    conn: &Connection,
+) -> Result<(), StorageError> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS proof_resolution_fact (
+            fact_id TEXT PRIMARY KEY CHECK(length(fact_id) = 64),
+            edge_id INTEGER,
+            file_id INTEGER NOT NULL,
+            source_sha256 TEXT NOT NULL CHECK(length(source_sha256) = 64),
+            start_byte INTEGER NOT NULL CHECK(start_byte >= 0),
+            end_byte_exclusive INTEGER NOT NULL CHECK(end_byte_exclusive > start_byte),
+            line INTEGER NOT NULL CHECK(line > 0),
+            column INTEGER NOT NULL CHECK(column > 0),
+            callee_form TEXT NOT NULL CHECK(callee_form IN (
+                'identifier', 'named_import', 'qualified_path', 'explicit_receiver',
+                'implicit_receiver', 'constructor', 'dynamic_access'
+            )),
+            raw_target TEXT NOT NULL CHECK(length(raw_target) > 0),
+            caller_node_id INTEGER NOT NULL,
+            target_node_id INTEGER,
+            status TEXT NOT NULL CHECK(status IN (
+                'exact', 'ambiguous', 'unsupported', 'missing_binding', 'incomplete_domain'
+            )),
+            reason TEXT NOT NULL CHECK(reason IN (
+                'exact_resolution', 'multiple_bindings', 'unsupported_construct',
+                'missing_binding', 'lookup_domain_incomplete'
+            )),
+            evidence_json TEXT NOT NULL,
+            dependency_json TEXT NOT NULL,
+            lookup_domain_complete INTEGER NOT NULL CHECK(lookup_domain_complete IN (0, 1)),
+            producer TEXT NOT NULL,
+            fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+            algorithm TEXT NOT NULL,
+            language_adapter TEXT NOT NULL,
+            language_adapter_version TEXT NOT NULL,
+            parser_fingerprint TEXT NOT NULL,
+            evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+            UNIQUE(file_id, start_byte, end_byte_exclusive),
+            CHECK(status != 'exact' OR (
+                target_node_id IS NOT NULL AND edge_id IS NOT NULL AND lookup_domain_complete = 1
+            )),
+            FOREIGN KEY(edge_id) REFERENCES edge(id),
+            FOREIGN KEY(file_id) REFERENCES file(id),
+            FOREIGN KEY(caller_node_id) REFERENCES node(id),
+            FOREIGN KEY(target_node_id) REFERENCES node(id)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS proof_resolution_publication (
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            core_generation_id TEXT NOT NULL CHECK(length(core_generation_id) > 0),
+            core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
+            fact_schema_version INTEGER NOT NULL CHECK(fact_schema_version > 0),
+            adapter_roster_json TEXT NOT NULL,
+            complete INTEGER NOT NULL CHECK(complete = 1),
+            fact_count INTEGER NOT NULL CHECK(fact_count >= 0),
+            fact_digest TEXT NOT NULL CHECK(length(fact_digest) = 64),
+            funnel_json TEXT NOT NULL,
+            published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_proof_resolution_exact_edge
+         ON proof_resolution_fact(edge_id) WHERE status = 'exact'",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proof_resolution_caller_target
+         ON proof_resolution_fact(caller_node_id, target_node_id, status)",
+        [],
     )?;
     Ok(())
 }

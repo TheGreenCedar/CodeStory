@@ -7,11 +7,8 @@ use codestory_store::Store;
 
 use super::contracts::InventoryReportV1;
 
-const ALL_ADMISSION_FAILURES: [RawAdmissionFailure; 14] = [
+const ALL_ADMISSION_FAILURES: [RawAdmissionFailure; 11] = [
     RawAdmissionFailure::WrongKind,
-    RawAdmissionFailure::CertaintyAbsent,
-    RawAdmissionFailure::CertaintyProbable,
-    RawAdmissionFailure::CertaintyUncertain,
     RawAdmissionFailure::WrongEffectiveSource,
     RawAdmissionFailure::WrongEffectiveTarget,
     RawAdmissionFailure::MissingExactResolvedTarget,

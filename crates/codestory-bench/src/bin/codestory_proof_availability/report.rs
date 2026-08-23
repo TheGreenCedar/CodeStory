@@ -3160,7 +3160,7 @@ mod tests {
             CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow,
             PinnedNodeIdentity, ReceiptRef, ResolvedNodeIdentity,
         };
-        use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+        use codestory_contracts::graph::NodeId;
 
         const SOURCE_CANONICAL_ID: &str = "/Users/private/worktree/src/caller.rs::caller";
         const TARGET_CANONICAL_ID: &str = r"C:\private\worktree\src\target.rs::target";
@@ -3199,7 +3199,9 @@ mod tests {
             },
             source: resolved(&prior.source, SOURCE_CANONICAL_ID),
             target: resolved(&prior.target, TARGET_CANONICAL_ID),
-            certainty: ResolutionCertainty::Certain,
+            resolution_fact_id: "a".repeat(64),
+            resolution_evidence_sha256: "b".repeat(64),
+            exact_callsite_start_byte: 0,
             callsite_identity: prior.callsite_identity.clone(),
             column_or_ordinal: 0,
             containment: CallableContainmentEvidence {

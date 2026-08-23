@@ -44,6 +44,7 @@ mod framework_routes;
 pub mod intermediate_storage;
 mod language_configs;
 mod languages;
+mod proof_resolution;
 
 /// SRC-C2 fence classification: lives in its own file because
 /// `codestory-indexer`'s own source is indexed by
@@ -62,6 +63,7 @@ use cache::{
 };
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
+pub use proof_resolution::rematerialize_proof_resolution_projection;
 use symbol_table::SymbolTable;
 
 pub(crate) const RECEIVER_OWNER_CALLSITE_PREFIX: &str = "receiver-owner:";
@@ -3648,7 +3650,7 @@ impl WorkspaceIndexer {
         prepared_input: &PreparedIndexInput,
         symbol_table: &Arc<SymbolTable>,
     ) -> PreparedIndexJobResult {
-        let index_result = index_file(
+        let index_result = index_file_with_resolution_inputs(
             &prepared_input.full_path,
             &prepared_input.source,
             &prepared_input.language_config,
@@ -3672,11 +3674,14 @@ impl WorkspaceIndexer {
             };
 
         match index_result {
-            Ok(mut index_result) => {
+            Ok((mut index_result, call_resolution_inputs)) => {
                 if let Some(file_info) = index_result.files.first_mut() {
                     file_info.modification_time = modification_time;
                 }
-                let artifact = CachedIndexArtifact::from_index_result(index_result);
+                let artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
+                    index_result,
+                    call_resolution_inputs,
+                );
                 let cache_write = prepared_input
                     .artifact_cache_path
                     .as_ref()
@@ -4237,6 +4242,10 @@ fn rebase_cached_index_artifact(
         .collect();
     artifact.impl_anchor_node_ids.sort_unstable();
     artifact.impl_anchor_node_ids.dedup();
+    for input in &mut artifact.call_resolution_inputs {
+        input.callsite.file_id = codestory_contracts::proof_resolution::FileId(new_file_id.0);
+        input.caller = id_remap.get(&input.caller).copied().unwrap_or(input.caller);
+    }
 
     if let Some(file_info) = artifact.files.first_mut() {
         file_info.id = new_file_id.0;
@@ -15072,6 +15081,23 @@ pub fn index_file(
     compilation_info: Option<compilation_database::CompilationInfo>,
     symbol_table: Option<Arc<SymbolTable>>,
 ) -> Result<IndexResult> {
+    index_file_with_resolution_inputs(
+        path,
+        source,
+        language_config,
+        compilation_info,
+        symbol_table,
+    )
+    .map(|(result, _)| result)
+}
+
+fn index_file_with_resolution_inputs(
+    path: &Path,
+    source: &str,
+    language_config: &LanguageConfig,
+    compilation_info: Option<compilation_database::CompilationInfo>,
+    symbol_table: Option<Arc<SymbolTable>>,
+) -> Result<(IndexResult, Vec<cache::CachedCallResolutionInput>)> {
     let flags = index_feature_flags();
     let is_jsx_like_file = path
         .extension()
@@ -15727,15 +15753,27 @@ pub fn index_file(
         }
     }
 
-    Ok(IndexResult {
-        files: result_files,
-        nodes: final_nodes,
-        edges: result_edges,
-        occurrences: result_occurrences,
-        component_access,
-        callable_projection_states,
-        impl_anchor_node_ids,
-    })
+    let call_resolution_inputs = proof_resolution::collect_call_resolution_inputs(
+        &tree,
+        source,
+        language_config.language_name,
+        file_id,
+        &final_nodes,
+        &mut result_edges,
+    );
+
+    Ok((
+        IndexResult {
+            files: result_files,
+            nodes: final_nodes,
+            edges: result_edges,
+            occurrences: result_occurrences,
+            component_access,
+            callable_projection_states,
+            impl_anchor_node_ids,
+        },
+        call_resolution_inputs,
+    ))
 }
 
 /// Return the public language-support profile for a file extension.

@@ -1221,7 +1221,9 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
         },
         source: identity("1", &oracle.caller),
         target: identity("2", &oracle.target),
-        certainty: codestory_contracts::graph::ResolutionCertainty::Certain,
+        resolution_fact_id: "a".repeat(64),
+        resolution_evidence_sha256: "b".repeat(64),
+        exact_callsite_start_byte: 0,
         callsite_identity: "1:1:0:2|fixture".into(),
         column_or_ordinal: 0,
         containment: codestory_agent::proof_qualification_support::CallableContainmentEvidence {
@@ -1327,7 +1329,7 @@ fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity,
     };
-    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+    use codestory_contracts::graph::NodeId;
 
     let path_file =
         CohortPathFileV1::from_json(cohort_path_file("codestory-rust")).expect("oracle path file");
@@ -1363,7 +1365,9 @@ fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
         },
         source: identity("-1", source_raw, &oracle.caller.symbol),
         target: identity("-2", target_raw, &oracle.target.symbol),
-        certainty: ResolutionCertainty::Certain,
+        resolution_fact_id: "a".repeat(64),
+        resolution_evidence_sha256: "b".repeat(64),
+        exact_callsite_start_byte: 0,
         callsite_identity: format!("-3:{}:0:-2|fixture", oracle.callsite_line),
         column_or_ordinal: 0,
         containment: CallableContainmentEvidence {
@@ -2359,7 +2363,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
     };
-    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+    use codestory_contracts::graph::NodeId;
     use codestory_runtime::proof_qualification_support::{
         CandidateFailure, CandidateGate, ContainmentFailure, FinalizationFailure,
         FinalizationTrace, ProofQualificationTrace, SelectorFailure, SelectorGateOutcome,
@@ -2413,6 +2417,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
 
     for gate in [
         CandidateGate::RawAdmission,
+        CandidateGate::ResolutionFact,
         CandidateGate::Containment,
         CandidateGate::SourceBinding,
         CandidateGate::Line,
@@ -2431,14 +2436,12 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         UnavailableReason::PublicationPinMismatch,
         UnavailableReason::SourceNotBoundToPublication,
         UnavailableReason::ProofFactsUnavailable,
+        UnavailableReason::ProofSemanticProjectionUnavailable,
     ] {
         let _: SelectorGateOutcomeV1 = SelectorGateOutcome::Unavailable(unavailable).into();
     }
     for reason in [
         codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyAbsent,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyProbable,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CertaintyUncertain,
         codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource,
         codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget,
         codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget,
@@ -2467,6 +2470,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         SourceBindingFailure::InvalidUtf8,
         SourceBindingFailure::LineMissing,
         SourceBindingFailure::LineOverLimit,
+        SourceBindingFailure::ExactCallsiteMismatch,
     ] {
         let _: CandidateFailureV1 = CandidateFailure::SourceBinding(reason).into();
     }
@@ -2520,7 +2524,9 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         },
         source: identity("-1", "codestory-rust-l1-0::start"),
         target: identity("-2", "codestory-rust-l1-0::target_0"),
-        certainty: ResolutionCertainty::Certain,
+        resolution_fact_id: "a".repeat(64),
+        resolution_evidence_sha256: "b".repeat(64),
+        exact_callsite_start_byte: 0,
         callsite_identity: "-3:1:0:-2|fixture".into(),
         column_or_ordinal: 0,
         containment: CallableContainmentEvidence {
@@ -2665,15 +2671,15 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         ["src", "area0", "file0.rs"]
     );
 
-    let mut probable = task6_receipt;
-    probable.certainty = ResolutionCertainty::Probable;
+    let mut unbound = task6_receipt;
+    unbound.resolution_fact_id.clear();
     let comparison: ReceiptOracleComparisonV1 = serde_json::from_value(
         report()["cases"][0]["receipt_evidence"]["observed_receipts"][0]["oracle_comparison"]
             .clone(),
     )
     .expect("oracle comparison");
-    ObservedReceiptV1::from_task6(0, &probable, comparison)
-        .expect_err("Task 6 receipts must retain and require Certain certainty");
+    ObservedReceiptV1::from_task6(0, &unbound, comparison)
+        .expect_err("Task 6 receipts must retain an authenticated exact-resolution fact");
 }
 
 #[test]
@@ -2682,7 +2688,7 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity,
     };
-    use codestory_contracts::graph::{NodeId, ResolutionCertainty};
+    use codestory_contracts::graph::NodeId;
 
     const RAW_TARGET: i64 = -8_657_445_931_347_514_024;
     const RESOLVED_TARGET: i64 = -8_657_442_632_812_629_391;
@@ -2716,7 +2722,9 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
         },
         source: identity(-1, &oracle.caller),
         target: identity(RESOLVED_TARGET, &oracle.target),
-        certainty: ResolutionCertainty::Certain,
+        resolution_fact_id: "a".repeat(64),
+        resolution_evidence_sha256: "b".repeat(64),
+        exact_callsite_start_byte: 0,
         callsite_identity: callsite_identity.clone(),
         column_or_ordinal: 0,
         containment: CallableContainmentEvidence {

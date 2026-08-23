@@ -14,8 +14,8 @@ pub use crate::indexed_source_call_path_v1::{
     FinalizationFailure, FinalizationTrace, IntegratedProjectedCallPathResult,
     MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP, MAX_QUALIFICATION_OBSERVED_RECEIPTS_PER_CASE,
     ObservedBuiltCallPathFacts, ObservedIntegratedProjectedCallPathResult, ProofQualificationTrace,
-    SelectorFailure, SelectorGateOutcome, SelectorQualificationTrace, SourceBindingFailure,
-    StepQualificationOutcome, StepQualificationTrace,
+    ResolutionFactFailure, SelectorFailure, SelectorGateOutcome, SelectorQualificationTrace,
+    SourceBindingFailure, StepQualificationOutcome, StepQualificationTrace,
 };
 
 /// Executes one observed proof through the runtime's existing core-only public

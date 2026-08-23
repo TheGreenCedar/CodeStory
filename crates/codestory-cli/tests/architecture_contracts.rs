@@ -1276,6 +1276,63 @@ fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
     );
 }
 
+#[test]
+fn exact_resolution_facts_are_a_one_way_proof_overlay() {
+    for proof_module in [
+        "crates/codestory-agent/src/indexed_source_call_path_v1.rs",
+        "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
+    ] {
+        let source = read(proof_module);
+        for forbidden in ["ResolutionCertainty", ".certainty", ".confidence"] {
+            assert!(
+                !source.contains(forbidden),
+                "{proof_module} reads navigation-only diagnostic evidence via {forbidden}"
+            );
+        }
+    }
+
+    for (consumer, source) in [
+        (
+            "retrieval",
+            read_source_tree("crates/codestory-retrieval/src"),
+        ),
+        (
+            "packet planner",
+            read_source_tree("crates/codestory-agent/src")
+                .replace(&read("crates/codestory-agent/src/indexed_source_call_path_v1.rs"), ""),
+        ),
+        ("search", read_source_tree("crates/codestory-runtime/src/search")),
+        (
+            "packet runtime",
+            read_source_tree("crates/codestory-runtime/src/agent"),
+        ),
+        (
+            "context",
+            read("crates/codestory-cli/src/app/agent_context/context.rs"),
+        ),
+    ] {
+        for forbidden in ["proof_resolution_fact", "CallResolutionFact"] {
+            assert!(
+                !source.contains(forbidden),
+                "{consumer} crossed the one-way proof overlay via {forbidden}"
+            );
+        }
+    }
+
+    for surface in [
+        read_source_tree("crates/codestory-cli/src"),
+        read("plugins/codestory/generated-mcp-catalog.json"),
+        read("crates/codestory-contracts/src/api.rs"),
+    ] {
+        for forbidden in ["CallResolutionFact", "proof_resolution_fact"] {
+            assert!(
+                !surface.contains(forbidden),
+                "the private exact-resolution overlay reached a public command, route, DTO, serializer, or catalog via {forbidden}"
+            );
+        }
+    }
+}
+
 fn dark_call_path_release_surface_violations() -> Vec<String> {
     const DARK_TOKENS: [&str; 5] = [
         "indexed_source_call_path_v1",
