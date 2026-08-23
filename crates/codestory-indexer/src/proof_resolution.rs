@@ -64,6 +64,9 @@ pub(crate) fn collect_call_resolution_inputs(
     {
         lookup_input_complete = false;
     }
+    if language == "rust" && rust_file_has_item_domain_macro_invocation(tree.root_node()) {
+        lookup_input_complete = false;
+    }
     let typescript_module =
         matches!(language, "typescript" | "tsx") && typescript_file_is_module(tree.root_node());
     let top_level_declarations = if matches!(language, "typescript" | "tsx" | "rust") {
@@ -145,16 +148,28 @@ fn is_installed_language(language: &str) -> bool {
         .any(|(installed, _)| *installed == language)
 }
 
+fn expected_parser_fingerprint(path: &Path, language: &str) -> Option<String> {
+    let extension = path.extension()?.to_str()?;
+    let config = crate::get_language_for_ext(extension)?;
+    (config.language_name == language).then(|| crate::resolution_parser_fingerprint(&config))
+}
+
 pub(crate) fn cached_resolution_inputs_are_current(
     artifact: &CachedIndexArtifact,
     language: &str,
+    expected_parser_fingerprint: &str,
 ) -> bool {
     !is_installed_language(language)
         || (artifact.resolution_input_schema_version == RESOLUTION_INPUT_SCHEMA_VERSION
             && artifact.resolution_file.as_ref().is_some_and(|file| {
                 file.language == language
                     && file.adapter_version == ADAPTER_VERSION
-                    && file.parser_fingerprint.len() == 64
+                    && file.parser_fingerprint == expected_parser_fingerprint
+                    && artifact.call_resolution_inputs.iter().all(|call| {
+                        call.language == language
+                            && call.adapter_version == ADAPTER_VERSION
+                            && call.parser_fingerprint == expected_parser_fingerprint
+                    })
             }))
 }
 
@@ -310,6 +325,9 @@ fn resolve_rust_syntax_claim(
     };
     if !rust_callable_is_in_root_module(callable) {
         return (Some(caller), CachedResolutionBinding::Unsupported);
+    }
+    if contains_node_kind(callable, "macro_invocation") {
+        return (Some(caller), CachedResolutionBinding::IncompleteDomain);
     }
     if callable_has_shadow_or_write("rust", callable, callee, raw_target, source)
         || rust_root_has_competing_value_binding(tree.root_node(), raw_target, source)
@@ -477,6 +495,30 @@ fn rust_callable_is_in_root_module(callable: TsNode<'_>) -> bool {
             }),
         _ => false,
     }
+}
+
+fn contains_node_kind(root: TsNode<'_>, kind: &str) -> bool {
+    let mut found = false;
+    walk_nodes(root, &mut |node| found |= node.kind() == kind);
+    found
+}
+
+fn rust_file_has_item_domain_macro_invocation(root: TsNode<'_>) -> bool {
+    let mut found = false;
+    walk_nodes(root, &mut |node| {
+        if found || node.kind() != "macro_invocation" {
+            return;
+        }
+        let mut ancestor = node.parent();
+        while let Some(current) = ancestor {
+            if current.kind() == "function_item" {
+                return;
+            }
+            ancestor = current.parent();
+        }
+        found = true;
+    });
+    found
 }
 
 fn direct_impl_functions(impl_item: TsNode<'_>) -> Vec<TsNode<'_>> {
@@ -860,19 +902,14 @@ fn collect_typescript_direct_exports(
         if statement.kind() != "export_statement" {
             continue;
         }
-        let is_default = node_text(statement, source)
-            .unwrap_or_default()
-            .trim_start()
-            .starts_with("export default function ");
-        let mut nested_cursor = statement.walk();
-        let declarations = statement
-            .named_children(&mut nested_cursor)
-            .filter(|child| child.kind() == "function_declaration")
-            .collect::<Vec<_>>();
-        if declarations.len() != 1 {
-            continue;
+        let declaration = statement.child_by_field_name("declaration")?;
+        if declaration.kind() != "function_declaration"
+            || statement.child_by_field_name("source").is_some()
+            || statement.child_by_field_name("value").is_some()
+        {
+            return None;
         }
-        let declaration = declarations[0];
+        let is_default = export_statement_has_default_token(statement)?;
         let name = declaration_name(declaration, source)?;
         if root_has_write(tree.root_node(), name, source) {
             continue;
@@ -889,7 +926,21 @@ fn collect_typescript_direct_exports(
             .cmp(&right.exported_name)
             .then(left.declaration.cmp(&right.declaration))
     });
+    if exports.windows(2).any(|pair| {
+        pair[0].exported_name == pair[1].exported_name && pair[0].is_default == pair[1].is_default
+    }) {
+        return None;
+    }
     Some(exports)
+}
+
+fn export_statement_has_default_token(statement: TsNode<'_>) -> Option<bool> {
+    let mut cursor = statement.walk();
+    let defaults = statement
+        .children(&mut cursor)
+        .filter(|child| !child.is_named() && child.kind() == "default")
+        .count();
+    (defaults <= 1).then_some(defaults == 1)
 }
 
 fn collect_top_level_declarations(
@@ -1125,18 +1176,38 @@ pub fn rematerialize_proof_resolution_projection(
                     indexed_file.path.display()
                 )
             })?;
+        let expected_parser_fingerprint = expected_parser_fingerprint(
+            &indexed_file.path,
+            &indexed_file.language,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "proof resolution installed adapter has no compiled parser fingerprint for {} ({})",
+                indexed_file.language,
+                indexed_file.path.display()
+            )
+        })?;
+        if record.file.parser_fingerprint != expected_parser_fingerprint
+            || record
+                .calls
+                .iter()
+                .any(|call| call.parser_fingerprint != expected_parser_fingerprint)
+        {
+            return Err(anyhow!(
+                "proof resolution parser fingerprint does not match the compiled parser/rules for {}",
+                indexed_file.path.display()
+            ));
+        }
         if record.file.file_id != NodeId(indexed_file.id)
             || record.file.source_sha256 != stored_hash
             || record.file.language != indexed_file.language
             || record.file.complete != indexed_file.complete
             || record.file.adapter_version != ADAPTER_VERSION
-            || record.file.parser_fingerprint.len() != 64
             || record.calls.iter().any(|call| {
                 call.callsite.file_id != FileId(indexed_file.id)
                     || call.callsite.source_sha256 != stored_hash
                     || call.language != indexed_file.language
                     || call.adapter_version != record.file.adapter_version
-                    || call.parser_fingerprint != record.file.parser_fingerprint
             })
         {
             return Err(anyhow!(

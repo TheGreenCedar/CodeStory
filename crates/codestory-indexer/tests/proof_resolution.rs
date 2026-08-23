@@ -254,6 +254,27 @@ fn assert_only_call_is_not_exact(files: &[(&str, &str)]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn assert_only_call_is_exact(files: &[(&str, &str)]) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let called = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    assert_eq!(called.len(), 1, "unexpected target calls: {called:#?}");
+    assert_eq!(
+        called[0].status,
+        ProofResolutionStatus::Exact,
+        "{called:#?}"
+    );
+    assert!(called[0].target.is_some(), "{called:#?}");
+    assert!(called[0].edge_id.is_some(), "{called:#?}");
+    Ok(())
+}
+
 #[test]
 fn typescript_exact_rejects_module_writes_shadows_and_unsupported_namespace_reflection()
 -> anyhow::Result<()> {
@@ -389,6 +410,97 @@ fn typescript_script_calls_are_never_exact() -> anyhow::Result<()> {
         "src/reflective.ts",
         "function target() {}\nfunction other() {}\nObject.defineProperty(globalThis, \"target\", { value: other });\nfunction caller() { target(); }\n",
     )])?;
+    Ok(())
+}
+
+#[test]
+fn typescript_direct_exports_are_classified_from_closed_syntax() -> anyhow::Result<()> {
+    assert_only_call_is_not_exact(&[
+        (
+            "src/exported.ts",
+            "export default async function target() {}\n",
+        ),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_not_exact(&[
+        ("src/exported.ts", "export default function* target() {}\n"),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_not_exact(&[
+        ("src/exported.ts", "export default function* target() {}\n"),
+        (
+            "src/importer.ts",
+            "import target from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_not_exact(&[
+        ("src/exported.ts", "export function* target() {}\n"),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/exported.ts",
+            "export default /* comment */ async function target() {}\n",
+        ),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_exact(&[
+        (
+            "src/exported.ts",
+            "export default async function target() {}\n",
+        ),
+        (
+            "src/importer.ts",
+            "import target from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_exact(&[
+        (
+            "src/exported.ts",
+            "export default /* comment */ async function target() {}\n",
+        ),
+        (
+            "src/importer.ts",
+            "import target from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_exact(&[
+        ("src/exported.ts", "export async function target() {}\n"),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
+    for unsupported_export in [
+        "export default function () {}\n",
+        "export default function first() {}\nexport default function second() {}\n",
+        "export declare function target(): void;\n",
+        "type target = () => void;\nexport type { target };\n",
+        "export { target } from './actual';\n",
+        "export function target(): void;\nexport function target() {}\n",
+        "export const unrelated = 1;\nexport function target() {}\n",
+    ] {
+        assert_only_call_is_not_exact(&[
+            ("src/exported.ts", unsupported_export),
+            ("src/actual.ts", "export function target() {}\n"),
+            (
+                "src/importer.ts",
+                "import { target } from './exported';\nexport function caller() { target(); }\n",
+            ),
+        ])?;
+    }
     Ok(())
 }
 
@@ -684,6 +796,44 @@ fn complete_projection_rejects_parser_completeness_mismatch() -> anyhow::Result<
 }
 
 #[test]
+fn complete_projection_rejects_an_attacker_supplied_parser_fingerprint() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/main.ts",
+            "export function target() {}\nexport function caller() { target(); }\n",
+        )],
+    )?;
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    let attacker_fingerprint = "f".repeat(64);
+    artifact["resolution_file"]["parser_fingerprint"] =
+        serde_json::Value::String(attacker_fingerprint.clone());
+    for call in artifact["call_resolution_inputs"]
+        .as_array_mut()
+        .expect("call inputs")
+    {
+        call["parser_fingerprint"] = serde_json::Value::String(attacker_fingerprint.clone());
+    }
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
+        .expect_err("attacker-supplied parser identity must not authenticate itself");
+    assert!(error.to_string().contains("fingerprint"), "{error}");
+    Ok(())
+}
+
+#[test]
 fn unrelated_relative_cache_suffix_cannot_impersonate_an_indexed_absolute_path()
 -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
@@ -704,6 +854,33 @@ fn unrelated_relative_cache_suffix_cannot_impersonate_an_indexed_absolute_path()
     let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
         .expect_err("a different component path must not impersonate the indexed file");
     assert!(error.to_string().contains("native path"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn rust_macro_expansion_domains_are_never_exact() -> anyhow::Result<()> {
+    assert_only_call_is_not_exact(&[(
+        "src/callable.rs",
+        "macro_rules! shadow { ($name:ident) => { let $name: fn() = || {}; }; }\nfn target() {}\nfn caller() { shadow!(target); target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/root.rs",
+        "macro_rules! duplicate { ($name:ident) => { fn $name() {} }; }\nduplicate!(target);\nfn target() {}\nfn caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/impl.rs",
+        "macro_rules! duplicate { () => { fn target(&self) {} }; }\nstruct Worker;\nimpl Worker { duplicate!(); fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/main.rs",
+            "struct Worker;\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        ),
+        (
+            "src/other.rs",
+            "macro_rules! duplicate { () => { impl Worker { fn target(&self) {} } }; }\nduplicate!();\n",
+        ),
+    ])?;
     Ok(())
 }
 

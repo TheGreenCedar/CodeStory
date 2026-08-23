@@ -3140,6 +3140,7 @@ impl WorkspaceIndexer {
                     if proof_resolution::cached_resolution_inputs_are_current(
                         &artifact,
                         language_config.language_name,
+                        &resolution_parser_fingerprint(&language_config),
                     ) =>
                 {
                     let mut artifact = rebase_cached_index_artifact(

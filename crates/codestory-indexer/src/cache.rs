@@ -580,8 +580,14 @@ mod tests {
         assert!(decoded.call_resolution_inputs.is_empty());
         assert!(decoded.resolution_file.is_none());
         assert!(
-            !crate::proof_resolution::cached_resolution_inputs_are_current(&decoded, "typescript")
+            !crate::proof_resolution::cached_resolution_inputs_are_current(
+                &decoded,
+                "typescript",
+                &"0".repeat(64),
+            )
         );
-        assert!(crate::proof_resolution::cached_resolution_inputs_are_current(&decoded, "go"));
+        assert!(
+            crate::proof_resolution::cached_resolution_inputs_are_current(&decoded, "go", "unused",)
+        );
     }
 }
