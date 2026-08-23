@@ -74,10 +74,6 @@ pub(crate) struct CachedResolutionFile {
     pub complete: bool,
     pub lookup_input_complete: bool,
     pub typescript_module: bool,
-    #[serde(default)]
-    pub typescript_project_value_mutations: Vec<String>,
-    #[serde(default)]
-    pub typescript_project_value_mutations_complete: bool,
     pub top_level_declarations: Vec<CachedTopLevelDeclaration>,
     pub inherent_methods: Vec<CachedInherentMethod>,
     pub direct_exports: Vec<CachedDirectExport>,
@@ -115,7 +111,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 4,
+            resolution_input_schema_version: 3,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

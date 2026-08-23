@@ -14,12 +14,12 @@ use codestory_contracts::proof_resolution::{
 };
 use codestory_store::{IndexPublicationRecord, ProofResolutionPublication, Store};
 use codestory_workspace::{WorkspacePathIdentity, workspace_path_identity};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node as TsNode, Tree};
 
 const ADAPTER_VERSION: &str = "reference-v3";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 4;
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 3;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("rust", ADAPTER_VERSION),
     ("tsx", ADAPTER_VERSION),
@@ -66,18 +66,6 @@ pub(crate) fn collect_call_resolution_inputs(
     }
     let typescript_module =
         matches!(language, "typescript" | "tsx") && typescript_file_is_module(tree.root_node());
-    let (typescript_project_value_mutations, typescript_project_value_mutations_complete) =
-        if matches!(language, "typescript" | "tsx") {
-            match collect_typescript_project_value_mutations(tree.root_node(), source) {
-                Some(mutations) => (mutations, true),
-                None => {
-                    lookup_input_complete = false;
-                    (Vec::new(), false)
-                }
-            }
-        } else {
-            (Vec::new(), false)
-        };
     let top_level_declarations = if matches!(language, "typescript" | "tsx" | "rust") {
         match collect_top_level_declarations(tree, source, language, file_id, nodes) {
             Some(declarations) => declarations,
@@ -144,8 +132,6 @@ pub(crate) fn collect_call_resolution_inputs(
             complete,
             lookup_input_complete,
             typescript_module,
-            typescript_project_value_mutations,
-            typescript_project_value_mutations_complete,
             top_level_declarations,
             inherent_methods,
             direct_exports,
@@ -169,8 +155,6 @@ pub(crate) fn cached_resolution_inputs_are_current(
                 file.language == language
                     && file.adapter_version == ADAPTER_VERSION
                     && file.parser_fingerprint.len() == 64
-                    && (!matches!(language, "typescript" | "tsx")
-                        || file.typescript_project_value_mutations_complete)
             }))
 }
 
@@ -249,6 +233,9 @@ fn resolve_typescript_syntax_claim(
         return (None, CachedResolutionBinding::Ambiguous);
     };
     if !typescript_callable_is_top_level(callable) {
+        return (Some(caller), CachedResolutionBinding::Unsupported);
+    }
+    if !typescript_file_is_module(tree.root_node()) {
         return (Some(caller), CachedResolutionBinding::Unsupported);
     }
     if form != CalleeForm::Identifier {
@@ -737,60 +724,6 @@ fn rust_binding_regions(node: TsNode<'_>) -> Result<Option<Vec<TsNode<'_>>>, ()>
     }
 }
 
-fn collect_typescript_project_value_mutations(
-    root: TsNode<'_>,
-    source: &str,
-) -> Option<Vec<String>> {
-    let mut names = BTreeSet::new();
-    let mut complete = true;
-    walk_nodes(root, &mut |node| {
-        if !complete {
-            return;
-        }
-        if let Some(target) = typescript_write_target(node) {
-            let Some(target) = target else {
-                complete = false;
-                return;
-            };
-            complete &= collect_subtree_value_names(target, source, &mut names);
-        }
-        if node.kind() == "function_declaration" && typescript_callable_is_top_level(node) {
-            return;
-        }
-        match typescript_binding_regions(node) {
-            Err(()) => complete = false,
-            Ok(Some(regions)) => {
-                for region in regions {
-                    complete &= collect_subtree_value_names(region, source, &mut names);
-                }
-            }
-            Ok(None) => {}
-        }
-    });
-    complete.then(|| names.into_iter().collect())
-}
-
-fn collect_subtree_value_names(
-    node: TsNode<'_>,
-    source: &str,
-    names: &mut BTreeSet<String>,
-) -> bool {
-    let mut complete = true;
-    walk_nodes(node, &mut |child| {
-        if matches!(
-            child.kind(),
-            "identifier" | "type_identifier" | "shorthand_property_identifier_pattern"
-        ) {
-            if let Some(name) = node_text(child, source) {
-                names.insert(name.to_string());
-            } else {
-                complete = false;
-            }
-        }
-    });
-    complete
-}
-
 fn subtree_binds(node: TsNode<'_>, name: &str, source: &str) -> bool {
     let mut found = false;
     walk_nodes(node, &mut |child| {
@@ -1198,18 +1131,6 @@ pub fn rematerialize_proof_resolution_projection(
             || record.file.complete != indexed_file.complete
             || record.file.adapter_version != ADAPTER_VERSION
             || record.file.parser_fingerprint.len() != 64
-            || (matches!(record.file.language.as_str(), "typescript" | "tsx")
-                && !record.file.typescript_project_value_mutations_complete)
-            || record
-                .file
-                .typescript_project_value_mutations
-                .iter()
-                .any(|name| name.is_empty())
-            || record
-                .file
-                .typescript_project_value_mutations
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
             || record.calls.iter().any(|call| {
                 call.callsite.file_id != FileId(indexed_file.id)
                     || call.callsite.source_sha256 != stored_hash
@@ -1364,41 +1285,13 @@ fn resolve_input(
                         binding.name == input.callsite.raw_target
                             && binding.declaration == declaration
                     });
-            let script_bindings = all_records
-                .iter()
-                .filter(|record| {
-                    matches!(record.file.language.as_str(), "typescript" | "tsx")
-                        && !record.file.typescript_module
-                })
-                .collect::<Vec<_>>();
-            let script_domain_incomplete = !source_record.file.typescript_module
-                && matches!(source_record.file.language.as_str(), "typescript" | "tsx")
-                && script_bindings
-                    .iter()
-                    .any(|record| !record.file.lookup_input_complete);
-            let script_declarations = script_bindings
-                .iter()
-                .flat_map(|record| record.file.top_level_declarations.iter())
-                .filter(|binding| binding.name == input.callsite.raw_target)
-                .collect::<Vec<_>>();
-            let script_value_mutated = !source_record.file.typescript_module
-                && matches!(source_record.file.language.as_str(), "typescript" | "tsx")
-                && script_bindings.iter().any(|record| {
-                    record
-                        .file
-                        .typescript_project_value_mutations
-                        .binary_search(&input.callsite.raw_target)
-                        .is_ok()
-                });
-            let script_ambiguous = !source_record.file.typescript_module
-                && matches!(source_record.file.language.as_str(), "typescript" | "tsx")
-                && (script_declarations.len() != 1
-                    || script_declarations[0].declaration != declaration
-                    || script_value_mutated);
-            if script_domain_incomplete {
-                status = ProofResolutionStatus::IncompleteDomain;
-                reason = ProofResolutionReason::LookupDomainIncomplete;
-            } else if !declaration_is_recorded || script_ambiguous {
+            let typescript_script =
+                matches!(source_record.file.language.as_str(), "typescript" | "tsx")
+                    && !source_record.file.typescript_module;
+            if typescript_script {
+                status = ProofResolutionStatus::Unsupported;
+                reason = ProofResolutionReason::UnsupportedConstruct;
+            } else if !declaration_is_recorded {
                 status = ProofResolutionStatus::Ambiguous;
                 reason = ProofResolutionReason::MultipleBindings;
             } else {

@@ -78,6 +78,10 @@ fn typescript_and_rust_reference_calls_rematerialize_exact_facts() -> anyhow::Re
                 "import defaultTarget from './defaulted';\nexport function defaultCaller() { defaultTarget(); }\n",
             ),
             (
+                "src/module_global_reflection.ts",
+                "function other() {}\nexport function moduleReflectiveTarget() {}\nObject.defineProperty(globalThis, \"moduleReflectiveTarget\", { value: other });\nexport function moduleReflectiveCaller() { moduleReflectiveTarget(); }\n",
+            ),
+            (
                 "src/lib.rs",
                 "fn rust_target() {}\nstruct Worker;\nimpl Worker {\n    fn step(&self) {}\n    fn run(&self) { self.step(); rust_target(); }\n}\n",
             ),
@@ -99,6 +103,7 @@ fn typescript_and_rust_reference_calls_rematerialize_exact_facts() -> anyhow::Re
         "localTarget",
         "importedTarget",
         "defaultTarget",
+        "moduleReflectiveTarget",
         "step",
         "rust_target",
     ] {
@@ -250,7 +255,7 @@ fn assert_only_call_is_not_exact(files: &[(&str, &str)]) -> anyhow::Result<()> {
 }
 
 #[test]
-fn typescript_exact_rejects_project_writes_shadows_and_script_global_ambiguity()
+fn typescript_exact_rejects_module_writes_shadows_and_unsupported_namespace_reflection()
 -> anyhow::Result<()> {
     assert_only_call_is_not_exact(&[(
         "src/reassigned.ts",
@@ -269,13 +274,6 @@ fn typescript_exact_rejects_project_writes_shadows_and_script_global_ambiguity()
             "src/importer.ts",
             "import { target } from './exported';\nexport function caller() { target(); }\n",
         ),
-    ])?;
-    assert_only_call_is_not_exact(&[
-        (
-            "src/first.ts",
-            "function target() {}\nfunction caller() { target(); }\n",
-        ),
-        ("src/second.ts", "function target() {}\n"),
     ])?;
     assert_only_call_is_not_exact(&[(
         "src/nested_function.ts",
@@ -353,23 +351,44 @@ fn typescript_exact_rejects_project_writes_shadows_and_script_global_ambiguity()
             "import { target } from './exported';\nimport * as target from './other';\nexport function caller() { target(); }\n",
         ),
     ])?;
-    for (path, mutation) in [
-        ("assignment", "target = () => {};"),
-        ("update", "target++;"),
-        ("destructuring", "[target] = [() => {}];"),
-        ("for_of", "for (target of [() => {}]) {}"),
-        ("for_in", "for ([target] in { 0: [() => {}] }) {}"),
-        ("binding", "let target = () => {};"),
-    ] {
-        let mutation_file = format!("src/{path}.ts");
-        assert_only_call_is_not_exact(&[
-            (
-                "src/main.ts",
-                "function target() {}\nfunction caller() { target(); }\n",
-            ),
-            (&mutation_file, mutation),
-        ])?;
-    }
+    assert_only_call_is_not_exact(&[
+        ("src/namespace_exported.ts", "export function target() {}\n"),
+        (
+            "src/namespace_importer.ts",
+            "import * as namespace from './namespace_exported';\nfunction other() {}\nObject.defineProperty(namespace, \"target\", { value: other });\nexport function caller() { namespace.target(); }\n",
+        ),
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn typescript_script_calls_are_never_exact() -> anyhow::Result<()> {
+    assert_only_call_is_not_exact(&[(
+        "src/local.ts",
+        "function target() {}\nfunction caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/direct.tsx",
+        "function target() {}\nfunction caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/main.ts",
+            "function target() {}\nfunction caller() { target(); }\n",
+        ),
+        ("src/unrelated.ts", "function unrelated() {}\n"),
+    ])?;
+    assert_only_call_is_not_exact(&[
+        (
+            "src/mixed.ts",
+            "function target() {}\nfunction caller() { target(); }\n",
+        ),
+        ("src/mutation.js", "target = () => {};\n"),
+    ])?;
+    assert_only_call_is_not_exact(&[(
+        "src/reflective.ts",
+        "function target() {}\nfunction other() {}\nObject.defineProperty(globalThis, \"target\", { value: other });\nfunction caller() { target(); }\n",
+    )])?;
     Ok(())
 }
 
@@ -660,39 +679,6 @@ fn complete_projection_rejects_parser_completeness_mismatch() -> anyhow::Result<
 
     let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
         .expect_err("parser completeness disagreement must invalidate cache coverage");
-    assert!(error.to_string().contains("stale"), "{error}");
-    Ok(())
-}
-
-#[test]
-fn complete_projection_rejects_a_missing_script_write_summary() -> anyhow::Result<()> {
-    let project = tempfile::tempdir()?;
-    let mut store = Store::new_in_memory()?;
-    index_files(
-        project.path(),
-        &mut store,
-        &[(
-            "src/main.ts",
-            "function target() {}\nfunction caller() { target(); }\n",
-        )],
-    )?;
-    let artifact_blob = store.get_connection().query_row(
-        "SELECT artifact_blob FROM index_artifact_cache",
-        [],
-        |row| row.get::<_, Vec<u8>>(0),
-    )?;
-    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
-    artifact["resolution_file"]
-        .as_object_mut()
-        .expect("resolution file object")
-        .remove("typescript_project_value_mutations_complete");
-    store.get_connection().execute(
-        "UPDATE index_artifact_cache SET artifact_blob = ?1",
-        [serde_json::to_vec(&artifact)?],
-    )?;
-
-    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
-        .expect_err("a schema-v4 script record cannot omit its write-domain receipt");
     assert!(error.to_string().contains("stale"), "{error}");
     Ok(())
 }
