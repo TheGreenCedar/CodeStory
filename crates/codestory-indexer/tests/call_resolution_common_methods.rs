@@ -15609,6 +15609,46 @@ func build() {
 }
 
 #[test]
+fn test_go_navigation_accepts_only_closed_type_and_constructor_ast_shapes() -> anyhow::Result<()> {
+    let source = r#"
+package proof
+
+type A struct { B B }
+type B struct{}
+func (*A) Run() {}
+func (*B) Run() {}
+
+func nestedSelector() {
+    x := A{B: B{}}.B
+    x.Run()
+}
+
+func doublePointer(x **A) {
+    x.Run()
+}
+
+func indexedComposite() {
+    x := []A{{}}[0]
+    x.Run()
+}
+"#;
+    let (nodes, edges) = index_files(&[("main.go", source)])?;
+    for caller in ["nestedSelector", "doublePointer", "indexedComposite"] {
+        for owner in ["A", "B"] {
+            assert_no_resolved_call_to_method_owner(
+                "Go non-closed type/constructor AST",
+                &nodes,
+                &edges,
+                caller,
+                owner,
+                "Run",
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_projection_regression_dart_arrow_and_initializer_calls_are_typed() -> anyhow::Result<()> {
     let request = r#"
 class BaseRequest {

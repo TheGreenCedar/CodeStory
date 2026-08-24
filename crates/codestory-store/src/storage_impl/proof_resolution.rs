@@ -13,6 +13,29 @@ const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-evidence-v1\0
 const FACT_ID_DOMAIN: &[u8] = b"codestory-proof-resolution-fact-id-v1\0";
 const PUBLICATION_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-publication-v1\0";
 
+#[cfg(test)]
+thread_local! {
+    static GO_STORE_REPLAY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_go_store_replay_work(amount: usize) {
+    #[cfg(test)]
+    GO_STORE_REPLAY_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_go_store_replay_work() {
+    GO_STORE_REPLAY_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn go_store_replay_work() -> usize {
+    GO_STORE_REPLAY_WORK.with(std::cell::Cell::get)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProofResolutionPublication {
     pub core_generation_id: String,
@@ -182,8 +205,393 @@ struct ProofResolutionValidationContext {
     node_by_id: HashMap<NodeId, Node>,
     edges: Vec<Edge>,
     edge_index_by_id: HashMap<EdgeId, usize>,
+    ordinary_call_edge_indices: Vec<usize>,
+    parsed_callsite_identity_by_edge: HashMap<EdgeId, StoredCanonicalCallsiteIdentity>,
     import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
+    go_package_identity_by_file: HashMap<i64, GoPackageIdentity>,
+    go_dependency_ids_by_package: HashMap<GoPackageIdentity, BTreeSet<FileId>>,
+    go_attestation_error_by_file: HashMap<i64, String>,
+    live_go_sources_authenticated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GoPackageIdentity {
+    native_directory: PathBuf,
+    package_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredCanonicalCallsiteIdentity {
+    file_id: FileId,
+    line: u32,
+    column_or_ordinal: u32,
+    raw_target: NodeId,
+}
+
+fn parse_stored_callsite_identity(identity: &str) -> Option<StoredCanonicalCallsiteIdentity> {
+    let mut fields = identity.split('|').next()?.split(':');
+    let parsed = StoredCanonicalCallsiteIdentity {
+        file_id: FileId(fields.next()?.parse().ok()?),
+        line: fields.next()?.parse().ok()?,
+        column_or_ordinal: fields.next()?.parse().ok()?,
+        raw_target: NodeId(fields.next()?.parse().ok()?),
+    };
+    (fields.next().is_none() && parsed.column_or_ordinal > 0).then_some(parsed)
+}
+
+fn prepare_call_edge_correlation_index(
+    edges: &[Edge],
+    node_by_id: &HashMap<NodeId, Node>,
+) -> (Vec<usize>, HashMap<EdgeId, StoredCanonicalCallsiteIdentity>) {
+    let mut indices = Vec::new();
+    let mut identities = HashMap::new();
+    for (index, edge) in edges.iter().enumerate() {
+        count_go_store_replay_work(1);
+        if edge.kind != EdgeKind::CALL || !node_by_id.contains_key(&edge.target) {
+            continue;
+        }
+        indices.push(index);
+        if let Some(identity) = edge
+            .callsite_identity
+            .as_deref()
+            .and_then(parse_stored_callsite_identity)
+        {
+            identities.insert(edge.id, identity);
+        }
+    }
+    (indices, identities)
+}
+
+fn go_package_dependency_ids(
+    source_file_id: FileId,
+    evidence_ids: &BTreeSet<FileId>,
+    context: &ProofResolutionValidationContext,
+) -> Result<BTreeSet<FileId>, StorageError> {
+    let source_file = context
+        .file_by_id
+        .get(&source_file_id.0)
+        .ok_or_else(|| proof_error("Go source dependency file is missing"))?;
+    if source_file
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("_test.go"))
+    {
+        return Err(proof_error(
+            "Go production proof cannot originate in a test file",
+        ));
+    }
+    if let Some(error) = context.go_attestation_error_by_file.get(&source_file_id.0) {
+        return Err(proof_error(format!(
+            "Go source dependency is not publication-authenticated: {error}"
+        )));
+    }
+    let source_identity = context
+        .go_package_identity_by_file
+        .get(&source_file_id.0)
+        .ok_or_else(|| proof_error("Go source dependency has no authenticated package clause"))?;
+    for file_id in evidence_ids {
+        count_go_store_replay_work(1);
+        if let Some(error) = context.go_attestation_error_by_file.get(&file_id.0) {
+            return Err(proof_error(format!(
+                "Go evidence dependency is not publication-authenticated: {error}"
+            )));
+        }
+        if context.go_package_identity_by_file.get(&file_id.0) != Some(source_identity) {
+            return Err(proof_error(
+                "Go exact evidence crosses its authenticated native package identity",
+            ));
+        }
+    }
+    count_go_store_replay_work(1);
+    context
+        .go_dependency_ids_by_package
+        .get(source_identity)
+        .cloned()
+        .ok_or_else(|| proof_error("Go authenticated package closure is missing"))
+}
+
+fn stored_go_package_dependency_ids(
+    source_file_id: FileId,
+    required_evidence_ids: &BTreeSet<FileId>,
+    stored_fact_ids: &BTreeSet<FileId>,
+    context: &ProofResolutionValidationContext,
+) -> Result<BTreeSet<FileId>, StorageError> {
+    if !required_evidence_ids.is_subset(stored_fact_ids) {
+        return Err(proof_error(
+            "stored Go dependency receipt omits source or typed evidence files",
+        ));
+    }
+    let source_file = context
+        .file_by_id
+        .get(&source_file_id.0)
+        .ok_or_else(|| proof_error("stored Go source dependency file is missing"))?;
+    let source_parent = source_file
+        .path
+        .parent()
+        .ok_or_else(|| proof_error("stored Go source path has no package directory"))?;
+    for file_id in stored_fact_ids {
+        count_go_store_replay_work(1);
+        let file = context
+            .file_by_id
+            .get(&file_id.0)
+            .ok_or_else(|| proof_error("stored Go dependency file is missing"))?;
+        if file.language != "go"
+            || file.path.parent() != Some(source_parent)
+            || file
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_test.go"))
+        {
+            return Err(proof_error(
+                "stored Go dependency receipt crosses its authenticated package domain",
+            ));
+        }
+    }
+    Ok(stored_fact_ids.clone())
+}
+
+type PreparedGoPackageClosure = (
+    HashMap<i64, GoPackageIdentity>,
+    HashMap<GoPackageIdentity, BTreeSet<FileId>>,
+    HashMap<i64, String>,
+);
+
+fn prepare_go_package_closure(
+    file_by_id: &HashMap<i64, FileInfo>,
+    file_content_hash_by_id: &HashMap<i64, String>,
+) -> PreparedGoPackageClosure {
+    let mut identity_by_file = HashMap::new();
+    let mut dependencies_by_package = HashMap::<GoPackageIdentity, BTreeSet<FileId>>::new();
+    let mut errors = HashMap::new();
+    for file in file_by_id.values().filter(|file| file.language == "go") {
+        count_go_store_replay_work(1);
+        match attest_go_file(file, file_content_hash_by_id) {
+            Ok(identity) => {
+                if !file
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("_test.go"))
+                {
+                    dependencies_by_package
+                        .entry(identity.clone())
+                        .or_default()
+                        .insert(FileId(file.id));
+                }
+                identity_by_file.insert(file.id, identity);
+            }
+            Err(error) => {
+                errors.insert(file.id, error);
+            }
+        }
+    }
+    (identity_by_file, dependencies_by_package, errors)
+}
+
+fn attest_go_file(
+    file: &FileInfo,
+    file_content_hash_by_id: &HashMap<i64, String>,
+) -> Result<GoPackageIdentity, String> {
+    let expected_hash = file_content_hash_by_id
+        .get(&file.id)
+        .ok_or_else(|| "stored source hash is missing".to_owned())?;
+    let bytes =
+        fs::read(&file.path).map_err(|error| format!("source bytes cannot be read: {error}"))?;
+    count_go_store_replay_work(bytes.len().saturating_add(1));
+    let observed_hash = format!("{:x}", Sha256::digest(&bytes));
+    if &observed_hash != expected_hash {
+        return Err("source bytes do not match the stored source hash".to_owned());
+    }
+    let source =
+        std::str::from_utf8(&bytes).map_err(|_| "source bytes are not strict UTF-8".to_owned())?;
+    let package_name = go_package_clause_from_source(source)
+        .ok_or_else(|| "source has no exact package clause".to_owned())?;
+    let parent = file
+        .path
+        .parent()
+        .ok_or_else(|| "source path has no package directory".to_owned())?;
+    let native_directory = fs::canonicalize(parent)
+        .map_err(|error| format!("package directory has no native identity: {error}"))?;
+    Ok(GoPackageIdentity {
+        native_directory,
+        package_name,
+    })
+}
+
+fn go_package_clause_from_source(source: &str) -> Option<String> {
+    let mut block_comment = false;
+    for raw_line in source.lines() {
+        let mut line = raw_line.trim();
+        loop {
+            if block_comment {
+                if let Some((_, rest)) = line.split_once("*/") {
+                    block_comment = false;
+                    line = rest.trim_start();
+                    continue;
+                }
+                break;
+            }
+            if line.is_empty() || line.starts_with("//") {
+                break;
+            }
+            if let Some(rest) = line.strip_prefix("/*") {
+                if let Some((_, trailing)) = rest.split_once("*/") {
+                    line = trailing.trim_start();
+                    continue;
+                }
+                block_comment = true;
+                break;
+            }
+            let rest = line.strip_prefix("package")?;
+            if rest
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_whitespace())
+            {
+                return None;
+            }
+            let mut components = rest.split_whitespace();
+            let name = components.next()?;
+            let trailing = components.collect::<Vec<_>>().join(" ");
+            if !go_package_identifier(name) || (!trailing.is_empty() && !trailing.starts_with("//"))
+            {
+                return None;
+            }
+            return Some(name.to_owned());
+        }
+    }
+    None
+}
+
+fn go_package_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|character| character == '_' || character.is_alphabetic())
+        && chars.all(|character| character == '_' || character.is_alphanumeric())
+}
+
+#[cfg(test)]
+mod go_replay_complexity_tests {
+    use super::*;
+
+    fn measured_package_replay_work(file_count: usize, lookup_count: usize) -> usize {
+        let temp = tempfile::tempdir().expect("Go replay tempdir");
+        let mut file_by_id = HashMap::new();
+        let mut file_content_hash_by_id = HashMap::new();
+        let source = b"package proof\n";
+        let source_hash = format!("{:x}", Sha256::digest(source));
+        for index in 0..file_count {
+            let id = i64::try_from(index + 1).expect("file id");
+            let path = temp.path().join(format!("file_{index}.go"));
+            fs::write(&path, source).expect("write Go replay source");
+            file_by_id.insert(
+                id,
+                FileInfo {
+                    id,
+                    path,
+                    language: "go".to_owned(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                },
+            );
+            file_content_hash_by_id.insert(id, source_hash.clone());
+        }
+        reset_go_store_replay_work();
+        let (
+            go_package_identity_by_file,
+            go_dependency_ids_by_package,
+            go_attestation_error_by_file,
+        ) = prepare_go_package_closure(&file_by_id, &file_content_hash_by_id);
+        let context = ProofResolutionValidationContext {
+            file_by_id,
+            file_content_hash_by_id,
+            node_by_id: HashMap::new(),
+            edges: Vec::new(),
+            edge_index_by_id: HashMap::new(),
+            ordinary_call_edge_indices: Vec::new(),
+            parsed_callsite_identity_by_edge: HashMap::new(),
+            import_relations: HashMap::new(),
+            member_relations: HashMap::new(),
+            go_package_identity_by_file,
+            go_dependency_ids_by_package,
+            go_attestation_error_by_file,
+            live_go_sources_authenticated: true,
+        };
+        for _ in 0..lookup_count {
+            go_package_dependency_ids(FileId(1), &BTreeSet::from([FileId(1)]), &context)
+                .expect("package closure");
+        }
+        go_store_replay_work()
+    }
+
+    #[test]
+    fn package_file_preparation_and_fact_replay_are_independently_linear() {
+        let baseline = measured_package_replay_work(32, 32);
+        let more_files = measured_package_replay_work(64, 32);
+        let more_facts = measured_package_replay_work(32, 64);
+        let combined = measured_package_replay_work(64, 64);
+        assert!(baseline > 0, "Go store replay work was not counted");
+        assert!(
+            more_files <= baseline * 2 + 64,
+            "Go store file preparation grew superlinearly: {baseline} -> {more_files}"
+        );
+        assert!(
+            more_facts <= baseline * 2 + 64,
+            "Go store fact replay grew superlinearly: {baseline} -> {more_facts}"
+        );
+        assert!(
+            combined <= baseline * 2 + 128,
+            "combined Go store replay grew superlinearly: {baseline} -> {combined}"
+        );
+    }
+
+    fn measured_repeated_callsite_index_work(count: usize) -> usize {
+        let node_by_id = HashMap::from([(
+            NodeId(4),
+            Node {
+                id: NodeId(4),
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "target".to_owned(),
+                ..Default::default()
+            },
+        )]);
+        let edges = (0..count)
+            .map(|index| Edge {
+                id: EdgeId(i64::try_from(index + 1).expect("edge id")),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(2),
+                resolved_target: Some(NodeId(3)),
+                callsite_identity: Some(format!("1:2:{}:4", index + 1)),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        reset_go_store_replay_work();
+        let (indices, identities) = prepare_call_edge_correlation_index(&edges, &node_by_id);
+        assert_eq!(indices.len(), count);
+        assert_eq!(identities.len(), count);
+        go_store_replay_work()
+    }
+
+    #[test]
+    fn repeated_same_line_correlation_identity_index_work_is_linear() {
+        let small = measured_repeated_callsite_index_work(64);
+        let large = measured_repeated_callsite_index_work(128);
+        assert!(small >= 64, "callsite index work was not counted: {small}");
+        assert!(
+            large <= small * 2 + 64,
+            "same-line callsite identity indexing grew superlinearly: {small} -> {large}"
+        );
+    }
 }
 
 #[derive(Default)]
@@ -199,19 +607,33 @@ impl ProofRelationState {
 }
 
 impl ProofResolutionValidationContext {
-    fn prepare(storage: &Storage) -> Result<Self, StorageError> {
+    fn prepare(
+        storage: &Storage,
+        authenticate_live_go_sources: bool,
+    ) -> Result<Self, StorageError> {
         let file_by_id = storage
             .get_files()?
             .into_iter()
             .map(|file| (file.id, file))
             .collect();
         let file_content_hash_by_id = storage.get_file_content_hashes()?;
+        let (
+            go_package_identity_by_file,
+            go_dependency_ids_by_package,
+            go_attestation_error_by_file,
+        ) = if authenticate_live_go_sources {
+            prepare_go_package_closure(&file_by_id, &file_content_hash_by_id)
+        } else {
+            (HashMap::new(), HashMap::new(), HashMap::new())
+        };
         let node_by_id: HashMap<NodeId, Node> = storage
             .get_nodes()?
             .into_iter()
             .map(|node| (node.id, node))
             .collect();
         let edges = storage.get_edges()?;
+        let (ordinary_call_edge_indices, parsed_callsite_identity_by_edge) =
+            prepare_call_edge_correlation_index(&edges, &node_by_id);
         let mut edge_index_by_id = HashMap::with_capacity(edges.len());
         let mut import_relations = HashMap::<_, ProofRelationState>::new();
         let mut member_relations = HashMap::<_, ProofRelationState>::new();
@@ -289,8 +711,14 @@ impl ProofResolutionValidationContext {
             node_by_id,
             edges,
             edge_index_by_id,
+            ordinary_call_edge_indices,
+            parsed_callsite_identity_by_edge,
             import_relations,
             member_relations,
+            go_package_identity_by_file,
+            go_dependency_ids_by_package,
+            go_attestation_error_by_file,
+            live_go_sources_authenticated: authenticate_live_go_sources,
         })
     }
 
@@ -472,11 +900,13 @@ impl Storage {
     fn validate_facts_against_graph(
         &self,
         facts: &[CallResolutionFact],
+        authenticate_live_go_sources: bool,
     ) -> Result<(), StorageError> {
         for fact in facts {
             validate_fact_seal(fact)?;
         }
-        let context = ProofResolutionValidationContext::prepare(self)?;
+        let context =
+            ProofResolutionValidationContext::prepare(self, authenticate_live_go_sources)?;
         let exact_fact_indices = facts
             .iter()
             .enumerate()
@@ -539,14 +969,11 @@ impl Storage {
             )
             .collect::<BTreeSet<_>>();
         let ordinary_edge_indices = context
-            .edges
+            .ordinary_call_edge_indices
             .iter()
-            .enumerate()
-            .filter_map(|(index, edge)| {
-                (edge.kind == EdgeKind::CALL
-                    && context.node_by_id.contains_key(&edge.target)
-                    && !constructor_evidence_nodes.contains(&edge.effective_target()))
-                .then_some(index)
+            .copied()
+            .filter(|index| {
+                !constructor_evidence_nodes.contains(&context.edges[*index].effective_target())
             })
             .collect::<Vec<_>>();
         let edge_inputs = ordinary_edge_indices
@@ -575,7 +1002,16 @@ impl Storage {
                     raw_target: graph_leaf_name(&raw.serialized_name),
                     callsite_identity: edge.callsite_identity.as_deref(),
                     semantic_exact: edge.resolved_target == Some(edge.effective_target())
-                        && edge.candidate_targets.is_empty(),
+                        && edge.candidate_targets.is_empty()
+                        && context
+                            .parsed_callsite_identity_by_edge
+                            .get(&edge.id)
+                            .is_some_and(|identity| {
+                                Some(identity.file_id)
+                                    == edge.file_node_id.map(|file| FileId(file.0))
+                                    && Some(identity.line) == edge.line
+                                    && identity.raw_target == edge.target
+                            }),
                 }
             })
             .collect::<Vec<_>>();
@@ -646,10 +1082,33 @@ impl Storage {
                 required_dependency_ids.insert(FileId(file_id.0));
             }
         }
-        if dependency_file_ids(fact) != required_dependency_ids {
-            return Err(proof_error(
-                "dependency hashes do not exactly cover source, import, package, and target files",
-            ));
+        if fact.status == ProofResolutionStatus::Exact && fact.provenance.language_adapter == "go" {
+            if fact
+                .evidence_chain
+                .iter()
+                .any(|evidence| matches!(evidence, ResolutionEvidence::StaticImportBinding { .. }))
+            {
+                return Err(proof_error(
+                    "Go exact import evidence has no authenticated module-domain receipt",
+                ));
+            }
+            required_dependency_ids = if context.live_go_sources_authenticated {
+                go_package_dependency_ids(fact.callsite.file_id, &required_dependency_ids, context)?
+            } else {
+                stored_go_package_dependency_ids(
+                    fact.callsite.file_id,
+                    &required_dependency_ids,
+                    &dependency_file_ids(fact),
+                    context,
+                )?
+            };
+        }
+        let observed_dependency_ids = dependency_file_ids(fact);
+        if observed_dependency_ids != required_dependency_ids {
+            return Err(proof_error(format!(
+                "dependency hashes do not exactly cover source, import, package, and target files for {}: observed={observed_dependency_ids:?} required={required_dependency_ids:?}",
+                fact.provenance.language_adapter
+            )));
         }
         for dependency in &fact.provenance.dependency_file_hashes {
             let dependency_file = context
@@ -697,6 +1156,22 @@ impl Storage {
             .ok_or_else(|| proof_error("exact target node is missing"))?;
         if target_node.file_node_id.is_none() {
             return Err(proof_error("exact target has no indexed dependency file"));
+        }
+        if fact.provenance.language_adapter == "go"
+            && (!matches!(caller.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                || !matches!(target_node.kind, NodeKind::FUNCTION | NodeKind::METHOD))
+        {
+            return Err(proof_error(
+                "Go exact caller and target must be source-level callables",
+            ));
+        }
+        if fact.provenance.language_adapter == "go"
+            && fact.callsite.callee_form == CalleeForm::Identifier
+            && target_node.kind != NodeKind::FUNCTION
+        {
+            return Err(proof_error(
+                "Go identifier evidence target is not a FUNCTION graph node",
+            ));
         }
         for evidence in &fact.evidence_chain {
             let ResolutionEvidence::StaticImportBinding { import, .. } = evidence else {
@@ -767,6 +1242,18 @@ impl Storage {
                 }
             }
             (
+                CalleeForm::Identifier,
+                [ResolutionEvidence::SamePackageDeclaration { declaration }],
+            ) if fact.provenance.language_adapter == "go" && *declaration == target => {
+                if target_node.file_node_id.is_none()
+                    || target_node.file_node_id == Some(NodeId(fact.callsite.file_id.0))
+                {
+                    return Err(proof_error(
+                        "SamePackageDeclaration is not an exact cross-file Go target",
+                    ));
+                }
+            }
+            (
                 CalleeForm::NamedImport,
                 [
                     ResolutionEvidence::StaticImportBinding {
@@ -830,16 +1317,44 @@ impl Storage {
                     .node_by_id
                     .get(owner)
                     .ok_or_else(|| proof_error("implicit receiver owner is missing"))?;
+                let go_owner = fact.provenance.language_adapter == "go";
                 if !matches!(
                     owner_node.kind,
                     NodeKind::STRUCT | NodeKind::CLASS | NodeKind::ENUM
-                ) || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || !context.has_member(*owner, fact.caller)
+                ) || if go_owner {
+                    owner_node.file_node_id.is_none()
+                        || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                } else {
+                    owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                        || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                } || !context.has_member(*owner, fact.caller)
                     || !context.has_member(*owner, target)
                 {
                     return Err(proof_error(
                         "ImplicitReceiver does not own caller and target through inherent membership",
+                    ));
+                }
+            }
+            (
+                CalleeForm::ImplicitReceiver,
+                [
+                    ResolutionEvidence::ImplicitReceiver { owner },
+                    ResolutionEvidence::SamePackageDeclaration { declaration },
+                ],
+            ) if fact.provenance.language_adapter == "go" && *declaration == target => {
+                let owner_node = context
+                    .node_by_id
+                    .get(owner)
+                    .ok_or_else(|| proof_error("Go implicit receiver owner is missing"))?;
+                if owner_node.kind != NodeKind::STRUCT
+                    || owner_node.file_node_id.is_none()
+                    || target_node.file_node_id.is_none()
+                    || target_node.file_node_id == Some(NodeId(fact.callsite.file_id.0))
+                    || !context.has_member(*owner, fact.caller)
+                    || !context.has_member(*owner, target)
+                {
+                    return Err(proof_error(
+                        "Go ImplicitReceiver does not own caller and target through direct membership",
                     ));
                 }
             }
@@ -937,9 +1452,13 @@ impl Storage {
                 if !matches!(
                     owner_node.kind,
                     NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
-                ) || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || owner_node.file_node_id != target_node.file_node_id
-                    || !context.has_member(owner, target)
+                ) || if fact.provenance.language_adapter == "go" {
+                    owner_node.file_node_id.is_none()
+                        || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                } else {
+                    owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                        || owner_node.file_node_id != target_node.file_node_id
+                } || !context.has_member(owner, target)
                 {
                     return Err(proof_error(
                         "ConstructorBinding and ExplicitReceiverType do not name the unique target owner/member",
@@ -961,14 +1480,52 @@ impl Storage {
                 if !matches!(
                     owner_node.kind,
                     NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
-                ) || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || owner_node.file_node_id != target_node.file_node_id
-                    || !context.has_member(owner, target)
+                ) || if fact.provenance.language_adapter == "go" {
+                    owner_node.file_node_id.is_none()
+                        || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                } else {
+                    owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                        || owner_node.file_node_id != target_node.file_node_id
+                } || !context.has_member(owner, target)
                 {
                     return Err(proof_error(
                         "ExplicitReceiverType does not name the unique target owner/member",
                     ));
                 }
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SamePackageDeclaration { declaration },
+                ],
+            ) if fact.provenance.language_adapter == "go"
+                && *constructor == *receiver_type
+                && *declaration == target =>
+            {
+                Self::validate_go_package_receiver(
+                    context,
+                    fact.callsite.file_id,
+                    *constructor,
+                    target,
+                    target_node,
+                )?;
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SamePackageDeclaration { declaration },
+                ],
+            ) if fact.provenance.language_adapter == "go" && *declaration == target => {
+                Self::validate_go_package_receiver(
+                    context,
+                    fact.callsite.file_id,
+                    *receiver_type,
+                    target,
+                    target_node,
+                )?;
             }
             (
                 CalleeForm::ExplicitReceiver,
@@ -1138,6 +1695,30 @@ impl Storage {
         Ok(())
     }
 
+    fn validate_go_package_receiver(
+        context: &ProofResolutionValidationContext,
+        source_file: FileId,
+        owner: NodeId,
+        target: NodeId,
+        target_node: &Node,
+    ) -> Result<(), StorageError> {
+        let owner_node = context
+            .node_by_id
+            .get(&owner)
+            .ok_or_else(|| proof_error("Go receiver owner is missing"))?;
+        if owner_node.kind != NodeKind::STRUCT
+            || owner_node.file_node_id.is_none()
+            || target_node.file_node_id.is_none()
+            || target_node.file_node_id == Some(NodeId(source_file.0))
+            || !context.has_member(owner, target)
+        {
+            return Err(proof_error(
+                "Go receiver evidence does not name one direct owner/member",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn replace_proof_resolution_projection(
         &mut self,
         publication: &IndexPublicationRecord,
@@ -1172,7 +1753,7 @@ impl Storage {
                     right.fact_id.as_str(),
                 ))
         });
-        self.validate_facts_against_graph(&facts)?;
+        self.validate_facts_against_graph(&facts, true)?;
         if facts.windows(2).any(|pair| {
             pair[0].callsite.file_id == pair[1].callsite.file_id
                 && pair[0].callsite.start_byte == pair[1].callsite.start_byte
@@ -1331,6 +1912,24 @@ impl Storage {
         &self,
         publication: &IndexPublicationRecord,
     ) -> Result<ProofResolutionPublication, StorageError> {
+        let (manifest, facts) = self.validate_proof_resolution_receipt(publication)?;
+        self.validate_facts_against_graph(&facts, true)?;
+        Ok(manifest)
+    }
+
+    pub(crate) fn validate_stored_proof_resolution_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<ProofResolutionPublication, StorageError> {
+        let (manifest, facts) = self.validate_proof_resolution_receipt(publication)?;
+        self.validate_facts_against_graph(&facts, false)?;
+        Ok(manifest)
+    }
+
+    fn validate_proof_resolution_receipt(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<(ProofResolutionPublication, Vec<CallResolutionFact>), StorageError> {
         let manifest = self
             .get_proof_resolution_publication()?
             .ok_or_else(|| proof_error("complete publication receipt is missing"))?;
@@ -1355,8 +1954,10 @@ impl Storage {
                 "fact rows do not match their publication digest",
             ));
         }
-        self.validate_facts_against_graph(&facts)?;
-        Ok(manifest)
+        for fact in &facts {
+            validate_fact_seal(fact)?;
+        }
+        Ok((manifest, facts))
     }
 
     /// Rebind an already authenticated proof projection to a semantic-only
@@ -1370,7 +1971,11 @@ impl Storage {
         if self.get_proof_resolution_publication()?.is_none() {
             return Ok(None);
         }
-        self.validate_proof_resolution_publication(previous)?;
+        // A semantic-only republish is allowed to operate from the stored core
+        // after working-tree sources disappear. The previous publication was
+        // graph-validated before promotion; rebind authenticates its immutable
+        // fact rows and receipt without consulting live source bytes.
+        self.validate_stored_proof_resolution_publication(previous)?;
         if next.generation_id.trim().is_empty()
             || next.run_id.trim().is_empty()
             || next.published_at_epoch_ms < 0
@@ -1398,7 +2003,8 @@ impl Storage {
             ));
         }
         tx.commit()?;
-        self.validate_proof_resolution_publication(next).map(Some)
+        self.validate_stored_proof_resolution_publication(next)
+            .map(Some)
     }
 }
 

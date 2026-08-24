@@ -4698,6 +4698,16 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
             .expect("read republished core"),
         Some(outcome.publication.clone())
     );
+    let proof = storage
+        .get_proof_resolution_publication()
+        .expect("read rebound proof publication")
+        .expect("stored proof publication remains present");
+    assert_eq!(proof.core_generation_id, outcome.publication.generation_id);
+    assert_eq!(proof.core_run_id, outcome.publication.run_id);
+    assert_eq!(
+        proof.published_at_epoch_ms,
+        outcome.publication.published_at_epoch_ms
+    );
     storage
         .validate_dense_anchor_publication(&outcome.publication)
         .expect("dense publication is coherent");
@@ -4745,6 +4755,37 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     assert_eq!(
         Storage::database_complete_index_publication(&storage_path)
             .expect("read publication after rejected source policy"),
+        Some(outcome.publication.clone())
+    );
+    assert_no_staged_publication_artifacts(&storage_path);
+
+    let tampered = rusqlite::Connection::open(&storage_path).expect("open rebound core");
+    let go_edge_id = tampered
+        .query_row(
+            "SELECT edge_id FROM proof_resolution_fact
+             WHERE status = 'exact' AND language_adapter = 'go'
+             ORDER BY edge_id LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("stored fixture has one exact Go edge");
+    tampered
+        .execute(
+            "UPDATE edge SET line = line + 1 WHERE id = ?1",
+            [go_edge_id],
+        )
+        .expect("tamper stored Go correlation");
+    drop(tampered);
+    let error = controller
+        .republish_semantic_projections_at_blocking(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect_err("stored-graph tamper must reject source-free proof rebind");
+    assert!(error.message.contains("proof resolution"), "{error:?}");
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path)
+            .expect("read publication after rejected proof rebind"),
         Some(outcome.publication)
     );
     assert_no_staged_publication_artifacts(&storage_path);

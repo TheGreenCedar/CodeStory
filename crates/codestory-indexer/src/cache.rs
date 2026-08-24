@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 // Bumped to 6 because JavaScript joins the private proof adapter roster and
 // ECMAScript bindings are now collected with name-specific closure semantics.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 9;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 10;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -86,6 +86,22 @@ pub(crate) enum CachedResolutionBinding {
         constructor_record: bool,
         constructor_method: Option<String>,
     },
+    GoPackageFunction {
+        package_name: String,
+        name: String,
+    },
+    GoImplicitReceiver {
+        package_name: String,
+        owner_name: String,
+        receiver_is_pointer: bool,
+    },
+    GoExplicitReceiver {
+        package_name: String,
+        owner_name: String,
+        receiver_is_pointer: bool,
+        constructor: bool,
+        constructor_uses_builtin_new: bool,
+    },
     Ambiguous,
     MissingBinding,
     Unsupported,
@@ -132,6 +148,34 @@ pub(crate) struct CachedResolutionFile {
     pub rust_types: Vec<CachedRustType>,
     #[serde(default)]
     pub rust_uses: Vec<CachedRustUseBinding>,
+    #[serde(default)]
+    pub go_package: Option<CachedGoPackage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoPackage {
+    pub name: String,
+    pub build_constrained: bool,
+    pub generated: bool,
+    pub package_blockers: Vec<String>,
+    pub types: Vec<CachedGoType>,
+    pub methods: Vec<CachedGoMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoType {
+    pub name: String,
+    pub declaration: NodeId,
+    pub interface: bool,
+    pub generic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoMethod {
+    pub owner_name: String,
+    pub method_name: String,
+    pub declaration: NodeId,
+    pub pointer_receiver: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,7 +287,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 7,
+            resolution_input_schema_version: 8,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,
@@ -719,7 +763,10 @@ mod tests {
             )
         );
         assert!(
-            crate::proof_resolution::cached_resolution_inputs_are_current(&decoded, "go", "unused",)
+            !crate::proof_resolution::cached_resolution_inputs_are_current(
+                &decoded, "go", "unused",
+            ),
+            "a legacy cache without proof inputs cannot satisfy the installed Go adapter"
         );
     }
 }

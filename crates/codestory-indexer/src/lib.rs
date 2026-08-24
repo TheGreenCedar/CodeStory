@@ -16457,6 +16457,7 @@ mod proof_resolution_cache_tests {
                 rust_modules: Vec::new(),
                 rust_types: Vec::new(),
                 rust_uses: Vec::new(),
+                go_package: None,
             }),
         };
 
