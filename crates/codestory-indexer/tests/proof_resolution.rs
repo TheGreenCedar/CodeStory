@@ -903,6 +903,106 @@ fn python_namespace_closure_hostiles_never_become_exact() -> anyhow::Result<()> 
 }
 
 #[test]
+fn python_control_flow_member_reads_do_not_poison_direct_methods() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.py",
+            concat!(
+                "class Worker:\n",
+                "    marker = object()\n",
+                "    def target(self, value=None):\n        return ()\n",
+                "    def caller(self, values):\n",
+                "        self.target()\n",
+                "        self.other = values\n",
+                "        self.target()\n",
+                "        for item in self.target():\n            self.target()\n",
+                "        with self.target():\n            self.target()\n",
+                "        try:\n            raise ValueError\n",
+                "        except ValueError:\n            self.target()\n",
+                "        if (value := self.target()):\n            pass\n",
+                "        [self.target() for item in self.target() if self.target()]\n",
+                "        match value:\n",
+                "            case self.marker if self.target():\n                self.target()\n",
+                "        self.target(); self.target()\n",
+                "        return self.target(self.target())\n",
+            ),
+        )],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let target_facts = facts
+        .iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == "python" && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(target_facts.len(), 17, "unexpected target call census");
+    assert!(
+        target_facts
+            .iter()
+            .all(|fact| fact.status == ProofResolutionStatus::Exact),
+        "read-only control-flow use poisoned target: {target_facts:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn python_control_flow_member_binding_targets_remain_non_exact() -> anyhow::Result<()> {
+    let cases = [
+        "for self.target in values:\n        pass",
+        "for (self.target, other) in values:\n        pass",
+        "for [self.target, *rest] in values:\n        pass",
+        "with resource as self.target:\n        pass",
+        "with resource as (self.target, other):\n        pass",
+        "[item for self.target in values]",
+        "[item for (self.target, *rest) in values]",
+        "self.target = replacement",
+        "self.target: object = replacement",
+        "self.target += replacement",
+        "self.__dict__['target'] = replacement",
+        "del self.target",
+    ];
+    for mutation in cases {
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\n    def caller(self, values, resource, replacement):\n        {mutation}\n        self.target()\n"
+        );
+        assert_python_target_has_closed_status(
+            &[("main.py", source.as_str())],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    for pattern in ["target", "_ as target", "[target]"] {
+        let source = format!(
+            "def target():\n    pass\ndef caller(value):\n    match value:\n        case {pattern}:\n            target()\n"
+        );
+        assert_python_target_has_closed_status(
+            &[("main.py", source.as_str())],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    for caller in [
+        "    [target() for target in values]\n",
+        "    with resource as target:\n        target()\n",
+        "    try:\n        raise ValueError\n    except ValueError as target:\n        target()\n",
+    ] {
+        let source = format!("def target():\n    pass\ndef caller(values, resource):\n{caller}");
+        assert_python_target_has_closed_status(
+            &[("main.py", source.as_str())],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
 fn python_import_and_annotation_families_are_closed_non_exact() -> anyhow::Result<()> {
     for source in [
         "from external import target\ndef caller():\n    target()\n",
@@ -5315,7 +5415,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v12", "adapter", "language"]
+            ["stale", "schema-v13", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -5450,7 +5550,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "rust")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v14")
+        Some("reference-v15")
     );
     for fact in store.get_proof_resolution_facts()? {
         assert!(receipt.adapter_roster.iter().any(|adapter| {
