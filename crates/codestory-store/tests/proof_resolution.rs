@@ -1664,6 +1664,46 @@ fn publication_digest_authenticates_roster_and_funnel() {
 }
 
 #[test]
+fn replacement_rejects_fact_provenance_missing_from_the_adapter_roster() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let mut result = projection(vec![exact_fact(EdgeId(7))]);
+    result.adapter_roster[0].adapter_version = "wrong-v1".to_owned();
+
+    let error = store
+        .replace_proof_resolution_projection(&publication(), &result)
+        .expect_err("a fact provenance adapter must be rostered exactly once");
+    assert!(error.to_string().contains("adapter roster"), "{error}");
+}
+
+#[test]
+fn stored_validation_rejects_fact_provenance_missing_from_the_adapter_roster() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    let publication = publication();
+    store
+        .replace_proof_resolution_projection(&publication, &projection(vec![exact_fact(EdgeId(7))]))
+        .unwrap();
+    let wrong_roster = serde_json::to_string(&[ProofResolutionAdapter {
+        language: "rust".to_owned(),
+        adapter_version: "wrong-v1".to_owned(),
+    }])
+    .unwrap();
+    store
+        .get_connection()
+        .execute(
+            "UPDATE proof_resolution_publication SET adapter_roster_json = ?1 WHERE id = 1",
+            [wrong_roster],
+        )
+        .unwrap();
+
+    let error = store
+        .validate_proof_resolution_publication(&publication)
+        .expect_err("stored facts must remain bound to their rostered adapter");
+    assert!(error.to_string().contains("adapter roster"), "{error}");
+}
+
+#[test]
 fn stored_proof_json_requires_exact_typed_canonical_bytes() {
     fn serialize_with_object_key_order(value: &serde_json::Value, reverse: bool) -> String {
         match value {

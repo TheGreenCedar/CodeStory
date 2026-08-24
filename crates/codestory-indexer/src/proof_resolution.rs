@@ -84,8 +84,8 @@ fn python_resolution_work() -> usize {
     PYTHON_RESOLUTION_WORK.with(std::cell::Cell::get)
 }
 
-const ADAPTER_VERSION: &str = "reference-v13";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 11;
+const ADAPTER_VERSION: &str = "reference-v14";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 12;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
@@ -94,6 +94,18 @@ const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("tsx", ADAPTER_VERSION),
     ("typescript", ADAPTER_VERSION),
 ];
+
+pub fn current_proof_resolution_adapter_roster() -> Vec<ProofResolutionAdapter> {
+    let mut roster = INSTALLED_ADAPTERS
+        .iter()
+        .map(|(language, adapter_version)| ProofResolutionAdapter {
+            language: (*language).to_owned(),
+            adapter_version: (*adapter_version).to_owned(),
+        })
+        .collect::<Vec<_>>();
+    roster.sort();
+    roster
+}
 
 pub(crate) struct CollectedResolutionInputs {
     pub calls: Vec<CachedCallResolutionInput>,
@@ -4344,6 +4356,7 @@ struct RustResolutionIndex<'tree> {
     methods_by_owner_name: HashMap<(Vec<String>, String, String), Vec<CachedInherentMethod>>,
     uses_by_module_name: HashMap<(Vec<String>, String), Vec<CachedRustUseBinding>>,
     module_complete: HashMap<Vec<String>, bool>,
+    identifier_module_complete: HashMap<Vec<String>, bool>,
     module_value_blockers: HashMap<Vec<String>, HashSet<String>>,
     module_incomplete_value_names: HashMap<Vec<String>, HashSet<String>>,
     module_unsupported_value_names: HashMap<Vec<String>, HashSet<String>>,
@@ -4376,6 +4389,7 @@ impl<'tree> RustResolutionIndex<'tree> {
             methods_by_owner_name: HashMap::new(),
             uses_by_module_name: HashMap::new(),
             module_complete: HashMap::new(),
+            identifier_module_complete: HashMap::new(),
             module_value_blockers: HashMap::new(),
             module_incomplete_value_names: HashMap::new(),
             module_unsupported_value_names: HashMap::new(),
@@ -4442,6 +4456,7 @@ impl<'tree> RustResolutionIndex<'tree> {
         graph_nodes: &RustGraphNodeIndex,
     ) {
         let mut domain_complete = true;
+        let mut identifier_module_complete = true;
         let mut file_children = Vec::new();
         let mut value_blockers = HashSet::new();
         let mut incomplete_value_names = HashSet::new();
@@ -4449,18 +4464,41 @@ impl<'tree> RustResolutionIndex<'tree> {
         let mut cursor = body.walk();
         let items = body.named_children(&mut cursor).collect::<Vec<_>>();
         let attributed_items = rust_attributed_item_ids(&items);
+        let bounded_attribute_ids = rust_bounded_outer_attribute_ids(&items, source);
         self.attributed_items
             .extend(attributed_items.iter().copied());
         for item in &items {
-            if item.kind() == "macro_invocation"
+            let direct_domain_poison = item.kind() == "macro_invocation"
                 || (item.kind() == "inner_attribute_item"
                     && !rust_inner_allow_preserves_module_bindings(*item, source))
-                || (item.kind() == "attribute_item"
-                    && !rust_attribute_is_bounded_item_metadata(*item, source))
-                || (!matches!(item.kind(), "function_item" | "mod_item" | "impl_item")
-                    && contains_node_kind(*item, "macro_invocation"))
-            {
+                || (item.kind() == "attribute_item" && !bounded_attribute_ids.contains(&item.id()))
+                || (item.kind() == "expression_statement"
+                    && contains_node_kind(*item, "macro_invocation"));
+            if direct_domain_poison {
                 domain_complete = false;
+                identifier_module_complete = false;
+            } else {
+                let conservative_macro_container =
+                    !matches!(item.kind(), "function_item" | "mod_item" | "impl_item");
+                let identifier_macro_container = !matches!(
+                    item.kind(),
+                    "function_item"
+                        | "mod_item"
+                        | "impl_item"
+                        | "const_item"
+                        | "static_item"
+                        | "enum_item"
+                );
+                if (conservative_macro_container || identifier_macro_container)
+                    && contains_node_kind(*item, "macro_invocation")
+                {
+                    if conservative_macro_container {
+                        domain_complete = false;
+                    }
+                    if identifier_macro_container {
+                        identifier_module_complete = false;
+                    }
+                }
             }
             match item.kind() {
                 "function_item" => {
@@ -4470,11 +4508,13 @@ impl<'tree> RustResolutionIndex<'tree> {
                             incomplete_value_names.insert(name);
                         } else {
                             domain_complete = false;
+                            identifier_module_complete = false;
                         }
                         continue;
                     }
                     let Some(name) = name else {
                         domain_complete = false;
+                        identifier_module_complete = false;
                         continue;
                     };
                     let Some(declaration) = graph_nodes.callable(*item, source) else {
@@ -4502,6 +4542,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                             incomplete_value_names.insert(name.to_string());
                         } else {
                             domain_complete = false;
+                            identifier_module_complete = false;
                         }
                         continue;
                     }
@@ -4510,6 +4551,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                         graph_nodes.rust_type(*item, source),
                     ) else {
                         domain_complete = false;
+                        identifier_module_complete = false;
                         continue;
                     };
                     self.types_by_module_name
@@ -4546,6 +4588,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                         let names = rust_use_bound_names(*item, source);
                         if names.is_empty() {
                             domain_complete = false;
+                            identifier_module_complete = false;
                         } else {
                             incomplete_value_names.extend(names);
                         }
@@ -4566,6 +4609,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                     } else {
                         if node_text(*item, source).is_some_and(|surface| surface.contains('*')) {
                             domain_complete = false;
+                            identifier_module_complete = false;
                         }
                         value_blockers.extend(rust_use_bound_names(*item, source));
                     }
@@ -4578,6 +4622,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                 "mod_item" => {
                     let Some(name) = declaration_name(*item, source).map(str::to_string) else {
                         domain_complete = false;
+                        identifier_module_complete = false;
                         continue;
                     };
                     if attributed_items.contains(&item.id()) {
@@ -4597,6 +4642,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                     } else {
                         let Some(declaration) = module_declaration else {
                             domain_complete = false;
+                            identifier_module_complete = false;
                             continue;
                         };
                         file_children.push(CachedRustFileModule { name, declaration });
@@ -4613,6 +4659,8 @@ impl<'tree> RustResolutionIndex<'tree> {
         file_children.dedup();
         self.module_complete
             .insert(module_path.clone(), domain_complete);
+        self.identifier_module_complete
+            .insert(module_path.clone(), identifier_module_complete);
         self.module_value_blockers
             .insert(module_path.clone(), value_blockers.clone());
         self.module_incomplete_value_names
@@ -4973,7 +5021,22 @@ impl<'tree> RustResolutionIndex<'tree> {
             return (Some(caller), CachedResolutionBinding::IncompleteDomain);
         };
         if self.module_complete.get(&module_path) != Some(&true) {
-            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+            let declarations = self
+                .declarations_by_module_name
+                .get(&(module_path.clone(), raw_target.to_owned()))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let uses = self
+                .uses_by_module_name
+                .get(&(module_path.clone(), raw_target.to_owned()))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            if !matches!(form, CalleeForm::Identifier)
+                || self.identifier_module_complete.get(&module_path) != Some(&true)
+                || !matches!((declarations, uses), ([_], []))
+            {
+                return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+            }
         }
         match form {
             CalleeForm::Identifier => {
@@ -5270,20 +5333,67 @@ fn rust_attributed_item_ids(items: &[TsNode<'_>]) -> HashSet<usize> {
     result
 }
 
-fn rust_attribute_is_bounded_item_metadata(attribute: TsNode<'_>, source: &str) -> bool {
-    let Some(surface) = node_text(attribute, source) else {
-        return false;
-    };
-    let Some(body) = surface.trim().strip_prefix("#[") else {
-        return false;
-    };
-    let name = body
-        .split(|character: char| {
-            character == '(' || character == '=' || character == ']' || character.is_whitespace()
+fn rust_bounded_outer_attribute_ids(items: &[TsNode<'_>], source: &str) -> HashSet<usize> {
+    let mut result = HashSet::new();
+    let mut attributes = Vec::new();
+    for item in items {
+        if item.kind() == "attribute_item" {
+            attributes.push(*item);
+        } else {
+            if rust_attribute_group_is_bounded(&attributes, *item, source) {
+                result.extend(attributes.iter().map(|attribute| attribute.id()));
+            }
+            attributes.clear();
+        }
+    }
+    result
+}
+
+fn rust_attribute_group_is_bounded(
+    attributes: &[TsNode<'_>],
+    attributed_item: TsNode<'_>,
+    source: &str,
+) -> bool {
+    let is_helper_type = matches!(attributed_item.kind(), "struct_item" | "enum_item");
+    let has_derive = attributes.iter().any(|attribute| {
+        node_text(*attribute, source).is_some_and(|surface| {
+            surface
+                .trim()
+                .strip_prefix("#[")
+                .is_some_and(|body| body.starts_with("derive("))
         })
-        .next()
-        .unwrap_or_default();
-    matches!(name, "allow" | "cfg" | "derive" | "doc")
+    });
+    attributes.iter().all(|attribute| {
+        let Some(surface) = node_text(*attribute, source) else {
+            return false;
+        };
+        let Some(body) = surface.trim().strip_prefix("#[") else {
+            return false;
+        };
+        let name = body
+            .split(|character: char| {
+                character == '('
+                    || character == '='
+                    || character == ']'
+                    || character.is_whitespace()
+            })
+            .next()
+            .unwrap_or_default();
+        match name {
+            "allow" | "cfg" | "derive" | "doc" => true,
+            "inline" => attributed_item.kind() == "function_item",
+            "serde" | "error" => is_helper_type && has_derive,
+            "cfg_attr" if is_helper_type => body
+                .strip_prefix("cfg_attr(")
+                .and_then(|arguments| arguments.strip_suffix(")]"))
+                .and_then(|arguments| arguments.split_once(','))
+                .is_some_and(|(_, injected)| {
+                    let injected = injected.trim();
+                    injected.starts_with("derive(") && injected.ends_with(')')
+                }),
+            _ => false,
+        }
+    })
 }
 
 fn rust_inner_allow_preserves_module_bindings(attribute: TsNode<'_>, source: &str) -> bool {
@@ -5332,10 +5442,7 @@ fn rust_callable_poison_ranges(function: TsNode<'_>, source: &str) -> Vec<(usize
                 continue;
             }
             if !pending_attributes.is_empty() {
-                if pending_attributes
-                    .iter()
-                    .all(|attribute| rust_attribute_is_bounded_item_metadata(*attribute, source))
-                {
+                if rust_attribute_group_is_bounded(&pending_attributes, child, source) {
                     output.push((child.start_byte(), child.end_byte()));
                 } else {
                     output.push(scope);
@@ -6513,13 +6620,7 @@ pub fn rematerialize_proof_resolution_projection(
         .replace_proof_resolution_projection(
             publication,
             &ProofResolutionProjection {
-                adapter_roster: INSTALLED_ADAPTERS
-                    .iter()
-                    .map(|(language, adapter_version)| ProofResolutionAdapter {
-                        language: (*language).to_string(),
-                        adapter_version: (*adapter_version).to_string(),
-                    })
-                    .collect(),
+                adapter_roster: current_proof_resolution_adapter_roster(),
                 facts,
                 funnel,
             },

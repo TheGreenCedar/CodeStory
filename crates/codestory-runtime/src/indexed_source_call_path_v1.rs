@@ -42,6 +42,7 @@ use codestory_agent::proof_qualification_test_support::{
 use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
+use codestory_indexer::current_proof_resolution_adapter_roster;
 use codestory_store::{FileInfo, IndexPublicationRecord, Store};
 use codestory_workspace::{
     ProjectRelativePathResolution, WorkspacePathIdentity, project_identity_v3,
@@ -381,10 +382,11 @@ where
         generation_id: publication.generation_id.clone(),
         run_id: publication.run_id.clone(),
     };
-    if store
-        .validate_proof_resolution_publication(publication)
-        .is_err()
-    {
+    let proof_projection_available = matches!(
+        store.validate_proof_resolution_publication(publication),
+        Ok(manifest) if manifest.adapter_roster == current_proof_resolution_adapter_roster()
+    );
+    if !proof_projection_available {
         return Ok(ObservedBuiltCallPathFacts {
             built: BuiltCallPathFacts {
                 publication: proof_publication,
@@ -1628,8 +1630,7 @@ mod tests {
     use codestory_contracts::proof_resolution::{
         CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
         ExactCallsite, FileId, INTERNAL_RESOLUTION_PRODUCER, PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
-        ProofResolutionAdapter, ProofResolutionProjection, ProofResolutionReason,
-        ResolutionEvidence, ResolutionProvenance,
+        ProofResolutionProjection, ProofResolutionReason, ResolutionEvidence, ResolutionProvenance,
     };
     use codestory_indexer::{
         WorkspaceIndexer, build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
@@ -1914,6 +1915,13 @@ mod tests {
         publication: &IndexPublicationRecord,
         edge_ids: &[EdgeId],
     ) {
+        let adapter_roster = current_proof_resolution_adapter_roster();
+        let rust_adapter_version = adapter_roster
+            .iter()
+            .find(|adapter| adapter.language == "rust")
+            .expect("compiled roster includes Rust")
+            .adapter_version
+            .clone();
         let nodes = store
             .get_nodes()
             .unwrap()
@@ -1994,7 +2002,7 @@ mod tests {
                         fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
                         algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
                         language_adapter: "rust".to_owned(),
-                        language_adapter_version: "test-v1".to_owned(),
+                        language_adapter_version: rust_adapter_version.clone(),
                         parser_fingerprint: "2".repeat(64),
                         dependency_file_hashes: vec![DependencyFileHash {
                             file_id: FileId(file_id.0),
@@ -2011,10 +2019,7 @@ mod tests {
             .replace_proof_resolution_projection(
                 publication,
                 &ProofResolutionProjection {
-                    adapter_roster: vec![ProofResolutionAdapter {
-                        language: "rust".to_owned(),
-                        adapter_version: "test-v1".to_owned(),
-                    }],
+                    adapter_roster,
                     facts,
                     funnel,
                 },
@@ -2884,6 +2889,70 @@ mod tests {
                     )
             })
         ));
+    }
+
+    #[test]
+    fn source_built_runtime_rejects_a_compiled_stale_adapter_roster() {
+        let mut fixture = source_built_fixture("fn target() {}\nfn source() { target(); }\n");
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let (contract, _hashes, _rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+        let manifest = fixture
+            .store
+            .get_proof_resolution_publication()
+            .unwrap()
+            .unwrap();
+        let mut facts = fixture.store.get_proof_resolution_facts().unwrap();
+        for fact in &mut facts {
+            fact.provenance.language_adapter_version = "wrong-v1".to_owned();
+            *fact = seal_call_resolution_fact(fact.clone()).unwrap();
+        }
+        let mut adapter_roster = manifest.adapter_roster;
+        adapter_roster
+            .iter_mut()
+            .find(|adapter| adapter.language == "rust")
+            .unwrap()
+            .adapter_version = "wrong-v1".to_owned();
+        let funnel = build_proof_resolution_funnel(&facts);
+        fixture
+            .store
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM proof_resolution_fact; DELETE FROM proof_resolution_publication;",
+            )
+            .unwrap();
+        fixture
+            .store
+            .replace_proof_resolution_projection(
+                &fixture.publication,
+                &ProofResolutionProjection {
+                    adapter_roster,
+                    facts,
+                    funnel,
+                },
+            )
+            .expect("the stored roster still covers each stored fact provenance");
+        fixture
+            .store
+            .validate_proof_resolution_publication(&fixture.publication)
+            .expect("store validation accepts a self-consistent stored roster");
+
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed.built.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
+        );
+        assert!(observed.built.receipts.is_empty());
     }
 
     #[test]

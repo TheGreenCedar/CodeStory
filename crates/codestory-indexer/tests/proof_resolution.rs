@@ -4837,7 +4837,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v11", "adapter", "language"]
+            ["stale", "schema-v12", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -4906,6 +4906,84 @@ fn rust_macro_expansion_poison_is_scoped_to_relevant_domains() -> anyhow::Result
 }
 
 #[test]
+fn rust_module_closure_ignores_unrelated_closed_expression_macros() -> anyhow::Result<()> {
+    for source in [
+        "const LABEL: &str = concat!(\"open\", \"\");\nfn target() {}\nfn caller() { target(); }\n",
+        "static PACKAGE: &str = env!(\"CARGO_PKG_NAME\");\nfn target() {}\nfn caller() { target(); }\n",
+        "const LABEL: &str = { let _ = format_args!(\"{}\", \"note\"); \"note\" };\nfn target() {}\nfn caller() { target(); }\n",
+        "enum Marker { Value = line!() }\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg(any())]\nconst UNRELATED: usize = 0;\nfn target() {}\nfn caller() { target(); }\n",
+    ] {
+        assert_only_call_is_exact(&[("src/lib.rs", source)])?;
+    }
+
+    for source in [
+        "include!(\"generated.rs\");\nfn target() {}\nfn caller() { target(); }\n",
+        "thread_local! { static MARKER: usize = 0; }\nfn target() {}\nfn caller() { target(); }\n",
+        "macro_rules! generated { () => { fn target() {} }; }\ngenerated!();\nfn target() {}\nfn caller() { target(); }\n",
+        "macro_rules! foreign_target { () => { fn target(); }; }\nunsafe extern \"C\" { foreign_target!(); }\nfn target() {}\nfn caller() { target(); }\n",
+        "#![cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg(any())]\nfn target() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "fn target() {}\n#[cfg(any())]\nfn caller() { target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_closed_expression_macros_only_relax_bare_same_file_calls() -> anyhow::Result<()> {
+    assert_only_call_is_exact(&[(
+        "src/lib.rs",
+        "const LABEL: &str = concat!(\"open\", \"\");\nfn target() {}\nfn caller() { target(); }\n",
+    )])?;
+
+    for source in [
+        "const LABEL: &str = concat!(\"open\", \"\");\nstruct Worker;\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        "const LABEL: &str = concat!(\"open\", \"\");\nstruct Worker;\nimpl Worker { fn target() {} }\nfn caller() { Worker::target(); }\n",
+        "const LABEL: &str = concat!(\"open\", \"\");\nstruct Worker;\nimpl Worker { fn target(&self) {} }\nfn caller() { let value: Worker = Worker; value.target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_identifier_local_closure_keeps_glob_import_domains_incomplete() -> anyhow::Result<()> {
+    assert_only_call_is_not_exact(&[(
+        "src/lib.rs",
+        "use crate::*;\nfn target() {}\nfn caller() { target(); }\n",
+    )])
+}
+
+#[test]
+fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n")],
+    )?;
+    let receipt = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    assert_eq!(
+        receipt
+            .adapter_roster
+            .iter()
+            .find(|adapter| adapter.language == "rust")
+            .map(|adapter| adapter.adapter_version.as_str()),
+        Some("reference-v14")
+    );
+    for fact in store.get_proof_resolution_facts()? {
+        assert!(receipt.adapter_roster.iter().any(|adapter| {
+            adapter.language == fact.provenance.language_adapter
+                && adapter.adapter_version == fact.provenance.language_adapter_version
+        }));
+    }
+    Ok(())
+}
+
+#[test]
 fn rust_attribute_domains_are_never_exact() -> anyhow::Result<()> {
     for source in [
         "#[unresolved_attribute_macro]\nfn target() {}\nfn caller() { target(); }\n",
@@ -4943,6 +5021,48 @@ fn rust_attribute_domains_are_never_exact() -> anyhow::Result<()> {
         "src/lib.rs",
         "struct Worker;\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
     )])?;
+    Ok(())
+}
+
+#[test]
+fn rust_bounded_outer_metadata_preserves_unrelated_bindings() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/lib.rs",
+            "#[derive(Debug)]\n#[serde(rename = \"serde_helper\")]\nstruct SerdeHelper;\n#[derive(Debug)]\n#[error(\"error_helper\")]\nstruct ErrorHelper;\n#[inline]\nfn inline_helper() {}\n#[cfg_attr(test, derive(Debug))]\nstruct Report;\nfn target() {}\nfn caller() { target(); SerdeHelper(); ErrorHelper(); inline_helper(); Report(); }\n",
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let fact = |name| {
+        facts
+            .iter()
+            .find(|fact| fact.callsite.raw_target == name)
+            .expect("one direct call")
+    };
+    assert_eq!(fact("target").status, ProofResolutionStatus::Exact);
+    for name in ["SerdeHelper", "ErrorHelper", "inline_helper", "Report"] {
+        assert_eq!(
+            fact(name).status,
+            ProofResolutionStatus::IncompleteDomain,
+            "the attributed item's own name remains incomplete: {name}"
+        );
+    }
+
+    for source in [
+        "#[unresolved_attribute_macro]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg_attr(test, unresolved_attribute_macro)]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "#[serde(rename = \"helper\")]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "#[error(\"helper\")]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "#[serde(rename = \"helper\")]\nstruct Helper;\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg_attr(test, derive(Debug))]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
     Ok(())
 }
 
