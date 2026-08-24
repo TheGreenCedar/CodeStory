@@ -960,14 +960,14 @@ fn go_lexical_shadowing_is_callsite_specific() -> anyhow::Result<()> {
     index_files(
         project.path(),
         &mut store,
-        &[((
+        &[(
             "main.go",
             concat!(
                 "package proof\n",
                 "func target() {}\n",
                 "func caller() { target(); { target := func() {}; target() }; target() }\n",
             ),
-        ))],
+        )],
     )?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let matching = store

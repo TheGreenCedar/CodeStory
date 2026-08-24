@@ -487,10 +487,8 @@ impl<'tree> GoResolutionIndex<'tree> {
                         });
                     }
                 }
-                "var_spec" | "const_spec" => {
-                    if go_spec_is_package_level(node, root) {
-                        go_declared_names(node, source, &mut result.package_blockers);
-                    }
+                "var_spec" | "const_spec" if go_spec_is_package_level(node, root) => {
+                    go_declared_names(node, source, &mut result.package_blockers);
                 }
                 "comment" => {
                     if let Some(name) = go_linkname_local_name(node, source) {
@@ -5819,6 +5817,9 @@ impl ExactEvidenceValidationIndex {
         }
     }
 
+    // Keeping every proof-correlation input explicit makes accidental endpoint
+    // substitution visible at the call sites.
+    #[allow(clippy::too_many_arguments)]
     fn local_receiver_is_correlated(
         &self,
         language: &str,
