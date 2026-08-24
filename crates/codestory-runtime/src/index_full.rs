@@ -1,6 +1,6 @@
 use crate::index_commit::{
     CoreCommitMode, PreparedCoreCommit, StagedPreparation, next_index_publication,
-    stage_core_publication_identity,
+    rematerialize_staged_proof_resolution_projection, stage_core_publication_identity,
 };
 use crate::index_incremental::spawn_progress_forwarder;
 use crate::index_timings::{
@@ -472,6 +472,11 @@ fn prepare_full_refresh(
         copy_forward_full_refresh_artifacts(preparation.staged_mut(), storage_path);
     }
     wall_durations.copy_forward = copy_started.elapsed();
+    rematerialize_staged_proof_resolution_projection(
+        preparation.staged_mut(),
+        &live_state.publication,
+        cancel_token,
+    )?;
     let snapshots = prepare_full_refresh_snapshots(
         preparation.staged_mut(),
         &live_state.dense_anchor_source_identity,
