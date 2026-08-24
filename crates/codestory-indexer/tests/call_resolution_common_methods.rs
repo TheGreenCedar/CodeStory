@@ -2293,6 +2293,101 @@ def outer(repo: Repository):
 }
 
 #[test]
+fn test_python_returned_call_projects_one_inner_member_call() -> anyhow::Result<()> {
+    let source = r#"
+class App:
+    def ensure_sync(self, function):
+        return function
+
+    def dispatch(self):
+        pass
+
+    def caller(self):
+        return self.ensure_sync(self.dispatch)()
+"#;
+
+    let (nodes, edges) = index_single_file("app.py", source)?;
+    let ensure_sync = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "App", "ensure_sync"))
+        .expect("ensure_sync declaration");
+    let projected = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.line == Some(10)
+                && edge.effective_target() == ensure_sync.id
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        projected.len(),
+        1,
+        "duplicate returned-call projection: {projected:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_python_parenthesized_member_call_is_transparent_but_returned_call_is_not()
+-> anyhow::Result<()> {
+    let source = r#"
+class App:
+    def run(self):
+        pass
+
+    def ensure_sync(self, function):
+        return function
+
+    def caller(self):
+        (self.run)()
+        return self.ensure_sync(self.run)()
+"#;
+
+    let (nodes, edges) = index_single_file("app.py", source)?;
+    let run = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "App", "run"))
+        .expect("run declaration");
+    let ensure_sync = nodes
+        .iter()
+        .find(|node| is_matching_owned_method(&node.serialized_name, "App", "ensure_sync"))
+        .expect("ensure_sync declaration");
+
+    let parenthesized = edges
+        .iter()
+        .filter(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge.line == Some(10)
+                && edge.effective_target() == run.id
+        })
+        .count();
+    assert_eq!(parenthesized, 1, "parenthesized member call: {edges:#?}");
+
+    let returned = edges
+        .iter()
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(11))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        returned
+            .iter()
+            .filter(|edge| edge.effective_target() == ensure_sync.id)
+            .count(),
+        1,
+        "returned-call inner member must project once: {returned:#?}"
+    );
+    assert_eq!(
+        returned
+            .iter()
+            .filter(|edge| edge.effective_target() == run.id)
+            .count(),
+        0,
+        "callable-return invocation must not project as the argument member: {returned:#?}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_go_imported_receiver_uses_qualified_import_owner() -> anyhow::Result<()> {
     let notifier_source = r#"
 package notifier

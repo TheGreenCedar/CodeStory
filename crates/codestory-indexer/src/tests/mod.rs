@@ -16,6 +16,126 @@ use rusqlite::types::Value;
 use std::collections::HashSet;
 use tempfile::tempdir;
 
+fn measured_manual_receiver_index_work(owner_count: usize, lookup_count: usize) -> usize {
+    let file_id = NodeId(1);
+    let mut nodes = HashMap::new();
+    let mut edges = Vec::new();
+    for index in 0..owner_count {
+        let owner_id = NodeId(i64::try_from(index * 2 + 2).expect("owner id"));
+        let target_id = NodeId(i64::try_from(index * 2 + 3).expect("target id"));
+        nodes.insert(
+            owner_id,
+            Node {
+                id: owner_id,
+                kind: NodeKind::CLASS,
+                serialized_name: format!("Owner{index}"),
+                qualified_name: Some(format!("module.Owner{index}")),
+                file_node_id: Some(file_id),
+                start_line: Some(u32::try_from(index + 1).expect("owner line")),
+                end_line: Some(u32::try_from(index + 2).expect("owner end line")),
+                ..Default::default()
+            },
+        );
+        nodes.insert(
+            target_id,
+            Node {
+                id: target_id,
+                kind: NodeKind::METHOD,
+                serialized_name: "run".to_owned(),
+                qualified_name: Some(format!("module.Owner{index}.run")),
+                file_node_id: Some(file_id),
+                start_line: Some(u32::try_from(index + 2).expect("method line")),
+                ..Default::default()
+            },
+        );
+        edges.push(Edge {
+            source: owner_id,
+            target: target_id,
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        });
+    }
+    reset_manual_receiver_lookup_work();
+    let prepared = PreparedMemberTargetIndex::prepare(&nodes, &edges);
+    for index in 0..lookup_count {
+        let owner_index = index % owner_count;
+        assert_eq!(
+            prepared.target(&format!("Owner{owner_index}"), "run", file_id, false, None,),
+            Some(NodeId(
+                i64::try_from(owner_index * 2 + 3).expect("target id")
+            ))
+        );
+    }
+    manual_receiver_lookup_work()
+}
+
+#[test]
+fn prepared_manual_receiver_members_and_lookups_are_independently_linear() {
+    let baseline = measured_manual_receiver_index_work(64, 64);
+    let more_members = measured_manual_receiver_index_work(128, 64);
+    let more_lookups = measured_manual_receiver_index_work(64, 128);
+    let combined = measured_manual_receiver_index_work(128, 128);
+    assert!(baseline >= 64, "manual receiver work was not counted");
+    assert!(
+        more_members <= baseline * 2 + 64,
+        "member preparation: {baseline} -> {more_members}"
+    );
+    assert!(
+        more_lookups <= baseline * 2 + 64,
+        "member lookups: {baseline} -> {more_lookups}"
+    );
+    assert!(
+        combined <= baseline * 2 + 128,
+        "combined work: {baseline} -> {combined}"
+    );
+}
+
+fn measured_python_local_owner_line_work(owner_count: usize, lookup_count: usize) -> usize {
+    let mut source = String::new();
+    for index in 0..owner_count {
+        source.push_str(&format!(
+            "def caller_{index}():\n    class Owner{index}:\n        pass\n\n"
+        ));
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("Python parser language");
+    let tree = parser.parse(&source, None).expect("Python syntax tree");
+    reset_manual_receiver_lookup_work();
+    let prepared = PythonLocalOwnerLineIndex::prepare(&tree, &source);
+    for index in 0..lookup_count {
+        let owner_index = index % owner_count;
+        assert!(
+            prepared
+                .unique_line(&format!("caller_{owner_index}.Owner{owner_index}"))
+                .is_some()
+        );
+    }
+    manual_receiver_lookup_work()
+}
+
+#[test]
+fn python_local_owner_lines_are_prepared_once_and_looked_up_linearly() {
+    let baseline = measured_python_local_owner_line_work(64, 64);
+    let more_owners = measured_python_local_owner_line_work(128, 64);
+    let more_lookups = measured_python_local_owner_line_work(64, 128);
+    let combined = measured_python_local_owner_line_work(128, 128);
+    assert!(baseline >= 64, "Python owner-line work was not counted");
+    assert!(
+        more_owners <= baseline * 2 + 128,
+        "owner preparation: {baseline} -> {more_owners}"
+    );
+    assert!(
+        more_lookups <= baseline * 2 + 64,
+        "owner lookups: {baseline} -> {more_lookups}"
+    );
+    assert!(
+        combined <= baseline * 2 + 192,
+        "combined work: {baseline} -> {combined}"
+    );
+}
+
 /// A file whose only structural node is a position-derived one: a shape
 /// several collectors produce today, because `structural_node_id` mixes the
 /// declaration's line and column into the id.

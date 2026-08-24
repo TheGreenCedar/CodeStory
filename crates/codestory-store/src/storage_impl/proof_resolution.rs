@@ -15,25 +15,25 @@ const PUBLICATION_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-publicatio
 
 #[cfg(test)]
 thread_local! {
-    static GO_STORE_REPLAY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STORE_REPLAY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
-fn count_go_store_replay_work(amount: usize) {
+fn count_store_replay_work(amount: usize) {
     #[cfg(test)]
-    GO_STORE_REPLAY_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    STORE_REPLAY_WORK.with(|work| work.set(work.get().saturating_add(amount)));
     #[cfg(not(test))]
     let _ = amount;
 }
 
 #[cfg(test)]
-fn reset_go_store_replay_work() {
-    GO_STORE_REPLAY_WORK.with(|work| work.set(0));
+fn reset_store_replay_work() {
+    STORE_REPLAY_WORK.with(|work| work.set(0));
 }
 
 #[cfg(test)]
-fn go_store_replay_work() -> usize {
-    GO_STORE_REPLAY_WORK.with(std::cell::Cell::get)
+fn store_replay_work() -> usize {
+    STORE_REPLAY_WORK.with(std::cell::Cell::get)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +94,22 @@ fn is_sha256(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_canonical_json<T>(value: &str, label: &str) -> Result<T, String>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let parsed: T = serde_json::from_str(value)
+        .map_err(|error| format!("stored {label} JSON is invalid: {error}"))?;
+    let canonical = serde_json::to_string(&parsed)
+        .map_err(|error| format!("stored {label} JSON cannot be serialized: {error}"))?;
+    if canonical != value {
+        return Err(format!(
+            "stored {label} JSON bytes are not canonical typed serialization"
+        ));
+    }
+    Ok(parsed)
 }
 
 fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<(), StorageError> {
@@ -209,6 +225,9 @@ struct ProofResolutionValidationContext {
     parsed_callsite_identity_by_edge: HashMap<EdgeId, StoredCanonicalCallsiteIdentity>,
     import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
+    python_import_paths: HashMap<(NodeId, NodeId), Vec<Vec<NodeId>>>,
+    python_file_ids_by_path: HashMap<PathBuf, Vec<FileId>>,
+    python_attestation_error_by_file: HashMap<i64, String>,
     go_package_identity_by_file: HashMap<i64, GoPackageIdentity>,
     go_dependency_ids_by_package: HashMap<GoPackageIdentity, BTreeSet<FileId>>,
     go_attestation_error_by_file: HashMap<i64, String>,
@@ -247,7 +266,7 @@ fn prepare_call_edge_correlation_index(
     let mut indices = Vec::new();
     let mut identities = HashMap::new();
     for (index, edge) in edges.iter().enumerate() {
-        count_go_store_replay_work(1);
+        count_store_replay_work(1);
         if edge.kind != EdgeKind::CALL || !node_by_id.contains_key(&edge.target) {
             continue;
         }
@@ -292,7 +311,7 @@ fn go_package_dependency_ids(
         .get(&source_file_id.0)
         .ok_or_else(|| proof_error("Go source dependency has no authenticated package clause"))?;
     for file_id in evidence_ids {
-        count_go_store_replay_work(1);
+        count_store_replay_work(1);
         if let Some(error) = context.go_attestation_error_by_file.get(&file_id.0) {
             return Err(proof_error(format!(
                 "Go evidence dependency is not publication-authenticated: {error}"
@@ -304,7 +323,7 @@ fn go_package_dependency_ids(
             ));
         }
     }
-    count_go_store_replay_work(1);
+    count_store_replay_work(1);
     context
         .go_dependency_ids_by_package
         .get(source_identity)
@@ -318,6 +337,7 @@ fn stored_go_package_dependency_ids(
     stored_fact_ids: &BTreeSet<FileId>,
     context: &ProofResolutionValidationContext,
 ) -> Result<BTreeSet<FileId>, StorageError> {
+    count_store_replay_work(1);
     if !required_evidence_ids.is_subset(stored_fact_ids) {
         return Err(proof_error(
             "stored Go dependency receipt omits source or typed evidence files",
@@ -332,7 +352,7 @@ fn stored_go_package_dependency_ids(
         .parent()
         .ok_or_else(|| proof_error("stored Go source path has no package directory"))?;
     for file_id in stored_fact_ids {
-        count_go_store_replay_work(1);
+        count_store_replay_work(1);
         let file = context
             .file_by_id
             .get(&file_id.0)
@@ -353,6 +373,312 @@ fn stored_go_package_dependency_ids(
     Ok(stored_fact_ids.clone())
 }
 
+fn python_dependency_ids(
+    fact: &CallResolutionFact,
+    required_evidence_ids: &BTreeSet<FileId>,
+    stored_fact_ids: &BTreeSet<FileId>,
+    context: &ProofResolutionValidationContext,
+) -> Result<BTreeSet<FileId>, StorageError> {
+    if !required_evidence_ids.is_subset(stored_fact_ids) {
+        return Err(proof_error(
+            "Python dependency receipt omits source or typed evidence files",
+        ));
+    }
+    let mut expected = required_evidence_ids.clone();
+    let imported = fact
+        .evidence_chain
+        .iter()
+        .any(|evidence| matches!(evidence, ResolutionEvidence::StaticImportBinding { .. }));
+    let source = context
+        .file_by_id
+        .get(&fact.callsite.file_id.0)
+        .ok_or_else(|| proof_error("Python source dependency file is missing"))?;
+    if source.language != "python"
+        || source
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("py")
+    {
+        return Err(proof_error(
+            "Python proof source is not an indexed runtime source file",
+        ));
+    }
+    if imported {
+        let module_specifier = fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| {
+                let ResolutionEvidence::QualifiedPath { components } = evidence else {
+                    return None;
+                };
+                components.iter().find_map(|component| {
+                    context
+                        .node_by_id
+                        .get(component)
+                        .filter(|node| node.kind == NodeKind::MODULE)
+                        .map(|node| node.serialized_name.as_str())
+                })
+            })
+            .ok_or_else(|| proof_error("Python relative import has no authenticated module"))?;
+        if !python_exact_relative_module(module_specifier) {
+            return Err(proof_error(
+                "Python relative import module is outside the exact subset",
+            ));
+        }
+        let parent = source
+            .path
+            .parent()
+            .ok_or_else(|| proof_error("Python source path has no package directory"))?;
+        let components = module_specifier[1..].split('.').collect::<Vec<_>>();
+        let mut base = parent.to_path_buf();
+        for marker_path in std::iter::once(parent.join("__init__.py")).chain(
+            components[..components.len() - 1].iter().map(|component| {
+                base.push(component);
+                base.join("__init__.py")
+            }),
+        ) {
+            let markers = context
+                .python_file_ids_by_path
+                .get(&marker_path)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let [marker] = markers else {
+                return Err(proof_error(
+                    "Python relative import has no unique indexed package marker",
+                ));
+            };
+            expected.insert(*marker);
+        }
+        let target = fact.target.expect("Exact Python fact has a target");
+        let target_file_id = context
+            .node_by_id
+            .get(&target)
+            .and_then(|node| node.file_node_id)
+            .ok_or_else(|| proof_error("Python imported target has no source file"))?;
+        let target_file = context
+            .file_by_id
+            .get(&target_file_id.0)
+            .ok_or_else(|| proof_error("Python imported target file is missing"))?;
+        let leaf = components.last().expect("relative module has a component");
+        let file_target = base.join(leaf).with_extension("py");
+        let package_target = base.join(leaf).join("__init__.py");
+        let target_ids = [file_target, package_target]
+            .into_iter()
+            .flat_map(|path| {
+                context
+                    .python_file_ids_by_path
+                    .get(&path)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
+            .collect::<Vec<_>>();
+        if target_ids.as_slice() != [FileId(target_file.id)] {
+            return Err(proof_error(
+                "Python relative import has no unique indexed native module target",
+            ));
+        }
+    }
+    if expected != *stored_fact_ids {
+        return Err(proof_error(
+            "Python dependency receipt has missing or extra package dependencies",
+        ));
+    }
+    for file_id in stored_fact_ids {
+        count_store_replay_work(1);
+        let file = context
+            .file_by_id
+            .get(&file_id.0)
+            .ok_or_else(|| proof_error("Python dependency file is missing"))?;
+        if file.language != "python"
+            || file
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("py")
+        {
+            return Err(proof_error(
+                "Python dependency receipt contains a non-runtime source file",
+            ));
+        }
+        if let Some(error) = context.python_attestation_error_by_file.get(&file.id) {
+            return Err(proof_error(format!(
+                "Python dependency source is not publication-authenticated: {error}"
+            )));
+        }
+    }
+    Ok(expected)
+}
+
+fn prepare_python_file_ids_by_path(
+    file_by_id: &HashMap<i64, FileInfo>,
+) -> HashMap<PathBuf, Vec<FileId>> {
+    let mut by_path = HashMap::<PathBuf, Vec<FileId>>::new();
+    for file in file_by_id.values().filter(|file| file.language == "python") {
+        count_store_replay_work(1);
+        by_path
+            .entry(file.path.clone())
+            .or_default()
+            .push(FileId(file.id));
+    }
+    by_path
+}
+
+fn python_exact_relative_module(module: &str) -> bool {
+    module.starts_with('.')
+        && !module.starts_with("..")
+        && module.len() > 1
+        && module[1..].split('.').all(|component| {
+            let mut chars = component.chars();
+            chars
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        })
+}
+
+#[cfg(unix)]
+type PythonNativeFileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type PythonNativeFileIdentity = PathBuf;
+
+fn python_native_file_identity(path: &Path) -> Result<PythonNativeFileIdentity, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("source cannot be inspected: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("source cannot be a symlink".to_owned());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::canonicalize(path)
+            .map(|path| PathBuf::from(path.to_string_lossy().to_lowercase()))
+            .map_err(|error| format!("source has no native identity: {error}"))
+    }
+}
+
+fn canonical_file_node_id_for_path(path: &Path) -> i64 {
+    #[cfg(windows)]
+    let file_identity = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
+    #[cfg(not(windows))]
+    let file_identity = path.to_string_lossy().into_owned();
+    let canonical_id = format!("{file_identity}:{file_identity}:1");
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in canonical_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash as i64
+}
+
+fn prepare_python_source_attestation(
+    file_by_id: &HashMap<i64, FileInfo>,
+    file_content_hash_by_id: &HashMap<i64, String>,
+    authenticate_live_sources: bool,
+) -> HashMap<i64, String> {
+    let mut errors = HashMap::new();
+    let mut native_owners = HashMap::<PythonNativeFileIdentity, i64>::new();
+    for file in file_by_id.values().filter(|file| file.language == "python") {
+        count_store_replay_work(1);
+        if canonical_file_node_id_for_path(&file.path) != file.id {
+            errors.insert(
+                file.id,
+                "file row path does not reproduce its canonical file node id".to_owned(),
+            );
+            continue;
+        }
+        if !authenticate_live_sources {
+            continue;
+        }
+        let identity = match python_native_file_identity(&file.path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                errors.insert(file.id, error);
+                continue;
+            }
+        };
+        if let Some(previous) = native_owners.insert(identity, file.id)
+            && previous != file.id
+        {
+            errors.insert(previous, "native source identity is not unique".to_owned());
+            errors.insert(file.id, "native source identity is not unique".to_owned());
+            continue;
+        }
+        let bytes = match fs::read(&file.path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                errors.insert(file.id, format!("source cannot be read: {error}"));
+                continue;
+            }
+        };
+        count_store_replay_work(bytes.len().saturating_add(1));
+        let observed = format!("{:x}", Sha256::digest(&bytes));
+        if file_content_hash_by_id.get(&file.id) != Some(&observed) {
+            errors.insert(
+                file.id,
+                "source bytes do not match the stored source hash".to_owned(),
+            );
+            continue;
+        }
+        if std::str::from_utf8(&bytes).is_err() {
+            errors.insert(file.id, "source bytes are not strict UTF-8".to_owned());
+        }
+    }
+    errors
+}
+
+fn validate_python_import_target(
+    context: &ProofResolutionValidationContext,
+    source_file: NodeId,
+    module: NodeId,
+    target: NodeId,
+) -> bool {
+    let Some(source) = context.file_by_id.get(&source_file.0) else {
+        return false;
+    };
+    let Some(module_node) = context.node_by_id.get(&module) else {
+        return false;
+    };
+    let Some(target_file) = context
+        .node_by_id
+        .get(&target)
+        .and_then(|node| node.file_node_id)
+        .and_then(|file| context.file_by_id.get(&file.0))
+    else {
+        return false;
+    };
+    let module_specifier = module_node.serialized_name.as_str();
+    if !module_specifier.starts_with('.')
+        || module_specifier.starts_with("..")
+        || module_specifier.len() <= 1
+        || !module_specifier[1..].split('.').all(|component| {
+            let mut chars = component.chars();
+            chars
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        })
+    {
+        return false;
+    }
+    let Some(parent) = source.path.parent() else {
+        return false;
+    };
+    let relative = module_specifier[1..].replace('.', std::path::MAIN_SEPARATOR_STR);
+    let base = parent.join(relative);
+    target_file.path == base.with_extension("py") || target_file.path == base.join("__init__.py")
+}
+
 type PreparedGoPackageClosure = (
     HashMap<i64, GoPackageIdentity>,
     HashMap<GoPackageIdentity, BTreeSet<FileId>>,
@@ -367,7 +693,7 @@ fn prepare_go_package_closure(
     let mut dependencies_by_package = HashMap::<GoPackageIdentity, BTreeSet<FileId>>::new();
     let mut errors = HashMap::new();
     for file in file_by_id.values().filter(|file| file.language == "go") {
-        count_go_store_replay_work(1);
+        count_store_replay_work(1);
         match attest_go_file(file, file_content_hash_by_id) {
             Ok(identity) => {
                 if !file
@@ -400,7 +726,7 @@ fn attest_go_file(
         .ok_or_else(|| "stored source hash is missing".to_owned())?;
     let bytes =
         fs::read(&file.path).map_err(|error| format!("source bytes cannot be read: {error}"))?;
-    count_go_store_replay_work(bytes.len().saturating_add(1));
+    count_store_replay_work(bytes.len().saturating_add(1));
     let observed_hash = format!("{:x}", Sha256::digest(&bytes));
     if &observed_hash != expected_hash {
         return Err("source bytes do not match the stored source hash".to_owned());
@@ -503,7 +829,7 @@ mod go_replay_complexity_tests {
             );
             file_content_hash_by_id.insert(id, source_hash.clone());
         }
-        reset_go_store_replay_work();
+        reset_store_replay_work();
         let (
             go_package_identity_by_file,
             go_dependency_ids_by_package,
@@ -519,6 +845,9 @@ mod go_replay_complexity_tests {
             parsed_callsite_identity_by_edge: HashMap::new(),
             import_relations: HashMap::new(),
             member_relations: HashMap::new(),
+            python_import_paths: HashMap::new(),
+            python_file_ids_by_path: HashMap::new(),
+            python_attestation_error_by_file: HashMap::new(),
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
@@ -528,7 +857,7 @@ mod go_replay_complexity_tests {
             go_package_dependency_ids(FileId(1), &BTreeSet::from([FileId(1)]), &context)
                 .expect("package closure");
         }
-        go_store_replay_work()
+        store_replay_work()
     }
 
     #[test]
@@ -575,11 +904,11 @@ mod go_replay_complexity_tests {
                 ..Default::default()
             })
             .collect::<Vec<_>>();
-        reset_go_store_replay_work();
+        reset_store_replay_work();
         let (indices, identities) = prepare_call_edge_correlation_index(&edges, &node_by_id);
         assert_eq!(indices.len(), count);
         assert_eq!(identities.len(), count);
-        go_store_replay_work()
+        store_replay_work()
     }
 
     #[test]
@@ -590,6 +919,131 @@ mod go_replay_complexity_tests {
         assert!(
             large <= small * 2 + 64,
             "same-line callsite identity indexing grew superlinearly: {small} -> {large}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod python_replay_complexity_tests {
+    use super::*;
+
+    fn measured_python_replay_work(file_count: usize, fact_count: usize) -> usize {
+        let temp = tempfile::tempdir().expect("Python replay tempdir");
+        let mut file_by_id = HashMap::new();
+        let mut file_content_hash_by_id = HashMap::new();
+        let source = b"def target():\n    pass\n";
+        let source_hash = format!("{:x}", Sha256::digest(source));
+        let mut source_file_id = None;
+        for index in 0..file_count {
+            let path = temp.path().join(format!("file_{index}.py"));
+            fs::write(&path, source).expect("write Python replay source");
+            let id = canonical_file_node_id_for_path(&path);
+            source_file_id.get_or_insert(id);
+            file_by_id.insert(
+                id,
+                FileInfo {
+                    id,
+                    path,
+                    language: "python".to_owned(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 1,
+                    file_role: FileRole::Source,
+                },
+            );
+            file_content_hash_by_id.insert(id, source_hash.clone());
+        }
+        let source_file_id = source_file_id.expect("source file id");
+        let fact = CallResolutionFact {
+            fact_id: String::new(),
+            edge_id: Some(EdgeId(1)),
+            raw_edge_target: Some(NodeId(2)),
+            raw_callsite_identity: Some("1:1:1:2".to_owned()),
+            callsite: ExactCallsite {
+                file_id: FileId(source_file_id),
+                source_sha256: source_hash.clone(),
+                start_byte: 0,
+                end_byte_exclusive: 6,
+                line: 1,
+                column: 1,
+                callee_form: CalleeForm::Identifier,
+                raw_target: "target".to_owned(),
+            },
+            caller: NodeId(source_file_id),
+            target: Some(NodeId(2)),
+            status: ProofResolutionStatus::Exact,
+            reason: ProofResolutionReason::ExactResolution,
+            evidence_chain: vec![ResolutionEvidence::SameFileDeclaration {
+                declaration: NodeId(2),
+            }],
+            lookup_domain_complete: true,
+            provenance: ResolutionProvenance {
+                producer: INTERNAL_RESOLUTION_PRODUCER.to_owned(),
+                fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+                algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
+                language_adapter: "python".to_owned(),
+                language_adapter_version: "reference-v13".to_owned(),
+                parser_fingerprint: source_hash.clone(),
+                dependency_file_hashes: vec![DependencyFileHash {
+                    file_id: FileId(source_file_id),
+                    source_sha256: source_hash.clone(),
+                }],
+                evidence_sha256: String::new(),
+            },
+        };
+        reset_store_replay_work();
+        let python_file_ids_by_path = prepare_python_file_ids_by_path(&file_by_id);
+        let python_attestation_error_by_file =
+            prepare_python_source_attestation(&file_by_id, &file_content_hash_by_id, true);
+        let context = ProofResolutionValidationContext {
+            file_content_hash_by_id,
+            file_by_id,
+            node_by_id: HashMap::new(),
+            edges: Vec::new(),
+            edge_index_by_id: HashMap::new(),
+            ordinary_call_edge_indices: Vec::new(),
+            parsed_callsite_identity_by_edge: HashMap::new(),
+            import_relations: HashMap::new(),
+            member_relations: HashMap::new(),
+            python_import_paths: HashMap::new(),
+            python_file_ids_by_path,
+            python_attestation_error_by_file,
+            go_package_identity_by_file: HashMap::new(),
+            go_dependency_ids_by_package: HashMap::new(),
+            go_attestation_error_by_file: HashMap::new(),
+            live_go_sources_authenticated: true,
+        };
+        for _ in 0..fact_count {
+            python_dependency_ids(
+                &fact,
+                &BTreeSet::from([FileId(source_file_id)]),
+                &BTreeSet::from([FileId(source_file_id)]),
+                &context,
+            )
+            .expect("Python dependency replay");
+        }
+        store_replay_work()
+    }
+
+    #[test]
+    fn python_file_preparation_and_fact_replay_are_independently_linear() {
+        let baseline = measured_python_replay_work(32, 32);
+        let more_files = measured_python_replay_work(64, 32);
+        let more_facts = measured_python_replay_work(32, 64);
+        let combined = measured_python_replay_work(64, 64);
+        assert!(baseline > 0, "Python store replay work was not counted");
+        assert!(
+            more_files <= baseline * 2 + 64,
+            "Python store preparation grew superlinearly: {baseline} -> {more_files}"
+        );
+        assert!(
+            more_facts <= baseline * 2 + 64,
+            "Python fact replay grew superlinearly: {baseline} -> {more_facts}"
+        );
+        assert!(
+            combined <= baseline * 2 + 128,
+            "combined Python store replay grew superlinearly: {baseline} -> {combined}"
         );
     }
 }
@@ -606,6 +1060,34 @@ impl ProofRelationState {
     }
 }
 
+fn python_raw_import_marker_is_admissible(edge: &Edge, nodes: &HashMap<NodeId, Node>) -> bool {
+    if edge.kind != EdgeKind::IMPORT
+        || edge.effective_source() != edge.source
+        || !edge.candidate_targets.is_empty()
+    {
+        return false;
+    }
+    let Some(file_id) = edge.file_node_id else {
+        return false;
+    };
+    let raw_markers_are_local = [edge.source, edge.target].into_iter().all(|node_id| {
+        nodes.get(&node_id).is_some_and(|node| {
+            node.file_node_id == Some(file_id)
+                && matches!(node.kind, NodeKind::UNKNOWN | NodeKind::MODULE)
+        })
+    });
+    let target_relation_is_consistent = match edge.resolved_target {
+        None => edge.effective_target() == edge.target,
+        Some(resolved) => {
+            edge.effective_target() == resolved
+                && resolved != edge.source
+                && resolved != edge.target
+                && nodes.contains_key(&resolved)
+        }
+    };
+    raw_markers_are_local && target_relation_is_consistent
+}
+
 impl ProofResolutionValidationContext {
     fn prepare(
         storage: &Storage,
@@ -616,7 +1098,13 @@ impl ProofResolutionValidationContext {
             .into_iter()
             .map(|file| (file.id, file))
             .collect();
+        let python_file_ids_by_path = prepare_python_file_ids_by_path(&file_by_id);
         let file_content_hash_by_id = storage.get_file_content_hashes()?;
+        let python_attestation_error_by_file = prepare_python_source_attestation(
+            &file_by_id,
+            &file_content_hash_by_id,
+            authenticate_live_go_sources,
+        );
         let (
             go_package_identity_by_file,
             go_dependency_ids_by_package,
@@ -637,6 +1125,7 @@ impl ProofResolutionValidationContext {
         let mut edge_index_by_id = HashMap::with_capacity(edges.len());
         let mut import_relations = HashMap::<_, ProofRelationState>::new();
         let mut member_relations = HashMap::<_, ProofRelationState>::new();
+        let mut python_import_edges = HashMap::<NodeId, Vec<NodeId>>::new();
         for (index, edge) in edges.iter().enumerate() {
             edge_index_by_id.insert(edge.id, index);
             if edge.kind == EdgeKind::IMPORT
@@ -668,6 +1157,12 @@ impl ProofResolutionValidationContext {
                     state.conflicting += 1;
                 }
             }
+            if python_raw_import_marker_is_admissible(edge, &node_by_id) {
+                python_import_edges
+                    .entry(edge.source)
+                    .or_default()
+                    .push(edge.target);
+            }
             if edge.kind == EdgeKind::MEMBER {
                 let owner = node_by_id.get(&edge.source);
                 let member = node_by_id.get(&edge.target);
@@ -686,10 +1181,8 @@ impl ProofResolutionValidationContext {
                                         | NodeKind::CLASS
                                         | NodeKind::ENUM
                                 )
-                            ) | (
-                                NodeKind::STRUCT | NodeKind::CLASS | NodeKind::ENUM,
-                                Some(NodeKind::METHOD)
-                            )
+                            ) | (NodeKind::STRUCT | NodeKind::ENUM, Some(NodeKind::METHOD))
+                                | (NodeKind::CLASS, Some(NodeKind::METHOD | NodeKind::FUNCTION))
                         )
                     })
                     && member.is_some_and(|member| {
@@ -705,6 +1198,44 @@ impl ProofResolutionValidationContext {
                 }
             }
         }
+        for targets in python_import_edges.values_mut() {
+            targets.sort();
+            targets.dedup();
+        }
+        let python_import_targets = python_import_edges
+            .values()
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut python_import_paths = HashMap::<_, Vec<Vec<NodeId>>>::new();
+        for &source in python_import_edges
+            .keys()
+            .filter(|source| !python_import_targets.contains(source))
+        {
+            let Some(file_id) = node_by_id.get(&source).and_then(|node| node.file_node_id) else {
+                continue;
+            };
+            let mut path = vec![source];
+            let mut visited = BTreeSet::from([source]);
+            let mut current = source;
+            while let Some([next]) = python_import_edges.get(&current).map(Vec::as_slice) {
+                if !visited.insert(*next) {
+                    break;
+                }
+                path.push(*next);
+                let Some(node) = node_by_id.get(next) else {
+                    break;
+                };
+                if node.kind == NodeKind::MODULE {
+                    python_import_paths
+                        .entry((file_id, source))
+                        .or_default()
+                        .push(path);
+                    break;
+                }
+                current = *next;
+            }
+        }
         Ok(Self {
             file_by_id,
             file_content_hash_by_id,
@@ -715,6 +1246,9 @@ impl ProofResolutionValidationContext {
             parsed_callsite_identity_by_edge,
             import_relations,
             member_relations,
+            python_import_paths,
+            python_file_ids_by_path,
+            python_attestation_error_by_file,
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
@@ -732,6 +1266,21 @@ impl ProofResolutionValidationContext {
         self.member_relations
             .get(&(owner, member))
             .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn has_python_import_path(&self, file: NodeId, components: &[NodeId]) -> bool {
+        let Some(import) = components.first() else {
+            return false;
+        };
+        self.python_import_paths
+            .get(&(file, *import))
+            .is_some_and(|paths| {
+                paths
+                    .iter()
+                    .filter(|path| path.as_slice() == components)
+                    .count()
+                    == 1
+            })
     }
 }
 
@@ -758,19 +1307,22 @@ impl Storage {
                 |row| {
                     let adapter_roster_json: String = row.get(3)?;
                     let funnel_json: String = row.get(7)?;
-                    let adapter_roster =
-                        serde_json::from_str(&adapter_roster_json).map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                adapter_roster_json.len(),
-                                rusqlite::types::Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                    let funnel = serde_json::from_str(&funnel_json).map_err(|error| {
+                    let adapter_roster = parse_canonical_json(
+                        &adapter_roster_json,
+                        "adapter roster",
+                    )
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            adapter_roster_json.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+                        )
+                    })?;
+                    let funnel = parse_canonical_json(&funnel_json, "funnel").map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
                             funnel_json.len(),
                             rusqlite::types::Type::Text,
-                            Box::new(error),
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
                         )
                     })?;
                     Ok(ProofResolutionPublication {
@@ -841,14 +1393,10 @@ impl Storage {
                 .ok_or_else(|| proof_error("stored status is outside the closed domain"))?;
             let reason = ProofResolutionReason::from_label(&reason_text)
                 .ok_or_else(|| proof_error("stored reason is outside the closed domain"))?;
-            let evidence_chain: Vec<ResolutionEvidence> = serde_json::from_str(&evidence_json)
-                .map_err(|error| {
-                    proof_error(format!("stored evidence JSON is invalid: {error}"))
-                })?;
+            let evidence_chain: Vec<ResolutionEvidence> =
+                parse_canonical_json(&evidence_json, "evidence").map_err(proof_error)?;
             let dependency_file_hashes: Vec<DependencyFileHash> =
-                serde_json::from_str(&dependency_json).map_err(|error| {
-                    proof_error(format!("stored dependency JSON is invalid: {error}"))
-                })?;
+                parse_canonical_json(&dependency_json, "dependency").map_err(proof_error)?;
             facts.push(CallResolutionFact {
                 fact_id: row.get(0)?,
                 edge_id: row.get::<_, Option<i64>>(1)?.map(EdgeId),
@@ -982,7 +1530,8 @@ impl Storage {
                 let edge = &context.edges[*index];
                 let raw = &context.node_by_id[&edge.target];
                 let direct_member_edge = edge.target == edge.effective_target()
-                    && (raw.kind == NodeKind::METHOD || raw.file_node_id != edge.file_node_id);
+                    && (matches!(raw.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                        || raw.file_node_id != edge.file_node_id);
                 OrdinaryCallEdgeCorrelationInput {
                     file_id: edge.file_node_id.map(|file| FileId(file.0)),
                     line: edge.line,
@@ -1104,6 +1653,16 @@ impl Storage {
             };
         }
         let observed_dependency_ids = dependency_file_ids(fact);
+        if fact.status == ProofResolutionStatus::Exact
+            && fact.provenance.language_adapter == "python"
+        {
+            required_dependency_ids = python_dependency_ids(
+                fact,
+                &required_dependency_ids,
+                &observed_dependency_ids,
+                context,
+            )?;
+        }
         if observed_dependency_ids != required_dependency_ids {
             return Err(proof_error(format!(
                 "dependency hashes do not exactly cover source, import, package, and target files for {}: observed={observed_dependency_ids:?} required={required_dependency_ids:?}",
@@ -1198,7 +1757,7 @@ impl Storage {
             fact.callsite.callee_form,
             CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver | CalleeForm::NamedImport
         ) && raw_edge_target == target
-            && (raw_placeholder.kind == NodeKind::METHOD
+            && (matches!(raw_placeholder.kind, NodeKind::FUNCTION | NodeKind::METHOD)
                 || raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0)));
         if !direct_member_target
             && (raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0))
@@ -1225,8 +1784,11 @@ impl Storage {
         if matches!(
             fact.callsite.callee_form,
             CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver
-        ) && target_node.kind != NodeKind::METHOD
-        {
+        ) && if fact.provenance.language_adapter == "python" {
+            target_node.kind != NodeKind::FUNCTION
+        } else {
+            target_node.kind != NodeKind::METHOD
+        } {
             return Err(proof_error(
                 "receiver evidence target is not a METHOD graph node",
             ));
@@ -1293,13 +1855,39 @@ impl Storage {
                     .node_by_id
                     .get(import)
                     .ok_or_else(|| proof_error("static import binding is missing"))?;
-                if import_node.kind != NodeKind::MODULE
-                    || import_node.file_node_id != Some(source_file)
-                    || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
-                    || !context.has_import(source_file, *import, target)
-                    || components
-                        .windows(2)
-                        .any(|pair| !context.has_member(pair[0], pair[1]))
+                let python_module_index = (fact.provenance.language_adapter == "python")
+                    .then(|| {
+                        components.iter().rposition(|component| {
+                            context
+                                .node_by_id
+                                .get(component)
+                                .is_some_and(|node| node.kind == NodeKind::MODULE)
+                        })
+                    })
+                    .flatten();
+                let python_relative = python_module_index.is_some_and(|module_index| {
+                    import_node.kind == NodeKind::UNKNOWN
+                        && components.first() == Some(import)
+                        && components.last() == Some(&target)
+                        && import_node.file_node_id == Some(source_file)
+                        && graph_leaf_name(&import_node.serialized_name) == fact.callsite.raw_target
+                        && context.has_python_import_path(source_file, &components[..=module_index])
+                        && validate_python_import_target(
+                            context,
+                            source_file,
+                            components[module_index],
+                            target,
+                        )
+                });
+                if !python_relative
+                    && (import_node.kind != NodeKind::MODULE
+                        || import_node.file_node_id != Some(source_file)
+                        || graph_leaf_name(&import_node.serialized_name)
+                            != fact.callsite.raw_target
+                        || !context.has_import(source_file, *import, target)
+                        || components
+                            .windows(2)
+                            .any(|pair| !context.has_member(pair[0], pair[1])))
                 {
                     return Err(proof_error(
                         "StaticImportBinding path is not one unique source IMPORT and MEMBER chain",
@@ -1538,10 +2126,7 @@ impl Storage {
                     ResolutionEvidence::ExplicitReceiverType { receiver_type },
                     ResolutionEvidence::QualifiedPath { components },
                 ],
-            ) if *owner == *constructor
-                && *owner == *receiver_type
-                && components.as_slice() == [*owner, target] =>
-            {
+            ) if *owner == *constructor && *owner == *receiver_type => {
                 Self::validate_imported_receiver_evidence(
                     fact,
                     context,
@@ -1549,6 +2134,7 @@ impl Storage {
                     *owner,
                     target,
                     target_node,
+                    Some(components),
                 )?;
             }
             (
@@ -1561,7 +2147,7 @@ impl Storage {
                     ResolutionEvidence::ExplicitReceiverType { receiver_type },
                     ResolutionEvidence::QualifiedPath { components },
                 ],
-            ) if *owner == *receiver_type && components.as_slice() == [*owner, target] => {
+            ) if *owner == *receiver_type => {
                 Self::validate_imported_receiver_evidence(
                     fact,
                     context,
@@ -1569,6 +2155,7 @@ impl Storage {
                     *owner,
                     target,
                     target_node,
+                    Some(components),
                 )?;
             }
             (
@@ -1590,6 +2177,7 @@ impl Storage {
                     *owner,
                     target,
                     target_node,
+                    None,
                 )?;
             }
             (
@@ -1610,6 +2198,7 @@ impl Storage {
                     *owner,
                     target,
                     target_node,
+                    None,
                 )?;
             }
             _ => {
@@ -1670,6 +2259,7 @@ impl Storage {
         owner: NodeId,
         target: NodeId,
         target_node: &Node,
+        components: Option<&[NodeId]>,
     ) -> Result<(), StorageError> {
         let import_node = context
             .node_by_id
@@ -1679,13 +2269,28 @@ impl Storage {
             .node_by_id
             .get(&owner)
             .ok_or_else(|| proof_error("imported receiver owner is missing"))?;
-        if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+        let source_file = NodeId(fact.callsite.file_id.0);
+        let python_relative = fact.provenance.language_adapter == "python"
+            && components.is_some_and(|components| {
+                components.len() >= 4
+                    && components[components.len() - 2] == owner
+                    && components.last() == Some(&target)
+                    && context
+                        .has_python_import_path(source_file, &components[..components.len() - 2])
+                    && validate_python_import_target(
+                        context,
+                        source_file,
+                        components[components.len() - 3],
+                        owner,
+                    )
+            });
+        if import_node.file_node_id != Some(source_file)
             || !matches!(
                 owner_node.kind,
                 NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
             )
             || owner_node.file_node_id != target_node.file_node_id
-            || !context.has_import(NodeId(fact.callsite.file_id.0), import, owner)
+            || !(python_relative || context.has_import(source_file, import, owner))
             || !context.has_member(owner, target)
         {
             return Err(proof_error(
@@ -2017,7 +2622,7 @@ fn graph_leaf_name(name: &str) -> &str {
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
         "rust" => kind == NodeKind::MODULE,
-        "javascript" | "typescript" | "tsx" => {
+        "javascript" | "typescript" | "tsx" | "python" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
         _ => false,
