@@ -4921,11 +4921,64 @@ fn rust_module_closure_ignores_unrelated_closed_expression_macros() -> anyhow::R
         "include!(\"generated.rs\");\nfn target() {}\nfn caller() { target(); }\n",
         "thread_local! { static MARKER: usize = 0; }\nfn target() {}\nfn caller() { target(); }\n",
         "macro_rules! generated { () => { fn target() {} }; }\ngenerated!();\nfn target() {}\nfn caller() { target(); }\n",
+        "macro_rules! foreign_target { () => { fn target(); }; }\nunsafe extern \"C\" { foreign_target!(); }\nfn target() {}\nfn caller() { target(); }\n",
         "#![cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
         "#[cfg(any())]\nfn target() {}\nfn target() {}\nfn caller() { target(); }\n",
         "fn target() {}\n#[cfg(any())]\nfn caller() { target(); }\n",
     ] {
         assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_closed_expression_macros_only_relax_bare_same_file_calls() -> anyhow::Result<()> {
+    assert_only_call_is_exact(&[(
+        "src/lib.rs",
+        "const LABEL: &str = concat!(\"open\", \"\");\nfn target() {}\nfn caller() { target(); }\n",
+    )])?;
+
+    for source in [
+        "const LABEL: &str = concat!(\"open\", \"\");\nstruct Worker;\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        "const LABEL: &str = concat!(\"open\", \"\");\nstruct Worker;\nimpl Worker { fn target() {} }\nfn caller() { Worker::target(); }\n",
+        "const LABEL: &str = concat!(\"open\", \"\");\nstruct Worker;\nimpl Worker { fn target(&self) {} }\nfn caller() { let value: Worker = Worker; value.target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_identifier_local_closure_keeps_glob_import_domains_incomplete() -> anyhow::Result<()> {
+    assert_only_call_is_not_exact(&[(
+        "src/lib.rs",
+        "use crate::*;\nfn target() {}\nfn caller() { target(); }\n",
+    )])
+}
+
+#[test]
+fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n")],
+    )?;
+    let receipt = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    assert_eq!(
+        receipt
+            .adapter_roster
+            .iter()
+            .find(|adapter| adapter.language == "rust")
+            .map(|adapter| adapter.adapter_version.as_str()),
+        Some("reference-v14")
+    );
+    for fact in store.get_proof_resolution_facts()? {
+        assert!(receipt.adapter_roster.iter().any(|adapter| {
+            adapter.language == fact.provenance.language_adapter
+                && adapter.adapter_version == fact.provenance.language_adapter_version
+        }));
     }
     Ok(())
 }

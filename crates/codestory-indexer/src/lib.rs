@@ -87,7 +87,8 @@ use cache::{
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
 pub use proof_resolution::{
-    build_funnel as build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+    build_funnel as build_proof_resolution_funnel, current_proof_resolution_adapter_roster,
+    rematerialize_proof_resolution_projection,
 };
 use symbol_table::SymbolTable;
 

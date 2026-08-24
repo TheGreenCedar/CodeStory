@@ -196,6 +196,39 @@ fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<
     Ok(())
 }
 
+fn validate_adapter_roster(
+    facts: &[CallResolutionFact],
+    adapter_roster: &[ProofResolutionAdapter],
+) -> Result<(), StorageError> {
+    let mut sorted_roster = adapter_roster.to_vec();
+    sorted_roster.sort();
+    if adapter_roster.is_empty()
+        || adapter_roster.iter().any(|adapter| {
+            adapter.language.trim().is_empty() || adapter.adapter_version.trim().is_empty()
+        })
+        || sorted_roster.windows(2).any(|pair| pair[0] == pair[1])
+    {
+        return Err(proof_error(
+            "adapter roster is empty, invalid, or duplicated",
+        ));
+    }
+    if facts.iter().any(|fact| {
+        sorted_roster
+            .iter()
+            .filter(|adapter| {
+                adapter.language == fact.provenance.language_adapter
+                    && adapter.adapter_version == fact.provenance.language_adapter_version
+            })
+            .count()
+            != 1
+    }) {
+        return Err(proof_error(
+            "fact provenance adapter is not represented exactly once in the adapter roster",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_fact_seal(fact: &CallResolutionFact) -> Result<(), StorageError> {
     validate_fact_shape(fact, true)?;
     let resealed = seal_call_resolution_fact(fact.clone())?;
@@ -2383,14 +2416,7 @@ impl Storage {
 
         let mut adapter_roster = projection.adapter_roster.clone();
         adapter_roster.sort();
-        adapter_roster.dedup();
-        if adapter_roster.is_empty()
-            || adapter_roster.iter().any(|adapter| {
-                adapter.language.trim().is_empty() || adapter.adapter_version.trim().is_empty()
-            })
-        {
-            return Err(proof_error("adapter roster is empty or invalid"));
-        }
+        validate_adapter_roster(&facts, &adapter_roster)?;
         let mut funnel = projection.funnel.clone();
         funnel.sort_by(|left, right| {
             (
@@ -2549,6 +2575,7 @@ impl Storage {
             ));
         }
         let facts = self.get_proof_resolution_facts()?;
+        validate_adapter_roster(&facts, &manifest.adapter_roster)?;
         let expected_funnel = recompute_funnel(&facts);
         if manifest.funnel != expected_funnel
             || manifest.fact_count != facts.len() as u64
