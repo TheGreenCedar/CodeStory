@@ -286,7 +286,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 13,
+            resolution_input_schema_version: 14,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,
