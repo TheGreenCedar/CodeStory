@@ -51,6 +51,7 @@ pub(crate) enum StdioV3InternalError {
     },
 }
 
+#[cfg(feature = "proof-qualification-support")]
 pub(crate) fn measure_revision_native_proof_result_v3(
     root: &serde_json::Value,
 ) -> Result<Vec<RevisionNativeToolResultMeasurementV3>, StdioV3InternalError> {

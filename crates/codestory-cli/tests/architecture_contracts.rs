@@ -1336,7 +1336,12 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
         ),
         (
             "CLI navigation adapters",
-            read_source_tree("crates/codestory-cli/src"),
+            read_source_tree_excluding_many("crates/codestory-cli/src", &["stdio_v3/transport.rs"]),
+        ),
+        (
+            "production proof transport",
+            production_source_prefix(&read("crates/codestory-cli/src/stdio_v3/transport.rs"))
+                .to_owned(),
         ),
     ] {
         for forbidden in [

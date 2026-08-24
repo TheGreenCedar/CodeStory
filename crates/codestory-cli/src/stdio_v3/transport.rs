@@ -87,6 +87,17 @@ pub(crate) fn build_proof_tool_result_v3(
     revision: McpRevisionV3,
     root: &Value,
 ) -> Result<Value, StdioV3InternalError> {
+    if crate::stdio_arguments::validate_structured_content(
+        &super::catalog::proof_output_schema_v3(),
+        root,
+    )
+    .is_err()
+    {
+        return Err(StdioV3InternalError::OutputSchemaViolation);
+    }
+    #[cfg(feature = "proof-qualification-support")]
+    codestory_runtime::proof_qualification_support::validate_compact_projection(root)
+        .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let result = build_tool_result_for_surface_v3(
         revision,
         "prove_call_path",
@@ -100,6 +111,17 @@ pub(crate) fn build_proof_tool_result_v3(
     }
 
     let fallback = proof_budget_fallback_v3(root, bytes.len())?;
+    if crate::stdio_arguments::validate_structured_content(
+        &super::catalog::proof_output_schema_v3(),
+        &fallback,
+    )
+    .is_err()
+    {
+        return Err(StdioV3InternalError::OutputSchemaViolation);
+    }
+    #[cfg(feature = "proof-qualification-support")]
+    codestory_runtime::proof_qualification_support::validate_compact_projection(&fallback)
+        .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let fallback_result = build_tool_result_for_surface_v3(
         revision,
         "prove_call_path",
@@ -228,9 +250,325 @@ pub(crate) fn jsonrpc_internal_error_v3(id: Value, _error: &StdioV3InternalError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "proof-qualification-support")]
+    use codestory_contracts::graph::NodeId;
+    #[cfg(feature = "proof-qualification-support")]
+    use codestory_contracts::proof_resolution::{
+        DependencyFileHash, ResolutionEvidence, ResolutionProvenance,
+    };
+    #[cfg(feature = "proof-qualification-support")]
+    use codestory_runtime::proof_qualification_support::{
+        BuiltCallPathFacts, CallableContainmentEvidence, ClauseAnchor, ClauseClassification,
+        IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
+        InternalProjection, PinnedNodeIdentity, ProofContractField, ReceiptRef,
+        ResolvedNodeIdentity, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
+        UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector, ValidationOutcome,
+        VerifiedDirectCallFact, VerifiedProofFact, check_built_call_path_integration,
+        project_internal_call_path_result, validate_contract,
+    };
+
+    #[cfg(feature = "proof-qualification-support")]
+    fn actual_projected_root(text: String) -> Value {
+        let source = "exact direct ordered call path";
+        let ValidationOutcome::Validated {
+            contract,
+            hashes,
+            rendering,
+        } = validate_contract(UnvalidatedCallPathContract::new(
+            source,
+            vec![ClauseAnchor {
+                clause_id: "contract".to_owned(),
+                start: 0,
+                end: source.len(),
+                quote: source.to_owned(),
+                classification: ClauseClassification::ResolvedMaterial {
+                    fields: vec![
+                        ProofContractField::Start,
+                        ProofContractField::StepTarget { step: 0 },
+                        ProofContractField::Directness { step: 0 },
+                        ProofContractField::Ordering { step: 0 },
+                        ProofContractField::Relation { step: 0 },
+                    ],
+                },
+            }],
+            UnvalidatedCallPathSpec {
+                start: UnvalidatedExactSymbolSelector::CanonicalId("A".to_owned()),
+                steps: vec![UnvalidatedDirectCallStep {
+                    target: UnvalidatedExactSymbolSelector::CanonicalId("B".to_owned()),
+                }],
+                prohibit_traversal_through: Vec::new(),
+                exclude_from_projection: Vec::new(),
+            },
+        ))
+        .expect("valid contract")
+        else {
+            panic!("fixture contract validates")
+        };
+        let node = |node_id: &str, canonical_id: &str, qualified_name: &str, path: &[&str]| {
+            ResolvedNodeIdentity::new(
+                PinnedNodeIdentity {
+                    project_id: "project".to_owned(),
+                    core_generation_id: "generation".to_owned(),
+                    core_run_id: "run".to_owned(),
+                    node_id: node_id.to_owned(),
+                },
+                canonical_id,
+                qualified_name,
+                NodeId(if node_id == "10" { 1 } else { 2 }),
+                path.iter().map(|part| (*part).to_owned()).collect(),
+            )
+            .expect("valid node")
+        };
+        let source = node("10", "A", "crate::A", &["src", "a.rs"]);
+        let target = node("20", "B", "crate::B", &["src", "b.rs"]);
+        let receipt = IndexedCallEdgeReceipt {
+            receipt: ReceiptRef {
+                receipt_id: "receipt-0".to_owned(),
+                edge_id: "1".to_owned(),
+            },
+            source: source.clone(),
+            target: target.clone(),
+            resolution_fact_id: "a".repeat(64),
+            resolution_evidence_sha256: "b".repeat(64),
+            resolution_evidence_chain: vec![ResolutionEvidence::SameFileDeclaration {
+                declaration: NodeId(20),
+            }],
+            resolution_provenance: ResolutionProvenance {
+                producer: "codestory-internal".to_owned(),
+                fact_schema_version: 1,
+                algorithm: "exact-call-resolution-v1".to_owned(),
+                language_adapter: "rust".to_owned(),
+                language_adapter_version: "test-v1".to_owned(),
+                parser_fingerprint: "c".repeat(64),
+                dependency_file_hashes: vec![
+                    DependencyFileHash {
+                        file_id: codestory_contracts::proof_resolution::FileId(1),
+                        source_sha256: "d".repeat(64),
+                    },
+                    DependencyFileHash {
+                        file_id: codestory_contracts::proof_resolution::FileId(2),
+                        source_sha256: "e".repeat(64),
+                    },
+                ],
+                evidence_sha256: "b".repeat(64),
+            },
+            exact_callsite_start_byte: 0,
+            callsite_identity: "1:1:1:20|rust".to_owned(),
+            column_or_ordinal: 1,
+            containment: CallableContainmentEvidence {
+                file_node_id: NodeId(1),
+                owner_node_id: NodeId(10),
+                start_line: 1,
+                end_line: 1,
+            },
+            line_window: IndexedLineWindow {
+                kind: "indexed_line_v1",
+                project_file_components: vec!["src".to_owned(), "a.rs".to_owned()],
+                indexed_sha256: "d".repeat(64),
+                observed_sha256: "d".repeat(64),
+                anchor_line: 1,
+                byte_start: 0,
+                byte_end: text.len(),
+                text,
+            },
+        };
+        let integration = check_built_call_path_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            BuiltCallPathFacts {
+                publication: InternalCorePublicationIdentity {
+                    project_id: "project".to_owned(),
+                    generation_id: "generation".to_owned(),
+                    run_id: "run".to_owned(),
+                },
+                facts: vec![VerifiedProofFact::DirectCall(VerifiedDirectCallFact {
+                    receipt: receipt.receipt.clone(),
+                    source,
+                    target,
+                })],
+                receipts: vec![receipt],
+                gaps: Vec::new(),
+                unavailable: Vec::new(),
+            },
+        )
+        .expect("checked integration");
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).expect("actual projected root")
+        else {
+            panic!("fixture must preserve its complete root for transport")
+        };
+        root
+    }
+
+    #[cfg(feature = "proof-qualification-support")]
+    fn set_receipt_line_text(root: &mut Value, text: String) {
+        let byte_start = root["receipts"][0]["line_window"]["byte_start"]
+            .as_u64()
+            .expect("line byte start");
+        root["receipts"][0]["line_window"]["text"] = json!(text);
+        root["receipts"][0]["line_window"]["byte_end"] = json!(
+            byte_start
+                + u64::try_from(
+                    root["receipts"][0]["line_window"]["text"]
+                        .as_str()
+                        .expect("line text")
+                        .len()
+                )
+                .expect("line text length")
+        );
+    }
+
+    #[cfg(feature = "proof-qualification-support")]
+    #[test]
+    fn actual_projected_root_round_trips_through_all_revision_profiles() {
+        let root = actual_projected_root("A calls B();\n".to_owned());
+        for revision in McpRevisionV3::all() {
+            let result = build_proof_tool_result_v3(*revision, &root)
+                .unwrap_or_else(|error| panic!("{revision:?}: {error:?}"));
+            assert_eq!(
+                serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+                    .unwrap(),
+                root
+            );
+            if revision.profile().structured_content {
+                assert_eq!(result["structuredContent"], root);
+            }
+        }
+    }
+
+    #[cfg(feature = "proof-qualification-support")]
+    #[test]
+    fn actual_projector_leaves_an_oversized_complete_root_for_revision_transport() {
+        let root = actual_projected_root("\\\"é".repeat(24_000));
+        assert_eq!(root["kind"], "complete");
+    }
+
+    #[cfg(feature = "proof-qualification-support")]
+    fn actual_projected_root_at_revision_bytes(revision: McpRevisionV3, target: usize) -> Value {
+        let root = actual_projected_root("A calls B();\n".to_owned());
+        let size = |root: &Value| {
+            let result = build_tool_result_for_surface_v3(
+                revision,
+                "prove_call_path",
+                root,
+                V3SurfaceSet::WithProof,
+            )
+            .expect("unbounded revision-native result");
+            crate::stdio_transport::v3_serialize_call_tool_result(&result)
+                .expect("unbounded revision-native bytes")
+                .len()
+        };
+        let baseline = size(&root);
+        assert!(baseline < target);
+        for quote_count in 0..=16 {
+            let mut candidate = root.clone();
+            set_receipt_line_text(&mut candidate, "\"".repeat(quote_count));
+            let candidate_size = size(&candidate);
+            let mut one_more = candidate.clone();
+            set_receipt_line_text(&mut one_more, format!("{}x", "\"".repeat(quote_count)));
+            let byte_step = size(&one_more) - candidate_size;
+            let remaining = target.saturating_sub(candidate_size);
+            if byte_step > 0 && remaining % byte_step == 0 {
+                let mut count = remaining / byte_step;
+                for _ in 0..4 {
+                    set_receipt_line_text(
+                        &mut candidate,
+                        format!("{}{}", "\"".repeat(quote_count), "x".repeat(count)),
+                    );
+                    let actual = size(&candidate);
+                    if actual == target {
+                        return candidate;
+                    }
+                    let delta = isize::try_from(target).unwrap() - isize::try_from(actual).unwrap();
+                    let adjustment = delta / isize::try_from(byte_step).unwrap();
+                    let Some(next) = count.checked_add_signed(adjustment) else {
+                        break;
+                    };
+                    if next == count {
+                        break;
+                    }
+                    count = next;
+                }
+            }
+        }
+        panic!("revision {revision:?} cannot reach target {target}");
+    }
+
+    #[cfg(feature = "proof-qualification-support")]
+    #[test]
+    fn revision_transport_owns_actual_projected_root_budgeting_and_internal_errors() {
+        for revision in McpRevisionV3::all() {
+            let fitting_size = if revision.profile().structured_content {
+                PROOF_TOOL_RESULT_MAX_BYTES_V3 - 1
+            } else {
+                PROOF_TOOL_RESULT_MAX_BYTES_V3
+            };
+            let complete = actual_projected_root_at_revision_bytes(*revision, fitting_size);
+            let complete_result = build_proof_tool_result_v3(*revision, &complete).unwrap();
+            assert_eq!(
+                crate::stdio_transport::v3_serialize_call_tool_result(&complete_result)
+                    .unwrap()
+                    .len(),
+                fitting_size
+            );
+
+            let oversized = actual_projected_root_at_revision_bytes(
+                *revision,
+                PROOF_TOOL_RESULT_MAX_BYTES_V3 + 1,
+            );
+            let expected_size = crate::stdio_transport::v3_serialize_call_tool_result(
+                &build_tool_result_for_surface_v3(
+                    *revision,
+                    "prove_call_path",
+                    &oversized,
+                    V3SurfaceSet::WithProof,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+            .len();
+            let fallback = build_proof_tool_result_v3(*revision, &oversized).unwrap();
+            let fallback_bytes =
+                crate::stdio_transport::v3_serialize_call_tool_result(&fallback).unwrap();
+            assert!(fallback_bytes.len() <= PROOF_TOOL_RESULT_MAX_BYTES_V3);
+            let fallback_root =
+                serde_json::from_str::<Value>(fallback["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(fallback_root["kind"], "budget_exceeded");
+            assert_eq!(fallback_root["required_complete_size"], expected_size);
+            assert!(
+                codestory_runtime::proof_qualification_support::validate_compact_projection(
+                    &fallback_root
+                )
+                .is_ok()
+            );
+            if revision.profile().structured_content {
+                assert_eq!(fallback["structuredContent"], fallback_root);
+            }
+        }
+
+        let mut fallback_too_large = actual_projected_root("A calls B();\n".to_owned());
+        fallback_too_large["core_publication"]["project_id"] = json!("p".repeat(70_000));
+        let error = build_proof_tool_result_v3(McpRevisionV3::November2024, &fallback_too_large)
+            .expect_err("oversized fallback must fail internally");
+        assert!(matches!(
+            error,
+            StdioV3InternalError::ResultExceedsBudget { .. }
+        ));
+        assert_eq!(
+            jsonrpc_internal_error_v3(json!(99), &error).pointer("/error/code"),
+            Some(&json!(-32603))
+        );
+    }
 
     fn proof_root(disposition_kind: &str) -> Value {
         let disposition = match disposition_kind {
+            "proven" => json!({
+                "kind": "contract_proven",
+                "contract_digest": "b".repeat(64),
+                "receipts": [0]
+            }),
             "unavailable" => json!({
                 "kind": "unavailable",
                 "contract_digest": "b".repeat(64),
@@ -243,6 +581,31 @@ mod tests {
                 "connected_receipts": []
             }),
         };
+        let (identities, steps, receipts) = if disposition_kind == "proven" {
+            (
+                json!({
+                    "files":[{"file_node_id":"1","project_file_components":["src","lib.rs"],"indexed_sha256":"c".repeat(64),"observed_sha256":"c".repeat(64)}],
+                    "symbols":[
+                        {"node_id":"1","canonical_id":"A","qualified_name":"crate::A","file":0},
+                        {"node_id":"2","canonical_id":"B","qualified_name":"crate::B","file":0}
+                    ],
+                    "evidence":[{"fact_id":"d".repeat(64),"caller":0,"target":1,"edge_id":"1","callsite_identity":"1:1:1:2|rust","chain":[{"kind":"same_file_declaration","symbols":[1]}],"provenance":{"producer":"codestory-internal","fact_schema_version":1,"algorithm":"exact-call-resolution-v1","language_adapter":"rust","language_adapter_version":"test-v1","parser_fingerprint":"e".repeat(64),"dependency_files":[0],"evidence_sha256":"f".repeat(64)}}]
+                }),
+                json!([{"step_index":0,"status":"proven","receipt":0}]),
+                json!([{"receipt_id":"receipt-1","edge_id":"1","source":0,"target":1,"evidence":0,"exact_callsite_start_byte":0,"callsite_identity":"1:1:1:2|rust","column_or_ordinal":1,"containment":{"file":0,"owner":0,"start_line":1,"end_line":1},"line_window":{"kind":"indexed_line_v1","file":0,"anchor_line":1,"byte_start":0,"byte_end":1,"text":"x"}}]),
+            )
+        } else {
+            let step_status = if disposition_kind == "unavailable" {
+                "unavailable"
+            } else {
+                "unknown"
+            };
+            (
+                json!({"files":[],"symbols":[],"evidence":[]}),
+                json!([{"step_index":0,"status":step_status,"receipt":null}]),
+                json!([]),
+            )
+        };
         json!({
             "kind": "complete",
             "schema_version": 1,
@@ -252,11 +615,12 @@ mod tests {
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
-            "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[],"prohibit_traversal_through":[],"exclude_from_projection":[]},
+            "identities": identities,
+            "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[{"target":{"kind":"canonical_id","canonical_id":"B"},"relation":"direct_outgoing_call"}],"prohibit_traversal_through":[],"exclude_from_projection":[]},
             "clauses": [],
             "disposition": disposition,
-            "steps": [],
-            "receipts": []
+            "steps": steps,
+            "receipts": receipts,
         })
     }
 
@@ -377,6 +741,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proof-qualification-support")]
     #[test]
     fn post_budget_validation_suppresses_invalid_payload_and_whole_result_falls_back() {
         let mut invalid = proof_root("unknown");
@@ -388,8 +753,8 @@ mod tests {
         assert_eq!(response.pointer("/error/code"), Some(&json!(-32603)));
         assert!(response.pointer("/error/data/structuredContent").is_none());
 
-        let mut oversized = proof_root("unknown");
-        oversized["receipts"] = json!([{"line_window":{"text":"\\\"é".repeat(24_000)}}]);
+        let mut oversized = proof_root("proven");
+        set_receipt_line_text(&mut oversized, "\\\"é".repeat(24_000));
         let result = build_proof_tool_result_v3(McpRevisionV3::June2025, &oversized)
             .expect("fallback result");
         assert_eq!(
@@ -597,9 +962,10 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "proof-qualification-support")]
     #[test]
     fn measurement_seam_owns_exact_builder_bytes_for_every_revision() {
-        let root = proof_root("unknown");
+        let root = proof_root("proven");
         let measured = super::super::measure_revision_native_proof_result_v3(&root)
             .expect("revision-native measurements");
         assert_eq!(measured.len(), 4);

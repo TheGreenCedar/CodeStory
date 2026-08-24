@@ -17,6 +17,14 @@ pub use crate::indexed_source_call_path_v1::{
     ResolutionFactFailure, SelectorFailure, SelectorGateOutcome, SelectorQualificationTrace,
     SourceBindingFailure, StepQualificationOutcome, StepQualificationTrace,
 };
+pub use codestory_agent::proof_qualification_support::{
+    BuiltCallPathFacts, CallableContainmentEvidence, ClauseAnchor, ClauseClassification,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    PinnedNodeIdentity, ProofContractField, ReceiptRef, ResolvedNodeIdentity,
+    UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
+    UnvalidatedExactSymbolSelector, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
+    check_built_call_path_integration, project_internal_call_path_result, validate_contract,
+};
 
 /// Executes one observed proof through the runtime's existing core-only public
 /// operation. The benchmark cannot obtain the controller or add a second
@@ -47,6 +55,12 @@ pub fn run_observed_call_path_public_operation(
 /// Identifies the request domain observed by proof qualification.
 pub fn proof_domain() -> &'static str {
     codestory_agent::proof_qualification_support::proof_domain()
+}
+
+/// The sealed CLI seam validates every compact numeric reference before a
+/// revision-native transport serializes it.
+pub fn validate_compact_projection(root: &serde_json::Value) -> Result<(), String> {
+    codestory_agent::proof_qualification_support::validate_compact_projection(root)
 }
 
 #[cfg(test)]

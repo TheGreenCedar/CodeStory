@@ -109,6 +109,27 @@ fn exact_graph_ids_serialize_as_canonical_signed_decimal_strings() {
 }
 
 #[test]
+fn qualification_reader_resolves_compact_receipt_indices_and_rejects_dangling_rows() {
+    let root = json!({
+        "kind":"complete",
+        "receipts":[{"receipt_id":"indexed-call-edge:compact","edge_id":"-42"}],
+        "disposition":{"kind":"contract_proven","contract_digest":SHA,"receipts":[0]}
+    });
+    let disposition = contracts::product_disposition_from_projection(&root).unwrap();
+    assert_eq!(
+        disposition.authoritative_receipts,
+        vec![ReceiptReferenceV1 {
+            receipt_id: "indexed-call-edge:compact".into(),
+            edge_id: -42
+        }]
+    );
+
+    let mut dangling = root;
+    dangling["disposition"]["receipts"] = json!([1]);
+    assert!(contracts::product_disposition_from_projection(&dangling).is_err());
+}
+
+#[test]
 fn exact_graph_id_codecs_reject_noncanonical_or_lossy_json() {
     for invalid in [
         json!(0),
@@ -433,12 +454,12 @@ fn task11a_product_result_contract_preserves_every_disposition_and_failure_basis
 
     for (projected, expected_kind, expected_summary_kind) in [
         (
-            json!({"kind":"contract_proven","contract_digest":SHA,"receipts":[{"receipt_id":"indexed-call-edge:1","edge_id":"1"}]}),
+            json!({"kind":"contract_proven","contract_digest":SHA,"receipts":[0]}),
             "contract_proven",
             "contract_proven",
         ),
         (
-            json!({"kind":"contract_refuted","contract_digest":SHA,"refutation":{"kind":"prohibited_scope_traversal","step_index":0,"prohibition_index":0,"connected_receipts":[{"receipt_id":"indexed-call-edge:1","edge_id":"1"}]}}),
+            json!({"kind":"contract_refuted","contract_digest":SHA,"refutation":{"kind":"prohibited_scope_traversal","step_index":0,"prohibition_index":0,"connected_receipts":[0]}}),
             "contract_refuted",
             "unknown",
         ),
@@ -458,9 +479,12 @@ fn task11a_product_result_contract_preserves_every_disposition_and_failure_basis
             "unknown",
         ),
     ] {
-        let report =
-            contracts::product_disposition_from_projection(&json!({"disposition":projected}))
-                .expect("actual product projection conversion");
+        let report = contracts::product_disposition_from_projection(&json!({
+            "kind":"complete",
+            "receipts":[{"receipt_id":"indexed-call-edge:1","edge_id":"1"}],
+            "disposition":projected
+        }))
+        .expect("actual product projection conversion");
         assert_eq!(
             serde_json::to_value(&report.actual).unwrap()["kind"],
             expected_kind
@@ -1301,6 +1325,7 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
             pinned: pinned(node_id),
             canonical_id: format!("canonical-{node_id}"),
             qualified_name: declaration.symbol.clone(),
+            file_node_id: codestory_contracts::graph::NodeId(10),
             project_file_components: project_file_components.clone(),
         }
     };
@@ -1314,6 +1339,21 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
         target: identity("2", &oracle.target),
         resolution_fact_id: "a".repeat(64),
         resolution_evidence_sha256: "b".repeat(64),
+        resolution_evidence_chain: vec![
+            codestory_contracts::proof_resolution::ResolutionEvidence::SameFileDeclaration {
+                declaration: codestory_contracts::graph::NodeId(2),
+            },
+        ],
+        resolution_provenance: codestory_contracts::proof_resolution::ResolutionProvenance {
+            producer: "codestory-internal".into(),
+            fact_schema_version: 1,
+            algorithm: "exact-call-resolution-v1".into(),
+            language_adapter: "rust".into(),
+            language_adapter_version: "test-v1".into(),
+            parser_fingerprint: "c".repeat(64),
+            dependency_file_hashes: Vec::new(),
+            evidence_sha256: "b".repeat(64),
+        },
         exact_callsite_start_byte: 0,
         callsite_identity: "1:1:0:2|fixture".into(),
         column_or_ordinal: 0,
@@ -1346,6 +1386,7 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
 #[test]
 fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
     use codestory_agent::proof_qualification_support::{PinnedNodeIdentity, ResolvedNodeIdentity};
+    use codestory_contracts::graph::NodeId;
 
     let raws = [
         "/Users/private/worktree/src/caller.rs::caller",
@@ -1371,6 +1412,7 @@ fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
                 },
                 canonical_id: raw.into(),
                 qualified_name: "module::callable".into(),
+                file_node_id: NodeId(node_id.parse().unwrap()),
                 project_file_components: vec!["src".into(), "caller.rs".into()],
             };
             let public = contracts::ResolvedNodeIdentityV1::try_from(&product).unwrap();
@@ -1408,6 +1450,7 @@ fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
         },
         canonical_id: String::new(),
         qualified_name: "module::callable".into(),
+        file_node_id: NodeId(-1),
         project_file_components: vec!["src".into(), "caller.rs".into()],
     };
     contracts::ResolvedNodeIdentityV1::try_from(&empty)
@@ -1442,6 +1485,7 @@ fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
         },
         canonical_id: canonical_id.into(),
         qualified_name: qualified_name.into(),
+        file_node_id: NodeId(-3),
         project_file_components: oracle
             .receipt_line_window
             .path
@@ -1458,6 +1502,21 @@ fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
         target: identity("-2", target_raw, &oracle.target.symbol),
         resolution_fact_id: "a".repeat(64),
         resolution_evidence_sha256: "b".repeat(64),
+        resolution_evidence_chain: vec![
+            codestory_contracts::proof_resolution::ResolutionEvidence::SameFileDeclaration {
+                declaration: NodeId(-2),
+            },
+        ],
+        resolution_provenance: codestory_contracts::proof_resolution::ResolutionProvenance {
+            producer: "codestory-internal".into(),
+            fact_schema_version: 1,
+            algorithm: "exact-call-resolution-v1".into(),
+            language_adapter: "rust".into(),
+            language_adapter_version: "test-v1".into(),
+            parser_fingerprint: "c".repeat(64),
+            dependency_file_hashes: Vec::new(),
+            evidence_sha256: "b".repeat(64),
+        },
         exact_callsite_start_byte: 0,
         callsite_identity: format!("-3:{}:0:-2|fixture", oracle.callsite_line),
         column_or_ordinal: 0,
@@ -2629,6 +2688,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         },
         canonical_id: format!("canonical-{node_id}"),
         qualified_name: qualified_name.into(),
+        file_node_id: NodeId(-3),
         project_file_components: vec!["src".into(), "area0".into(), "file0.rs".into()],
     };
     let task6_receipt = IndexedCallEdgeReceipt {
@@ -2640,6 +2700,21 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         target: identity("-2", "codestory-rust-l1-0::target_0"),
         resolution_fact_id: "a".repeat(64),
         resolution_evidence_sha256: "b".repeat(64),
+        resolution_evidence_chain: vec![
+            codestory_contracts::proof_resolution::ResolutionEvidence::SameFileDeclaration {
+                declaration: NodeId(-2),
+            },
+        ],
+        resolution_provenance: codestory_contracts::proof_resolution::ResolutionProvenance {
+            producer: "codestory-internal".into(),
+            fact_schema_version: 1,
+            algorithm: "exact-call-resolution-v1".into(),
+            language_adapter: "rust".into(),
+            language_adapter_version: "test-v1".into(),
+            parser_fingerprint: "c".repeat(64),
+            dependency_file_hashes: Vec::new(),
+            evidence_sha256: "b".repeat(64),
+        },
         exact_callsite_start_byte: 0,
         callsite_identity: "-3:1:0:-2|fixture".into(),
         column_or_ordinal: 0,
@@ -2826,6 +2901,7 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
             },
             canonical_id: format!("canonical-{node_id}"),
             qualified_name: declaration.symbol.clone(),
+            file_node_id: NodeId(-3),
             project_file_components: project_file_components.clone(),
         };
     let callsite_identity = format!("-3:{}:0:{RAW_TARGET}|fixture", oracle.callsite_line);
@@ -2838,6 +2914,21 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
         target: identity(RESOLVED_TARGET, &oracle.target),
         resolution_fact_id: "a".repeat(64),
         resolution_evidence_sha256: "b".repeat(64),
+        resolution_evidence_chain: vec![
+            codestory_contracts::proof_resolution::ResolutionEvidence::SameFileDeclaration {
+                declaration: NodeId(RESOLVED_TARGET),
+            },
+        ],
+        resolution_provenance: codestory_contracts::proof_resolution::ResolutionProvenance {
+            producer: "codestory-internal".into(),
+            fact_schema_version: 1,
+            algorithm: "exact-call-resolution-v1".into(),
+            language_adapter: "rust".into(),
+            language_adapter_version: "test-v1".into(),
+            parser_fingerprint: "c".repeat(64),
+            dependency_file_hashes: Vec::new(),
+            evidence_sha256: "b".repeat(64),
+        },
         exact_callsite_start_byte: 0,
         callsite_identity: callsite_identity.clone(),
         column_or_ordinal: 0,

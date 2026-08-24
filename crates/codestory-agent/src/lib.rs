@@ -40,7 +40,7 @@ pub mod proof_qualification_support {
         ValidatedCallPathContract, ValidatedContractRendering, ValidationOutcome,
         VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
         check_built_call_path_integration, diagnose_raw_call_edge,
-        project_internal_call_path_result, validate_contract,
+        project_internal_call_path_result, validate_compact_projection, validate_contract,
     };
 
     /// Identifies the sealed request domain observed by benchmark qualification.

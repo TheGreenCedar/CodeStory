@@ -22,79 +22,186 @@ pub(crate) fn tools_for_surface_v3(revision: McpRevisionV3, surface: V3SurfaceSe
 }
 
 pub(crate) fn proof_output_schema_v3() -> Value {
-    let common = Map::from_iter([
-        ("kind".to_string(), json!({"type":"string"})),
-        ("schema_version".to_string(), json!({"type":"integer"})),
-        ("domain".to_string(), json!({"type":"string"})),
-        (
-            "contract_interpretation".to_string(),
-            json!({"type":"string","enum":["host_supplied"]}),
-        ),
-        ("guard_version".to_string(), json!({"type":"string"})),
-        (
-            "source_text_sha256".to_string(),
-            json!({"type":"string","minLength":64,"maxLength":64}),
-        ),
-        (
-            "contract_digest".to_string(),
-            json!({"type":"string","minLength":64,"maxLength":64}),
-        ),
-        ("core_publication".to_string(), json!({"type":"object"})),
-        ("disposition".to_string(), json!({"type":"object"})),
-    ]);
-    let variant = |kind: &str, additional: &[(&str, Value)], required: &[&str]| {
-        let mut properties = common.clone();
-        properties.insert("kind".to_string(), json!({"type":"string","enum":[kind]}));
-        properties.extend(
-            additional
-                .iter()
-                .map(|(name, schema)| ((*name).to_string(), schema.clone())),
-        );
-        let mut required_fields = vec![
-            "kind",
-            "schema_version",
-            "domain",
-            "contract_interpretation",
-            "guard_version",
-            "source_text_sha256",
-            "contract_digest",
-            "core_publication",
-            "disposition",
-        ];
-        required_fields.extend_from_slice(required);
-        json!({
-            "type": "object",
-            "properties": properties,
-            "required": required_fields,
-            "additionalProperties": false
-        })
-    };
     json!({
         "type": "object",
         "oneOf": [
-            variant(
-                "complete",
-                &[
-                    ("spec", json!({"type":"object"})),
-                    ("clauses", json!({"type":"array"})),
-                    ("steps", json!({"type":"array"})),
-                    ("receipts", json!({"type":"array"})),
-                ],
-                &["spec", "clauses", "steps", "receipts"],
-            ),
-            variant(
-                "budget_exceeded",
-                &[
-                    ("cap_bytes", json!({"type":"integer","minimum":1})),
-                    (
-                        "required_complete_size",
-                        json!({"type":"integer","minimum":1}),
-                    ),
-                ],
-                &["cap_bytes", "required_complete_size"],
-            )
+            proof_complete_schema_v3(),
+            proof_budget_exceeded_schema_v3()
         ]
     })
+}
+
+fn proof_common_fields_v3(kind: &str) -> Vec<(&str, Value)> {
+    vec![
+        ("kind", enum_schema_v3(&[kind])),
+        ("schema_version", json!({"type":"integer","enum":[1]})),
+        ("domain", enum_schema_v3(&["indexed_source_call_path_v1"])),
+        (
+            "contract_interpretation",
+            enum_schema_v3(&["host_supplied"]),
+        ),
+        ("guard_version", enum_schema_v3(&["clause_guard_v1"])),
+        ("source_text_sha256", sha256_schema_v3()),
+        ("contract_digest", sha256_schema_v3()),
+        (
+            "core_publication",
+            closed_object_schema_v3(vec![
+                ("project_id", string_schema_v3()),
+                ("generation_id", string_schema_v3()),
+                ("run_id", string_schema_v3()),
+            ]),
+        ),
+        ("disposition", json!({"type":"object"})),
+    ]
+}
+
+fn proof_complete_schema_v3() -> Value {
+    let mut fields = proof_common_fields_v3("complete");
+    fields.extend([
+        (
+            "identities",
+            closed_object_schema_v3(vec![
+                (
+                    "files",
+                    json!({"type":"array","items":proof_file_schema_v3(),"maxItems":65536}),
+                ),
+                (
+                    "symbols",
+                    json!({"type":"array","items":proof_symbol_schema_v3(),"maxItems":65536}),
+                ),
+                (
+                    "evidence",
+                    json!({"type":"array","items":proof_evidence_schema_v3(),"maxItems":65536}),
+                ),
+            ]),
+        ),
+        ("spec", json!({"type":"object"})),
+        ("clauses", json!({"type":"array"})),
+        (
+            "steps",
+            json!({"type":"array","items":proof_step_schema_v3(),"maxItems":6}),
+        ),
+        (
+            "receipts",
+            json!({"type":"array","items":proof_receipt_schema_v3(),"maxItems":6}),
+        ),
+    ]);
+    closed_object_schema_v3(fields)
+}
+
+fn proof_budget_exceeded_schema_v3() -> Value {
+    let mut fields = proof_common_fields_v3("budget_exceeded");
+    fields.extend([
+        ("cap_bytes", json!({"type":"integer","minimum":1})),
+        (
+            "required_complete_size",
+            json!({"type":"integer","minimum":1}),
+        ),
+    ]);
+    closed_object_schema_v3(fields)
+}
+
+fn proof_file_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("file_node_id", nullable_schema_v3(string_schema_v3())),
+        (
+            "project_file_components",
+            nullable_schema_v3(json!({"type":"array","items":string_schema_v3()})),
+        ),
+        ("indexed_sha256", nullable_schema_v3(sha256_schema_v3())),
+        ("observed_sha256", nullable_schema_v3(sha256_schema_v3())),
+    ])
+}
+
+fn proof_symbol_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("node_id", string_schema_v3()),
+        ("canonical_id", nullable_schema_v3(string_schema_v3())),
+        ("qualified_name", nullable_schema_v3(string_schema_v3())),
+        ("file", nullable_schema_v3(unsigned_integer_schema_v3())),
+    ])
+}
+
+fn proof_evidence_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("fact_id", sha256_schema_v3()),
+        ("caller", unsigned_integer_schema_v3()),
+        ("target", unsigned_integer_schema_v3()),
+        ("edge_id", string_schema_v3()),
+        ("callsite_identity", string_schema_v3()),
+        (
+            "chain",
+            json!({"type":"array","items":closed_object_schema_v3(vec![
+                ("kind", string_schema_v3()), ("symbols", json!({"type":"array","items":unsigned_integer_schema_v3()})),
+            ])}),
+        ),
+        (
+            "provenance",
+            closed_object_schema_v3(vec![
+                ("producer", string_schema_v3()),
+                ("fact_schema_version", json!({"type":"integer","minimum":1})),
+                ("algorithm", string_schema_v3()),
+                ("language_adapter", string_schema_v3()),
+                ("language_adapter_version", string_schema_v3()),
+                ("parser_fingerprint", sha256_schema_v3()),
+                (
+                    "dependency_files",
+                    json!({"type":"array","items":unsigned_integer_schema_v3()}),
+                ),
+                ("evidence_sha256", sha256_schema_v3()),
+            ]),
+        ),
+    ])
+}
+
+fn proof_receipt_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("receipt_id", string_schema_v3()),
+        ("edge_id", string_schema_v3()),
+        ("source", unsigned_integer_schema_v3()),
+        ("target", unsigned_integer_schema_v3()),
+        ("evidence", unsigned_integer_schema_v3()),
+        ("exact_callsite_start_byte", unsigned_integer_schema_v3()),
+        ("callsite_identity", string_schema_v3()),
+        ("column_or_ordinal", unsigned_integer_schema_v3()),
+        (
+            "containment",
+            closed_object_schema_v3(vec![
+                ("file", unsigned_integer_schema_v3()),
+                ("owner", unsigned_integer_schema_v3()),
+                ("start_line", unsigned_integer_schema_v3()),
+                ("end_line", unsigned_integer_schema_v3()),
+            ]),
+        ),
+        (
+            "line_window",
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["indexed_line_v1"])),
+                ("file", unsigned_integer_schema_v3()),
+                ("anchor_line", unsigned_integer_schema_v3()),
+                ("byte_start", unsigned_integer_schema_v3()),
+                ("byte_end", unsigned_integer_schema_v3()),
+                ("text", string_schema_v3()),
+            ]),
+        ),
+    ])
+}
+
+fn proof_step_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("step_index", unsigned_integer_schema_v3()),
+        (
+            "status",
+            enum_schema_v3(&[
+                "proven",
+                "positive_contradiction",
+                "certified_absence",
+                "unavailable",
+                "unknown",
+            ]),
+        ),
+        ("receipt", nullable_schema_v3(unsigned_integer_schema_v3())),
+    ])
 }
 
 fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
@@ -780,6 +887,7 @@ mod tests {
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
+            "identities": {"files":[],"symbols":[],"evidence":[]},
             "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[],"prohibit_traversal_through":[],"exclude_from_projection":[]},
             "clauses": [],
             "disposition": {"kind":"unknown","contract_digest":"b".repeat(64),"gaps":[],"connected_receipts":[]},
