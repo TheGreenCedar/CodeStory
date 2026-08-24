@@ -219,10 +219,7 @@ pub fn correlate_exact_syntax_callsites(
             let Some((file_id, line)) = coordinates[coordinate_index] else {
                 continue;
             };
-            if coordinates[..coordinate_index]
-                .iter()
-                .any(|coordinate| *coordinate == Some((file_id, line)))
-            {
+            if coordinates[..coordinate_index].contains(&Some((file_id, line))) {
                 continue;
             }
             count_correlation_work(1);
