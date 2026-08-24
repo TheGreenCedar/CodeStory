@@ -5025,6 +5025,48 @@ fn rust_attribute_domains_are_never_exact() -> anyhow::Result<()> {
 }
 
 #[test]
+fn rust_bounded_outer_metadata_preserves_unrelated_bindings() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/lib.rs",
+            "#[derive(Debug)]\n#[serde(rename = \"serde_helper\")]\nstruct SerdeHelper;\n#[derive(Debug)]\n#[error(\"error_helper\")]\nstruct ErrorHelper;\n#[inline]\nfn inline_helper() {}\n#[cfg_attr(test, derive(Debug))]\nstruct Report;\nfn target() {}\nfn caller() { target(); SerdeHelper(); ErrorHelper(); inline_helper(); Report(); }\n",
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let fact = |name| {
+        facts
+            .iter()
+            .find(|fact| fact.callsite.raw_target == name)
+            .expect("one direct call")
+    };
+    assert_eq!(fact("target").status, ProofResolutionStatus::Exact);
+    for name in ["SerdeHelper", "ErrorHelper", "inline_helper", "Report"] {
+        assert_eq!(
+            fact(name).status,
+            ProofResolutionStatus::IncompleteDomain,
+            "the attributed item's own name remains incomplete: {name}"
+        );
+    }
+
+    for source in [
+        "#[unresolved_attribute_macro]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg_attr(test, unresolved_attribute_macro)]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "#[serde(rename = \"helper\")]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "#[error(\"helper\")]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "#[serde(rename = \"helper\")]\nstruct Helper;\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg_attr(test, derive(Debug))]\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
 fn non_exact_reference_inputs_keep_closed_fail_closed_statuses() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;

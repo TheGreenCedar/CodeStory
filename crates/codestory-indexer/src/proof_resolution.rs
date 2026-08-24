@@ -4464,14 +4464,14 @@ impl<'tree> RustResolutionIndex<'tree> {
         let mut cursor = body.walk();
         let items = body.named_children(&mut cursor).collect::<Vec<_>>();
         let attributed_items = rust_attributed_item_ids(&items);
+        let bounded_attribute_ids = rust_bounded_outer_attribute_ids(&items, source);
         self.attributed_items
             .extend(attributed_items.iter().copied());
         for item in &items {
             let direct_domain_poison = item.kind() == "macro_invocation"
                 || (item.kind() == "inner_attribute_item"
                     && !rust_inner_allow_preserves_module_bindings(*item, source))
-                || (item.kind() == "attribute_item"
-                    && !rust_attribute_is_bounded_item_metadata(*item, source))
+                || (item.kind() == "attribute_item" && !bounded_attribute_ids.contains(&item.id()))
                 || (item.kind() == "expression_statement"
                     && contains_node_kind(*item, "macro_invocation"));
             if direct_domain_poison {
@@ -5333,20 +5333,67 @@ fn rust_attributed_item_ids(items: &[TsNode<'_>]) -> HashSet<usize> {
     result
 }
 
-fn rust_attribute_is_bounded_item_metadata(attribute: TsNode<'_>, source: &str) -> bool {
-    let Some(surface) = node_text(attribute, source) else {
-        return false;
-    };
-    let Some(body) = surface.trim().strip_prefix("#[") else {
-        return false;
-    };
-    let name = body
-        .split(|character: char| {
-            character == '(' || character == '=' || character == ']' || character.is_whitespace()
+fn rust_bounded_outer_attribute_ids(items: &[TsNode<'_>], source: &str) -> HashSet<usize> {
+    let mut result = HashSet::new();
+    let mut attributes = Vec::new();
+    for item in items {
+        if item.kind() == "attribute_item" {
+            attributes.push(*item);
+        } else {
+            if rust_attribute_group_is_bounded(&attributes, *item, source) {
+                result.extend(attributes.iter().map(|attribute| attribute.id()));
+            }
+            attributes.clear();
+        }
+    }
+    result
+}
+
+fn rust_attribute_group_is_bounded(
+    attributes: &[TsNode<'_>],
+    attributed_item: TsNode<'_>,
+    source: &str,
+) -> bool {
+    let is_helper_type = matches!(attributed_item.kind(), "struct_item" | "enum_item");
+    let has_derive = attributes.iter().any(|attribute| {
+        node_text(*attribute, source).is_some_and(|surface| {
+            surface
+                .trim()
+                .strip_prefix("#[")
+                .is_some_and(|body| body.starts_with("derive("))
         })
-        .next()
-        .unwrap_or_default();
-    matches!(name, "allow" | "cfg" | "derive" | "doc")
+    });
+    attributes.iter().all(|attribute| {
+        let Some(surface) = node_text(*attribute, source) else {
+            return false;
+        };
+        let Some(body) = surface.trim().strip_prefix("#[") else {
+            return false;
+        };
+        let name = body
+            .split(|character: char| {
+                character == '('
+                    || character == '='
+                    || character == ']'
+                    || character.is_whitespace()
+            })
+            .next()
+            .unwrap_or_default();
+        match name {
+            "allow" | "cfg" | "derive" | "doc" => true,
+            "inline" => attributed_item.kind() == "function_item",
+            "serde" | "error" => is_helper_type && has_derive,
+            "cfg_attr" if is_helper_type => body
+                .strip_prefix("cfg_attr(")
+                .and_then(|arguments| arguments.strip_suffix(")]"))
+                .and_then(|arguments| arguments.split_once(','))
+                .is_some_and(|(_, injected)| {
+                    let injected = injected.trim();
+                    injected.starts_with("derive(") && injected.ends_with(')')
+                }),
+            _ => false,
+        }
+    })
 }
 
 fn rust_inner_allow_preserves_module_bindings(attribute: TsNode<'_>, source: &str) -> bool {
@@ -5395,10 +5442,7 @@ fn rust_callable_poison_ranges(function: TsNode<'_>, source: &str) -> Vec<(usize
                 continue;
             }
             if !pending_attributes.is_empty() {
-                if pending_attributes
-                    .iter()
-                    .all(|attribute| rust_attribute_is_bounded_item_metadata(*attribute, source))
-                {
+                if rust_attribute_group_is_bounded(&pending_attributes, child, source) {
                     output.push((child.start_byte(), child.end_byte()));
                 } else {
                     output.push(scope);
