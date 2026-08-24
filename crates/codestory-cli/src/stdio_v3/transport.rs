@@ -266,6 +266,15 @@ mod tests {
         VerifiedDirectCallFact, VerifiedProofFact, check_built_call_path_integration,
         project_internal_call_path_result, validate_contract,
     };
+    use sha2::{Digest, Sha256};
+
+    fn resolution_fact_id(evidence_sha256: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"codestory-proof-resolution-fact-id-v1\0");
+        hasher.update((evidence_sha256.len() as u64).to_be_bytes());
+        hasher.update(evidence_sha256.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
 
     #[cfg(feature = "proof-qualification-support")]
     fn actual_projected_root(text: String) -> Value {
@@ -328,7 +337,7 @@ mod tests {
             },
             source: source.clone(),
             target: target.clone(),
-            resolution_fact_id: "a".repeat(64),
+            resolution_fact_id: resolution_fact_id(&"b".repeat(64)),
             resolution_evidence_sha256: "b".repeat(64),
             resolution_evidence_chain: vec![ResolutionEvidence::SameFileDeclaration {
                 declaration: NodeId(20),
@@ -563,6 +572,47 @@ mod tests {
     }
 
     fn proof_root(disposition_kind: &str) -> Value {
+        #[cfg(feature = "proof-qualification-support")]
+        {
+            let mut root = actual_projected_root("x".to_owned());
+            match disposition_kind {
+                "proven" => return root,
+                "unavailable" => {
+                    root["identities"] = json!({
+                        "files":[],"symbols":[],"provenance_profiles":[],"evidence":[]
+                    });
+                    root["spec"]["start"] = json!({"kind":"canonical_id","canonical_id":"A"});
+                    root["spec"]["steps"][0]["target"] =
+                        json!({"kind":"canonical_id","canonical_id":"B"});
+                    root["disposition"] = json!({
+                        "kind":"unavailable",
+                        "contract_digest":root["contract_digest"],
+                        "reasons":["publication_pin_mismatch"]
+                    });
+                    root["steps"] = json!([{"step_index":0,"status":"unavailable","receipt":null}]);
+                    root["receipts"] = json!([]);
+                    return root;
+                }
+                _ => {
+                    root["identities"] = json!({
+                        "files":[],"symbols":[],"provenance_profiles":[],"evidence":[]
+                    });
+                    root["spec"]["start"] = json!({"kind":"canonical_id","canonical_id":"A"});
+                    root["spec"]["steps"][0]["target"] =
+                        json!({"kind":"canonical_id","canonical_id":"B"});
+                    root["disposition"] = json!({
+                        "kind":"unknown",
+                        "contract_digest":root["contract_digest"],
+                        "gaps":[{"kind":"direct_call_missing","step_index":0}],
+                        "connected_receipts":[]
+                    });
+                    root["steps"] = json!([{"step_index":0,"status":"unknown","receipt":null}]);
+                    root["receipts"] = json!([]);
+                    return root;
+                }
+            }
+        }
+
         let disposition = match disposition_kind {
             "proven" => json!({
                 "kind": "contract_proven",
@@ -572,12 +622,12 @@ mod tests {
             "unavailable" => json!({
                 "kind": "unavailable",
                 "contract_digest": "b".repeat(64),
-                "reasons": ["publication_unavailable"]
+                "reasons": ["publication_pin_mismatch"]
             }),
             _ => json!({
                 "kind": "unknown",
                 "contract_digest": "b".repeat(64),
-                "gaps": [{"kind":"direct_call_missing"}],
+                "gaps": [{"kind":"direct_call_missing","step_index":0}],
                 "connected_receipts": []
             }),
         };
@@ -589,7 +639,8 @@ mod tests {
                         {"node_id":"1","canonical_id":"A","qualified_name":"crate::A","file":0},
                         {"node_id":"2","canonical_id":"B","qualified_name":"crate::B","file":0}
                     ],
-                    "evidence":[{"fact_id":"d".repeat(64),"caller":0,"target":1,"edge_id":"1","callsite_identity":"1:1:1:2|rust","chain":[{"kind":"same_file_declaration","symbols":[1]}],"provenance":{"producer":"codestory-internal","fact_schema_version":1,"algorithm":"exact-call-resolution-v1","language_adapter":"rust","language_adapter_version":"test-v1","parser_fingerprint":"e".repeat(64),"dependency_files":[0],"evidence_sha256":"f".repeat(64)}}]
+                    "provenance_profiles":[{"producer":"codestory-internal","fact_schema_version":1,"algorithm":"exact-call-resolution-v1","language_adapter":"rust","language_adapter_version":"test-v1","parser_fingerprint":"e".repeat(64)}],
+                    "evidence":[{"fact_id":resolution_fact_id(&"f".repeat(64)),"caller":0,"target":1,"edge_id":"1","callsite_identity":"1:1:1:2|rust","chain":[{"kind":"same_file_declaration","symbols":[1]}],"provenance":{"profile":0,"dependency_files":[0],"evidence_sha256":"f".repeat(64)}}]
                 }),
                 json!([{"step_index":0,"status":"proven","receipt":0}]),
                 json!([{"receipt_id":"receipt-1","edge_id":"1","source":0,"target":1,"evidence":0,"exact_callsite_start_byte":0,"callsite_identity":"1:1:1:2|rust","column_or_ordinal":1,"containment":{"file":0,"owner":0,"start_line":1,"end_line":1},"line_window":{"kind":"indexed_line_v1","file":0,"anchor_line":1,"byte_start":0,"byte_end":1,"text":"x"}}]),
@@ -601,7 +652,7 @@ mod tests {
                 "unknown"
             };
             (
-                json!({"files":[],"symbols":[],"evidence":[]}),
+                json!({"files":[],"symbols":[],"provenance_profiles":[],"evidence":[]}),
                 json!([{"step_index":0,"status":step_status,"receipt":null}]),
                 json!([]),
             )
@@ -617,7 +668,11 @@ mod tests {
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
             "identities": identities,
             "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[{"target":{"kind":"canonical_id","canonical_id":"B"},"relation":"direct_outgoing_call"}],"prohibit_traversal_through":[],"exclude_from_projection":[]},
-            "clauses": [],
+            "clauses": [{
+                "start":0,"end":1,"clause_id":"c","quote":"x","classification":"resolved_material",
+                "fields":[{"kind":"start"},{"kind":"step_target","step":0},{"kind":"directness","step":0},{"kind":"ordering","step":0},{"kind":"relation","step":0}],
+                "reason":null,"non_material_kind":null
+            }],
             "disposition": disposition,
             "steps": steps,
             "receipts": receipts,

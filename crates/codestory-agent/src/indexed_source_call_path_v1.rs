@@ -14,7 +14,7 @@
 #![allow(dead_code)]
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
 use codestory_contracts::proof_resolution::{
@@ -28,6 +28,7 @@ pub const PROOF_CONTRACT_SCHEMA_VERSION: u32 = 1;
 pub const PROOF_DOMAIN: &str = "indexed_source_call_path_v1";
 pub const CLAUSE_GUARD_VERSION: &str = "clause_guard_v1";
 const DIGEST_DOMAIN_SEPARATOR: &[u8] = b"codestory.proof-contract.digest.v1\0";
+const FACT_ID_DOMAIN_SEPARATOR: &[u8] = b"codestory-proof-resolution-fact-id-v1\0";
 const MIN_STEPS: usize = 1;
 const MAX_STEPS: usize = 6;
 const MAX_INDEXED_SCOPES: usize = u8::MAX as usize + 1;
@@ -61,6 +62,36 @@ pub enum RawAdmissionFailure {
     CallsiteFileMismatch,
     CallsiteLineMismatch,
     CallsiteRawTargetMismatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanonicalCallsiteIdentity {
+    file_id: i64,
+    line: u32,
+    column_or_ordinal: u32,
+    raw_target: i64,
+}
+
+fn parse_canonical_callsite_identity(identity: &str) -> Option<CanonicalCallsiteIdentity> {
+    let pre_marker = identity
+        .split_once('|')
+        .map_or(identity, |(identity, _)| identity);
+    let mut fields = pre_marker.split(':');
+    let parsed = CanonicalCallsiteIdentity {
+        file_id: fields.next()?.parse().ok()?,
+        line: fields.next()?.parse().ok()?,
+        column_or_ordinal: fields.next()?.parse().ok()?,
+        raw_target: fields.next()?.parse().ok()?,
+    };
+    if fields.next().is_some()
+        || format!(
+            "{}:{}:{}:{}",
+            parsed.file_id, parsed.line, parsed.column_or_ordinal, parsed.raw_target
+        ) != pre_marker
+    {
+        return None;
+    }
+    Some(parsed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,42 +204,23 @@ pub fn diagnose_raw_call_edge(
         .as_deref()
         .filter(|identity| !identity.is_empty())
         .ok_or(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity)?;
-    let pre_marker = callsite_identity
-        .split_once('|')
-        .map_or(callsite_identity, |(identity, _)| identity);
-    let mut fields = pre_marker.split(':');
-    let parsed = (
-        fields.next().and_then(|value| value.parse::<i64>().ok()),
-        fields.next().and_then(|value| value.parse::<u32>().ok()),
-        fields.next().and_then(|value| value.parse::<u32>().ok()),
-        fields.next().and_then(|value| value.parse::<i64>().ok()),
-    );
-    if fields.next().is_some() {
-        return Err(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity);
-    }
-    let (Some(parsed_file), Some(parsed_line), Some(column_or_ordinal), Some(parsed_target)) =
-        parsed
-    else {
-        return Err(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity);
-    };
-    if parsed_file != file_node_id.0 {
+    let parsed = parse_canonical_callsite_identity(callsite_identity)
+        .ok_or(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity)?;
+    if parsed.file_id != file_node_id.0 {
         return Err(RawAdmissionFailure::CallsiteFileMismatch);
     }
-    if parsed_line != line {
+    if parsed.line != line {
         return Err(RawAdmissionFailure::CallsiteLineMismatch);
     }
-    if parsed_target != edge.target.0 {
+    if parsed.raw_target != edge.target.0 {
         return Err(RawAdmissionFailure::CallsiteRawTargetMismatch);
-    }
-    if format!("{parsed_file}:{parsed_line}:{column_or_ordinal}:{parsed_target}") != pre_marker {
-        return Err(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity);
     }
     Ok(AdmittedRawCallEdge {
         edge_id: edge.id,
         file_node_id,
         line,
-        column_or_ordinal,
-        raw_target: NodeId(parsed_target),
+        column_or_ordinal: parsed.column_or_ordinal,
+        raw_target: NodeId(parsed.raw_target),
         callsite_identity: callsite_identity.to_owned(),
     })
 }
@@ -252,7 +264,7 @@ pub enum ClauseClassification {
     NonMaterial { kind: NonMaterialKind },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProofContractField {
     Start,
     StepTarget { step: u8 },
@@ -1332,6 +1344,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn resolution_fact_id_from_evidence_sha256(evidence_sha256: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(FACT_ID_DOMAIN_SEPARATOR);
+    hasher.update((evidence_sha256.len() as u64).to_be_bytes());
+    hasher.update(evidence_sha256.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ResolvedNodeIdentity {
     pub pinned: PinnedNodeIdentity,
@@ -2291,6 +2311,16 @@ struct CompactSymbolIdentity {
     file: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CompactProvenanceProfile {
+    producer: String,
+    fact_schema_version: u32,
+    algorithm: String,
+    language_adapter: String,
+    language_adapter_version: String,
+    parser_fingerprint: String,
+}
+
 #[derive(Default)]
 struct CompactIdentityTables {
     files: Vec<CompactFileIdentity>,
@@ -2298,6 +2328,8 @@ struct CompactIdentityTables {
     file_by_path: BTreeMap<Vec<String>, u32>,
     symbols: Vec<CompactSymbolIdentity>,
     symbol_by_node_id: BTreeMap<String, u32>,
+    provenance_profiles: Vec<CompactProvenanceProfile>,
+    provenance_profile_indices: HashMap<CompactProvenanceProfile, u32>,
     evidence: Vec<Value>,
     evidence_by_fact_id: BTreeMap<String, u32>,
 }
@@ -2453,6 +2485,22 @@ impl CompactIdentityTables {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let provenance = &receipt.resolution_provenance;
+        let profile = CompactProvenanceProfile {
+            producer: provenance.producer.clone(),
+            fact_schema_version: provenance.fact_schema_version,
+            algorithm: provenance.algorithm.clone(),
+            language_adapter: provenance.language_adapter.clone(),
+            language_adapter_version: provenance.language_adapter_version.clone(),
+            parser_fingerprint: provenance.parser_fingerprint.clone(),
+        };
+        let profile_index = if let Some(index) = self.provenance_profile_indices.get(&profile) {
+            *index
+        } else {
+            let index = bounded_index(self.provenance_profiles.len())?;
+            self.provenance_profiles.push(profile.clone());
+            self.provenance_profile_indices.insert(profile, index);
+            index
+        };
         let row = json!({
             "fact_id": receipt.resolution_fact_id,
             "caller": source,
@@ -2461,12 +2509,7 @@ impl CompactIdentityTables {
             "callsite_identity": receipt.callsite_identity,
             "chain": chain,
             "provenance": {
-                "producer": provenance.producer,
-                "fact_schema_version": provenance.fact_schema_version,
-                "algorithm": provenance.algorithm,
-                "language_adapter": provenance.language_adapter,
-                "language_adapter_version": provenance.language_adapter_version,
-                "parser_fingerprint": provenance.parser_fingerprint,
+                "profile": profile_index,
                 "dependency_files": dependency_files,
                 "evidence_sha256": provenance.evidence_sha256,
             },
@@ -2549,6 +2592,14 @@ impl CompactIdentityTables {
                 "canonical_id": symbol.canonical_id,
                 "qualified_name": symbol.qualified_name,
                 "file": symbol.file,
+            })).collect::<Vec<_>>(),
+            "provenance_profiles": self.provenance_profiles.iter().map(|profile| json!({
+                "producer": profile.producer,
+                "fact_schema_version": profile.fact_schema_version,
+                "algorithm": profile.algorithm,
+                "language_adapter": profile.language_adapter,
+                "language_adapter_version": profile.language_adapter_version,
+                "parser_fingerprint": profile.parser_fingerprint,
             })).collect::<Vec<_>>(),
             "evidence": self.evidence,
         })
@@ -2638,11 +2689,15 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
     let identities = compact_object_field(root_object, "identities", "compact_identities_missing")?;
     compact_closed_object(
         identities,
-        &["files", "symbols", "evidence"],
+        &["files", "symbols", "provenance_profiles", "evidence"],
         "compact_identities_shape_invalid",
     )?;
     let files = compact_array(identities.get("files"), "compact_files_missing")?;
     let symbols = compact_array(identities.get("symbols"), "compact_symbols_missing")?;
+    let provenance_profiles = compact_array(
+        identities.get("provenance_profiles"),
+        "compact_provenance_profiles_missing",
+    )?;
     let evidence = compact_array(identities.get("evidence"), "compact_evidence_missing")?;
     let receipts = compact_array(root_object.get("receipts"), "compact_receipts_missing")?;
     let spec = compact_object_field(root_object, "spec", "compact_spec_missing")?;
@@ -2699,7 +2754,62 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
             compact_index(file, files.len(), "compact_symbol_file_reference_invalid")?;
         }
     }
+
+    let mut unique_profiles = HashSet::new();
+    for profile in provenance_profiles {
+        let profile = compact_object(profile, "compact_provenance_profile_invalid")?;
+        compact_closed_object(
+            profile,
+            &[
+                "producer",
+                "fact_schema_version",
+                "algorithm",
+                "language_adapter",
+                "language_adapter_version",
+                "parser_fingerprint",
+            ],
+            "compact_provenance_profile_shape_invalid",
+        )?;
+        let key = (
+            compact_string(profile, "producer", "compact_provenance_profile_invalid")?.to_owned(),
+            compact_u64(
+                profile,
+                "fact_schema_version",
+                "compact_provenance_profile_invalid",
+            )?,
+            compact_string(profile, "algorithm", "compact_provenance_profile_invalid")?.to_owned(),
+            compact_string(
+                profile,
+                "language_adapter",
+                "compact_provenance_profile_invalid",
+            )?
+            .to_owned(),
+            compact_string(
+                profile,
+                "language_adapter_version",
+                "compact_provenance_profile_invalid",
+            )?
+            .to_owned(),
+            compact_hash(
+                profile,
+                "parser_fingerprint",
+                "compact_provenance_profile_invalid",
+            )?
+            .to_owned(),
+        );
+        if key.0 != INTERNAL_RESOLUTION_PRODUCER
+            || key.1 != u64::from(PROOF_RESOLUTION_FACT_SCHEMA_VERSION)
+            || key.2 != EXACT_CALL_RESOLUTION_ALGORITHM
+            || key.3.is_empty()
+            || key.4.is_empty()
+            || !unique_profiles.insert(key)
+        {
+            return Err("compact_provenance_profile_invalid".to_owned());
+        }
+    }
     let mut fact_ids = BTreeSet::new();
+    let mut referenced_profiles = vec![false; provenance_profiles.len()];
+    let mut next_profile = 0_usize;
     for evidence_row in evidence {
         let evidence_row = compact_object(evidence_row, "compact_evidence_row_invalid")?;
         compact_closed_object(
@@ -2799,44 +2909,26 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
         )?;
         compact_closed_object(
             provenance,
-            &[
-                "producer",
-                "fact_schema_version",
-                "algorithm",
-                "language_adapter",
-                "language_adapter_version",
-                "parser_fingerprint",
-                "dependency_files",
-                "evidence_sha256",
-            ],
+            &["profile", "dependency_files", "evidence_sha256"],
             "compact_provenance_shape_invalid",
         )?;
-        if compact_string(provenance, "producer", "compact_provenance_invalid")?
-            != INTERNAL_RESOLUTION_PRODUCER
-            || compact_u64(
-                provenance,
-                "fact_schema_version",
-                "compact_provenance_invalid",
-            )? != u64::from(PROOF_RESOLUTION_FACT_SCHEMA_VERSION)
-            || compact_string(provenance, "algorithm", "compact_provenance_invalid")?
-                != EXACT_CALL_RESOLUTION_ALGORITHM
-            || compact_string(provenance, "language_adapter", "compact_provenance_invalid")?
-                .is_empty()
-            || compact_string(
-                provenance,
-                "language_adapter_version",
-                "compact_provenance_invalid",
-            )?
-            .is_empty()
-        {
-            return Err("compact_provenance_invalid".to_owned());
-        }
-        compact_hash(
-            provenance,
-            "parser_fingerprint",
-            "compact_provenance_invalid",
+        let profile = compact_index(
+            provenance.get("profile").unwrap_or(&Value::Null),
+            provenance_profiles.len(),
+            "compact_provenance_profile_reference_invalid",
         )?;
-        compact_hash(provenance, "evidence_sha256", "compact_provenance_invalid")?;
+        if !referenced_profiles[profile] {
+            if profile != next_profile {
+                return Err("compact_provenance_profile_order_invalid".to_owned());
+            }
+            referenced_profiles[profile] = true;
+            next_profile += 1;
+        }
+        let evidence_sha256 =
+            compact_hash(provenance, "evidence_sha256", "compact_provenance_invalid")?;
+        if resolution_fact_id_from_evidence_sha256(evidence_sha256) != fact_id {
+            return Err("compact_fact_id_evidence_digest_mismatch".to_owned());
+        }
         let dependencies = compact_array(
             provenance.get("dependency_files"),
             "compact_dependency_files_missing",
@@ -2861,6 +2953,9 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
             }
             prior_file_id = Some(file_id);
         }
+    }
+    if referenced_profiles.iter().any(|referenced| !referenced) {
+        return Err("compact_provenance_profile_unreferenced".to_owned());
     }
     let mut receipt_ids = BTreeSet::new();
     let mut edge_ids = BTreeSet::new();
@@ -3005,7 +3100,12 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
         }
     }
     let step_rows = validate_compact_steps(steps, spec_steps.len(), receipts.len())?;
-    validate_disposition_receipts(
+    let prohibition_count = compact_array(
+        spec.get("prohibit_traversal_through"),
+        "compact_spec_prohibitions_missing",
+    )?
+    .len();
+    let authorized_receipts = validate_disposition_receipts(
         compact_object_field(root_object, "disposition", "compact_disposition_missing")?,
         compact_string(
             root_object,
@@ -3014,7 +3114,52 @@ pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
         )?,
         &step_rows,
         receipts,
-    )
+        prohibition_count,
+    )?;
+    if authorized_receipts.len() != receipts.len()
+        || authorized_receipts
+            .iter()
+            .enumerate()
+            .any(|(expected, actual)| expected != *actual)
+    {
+        return Err("compact_disposition_receipts_unexhausted".to_owned());
+    }
+    validate_compact_contract_digest(root_object, files, symbols, receipts, &authorized_receipts)
+}
+
+fn validate_compact_projection_against_receipts(
+    root: &Value,
+    authoritative_receipts: &[IndexedCallEdgeReceipt],
+) -> Result<(), String> {
+    validate_compact_projection(root)?;
+    let root = compact_object(root, "compact_root_invalid")?;
+    if compact_string(root, "kind", "compact_root_kind_invalid")? != "complete" {
+        return Err("compact_typed_receipt_validation_requires_complete".to_owned());
+    }
+    let mut tables = CompactIdentityTables::default();
+    let projected_receipts = authoritative_receipts
+        .iter()
+        .map(|receipt| {
+            tables
+                .receipt_json(receipt)
+                .map_err(compact_projection_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if root.get("identities") != Some(&tables.json())
+        || root.get("receipts") != Some(&Value::Array(projected_receipts))
+    {
+        return Err("compact_typed_receipt_correlation_invalid".to_owned());
+    }
+    Ok(())
+}
+
+fn compact_projection_error(error: InternalProjectionError) -> String {
+    match error {
+        InternalProjectionError::Serialization(message) => {
+            format!("compact_typed_receipt_serialization_failed:{message}")
+        }
+        InternalProjectionError::InvalidCompactProjection(code) => code,
+    }
 }
 
 fn compact_array<'a>(value: Option<&'a Value>, code: &str) -> Result<&'a Vec<Value>, String> {
@@ -3129,6 +3274,592 @@ fn compact_optional_path(
         })
         .ok_or_else(|| "compact_file_path_invalid".to_owned())?;
     Ok(Some(path))
+}
+
+fn validate_compact_contract_digest(
+    root: &serde_json::Map<String, Value>,
+    files: &[Value],
+    symbols: &[Value],
+    receipts: &[Value],
+    authorized_receipts: &[usize],
+) -> Result<(), String> {
+    let publication =
+        compact_object_field(root, "core_publication", "compact_publication_missing")?;
+    let spec = expand_compact_spec(
+        compact_object_field(root, "spec", "compact_spec_missing")?,
+        publication,
+        files,
+        symbols,
+        receipts,
+        authorized_receipts,
+    )?;
+    let step_count = compact_array(
+        compact_object(&spec, "compact_spec_invalid")?.get("steps"),
+        "compact_spec_steps_missing",
+    )?
+    .len();
+    let prohibition_count = compact_array(
+        compact_object(&spec, "compact_spec_invalid")?.get("prohibit_traversal_through"),
+        "compact_spec_prohibitions_missing",
+    )?
+    .len();
+    let exclusion_count = compact_array(
+        compact_object(&spec, "compact_spec_invalid")?.get("exclude_from_projection"),
+        "compact_spec_exclusions_missing",
+    )?
+    .len();
+    let clauses = expand_grouped_clauses(
+        compact_array(root.get("clauses"), "compact_clauses_missing")?,
+        step_count,
+        prohibition_count,
+        exclusion_count,
+    )?;
+    let digest_document = json!({
+        "schema_version": compact_u64(root, "schema_version", "compact_schema_version_invalid")?,
+        "proof_domain": compact_string(root, "domain", "compact_domain_invalid")?,
+        "guard_version": compact_string(root, "guard_version", "compact_guard_version_invalid")?,
+        "source_text_sha256": compact_string(root, "source_text_sha256", "compact_source_hash_invalid")?,
+        "clauses": clauses,
+        "spec": spec,
+    });
+    let canonical = serde_json_canonicalizer::to_vec(&digest_document)
+        .map_err(|_| "compact_contract_digest_canonicalization_failed".to_owned())?;
+    let mut digest_bytes = Vec::with_capacity(DIGEST_DOMAIN_SEPARATOR.len() + canonical.len());
+    digest_bytes.extend_from_slice(DIGEST_DOMAIN_SEPARATOR);
+    digest_bytes.extend_from_slice(&canonical);
+    let recomputed = sha256_hex(&digest_bytes);
+    if recomputed != compact_string(root, "contract_digest", "compact_contract_digest_invalid")? {
+        return Err("compact_contract_digest_mismatch".to_owned());
+    }
+    Ok(())
+}
+
+fn expand_compact_spec(
+    spec: &serde_json::Map<String, Value>,
+    publication: &serde_json::Map<String, Value>,
+    files: &[Value],
+    symbols: &[Value],
+    receipts: &[Value],
+    authorized_receipts: &[usize],
+) -> Result<Value, String> {
+    compact_closed_object(
+        spec,
+        &[
+            "start",
+            "steps",
+            "prohibit_traversal_through",
+            "exclude_from_projection",
+        ],
+        "compact_spec_shape_invalid",
+    )?;
+    let steps = compact_array(spec.get("steps"), "compact_spec_steps_missing")?;
+    if !(MIN_STEPS..=MAX_STEPS).contains(&steps.len()) {
+        return Err("compact_spec_step_count_invalid".to_owned());
+    }
+    let prohibitions = compact_array(
+        spec.get("prohibit_traversal_through"),
+        "compact_spec_prohibitions_missing",
+    )?;
+    let exclusions = compact_array(
+        spec.get("exclude_from_projection"),
+        "compact_spec_exclusions_missing",
+    )?;
+    if prohibitions.len() > MAX_INDEXED_SCOPES || exclusions.len() > MAX_INDEXED_SCOPES {
+        return Err("compact_spec_scope_count_invalid".to_owned());
+    }
+
+    let connected_source = authorized_receipts
+        .first()
+        .map(|index| &receipts[*index])
+        .map(|receipt| {
+            compact_index(
+                compact_object(receipt, "compact_receipt_row_invalid")?
+                    .get("source")
+                    .unwrap_or(&Value::Null),
+                symbols.len(),
+                "compact_receipt_source_reference_invalid",
+            )
+        })
+        .transpose()?;
+    let start = expand_compact_symbol_selector(
+        spec.get("start")
+            .ok_or_else(|| "compact_spec_start_missing".to_owned())?,
+        connected_source,
+        publication,
+        files,
+        symbols,
+    )?;
+    let steps = steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let step = compact_object(step, "compact_spec_step_invalid")?;
+            compact_closed_object(
+                step,
+                &["relation", "target"],
+                "compact_spec_step_shape_invalid",
+            )?;
+            if compact_string(step, "relation", "compact_spec_relation_invalid")?
+                != "direct_outgoing_call"
+            {
+                return Err("compact_spec_relation_invalid".to_owned());
+            }
+            let expected = authorized_receipts
+                .get(index)
+                .map(|receipt_index| &receipts[*receipt_index])
+                .map(|receipt| {
+                    compact_index(
+                        compact_object(receipt, "compact_receipt_row_invalid")?
+                            .get("target")
+                            .unwrap_or(&Value::Null),
+                        symbols.len(),
+                        "compact_receipt_target_reference_invalid",
+                    )
+                })
+                .transpose()?;
+            Ok(json!({
+                "relation":"direct_outgoing_call",
+                "target":expand_compact_symbol_selector(
+                    step.get("target").ok_or_else(|| "compact_spec_target_missing".to_owned())?,
+                    expected,
+                    publication,
+                    files,
+                    symbols,
+                )?,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let prohibitions = prohibitions
+        .iter()
+        .map(|selector| expand_inline_selector(selector, publication, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let exclusions = exclusions
+        .iter()
+        .map(|selector| expand_inline_selector(selector, publication, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({
+        "start":start,
+        "steps":steps,
+        "prohibit_traversal_through":prohibitions,
+        "exclude_from_projection":exclusions,
+    }))
+}
+
+fn expand_compact_symbol_selector(
+    selector: &Value,
+    expected_symbol: Option<usize>,
+    publication: &serde_json::Map<String, Value>,
+    files: &[Value],
+    symbols: &[Value],
+) -> Result<Value, String> {
+    let selector_object = compact_object(selector, "compact_selector_invalid")?;
+    let kind = compact_string(selector_object, "kind", "compact_selector_kind_invalid")?;
+    let is_reference = matches!(
+        kind,
+        "pinned_node_ref" | "canonical_id_ref" | "qualified_name_ref"
+    );
+    if !is_reference {
+        if expected_symbol.is_some() {
+            return Err("compact_selector_reference_required".to_owned());
+        }
+        return expand_inline_selector(selector, publication, true);
+    }
+    let expected_symbol =
+        expected_symbol.ok_or_else(|| "compact_selector_reference_disconnected".to_owned())?;
+    let fields: &[&str] = if kind == "qualified_name_ref" {
+        &["kind", "symbol", "path_binding"]
+    } else {
+        &["kind", "symbol"]
+    };
+    compact_closed_object(
+        selector_object,
+        fields,
+        "compact_selector_reference_shape_invalid",
+    )?;
+    let symbol = compact_index(
+        selector_object.get("symbol").unwrap_or(&Value::Null),
+        symbols.len(),
+        "compact_selector_symbol_reference_invalid",
+    )?;
+    if symbol != expected_symbol {
+        return Err("compact_selector_receipt_correlation_invalid".to_owned());
+    }
+    let file = compact_full_symbol(symbols, symbol, files.len())?;
+    let symbol = compact_object(&symbols[symbol], "compact_symbol_row_invalid")?;
+    Ok(match kind {
+        "pinned_node_ref" => json!({
+            "kind":"pinned_node",
+            "project_id":compact_string(publication, "project_id", "compact_publication_invalid")?,
+            "core_generation_id":compact_string(publication, "generation_id", "compact_publication_invalid")?,
+            "core_run_id":compact_string(publication, "run_id", "compact_publication_invalid")?,
+            "node_id":compact_string(symbol, "node_id", "compact_symbol_id_invalid")?,
+        }),
+        "canonical_id_ref" => json!({
+            "kind":"canonical_id",
+            "canonical_id":compact_string(symbol, "canonical_id", "compact_symbol_not_full")?,
+        }),
+        "qualified_name_ref" => {
+            let path = match compact_string(
+                selector_object,
+                "path_binding",
+                "compact_selector_path_binding_invalid",
+            )? {
+                "none" => Value::Null,
+                "exact_file" => {
+                    let file = compact_object(&files[file], "compact_file_row_invalid")?;
+                    file.get("project_file_components")
+                        .filter(|path| !path.is_null())
+                        .cloned()
+                        .ok_or_else(|| "compact_selector_file_path_missing".to_owned())?
+                }
+                _ => return Err("compact_selector_path_binding_invalid".to_owned()),
+            };
+            json!({
+                "kind":"qualified_name",
+                "qualified_name":compact_string(symbol, "qualified_name", "compact_symbol_not_full")?,
+                "project_file_components":path,
+            })
+        }
+        _ => unreachable!("reference kind was matched"),
+    })
+}
+
+fn expand_inline_selector(
+    selector: &Value,
+    publication: &serde_json::Map<String, Value>,
+    symbol_selector: bool,
+) -> Result<Value, String> {
+    let selector = compact_object(selector, "compact_selector_invalid")?;
+    match compact_string(selector, "kind", "compact_selector_kind_invalid")? {
+        "pinned_node" => {
+            compact_closed_object(
+                selector,
+                &[
+                    "kind",
+                    "project_id",
+                    "core_generation_id",
+                    "core_run_id",
+                    "node_id",
+                ],
+                "compact_pinned_selector_shape_invalid",
+            )?;
+            let identity = PinnedNodeIdentity {
+                project_id: compact_string(selector, "project_id", "compact_selector_invalid")?
+                    .to_owned(),
+                core_generation_id: compact_string(
+                    selector,
+                    "core_generation_id",
+                    "compact_selector_invalid",
+                )?
+                .to_owned(),
+                core_run_id: compact_string(selector, "core_run_id", "compact_selector_invalid")?
+                    .to_owned(),
+                node_id: compact_string(selector, "node_id", "compact_selector_invalid")?
+                    .to_owned(),
+            };
+            validate_pinned_identity(&identity)
+                .map_err(|_| "compact_selector_invalid".to_owned())?;
+            if identity.project_id
+                != compact_string(publication, "project_id", "compact_publication_invalid")?
+                || identity.core_generation_id
+                    != compact_string(publication, "generation_id", "compact_publication_invalid")?
+                || identity.core_run_id
+                    != compact_string(publication, "run_id", "compact_publication_invalid")?
+            {
+                return Err("compact_selector_publication_mismatch".to_owned());
+            }
+            Ok(Value::Object(selector.clone()))
+        }
+        "canonical_id" => {
+            compact_closed_object(
+                selector,
+                &["kind", "canonical_id"],
+                "compact_canonical_selector_shape_invalid",
+            )?;
+            validate_identity(compact_string(
+                selector,
+                "canonical_id",
+                "compact_selector_invalid",
+            )?)
+            .map_err(|_| "compact_selector_invalid".to_owned())?;
+            Ok(Value::Object(selector.clone()))
+        }
+        "qualified_name" => {
+            compact_closed_object(
+                selector,
+                &["kind", "qualified_name", "project_file_components"],
+                "compact_qualified_selector_shape_invalid",
+            )?;
+            validate_qualified_name(compact_string(
+                selector,
+                "qualified_name",
+                "compact_selector_invalid",
+            )?)
+            .map_err(|_| "compact_selector_invalid".to_owned())?;
+            let path = compact_selector_path(selector)?;
+            validate_optional_path(path.as_deref())
+                .map_err(|_| "compact_selector_path_invalid".to_owned())?;
+            Ok(Value::Object(selector.clone()))
+        }
+        kind if symbol_selector && kind.ends_with("_ref") => {
+            Err("compact_selector_reference_invalid".to_owned())
+        }
+        _ => Err("compact_selector_kind_invalid".to_owned()),
+    }
+}
+
+fn compact_selector_path(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<Vec<String>>, String> {
+    let value = object
+        .get("project_file_components")
+        .ok_or_else(|| "compact_selector_path_invalid".to_owned())?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_array()
+        .and_then(|path| {
+            path.iter()
+                .map(|part| part.as_str().map(ToOwned::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .map(Some)
+        .ok_or_else(|| "compact_selector_path_invalid".to_owned())
+}
+
+fn expand_grouped_clauses(
+    clauses: &[Value],
+    step_count: usize,
+    prohibition_count: usize,
+    exclusion_count: usize,
+) -> Result<Vec<Value>, String> {
+    if clauses.is_empty() {
+        return Err("compact_clauses_empty".to_owned());
+    }
+    let mut normalized = Vec::<NormalizedClause>::new();
+    let mut groups = HashMap::<(usize, usize, String), String>::new();
+    let mut covered = HashSet::<ProofContractField>::new();
+    for clause in clauses {
+        let clause = compact_object(clause, "compact_clause_invalid")?;
+        compact_closed_object(
+            clause,
+            &[
+                "start",
+                "end",
+                "clause_id",
+                "quote",
+                "classification",
+                "fields",
+                "reason",
+                "non_material_kind",
+            ],
+            "compact_clause_shape_invalid",
+        )?;
+        let start = usize::try_from(compact_u64(clause, "start", "compact_clause_span_invalid")?)
+            .map_err(|_| "compact_clause_span_invalid".to_owned())?;
+        let end = usize::try_from(compact_u64(clause, "end", "compact_clause_span_invalid")?)
+            .map_err(|_| "compact_clause_span_invalid".to_owned())?;
+        let clause_id = compact_string(clause, "clause_id", "compact_clause_id_invalid")?;
+        let quote = compact_string(clause, "quote", "compact_clause_quote_invalid")?;
+        if clause_id.is_empty() || start >= end || end - start != quote.len() {
+            return Err("compact_clause_span_invalid".to_owned());
+        }
+        let classification = compact_string(
+            clause,
+            "classification",
+            "compact_clause_classification_invalid",
+        )?;
+        let fields = compact_array(clause.get("fields"), "compact_clause_fields_missing")?;
+        let (classification, group_fingerprint) = match classification {
+            "resolved_material" => {
+                if fields.is_empty()
+                    || !clause.get("reason").is_some_and(Value::is_null)
+                    || !clause.get("non_material_kind").is_some_and(Value::is_null)
+                {
+                    return Err("compact_resolved_clause_invalid".to_owned());
+                }
+                let mut prior = None;
+                for field in fields {
+                    let field = parse_compact_contract_field(
+                        field,
+                        step_count,
+                        prohibition_count,
+                        exclusion_count,
+                    )?;
+                    if prior.is_some_and(|prior| prior >= field) {
+                        return Err("compact_clause_fields_noncanonical".to_owned());
+                    }
+                    prior = Some(field);
+                    covered.insert(field);
+                    normalized.push(NormalizedClause {
+                        start,
+                        end,
+                        clause_id: clause_id.to_owned(),
+                        classification: NormalizedClauseClassification::Resolved,
+                        field: Some(field),
+                        quote: quote.to_owned(),
+                    });
+                }
+                (
+                    NormalizedClauseClassification::Resolved,
+                    "resolved_material".to_owned(),
+                )
+            }
+            "unresolved_material" => {
+                if !fields.is_empty()
+                    || !clause.get("non_material_kind").is_some_and(Value::is_null)
+                {
+                    return Err("compact_unresolved_clause_invalid".to_owned());
+                }
+                let reason =
+                    match compact_string(clause, "reason", "compact_unresolved_clause_invalid")? {
+                        "missing_selector_resolution" => {
+                            UnresolvedMaterialReason::MissingSelectorResolution
+                        }
+                        "ambiguous_selector_resolution" => {
+                            UnresolvedMaterialReason::AmbiguousSelectorResolution
+                        }
+                        "unsupported_interpretation" => {
+                            UnresolvedMaterialReason::UnsupportedInterpretation
+                        }
+                        _ => return Err("compact_unresolved_clause_invalid".to_owned()),
+                    };
+                normalized.push(NormalizedClause {
+                    start,
+                    end,
+                    clause_id: clause_id.to_owned(),
+                    classification: NormalizedClauseClassification::Unresolved(reason.clone()),
+                    field: None,
+                    quote: quote.to_owned(),
+                });
+                (
+                    NormalizedClauseClassification::Unresolved(reason.clone()),
+                    format!("unresolved_material:{}", reason.canonical_name()),
+                )
+            }
+            "non_material" => {
+                if !fields.is_empty() || !clause.get("reason").is_some_and(Value::is_null) {
+                    return Err("compact_non_material_clause_invalid".to_owned());
+                }
+                let kind = match compact_string(
+                    clause,
+                    "non_material_kind",
+                    "compact_non_material_clause_invalid",
+                )? {
+                    "whitespace" => NonMaterialKind::Whitespace,
+                    "punctuation" => NonMaterialKind::Punctuation,
+                    "connector" => NonMaterialKind::Connector,
+                    "commentary" => NonMaterialKind::Commentary,
+                    _ => return Err("compact_non_material_clause_invalid".to_owned()),
+                };
+                normalized.push(NormalizedClause {
+                    start,
+                    end,
+                    clause_id: clause_id.to_owned(),
+                    classification: NormalizedClauseClassification::Ignored(kind.clone()),
+                    field: None,
+                    quote: quote.to_owned(),
+                });
+                (
+                    NormalizedClauseClassification::Ignored(kind.clone()),
+                    format!("non_material:{}", kind.canonical_name()),
+                )
+            }
+            _ => return Err("compact_clause_classification_invalid".to_owned()),
+        };
+        let key = (start, end, clause_id.to_owned());
+        if groups.insert(key, group_fingerprint).is_some() {
+            return Err("compact_clause_group_duplicate_or_conflicting".to_owned());
+        }
+        let _ = classification;
+    }
+    if normalized.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("compact_clauses_noncanonical".to_owned());
+    }
+    let mut required = vec![ProofContractField::Start];
+    for step in 0..step_count {
+        let step = u8::try_from(step).expect("bounded step index");
+        required.extend([
+            ProofContractField::StepTarget { step },
+            ProofContractField::Directness { step },
+            ProofContractField::Ordering { step },
+            ProofContractField::Relation { step },
+        ]);
+    }
+    required.extend(
+        (0..prohibition_count).map(|index| ProofContractField::TraversalProhibition {
+            index: u8::try_from(index).expect("bounded prohibition index"),
+        }),
+    );
+    required.extend(
+        (0..exclusion_count).map(|index| ProofContractField::ProjectionExclusion {
+            index: u8::try_from(index).expect("bounded exclusion index"),
+        }),
+    );
+    if required.iter().any(|field| !covered.contains(field)) {
+        return Err("compact_clause_required_field_missing".to_owned());
+    }
+    Ok(normalized.iter().map(normalized_clause_json).collect())
+}
+
+fn parse_compact_contract_field(
+    field: &Value,
+    step_count: usize,
+    prohibition_count: usize,
+    exclusion_count: usize,
+) -> Result<ProofContractField, String> {
+    let field = compact_object(field, "compact_clause_field_invalid")?;
+    let kind = compact_string(field, "kind", "compact_clause_field_invalid")?;
+    let parsed = match kind {
+        "start" => {
+            compact_closed_object(field, &["kind"], "compact_clause_field_shape_invalid")?;
+            ProofContractField::Start
+        }
+        "step_target" | "directness" | "ordering" | "relation" => {
+            compact_closed_object(
+                field,
+                &["kind", "step"],
+                "compact_clause_field_shape_invalid",
+            )?;
+            let step = compact_u64(field, "step", "compact_clause_field_invalid")?;
+            let step_u8 = u8::try_from(step)
+                .ok()
+                .filter(|step| usize::from(*step) < step_count)
+                .ok_or_else(|| "compact_clause_field_out_of_range".to_owned())?;
+            match kind {
+                "step_target" => ProofContractField::StepTarget { step: step_u8 },
+                "directness" => ProofContractField::Directness { step: step_u8 },
+                "ordering" => ProofContractField::Ordering { step: step_u8 },
+                "relation" => ProofContractField::Relation { step: step_u8 },
+                _ => unreachable!(),
+            }
+        }
+        "traversal_prohibition" | "projection_exclusion" => {
+            compact_closed_object(
+                field,
+                &["kind", "index"],
+                "compact_clause_field_shape_invalid",
+            )?;
+            let index = compact_u64(field, "index", "compact_clause_field_invalid")?;
+            let bound = if kind == "traversal_prohibition" {
+                prohibition_count
+            } else {
+                exclusion_count
+            };
+            let index_u8 = u8::try_from(index)
+                .ok()
+                .filter(|index| usize::from(*index) < bound)
+                .ok_or_else(|| "compact_clause_field_out_of_range".to_owned())?;
+            if kind == "traversal_prohibition" {
+                ProofContractField::TraversalProhibition { index: index_u8 }
+            } else {
+                ProofContractField::ProjectionExclusion { index: index_u8 }
+            }
+        }
+        _ => return Err("compact_clause_field_invalid".to_owned()),
+    };
+    Ok(parsed)
 }
 
 fn validate_common_projection_fields(root: &serde_json::Map<String, Value>) -> Result<(), String> {
@@ -3266,37 +3997,27 @@ fn validate_compact_line_window(
         "callsite_identity",
         "compact_receipt_callsite_invalid",
     )?;
-    let parts = callsite
-        .split('|')
-        .next()
-        .map(|prefix| prefix.split(':').collect::<Vec<_>>())
-        .filter(|parts| parts.len() == 4)
+    let callsite = parse_canonical_callsite_identity(callsite)
         .ok_or_else(|| "compact_receipt_callsite_invalid".to_owned())?;
     let expected_file = compact_i64(
         compact_object(&files[file], "compact_file_row_invalid")?,
         "file_node_id",
         "compact_file_id_invalid",
     )?;
-    let callsite_file = parts[0]
-        .parse::<i64>()
-        .ok()
-        .ok_or_else(|| "compact_receipt_callsite_invalid".to_owned())?;
-    let callsite_line = parts[1]
-        .parse::<u64>()
-        .ok()
-        .ok_or_else(|| "compact_receipt_callsite_invalid".to_owned())?;
-    parts[2]
-        .parse::<u64>()
-        .ok()
-        .ok_or_else(|| "compact_receipt_callsite_invalid".to_owned())?;
+    let projected_column = compact_u64(
+        receipt,
+        "column_or_ordinal",
+        "compact_receipt_column_invalid",
+    )?;
     let exact_start = compact_u64(
         receipt,
         "exact_callsite_start_byte",
         "compact_receipt_start_invalid",
     )?;
-    if callsite_file != expected_file
-        || callsite_line != anchor_line
-        || parts[3].is_empty()
+    if callsite.file_id != expected_file
+        || callsite.line == 0
+        || u64::from(callsite.line) != anchor_line
+        || u64::from(callsite.column_or_ordinal) != projected_column
         || exact_start < byte_start
         || exact_start >= byte_end
     {
@@ -3360,7 +4081,8 @@ fn validate_disposition_receipts(
     contract_digest: &str,
     steps: &[(String, Option<usize>)],
     receipts: &[Value],
-) -> Result<(), String> {
+    prohibition_count: usize,
+) -> Result<Vec<usize>, String> {
     if compact_string(
         disposition,
         "contract_digest",
@@ -3387,7 +4109,8 @@ fn validate_disposition_receipts(
             {
                 return Err("compact_proven_step_sequence_invalid".to_owned());
             }
-            validate_receipt_sequence(&sequence, receipts)
+            validate_receipt_sequence(&sequence, receipts)?;
+            Ok(sequence)
         }
         "unknown" => {
             compact_closed_object(
@@ -3395,11 +4118,15 @@ fn validate_disposition_receipts(
                 &["kind", "contract_digest", "gaps", "connected_receipts"],
                 "compact_disposition_shape_invalid",
             )?;
-            compact_array(disposition.get("gaps"), "compact_disposition_gaps_missing")?;
+            validate_compact_gaps(
+                compact_array(disposition.get("gaps"), "compact_disposition_gaps_missing")?,
+                steps.len(),
+            )?;
             let sequence =
                 compact_receipt_sequence(disposition.get("connected_receipts"), receipts)?;
             validate_prefix_steps(steps, &sequence, "unknown", None)?;
-            validate_receipt_sequence(&sequence, receipts)
+            validate_receipt_sequence(&sequence, receipts)?;
+            Ok(sequence)
         }
         "contract_refuted" => {
             compact_closed_object(
@@ -3429,11 +4156,14 @@ fn validate_disposition_receipts(
                         ],
                         "compact_refutation_shape_invalid",
                     )?;
-                    compact_u64(
+                    usize::try_from(compact_u64(
                         refutation,
                         "prohibition_index",
                         "compact_refutation_invalid",
-                    )?;
+                    )?)
+                    .ok()
+                    .filter(|index| *index < prohibition_count)
+                    .ok_or_else(|| "compact_refutation_invalid".to_owned())?;
                     let sequence =
                         compact_receipt_sequence(refutation.get("connected_receipts"), receipts)?;
                     if sequence.len() != step_index + 1 {
@@ -3445,7 +4175,8 @@ fn validate_disposition_receipts(
                         "unknown",
                         Some((step_index, "positive_contradiction")),
                     )?;
-                    validate_receipt_sequence(&sequence, receipts)
+                    validate_receipt_sequence(&sequence, receipts)?;
+                    Ok(sequence)
                 }
                 "certified_absence" => {
                     compact_closed_object(
@@ -3480,7 +4211,8 @@ fn validate_disposition_receipts(
                         "unknown",
                         Some((step_index, "certified_absence")),
                     )?;
-                    validate_receipt_sequence(&sequence, receipts)
+                    validate_receipt_sequence(&sequence, receipts)?;
+                    Ok(sequence)
                 }
                 _ => Err("compact_refutation_kind_invalid".to_owned()),
             }
@@ -3495,7 +4227,27 @@ fn validate_disposition_receipts(
                 disposition.get("reasons"),
                 "compact_unavailable_reasons_missing",
             )?;
-            if reasons.is_empty() || reasons.iter().any(|reason| !reason.is_string()) {
+            const CANONICAL_REASONS: &[&str] = &[
+                "validated_contract_hash_mismatch",
+                "publication_pin_mismatch",
+                "source_not_bound_to_publication",
+                "proof_facts_unavailable",
+                "proof_semantic_projection_unavailable",
+            ];
+            let reason_ranks = reasons
+                .iter()
+                .map(|reason| {
+                    reason
+                        .as_str()
+                        .and_then(|reason| {
+                            CANONICAL_REASONS
+                                .iter()
+                                .position(|candidate| *candidate == reason)
+                        })
+                        .ok_or_else(|| "compact_unavailable_reasons_invalid".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if reason_ranks.is_empty() || reason_ranks.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err("compact_unavailable_reasons_invalid".to_owned());
             }
             if steps
@@ -3504,10 +4256,79 @@ fn validate_disposition_receipts(
             {
                 return Err("compact_unavailable_step_sequence_invalid".to_owned());
             }
-            Ok(())
+            Ok(Vec::new())
         }
         _ => Err("compact_disposition_kind_invalid".to_owned()),
     }
+}
+
+fn validate_compact_gaps(gaps: &[Value], step_count: usize) -> Result<(), String> {
+    if gaps.is_empty() {
+        return Err("compact_disposition_gaps_invalid".to_owned());
+    }
+    let mut prior = None;
+    for gap in gaps {
+        let gap = compact_object(gap, "compact_disposition_gap_invalid")?;
+        let kind = compact_string(gap, "kind", "compact_disposition_gap_invalid")?;
+        let (rank, index, index_field) = match kind {
+            "selector_missing" => (0_u8, selector_gap_index(gap, step_count)?, "selector_index"),
+            "selector_ambiguous" => (1, selector_gap_index(gap, step_count)?, "selector_index"),
+            "non_callable_selector" => (2, selector_gap_index(gap, step_count)?, "selector_index"),
+            "direct_call_missing" => (3, step_gap_index(gap, step_count)?, "step_index"),
+            "recursive_call_not_representable" => {
+                (4, step_gap_index(gap, step_count)?, "step_index")
+            }
+            "source_window_too_large" => (5, step_gap_index(gap, step_count)?, "step_index"),
+            "invalid_utf8" => (6, step_gap_index(gap, step_count)?, "step_index"),
+            "source_line_out_of_range" => (7, step_gap_index(gap, step_count)?, "step_index"),
+            "edge_containment_unproven" => (8, step_gap_index(gap, step_count)?, "step_index"),
+            "missing_direct_call_receipt" => (9, step_gap_index(gap, step_count)?, "step_index"),
+            "receipt_or_edge_already_used" => (10, step_gap_index(gap, step_count)?, "step_index"),
+            "projection_exclusion_conflicts_with_required_receipt" => {
+                (11, step_gap_index(gap, step_count)?, "step_index")
+            }
+            _ => return Err("compact_disposition_gap_invalid".to_owned()),
+        };
+        compact_closed_object(
+            gap,
+            &["kind", index_field],
+            "compact_disposition_gap_invalid",
+        )?;
+        let key = (rank, index);
+        if prior.is_some_and(|prior| prior >= key) {
+            return Err("compact_disposition_gaps_noncanonical".to_owned());
+        }
+        prior = Some(key);
+    }
+    Ok(())
+}
+
+fn selector_gap_index(
+    gap: &serde_json::Map<String, Value>,
+    step_count: usize,
+) -> Result<usize, String> {
+    usize::try_from(compact_u64(
+        gap,
+        "selector_index",
+        "compact_disposition_gap_invalid",
+    )?)
+    .ok()
+    .filter(|index| *index <= step_count)
+    .ok_or_else(|| "compact_disposition_gap_invalid".to_owned())
+}
+
+fn step_gap_index(
+    gap: &serde_json::Map<String, Value>,
+    step_count: usize,
+) -> Result<usize, String> {
+    usize::try_from(compact_u64(
+        gap,
+        "step_index",
+        "compact_disposition_gap_invalid",
+    )?)
+    .ok()
+    .filter(|index| *index < step_count)
+    .ok_or_else(|| "compact_disposition_gap_invalid".to_owned())
 }
 
 fn compact_receipt_sequence(
@@ -3592,6 +4413,123 @@ pub fn project_internal_call_path_result(
     })
 }
 
+fn grouped_clauses_json(clauses: &[NormalizedClause]) -> Vec<Value> {
+    let mut grouped = Vec::<Value>::new();
+    let mut prior: Option<&NormalizedClause> = None;
+    for clause in clauses {
+        let same_group = prior.is_some_and(|prior| {
+            prior.start == clause.start
+                && prior.end == clause.end
+                && prior.clause_id == clause.clause_id
+                && prior.quote == clause.quote
+                && prior.classification == clause.classification
+        });
+        if same_group {
+            grouped
+                .last_mut()
+                .and_then(|row| row.get_mut("fields"))
+                .and_then(Value::as_array_mut)
+                .expect("grouped normalized clause has fields")
+                .push(
+                    clause
+                        .field
+                        .expect("only resolved normalized clauses repeat")
+                        .canonical_json(),
+                );
+        } else {
+            let (reason, non_material_kind) = match &clause.classification {
+                NormalizedClauseClassification::Resolved => (None, None),
+                NormalizedClauseClassification::Unresolved(reason) => {
+                    (Some(reason.canonical_name()), None)
+                }
+                NormalizedClauseClassification::Ignored(kind) => {
+                    (None, Some(kind.canonical_name()))
+                }
+            };
+            grouped.push(json!({
+                "start": clause.start,
+                "end": clause.end,
+                "clause_id": clause.clause_id,
+                "quote": clause.quote,
+                "classification": clause.classification.canonical_name(),
+                "fields": clause.field.map(ProofContractField::canonical_json).into_iter().collect::<Vec<_>>(),
+                "reason": reason,
+                "non_material_kind": non_material_kind,
+            }));
+        }
+        prior = Some(clause);
+    }
+    grouped
+}
+
+fn compact_symbol_selector_json(
+    selector: &ExactSymbolSelector,
+    expected: Option<&ResolvedNodeIdentity>,
+    tables: &CompactIdentityTables,
+) -> Result<Value, InternalProjectionError> {
+    let Some(expected) = expected else {
+        return Ok(symbol_selector_json(selector));
+    };
+    if !symbol_selector_matches(selector, expected) {
+        return Err(InternalProjectionError::InvalidCompactProjection(
+            "compact_selector_receipt_mismatch".to_owned(),
+        ));
+    }
+    let symbol = tables
+        .symbol_by_node_id
+        .get(&expected.pinned.node_id)
+        .copied()
+        .ok_or_else(|| {
+            InternalProjectionError::InvalidCompactProjection(
+                "compact_selector_symbol_missing".to_owned(),
+            )
+        })?;
+    Ok(match selector {
+        ExactSymbolSelector::PinnedNode(_) => {
+            json!({"kind":"pinned_node_ref", "symbol":symbol})
+        }
+        ExactSymbolSelector::CanonicalId(_) => {
+            json!({"kind":"canonical_id_ref", "symbol":symbol})
+        }
+        ExactSymbolSelector::QualifiedName {
+            project_file_components,
+            ..
+        } => json!({
+            "kind":"qualified_name_ref",
+            "symbol":symbol,
+            "path_binding": if project_file_components.is_some() { "exact_file" } else { "none" },
+        }),
+    })
+}
+
+fn compact_spec_json(
+    spec: &CallPathSpec,
+    receipts: &[IndexedCallEdgeReceipt],
+    tables: &CompactIdentityTables,
+) -> Result<Value, InternalProjectionError> {
+    Ok(json!({
+        "start": compact_symbol_selector_json(
+            &spec.start,
+            receipts.first().map(|receipt| &receipt.source),
+            tables,
+        )?,
+        "steps": spec.steps.iter().enumerate().map(|(index, step)| {
+            compact_symbol_selector_json(
+                &step.target,
+                receipts.get(index).map(|receipt| &receipt.target),
+                tables,
+            ).map(|target| json!({
+                "relation":"direct_outgoing_call",
+                "target":target,
+            }))
+        }).collect::<Result<Vec<_>, _>>()?,
+        "prohibit_traversal_through": spec.prohibit_traversal_through
+            .iter().map(scope_selector_json).collect::<Vec<_>>(),
+        "exclude_from_projection": spec.exclude_from_projection
+            .iter().map(scope_selector_json).collect::<Vec<_>>(),
+    }))
+}
+
 fn complete_projection_json(
     integration: &CheckedBuiltCallPathIntegration,
 ) -> Result<Value, InternalProjectionError> {
@@ -3620,18 +4558,17 @@ fn complete_projection_json(
         "contract_digest": integration.hashes.contract_digest,
         "core_publication": publication_json(&integration.built.publication),
         "identities": tables.json(),
-        "spec": spec_json(&integration.contract.spec),
-        "clauses": integration
-            .rendering
-            .normalized_clauses
-            .iter()
-            .map(normalized_clause_json)
-            .collect::<Vec<_>>(),
+        "spec": compact_spec_json(
+            &integration.contract.spec,
+            &integration.authoritative_receipts,
+            &tables,
+        )?,
+        "clauses": grouped_clauses_json(&integration.rendering.normalized_clauses),
         "disposition": disposition_json(&integration.disposition, &receipt_refs)?,
         "steps": step_results_json(&integration.contract, &integration.disposition, &receipt_refs)?,
         "receipts": receipts,
     });
-    validate_compact_projection(&complete)
+    validate_compact_projection_against_receipts(&complete, &integration.authoritative_receipts)
         .map_err(InternalProjectionError::InvalidCompactProjection)?;
     Ok(complete)
 }
@@ -4012,6 +4949,7 @@ mod tests {
         target: &str,
         text: String,
     ) -> IndexedCallEdgeReceipt {
+        let evidence_sha256 = format!("{:064x}", index + 2);
         IndexedCallEdgeReceipt {
             receipt: ReceiptRef {
                 receipt_id: format!("receipt-{index}"),
@@ -4019,8 +4957,8 @@ mod tests {
             },
             source: node(source),
             target: node(target),
-            resolution_fact_id: format!("{:064x}", index + 1),
-            resolution_evidence_sha256: format!("{:064x}", index + 2),
+            resolution_fact_id: resolution_fact_id_from_evidence_sha256(&evidence_sha256),
+            resolution_evidence_sha256: evidence_sha256.clone(),
             resolution_evidence_chain: vec![ResolutionEvidence::SameFileDeclaration {
                 declaration: NodeId(node(target).pinned.node_id.parse().unwrap()),
             }],
@@ -4041,7 +4979,7 @@ mod tests {
                         source_sha256: format!("{:064x}", index + 4),
                     },
                 ],
-                evidence_sha256: format!("{:064x}", index + 2),
+                evidence_sha256,
             },
             exact_callsite_start_byte: (index * 10) as u64,
             callsite_identity: format!(
@@ -4643,6 +5581,702 @@ mod tests {
         assert_eq!(root["disposition"]["receipts"], json!([0, 1]));
         assert_eq!(root["steps"][0]["receipt"], 0);
         assert_eq!(root["steps"][1]["receipt"], 1);
+    }
+
+    #[test]
+    fn compact_projection_groups_one_six_step_anchor_into_twenty_five_ordered_fields() {
+        let source = "call A → B → C → D → E → F → G exactly \\\"once\\\"";
+        let names = ["A", "B", "C", "D", "E", "F", "G"];
+        let mut fields = vec![ProofContractField::Start];
+        for step in 0..6_u8 {
+            fields.extend([
+                ProofContractField::StepTarget { step },
+                ProofContractField::Directness { step },
+                ProofContractField::Ordering { step },
+                ProofContractField::Relation { step },
+            ]);
+        }
+        let ValidationOutcome::Validated {
+            contract,
+            hashes,
+            rendering,
+        } = validate_contract(UnvalidatedCallPathContract::new(
+            source,
+            vec![ClauseAnchor {
+                clause_id: "single éscape-heavy anchor".to_owned(),
+                start: 0,
+                end: source.len(),
+                quote: source.to_owned(),
+                classification: ClauseClassification::ResolvedMaterial { fields },
+            }],
+            spec(&names[1..]),
+        ))
+        .expect("valid six-step grouped contract")
+        else {
+            panic!("six-step grouped contract must validate")
+        };
+        let receipts = (0..6)
+            .map(|index| {
+                indexed_receipt(
+                    index,
+                    names[index],
+                    names[index + 1],
+                    format!("{} calls {}();\n", names[index], names[index + 1]),
+                )
+            })
+            .collect();
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(receipts, Vec::new(), Vec::new()),
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).expect("compact six-step projection")
+        else {
+            panic!("six-step projection remains complete")
+        };
+
+        let clauses = root["clauses"].as_array().expect("grouped clauses");
+        assert_eq!(clauses.len(), 1);
+        assert_eq!(clauses[0]["quote"], source);
+        let fields = clauses[0]["fields"].as_array().expect("grouped fields");
+        assert_eq!(fields.len(), 25);
+        assert_eq!(fields[0], json!({"kind":"start"}));
+        assert_eq!(fields.last(), Some(&json!({"kind":"relation","step":5})));
+        assert_eq!(root["contract_digest"], hashes.contract_digest());
+        assert_eq!(validate_compact_projection(&root), Ok(()));
+    }
+
+    #[test]
+    fn compact_projection_grouped_clause_hostile_matrix_is_closed() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B"]);
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![indexed_receipt(0, "A", "B", "A calls B();\n".to_owned())],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).unwrap()
+        else {
+            panic!("fixture remains complete")
+        };
+        assert_eq!(root["clauses"].as_array().unwrap().len(), 2);
+
+        let mut mutations = Vec::new();
+
+        let mut duplicate = root.clone();
+        let duplicate_field = duplicate["clauses"][0]["fields"][0].clone();
+        duplicate["clauses"][0]["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate_field);
+        mutations.push(duplicate);
+
+        let mut missing = root.clone();
+        missing["clauses"][1]["fields"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        mutations.push(missing);
+
+        let mut out_of_order = root.clone();
+        out_of_order["clauses"][0]["fields"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        mutations.push(out_of_order);
+
+        let mut unknown = root.clone();
+        unknown["clauses"][0]["fields"][0]["kind"] = json!("unknown_field");
+        mutations.push(unknown);
+
+        let mut out_of_range = root.clone();
+        out_of_range["clauses"][0]["fields"][0] = json!({"kind":"step_target","step":6});
+        mutations.push(out_of_range);
+
+        let mut contradictory = root.clone();
+        let mut contradiction = contradictory["clauses"][0].clone();
+        contradiction["classification"] = json!("unresolved_material");
+        contradiction["fields"] = json!([]);
+        contradiction["reason"] = json!("missing_selector_resolution");
+        contradictory["clauses"]
+            .as_array_mut()
+            .unwrap()
+            .push(contradiction);
+        mutations.push(contradictory);
+
+        let mut bad_span = root.clone();
+        bad_span["clauses"][0]["end"] = bad_span["clauses"][0]["start"].clone();
+        mutations.push(bad_span);
+
+        let mut bad_quote = root.clone();
+        bad_quote["clauses"][0]["quote"] = json!("\\\"café\\n");
+        mutations.push(bad_quote);
+
+        let mut bad_reason = root.clone();
+        bad_reason["clauses"][0]["reason"] = json!("unsupported_interpretation");
+        mutations.push(bad_reason);
+
+        let mut bad_non_material = root.clone();
+        bad_non_material["clauses"][0]["non_material_kind"] = json!("commentary");
+        mutations.push(bad_non_material);
+
+        for mutation in mutations {
+            assert!(
+                validate_compact_projection(&mutation).is_err(),
+                "grouped clause mutation passed: {mutation}"
+            );
+        }
+    }
+
+    fn projection_with_selectors(
+        start: UnvalidatedExactSymbolSelector,
+        target: UnvalidatedExactSymbolSelector,
+    ) -> Value {
+        let mut input = valid_input(&["B"]);
+        input.spec.start = start;
+        input.spec.steps[0].target = target;
+        let ValidationOutcome::Validated {
+            contract,
+            hashes,
+            rendering,
+        } = validate_contract(input).expect("selector fixture validates")
+        else {
+            panic!("selector fixture must validate")
+        };
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![indexed_receipt(0, "A", "B", "A calls B();\n".to_owned())],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).unwrap()
+        else {
+            panic!("selector fixture remains complete")
+        };
+        root
+    }
+
+    #[test]
+    fn compact_selector_refs_preserve_kind_path_presence_and_connected_positions_only() {
+        let canonical = projection_with_selectors(
+            UnvalidatedExactSymbolSelector::CanonicalId("A".to_owned()),
+            UnvalidatedExactSymbolSelector::CanonicalId("B".to_owned()),
+        );
+        assert_eq!(
+            canonical["spec"]["start"],
+            json!({"kind":"canonical_id_ref","symbol":0})
+        );
+        assert_eq!(
+            canonical["spec"]["steps"][0]["target"],
+            json!({"kind":"canonical_id_ref","symbol":1})
+        );
+
+        let pinned = projection_with_selectors(
+            UnvalidatedExactSymbolSelector::PinnedNode(node("A").pinned),
+            UnvalidatedExactSymbolSelector::PinnedNode(node("B").pinned),
+        );
+        assert_eq!(
+            pinned["spec"]["start"],
+            json!({"kind":"pinned_node_ref","symbol":0})
+        );
+
+        let qualified_unbound = projection_with_selectors(
+            UnvalidatedExactSymbolSelector::QualifiedName {
+                qualified_name: "crate::A".to_owned(),
+                project_file_components: None,
+            },
+            UnvalidatedExactSymbolSelector::QualifiedName {
+                qualified_name: "crate::B".to_owned(),
+                project_file_components: None,
+            },
+        );
+        assert_eq!(
+            qualified_unbound["spec"]["start"],
+            json!({"kind":"qualified_name_ref","symbol":0,"path_binding":"none"})
+        );
+
+        let qualified_exact = projection_with_selectors(
+            UnvalidatedExactSymbolSelector::QualifiedName {
+                qualified_name: "crate::A".to_owned(),
+                project_file_components: Some(node("A").project_file_components),
+            },
+            UnvalidatedExactSymbolSelector::QualifiedName {
+                qualified_name: "crate::B".to_owned(),
+                project_file_components: Some(node("B").project_file_components),
+            },
+        );
+        assert_eq!(
+            qualified_exact["spec"]["start"],
+            json!({"kind":"qualified_name_ref","symbol":0,"path_binding":"exact_file"})
+        );
+
+        let (contract, hashes, rendering) = validate_for_projection(&["B", "C"]);
+        let partial = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![indexed_receipt(0, "A", "B", "A calls B();\n".to_owned())],
+                vec![FactBuildGap::DirectCallMissing { step_index: 1 }],
+                Vec::new(),
+            ),
+        );
+        let InternalProjection::Complete { root: partial, .. } =
+            project_internal_call_path_result(&partial).unwrap()
+        else {
+            panic!("partial projection remains complete")
+        };
+        assert_eq!(partial["spec"]["start"]["kind"], "canonical_id_ref");
+        assert_eq!(
+            partial["spec"]["steps"][0]["target"]["kind"],
+            "canonical_id_ref"
+        );
+        assert_eq!(
+            partial["spec"]["steps"][1]["target"],
+            json!({"kind":"canonical_id","canonical_id":"C"})
+        );
+
+        let mut mutations = Vec::new();
+        let mut wrong_symbol = canonical.clone();
+        wrong_symbol["spec"]["start"]["symbol"] = json!(1);
+        mutations.push(wrong_symbol);
+        let mut dangling = canonical.clone();
+        dangling["spec"]["start"]["symbol"] = json!(99);
+        mutations.push(dangling);
+        let mut wrong_kind = canonical.clone();
+        wrong_kind["spec"]["start"]["kind"] = json!("pinned_node_ref");
+        mutations.push(wrong_kind);
+        let mut wrong_path_mode = qualified_exact.clone();
+        wrong_path_mode["spec"]["start"]["path_binding"] = json!("none");
+        mutations.push(wrong_path_mode);
+        let mut wrong_file = qualified_exact;
+        wrong_file["identities"]["symbols"][1]["file"] = json!(0);
+        mutations.push(wrong_file);
+        let mut wrong_publication = pinned;
+        wrong_publication["core_publication"]["run_id"] = json!("other-run");
+        mutations.push(wrong_publication);
+        let mut disconnected = partial;
+        disconnected["spec"]["steps"][1]["target"] = json!({"kind":"canonical_id_ref","symbol":1});
+        mutations.push(disconnected);
+
+        for mutation in mutations {
+            assert!(
+                validate_compact_projection(&mutation).is_err(),
+                "compact selector mutation passed: {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_provenance_profiles_are_shared_and_hostile_references_fail_closed() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B", "C"]);
+        let first = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+        let second = indexed_receipt(1, "B", "C", "B calls C();\n".to_owned());
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).unwrap()
+        else {
+            panic!("shared provenance fixture remains complete")
+        };
+        assert_eq!(
+            root["identities"]["provenance_profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            root["identities"]["evidence"][0]["provenance"]["profile"],
+            0
+        );
+        assert_eq!(
+            root["identities"]["evidence"][1]["provenance"]["profile"],
+            0
+        );
+        assert!(
+            root["identities"]["provenance_profiles"][0]
+                .get("evidence_sha256")
+                .is_none()
+        );
+        assert!(
+            root["identities"]["evidence"][0]["provenance"]
+                .get("evidence_sha256")
+                .is_some()
+        );
+
+        let mut mutations = Vec::new();
+        let mut dangling = root.clone();
+        dangling["identities"]["evidence"][0]["provenance"]["profile"] = json!(99);
+        mutations.push(dangling);
+        let mut duplicate_profile = root.clone();
+        duplicate_profile["identities"]["provenance_profiles"]
+            .as_array_mut()
+            .unwrap()
+            .push(root["identities"]["provenance_profiles"][0].clone());
+        mutations.push(duplicate_profile);
+        let mut moved_hash = root.clone();
+        moved_hash["identities"]["provenance_profiles"][0]["evidence_sha256"] =
+            moved_hash["identities"]["evidence"][0]["provenance"]["evidence_sha256"].clone();
+        moved_hash["identities"]["evidence"][0]["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("evidence_sha256");
+        mutations.push(moved_hash);
+        let mut moved_dependencies = root.clone();
+        moved_dependencies["identities"]["provenance_profiles"][0]["dependency_files"] =
+            moved_dependencies["identities"]["evidence"][0]["provenance"]["dependency_files"]
+                .clone();
+        moved_dependencies["identities"]["evidence"][0]["provenance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("dependency_files");
+        mutations.push(moved_dependencies);
+
+        let mut first = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+        first.resolution_provenance.language_adapter_version = "test-v1".to_owned();
+        let mut second = indexed_receipt(1, "B", "C", "B calls C();\n".to_owned());
+        second.resolution_provenance.language_adapter_version = "test-v2".to_owned();
+        let two_profiles = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
+        );
+        let InternalProjection::Complete {
+            root: mut swapped, ..
+        } = project_internal_call_path_result(&two_profiles).unwrap()
+        else {
+            panic!("two-profile fixture remains complete")
+        };
+        swapped["identities"]["evidence"][0]["provenance"]["profile"] = json!(1);
+        swapped["identities"]["evidence"][1]["provenance"]["profile"] = json!(0);
+        mutations.push(swapped);
+
+        for mutation in mutations {
+            assert!(
+                validate_compact_projection(&mutation).is_err(),
+                "provenance mutation passed: {mutation}"
+            );
+        }
+    }
+
+    fn projected_root(
+        contract: &ValidatedCallPathContract,
+        hashes: &ProofHashes,
+        rendering: &ValidatedContractRendering,
+        built: BuiltCallPathFacts,
+    ) -> Value {
+        let integration = checked_integration(contract, hashes, rendering, built);
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).unwrap()
+        else {
+            panic!("focused fixture remains complete")
+        };
+        root
+    }
+
+    #[test]
+    fn compact_disposition_authority_hostile_matrix_is_closed_for_every_variant() {
+        let (proven_contract, proven_hashes, proven_rendering) =
+            validate_for_projection(&["B", "C"]);
+        let proven = projected_root(
+            &proven_contract,
+            &proven_hashes,
+            &proven_rendering,
+            built_from_receipts(
+                vec![
+                    indexed_receipt(0, "A", "B", "A calls B();\n".to_owned()),
+                    indexed_receipt(1, "B", "C", "B calls C();\n".to_owned()),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+
+        let (unknown_contract, unknown_hashes, unknown_rendering) =
+            validate_for_projection(&["B", "C", "D"]);
+        let unknown = projected_root(
+            &unknown_contract,
+            &unknown_hashes,
+            &unknown_rendering,
+            built_from_receipts(
+                vec![
+                    indexed_receipt(0, "A", "B", "A calls B();\n".to_owned()),
+                    indexed_receipt(1, "B", "C", "B calls C();\n".to_owned()),
+                ],
+                vec![FactBuildGap::DirectCallMissing { step_index: 2 }],
+                Vec::new(),
+            ),
+        );
+
+        let (refuted_contract, refuted_hashes, refuted_rendering) =
+            validated_with_policies(&["B", "C"], &["B"], &[]);
+        let refuted = projected_root(
+            &refuted_contract,
+            &refuted_hashes,
+            &refuted_rendering,
+            built_from_receipts(
+                vec![indexed_receipt(0, "A", "B", "A calls B();\n".to_owned())],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+
+        let (absence_contract, absence_hashes, absence_rendering) = validate_for_projection(&["B"]);
+        let absence = projected_root(
+            &absence_contract,
+            &absence_hashes,
+            &absence_rendering,
+            BuiltCallPathFacts {
+                publication: publication(),
+                facts: vec![VerifiedProofFact::CertifiedAbsence(CertifiedAbsenceFact {
+                    source: node("A"),
+                    expected_target: ExactSymbolSelector::CanonicalId("B".to_owned()),
+                    extractor_capability_receipt_id: "extractor".to_owned(),
+                    untruncated_enumeration_receipt_id: "enumeration".to_owned(),
+                })],
+                receipts: Vec::new(),
+                gaps: Vec::new(),
+                unavailable: Vec::new(),
+            },
+        );
+
+        let unavailable = projected_root(
+            &absence_contract,
+            &absence_hashes,
+            &absence_rendering,
+            BuiltCallPathFacts {
+                publication: publication(),
+                facts: vec![VerifiedProofFact::Unavailable(UnavailableProofFact {
+                    reason: UnavailableReason::ProofFactsUnavailable,
+                })],
+                receipts: Vec::new(),
+                gaps: Vec::new(),
+                unavailable: vec![UnavailableReason::ProofFactsUnavailable],
+            },
+        );
+
+        for root in [&proven, &unknown, &refuted, &absence, &unavailable] {
+            assert_eq!(validate_compact_projection(root), Ok(()));
+        }
+
+        let (long_contract, long_hashes, long_rendering) =
+            validate_for_projection(&["B", "C", "D"]);
+        let mut unexhausted = projected_root(
+            &long_contract,
+            &long_hashes,
+            &long_rendering,
+            built_from_receipts(
+                vec![
+                    indexed_receipt(0, "A", "B", "A calls B();\n".to_owned()),
+                    indexed_receipt(1, "B", "C", "B calls C();\n".to_owned()),
+                    indexed_receipt(2, "C", "D", "C calls D();\n".to_owned()),
+                ],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        unexhausted["disposition"] = json!({
+            "kind":"unknown",
+            "contract_digest":long_hashes.contract_digest(),
+            "gaps":[{"kind":"direct_call_missing","step_index":2}],
+            "connected_receipts":[0,1]
+        });
+        unexhausted["steps"] = json!([
+            {"step_index":0,"status":"proven","receipt":0},
+            {"step_index":1,"status":"proven","receipt":1},
+            {"step_index":2,"status":"unknown","receipt":null}
+        ]);
+
+        let mut mutations = vec![unexhausted];
+        let mut removed = proven.clone();
+        removed["receipts"].as_array_mut().unwrap().pop();
+        mutations.push(removed);
+        let mut reordered = proven.clone();
+        reordered["receipts"].as_array_mut().unwrap().swap(0, 1);
+        mutations.push(reordered);
+        let mut disconnected = unknown.clone();
+        disconnected["spec"]["steps"][2]["target"] = json!({"kind":"canonical_id_ref","symbol":2});
+        mutations.push(disconnected);
+        let mut malformed_gap = unknown.clone();
+        malformed_gap["disposition"]["gaps"] = json!([{
+            "kind":"selector_missing","selector_index":99,"extra":true
+        }]);
+        mutations.push(malformed_gap);
+        let mut unknown_gap = unknown;
+        unknown_gap["disposition"]["gaps"] = json!([{"kind":"mystery_gap"}]);
+        mutations.push(unknown_gap);
+        let mut nonexistent_prohibition = refuted;
+        nonexistent_prohibition["disposition"]["refutation"]["prohibition_index"] = json!(1);
+        mutations.push(nonexistent_prohibition);
+        let mut unknown_reason = unavailable.clone();
+        unknown_reason["disposition"]["reasons"] = json!(["unknown_reason"]);
+        mutations.push(unknown_reason);
+        let mut duplicate_reason = unavailable;
+        duplicate_reason["disposition"]["reasons"] =
+            json!(["proof_facts_unavailable", "proof_facts_unavailable"]);
+        mutations.push(duplicate_reason);
+
+        for mutation in mutations {
+            assert!(
+                validate_compact_projection(&mutation).is_err(),
+                "disposition authority mutation passed: {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_typed_receipt_correlation_closes_two_profile_payload_mutations() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B", "C"]);
+        let mut first = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+        first.resolution_provenance.language_adapter_version = "adapter-v1".to_owned();
+        first.resolution_evidence_chain = vec![ResolutionEvidence::StaticImportBinding {
+            import: NodeId(10),
+            declaration: NodeId(20),
+        }];
+        let mut second = indexed_receipt(1, "B", "C", "B calls C();\n".to_owned());
+        second.resolution_provenance.language_adapter_version = "adapter-v2".to_owned();
+        let typed = vec![first, second];
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(typed.clone(), Vec::new(), Vec::new()),
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).unwrap()
+        else {
+            panic!("two-profile fixture remains complete")
+        };
+        assert_eq!(
+            validate_compact_projection_against_receipts(&root, &typed),
+            Ok(())
+        );
+
+        let mut mutations = Vec::new();
+        for (field, replacement) in [
+            ("producer", json!("other-internal")),
+            ("fact_schema_version", json!(2)),
+            ("algorithm", json!("exact-call-resolution-v2")),
+            ("language_adapter", json!("other-language")),
+            ("language_adapter_version", json!("other-adapter")),
+            ("parser_fingerprint", json!("0".repeat(64))),
+        ] {
+            let mut mutation = root.clone();
+            mutation["identities"]["provenance_profiles"][0][field] = replacement;
+            mutations.push(mutation);
+        }
+        let mut swapped_profiles = root.clone();
+        swapped_profiles["identities"]["provenance_profiles"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        swapped_profiles["identities"]["evidence"][0]["provenance"]["profile"] = json!(1);
+        swapped_profiles["identities"]["evidence"][1]["provenance"]["profile"] = json!(0);
+        mutations.push(swapped_profiles);
+        let mut chain_kind = root.clone();
+        chain_kind["identities"]["evidence"][0]["chain"][0]["kind"] = json!("qualified_path");
+        mutations.push(chain_kind);
+        let mut chain_symbols = root.clone();
+        chain_symbols["identities"]["evidence"][0]["chain"][0]["symbols"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        mutations.push(chain_symbols);
+        let mut dependency_order = root.clone();
+        dependency_order["identities"]["evidence"][0]["provenance"]["dependency_files"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        mutations.push(dependency_order);
+        let mut dependency_identity = root.clone();
+        dependency_identity["identities"]["files"][1]["file_node_id"] = json!("99");
+        mutations.push(dependency_identity);
+        let mut dependency_hash = root.clone();
+        dependency_hash["identities"]["files"][1]["indexed_sha256"] = json!("0".repeat(64));
+        mutations.push(dependency_hash);
+        let mut fact_id = root.clone();
+        fact_id["identities"]["evidence"][0]["fact_id"] = json!("0".repeat(64));
+        mutations.push(fact_id);
+        let mut evidence_digest = root;
+        evidence_digest["identities"]["evidence"][0]["provenance"]["evidence_sha256"] =
+            json!("0".repeat(64));
+        mutations.push(evidence_digest);
+
+        for mutation in mutations {
+            assert!(
+                validate_compact_projection_against_receipts(&mutation, &typed).is_err(),
+                "typed receipt correlation mutation passed: {mutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_callsite_coordinates_require_canonical_widths_and_match_the_receipt() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B"]);
+        let mut zero_ordinal = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
+        zero_ordinal.column_or_ordinal = 0;
+        zero_ordinal.callsite_identity = "1:1:0:20|rust".to_owned();
+        let valid_zero = projected_root(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![zero_ordinal], Vec::new(), Vec::new()),
+        );
+        assert_eq!(validate_compact_projection(&valid_zero), Ok(()));
+
+        let base = projected_root(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(
+                vec![indexed_receipt(0, "A", "B", "A calls B();\n".to_owned())],
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let mut mutations = Vec::new();
+        let mutate_callsite = |root: &Value, identity: &str| {
+            let mut mutation = root.clone();
+            mutation["receipts"][0]["callsite_identity"] = json!(identity);
+            mutation["identities"]["evidence"][0]["callsite_identity"] = json!(identity);
+            mutation
+        };
+        let mut column_mismatch = base.clone();
+        column_mismatch["receipts"][0]["column_or_ordinal"] = json!(2);
+        mutations.push(column_mismatch);
+        mutations.push(mutate_callsite(&base, "1:1:4294967296:20|rust"));
+        mutations.push(mutate_callsite(&base, "1:0:1:20|rust"));
+        mutations.push(mutate_callsite(&base, "1:4294967296:1:20|rust"));
+        mutations.push(mutate_callsite(&base, "1:1:1:not-a-target|rust"));
+        mutations.push(mutate_callsite(&base, "01:1:1:20|rust"));
+        mutations.push(mutate_callsite(&base, "1:01:1:20|rust"));
+        mutations.push(mutate_callsite(&base, "1:1:01:20|rust"));
+        mutations.push(mutate_callsite(&base, "1:1:1:020|rust"));
+
+        for mutation in mutations {
+            assert!(
+                validate_compact_projection(&mutation).is_err(),
+                "callsite coordinate mutation passed: {mutation}"
+            );
+        }
     }
 
     #[test]
