@@ -2554,8 +2554,15 @@ mod tests {
         );
 
         let mut receipt_budget = observed.clone();
+        let canonical_callsite = receipt_budget.built.receipts[0]
+            .callsite_identity
+            .split_once('|')
+            .map_or(
+                receipt_budget.built.receipts[0].callsite_identity.as_str(),
+                |(identity, _)| identity,
+            );
         receipt_budget.built.receipts[0].callsite_identity =
-            format!("1:1:1:{}", "x".repeat(70_000));
+            format!("{canonical_callsite}|{}", "x".repeat(70_000));
         let receipt_budget =
             finalize_observed_call_path(&contract, &hashes, &rendering, receipt_budget);
         assert!(matches!(
