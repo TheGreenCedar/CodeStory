@@ -311,14 +311,16 @@ fn go_package_dependency_ids(
         .ok_or_else(|| proof_error("Go authenticated package closure is missing"))
 }
 
-fn prepare_go_package_closure(
-    file_by_id: &HashMap<i64, FileInfo>,
-    file_content_hash_by_id: &HashMap<i64, String>,
-) -> (
+type PreparedGoPackageClosure = (
     HashMap<i64, GoPackageIdentity>,
     HashMap<GoPackageIdentity, BTreeSet<FileId>>,
     HashMap<i64, String>,
-) {
+);
+
+fn prepare_go_package_closure(
+    file_by_id: &HashMap<i64, FileInfo>,
+    file_content_hash_by_id: &HashMap<i64, String>,
+) -> PreparedGoPackageClosure {
     let mut identity_by_file = HashMap::new();
     let mut dependencies_by_package = HashMap::<GoPackageIdentity, BTreeSet<FileId>>::new();
     let mut errors = HashMap::new();
