@@ -94,6 +94,23 @@ pub struct BoundedRawCallEdges {
     pub edges: Vec<Edge>,
     pub truncated: bool,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactCallEdgeProjection {
+    pub edge_id: EdgeId,
+    pub raw_source: NodeId,
+    pub raw_target: NodeId,
+    pub raw_kind: EdgeKind,
+    pub file_node_id: Option<NodeId>,
+    pub line: Option<u32>,
+    pub callsite_identity: Option<String>,
+    pub raw_target_kind: NodeKind,
+    pub raw_target_file_node_id: Option<NodeId>,
+    pub raw_target_start_line: Option<u32>,
+    pub raw_target_name: String,
+    pub caller: NodeId,
+    pub target: NodeId,
+}
 pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
@@ -6671,6 +6688,89 @@ impl Storage {
             ],
         )?;
         self.invalidate_grounding_snapshots()?;
+        Ok(())
+    }
+
+    /// Authenticates existing CALL edges with exact syntax resolution metadata.
+    ///
+    /// Raw graph identity is immutable here: this updates only the resolved
+    /// endpoints and resolution metadata. The whole batch commits or rolls back
+    /// together so a staged proof projection cannot observe a partial upgrade.
+    pub fn project_exact_call_edge_resolutions(
+        &mut self,
+        projections: &[ExactCallEdgeProjection],
+    ) -> Result<(), StorageError> {
+        if projections.is_empty() {
+            return Ok(());
+        }
+        let mut edge_ids = HashSet::with_capacity(projections.len());
+        if projections
+            .iter()
+            .any(|projection| !edge_ids.insert(projection.edge_id))
+        {
+            return Err(StorageError::Other(
+                "exact CALL edge projection contains a duplicate edge ID".to_owned(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "UPDATE edge
+                 SET resolved_source_node_id = ?2,
+                     resolved_target_node_id = ?3,
+                     confidence = 1.0,
+                     certainty = 'certain',
+                     candidate_target_node_ids = '[]'
+                 WHERE id = ?1
+                   AND source_node_id = ?4
+                   AND target_node_id = ?5
+                   AND kind = ?6
+                   AND file_node_id IS ?7
+                   AND line IS ?8
+                   AND callsite_identity IS ?9
+                   AND EXISTS (
+                       SELECT 1
+                       FROM node raw
+                       WHERE raw.id = edge.target_node_id
+                         AND raw.kind = ?10
+                         AND raw.file_node_id IS ?11
+                         AND raw.start_line IS ?12
+                         AND raw.serialized_name = ?13
+                   )",
+            )?;
+            for projection in projections {
+                let updated = statement.execute(params![
+                    projection.edge_id.0,
+                    projection.caller.0,
+                    projection.target.0,
+                    projection.raw_source.0,
+                    projection.raw_target.0,
+                    projection.raw_kind as i32,
+                    projection.file_node_id.map(|id| id.0),
+                    projection.line,
+                    projection.callsite_identity.as_deref(),
+                    projection.raw_target_kind as i32,
+                    projection.raw_target_file_node_id.map(|id| id.0),
+                    projection.raw_target_start_line,
+                    &projection.raw_target_name,
+                ])?;
+                if updated != 1 {
+                    return Err(StorageError::Other(format!(
+                        "exact CALL edge projection did not match one CALL edge: {}",
+                        projection.edge_id.0
+                    )));
+                }
+            }
+        }
+        Self::write_grounding_snapshot_states_on(
+            &tx,
+            GroundingSnapshotState::Dirty,
+            GroundingSnapshotState::Dirty,
+            None,
+            None,
+        )?;
+        Self::invalidate_resolution_support_snapshot_on(&tx)?;
+        tx.commit()?;
         Ok(())
     }
 

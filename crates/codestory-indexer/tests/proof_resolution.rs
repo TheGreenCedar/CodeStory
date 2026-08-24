@@ -1,5 +1,5 @@
 use codestory_contracts::events::EventBus;
-use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind};
+use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty};
 use codestory_contracts::proof_resolution::{
     DependencyFileHash, FileId, ProofResolutionProjection, ProofResolutionReason,
     ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
@@ -152,13 +152,17 @@ enum RepeatedCallGraphMutation {
     OrdinalGap,
     ExtraEdge,
     ExtraInput,
+    NonCall,
     OpaqueIdentity,
     WrongIdentityFile,
     WrongIdentityLine,
     WrongIdentityRawTarget,
     CandidatesRetained,
-    CrossSource,
-    CrossTarget,
+    HeuristicSource,
+    HeuristicTarget,
+    CertainSource,
+    CertainTarget,
+    WrongRawSource,
     TwoValidRawPlaceholderGroups,
 }
 
@@ -234,6 +238,12 @@ fn repeated_call_facts_after_graph_mutation(
         RepeatedCallGraphMutation::ExtraInput => {
             connection.execute("DELETE FROM edge WHERE id = ?1", [calls[1].id.0])?;
         }
+        RepeatedCallGraphMutation::NonCall => {
+            connection.execute(
+                "UPDATE edge SET kind = ?1 WHERE id = ?2",
+                (EdgeKind::USAGE as i32, calls[1].id.0),
+            )?;
+        }
         RepeatedCallGraphMutation::OpaqueIdentity => {
             connection.execute(
                 "UPDATE edge SET callsite_identity = 'opaque' WHERE id = ?1",
@@ -279,16 +289,34 @@ fn repeated_call_facts_after_graph_mutation(
                 ),
             )?;
         }
-        RepeatedCallGraphMutation::CrossSource => {
+        RepeatedCallGraphMutation::HeuristicSource => {
             connection.execute(
-                "UPDATE edge SET resolved_source_node_id = ?1 WHERE id = ?2",
+                "UPDATE edge SET resolved_source_node_id = ?1, certainty = 'uncertain' WHERE id = ?2",
                 (calls[0].file_node_id.unwrap().0, calls[0].id.0),
             )?;
         }
-        RepeatedCallGraphMutation::CrossTarget => {
+        RepeatedCallGraphMutation::HeuristicTarget => {
             connection.execute(
-                "UPDATE edge SET resolved_target_node_id = ?1 WHERE id = ?2",
+                "UPDATE edge SET resolved_target_node_id = ?1, certainty = 'uncertain' WHERE id = ?2",
                 (calls[0].effective_source().0, calls[0].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::CertainSource => {
+            connection.execute(
+                "UPDATE edge SET resolved_source_node_id = ?1, certainty = 'certain' WHERE id = ?2",
+                (calls[0].file_node_id.unwrap().0, calls[0].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::CertainTarget => {
+            connection.execute(
+                "UPDATE edge SET resolved_target_node_id = ?1, certainty = 'certain' WHERE id = ?2",
+                (calls[0].effective_source().0, calls[0].id.0),
+            )?;
+        }
+        RepeatedCallGraphMutation::WrongRawSource => {
+            connection.execute(
+                "UPDATE edge SET source_node_id = ?1, resolved_source_node_id = NULL, certainty = 'uncertain' WHERE id = ?2",
+                (calls[0].file_node_id.unwrap().0, calls[0].id.0),
             )?;
         }
         RepeatedCallGraphMutation::TwoValidRawPlaceholderGroups => {
@@ -351,11 +379,23 @@ fn typescript_and_rust_reference_calls_rematerialize_exact_facts() -> anyhow::Re
     let graph_before = store.get_edges()?;
 
     let first = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
-    assert_eq!(
-        store.get_edges()?,
-        graph_before,
-        "proof overlay mutated graph output"
-    );
+    let graph_after = store.get_edges()?;
+    assert_eq!(graph_after.len(), graph_before.len());
+    for before in &graph_before {
+        let after = graph_after
+            .iter()
+            .find(|edge| edge.id == before.id)
+            .expect("projection preserves every edge ID");
+        assert_eq!(after.source, before.source);
+        assert_eq!(after.target, before.target);
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.file_node_id, before.file_node_id);
+        assert_eq!(after.line, before.line);
+        assert_eq!(after.callsite_identity, before.callsite_identity);
+        if before.kind != EdgeKind::CALL {
+            assert_eq!(after, before, "non-CALL graph output is immutable");
+        }
+    }
     store.validate_proof_resolution_publication(&publication(1))?;
     let facts = store.get_proof_resolution_facts()?;
 
@@ -2237,8 +2277,7 @@ fn go_repeated_callsites_and_utf8_crlf_coordinates_are_source_bound_and_distinct
 }
 
 #[test]
-fn go_wrong_effective_target_never_becomes_exact_even_with_certain_navigation_metadata()
--> anyhow::Result<()> {
+fn go_authenticated_receiver_replaces_wrong_certain_navigation_target() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(
@@ -2257,6 +2296,12 @@ fn go_wrong_effective_target_never_becomes_exact_even_with_certain_navigation_me
         )],
     )?;
     let nodes = store.get_nodes()?;
+    let right_target = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::METHOD && node.serialized_name.ends_with("A.Run"))
+        .map(|node| node.id)
+        .next()
+        .expect("A.Run target");
     let wrong_target = nodes
         .iter()
         .filter(|node| node.kind == NodeKind::METHOD && node.serialized_name.ends_with("B.Run"))
@@ -2287,8 +2332,18 @@ fn go_wrong_effective_target_never_becomes_exact_even_with_certain_navigation_me
         .into_iter()
         .find(|fact| fact.callsite.raw_target == "Run")
         .expect("mutated Run fact");
-    assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
-    assert!(fact.edge_id.is_none());
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert_eq!(fact.target, Some(right_target));
+    assert_eq!(fact.edge_id, Some(call.id));
+    let projected = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == call.id)
+        .expect("projected receiver CALL edge");
+    assert_eq!(projected.resolved_target, Some(right_target));
+    assert_eq!(projected.confidence, Some(1.0));
+    assert_eq!(projected.certainty, Some(ResolutionCertainty::Certain));
+    assert!(projected.candidate_targets.is_empty());
     Ok(())
 }
 
@@ -2473,6 +2528,161 @@ fn supported_import_alias_still_requires_an_ordinary_resolved_call_edge() -> any
             "import { actual as target } from './exported';\nexport function caller() { target(); }\n",
         ),
     ])
+}
+
+#[test]
+fn authenticated_direct_import_projects_one_existing_call_edge_before_exact_replay()
+-> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("src/right.ts", "export function importedTarget() {}\n"),
+            (
+                "src/caller.ts",
+                "import { importedTarget } from './right';\nexport function caller() { importedTarget(); }\n",
+            ),
+        ],
+    )?;
+    let initial = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.kind == EdgeKind::CALL)
+        .expect("ordinary CALL edge");
+    let nodes = store.get_nodes()?;
+    let caller = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "caller")
+        .expect("authenticated caller")
+        .id;
+    let target = nodes
+        .iter()
+        .find(|node| {
+            node.kind == NodeKind::FUNCTION
+                && node.serialized_name == "importedTarget"
+                && node
+                    .file_node_id
+                    .and_then(|id| store.get_node(id).ok().flatten())
+                    .is_some_and(|file| file.serialized_name.ends_with("right.ts"))
+        })
+        .expect("authenticated target")
+        .id;
+    let wrong = caller;
+    store.get_connection().execute(
+        "UPDATE edge
+         SET resolved_target_node_id = ?1,
+             confidence = 0.5,
+             certainty = 'certain',
+             candidate_target_node_ids = ?2
+         WHERE id = ?3",
+        (wrong.0, format!("[{}]", wrong.0), initial.id.0),
+    )?;
+    let before = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == initial.id)
+        .expect("tampered ordinary CALL edge");
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "importedTarget")
+        .expect("direct import call fact");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert_eq!(fact.edge_id, Some(before.id));
+    assert_eq!(fact.caller, caller);
+    assert_eq!(fact.target, Some(target));
+
+    let after = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == before.id)
+        .expect("projected CALL edge");
+    assert_eq!(after.source, before.source, "raw source is immutable");
+    assert_eq!(after.target, before.target, "raw target is immutable");
+    assert_eq!(after.kind, before.kind);
+    assert_eq!(after.file_node_id, before.file_node_id);
+    assert_eq!(after.line, before.line);
+    assert_eq!(after.callsite_identity, before.callsite_identity);
+    assert_eq!(after.resolved_source, Some(caller));
+    assert_eq!(after.resolved_target, Some(target));
+    assert_eq!(after.certainty, Some(ResolutionCertainty::Certain));
+    assert_eq!(after.confidence, Some(1.0));
+    assert!(after.candidate_targets.is_empty());
+    Ok(())
+}
+
+#[test]
+fn go_same_package_helper_projects_one_existing_call_edge_before_exact_replay() -> anyhow::Result<()>
+{
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("target.go", "package proof\nfunc target() {}\n"),
+            ("caller.go", "package proof\nfunc caller() { target() }\n"),
+        ],
+    )?;
+    let nodes = store.get_nodes()?;
+    let caller = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "caller")
+        .expect("authenticated Go caller")
+        .id;
+    let target = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "target")
+        .expect("authenticated Go target")
+        .id;
+    let before = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.kind == EdgeKind::CALL)
+        .expect("source-built Go CALL edge");
+    store.get_connection().execute(
+        "UPDATE edge
+         SET resolved_target_node_id = ?1,
+             confidence = 0.5,
+             certainty = 'certain',
+             candidate_target_node_ids = ?2
+         WHERE id = ?3",
+        (caller.0, format!("[{}]", caller.0), before.id.0),
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("Go helper call fact");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert_eq!(fact.edge_id, Some(before.id));
+    assert_eq!(fact.caller, caller);
+    assert_eq!(fact.target, Some(target));
+    let after = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == before.id)
+        .expect("projected Go CALL edge");
+    assert_eq!(after.source, before.source);
+    assert_eq!(after.target, before.target);
+    assert_eq!(after.kind, before.kind);
+    assert_eq!(after.file_node_id, before.file_node_id);
+    assert_eq!(after.line, before.line);
+    assert_eq!(after.callsite_identity, before.callsite_identity);
+    assert_eq!(after.resolved_source, Some(caller));
+    assert_eq!(after.resolved_target, Some(target));
+    assert_eq!(after.certainty, Some(ResolutionCertainty::Certain));
+    assert_eq!(after.confidence, Some(1.0));
+    assert!(after.candidate_targets.is_empty());
+    Ok(())
 }
 
 #[test]
@@ -3482,13 +3692,12 @@ fn repeated_call_correlation_rejects_incomplete_or_noncanonical_domains() -> any
         RepeatedCallGraphMutation::OrdinalGap,
         RepeatedCallGraphMutation::ExtraEdge,
         RepeatedCallGraphMutation::ExtraInput,
+        RepeatedCallGraphMutation::NonCall,
         RepeatedCallGraphMutation::OpaqueIdentity,
         RepeatedCallGraphMutation::WrongIdentityFile,
         RepeatedCallGraphMutation::WrongIdentityLine,
         RepeatedCallGraphMutation::WrongIdentityRawTarget,
-        RepeatedCallGraphMutation::CandidatesRetained,
-        RepeatedCallGraphMutation::CrossSource,
-        RepeatedCallGraphMutation::CrossTarget,
+        RepeatedCallGraphMutation::WrongRawSource,
         RepeatedCallGraphMutation::TwoValidRawPlaceholderGroups,
     ] {
         let facts = repeated_call_facts_after_graph_mutation(mutation)?;
@@ -3498,6 +3707,239 @@ fn repeated_call_correlation_rejects_incomplete_or_noncanonical_domains() -> any
                 .iter()
                 .all(|fact| fact.status != ProofResolutionStatus::Exact),
             "malformed complete correlation domain retained Exact for {mutation:?}: {facts:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_call_projection_replaces_only_heuristic_resolution_metadata() -> anyhow::Result<()> {
+    for mutation in [
+        RepeatedCallGraphMutation::CandidatesRetained,
+        RepeatedCallGraphMutation::HeuristicSource,
+        RepeatedCallGraphMutation::HeuristicTarget,
+        RepeatedCallGraphMutation::CertainSource,
+        RepeatedCallGraphMutation::CertainTarget,
+    ] {
+        let facts = repeated_call_facts_after_graph_mutation(mutation)?;
+        assert_eq!(facts.len(), 2, "one syntax fact per callsite: {mutation:?}");
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.status == ProofResolutionStatus::Exact),
+            "authenticated repeated calls did not replace heuristic metadata for {mutation:?}: {facts:#?}"
+        );
+        assert_eq!(
+            facts
+                .iter()
+                .filter_map(|fact| fact.edge_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            2,
+            "one stored edge must authorize one repeated call: {facts:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RawProjectionHostile {
+    WrongSameNamedDirect,
+    MalformedSameFilePlaceholder,
+    CrossFilePlaceholder,
+    NonPlaceholderKind,
+    WrongRawCaller,
+    WrongEdgeFile,
+    WrongEdgeLine,
+}
+
+#[test]
+fn raw_call_projection_hostiles_leave_the_edge_unchanged_and_fact_non_exact() -> anyhow::Result<()>
+{
+    for hostile in [
+        RawProjectionHostile::WrongSameNamedDirect,
+        RawProjectionHostile::MalformedSameFilePlaceholder,
+        RawProjectionHostile::CrossFilePlaceholder,
+        RawProjectionHostile::NonPlaceholderKind,
+        RawProjectionHostile::WrongRawCaller,
+        RawProjectionHostile::WrongEdgeFile,
+        RawProjectionHostile::WrongEdgeLine,
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                ("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n"),
+                ("src/other.rs", "fn unrelated() {}\n"),
+            ],
+        )?;
+        let call = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.kind == EdgeKind::CALL)
+            .expect("source-built CALL edge");
+        let raw = store.get_node(call.target)?.expect("raw CALL target");
+        assert_eq!(raw.kind, NodeKind::UNKNOWN, "closed placeholder fixture");
+        store.get_connection().execute(
+            "UPDATE edge
+             SET resolved_target_node_id = NULL,
+                 confidence = 0.5,
+                 certainty = 'uncertain',
+                 candidate_target_node_ids = '[]'
+             WHERE id = ?1",
+            [call.id.0],
+        )?;
+        let other_file = store
+            .get_nodes()?
+            .into_iter()
+            .find(|node| node.kind == NodeKind::FILE && node.serialized_name.ends_with("other.rs"))
+            .expect("other file")
+            .id;
+        match hostile {
+            RawProjectionHostile::WrongSameNamedDirect => {
+                store.get_connection().execute(
+                    "UPDATE node SET kind = ?1 WHERE id = ?2",
+                    (NodeKind::FUNCTION as i32, raw.id.0),
+                )?;
+            }
+            RawProjectionHostile::MalformedSameFilePlaceholder => {
+                store
+                    .get_connection()
+                    .execute("UPDATE node SET start_line = 99 WHERE id = ?1", [raw.id.0])?;
+            }
+            RawProjectionHostile::CrossFilePlaceholder => {
+                store.get_connection().execute(
+                    "UPDATE node SET file_node_id = ?1 WHERE id = ?2",
+                    (other_file.0, raw.id.0),
+                )?;
+            }
+            RawProjectionHostile::NonPlaceholderKind => {
+                store.get_connection().execute(
+                    "UPDATE node SET kind = ?1 WHERE id = ?2",
+                    (NodeKind::VARIABLE as i32, raw.id.0),
+                )?;
+            }
+            RawProjectionHostile::WrongRawCaller => {
+                store.get_connection().execute(
+                    "UPDATE edge SET source_node_id = file_node_id, resolved_source_node_id = NULL WHERE id = ?1",
+                    [call.id.0],
+                )?;
+            }
+            RawProjectionHostile::WrongEdgeFile => {
+                store.get_connection().execute(
+                    "UPDATE edge SET file_node_id = ?1 WHERE id = ?2",
+                    (other_file.0, call.id.0),
+                )?;
+            }
+            RawProjectionHostile::WrongEdgeLine => {
+                store
+                    .get_connection()
+                    .execute("UPDATE edge SET line = 99 WHERE id = ?1", [call.id.0])?;
+            }
+        }
+        let before = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.id == call.id)
+            .expect("mutated raw edge");
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let after = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.id == call.id)
+            .expect("retained raw edge");
+        assert_eq!(after, before, "rejected hostile was mutated: {hostile:?}");
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("target fact");
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "{hostile:?}: {fact:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn noncanonical_callsite_spellings_leave_the_edge_unchanged_and_fact_non_exact()
+-> anyhow::Result<()> {
+    for case in 0..15 {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n")],
+        )?;
+        let call = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.kind == EdgeKind::CALL)
+            .expect("source-built CALL edge");
+        let canonical = call
+            .callsite_identity
+            .as_deref()
+            .expect("canonical source-built identity");
+        let fields = canonical
+            .split('|')
+            .next()
+            .unwrap()
+            .split(':')
+            .collect::<Vec<_>>();
+        let [file, line, discriminator, raw] = fields.as_slice() else {
+            panic!("source-built identity has four fields: {canonical}");
+        };
+        let rewritten = match case {
+            0 => format!("0{file}:{line}:{discriminator}:{raw}"),
+            1 => format!("+{file}:{line}:{discriminator}:{raw}"),
+            2 => format!("{file}:0{line}:{discriminator}:{raw}"),
+            3 => format!("{file}:{line}:+{discriminator}:{raw}"),
+            4 => format!("{file}:{line}:0:{raw}"),
+            5 => format!("{file}:{line}:0{discriminator}:{raw}"),
+            6 => format!("{file}:{line}:4294967296:{raw}"),
+            7 => format!("{file}:{line}:{discriminator}:+{raw}"),
+            8 => format!("{file}:{line}:{discriminator}:0{raw}"),
+            9 => format!("{file}:{line}:{discriminator}:9223372036854775808"),
+            10 => format!("{file}:{line}:{discriminator}"),
+            11 => format!("{file}:{line}:{discriminator}:{raw}:5"),
+            12 => "|marker".to_owned(),
+            13 => "opaque".to_owned(),
+            14 => format!("{file}:{line}:{discriminator}:{raw}|"),
+            _ => unreachable!(),
+        };
+        store.get_connection().execute(
+            "UPDATE edge SET callsite_identity = ?1 WHERE id = ?2",
+            (&rewritten, call.id.0),
+        )?;
+        let before = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.id == call.id)
+            .expect("mutated raw edge");
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let after = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.id == call.id)
+            .expect("retained raw edge");
+        assert_eq!(
+            after, before,
+            "noncanonical identity was mutated: {rewritten}"
+        );
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("target fact");
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "{rewritten}: {fact:#?}"
         );
     }
     Ok(())
@@ -3981,7 +4423,6 @@ fn typescript_direct_exports_are_classified_from_closed_syntax() -> anyhow::Resu
         "type target = () => void;\nexport type { target };\n",
         "export { target } from './actual';\n",
         "export function target(): void;\nexport function target() {}\n",
-        "export const unrelated = 1;\nexport function target() {}\n",
     ] {
         assert_only_call_is_not_exact(&[
             ("src/exported.ts", unsupported_export),
@@ -3992,6 +4433,17 @@ fn typescript_direct_exports_are_classified_from_closed_syntax() -> anyhow::Resu
             ),
         ])?;
     }
+    assert_only_call_is_exact(&[
+        (
+            "src/exported.ts",
+            "export const unrelated = 1;\nexport function target() {}\n",
+        ),
+        ("src/actual.ts", "export function target() {}\n"),
+        (
+            "src/importer.ts",
+            "import { target } from './exported';\nexport function caller() { target(); }\n",
+        ),
+    ])?;
     Ok(())
 }
 
@@ -4350,7 +4802,7 @@ fn rust_inherent_receiver_and_constructor_subset_authorizes_closed_bindings() ->
 }
 
 #[test]
-fn rust_closed_syntax_without_an_exact_ordinary_call_edge_stays_non_exact() -> anyhow::Result<()> {
+fn rust_projection_requires_exact_syntax_but_not_exact_navigation_metadata() -> anyhow::Result<()> {
     assert_no_exact_calls(&[
         ("src/target.rs", "pub fn target() {}\n"),
         (
@@ -4369,10 +4821,13 @@ fn rust_closed_syntax_without_an_exact_ordinary_call_edge_stays_non_exact() -> a
     for source in [
         "fn target() {}\nfn caller() { target(); let target: fn() = || {}; }\n",
         "fn target() {}\nfn caller() { { let target: fn() = || {}; let _ = target; } target(); }\n",
-        "struct Owner;\nimpl Owner { fn target(&self) {} }\nmod other { pub struct Owner; }\nfn caller() { use crate::other::Owner; let value: Owner = Owner; value.target(); }\n",
     ] {
-        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+        assert_only_call_is_exact(&[("src/lib.rs", source)])?;
     }
+    assert_only_call_is_not_exact(&[(
+        "src/lib.rs",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nmod other { pub struct Owner; }\nfn caller() { use crate::other::Owner; let value: Owner = Owner; value.target(); }\n",
+    )])?;
     Ok(())
 }
 
@@ -4540,7 +4995,8 @@ fn rust_relevant_domain_poison_does_not_escape_its_module_or_callable() -> anyho
 }
 
 #[test]
-fn parser_claim_is_independent_of_tampered_navigation_resolution() -> anyhow::Result<()> {
+fn certain_navigation_resolution_is_replaced_by_authenticated_exact_evidence() -> anyhow::Result<()>
+{
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(
@@ -4548,33 +5004,46 @@ fn parser_claim_is_independent_of_tampered_navigation_resolution() -> anyhow::Re
         &mut store,
         &[
             ("src/right.ts", "export function importedTarget() {}\n"),
-            ("src/wrong.ts", "export function importedTarget() {}\n"),
+            ("src/wrong.ts", "export function wrongTarget() {}\n"),
             (
                 "src/caller.ts",
                 "import { importedTarget } from './right';\nexport function caller() { importedTarget(); }\n",
             ),
         ],
     )?;
-    let wrong = store
-        .get_nodes()?
-        .into_iter()
+    let nodes = store.get_nodes()?;
+    let right = nodes
+        .iter()
         .find(|node| {
             node.kind == NodeKind::FUNCTION
                 && node.serialized_name == "importedTarget"
                 && node
                     .file_node_id
                     .and_then(|id| store.get_node(id).ok().flatten())
+                    .is_some_and(|file| file.serialized_name.ends_with("right.ts"))
+        })
+        .expect("authenticated declaration")
+        .id;
+    let wrong = nodes
+        .into_iter()
+        .find(|node| {
+            node.kind == NodeKind::FUNCTION
+                && node.serialized_name == "wrongTarget"
+                && node
+                    .file_node_id
+                    .and_then(|id| store.get_node(id).ok().flatten())
                     .is_some_and(|file| file.serialized_name.ends_with("wrong.ts"))
         })
-        .expect("wrong declaration");
+        .expect("wrong declaration")
+        .id;
     let call_edge = store
         .get_edges()?
         .into_iter()
         .find(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(2))
         .expect("raw call edge");
     store.get_connection().execute(
-        "UPDATE edge SET resolved_target_node_id = ?1 WHERE id = ?2",
-        [wrong.id.0, call_edge.id.0],
+        "UPDATE edge SET resolved_target_node_id = ?1, certainty = 'certain' WHERE id = ?2",
+        [wrong.0, call_edge.id.0],
     )?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let fact = store
@@ -4582,9 +5051,18 @@ fn parser_claim_is_independent_of_tampered_navigation_resolution() -> anyhow::Re
         .into_iter()
         .find(|fact| fact.callsite.raw_target == "importedTarget")
         .expect("call fact");
-    assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
-    assert_eq!(fact.target, None);
-    assert_eq!(fact.edge_id, None);
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert_eq!(fact.target, Some(right));
+    assert_eq!(fact.edge_id, Some(call_edge.id));
+    let edge = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.id == call_edge.id)
+        .expect("projected CALL edge");
+    assert_eq!(edge.resolved_target, Some(right));
+    assert_eq!(edge.confidence, Some(1.0));
+    assert_eq!(edge.certainty, Some(ResolutionCertainty::Certain));
+    assert!(edge.candidate_targets.is_empty());
     Ok(())
 }
 

@@ -5,7 +5,7 @@
 
 use crate::graph::{EdgeId, NodeId};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::HashMap;
 
 pub const PROOF_RESOLUTION_FACT_SCHEMA_VERSION: u32 = 1;
 pub const INTERNAL_RESOLUTION_PRODUCER: &str = "codestory-internal";
@@ -97,32 +97,83 @@ pub enum ExactCallsiteCorrelationFailure {
     Ambiguous,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CanonicalCallsiteIdentity {
-    file_id: FileId,
-    line: u32,
-    column_or_ordinal: u32,
-    raw_target: NodeId,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Canonical four-field prefix of a stored callsite identity.
+pub struct CanonicalCallsiteIdentity {
+    pub file_id: FileId,
+    pub line: u32,
+    pub column_or_ordinal: u32,
+    pub raw_target: NodeId,
 }
 
-fn parse_canonical_callsite_identity(identity: &str) -> Option<CanonicalCallsiteIdentity> {
-    let mut fields = identity.split('|').next()?.split(':');
+/// Parses an exact canonical prefix while leaving any non-empty marker suffix opaque.
+pub fn parse_canonical_callsite_identity(identity: &str) -> Option<CanonicalCallsiteIdentity> {
+    let (prefix, marker) = identity
+        .split_once('|')
+        .map_or((identity, None), |(prefix, marker)| (prefix, Some(marker)));
+    if marker.is_some_and(str::is_empty) {
+        return None;
+    }
+    let mut fields = prefix.split(':');
     let parsed = CanonicalCallsiteIdentity {
         file_id: FileId(fields.next()?.parse().ok()?),
         line: fields.next()?.parse().ok()?,
         column_or_ordinal: fields.next()?.parse().ok()?,
         raw_target: NodeId(fields.next()?.parse().ok()?),
     };
-    (fields.next().is_none() && parsed.column_or_ordinal > 0).then_some(parsed)
+    (fields.next().is_none()
+        && parsed.line > 0
+        && parsed.column_or_ordinal > 0
+        && format!(
+            "{}:{}:{}:{}",
+            parsed.file_id.0, parsed.line, parsed.column_or_ordinal, parsed.raw_target.0
+        ) == prefix)
+        .then_some(parsed)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CorrelationGroupKey<'a> {
     file_id: FileId,
     line: u32,
     caller: NodeId,
     target: NodeId,
     raw_target: &'a str,
+}
+
+#[derive(Default)]
+struct PreparedRawEdgeGroup {
+    edge_count: usize,
+    invalid: bool,
+    by_discriminator: HashMap<u32, usize>,
+}
+
+#[derive(Default)]
+struct PreparedEdgeGroup {
+    edge_count: usize,
+    raw_groups: HashMap<NodeId, PreparedRawEdgeGroup>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CORRELATION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_correlation_work(amount: usize) {
+    #[cfg(test)]
+    CORRELATION_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_correlation_work() {
+    CORRELATION_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn correlation_work() -> usize {
+    CORRELATION_WORK.with(std::cell::Cell::get)
 }
 
 /// Correlate parser-derived exact syntax claims with unchanged ordinary CALL
@@ -134,8 +185,9 @@ pub fn correlate_exact_syntax_callsites(
     edges: &[OrdinaryCallEdgeCorrelationInput<'_>],
 ) -> Vec<Result<usize, ExactCallsiteCorrelationFailure>> {
     let mut results = vec![Err(ExactCallsiteCorrelationFailure::Missing); syntax.len()];
-    let mut syntax_groups = BTreeMap::<CorrelationGroupKey<'_>, Vec<usize>>::new();
+    let mut syntax_groups = HashMap::<CorrelationGroupKey<'_>, Vec<usize>>::new();
     for (index, input) in syntax.iter().enumerate() {
+        count_correlation_work(1);
         syntax_groups
             .entry(CorrelationGroupKey {
                 file_id: input.file_id,
@@ -147,23 +199,31 @@ pub fn correlate_exact_syntax_callsites(
             .or_default()
             .push(index);
     }
-    let mut edge_groups = BTreeMap::<CorrelationGroupKey<'_>, BTreeSet<usize>>::new();
+    let mut edge_groups = HashMap::<CorrelationGroupKey<'_>, PreparedEdgeGroup>::new();
     for (index, edge) in edges.iter().enumerate() {
-        let mut coordinates = BTreeSet::new();
+        count_correlation_work(1);
+        let parsed = edge
+            .callsite_identity
+            .and_then(parse_canonical_callsite_identity);
+        let mut coordinates = [None; 3];
         if let (Some(file_id), Some(line)) = (edge.file_id, edge.line) {
-            coordinates.insert((file_id, line));
+            coordinates[0] = Some((file_id, line));
         }
         if let (Some(file_id), Some(line)) = (edge.raw_file_id, edge.raw_line) {
-            coordinates.insert((file_id, line));
+            coordinates[1] = Some((file_id, line));
         }
-        if let Some(identity) = edge
-            .callsite_identity
-            .and_then(parse_canonical_callsite_identity)
-        {
-            coordinates.insert((identity.file_id, identity.line));
+        if let Some(identity) = parsed {
+            coordinates[2] = Some((identity.file_id, identity.line));
         }
-        for (file_id, line) in coordinates {
-            edge_groups
+        for coordinate_index in 0..coordinates.len() {
+            let Some((file_id, line)) = coordinates[coordinate_index] else {
+                continue;
+            };
+            if coordinates[..coordinate_index].contains(&Some((file_id, line))) {
+                continue;
+            }
+            count_correlation_work(1);
+            let group = edge_groups
                 .entry(CorrelationGroupKey {
                     file_id,
                     line,
@@ -171,85 +231,69 @@ pub fn correlate_exact_syntax_callsites(
                     target: edge.target,
                     raw_target: edge.raw_target,
                 })
-                .or_default()
-                .insert(index);
+                .or_default();
+            group.edge_count += 1;
+            let raw_group = group.raw_groups.entry(edge.raw_edge_target).or_default();
+            raw_group.edge_count += 1;
+            let Some(identity) = parsed.filter(|identity| {
+                identity.file_id == file_id
+                    && identity.line == line
+                    && identity.raw_target == edge.raw_edge_target
+                    && edge.raw_file_id == Some(file_id)
+                    && edge.raw_line == Some(line)
+                    && edge.semantic_exact
+            }) else {
+                raw_group.invalid = true;
+                continue;
+            };
+            if raw_group
+                .by_discriminator
+                .insert(identity.column_or_ordinal, index)
+                .is_some()
+            {
+                raw_group.invalid = true;
+            }
         }
     }
 
-    for (key, mut syntax_indices) in syntax_groups {
-        syntax_indices.sort_by_key(|index| {
-            let input = syntax[*index];
-            (input.start_byte, input.end_byte_exclusive)
-        });
-        let edge_indices = edge_groups
-            .get(&key)
-            .into_iter()
-            .flat_map(|indices| indices.iter().copied())
-            .collect::<Vec<_>>();
-        let mut raw_groups = BTreeMap::<NodeId, Vec<usize>>::new();
-        for edge_index in &edge_indices {
-            raw_groups
-                .entry(edges[*edge_index].raw_edge_target)
-                .or_default()
-                .push(*edge_index);
+    for (key, syntax_indices) in syntax_groups {
+        count_correlation_work(1);
+        if syntax_indices.windows(2).any(|pair| {
+            let left = syntax[pair[0]];
+            let right = syntax[pair[1]];
+            (left.start_byte, left.end_byte_exclusive)
+                >= (right.start_byte, right.end_byte_exclusive)
+        }) {
+            continue;
         }
+        let Some(edge_group) = edge_groups.get(&key) else {
+            continue;
+        };
         let mut valid_mappings = Vec::new();
-        let mut ambiguous_invalid_mapping = edge_indices.len() > syntax_indices.len();
-        for (raw_target, raw_indices) in raw_groups {
-            if raw_indices.len() != syntax_indices.len()
-                || raw_indices
-                    .iter()
-                    .any(|index| !edges[*index].semantic_exact)
-            {
-                continue;
-            }
-            let parsed = raw_indices
-                .iter()
-                .map(|index| {
-                    let edge = edges[*index];
-                    let identity = parse_canonical_callsite_identity(edge.callsite_identity?)?;
-                    (identity.file_id == key.file_id
-                        && identity.line == key.line
-                        && identity.raw_target == raw_target
-                        && edge.raw_file_id == Some(key.file_id)
-                        && edge.raw_line == Some(key.line))
-                    .then_some((identity.column_or_ordinal, *index))
-                })
-                .collect::<Option<Vec<_>>>();
-            let Some(parsed) = parsed else {
-                continue;
-            };
-            let distinct_values = parsed
-                .iter()
-                .map(|(value, _)| *value)
-                .collect::<BTreeSet<_>>();
-            if distinct_values.len() != parsed.len() {
-                ambiguous_invalid_mapping = true;
+        let mut ambiguous_invalid_mapping = edge_group.edge_count > syntax_indices.len();
+        for raw_group in edge_group.raw_groups.values() {
+            count_correlation_work(1);
+            if raw_group.edge_count != syntax_indices.len() || raw_group.invalid {
                 continue;
             }
             let column_mapping = syntax_indices
                 .iter()
                 .map(|syntax_index| {
-                    let column = syntax[*syntax_index].column;
-                    parsed
-                        .iter()
-                        .find_map(|(value, edge_index)| (*value == column).then_some(*edge_index))
+                    count_correlation_work(1);
+                    raw_group
+                        .by_discriminator
+                        .get(&syntax[*syntax_index].column)
+                        .copied()
                 })
                 .collect::<Option<Vec<_>>>();
-            let mut ordinal_mapping = parsed;
-            ordinal_mapping.sort_by_key(|(value, _)| *value);
-            let ordinal_mapping = ordinal_mapping
-                .iter()
-                .enumerate()
-                .all(|(index, (value, _))| {
-                    u32::try_from(index + 1).is_ok_and(|expected| *value == expected)
+            let ordinal_mapping = (1..=syntax_indices.len())
+                .map(|ordinal| {
+                    count_correlation_work(1);
+                    u32::try_from(ordinal)
+                        .ok()
+                        .and_then(|ordinal| raw_group.by_discriminator.get(&ordinal).copied())
                 })
-                .then(|| {
-                    ordinal_mapping
-                        .into_iter()
-                        .map(|(_, edge_index)| edge_index)
-                        .collect::<Vec<_>>()
-                });
+                .collect::<Option<Vec<_>>>();
             match (column_mapping, ordinal_mapping) {
                 (Some(columns), Some(ordinals)) if columns == ordinals => {
                     valid_mappings.push(columns)
@@ -648,5 +692,96 @@ mod tests {
             },
         ];
         assert_all_fail(&disagreeing_syntax, &[edge("1:2:1:30"), edge("1:2:2:30")]);
+    }
+
+    #[test]
+    fn canonical_callsite_identity_rejects_noncanonical_spellings() {
+        assert_eq!(
+            parse_canonical_callsite_identity("-1:2:3:-4|syntax:rust"),
+            Some(CanonicalCallsiteIdentity {
+                file_id: FileId(-1),
+                line: 2,
+                column_or_ordinal: 3,
+                raw_target: NodeId(-4),
+            })
+        );
+        for identity in [
+            "01:2:3:4",
+            "+1:2:3:4",
+            "-0:2:3:4",
+            "1:02:3:4",
+            "1:+2:3:4",
+            "1:0:3:4",
+            "1:2:03:4",
+            "1:2:+3:4",
+            "1:2:0:4",
+            "1:2:3:04",
+            "1:2:3:+4",
+            "1:2:3:-0",
+            "1:2:4294967296:4",
+            "9223372036854775808:2:3:4",
+            "1:2:3:9223372036854775808",
+            "1:2:3",
+            "1:2:3:4:5",
+            "|marker",
+            "opaque",
+            "1:2:3:4|",
+        ] {
+            assert_eq!(
+                parse_canonical_callsite_identity(identity),
+                None,
+                "accepted noncanonical identity {identity:?}"
+            );
+        }
+    }
+
+    fn measured_same_line_correlation(count: usize, columns: bool) -> usize {
+        let syntax = (0..count)
+            .map(|index| ExactSyntaxCallsiteCorrelationInput {
+                file_id: FileId(1),
+                line: 2,
+                start_byte: u64::try_from(index * 10).expect("test byte"),
+                end_byte_exclusive: u64::try_from(index * 10 + 6).expect("test byte"),
+                column: u32::try_from(100 + index * 2).expect("test column"),
+                caller: NodeId(10),
+                target: NodeId(20),
+                raw_target: "target",
+            })
+            .collect::<Vec<_>>();
+        let identities = (0..count)
+            .rev()
+            .map(|index| {
+                let discriminator = if columns {
+                    syntax[index].column
+                } else {
+                    u32::try_from(index + 1).expect("test ordinal")
+                };
+                format!("1:2:{discriminator}:30")
+            })
+            .collect::<Vec<_>>();
+        let edges = identities
+            .iter()
+            .map(|identity| OrdinaryCallEdgeCorrelationInput {
+                callsite_identity: Some(identity),
+                ..edge("1:2:1:30")
+            })
+            .collect::<Vec<_>>();
+        reset_correlation_work();
+        let result = correlate_exact_syntax_callsites(&syntax, &edges);
+        assert!(result.iter().all(Result::is_ok), "{result:?}");
+        correlation_work()
+    }
+
+    #[test]
+    fn same_line_column_and_ordinal_correlation_work_is_linear_with_reversed_edges() {
+        for columns in [false, true] {
+            let small = measured_same_line_correlation(64, columns);
+            let large = measured_same_line_correlation(128, columns);
+            assert!(small >= 64 * 4, "correlation work was not counted: {small}");
+            assert!(
+                large <= small * 2 + 16,
+                "correlation work grew superlinearly: {small} -> {large}"
+            );
+        }
     }
 }

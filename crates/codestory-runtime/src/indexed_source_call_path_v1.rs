@@ -2337,7 +2337,7 @@ mod tests {
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(4)),
-                callsite_identity: Some("1:1:0:4|alternatives".to_owned()),
+                callsite_identity: Some("1:1:1:4|alternatives".to_owned()),
                 candidate_targets: vec![NodeId(3)],
                 ..Default::default()
             },
@@ -2350,7 +2350,7 @@ mod tests {
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(4)),
-                callsite_identity: Some("1:1:0:4|probable".to_owned()),
+                callsite_identity: Some("1:1:1:4|probable".to_owned()),
                 candidate_targets: Vec::new(),
                 ..Default::default()
             },
@@ -2479,7 +2479,7 @@ mod tests {
                 line: Some(3),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(4)),
-                callsite_identity: Some("1:3:0:4|out-of-range".to_owned()),
+                callsite_identity: Some("1:3:1:4|out-of-range".to_owned()),
                 candidate_targets: Vec::new(),
                 ..Default::default()
             })

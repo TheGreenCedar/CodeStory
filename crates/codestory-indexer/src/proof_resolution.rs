@@ -7,7 +7,7 @@ use crate::cache::{
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
-use codestory_contracts::graph::{Edge, EdgeKind, Node, NodeId, NodeKind};
+use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{
     CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
     ExactCallsite, ExactCallsiteCorrelationFailure, ExactSyntaxCallsiteCorrelationInput, FileId,
@@ -17,7 +17,9 @@ use codestory_contracts::proof_resolution::{
     ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind, ResolutionProvenance,
     correlate_exact_syntax_callsites,
 };
-use codestory_store::{IndexPublicationRecord, ProofResolutionPublication, Store};
+use codestory_store::{
+    ExactCallEdgeProjection, IndexPublicationRecord, ProofResolutionPublication, Store,
+};
 use codestory_workspace::{WorkspacePathIdentity, workspace_path_identity};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -6290,6 +6292,80 @@ impl PreparedGovernedCachePaths {
     }
 }
 
+fn exact_call_edge_projection_updates(
+    syntax: &[ExactSyntaxCallsiteCorrelationInput<'_>],
+    targets: &[NodeId],
+    edge_inputs: &[OrdinaryCallEdgeCorrelationInput<'_>],
+    edges: &[&Edge],
+    raw_targets: &[&Node],
+) -> Result<Vec<ExactCallEdgeProjection>> {
+    if syntax.len() != targets.len()
+        || edge_inputs.len() != edges.len()
+        || edges.len() != raw_targets.len()
+    {
+        return Err(anyhow!(
+            "exact CALL edge projection correlation inputs are misaligned"
+        ));
+    }
+    let correlations = correlate_exact_syntax_callsites(syntax, edge_inputs);
+    let mut candidates = Vec::with_capacity(syntax.len());
+    let mut invalid_groups = HashSet::new();
+    let mut edge_owners = HashMap::<EdgeId, (FileId, u32, NodeId, String)>::new();
+    for (syntax_index, correlation) in correlations.into_iter().enumerate() {
+        let Ok(edge_index) = correlation else {
+            continue;
+        };
+        let input = syntax[syntax_index];
+        let group = (
+            input.file_id,
+            input.line,
+            input.caller,
+            input.raw_target.to_owned(),
+        );
+        let edge = edges[edge_index];
+        let raw_target = raw_targets[edge_index];
+        let target = targets[syntax_index];
+        let raw_target_is_eligible = match raw_target.kind {
+            NodeKind::FUNCTION | NodeKind::METHOD => edge.target == target,
+            NodeKind::UNKNOWN => {
+                raw_target.file_node_id == edge.file_node_id && raw_target.start_line == edge.line
+            }
+            _ => false,
+        };
+        if edge.kind != EdgeKind::CALL || !raw_target_is_eligible {
+            invalid_groups.insert(group.clone());
+        }
+        if let Some(previous_group) = edge_owners.insert(edge.id, group.clone()) {
+            invalid_groups.insert(previous_group);
+            invalid_groups.insert(group.clone());
+        }
+        candidates.push((group, edge_index, input.caller, target));
+    }
+    let mut projections = Vec::with_capacity(candidates.len());
+    for (group, edge_index, caller, target) in candidates {
+        if !invalid_groups.contains(&group) {
+            let edge = edges[edge_index];
+            let raw_target = raw_targets[edge_index];
+            projections.push(ExactCallEdgeProjection {
+                edge_id: edge.id,
+                raw_source: edge.source,
+                raw_target: edge.target,
+                raw_kind: edge.kind,
+                file_node_id: edge.file_node_id,
+                line: edge.line,
+                callsite_identity: edge.callsite_identity.clone(),
+                raw_target_kind: raw_target.kind,
+                raw_target_file_node_id: raw_target.file_node_id,
+                raw_target_start_line: raw_target.start_line,
+                raw_target_name: raw_target.serialized_name.clone(),
+                caller,
+                target,
+            });
+        }
+    }
+    Ok(projections)
+}
+
 pub fn rematerialize_proof_resolution_projection(
     store: &mut Store,
     publication: &IndexPublicationRecord,
@@ -6310,7 +6386,7 @@ pub fn rematerialize_proof_resolution_projection(
         .iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
-    let edges = store.get_edges()?;
+    let mut edges = store.get_edges()?;
     let exact_evidence_validation = ExactEvidenceValidationIndex::prepare(&edges, &node_by_id);
     let governed = files
         .iter()
@@ -6530,6 +6606,95 @@ pub fn rematerialize_proof_resolution_projection(
             (claim.status == ProofResolutionStatus::Exact).then_some(index)
         })
         .collect::<Vec<_>>();
+    let constructor_evidence_nodes = claims
+        .iter()
+        .flat_map(|claim| claim.evidence_chain.iter())
+        .filter_map(|evidence| match evidence {
+            ResolutionEvidence::ConstructorBinding { constructor } => Some(*constructor),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+
+    let projection_syntax_inputs = exact_claim_indices
+        .iter()
+        .map(|index| {
+            let claim = &claims[*index];
+            ExactSyntaxCallsiteCorrelationInput {
+                file_id: claim.input.callsite.file_id,
+                line: claim.input.callsite.line,
+                start_byte: claim.input.callsite.start_byte,
+                end_byte_exclusive: claim.input.callsite.end_byte_exclusive,
+                column: claim.input.callsite.column,
+                caller: claim.caller,
+                target: NodeId(0),
+                raw_target: &claim.input.callsite.raw_target,
+            }
+        })
+        .collect::<Vec<_>>();
+    let projection_targets = exact_claim_indices
+        .iter()
+        .map(|index| {
+            claims[*index]
+                .target
+                .expect("Exact syntax claim has a target")
+        })
+        .collect::<Vec<_>>();
+    let projection_edge_indices = edges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, edge)| {
+            (edge.kind == EdgeKind::CALL
+                && node_by_id.contains_key(&edge.target)
+                && !constructor_evidence_nodes.contains(&edge.target))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let projection_edges = projection_edge_indices
+        .iter()
+        .map(|index| &edges[*index])
+        .collect::<Vec<_>>();
+    let projection_raw_targets = projection_edges
+        .iter()
+        .map(|edge| node_by_id[&edge.target])
+        .collect::<Vec<_>>();
+    let projection_edge_inputs = projection_edges
+        .iter()
+        .map(|edge| {
+            let raw = node_by_id[&edge.target];
+            let direct_member_edge = matches!(raw.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                || raw.file_node_id != edge.file_node_id;
+            OrdinaryCallEdgeCorrelationInput {
+                file_id: edge.file_node_id.map(|file| FileId(file.0)),
+                line: edge.line,
+                caller: edge.source,
+                target: NodeId(0),
+                raw_edge_target: edge.target,
+                raw_file_id: if direct_member_edge {
+                    edge.file_node_id.map(|file| FileId(file.0))
+                } else {
+                    raw.file_node_id.map(|file| FileId(file.0))
+                },
+                raw_line: if direct_member_edge {
+                    edge.line
+                } else {
+                    raw.start_line
+                },
+                raw_target: graph_leaf_name(&raw.serialized_name),
+                callsite_identity: edge.callsite_identity.as_deref(),
+                semantic_exact: true,
+            }
+        })
+        .collect::<Vec<_>>();
+    let edge_projections = exact_call_edge_projection_updates(
+        &projection_syntax_inputs,
+        &projection_targets,
+        &projection_edge_inputs,
+        &projection_edges,
+        &projection_raw_targets,
+    )?;
+    store.project_exact_call_edge_resolutions(&edge_projections)?;
+    edges = store.get_edges()?;
+
     let syntax_correlation_inputs = exact_claim_indices
         .iter()
         .map(|index| {
@@ -6546,14 +6711,6 @@ pub fn rematerialize_proof_resolution_projection(
             }
         })
         .collect::<Vec<_>>();
-    let constructor_evidence_nodes = claims
-        .iter()
-        .flat_map(|claim| claim.evidence_chain.iter())
-        .filter_map(|evidence| match evidence {
-            ResolutionEvidence::ConstructorBinding { constructor } => Some(*constructor),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
     let ordinary_edge_indices = edges
         .iter()
         .enumerate()
@@ -10181,6 +10338,113 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
             ))
     });
     result
+}
+
+#[cfg(test)]
+mod exact_edge_projection_tests {
+    use super::*;
+
+    #[test]
+    fn exact_edge_projection_accepts_direct_and_placeholder_raw_targets() {
+        let identities = ["1:2:1:3".to_owned(), "1:3:1:9".to_owned()];
+        let syntax = [
+            ExactSyntaxCallsiteCorrelationInput {
+                file_id: FileId(1),
+                line: 2,
+                start_byte: 20,
+                end_byte_exclusive: 26,
+                column: 1,
+                caller: NodeId(2),
+                target: NodeId(0),
+                raw_target: "target",
+            },
+            ExactSyntaxCallsiteCorrelationInput {
+                file_id: FileId(1),
+                line: 3,
+                start_byte: 30,
+                end_byte_exclusive: 36,
+                column: 1,
+                caller: NodeId(2),
+                target: NodeId(0),
+                raw_target: "target",
+            },
+        ];
+        let targets = [NodeId(3), NodeId(4)];
+        let raw_edges = [
+            Edge {
+                id: EdgeId(7),
+                source: NodeId(2),
+                target: NodeId(3),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(2),
+                callsite_identity: Some(identities[0].clone()),
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(8),
+                source: NodeId(2),
+                target: NodeId(9),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(3),
+                callsite_identity: Some(identities[1].clone()),
+                ..Default::default()
+            },
+        ];
+        let edge_inputs = raw_edges
+            .iter()
+            .map(|edge| OrdinaryCallEdgeCorrelationInput {
+                file_id: Some(FileId(1)),
+                line: edge.line,
+                caller: NodeId(2),
+                target: NodeId(0),
+                raw_edge_target: edge.target,
+                raw_file_id: Some(FileId(1)),
+                raw_line: edge.line,
+                raw_target: "target",
+                callsite_identity: edge.callsite_identity.as_deref(),
+                semantic_exact: true,
+            })
+            .collect::<Vec<_>>();
+        let raw_nodes = [
+            Node {
+                id: NodeId(3),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "target".to_owned(),
+                file_node_id: Some(NodeId(1)),
+                start_line: Some(1),
+                ..Default::default()
+            },
+            Node {
+                id: NodeId(9),
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "target".to_owned(),
+                file_node_id: Some(NodeId(1)),
+                start_line: Some(3),
+                ..Default::default()
+            },
+        ];
+        let projections = exact_call_edge_projection_updates(
+            &syntax,
+            &targets,
+            &edge_inputs,
+            &raw_edges.iter().collect::<Vec<_>>(),
+            &raw_nodes.iter().collect::<Vec<_>>(),
+        )
+        .expect("direct and placeholder projections");
+        assert_eq!(projections.len(), 2);
+        assert_eq!(
+            projections
+                .iter()
+                .map(|projection| (projection.edge_id, projection.caller, projection.target))
+                .collect::<Vec<_>>(),
+            [
+                (EdgeId(7), NodeId(2), NodeId(3)),
+                (EdgeId(8), NodeId(2), NodeId(4))
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

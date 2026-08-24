@@ -119,6 +119,30 @@ impl Drop for IndexWriterGuard {
     }
 }
 
+pub(super) fn rematerialize_staged_proof_resolution_projection(
+    staged: &mut StagedSnapshot,
+    publication: &IndexPublicationRecord,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<(), ApiError> {
+    ensure_indexing_active(cancel_token)?;
+    codestory_indexer::rematerialize_proof_resolution_projection(staged.store_mut(), publication)
+        .map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to rematerialize complete proof resolution facts: {error}"
+        ))
+    })?;
+    ensure_indexing_active(cancel_token)?;
+    staged
+        .store_mut()
+        .validate_proof_resolution_publication(publication)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to validate complete proof resolution facts: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
 pub(super) fn stage_core_publication_identity(
     staged: &mut StagedSnapshot,
     root: &Path,
@@ -159,21 +183,6 @@ pub(super) fn stage_core_publication_identity(
             ))
         })?;
     ensure_indexing_active(cancel_token)?;
-    codestory_indexer::rematerialize_proof_resolution_projection(staged.store_mut(), publication)
-        .map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to rematerialize complete proof resolution facts: {error}"
-        ))
-    })?;
-    ensure_indexing_active(cancel_token)?;
-    staged
-        .store_mut()
-        .validate_proof_resolution_publication(publication)
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to validate complete proof resolution facts: {error}"
-            ))
-        })?;
     let mode = match publication.mode {
         IndexPublicationMode::Full => "full",
         IndexPublicationMode::Incremental => "incremental",

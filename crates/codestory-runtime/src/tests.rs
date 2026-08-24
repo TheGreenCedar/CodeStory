@@ -10657,6 +10657,23 @@ fn full_refresh_publishes_both_grounding_snapshot_tiers() {
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let controller = AppController::new();
+    let assert_ready = |phase: &str| {
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        assert!(
+            storage
+                .snapshots()
+                .has_ready_summary()
+                .expect("summary snapshot readiness"),
+            "{phase} should publish ready grounding summary snapshots"
+        );
+        assert!(
+            storage
+                .snapshots()
+                .has_ready_detail()
+                .expect("detail snapshot readiness"),
+            "{phase} should publish ready grounding detail snapshots"
+        );
+    };
 
     controller
         .open_project_summary_with_storage_path(
@@ -10667,22 +10684,16 @@ fn full_refresh_publishes_both_grounding_snapshot_tiers() {
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("index without runtime refresh");
+    assert_ready("full refresh");
 
-    let storage = Storage::open(&storage_path).expect("reopen storage");
-    assert!(
-        storage
-            .snapshots()
-            .has_ready_summary()
-            .expect("summary snapshot readiness"),
-        "full refresh should publish ready grounding summary snapshots"
-    );
-    assert!(
-        storage
-            .snapshots()
-            .has_ready_detail()
-            .expect("detail snapshot readiness"),
-        "full refresh should publish ready grounding detail snapshots"
-    );
+    let source_path = workspace.path().join("rust_tictactoe.rs");
+    let mut source = fs::read_to_string(&source_path).expect("read indexed source");
+    source.push_str("\nfn snapshot_incremental_probe() {}\n");
+    fs::write(&source_path, source).expect("write incremental source edit");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental index without runtime refresh");
+    assert_ready("incremental refresh");
 }
 
 #[test]

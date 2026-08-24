@@ -1,4 +1,6 @@
-use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind};
+use codestory_contracts::graph::{
+    Edge, EdgeId, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty,
+};
 use codestory_contracts::proof_resolution::{
     CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
     ExactCallsite, FileId, INTERNAL_RESOLUTION_PRODUCER, PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
@@ -7,8 +9,8 @@ use codestory_contracts::proof_resolution::{
     ResolutionEvidenceKind, ResolutionProvenance,
 };
 use codestory_store::{
-    FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
-    seal_call_resolution_fact,
+    ExactCallEdgeProjection, FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord,
+    Store, seal_call_resolution_fact,
 };
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use sha2::{Digest, Sha256};
@@ -1582,6 +1584,23 @@ fn resealed_raw_callsite_and_incomplete_dependency_mutations_are_rejected() {
         .replace_proof_resolution_projection(&publication(), &projection(vec![fact]))
         .expect_err("callsite identity file must match the exact syntax span");
     assert!(error.to_string().contains("callsite identity"), "{error}");
+
+    let mut noncanonical = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut noncanonical);
+    noncanonical
+        .get_connection()
+        .execute(
+            "UPDATE edge SET callsite_identity = '01:2:1:4' WHERE id = 7",
+            [],
+        )
+        .unwrap();
+    let mut fact = exact_fact(EdgeId(7));
+    fact.raw_callsite_identity = Some("01:2:1:4".to_owned());
+    let fact = seal_call_resolution_fact(fact).unwrap();
+    let error = noncanonical
+        .replace_proof_resolution_projection(&publication(), &projection(vec![fact]))
+        .expect_err("store replay must reject noncanonical callsite spelling");
+    assert!(error.to_string().contains("callsite"), "{error}");
 }
 
 #[test]
@@ -1894,4 +1913,112 @@ fn failed_incremental_fence_preserves_the_complete_proof_overlay() {
     store
         .validate_proof_resolution_publication(&publication())
         .expect("the prior proof overlay survived rollback");
+}
+
+fn exact_projection_fingerprint(edge_id: i64) -> ExactCallEdgeProjection {
+    ExactCallEdgeProjection {
+        edge_id: EdgeId(edge_id),
+        raw_source: NodeId(2),
+        raw_target: NodeId(4),
+        raw_kind: EdgeKind::CALL,
+        file_node_id: Some(NodeId(1)),
+        line: Some(2),
+        callsite_identity: Some("1:2:1:4".to_owned()),
+        raw_target_kind: NodeKind::UNKNOWN,
+        raw_target_file_node_id: Some(NodeId(1)),
+        raw_target_start_line: Some(2),
+        raw_target_name: "callee".to_owned(),
+        caller: NodeId(2),
+        target: NodeId(3),
+    }
+}
+
+#[test]
+fn exact_call_edge_projection_is_metadata_only_idempotent_and_transactional() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_exact_graph(&mut store);
+    store
+        .get_connection()
+        .execute(
+            "UPDATE edge
+             SET resolved_source_node_id = NULL,
+                 resolved_target_node_id = NULL,
+                 confidence = 0.5,
+                 certainty = 'uncertain',
+                 candidate_target_node_ids = '[2]'
+             WHERE id = 7",
+            [],
+        )
+        .unwrap();
+    let before = store.get_edges().unwrap().remove(0);
+
+    store
+        .project_exact_call_edge_resolutions(&[
+            exact_projection_fingerprint(7),
+            exact_projection_fingerprint(999),
+        ])
+        .expect_err("a missing member must roll back the entire batch");
+    assert_eq!(store.get_edges().unwrap(), std::slice::from_ref(&before));
+
+    let projection = [exact_projection_fingerprint(7)];
+    store
+        .project_exact_call_edge_resolutions(&projection)
+        .expect("exact projection");
+    store
+        .project_exact_call_edge_resolutions(&projection)
+        .expect("idempotent exact projection");
+    let after = store.get_edges().unwrap().remove(0);
+    assert_eq!(after.id, before.id);
+    assert_eq!(after.source, before.source);
+    assert_eq!(after.target, before.target);
+    assert_eq!(after.kind, before.kind);
+    assert_eq!(after.file_node_id, before.file_node_id);
+    assert_eq!(after.line, before.line);
+    assert_eq!(after.callsite_identity, before.callsite_identity);
+    assert_eq!(after.resolved_source, Some(NodeId(2)));
+    assert_eq!(after.resolved_target, Some(NodeId(3)));
+    assert_eq!(after.confidence, Some(1.0));
+    assert_eq!(after.certainty, Some(ResolutionCertainty::Certain));
+    assert!(after.candidate_targets.is_empty());
+    assert_eq!(
+        store
+            .get_connection()
+            .query_row(
+                "SELECT candidate_target_node_ids FROM edge WHERE id = 7",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+        "[]",
+        "projection must explicitly clear persisted candidate alternatives"
+    );
+}
+
+#[test]
+fn exact_call_edge_projection_rejects_every_stale_raw_fingerprint_without_mutation() {
+    for mutation in [
+        "UPDATE edge SET source_node_id = 1 WHERE id = 7",
+        "UPDATE edge SET target_node_id = 3 WHERE id = 7",
+        "UPDATE edge SET kind = 2 WHERE id = 7",
+        "UPDATE edge SET file_node_id = 3 WHERE id = 7",
+        "UPDATE edge SET line = 3 WHERE id = 7",
+        "UPDATE edge SET callsite_identity = '1:2:2:4' WHERE id = 7",
+        "UPDATE node SET kind = 13 WHERE id = 4",
+        "UPDATE node SET file_node_id = 3 WHERE id = 4",
+        "UPDATE node SET start_line = 3 WHERE id = 4",
+        "UPDATE node SET serialized_name = 'other' WHERE id = 4",
+    ] {
+        let mut store = Store::new_in_memory().unwrap();
+        seed_exact_graph(&mut store);
+        let prepared = exact_projection_fingerprint(7);
+        store
+            .get_connection()
+            .execute(mutation, [])
+            .expect("install stale fingerprint mutation");
+        let before = store.get_edges().unwrap();
+        store
+            .project_exact_call_edge_resolutions(&[prepared])
+            .expect_err("stale raw fingerprint must reject the batch");
+        assert_eq!(store.get_edges().unwrap(), before, "{mutation}");
+    }
 }
