@@ -587,6 +587,43 @@ fn python_closed_exact_subset_authorizes_s1_through_s4() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn python_single_simple_base_authorizes_a_direct_same_class_method() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.py",
+            concat!(
+                "class Base:\n    pass\n\n",
+                "class Worker(Base):\n",
+                "    def target(self):\n        pass\n",
+                "    def caller(self):\n        self.target()\n",
+            ),
+        )],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let fact = facts
+        .iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "python" && fact.callsite.raw_target == "target"
+        })
+        .unwrap_or_else(|| panic!("missing Python target fact: {facts:#?}"));
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(matches!(
+        fact.evidence_chain.as_slice(),
+        [
+            ResolutionEvidence::ImplicitReceiver { .. },
+            ResolutionEvidence::SameFileDeclaration { .. }
+        ]
+    ));
+    Ok(())
+}
+
 fn assert_python_target_has_closed_status(
     files: &[(&str, &str)],
     raw_target: &str,
@@ -4764,7 +4801,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v9", "adapter", "language"]
+            ["stale", "schema-v10", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"

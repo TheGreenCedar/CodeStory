@@ -84,8 +84,8 @@ fn python_resolution_work() -> usize {
     PYTHON_RESOLUTION_WORK.with(std::cell::Cell::get)
 }
 
-const ADAPTER_VERSION: &str = "reference-v11";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 9;
+const ADAPTER_VERSION: &str = "reference-v12";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 10;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
@@ -1643,6 +1643,7 @@ struct PythonResolutionIndex<'tree> {
     classes_by_name: HashMap<String, Vec<CachedClassDeclaration>>,
     class_owner_by_syntax_id: HashMap<usize, NodeId>,
     closed_class_owners: HashSet<NodeId>,
+    simple_base_class_owners: HashSet<NodeId>,
     dynamic_class_owners: HashSet<NodeId>,
     methods_by_owner_and_name: HashMap<(NodeId, String), Vec<NodeId>>,
     method_blockers_by_owner_and_name: HashSet<(NodeId, String)>,
@@ -1698,6 +1699,7 @@ impl<'tree> PythonResolutionIndex<'tree> {
             classes_by_name: HashMap::new(),
             class_owner_by_syntax_id: HashMap::new(),
             closed_class_owners: HashSet::new(),
+            simple_base_class_owners: HashSet::new(),
             dynamic_class_owners: HashSet::new(),
             methods_by_owner_and_name: HashMap::new(),
             method_blockers_by_owner_and_name: HashSet::new(),
@@ -1896,15 +1898,24 @@ impl<'tree> PythonResolutionIndex<'tree> {
             && node
                 .parent()
                 .is_some_and(|parent| parent.kind() != "decorated_definition");
+        let simple_base = python_single_simple_base(node, source);
+        let header_supported = node
+            .child_by_field_name("body")
+            .and_then(|body| source.get(node.start_byte()..body.start_byte()))
+            .is_some_and(|header| {
+                !header.contains('[')
+                    && (simple_base
+                        || (node.child_by_field_name("superclasses").is_none()
+                            && !header.contains('(')))
+            });
         let closed = direct_module
-            && node.child_by_field_name("superclasses").is_none()
             && node.child_by_field_name("type_parameters").is_none()
-            && node
-                .child_by_field_name("body")
-                .and_then(|body| source.get(node.start_byte()..body.start_byte()))
-                .is_some_and(|header| !header.contains('(') && !header.contains('['));
+            && header_supported;
         if closed && let Some(owner) = python_unique_graph_node(class_nodes, node, &name) {
             self.class_owner_by_syntax_id.insert(node.id(), owner);
+            if simple_base {
+                self.simple_base_class_owners.insert(owner);
+            }
             let mut methods = Vec::new();
             if let Some(body) = node.child_by_field_name("body") {
                 let mut cursor = body.walk();
@@ -2428,6 +2439,8 @@ impl<'tree> PythonResolutionIndex<'tree> {
                         }
                     } else if methods.len() > 1 {
                         CachedResolutionBinding::Ambiguous
+                    } else if self.simple_base_class_owners.contains(owner) {
+                        CachedResolutionBinding::Unsupported
                     } else {
                         CachedResolutionBinding::MissingBinding
                     }
@@ -2531,6 +2544,28 @@ fn python_direct_function_in_class(function: TsNode<'_>, class: TsNode<'_>) -> b
                         .is_some_and(|grandparent| grandparent.id() == body.id())
             })
     })
+}
+
+fn python_single_simple_base(class: TsNode<'_>, source: &str) -> bool {
+    let Some(superclasses) = class.child_by_field_name("superclasses") else {
+        return false;
+    };
+    let mut cursor = superclasses.walk();
+    let bases = superclasses.named_children(&mut cursor).collect::<Vec<_>>();
+    let [base] = bases.as_slice() else {
+        return false;
+    };
+    let Some(base_name) = (base.kind() == "identifier")
+        .then(|| node_text(*base, source))
+        .flatten()
+        .filter(|name| python_identifier(name))
+    else {
+        return false;
+    };
+    node_text(superclasses, source)
+        .and_then(|surface| surface.strip_prefix('('))
+        .and_then(|surface| surface.strip_suffix(')'))
+        .is_some_and(|surface| surface.trim() == base_name)
 }
 
 fn python_direct_enclosing_class(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
