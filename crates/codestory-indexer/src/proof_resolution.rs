@@ -1757,12 +1757,14 @@ impl<'tree> PythonResolutionIndex<'tree> {
                 | "global_statement"
                 | "nonlocal_statement"
                 | "delete_statement"
-                | "case_pattern"
                 | "list_comprehension"
                 | "set_comprehension"
                 | "dictionary_comprehension"
                 | "generator_expression"
                 | "import_statement" => result.collect_local_binding_node(node, source),
+                "case_pattern" if python_outermost_case_pattern(node) => {
+                    result.collect_local_binding_node(node, source);
+                }
                 _ => {}
             }
         });
@@ -2094,6 +2096,14 @@ impl<'tree> PythonResolutionIndex<'tree> {
             && let Some(function) = python_enclosing_function(node)
         {
             self.dynamic_functions.insert(function.id());
+        }
+        if python_call_on_self_dict(node, source)
+            && let Some(owner) = python_enclosing_function(node)
+                .and_then(|function| self.functions.get(&function.id()))
+                .and_then(|info| info.owner.as_ref())
+                .map(|(owner, _)| *owner)
+        {
+            self.dynamic_class_owners.insert(owner);
         }
     }
 
@@ -2656,6 +2666,44 @@ fn python_direct_call_name<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a 
     (function.kind() == "identifier").then(|| node_text(function, source))?
 }
 
+fn python_unwrap_parenthesized(mut node: TsNode<'_>) -> TsNode<'_> {
+    while node.kind() == "parenthesized_expression" && node.named_child_count() == 1 {
+        let Some(inner) = node.named_child(0) else {
+            break;
+        };
+        node = inner;
+    }
+    node
+}
+
+fn python_is_plain_self(node: TsNode<'_>, source: &str) -> bool {
+    let node = python_unwrap_parenthesized(node);
+    node.kind() == "identifier" && node_text(node, source) == Some("self")
+}
+
+fn python_is_self_dict(node: TsNode<'_>, source: &str) -> bool {
+    let node = python_unwrap_parenthesized(node);
+    node.kind() == "attribute"
+        && node
+            .child_by_field_name("object")
+            .is_some_and(|object| python_is_plain_self(object, source))
+        && node
+            .child_by_field_name("attribute")
+            .and_then(|attribute| node_text(attribute, source))
+            == Some("__dict__")
+}
+
+fn python_call_on_self_dict(node: TsNode<'_>, source: &str) -> bool {
+    let Some(function) = node.child_by_field_name("function") else {
+        return false;
+    };
+    let function = python_unwrap_parenthesized(function);
+    function.kind() == "attribute"
+        && function
+            .child_by_field_name("object")
+            .is_some_and(|object| python_is_self_dict(object, source))
+}
+
 fn python_exact_relative_module(module: &str) -> bool {
     module.starts_with('.')
         && !module.starts_with("..")
@@ -2669,6 +2717,22 @@ fn python_identifier(name: &str) -> bool {
         .next()
         .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn python_outermost_case_pattern(node: TsNode<'_>) -> bool {
+    !node.parent().is_some_and(|parent| {
+        matches!(
+            parent.kind(),
+            "case_pattern"
+                | "as_pattern"
+                | "class_pattern"
+                | "dict_pattern"
+                | "keyword_pattern"
+                | "list_pattern"
+                | "tuple_pattern"
+                | "union_pattern"
+        )
+    })
 }
 
 fn python_for_each_binding_target<'tree>(
@@ -2751,18 +2815,95 @@ fn python_binding_names(node: TsNode<'_>, source: &str) -> Vec<String> {
         "case_pattern" => {
             python_collect_case_capture_names(node, source, &mut names);
         }
-        "parameters"
-        | "global_statement"
-        | "nonlocal_statement"
-        | "import_statement"
-        | "import_from_statement" => {
-            python_binding_target_names(node, source, &mut names);
+        "parameters" => {
+            python_collect_parameter_binding_names(node, source, &mut names);
+        }
+        "import_statement" | "import_from_statement" => {
+            python_collect_import_binding_names(node, source, &mut names);
+        }
+        "global_statement" | "nonlocal_statement" => {
+            count_python_resolution_work(1);
+            let mut cursor = node.walk();
+            for name in node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "identifier")
+            {
+                python_binding_target_names(name, source, &mut names);
+            }
         }
         _ => python_binding_target_names(node, source, &mut names),
     }
     names.sort();
     names.dedup();
     names
+}
+
+fn python_collect_parameter_binding_names(node: TsNode<'_>, source: &str, names: &mut Vec<String>) {
+    count_python_resolution_work(1);
+    let mut cursor = node.walk();
+    for parameter in node.named_children(&mut cursor) {
+        count_python_resolution_work(1);
+        match parameter.kind() {
+            "default_parameter" | "typed_default_parameter" => {
+                if let Some(name) = parameter.child_by_field_name("name") {
+                    python_binding_target_names(name, source, names);
+                }
+            }
+            "typed_parameter" => {
+                for index in 0..parameter.named_child_count() {
+                    let Ok(index) = u32::try_from(index) else {
+                        break;
+                    };
+                    if parameter.field_name_for_named_child(index) == Some("type") {
+                        continue;
+                    }
+                    if let Some(target) = parameter.named_child(index) {
+                        python_binding_target_names(target, source, names);
+                    }
+                }
+            }
+            "identifier"
+            | "keyword_identifier"
+            | "list_splat_pattern"
+            | "dictionary_splat_pattern"
+            | "tuple_pattern" => {
+                python_binding_target_names(parameter, source, names);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn python_collect_import_binding_names(node: TsNode<'_>, source: &str, names: &mut Vec<String>) {
+    count_python_resolution_work(1);
+    for index in 0..node.named_child_count() {
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
+        count_python_resolution_work(1);
+        if node.field_name_for_named_child(index) != Some("name") {
+            continue;
+        }
+        let Some(imported) = node.named_child(index) else {
+            continue;
+        };
+        if imported.kind() == "aliased_import" {
+            if let Some(alias) = imported.child_by_field_name("alias") {
+                python_binding_target_names(alias, source, names);
+            }
+            continue;
+        }
+        if imported.kind() != "dotted_name" {
+            continue;
+        }
+        let mut cursor = imported.walk();
+        if let Some(binding) = imported
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "identifier")
+        {
+            python_binding_target_names(binding, source, names);
+        }
+    }
 }
 
 fn python_collect_case_capture_names(node: TsNode<'_>, source: &str, names: &mut Vec<String>) {
@@ -2852,18 +2993,30 @@ fn python_collect_case_capture_names(node: TsNode<'_>, source: &str, names: &mut
 
 fn python_binding_target_names(node: TsNode<'_>, source: &str, names: &mut Vec<String>) {
     count_python_resolution_work(1);
-    if node.kind() == "identifier" {
-        if let Some(name) = node_text(node, source).filter(|name| python_identifier(name)) {
-            names.push(name.to_string());
+    match node.kind() {
+        "identifier" | "keyword_identifier" => {
+            if let Some(name) = node_text(node, source).filter(|name| python_identifier(name)) {
+                names.push(name.to_string());
+            }
         }
-        return;
-    }
-    if node.kind() == "attribute" {
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        python_binding_target_names(child, source, names);
+        "as_pattern_target"
+        | "dictionary_splat"
+        | "dictionary_splat_pattern"
+        | "expression_list"
+        | "list"
+        | "list_pattern"
+        | "list_splat"
+        | "list_splat_pattern"
+        | "parenthesized_expression"
+        | "pattern_list"
+        | "tuple"
+        | "tuple_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                python_binding_target_names(child, source, names);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2883,24 +3036,44 @@ fn python_collect_self_member_binding_names(
     names: &mut Vec<String>,
 ) {
     count_python_resolution_work(1);
-    if node.kind() == "attribute"
-        && node
-            .child_by_field_name("object")
-            .and_then(|object| node_text(object, source))
-            == Some("self")
-    {
-        if let Some(name) = node
-            .child_by_field_name("attribute")
-            .and_then(|attribute| node_text(attribute, source))
-            .filter(|name| python_identifier(name))
-        {
-            names.push(name.to_string());
+    match node.kind() {
+        "attribute" => {
+            if node
+                .child_by_field_name("object")
+                .is_some_and(|object| python_is_plain_self(object, source))
+                && let Some(name) = node
+                    .child_by_field_name("attribute")
+                    .and_then(|attribute| node_text(attribute, source))
+                    .filter(|name| python_identifier(name))
+            {
+                names.push(name.to_string());
+            }
         }
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        python_collect_self_member_binding_names(child, source, names);
+        "subscript"
+            if node
+                .child_by_field_name("value")
+                .is_some_and(|value| python_is_self_dict(value, source)) =>
+        {
+            names.push("__dict__".to_owned());
+        }
+        "as_pattern_target"
+        | "dictionary_splat"
+        | "dictionary_splat_pattern"
+        | "expression_list"
+        | "list"
+        | "list_pattern"
+        | "list_splat"
+        | "list_splat_pattern"
+        | "parenthesized_expression"
+        | "pattern_list"
+        | "tuple"
+        | "tuple_pattern" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                python_collect_self_member_binding_names(child, source, names);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -10942,6 +11115,31 @@ mod python_complexity_tests {
         python_resolution_work()
     }
 
+    fn measured_nested_match_work(depth: usize) -> usize {
+        let mut pattern = "capture".to_owned();
+        for level in 0..depth {
+            pattern = match level % 5 {
+                0 => format!("[{pattern}]"),
+                1 => format!("({pattern},)"),
+                2 => format!("Box({pattern})"),
+                3 => format!("Box(value={pattern})"),
+                _ => format!("{{'key': {pattern}}}"),
+            };
+        }
+        let source = format!(
+            "class Box:\n    pass\ndef target():\n    pass\ndef caller(value):\n    match value:\n        case {pattern}:\n            target()\n"
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Python grammar must load");
+        let tree = parser.parse(&source, None).expect("source must parse");
+        assert!(!tree.root_node().has_error(), "nested pattern must parse");
+        reset_python_resolution_work();
+        let _ = PythonResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+        python_resolution_work()
+    }
+
     fn measured_projection_work(file_count: usize, lookup_count: usize) -> usize {
         let temp = tempfile::tempdir().expect("Python projection tempdir");
         let package = temp.path().join("proof");
@@ -10994,6 +11192,17 @@ mod python_complexity_tests {
         assert!(
             large <= small * 2 + 256,
             "Python source work grew superlinearly: {small} -> {large}"
+        );
+    }
+
+    #[test]
+    fn python_nested_match_binding_work_is_linear() {
+        let small = measured_nested_match_work(64);
+        let large = measured_nested_match_work(128);
+        assert!(small > 0, "nested match work was not counted");
+        assert!(
+            large <= small * 2 + 512,
+            "nested match work grew superlinearly: {small} -> {large}"
         );
     }
 
