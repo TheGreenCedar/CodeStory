@@ -219,6 +219,262 @@ fn seed_exact_graph(store: &mut Store) {
         .expect("edge");
 }
 
+fn receiver_projection(fact: CallResolutionFact) -> ProofResolutionProjection {
+    let mut result = projection(vec![fact.clone()]);
+    result.adapter_roster = vec![ProofResolutionAdapter {
+        language: "typescript".to_owned(),
+        adapter_version: "reference-v6".to_owned(),
+    }];
+    result.funnel[0].language = "typescript".to_owned();
+    result.funnel[0].callee_form = Some(fact.callsite.callee_form);
+    result.funnel[0].evidence_kind = fact.evidence_chain.first().map(ResolutionEvidence::kind);
+    result
+}
+
+fn local_receiver_fact(with_constructor: bool) -> CallResolutionFact {
+    let mut fact = exact_fact(EdgeId(7));
+    fact.raw_edge_target = Some(NodeId(4));
+    fact.raw_callsite_identity = Some("1:2:1:4".to_owned());
+    fact.callsite.callee_form = CalleeForm::ExplicitReceiver;
+    fact.callsite.raw_target = "target".to_owned();
+    fact.caller = NodeId(2);
+    fact.target = Some(NodeId(4));
+    fact.evidence_chain = vec![
+        ResolutionEvidence::ExplicitReceiverType {
+            receiver_type: NodeId(3),
+        },
+        ResolutionEvidence::SameFileDeclaration {
+            declaration: NodeId(4),
+        },
+    ];
+    if with_constructor {
+        fact.evidence_chain.insert(
+            0,
+            ResolutionEvidence::ConstructorBinding {
+                constructor: NodeId(3),
+            },
+        );
+    }
+    fact.provenance.language_adapter = "typescript".to_owned();
+    fact.provenance.language_adapter_version = "reference-v6".to_owned();
+    seal_call_resolution_fact(fact).expect("seal local receiver fact")
+}
+
+fn imported_receiver_fact(with_constructor: bool) -> CallResolutionFact {
+    let mut fact = local_receiver_fact(with_constructor);
+    fact.raw_edge_target = Some(NodeId(7));
+    fact.raw_callsite_identity = Some("1:2:1:7".to_owned());
+    fact.target = Some(NodeId(7));
+    for evidence in &mut fact.evidence_chain {
+        match evidence {
+            ResolutionEvidence::ConstructorBinding { constructor } => *constructor = NodeId(6),
+            ResolutionEvidence::ExplicitReceiverType { receiver_type } => {
+                *receiver_type = NodeId(6)
+            }
+            ResolutionEvidence::SameFileDeclaration { declaration } => *declaration = NodeId(7),
+            _ => {}
+        }
+    }
+    fact.evidence_chain.insert(
+        0,
+        ResolutionEvidence::StaticImportBinding {
+            import: NodeId(8),
+            declaration: NodeId(6),
+        },
+    );
+    fact.provenance
+        .dependency_file_hashes
+        .push(DependencyFileHash {
+            file_id: FileId(5),
+            source_sha256: "b".repeat(64),
+        });
+    seal_call_resolution_fact(fact).expect("seal imported receiver fact")
+}
+
+fn seed_local_receiver_graph(store: &mut Store) {
+    let file = FileInfo {
+        id: 1,
+        path: "src/main.ts".into(),
+        language: "typescript".to_owned(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 2,
+        file_role: FileRole::Source,
+    };
+    store.insert_file(&file).unwrap();
+    store
+        .update_file_metadata(&file, Some(&"a".repeat(64)))
+        .unwrap();
+    for node in [
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/main.ts".to_owned(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(2),
+            end_line: Some(2),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::CLASS,
+            serialized_name: "C".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::METHOD,
+            serialized_name: "C.target".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+    ] {
+        store.insert_node(&node).unwrap();
+    }
+    for edge in [
+        Edge {
+            id: EdgeId(7),
+            source: NodeId(2),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(4)),
+            callsite_identity: Some("1:2:1:4".to_owned()),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(8),
+            source: NodeId(3),
+            target: NodeId(4),
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(9),
+            source: NodeId(2),
+            target: NodeId(3),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(3)),
+            callsite_identity: Some("1:2:2:3".to_owned()),
+            ..Default::default()
+        },
+    ] {
+        store.insert_edge(&edge).unwrap();
+    }
+}
+
+fn seed_imported_receiver_graph(store: &mut Store) {
+    seed_local_receiver_graph(store);
+    store
+        .get_connection()
+        .execute("DELETE FROM edge", [])
+        .unwrap();
+    store
+        .get_connection()
+        .execute("DELETE FROM node WHERE id IN (3, 4)", [])
+        .unwrap();
+    let target_file = FileInfo {
+        id: 5,
+        path: "src/other.ts".into(),
+        language: "typescript".to_owned(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 2,
+        file_role: FileRole::Source,
+    };
+    store.insert_file(&target_file).unwrap();
+    store
+        .update_file_metadata(&target_file, Some(&"b".repeat(64)))
+        .unwrap();
+    for node in [
+        Node {
+            id: NodeId(5),
+            kind: NodeKind::FILE,
+            serialized_name: "src/other.ts".to_owned(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(6),
+            kind: NodeKind::CLASS,
+            serialized_name: "C".to_owned(),
+            file_node_id: Some(NodeId(5)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(7),
+            kind: NodeKind::METHOD,
+            serialized_name: "C.target".to_owned(),
+            file_node_id: Some(NodeId(5)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(8),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "C".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+    ] {
+        store.insert_node(&node).unwrap();
+    }
+    for edge in [
+        Edge {
+            id: EdgeId(7),
+            source: NodeId(2),
+            target: NodeId(7),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(7)),
+            callsite_identity: Some("1:2:1:7".to_owned()),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(8),
+            source: NodeId(8),
+            target: NodeId(6),
+            kind: EdgeKind::IMPORT,
+            file_node_id: Some(NodeId(1)),
+            resolved_target: Some(NodeId(6)),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(9),
+            source: NodeId(6),
+            target: NodeId(7),
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(NodeId(5)),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(10),
+            source: NodeId(2),
+            target: NodeId(6),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(6)),
+            callsite_identity: Some("1:2:2:6".to_owned()),
+            ..Default::default()
+        },
+    ] {
+        store.insert_edge(&edge).unwrap();
+    }
+}
+
 fn seed_repeated_exact_graph(store: &mut Store, fact_count: u32) {
     seed_exact_graph(store);
     for index in 1..fact_count {
@@ -308,6 +564,139 @@ fn exact_projection_round_trips_with_matching_raw_call_and_deterministic_digest(
         first,
         store.get_proof_resolution_publication().unwrap().unwrap()
     );
+}
+
+#[test]
+fn literal_receiver_evidence_shapes_round_trip() {
+    for with_constructor in [false, true] {
+        let mut local = Store::new_in_memory().unwrap();
+        seed_local_receiver_graph(&mut local);
+        let local_fact = local_receiver_fact(with_constructor);
+        local
+            .replace_proof_resolution_projection(
+                &publication(),
+                &receiver_projection(local_fact.clone()),
+            )
+            .expect("local receiver evidence must validate");
+        assert_eq!(
+            local
+                .get_exact_proof_resolution_fact_by_edge(EdgeId(7))
+                .unwrap(),
+            Some(local_fact)
+        );
+
+        let mut imported = Store::new_in_memory().unwrap();
+        seed_imported_receiver_graph(&mut imported);
+        let imported_fact = imported_receiver_fact(with_constructor);
+        imported
+            .replace_proof_resolution_projection(
+                &publication(),
+                &receiver_projection(imported_fact.clone()),
+            )
+            .expect("imported receiver evidence must validate");
+        assert_eq!(
+            imported
+                .get_exact_proof_resolution_fact_by_edge(EdgeId(7))
+                .unwrap(),
+            Some(imported_fact)
+        );
+    }
+}
+
+#[test]
+fn literal_receiver_evidence_rejects_permuted_missing_and_unrelated_graph_proof() {
+    let assert_local_rejected = |mutate: fn(&mut CallResolutionFact), graph_sql: Option<&str>| {
+        let mut store = Store::new_in_memory().unwrap();
+        seed_local_receiver_graph(&mut store);
+        if let Some(sql) = graph_sql {
+            store.get_connection().execute(sql, []).unwrap();
+        }
+        let mut fact = local_receiver_fact(true);
+        mutate(&mut fact);
+        let fact = seal_call_resolution_fact(fact).unwrap();
+        store
+            .replace_proof_resolution_projection(&publication(), &receiver_projection(fact))
+            .expect_err("mutated local receiver proof must fail closed");
+    };
+    assert_local_rejected(|fact| fact.evidence_chain.swap(0, 1), None);
+    assert_local_rejected(
+        |fact| {
+            fact.evidence_chain[0] = ResolutionEvidence::ConstructorBinding {
+                constructor: NodeId(4),
+            };
+        },
+        None,
+    );
+    assert_local_rejected(
+        |fact| {
+            fact.evidence_chain.remove(1);
+        },
+        None,
+    );
+    assert_local_rejected(
+        |fact| {
+            fact.evidence_chain.remove(2);
+        },
+        None,
+    );
+    assert_local_rejected(
+        |fact| fact.callsite.callee_form = CalleeForm::Identifier,
+        None,
+    );
+    assert_local_rejected(|_| {}, Some("DELETE FROM edge WHERE id = 8"));
+    assert_local_rejected(|_| {}, Some("UPDATE node SET kind = 13 WHERE id = 4"));
+
+    let assert_imported_rejected = |mutate: fn(&mut CallResolutionFact),
+                                    graph_sql: Option<&str>| {
+        let mut store = Store::new_in_memory().unwrap();
+        seed_imported_receiver_graph(&mut store);
+        if let Some(sql) = graph_sql {
+            store.get_connection().execute(sql, []).unwrap();
+        }
+        let mut fact = imported_receiver_fact(true);
+        mutate(&mut fact);
+        let fact = seal_call_resolution_fact(fact).unwrap();
+        store
+            .replace_proof_resolution_projection(&publication(), &receiver_projection(fact))
+            .expect_err("mutated imported receiver proof must fail closed");
+    };
+    assert_imported_rejected(|fact| fact.evidence_chain.swap(0, 1), None);
+    for index in [0, 2, 3] {
+        assert_imported_rejected(
+            match index {
+                0 => |fact| {
+                    fact.evidence_chain.remove(0);
+                },
+                1 => |fact| {
+                    fact.evidence_chain.remove(1);
+                },
+                2 => |fact| {
+                    fact.evidence_chain.remove(2);
+                },
+                _ => |fact| {
+                    fact.evidence_chain.remove(3);
+                },
+            },
+            None,
+        );
+    }
+    assert_imported_rejected(
+        |fact| {
+            fact.evidence_chain[1] = ResolutionEvidence::ConstructorBinding {
+                constructor: NodeId(7),
+            };
+        },
+        None,
+    );
+    assert_imported_rejected(
+        |fact| {
+            fact.provenance.dependency_file_hashes.pop();
+        },
+        None,
+    );
+    assert_imported_rejected(|_| {}, Some("DELETE FROM edge WHERE id = 8"));
+    assert_imported_rejected(|_| {}, Some("DELETE FROM edge WHERE id = 9"));
+    assert_imported_rejected(|_| {}, Some("UPDATE node SET kind = 13 WHERE id = 7"));
 }
 
 #[test]
@@ -468,6 +857,7 @@ fn resealed_but_semantically_false_evidence_and_funnel_are_rejected() {
         .execute("DELETE FROM edge WHERE id = 7", [])
         .unwrap();
     target.file_node_id = Some(NodeId(5));
+    target.kind = NodeKind::METHOD;
     cross_file_receiver.insert_node(&target).unwrap();
     cross_file_receiver
         .insert_edge(&Edge {

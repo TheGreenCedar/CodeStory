@@ -4305,6 +4305,56 @@ fn rebase_cached_index_artifact(
                 declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
                 owner_name,
             },
+            CachedResolutionBinding::ConstructorBinding {
+                class_binding,
+                method_name,
+            } => CachedResolutionBinding::ConstructorBinding {
+                class_binding: match class_binding {
+                    cache::CachedClassBinding::SameFile { owner, owner_name } => {
+                        cache::CachedClassBinding::SameFile {
+                            owner: id_remap.get(&owner).copied().unwrap_or(owner),
+                            owner_name,
+                        }
+                    }
+                    cache::CachedClassBinding::StaticImport {
+                        import,
+                        module_specifier,
+                        imported_name,
+                        is_default,
+                    } => cache::CachedClassBinding::StaticImport {
+                        import: id_remap.get(&import).copied().unwrap_or(import),
+                        module_specifier,
+                        imported_name,
+                        is_default,
+                    },
+                },
+                method_name,
+            },
+            CachedResolutionBinding::ExplicitReceiverType {
+                class_binding,
+                method_name,
+            } => CachedResolutionBinding::ExplicitReceiverType {
+                class_binding: match class_binding {
+                    cache::CachedClassBinding::SameFile { owner, owner_name } => {
+                        cache::CachedClassBinding::SameFile {
+                            owner: id_remap.get(&owner).copied().unwrap_or(owner),
+                            owner_name,
+                        }
+                    }
+                    cache::CachedClassBinding::StaticImport {
+                        import,
+                        module_specifier,
+                        imported_name,
+                        is_default,
+                    } => cache::CachedClassBinding::StaticImport {
+                        import: id_remap.get(&import).copied().unwrap_or(import),
+                        module_specifier,
+                        imported_name,
+                        is_default,
+                    },
+                },
+                method_name,
+            },
             other => other,
         };
     }
@@ -4327,6 +4377,18 @@ fn rebase_cached_index_artifact(
                 .get(&method.declaration)
                 .copied()
                 .unwrap_or(method.declaration);
+        }
+        for class in &mut resolution_file.classes {
+            class.declaration = id_remap
+                .get(&class.declaration)
+                .copied()
+                .unwrap_or(class.declaration);
+            for method in &mut class.methods {
+                method.declaration = id_remap
+                    .get(&method.declaration)
+                    .copied()
+                    .unwrap_or(method.declaration);
+            }
         }
     }
 
@@ -16172,3 +16234,186 @@ fn generate_edge_id_for_edge(edge: &Edge, flags: IndexFeatureFlags) -> i64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod proof_resolution_cache_tests {
+    use super::*;
+    use crate::cache::{
+        CachedCallResolutionInput, CachedClassBinding, CachedClassDeclaration, CachedClassMethod,
+        CachedDeclarationKind, CachedDirectExport, CachedIndexArtifact, CachedInherentMethod,
+        CachedResolutionBinding, CachedResolutionFile, CachedTopLevelDeclaration,
+    };
+    use codestory_contracts::proof_resolution::{CalleeForm, ExactCallsite, FileId};
+    use codestory_store::{FileInfo, FileRole};
+
+    #[test]
+    fn rebases_every_cached_receiver_inventory_and_binding_node_id() {
+        let old_file = NodeId(1);
+        let old_owner = NodeId(2);
+        let old_method = NodeId(3);
+        let old_import = NodeId(4);
+        let old_caller = NodeId(5);
+        let node = |id: NodeId, kind: NodeKind, name: &str| Node {
+            id,
+            kind,
+            serialized_name: name.to_owned(),
+            file_node_id: (id != old_file).then_some(old_file),
+            start_line: Some(id.0 as u32),
+            start_col: Some(1),
+            end_line: Some(id.0 as u32),
+            end_col: Some(10),
+            ..Default::default()
+        };
+        let callsite = ExactCallsite {
+            file_id: FileId(old_file.0),
+            source_sha256: "a".repeat(64),
+            start_byte: 20,
+            end_byte_exclusive: 26,
+            line: 5,
+            column: 1,
+            callee_form: CalleeForm::ExplicitReceiver,
+            raw_target: "target".to_owned(),
+        };
+        let artifact = CachedIndexArtifact {
+            resolution_input_schema_version: 5,
+            files: vec![FileInfo {
+                id: old_file.0,
+                path: "old.ts".into(),
+                language: "typescript".to_owned(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 5,
+                file_role: FileRole::Source,
+            }],
+            nodes: vec![
+                node(old_file, NodeKind::FILE, "old.ts"),
+                node(old_owner, NodeKind::CLASS, "C"),
+                node(old_method, NodeKind::METHOD, "C.target"),
+                node(old_import, NodeKind::UNKNOWN, "C"),
+                node(old_caller, NodeKind::FUNCTION, "caller"),
+            ],
+            edges: Vec::new(),
+            occurrences: Vec::new(),
+            component_access: Vec::new(),
+            callable_projection_states: Vec::new(),
+            impl_anchor_node_ids: Vec::new(),
+            call_resolution_inputs: vec![
+                CachedCallResolutionInput {
+                    callsite: callsite.clone(),
+                    caller: Some(old_caller),
+                    binding: CachedResolutionBinding::ConstructorBinding {
+                        class_binding: CachedClassBinding::SameFile {
+                            owner: old_owner,
+                            owner_name: "C".to_owned(),
+                        },
+                        method_name: "target".to_owned(),
+                    },
+                    language: "typescript".to_owned(),
+                    adapter_version: "reference-v7".to_owned(),
+                    parser_fingerprint: "b".repeat(64),
+                },
+                CachedCallResolutionInput {
+                    callsite,
+                    caller: Some(old_caller),
+                    binding: CachedResolutionBinding::ExplicitReceiverType {
+                        class_binding: CachedClassBinding::StaticImport {
+                            import: old_import,
+                            module_specifier: "./other".to_owned(),
+                            imported_name: "C".to_owned(),
+                            is_default: false,
+                        },
+                        method_name: "target".to_owned(),
+                    },
+                    language: "typescript".to_owned(),
+                    adapter_version: "reference-v7".to_owned(),
+                    parser_fingerprint: "b".repeat(64),
+                },
+            ],
+            resolution_file: Some(CachedResolutionFile {
+                file_id: old_file,
+                source_sha256: "a".repeat(64),
+                language: "typescript".to_owned(),
+                adapter_version: "reference-v7".to_owned(),
+                parser_fingerprint: "b".repeat(64),
+                complete: true,
+                lookup_input_complete: true,
+                typescript_module: true,
+                top_level_declarations: vec![CachedTopLevelDeclaration {
+                    name: "target".to_owned(),
+                    declaration: old_method,
+                }],
+                inherent_methods: vec![CachedInherentMethod {
+                    owner_name: "C".to_owned(),
+                    method_name: "target".to_owned(),
+                    declaration: old_method,
+                }],
+                classes: vec![CachedClassDeclaration {
+                    name: "C".to_owned(),
+                    declaration: old_owner,
+                    methods: vec![CachedClassMethod {
+                        name: "target".to_owned(),
+                        declaration: old_method,
+                    }],
+                }],
+                direct_exports: vec![CachedDirectExport {
+                    exported_name: "C".to_owned(),
+                    declaration: old_owner,
+                    is_default: false,
+                    declaration_kind: CachedDeclarationKind::Class,
+                }],
+                export_poison_all: false,
+                poisoned_export_names: vec!["unrelated".to_owned()],
+            }),
+        };
+
+        let rebased = rebase_cached_index_artifact(
+            artifact,
+            Path::new("/tmp/rebased.ts"),
+            "export class C { target() {} }",
+            "typescript",
+            index_feature_flags(),
+        );
+        let id = |kind, name: &str| {
+            rebased
+                .nodes
+                .iter()
+                .find(|node| node.kind == kind && node.serialized_name.ends_with(name))
+                .expect("rebased node")
+                .id
+        };
+        let new_file = id(NodeKind::FILE, "rebased.ts");
+        let new_owner = id(NodeKind::CLASS, "C");
+        let new_method = id(NodeKind::METHOD, "C.target");
+        let new_import = id(NodeKind::UNKNOWN, "C");
+        let new_caller = id(NodeKind::FUNCTION, "caller");
+        assert_ne!(
+            (new_file, new_owner, new_method, new_import, new_caller),
+            (old_file, old_owner, old_method, old_import, old_caller)
+        );
+        assert!(rebased.call_resolution_inputs.iter().all(|input| {
+            input.callsite.file_id == FileId(new_file.0) && input.caller == Some(new_caller)
+        }));
+        assert!(matches!(
+            &rebased.call_resolution_inputs[0].binding,
+            CachedResolutionBinding::ConstructorBinding {
+                class_binding: CachedClassBinding::SameFile { owner, .. }, ..
+            } if *owner == new_owner
+        ));
+        assert!(matches!(
+            &rebased.call_resolution_inputs[1].binding,
+            CachedResolutionBinding::ExplicitReceiverType {
+                class_binding: CachedClassBinding::StaticImport { import, .. }, ..
+            } if *import == new_import
+        ));
+        let file = rebased.resolution_file.expect("resolution file");
+        assert_eq!(file.file_id, new_file);
+        assert_eq!(file.top_level_declarations[0].declaration, new_method);
+        assert_eq!(file.inherent_methods[0].declaration, new_method);
+        assert_eq!(file.classes[0].declaration, new_owner);
+        assert_eq!(file.classes[0].methods[0].declaration, new_method);
+        assert_eq!(file.direct_exports[0].declaration, new_owner);
+        assert!(!file.export_poison_all);
+        assert_eq!(file.poisoned_export_names, ["unrelated"]);
+    }
+}

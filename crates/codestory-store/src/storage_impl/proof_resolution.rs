@@ -423,13 +423,42 @@ impl Storage {
                 }
             })
             .collect::<Vec<_>>();
+        let constructor_evidence_nodes = facts
+            .iter()
+            .filter_map(
+                |fact| match (fact.callsite.callee_form, fact.evidence_chain.as_slice()) {
+                    (
+                        CalleeForm::ExplicitReceiver,
+                        [
+                            ResolutionEvidence::ConstructorBinding { constructor },
+                            ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                            ResolutionEvidence::SameFileDeclaration { .. },
+                        ],
+                    ) if constructor == receiver_type => Some(*constructor),
+                    (
+                        CalleeForm::ExplicitReceiver,
+                        [
+                            ResolutionEvidence::StaticImportBinding {
+                                declaration: owner, ..
+                            },
+                            ResolutionEvidence::ConstructorBinding { constructor },
+                            ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                            ResolutionEvidence::SameFileDeclaration { .. },
+                        ],
+                    ) if owner == constructor && constructor == receiver_type => Some(*constructor),
+                    _ => None,
+                },
+            )
+            .collect::<BTreeSet<_>>();
         let ordinary_edge_indices = context
             .edges
             .iter()
             .enumerate()
             .filter_map(|(index, edge)| {
-                (edge.kind == EdgeKind::CALL && context.node_by_id.contains_key(&edge.target))
-                    .then_some(index)
+                (edge.kind == EdgeKind::CALL
+                    && context.node_by_id.contains_key(&edge.target)
+                    && !constructor_evidence_nodes.contains(&edge.effective_target()))
+                .then_some(index)
             })
             .collect::<Vec<_>>();
         let edge_inputs = ordinary_edge_indices
@@ -437,14 +466,24 @@ impl Storage {
             .map(|index| {
                 let edge = &context.edges[*index];
                 let raw = &context.node_by_id[&edge.target];
+                let direct_member_edge = edge.target == edge.effective_target()
+                    && (raw.kind == NodeKind::METHOD || raw.file_node_id != edge.file_node_id);
                 OrdinaryCallEdgeCorrelationInput {
                     file_id: edge.file_node_id.map(|file| FileId(file.0)),
                     line: edge.line,
                     caller: edge.effective_source(),
                     target: edge.effective_target(),
                     raw_edge_target: edge.target,
-                    raw_file_id: raw.file_node_id.map(|file| FileId(file.0)),
-                    raw_line: raw.start_line,
+                    raw_file_id: if direct_member_edge {
+                        edge.file_node_id.map(|file| FileId(file.0))
+                    } else {
+                        raw.file_node_id.map(|file| FileId(file.0))
+                    },
+                    raw_line: if direct_member_edge {
+                        edge.line
+                    } else {
+                        raw.start_line
+                    },
                     raw_target: graph_leaf_name(&raw.serialized_name),
                     callsite_identity: edge.callsite_identity.as_deref(),
                     semantic_exact: edge.resolved_target == Some(edge.effective_target())
@@ -575,8 +614,15 @@ impl Storage {
             .node_by_id
             .get(&raw_edge_target)
             .ok_or_else(|| proof_error("raw CALL placeholder node is missing"))?;
-        if raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-            || raw_placeholder.start_line != Some(fact.callsite.line)
+        let direct_member_target = matches!(
+            fact.callsite.callee_form,
+            CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver | CalleeForm::NamedImport
+        ) && raw_edge_target == target
+            && (raw_placeholder.kind == NodeKind::METHOD
+                || raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0)));
+        if !direct_member_target
+            && (raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                || raw_placeholder.start_line != Some(fact.callsite.line))
             || graph_leaf_name(&raw_placeholder.serialized_name) != fact.callsite.raw_target
         {
             return Err(proof_error(
@@ -595,6 +641,15 @@ impl Storage {
                     "matching ordinary CALL edge canonical callsite identity does not form one complete mapping",
                 ));
             }
+        }
+        if matches!(
+            fact.callsite.callee_form,
+            CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver
+        ) && target_node.kind != NodeKind::METHOD
+        {
+            return Err(proof_error(
+                "receiver evidence target is not a METHOD graph node",
+            ));
         }
         match (fact.callsite.callee_form, fact.evidence_chain.as_slice()) {
             (CalleeForm::Identifier, [ResolutionEvidence::SameFileDeclaration { declaration }])
@@ -662,6 +717,100 @@ impl Storage {
                     ));
                 }
             }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *constructor == *receiver_type && *declaration == target => {
+                let owner = *constructor;
+                let owner_node = context
+                    .node_by_id
+                    .get(&owner)
+                    .ok_or_else(|| proof_error("constructor receiver owner is missing"))?;
+                if owner_node.kind != NodeKind::CLASS
+                    || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                    || owner_node.file_node_id != target_node.file_node_id
+                    || context
+                        .member_relation_counts
+                        .get(&(owner, target))
+                        .copied()
+                        != Some(1)
+                {
+                    return Err(proof_error(
+                        "ConstructorBinding and ExplicitReceiverType do not name the unique target owner/member",
+                    ));
+                }
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *declaration == target => {
+                let owner = *receiver_type;
+                let owner_node = context
+                    .node_by_id
+                    .get(&owner)
+                    .ok_or_else(|| proof_error("explicit receiver type is missing"))?;
+                if owner_node.kind != NodeKind::CLASS
+                    || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                    || owner_node.file_node_id != target_node.file_node_id
+                    || context
+                        .member_relation_counts
+                        .get(&(owner, target))
+                        .copied()
+                        != Some(1)
+                {
+                    return Err(proof_error(
+                        "ExplicitReceiverType does not name the unique target owner/member",
+                    ));
+                }
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *owner == *constructor && *owner == *receiver_type && *declaration == target => {
+                Self::validate_imported_receiver_evidence(
+                    fact,
+                    context,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                )?;
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *owner == *receiver_type && *declaration == target => {
+                Self::validate_imported_receiver_evidence(
+                    fact,
+                    context,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                )?;
+            }
             _ => {
                 return Err(proof_error(
                     "typed evidence has no implemented exact semantic validator",
@@ -708,6 +857,43 @@ impl Storage {
         {
             return Err(proof_error(
                 "matching ordinary CALL edge has a different exact callsite identity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_imported_receiver_evidence(
+        fact: &CallResolutionFact,
+        context: &ProofResolutionValidationContext,
+        import: NodeId,
+        owner: NodeId,
+        target: NodeId,
+        target_node: &Node,
+    ) -> Result<(), StorageError> {
+        let import_node = context
+            .node_by_id
+            .get(&import)
+            .ok_or_else(|| proof_error("imported receiver binding is missing"))?;
+        let owner_node = context
+            .node_by_id
+            .get(&owner)
+            .ok_or_else(|| proof_error("imported receiver owner is missing"))?;
+        if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+            || owner_node.kind != NodeKind::CLASS
+            || owner_node.file_node_id != target_node.file_node_id
+            || context
+                .import_relation_counts
+                .get(&(NodeId(fact.callsite.file_id.0), import, owner))
+                .copied()
+                != Some(1)
+            || context
+                .member_relation_counts
+                .get(&(owner, target))
+                .copied()
+                != Some(1)
+        {
+            return Err(proof_error(
+                "imported receiver evidence does not name one IMPORT owner and one MEMBER target",
             ));
         }
         Ok(())
