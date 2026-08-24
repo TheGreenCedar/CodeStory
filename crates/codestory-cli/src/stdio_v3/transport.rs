@@ -571,48 +571,49 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "proof-qualification-support")]
     fn proof_root(disposition_kind: &str) -> Value {
-        #[cfg(feature = "proof-qualification-support")]
-        {
-            let mut root = actual_projected_root("x".to_owned());
-            match disposition_kind {
-                "proven" => return root,
-                "unavailable" => {
-                    root["identities"] = json!({
-                        "files":[],"symbols":[],"provenance_profiles":[],"evidence":[]
-                    });
-                    root["spec"]["start"] = json!({"kind":"canonical_id","canonical_id":"A"});
-                    root["spec"]["steps"][0]["target"] =
-                        json!({"kind":"canonical_id","canonical_id":"B"});
-                    root["disposition"] = json!({
-                        "kind":"unavailable",
-                        "contract_digest":root["contract_digest"],
-                        "reasons":["publication_pin_mismatch"]
-                    });
-                    root["steps"] = json!([{"step_index":0,"status":"unavailable","receipt":null}]);
-                    root["receipts"] = json!([]);
-                    return root;
-                }
-                _ => {
-                    root["identities"] = json!({
-                        "files":[],"symbols":[],"provenance_profiles":[],"evidence":[]
-                    });
-                    root["spec"]["start"] = json!({"kind":"canonical_id","canonical_id":"A"});
-                    root["spec"]["steps"][0]["target"] =
-                        json!({"kind":"canonical_id","canonical_id":"B"});
-                    root["disposition"] = json!({
-                        "kind":"unknown",
-                        "contract_digest":root["contract_digest"],
-                        "gaps":[{"kind":"direct_call_missing","step_index":0}],
-                        "connected_receipts":[]
-                    });
-                    root["steps"] = json!([{"step_index":0,"status":"unknown","receipt":null}]);
-                    root["receipts"] = json!([]);
-                    return root;
-                }
+        let mut root = actual_projected_root("x".to_owned());
+        match disposition_kind {
+            "proven" => root,
+            "unavailable" => {
+                root["identities"] = json!({
+                    "files":[],"symbols":[],"provenance_profiles":[],"evidence":[]
+                });
+                root["spec"]["start"] = json!({"kind":"canonical_id","canonical_id":"A"});
+                root["spec"]["steps"][0]["target"] =
+                    json!({"kind":"canonical_id","canonical_id":"B"});
+                root["disposition"] = json!({
+                    "kind":"unavailable",
+                    "contract_digest":root["contract_digest"],
+                    "reasons":["publication_pin_mismatch"]
+                });
+                root["steps"] = json!([{"step_index":0,"status":"unavailable","receipt":null}]);
+                root["receipts"] = json!([]);
+                root
+            }
+            _ => {
+                root["identities"] = json!({
+                    "files":[],"symbols":[],"provenance_profiles":[],"evidence":[]
+                });
+                root["spec"]["start"] = json!({"kind":"canonical_id","canonical_id":"A"});
+                root["spec"]["steps"][0]["target"] =
+                    json!({"kind":"canonical_id","canonical_id":"B"});
+                root["disposition"] = json!({
+                    "kind":"unknown",
+                    "contract_digest":root["contract_digest"],
+                    "gaps":[{"kind":"direct_call_missing","step_index":0}],
+                    "connected_receipts":[]
+                });
+                root["steps"] = json!([{"step_index":0,"status":"unknown","receipt":null}]);
+                root["receipts"] = json!([]);
+                root
             }
         }
+    }
 
+    #[cfg(not(feature = "proof-qualification-support"))]
+    fn proof_root(disposition_kind: &str) -> Value {
         let disposition = match disposition_kind {
             "proven" => json!({
                 "kind": "contract_proven",
