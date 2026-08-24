@@ -4837,7 +4837,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v11", "adapter", "language"]
+            ["stale", "schema-v12", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -4902,6 +4902,31 @@ fn rust_macro_expansion_poison_is_scoped_to_relevant_domains() -> anyhow::Result
         "src/disjoint.rs",
         "macro_rules! local_only { () => { let unrelated = 1; }; }\nfn target() {}\nfn caller() { { local_only!(); } target(); }\n",
     )])?;
+    Ok(())
+}
+
+#[test]
+fn rust_module_closure_ignores_unrelated_closed_expression_macros() -> anyhow::Result<()> {
+    for source in [
+        "const LABEL: &str = concat!(\"open\", \"\");\nfn target() {}\nfn caller() { target(); }\n",
+        "static PACKAGE: &str = env!(\"CARGO_PKG_NAME\");\nfn target() {}\nfn caller() { target(); }\n",
+        "const LABEL: &str = { let _ = format_args!(\"{}\", \"note\"); \"note\" };\nfn target() {}\nfn caller() { target(); }\n",
+        "enum Marker { Value = line!() }\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg(any())]\nconst UNRELATED: usize = 0;\nfn target() {}\nfn caller() { target(); }\n",
+    ] {
+        assert_only_call_is_exact(&[("src/lib.rs", source)])?;
+    }
+
+    for source in [
+        "include!(\"generated.rs\");\nfn target() {}\nfn caller() { target(); }\n",
+        "thread_local! { static MARKER: usize = 0; }\nfn target() {}\nfn caller() { target(); }\n",
+        "macro_rules! generated { () => { fn target() {} }; }\ngenerated!();\nfn target() {}\nfn caller() { target(); }\n",
+        "#![cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg(any())]\nfn target() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "fn target() {}\n#[cfg(any())]\nfn caller() { target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
     Ok(())
 }
 

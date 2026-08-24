@@ -85,7 +85,7 @@ fn python_resolution_work() -> usize {
 }
 
 const ADAPTER_VERSION: &str = "reference-v13";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 11;
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 12;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
@@ -4457,7 +4457,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                     && !rust_inner_allow_preserves_module_bindings(*item, source))
                 || (item.kind() == "attribute_item"
                     && !rust_attribute_is_bounded_item_metadata(*item, source))
-                || (!matches!(item.kind(), "function_item" | "mod_item" | "impl_item")
+                || (item.kind() == "expression_statement"
                     && contains_node_kind(*item, "macro_invocation"))
             {
                 domain_complete = false;
