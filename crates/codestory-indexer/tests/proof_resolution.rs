@@ -628,6 +628,225 @@ fn python_closed_exact_subset_authorizes_s1_through_s4() -> anyhow::Result<()> {
 }
 
 #[test]
+fn python_read_only_getattr_does_not_poison_closed_static_neighbors() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/target.py", "def imported_target():\n    pass\n"),
+            (
+                "pkg/main.py",
+                concat!(
+                    "from .target import imported_target\n\n",
+                    "def local_target():\n    pass\n\n",
+                    "class Worker:\n",
+                    "    def run(self):\n        pass\n",
+                    "    def self_caller(self, obj):\n",
+                    "        self.run()\n",
+                    "        getattr(obj, 'value')\n",
+                    "        self.run()\n\n",
+                    "def local_caller(obj):\n",
+                    "    local_target()\n",
+                    "    getattr(obj, 'value')\n",
+                    "    local_target()\n\n",
+                    "def import_caller(obj):\n",
+                    "    imported_target()\n",
+                    "    getattr(obj, 'value')\n",
+                    "    imported_target()\n\n",
+                    "def receiver_caller(obj):\n",
+                    "    worker: Worker\n",
+                    "    worker.run()\n",
+                    "    getattr(obj, 'value')\n",
+                    "    worker.run()\n",
+                ),
+            ),
+        ],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "python")
+        .collect::<Vec<_>>();
+    for (target, expected_count) in [("local_target", 2), ("imported_target", 2), ("run", 4)] {
+        let static_facts = facts
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == target)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            static_facts.len(),
+            expected_count,
+            "missing before/after {target} facts: {facts:#?}"
+        );
+        assert!(
+            static_facts.iter().all(|fact| {
+                fact.status == ProofResolutionStatus::Exact
+                    && fact.edge_id.is_some()
+                    && fact.provenance.language_adapter_version == "reference-v16"
+            }),
+            "read-only getter poisoned {target}: {static_facts:#?}"
+        );
+    }
+    let getter_facts = facts
+        .iter()
+        .filter(|fact| fact.callsite.raw_target == "getattr")
+        .collect::<Vec<_>>();
+    assert_eq!(getter_facts.len(), 4, "missing getter facts: {facts:#?}");
+    assert!(
+        getter_facts.iter().all(|fact| {
+            fact.status == ProofResolutionStatus::Unsupported
+                && fact.reason.matches_status(fact.status)
+                && fact.evidence_chain.is_empty()
+        }),
+        "getter became authoritative: {getter_facts:#?}"
+    );
+    Ok(())
+}
+
+fn assert_python_facts_are_non_authoritative(files: &[(&str, &str)]) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "python")
+        .collect::<Vec<_>>();
+    assert!(!facts.is_empty(), "missing Python facts for {files:?}");
+    assert!(
+        facts.iter().all(|fact| {
+            fact.status != ProofResolutionStatus::Exact && fact.evidence_chain.is_empty()
+        }),
+        "dynamic Python fact became authoritative: {facts:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn python_getattr_and_derived_values_remain_non_authoritative() -> anyhow::Result<()> {
+    for source in [
+        "def caller(obj):\n    getattr(obj, 'target')()\n",
+        "def caller(obj):\n    callback = getattr(obj, 'target')\n    callback()\n",
+        "def caller(obj):\n    getattr(obj, 'target').method()\n",
+        "def caller(obj, getattr):\n    getattr(obj, 'target')()\n",
+        "def caller(obj):\n    getattr = obj\n    getattr(obj, 'target')()\n",
+        "from foreign import getattr\ndef caller(obj):\n    getattr(obj, 'target')()\n",
+        "def target():\n    pass\ndef caller(obj):\n    getattr(obj, 'value')\n    def inner():\n        target()\n    inner()\n",
+        "def caller(obj):\n    callback = lambda: getattr(obj, 'target')()\n    callback()\n",
+        "def caller(obj):\n    receiver = getattr(obj, 'receiver')\n    receiver.target()\n",
+        "def caller(obj):\n    constructor = getattr(obj, 'Worker')\n    constructor()\n",
+    ] {
+        assert_python_facts_are_non_authoritative(&[("main.py", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn python_getattr_does_not_relax_existing_dynamic_guards() -> anyhow::Result<()> {
+    for guard in [
+        "setattr(obj, 'target', replacement)",
+        "delattr(obj, 'target')",
+        "exec('target = replacement')",
+        "eval('target = replacement')",
+        "globals()",
+    ] {
+        let source = format!(
+            "def target():\n    pass\ndef caller(obj, replacement):\n    target()\n    getattr(obj, 'value')\n    {guard}\n    target()\n"
+        );
+        assert_python_target_has_closed_status(
+            &[("main.py", source.as_str())],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    for hook in [
+        "__getattribute__",
+        "__getattr__",
+        "__setattr__",
+        "__delattr__",
+    ] {
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\n    def {hook}(self, *args):\n        pass\n    def caller(self, obj):\n        self.target()\n        getattr(obj, 'value')\n        self.target()\n"
+        );
+        assert_python_target_has_closed_status(
+            &[("main.py", source.as_str())],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    let source = concat!(
+        "class Worker:\n",
+        "    def target(self):\n        pass\n",
+        "    def caller(self, obj):\n",
+        "        self.target()\n",
+        "        getattr(obj, 'value')\n",
+        "        self.__dict__['target'] = None\n",
+        "        self.target()\n",
+    );
+    assert_python_target_has_closed_status(
+        &[("main.py", source)],
+        "target",
+        ProofResolutionStatus::Unsupported,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn python_namespace_getattr_and_getattr_named_constructor_stay_closed() -> anyhow::Result<()> {
+    for source in [
+        concat!(
+            "class Worker:\n    def target(self):\n        pass\n",
+            "def caller(worker: Worker):\n",
+            "    worker.target()\n",
+            "    namespace = getattr(worker, '__dict__')\n",
+            "    alias = namespace\n",
+            "    alias.update(target=None)\n",
+            "    worker.target()\n",
+        ),
+        concat!(
+            "class Worker:\n",
+            "    def target(self):\n        pass\n",
+            "    def caller(self):\n",
+            "        self.target()\n",
+            "        getattr(self, '__dict__').__setitem__('target', None)\n",
+            "        self.target()\n",
+        ),
+        concat!(
+            "def target():\n    pass\n",
+            "def caller():\n",
+            "    target()\n",
+            "    getattr(sys.modules[__name__], '__dict__').__setitem__('target', None)\n",
+            "    target()\n",
+        ),
+    ] {
+        assert_python_target_has_closed_status(
+            &[("main.py", source)],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+
+    let class_named_getattr = concat!(
+        "class getattr:\n",
+        "    def run(self):\n        pass\n",
+        "def caller():\n",
+        "    receiver = getattr()\n",
+        "    receiver.run()\n",
+    );
+    assert_python_target_has_closed_status(
+        &[("main.py", class_named_getattr)],
+        "run",
+        ProofResolutionStatus::Unsupported,
+    )?;
+    Ok(())
+}
+
+#[test]
 fn python_single_simple_base_authorizes_a_direct_same_class_method() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
@@ -5486,8 +5705,8 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             project.path(),
             &mut store,
             &[(
-                "src/main.ts",
-                "export function target() {}\nexport function caller() { target(); }\n",
+                "src/main.py",
+                "def target():\n    pass\ndef caller():\n    target()\n",
             )],
         )?;
         let artifact_blob = store.get_connection().query_row(
@@ -5511,7 +5730,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v13", "adapter", "language"]
+            ["stale", "schema-v14", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -5637,7 +5856,13 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
     index_files(
         project.path(),
         &mut store,
-        &[("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n")],
+        &[
+            ("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n"),
+            (
+                "src/main.py",
+                "def target():\n    pass\ndef caller():\n    target()\n",
+            ),
+        ],
     )?;
     let receipt = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     assert_eq!(
@@ -5647,6 +5872,14 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .find(|adapter| adapter.language == "rust")
             .map(|adapter| adapter.adapter_version.as_str()),
         Some("reference-v15")
+    );
+    assert_eq!(
+        receipt
+            .adapter_roster
+            .iter()
+            .find(|adapter| adapter.language == "python")
+            .map(|adapter| adapter.adapter_version.as_str()),
+        Some("reference-v16")
     );
     for fact in store.get_proof_resolution_facts()? {
         assert!(receipt.adapter_roster.iter().any(|adapter| {

@@ -87,15 +87,23 @@ fn python_resolution_work() -> usize {
 }
 
 const ADAPTER_VERSION: &str = "reference-v15";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 13;
+const PYTHON_ADAPTER_VERSION: &str = "reference-v16";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 14;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
-    ("python", ADAPTER_VERSION),
+    ("python", PYTHON_ADAPTER_VERSION),
     ("rust", ADAPTER_VERSION),
     ("tsx", ADAPTER_VERSION),
     ("typescript", ADAPTER_VERSION),
 ];
+
+fn adapter_version(language: &str) -> &str {
+    INSTALLED_ADAPTERS
+        .iter()
+        .find_map(|(installed, version)| (*installed == language).then_some(*version))
+        .unwrap_or(ADAPTER_VERSION)
+}
 
 pub fn current_proof_resolution_adapter_roster() -> Vec<ProofResolutionAdapter> {
     let mut roster = INSTALLED_ADAPTERS
@@ -216,7 +224,7 @@ pub(crate) fn collect_call_resolution_inputs(
                 caller,
                 binding,
                 language: language.to_string(),
-                adapter_version: ADAPTER_VERSION.to_string(),
+                adapter_version: adapter_version(language).to_string(),
                 parser_fingerprint: parser_fingerprint.to_string(),
             });
         };
@@ -258,7 +266,7 @@ pub(crate) fn collect_call_resolution_inputs(
             file_id,
             source_sha256,
             language: language.to_string(),
-            adapter_version: ADAPTER_VERSION.to_string(),
+            adapter_version: adapter_version(language).to_string(),
             parser_fingerprint: parser_fingerprint.to_string(),
             complete,
             lookup_input_complete,
@@ -315,11 +323,11 @@ pub(crate) fn cached_resolution_inputs_are_current(
         || (artifact.resolution_input_schema_version == RESOLUTION_INPUT_SCHEMA_VERSION
             && artifact.resolution_file.as_ref().is_some_and(|file| {
                 file.language == language
-                    && file.adapter_version == ADAPTER_VERSION
+                    && file.adapter_version == adapter_version(language)
                     && file.parser_fingerprint == expected_parser_fingerprint
                     && artifact.call_resolution_inputs.iter().all(|call| {
                         call.language == language
-                            && call.adapter_version == ADAPTER_VERSION
+                            && call.adapter_version == adapter_version(language)
                             && call.parser_fingerprint == expected_parser_fingerprint
                     })
             }))
@@ -2091,8 +2099,9 @@ impl<'tree> PythonResolutionIndex<'tree> {
             form,
             raw_target,
         });
-        if python_direct_call_name(node, source)
-            .is_some_and(|name| matches!(name, "getattr" | "setattr" | "delattr"))
+        if (python_direct_call_name(node, source)
+            .is_some_and(|name| matches!(name, "setattr" | "delattr"))
+            || python_getattr_exposes_namespace(node, source))
             && let Some(function) = python_enclosing_function(node)
         {
             self.dynamic_functions.insert(function.id());
@@ -2140,9 +2149,9 @@ impl<'tree> PythonResolutionIndex<'tree> {
         let direct_block = python_direct_statement_in_function(node, function);
         let receiver = if names.len() == 1 && left.kind() == "identifier" && direct_block {
             let class_name = match node.child_by_field_name("right") {
-                Some(right) => {
-                    python_direct_constructor_name(right, source).map(|name| (name, true))
-                }
+                Some(right) => python_direct_constructor_name(right, source)
+                    .filter(|name| name != "getattr")
+                    .map(|name| (name, true)),
                 None => node
                     .child_by_field_name("type")
                     .and_then(|annotation| python_exact_annotation(annotation, source))
@@ -2371,6 +2380,9 @@ impl<'tree> PythonResolutionIndex<'tree> {
             return (Some(caller), CachedResolutionBinding::Unsupported);
         }
         if python_has_enclosing_lambda(call, function) {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if python_direct_call_name(call, source).is_some_and(|name| name == "getattr") {
             return (Some(caller), CachedResolutionBinding::Unsupported);
         }
         if self.dynamic_functions.contains(&function.id()) {
@@ -2664,6 +2676,22 @@ fn python_exact_annotation(node: TsNode<'_>, source: &str) -> Option<String> {
 fn python_direct_call_name<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
     let function = node.child_by_field_name("function")?;
     (function.kind() == "identifier").then(|| node_text(function, source))?
+}
+
+fn python_getattr_exposes_namespace(node: TsNode<'_>, source: &str) -> bool {
+    if python_direct_call_name(node, source) != Some("getattr") {
+        return false;
+    }
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return false;
+    };
+    let mut cursor = arguments.walk();
+    let mut values = arguments.named_children(&mut cursor);
+    let _receiver = values.next();
+    matches!(
+        values.next().and_then(|value| node_text(value, source)),
+        Some("\"__dict__\"" | "'__dict__'")
+    )
 }
 
 fn python_unwrap_parenthesized(mut node: TsNode<'_>) -> TsNode<'_> {
@@ -6825,7 +6853,7 @@ pub fn rematerialize_proof_resolution_projection(
             || record.file.source_sha256 != *stored_hash
             || record.file.language != indexed_file.language
             || record.file.complete != indexed_file.complete
-            || record.file.adapter_version != ADAPTER_VERSION
+            || record.file.adapter_version != adapter_version(&indexed_file.language)
             || record.calls.iter().any(|call| {
                 call.callsite.file_id != FileId(indexed_file.id)
                     || call.callsite.source_sha256 != *stored_hash
@@ -11098,11 +11126,11 @@ mod python_complexity_tests {
 
     fn measured_source_work(call_count: usize) -> usize {
         let mut source = String::from(
-            "class Worker:\n    def run(self):\n        pass\n\ndef target():\n    pass\n\ndef caller():\n",
+            "class Worker:\n    def run(self):\n        pass\n\ndef target():\n    pass\n\ndef caller(obj):\n",
         );
         for index in 0..call_count {
             source.push_str(&format!(
-                "    worker_{index} = Worker()\n    worker_{index}.run()\n    target()\n"
+                "    getattr(obj, 'marker')\n    worker_{index} = Worker()\n    worker_{index}.run()\n    target()\n"
             ));
         }
         let mut parser = Parser::new();
