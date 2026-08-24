@@ -52,11 +52,19 @@ fn index_files(
     Ok(paths)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum RelationMutation {
     Missing,
     Wrong,
     Duplicate,
+    CandidateRetained,
+    RecoveredSource,
+    RecoveredMemberSource,
+    RecoveredMemberTarget,
+    WrongFile,
+    WrongSourceKind,
+    WrongTargetKind,
+    WrongTargetOwnership,
 }
 
 fn mutate_relation(
@@ -81,6 +89,52 @@ fn mutate_relation(
             duplicate.id =
                 EdgeId(8_800_000_000_000_000_000 + edge.id.0.unsigned_abs() as i64 % 1_000_000);
             store.insert_edge(&duplicate)?;
+        }
+        RelationMutation::CandidateRetained => {
+            store.get_connection().execute(
+                "UPDATE edge SET candidate_target_node_ids = ?1 WHERE id = ?2",
+                (format!("[{}]", edge.effective_target().0), edge.id.0),
+            )?;
+        }
+        RelationMutation::RecoveredSource => {
+            store.get_connection().execute(
+                "UPDATE edge SET resolved_source_node_id = file_node_id WHERE id = ?1",
+                [edge.id.0],
+            )?;
+        }
+        RelationMutation::RecoveredMemberSource => {
+            store.get_connection().execute(
+                "UPDATE edge SET source_node_id = file_node_id, resolved_source_node_id = ?1 WHERE id = ?2",
+                [edge.source.0, edge.id.0],
+            )?;
+        }
+        RelationMutation::RecoveredMemberTarget => {
+            store.get_connection().execute(
+                "UPDATE edge SET target_node_id = file_node_id, resolved_target_node_id = ?1 WHERE id = ?2",
+                [edge.target.0, edge.id.0],
+            )?;
+        }
+        RelationMutation::WrongFile => {
+            store.get_connection().execute(
+                "UPDATE edge SET file_node_id = source_node_id WHERE id = ?1",
+                [edge.id.0],
+            )?;
+        }
+        RelationMutation::WrongSourceKind => {
+            store
+                .get_connection()
+                .execute("UPDATE node SET kind = 21 WHERE id = ?1", [edge.source.0])?;
+        }
+        RelationMutation::WrongTargetKind => {
+            store
+                .get_connection()
+                .execute("UPDATE node SET kind = 21 WHERE id = ?1", [edge.target.0])?;
+        }
+        RelationMutation::WrongTargetOwnership => {
+            store.get_connection().execute(
+                "UPDATE node SET file_node_id = (SELECT file_node_id FROM node WHERE id = ?1) WHERE id = ?2",
+                [edge.source.0, edge.target.0],
+            )?;
         }
     }
     Ok(())
@@ -946,6 +1000,252 @@ fn local_and_implicit_receiver_corroboration_requires_unique_member_relations() 
 }
 
 #[test]
+fn rust_import_qualified_and_inherent_evidence_requires_unique_graph_relations()
+-> anyhow::Result<()> {
+    for (family, relation_kind, mutation) in [
+        ("import", EdgeKind::IMPORT, RelationMutation::Missing),
+        ("import", EdgeKind::IMPORT, RelationMutation::Wrong),
+        ("import", EdgeKind::IMPORT, RelationMutation::Duplicate),
+        (
+            "import",
+            EdgeKind::IMPORT,
+            RelationMutation::CandidateRetained,
+        ),
+        (
+            "import",
+            EdgeKind::IMPORT,
+            RelationMutation::RecoveredSource,
+        ),
+        ("import", EdgeKind::IMPORT, RelationMutation::WrongFile),
+        ("qualified", EdgeKind::MEMBER, RelationMutation::Missing),
+        ("qualified", EdgeKind::MEMBER, RelationMutation::Wrong),
+        ("qualified", EdgeKind::MEMBER, RelationMutation::Duplicate),
+        (
+            "qualified",
+            EdgeKind::MEMBER,
+            RelationMutation::CandidateRetained,
+        ),
+        (
+            "qualified",
+            EdgeKind::MEMBER,
+            RelationMutation::RecoveredMemberSource,
+        ),
+        (
+            "qualified",
+            EdgeKind::MEMBER,
+            RelationMutation::RecoveredMemberTarget,
+        ),
+        ("qualified", EdgeKind::MEMBER, RelationMutation::WrongFile),
+        ("inherent", EdgeKind::MEMBER, RelationMutation::Missing),
+        ("inherent", EdgeKind::MEMBER, RelationMutation::Wrong),
+        ("inherent", EdgeKind::MEMBER, RelationMutation::Duplicate),
+        (
+            "inherent",
+            EdgeKind::MEMBER,
+            RelationMutation::CandidateRetained,
+        ),
+        (
+            "inherent",
+            EdgeKind::MEMBER,
+            RelationMutation::RecoveredMemberSource,
+        ),
+        (
+            "inherent",
+            EdgeKind::MEMBER,
+            RelationMutation::RecoveredMemberTarget,
+        ),
+        ("inherent", EdgeKind::MEMBER, RelationMutation::WrongFile),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let files = match family {
+            "import" => vec![
+                ("src/target.rs", "pub fn target() {}\n"),
+                (
+                    "src/lib.rs",
+                    "mod target;\nuse crate::target::target;\nfn caller() { target(); }\n",
+                ),
+            ],
+            "qualified" => vec![(
+                "src/lib.rs",
+                "mod nested { pub fn target() {} }\nfn caller() { crate::nested::target(); }\n",
+            )],
+            _ => vec![(
+                "src/lib.rs",
+                "struct Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+            )],
+        };
+        index_files(project.path(), &mut store, &files)?;
+        let nodes = store.get_nodes()?;
+        let target = nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    && node.serialized_name.ends_with("target")
+            })
+            .expect("target node");
+        let relation = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| {
+                edge.kind == relation_kind
+                    && edge.effective_target() == target.id
+                    && (family != "inherent" || edge.effective_source() != target.id)
+            })
+            .expect("Rust evidence relation");
+        mutate_relation(&mut store, &relation, mutation)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("target fact");
+        assert_eq!(
+            fact.status,
+            ProofResolutionStatus::IncompleteDomain,
+            "{family}: {fact:#?}"
+        );
+        assert!(fact.evidence_chain.is_empty(), "{family}: {fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_imported_implicit_receiver_requires_literal_import_owner_and_members() -> anyhow::Result<()>
+{
+    for (relation_role, mutation) in [
+        ("import", RelationMutation::Missing),
+        ("import", RelationMutation::Wrong),
+        ("import", RelationMutation::Duplicate),
+        ("import", RelationMutation::CandidateRetained),
+        ("import", RelationMutation::RecoveredSource),
+        ("import", RelationMutation::WrongFile),
+        ("import", RelationMutation::WrongSourceKind),
+        ("import", RelationMutation::WrongTargetKind),
+        ("caller_member", RelationMutation::Missing),
+        ("caller_member", RelationMutation::Wrong),
+        ("caller_member", RelationMutation::Duplicate),
+        ("caller_member", RelationMutation::CandidateRetained),
+        ("caller_member", RelationMutation::RecoveredMemberSource),
+        ("caller_member", RelationMutation::RecoveredMemberTarget),
+        ("caller_member", RelationMutation::WrongFile),
+        ("caller_member", RelationMutation::WrongSourceKind),
+        ("caller_member", RelationMutation::WrongTargetKind),
+        ("caller_member", RelationMutation::WrongTargetOwnership),
+        ("target_member", RelationMutation::Missing),
+        ("target_member", RelationMutation::Wrong),
+        ("target_member", RelationMutation::Duplicate),
+        ("target_member", RelationMutation::CandidateRetained),
+        ("target_member", RelationMutation::RecoveredMemberSource),
+        ("target_member", RelationMutation::RecoveredMemberTarget),
+        ("target_member", RelationMutation::WrongFile),
+        ("target_member", RelationMutation::WrongSourceKind),
+        ("target_member", RelationMutation::WrongTargetKind),
+        ("target_member", RelationMutation::WrongTargetOwnership),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                ("src/owner.rs", "pub struct Owner;\n"),
+                (
+                    "src/lib.rs",
+                    "mod owner;\nuse crate::owner::Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+                ),
+            ],
+        )?;
+        let nodes = store.get_nodes()?;
+        let owner = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::STRUCT && node.serialized_name == "Owner")
+            .expect("imported owner")
+            .id;
+        let import = nodes
+            .iter()
+            .find(|node| {
+                node.kind == NodeKind::MODULE
+                    && node.serialized_name.ends_with(" (import)")
+                    && node
+                        .serialized_name
+                        .trim_end_matches(" (import)")
+                        .rsplit(['.', ':'])
+                        .find(|part| !part.is_empty())
+                        == Some("Owner")
+            })
+            .expect("Owner import node")
+            .id;
+        let caller = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::METHOD && node.serialized_name.ends_with("caller"))
+            .expect("caller method")
+            .id;
+        let target = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::METHOD && node.serialized_name.ends_with("target"))
+            .expect("target method")
+            .id;
+        let relation = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| match relation_role {
+                "import" => {
+                    edge.kind == EdgeKind::IMPORT
+                        && edge.source == import
+                        && edge.effective_source() == import
+                        && edge.resolved_target == Some(owner)
+                        && edge.effective_target() == owner
+                        && edge.candidate_targets.is_empty()
+                }
+                "caller_member" => {
+                    edge.kind == EdgeKind::MEMBER
+                        && edge.source == owner
+                        && edge.target == caller
+                        && edge.effective_source() == owner
+                        && edge.effective_target() == caller
+                        && edge.candidate_targets.is_empty()
+                }
+                _ => {
+                    edge.kind == EdgeKind::MEMBER
+                        && edge.source == owner
+                        && edge.target == target
+                        && edge.effective_source() == owner
+                        && edge.effective_target() == target
+                        && edge.candidate_targets.is_empty()
+                }
+            })
+            .expect("imported S4 evidence relation");
+        mutate_relation(&mut store, &relation, mutation)?;
+        if let Err(error) = rematerialize_proof_resolution_projection(&mut store, &publication(1)) {
+            assert!(
+                matches!(
+                    mutation,
+                    RelationMutation::WrongTargetKind | RelationMutation::WrongTargetOwnership
+                ),
+                "unexpected imported S4 rematerialization error for {relation_role}/{mutation:?}: {error:#}"
+            );
+            continue;
+        }
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("imported S4 fact");
+        assert_eq!(
+            fact.status,
+            ProofResolutionStatus::IncompleteDomain,
+            "{relation_role}/{mutation:?}: {fact:#?}"
+        );
+        assert!(
+            fact.evidence_chain.is_empty(),
+            "{relation_role}/{mutation:?}: {fact:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn optional_typescript_parameters_are_not_receiver_authority() -> anyhow::Result<()> {
     assert_only_call_is_not_exact(&[(
         "src/optional.ts",
@@ -1286,6 +1586,49 @@ fn rust_same_line_repeated_calls_correlate_to_distinct_ordinary_edges() -> anyho
 }
 
 #[test]
+fn rust_exact_callsites_use_source_bound_utf8_byte_coordinates() -> anyhow::Result<()> {
+    for source in [
+        "fn target() {}\r\nfn caller() {\r\n\t/* é */ target();\r\n}",
+        "fn target() {}\nfn caller() { /* 日 */\ttarget(); }",
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[("src/lib.rs", source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.callsite.raw_target == "target")
+            .collect::<Vec<_>>();
+        let [fact] = facts.as_slice() else {
+            panic!("one target call expected: {facts:#?}");
+        };
+        let start = source.rfind("target();").expect("fixture call") as u64;
+        let line_start = source[..start as usize]
+            .rfind('\n')
+            .map_or(0, |newline| newline + 1);
+        let line = source[..start as usize]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32
+            + 1;
+        assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+        assert_eq!(fact.callsite.start_byte, start);
+        assert_eq!(
+            fact.callsite.end_byte_exclusive,
+            start + "target".len() as u64
+        );
+        assert_eq!(fact.callsite.line, line);
+        assert_eq!(
+            fact.callsite.column,
+            (start as usize - line_start + 1) as u32,
+            "tree-sitter columns are UTF-8 byte columns"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn repeated_call_correlation_rejects_incomplete_or_noncanonical_domains() -> anyhow::Result<()> {
     for mutation in [
         RepeatedCallGraphMutation::DuplicateOrdinal,
@@ -1376,6 +1719,10 @@ fn assert_only_call_is_not_exact(files: &[(&str, &str)]) -> anyhow::Result<()> {
 }
 
 fn assert_only_call_is_exact(files: &[(&str, &str)]) -> anyhow::Result<()> {
+    assert_call_named_is_exact(files, "target")
+}
+
+fn assert_call_named_is_exact(files: &[(&str, &str)], raw_target: &str) -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(project.path(), &mut store, files)?;
@@ -1383,7 +1730,7 @@ fn assert_only_call_is_exact(files: &[(&str, &str)]) -> anyhow::Result<()> {
     let called = store
         .get_proof_resolution_facts()?
         .into_iter()
-        .filter(|fact| fact.callsite.raw_target == "target")
+        .filter(|fact| fact.callsite.raw_target == raw_target)
         .collect::<Vec<_>>();
     assert_eq!(called.len(), 1, "unexpected target calls: {called:#?}");
     assert_eq!(
@@ -1424,6 +1771,55 @@ fn assert_no_exact_target_calls(files: &[(&str, &str)]) -> anyhow::Result<()> {
         "{files:?}: {facts:#?}"
     );
     Ok(())
+}
+
+fn rust_fact_after_forcing_call_target(
+    files: &[(&str, &str)],
+    raw_target: &str,
+) -> anyhow::Result<codestory_contracts::proof_resolution::CallResolutionFact> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    let nodes = store.get_nodes()?;
+    let target_name = if raw_target == "alias" {
+        "target"
+    } else {
+        raw_target
+    };
+    let target = nodes
+        .iter()
+        .find(|node| {
+            matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                && node.serialized_name.ends_with(target_name)
+                && !node.serialized_name.ends_with("caller")
+        })
+        .unwrap_or_else(|| panic!("forced target node for {files:?}: {nodes:#?}"));
+    let caller = nodes
+        .iter()
+        .find(|node| {
+            matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                && node.serialized_name.ends_with("caller")
+        })
+        .expect("forced caller node");
+    let call = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.kind == EdgeKind::CALL)
+        .expect("forced ordinary CALL edge");
+    store.get_connection().execute(
+        "UPDATE edge
+         SET resolved_source_node_id = ?1,
+             resolved_target_node_id = ?2,
+             candidate_target_node_ids = '[]'
+         WHERE id = ?3",
+        (caller.id.0, target.id.0, call.id.0),
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    Ok(store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == raw_target)
+        .expect("forced call fact"))
 }
 
 #[test]
@@ -1906,6 +2302,10 @@ fn rust_exact_rejects_lexical_module_and_inherent_lookup_ambiguity() -> anyhow::
         "fn target() {}\nfn caller() { fn target() {} target(); }\n",
     )])?;
     assert_only_call_is_not_exact(&[(
+        "src/hoisted_inner_function.rs",
+        "fn target() {}\nfn caller() { target(); fn target() {} }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
         "src/block_use.rs",
         "fn target() {}\nmod other { pub fn value() {} }\nfn caller() { use crate::other::value as target; target(); }\n",
     )])?;
@@ -1945,6 +2345,350 @@ fn rust_exact_rejects_lexical_module_and_inherent_lookup_ambiguity() -> anyhow::
         "src/const_generic.rs",
         "fn target() {}\nfn caller<const target: usize>() { target(); }\n",
     )])?;
+    for source in [
+        "fn target() {}\nfn caller() { let (target,) = (|| {},); target(); }\n",
+        "fn target() {}\nstruct Pair { target: fn() }\nfn caller() { let Pair { target } = Pair { target: || {} }; target(); }\n",
+        "fn target() {}\nfn caller() { let [target] = [|| {}]; target(); }\n",
+        "fn target() {}\nfn caller(value: Option<fn()>) { if let Some(target @ _) = value { target(); } }\n",
+        "fn target() {}\nfn caller(value: &fn()) { let ref target = value; target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/pattern.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_closed_exact_subset_authorizes_supported_calls() -> anyhow::Result<()> {
+    for files in [
+        vec![(
+            "src/lib.rs",
+            "mod nested {\nfn target() {}\nfn caller() { target(); }\n}\n",
+        )],
+        vec![
+            ("src/target.rs", "pub fn target() {}\n"),
+            (
+                "src/lib.rs",
+                "mod target;\nuse crate::target::target;\nfn caller() { target(); }\n",
+            ),
+        ],
+        vec![(
+            "src/lib.rs",
+            "mod nested {\npub fn target() {}\n}\nfn caller() { self::nested::target(); }\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "enum Owner { Value }\nimpl Owner {\nfn target(&self) {}\nfn caller(&self) { self.target(); }\n}\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "struct Owner;\nimpl Owner {\nfn target() {}\nfn caller() { Self::target(); }\n}\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: &mut Owner) { value.target(); }\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner; value.target(); }\n",
+        )],
+    ] {
+        assert_only_call_is_exact(&files)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_direct_uses_and_anchored_module_paths_authorize_closed_bindings() -> anyhow::Result<()> {
+    for (files, raw_target) in [
+        (
+            vec![
+                ("src/target.rs", "pub fn target() {}\npub fn other() {}\n"),
+                (
+                    "src/lib.rs",
+                    "mod target;\nuse crate::target::{other, target};\nfn caller() { target(); }\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            vec![(
+                "src/lib.rs",
+                "mod nested { pub fn target() {} }\nfn caller() { crate::nested::target(); }\n",
+            )],
+            "target",
+        ),
+    ] {
+        assert_call_named_is_exact(&files, raw_target)?;
+    }
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "src/lib.rs",
+                "mod a;\nuse crate::a::b::target;\nfn caller() { target(); }\n",
+            ),
+            ("src/a.rs", "pub mod b;\n"),
+            ("src/a/b.rs", "pub fn target() {}\n"),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("deep direct import fact");
+    assert_eq!(
+        fact.status,
+        ProofResolutionStatus::IncompleteDomain,
+        "file-backed module paths without literal MEMBER edges remain non-exact: {fact:#?}"
+    );
+    assert!(fact.evidence_chain.is_empty(), "{fact:#?}");
+    Ok(())
+}
+
+#[test]
+fn rust_inherent_receiver_and_constructor_subset_authorizes_closed_bindings() -> anyhow::Result<()>
+{
+    for files in [
+        vec![(
+            "src/lib.rs",
+            "struct Owner;\nimpl Owner { fn target() {} }\nfn caller() { Owner::target(); }\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { let value: &Owner = &Owner; value.target(); }\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "struct Owner;\nimpl Owner { fn build() -> Self { Self } fn target(&self) {} }\nfn caller() { let value = Owner::build(); value.target(); }\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "struct Owner;\nimpl Owner { fn build() -> Owner { Owner } fn target(&self) {} }\nfn caller() { let value = Owner::build(); value.target(); }\n",
+        )],
+        vec![
+            (
+                "src/owner.rs",
+                "pub struct Owner;\nimpl Owner { pub fn target(&self) {} }\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod owner;\nuse crate::owner::Owner;\nfn caller(value: &Owner) { value.target(); }\n",
+            ),
+        ],
+        vec![
+            (
+                "src/owner.rs",
+                "pub struct Owner;\nimpl Owner { pub fn target() {} }\n",
+            ),
+            (
+                "src/lib.rs",
+                "mod owner;\nuse crate::owner::Owner;\nfn caller() { Owner::target(); }\n",
+            ),
+        ],
+        vec![
+            ("src/owner.rs", "pub struct Owner;\n"),
+            (
+                "src/lib.rs",
+                "mod owner;\nuse crate::owner::Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+            ),
+        ],
+    ] {
+        assert_only_call_is_exact(&files)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_closed_syntax_without_an_exact_ordinary_call_edge_stays_non_exact() -> anyhow::Result<()> {
+    assert_no_exact_calls(&[
+        ("src/target.rs", "pub fn target() {}\n"),
+        (
+            "src/lib.rs",
+            "mod target;\nuse crate::target::target as alias;\nfn caller() { alias(); }\n",
+        ),
+    ])?;
+    assert_only_call_is_not_exact(&[(
+        "src/lib.rs",
+        "pub fn target() {}\nmod nested { fn caller() { super::target(); } }\n",
+    )])?;
+    assert_only_call_is_not_exact(&[(
+        "src/lib.rs",
+        "struct Owner { value: usize }\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner { value: 1 }; value.target(); }\n",
+    )])?;
+    for source in [
+        "fn target() {}\nfn caller() { target(); let target: fn() = || {}; }\n",
+        "fn target() {}\nfn caller() { { let target: fn() = || {}; let _ = target; } target(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nmod other { pub struct Owner; }\nfn caller() { use crate::other::Owner; let value: Owner = Owner; value.target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_source_closure_rejects_unsupported_surfaces_before_graph_correlation() -> anyhow::Result<()>
+{
+    for source in [
+        "struct Owner;\nimpl Owner { fn target(&self) {} fn caller() { self.target(); } }\n",
+        "struct Owner;\nimpl Owner { fn target() {} fn caller() { Self::Nested::target(); } }\n",
+        "struct T;\nimpl T { fn target(&self) {} }\nfn caller<T>(value: T) { value.target(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { struct Owner; let value: Owner = Owner; value.target(); }\n",
+        "struct Owner<T = ()>;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        "struct Owner { value: usize }\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner { value: 1 }; value.target(); }\n",
+    ] {
+        let fact = rust_fact_after_forcing_call_target(&[("src/lib.rs", source)], "target")?;
+        assert_eq!(fact.status, ProofResolutionStatus::Unsupported, "{fact:#?}");
+        assert!(fact.evidence_chain.is_empty(), "{fact:#?}");
+    }
+    let renamed = rust_fact_after_forcing_call_target(
+        &[
+            ("src/target.rs", "pub fn target() {}\n"),
+            (
+                "src/lib.rs",
+                "mod target;\nuse crate::target::target as alias;\nfn caller() { alias(); }\n",
+            ),
+        ],
+        "alias",
+    )?;
+    assert_eq!(
+        renamed.status,
+        ProofResolutionStatus::Unsupported,
+        "{renamed:#?}"
+    );
+    let parent = rust_fact_after_forcing_call_target(
+        &[(
+            "src/lib.rs",
+            "pub fn target() {}\nmod nested { fn caller() { super::target(); } }\n",
+        )],
+        "target",
+    )?;
+    assert_eq!(
+        parent.status,
+        ProofResolutionStatus::Unsupported,
+        "{parent:#?}"
+    );
+
+    for source in [
+        "struct Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        "struct Owner;\nimpl Owner { fn target() {} fn caller() { Self::target(); } }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: &Owner) { value.target(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner; value.target(); }\n",
+    ] {
+        assert_only_call_is_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_module_and_import_closure_matrix_stays_fail_closed() -> anyhow::Result<()> {
+    for files in [
+        vec![(
+            "src/lib.rs",
+            "mod missing;\nuse crate::missing::target;\nfn caller() { target(); }\n",
+        )],
+        vec![
+            ("src/foo.rs", "pub fn target() {}\n"),
+            ("src/foo/mod.rs", "pub fn target() {}\n"),
+            (
+                "src/lib.rs",
+                "mod foo;\nuse crate::foo::target;\nfn caller() { target(); }\n",
+            ),
+        ],
+        vec![
+            ("src/actual.rs", "pub fn target() {}\n"),
+            (
+                "src/lib.rs",
+                "#[path = \"actual.rs\"] mod selected;\nuse crate::selected::target;\nfn caller() { target(); }\n",
+            ),
+        ],
+        vec![(
+            "src/lib.rs",
+            "use external::target;\nfn caller() { target(); }\n",
+        )],
+        vec![
+            ("src/foo.rs", "pub fn target() {}\n"),
+            (
+                "src/lib.rs",
+                "mod foo;\nuse crate::foo::*;\nfn caller() { target(); }\n",
+            ),
+        ],
+        vec![
+            ("src/foo.rs", "pub fn target() {}\n"),
+            (
+                "src/lib.rs",
+                "mod foo;\npub use crate::foo::target;\nfn caller() { target(); }\n",
+            ),
+        ],
+        vec![
+            ("src/foo.rs", "fn target() {}\n"),
+            (
+                "src/lib.rs",
+                "mod foo;\nuse crate::foo::target;\nfn caller() { target(); }\n",
+            ),
+        ],
+    ] {
+        assert_no_exact_target_calls(&files)?;
+    }
+    assert_only_call_is_not_exact(&[(
+        "src/lib.rs",
+        "fn target() {}\nfn target() {}\nfn caller() { target(); }\n",
+    )])?;
+    assert_no_exact_target_calls(&[
+        ("src/lib.rs", "mod target;\n"),
+        ("src/target.rs", "pub fn target() {}\n"),
+        (
+            "src/orphan.rs",
+            "use crate::target::target;\nfn caller() { target(); }\n",
+        ),
+    ])?;
+    assert_no_exact_target_calls(&[
+        (
+            "src/lib.rs",
+            "mod target;\nuse crate::target::target;\nfn caller() { target(); }\n",
+        ),
+        ("src/target.rs", "pub fn target() {}\nstruct target;\n"),
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn rust_inherent_and_receiver_unsupported_matrix_stays_fail_closed() -> anyhow::Result<()> {
+    for source in [
+        "struct Owner;\nimpl Owner where Owner: Sized { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        "struct Owner;\ntrait Trait { fn target(); }\nimpl Trait for Owner { fn target() {} }\nfn caller() { <Owner as Trait>::target(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { Owner::target(); }\n",
+        "struct Owner;\nstruct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: &Owner) { value.target(); }\n",
+        "struct Owner;\ntype Alias = Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: Alias) { value.target(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller(value: Box<Owner>) { value.target(); }\n",
+        "trait Trait { fn target(&self); }\nfn caller(value: &dyn Trait) { value.target(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nstruct Holder { value: Owner }\nfn caller(holder: Holder) { holder.value.target(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn make() -> Owner { Owner }\nfn caller() { make().target(); }\n",
+        "struct Owner(u8);\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner(1); value.target(); }\n",
+        "struct Owner;\nimpl Owner { fn build() -> Result<Self, ()> { Ok(Self) } fn target(&self) {} }\nfn caller() { let value = Owner::build(); value.target(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} }\nfn caller() { let value = Owner; value = Owner; value.target(); }\n",
+        "fn target<T>() {}\nfn caller() { target::<u8>(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\nimpl Owner { generated!(); }\n",
+        "struct Owner;\nimpl Owner { fn target(&self) {} fn caller(&self) { self.target(); } }\nimpl Owner where Owner: Sized { fn other(&self) {} }\n",
+    ] {
+        assert_no_exact_target_calls(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_relevant_domain_poison_does_not_escape_its_module_or_callable() -> anyhow::Result<()> {
+    for source in [
+        "fn target() {}\nfn caller() { target(); }\nmod unrelated { generated!(); }\n",
+        "fn target() {}\nfn caller() { target(); }\nfn unrelated() { generated!(); }\n",
+        "fn target() {}\nfn caller() { fn unrelated() { generated!(); } target(); }\n",
+        "struct Owner;\nimpl Owner {\nfn target(&self) {}\nfn caller(&self) { self.target(); }\n}\nmod unrelated { #[custom] fn hidden() {} }\n",
+    ] {
+        assert_only_call_is_exact(&[("src/lib.rs", source)])?;
+    }
     Ok(())
 }
 
@@ -2232,7 +2976,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
         )?;
         let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
         match mutation {
-            0 => artifact["resolution_input_schema_version"] = 4.into(),
+            0 => artifact["resolution_input_schema_version"] = 5.into(),
             1 => artifact["resolution_file"]["adapter_version"] = "reference-v5".into(),
             2 => artifact["call_resolution_inputs"][0]["adapter_version"] = "reference-v5".into(),
             3 => artifact["resolution_file"]["language"] = "javascript".into(),
@@ -2246,7 +2990,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v5", "adapter", "language"]
+            ["stale", "schema-v7", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -2280,7 +3024,7 @@ fn unrelated_relative_cache_suffix_cannot_impersonate_an_indexed_absolute_path()
 }
 
 #[test]
-fn rust_macro_expansion_domains_are_never_exact() -> anyhow::Result<()> {
+fn rust_macro_expansion_poison_is_scoped_to_relevant_domains() -> anyhow::Result<()> {
     assert_only_call_is_not_exact(&[(
         "src/callable.rs",
         "macro_rules! shadow { ($name:ident) => { let $name: fn() = || {}; }; }\nfn target() {}\nfn caller() { shadow!(target); target(); }\n",
@@ -2293,7 +3037,7 @@ fn rust_macro_expansion_domains_are_never_exact() -> anyhow::Result<()> {
         "src/impl.rs",
         "macro_rules! duplicate { () => { fn target(&self) {} }; }\nstruct Worker;\nimpl Worker { duplicate!(); fn target(&self) {} fn caller(&self) { self.target(); } }\n",
     )])?;
-    assert_only_call_is_not_exact(&[
+    assert_only_call_is_exact(&[
         (
             "src/main.rs",
             "struct Worker;\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",
@@ -2303,6 +3047,14 @@ fn rust_macro_expansion_domains_are_never_exact() -> anyhow::Result<()> {
             "macro_rules! duplicate { () => { impl Worker { fn target(&self) {} } }; }\nduplicate!();\n",
         ),
     ])?;
+    assert_only_call_is_exact(&[(
+        "src/expression.rs",
+        "fn target() {}\nfn caller() -> String { target(); format!(\"done\") }\n",
+    )])?;
+    assert_only_call_is_exact(&[(
+        "src/disjoint.rs",
+        "macro_rules! local_only { () => { let unrelated = 1; }; }\nfn target() {}\nfn caller() { { local_only!(); } target(); }\n",
+    )])?;
     Ok(())
 }
 
@@ -2328,6 +3080,18 @@ fn rust_attribute_domains_are_never_exact() -> anyhow::Result<()> {
     }
 
     assert_only_call_is_exact(&[("src/lib.rs", "fn target() {}\nfn caller() { target(); }\n")])?;
+    assert_only_call_is_exact(&[(
+        "src/lib.rs",
+        "#[derive(Debug)]\nstruct Unrelated;\n#[cfg(test)]\nmod tests {}\nfn target() {}\nfn caller() { target(); }\n",
+    )])?;
+    assert_only_call_is_exact(&[(
+        "src/lib.rs",
+        "fn target() {}\nfn caller() { #[cfg(any())] {} target(); }\n",
+    )])?;
+    assert_only_call_is_exact(&[(
+        "src/lib.rs",
+        "#![allow(dead_code)]\nfn target() {}\nfn caller() { target(); }\n",
+    )])?;
     assert_only_call_is_exact(&[(
         "src/lib.rs",
         "struct Worker;\nimpl Worker { fn target(&self) {} fn caller(&self) { self.target(); } }\n",

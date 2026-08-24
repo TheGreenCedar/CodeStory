@@ -4355,6 +4355,62 @@ fn rebase_cached_index_artifact(
                 },
                 method_name,
             },
+            CachedResolutionBinding::RustPath {
+                module_path,
+                components,
+                import,
+                associated_owner,
+            } => CachedResolutionBinding::RustPath {
+                module_path,
+                components,
+                import: import.map(|mut import| {
+                    import.import = id_remap
+                        .get(&import.import)
+                        .copied()
+                        .unwrap_or(import.import);
+                    import
+                }),
+                associated_owner: associated_owner
+                    .map(|owner| id_remap.get(&owner).copied().unwrap_or(owner)),
+            },
+            CachedResolutionBinding::RustImplicitReceiver {
+                module_path,
+                owner_name,
+                mut import,
+                declaration,
+            } => {
+                import.import = id_remap
+                    .get(&import.import)
+                    .copied()
+                    .unwrap_or(import.import);
+                CachedResolutionBinding::RustImplicitReceiver {
+                    module_path,
+                    owner_name,
+                    import,
+                    declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                }
+            }
+            CachedResolutionBinding::RustExplicitReceiver {
+                module_path,
+                owner_name,
+                import,
+                constructor,
+                constructor_record,
+                constructor_method,
+            } => CachedResolutionBinding::RustExplicitReceiver {
+                module_path,
+                owner_name,
+                import: import.map(|mut import| {
+                    import.import = id_remap
+                        .get(&import.import)
+                        .copied()
+                        .unwrap_or(import.import);
+                    import
+                }),
+                constructor,
+                constructor_record,
+                constructor_method,
+            },
             other => other,
         };
     }
@@ -4377,6 +4433,32 @@ fn rebase_cached_index_artifact(
                 .get(&method.declaration)
                 .copied()
                 .unwrap_or(method.declaration);
+            method.owner = method
+                .owner
+                .map(|owner| id_remap.get(&owner).copied().unwrap_or(owner));
+        }
+        for rust_type in &mut resolution_file.rust_types {
+            rust_type.declaration = id_remap
+                .get(&rust_type.declaration)
+                .copied()
+                .unwrap_or(rust_type.declaration);
+        }
+        for rust_use in &mut resolution_file.rust_uses {
+            rust_use.import = id_remap
+                .get(&rust_use.import)
+                .copied()
+                .unwrap_or(rust_use.import);
+        }
+        for rust_module in &mut resolution_file.rust_modules {
+            rust_module.declaration = rust_module
+                .declaration
+                .map(|declaration| id_remap.get(&declaration).copied().unwrap_or(declaration));
+            for child in &mut rust_module.file_children {
+                child.declaration = id_remap
+                    .get(&child.declaration)
+                    .copied()
+                    .unwrap_or(child.declaration);
+            }
         }
         for class in &mut resolution_file.classes {
             class.declaration = id_remap
@@ -16275,7 +16357,7 @@ mod proof_resolution_cache_tests {
             raw_target: "target".to_owned(),
         };
         let artifact = CachedIndexArtifact {
-            resolution_input_schema_version: 5,
+            resolution_input_schema_version: 7,
             files: vec![FileInfo {
                 id: old_file.0,
                 path: "old.ts".into(),
@@ -16310,7 +16392,7 @@ mod proof_resolution_cache_tests {
                         method_name: "target".to_owned(),
                     },
                     language: "typescript".to_owned(),
-                    adapter_version: "reference-v7".to_owned(),
+                    adapter_version: "reference-v9".to_owned(),
                     parser_fingerprint: "b".repeat(64),
                 },
                 CachedCallResolutionInput {
@@ -16326,7 +16408,7 @@ mod proof_resolution_cache_tests {
                         method_name: "target".to_owned(),
                     },
                     language: "typescript".to_owned(),
-                    adapter_version: "reference-v7".to_owned(),
+                    adapter_version: "reference-v9".to_owned(),
                     parser_fingerprint: "b".repeat(64),
                 },
             ],
@@ -16334,7 +16416,7 @@ mod proof_resolution_cache_tests {
                 file_id: old_file,
                 source_sha256: "a".repeat(64),
                 language: "typescript".to_owned(),
-                adapter_version: "reference-v7".to_owned(),
+                adapter_version: "reference-v9".to_owned(),
                 parser_fingerprint: "b".repeat(64),
                 complete: true,
                 lookup_input_complete: true,
@@ -16342,11 +16424,19 @@ mod proof_resolution_cache_tests {
                 top_level_declarations: vec![CachedTopLevelDeclaration {
                     name: "target".to_owned(),
                     declaration: old_method,
+                    module_path: Vec::new(),
+                    cross_module_visible: false,
                 }],
                 inherent_methods: vec![CachedInherentMethod {
                     owner_name: "C".to_owned(),
                     method_name: "target".to_owned(),
                     declaration: old_method,
+                    module_path: Vec::new(),
+                    owner: Some(old_owner),
+                    has_self: true,
+                    return_owner: None,
+                    domain_complete: true,
+                    cross_module_visible: false,
                 }],
                 classes: vec![CachedClassDeclaration {
                     name: "C".to_owned(),
@@ -16364,6 +16454,9 @@ mod proof_resolution_cache_tests {
                 }],
                 export_poison_all: false,
                 poisoned_export_names: vec!["unrelated".to_owned()],
+                rust_modules: Vec::new(),
+                rust_types: Vec::new(),
+                rust_uses: Vec::new(),
             }),
         };
 

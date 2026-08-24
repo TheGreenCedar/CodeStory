@@ -2646,7 +2646,7 @@ mod tests {
         assert!(matches!(
             result.disposition(),
             ProofDisposition::ContractProven { receipts, .. }
-                if receipts == &[earliest.receipt.clone()]
+                if receipts == std::slice::from_ref(&earliest.receipt)
         ));
     }
 
@@ -2800,7 +2800,8 @@ mod tests {
             .unwrap();
         let mut ambiguous = raw_edge.clone();
         ambiguous.candidate_targets = vec![nodes[2].id];
-        for (mutation, edge) in [("ambiguous", &ambiguous)] {
+        {
+            let (mutation, edge) = ("ambiguous", &ambiguous);
             assert_eq!(
                 admit_raw_call_edge(edge, edge.effective_source(), edge.effective_target()),
                 RawCallEdgeAdmission::Rejected

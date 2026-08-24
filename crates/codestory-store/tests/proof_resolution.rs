@@ -231,6 +231,16 @@ fn receiver_projection(fact: CallResolutionFact) -> ProofResolutionProjection {
     result
 }
 
+fn rust_receiver_projection(fact: CallResolutionFact) -> ProofResolutionProjection {
+    let mut result = receiver_projection(fact);
+    result.adapter_roster = vec![ProofResolutionAdapter {
+        language: "rust".to_owned(),
+        adapter_version: "reference-v9".to_owned(),
+    }];
+    result.funnel[0].language = "rust".to_owned();
+    result
+}
+
 fn local_receiver_fact(with_constructor: bool) -> CallResolutionFact {
     let mut fact = exact_fact(EdgeId(7));
     fact.raw_edge_target = Some(NodeId(4));
@@ -289,6 +299,35 @@ fn imported_receiver_fact(with_constructor: bool) -> CallResolutionFact {
             source_sha256: "b".repeat(64),
         });
     seal_call_resolution_fact(fact).expect("seal imported receiver fact")
+}
+
+fn rust_imported_implicit_receiver_fact() -> CallResolutionFact {
+    let mut fact = exact_fact(EdgeId(7));
+    fact.callsite.callee_form = CalleeForm::ImplicitReceiver;
+    fact.callsite.raw_target = "target".to_owned();
+    fact.raw_edge_target = Some(NodeId(4));
+    fact.raw_callsite_identity = Some("1:2:1:4".to_owned());
+    fact.caller = NodeId(2);
+    fact.target = Some(NodeId(4));
+    fact.evidence_chain = vec![
+        ResolutionEvidence::StaticImportBinding {
+            import: NodeId(8),
+            declaration: NodeId(6),
+        },
+        ResolutionEvidence::ImplicitReceiver { owner: NodeId(6) },
+        ResolutionEvidence::SameFileDeclaration {
+            declaration: NodeId(4),
+        },
+    ];
+    fact.provenance.language_adapter = "rust".to_owned();
+    fact.provenance.language_adapter_version = "reference-v9".to_owned();
+    fact.provenance
+        .dependency_file_hashes
+        .push(DependencyFileHash {
+            file_id: FileId(5),
+            source_sha256: "b".repeat(64),
+        });
+    seal_call_resolution_fact(fact).expect("seal Rust imported implicit receiver fact")
 }
 
 fn seed_local_receiver_graph(store: &mut Store) {
@@ -422,7 +461,7 @@ fn seed_imported_receiver_graph(store: &mut Store) {
         },
         Node {
             id: NodeId(8),
-            kind: NodeKind::UNKNOWN,
+            kind: NodeKind::MODULE,
             serialized_name: "C".to_owned(),
             file_node_id: Some(NodeId(1)),
             ..Default::default()
@@ -472,6 +511,129 @@ fn seed_imported_receiver_graph(store: &mut Store) {
         },
     ] {
         store.insert_edge(&edge).unwrap();
+    }
+}
+
+fn seed_rust_imported_implicit_receiver_graph(store: &mut Store) {
+    for file in [
+        FileInfo {
+            id: 1,
+            path: "src/lib.rs".into(),
+            language: "rust".to_owned(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 3,
+            file_role: FileRole::Source,
+        },
+        FileInfo {
+            id: 5,
+            path: "src/owner.rs".into(),
+            language: "rust".to_owned(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        },
+    ] {
+        let hash = if file.id == 1 {
+            "a".repeat(64)
+        } else {
+            "b".repeat(64)
+        };
+        store.insert_file(&file).expect("file");
+        store
+            .update_file_metadata(&file, Some(&hash))
+            .expect("source hash");
+    }
+    for node in [
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "src/lib.rs".to_owned(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::METHOD,
+            serialized_name: "Owner.caller".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(2),
+            end_line: Some(2),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::METHOD,
+            serialized_name: "Owner.target".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(1),
+            end_line: Some(1),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(5),
+            kind: NodeKind::FILE,
+            serialized_name: "src/owner.rs".to_owned(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(6),
+            kind: NodeKind::STRUCT,
+            serialized_name: "Owner".to_owned(),
+            file_node_id: Some(NodeId(5)),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(8),
+            kind: NodeKind::MODULE,
+            serialized_name: "Owner".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+    ] {
+        store.insert_node(&node).expect("node");
+    }
+    for edge in [
+        Edge {
+            id: EdgeId(7),
+            source: NodeId(2),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(4)),
+            callsite_identity: Some("1:2:1:4".to_owned()),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(8),
+            source: NodeId(8),
+            target: NodeId(6),
+            kind: EdgeKind::IMPORT,
+            file_node_id: Some(NodeId(1)),
+            resolved_target: Some(NodeId(6)),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(9),
+            source: NodeId(6),
+            target: NodeId(2),
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+        Edge {
+            id: EdgeId(10),
+            source: NodeId(6),
+            target: NodeId(4),
+            kind: EdgeKind::MEMBER,
+            file_node_id: Some(NodeId(1)),
+            ..Default::default()
+        },
+    ] {
+        store.insert_edge(&edge).expect("edge");
     }
 }
 
@@ -604,6 +766,63 @@ fn literal_receiver_evidence_shapes_round_trip() {
 }
 
 #[test]
+fn rust_imported_implicit_receiver_literal_shape_round_trips() {
+    let mut store = Store::new_in_memory().unwrap();
+    seed_rust_imported_implicit_receiver_graph(&mut store);
+    let fact = rust_imported_implicit_receiver_fact();
+    store
+        .replace_proof_resolution_projection(
+            &publication(),
+            &rust_receiver_projection(fact.clone()),
+        )
+        .expect("Rust imported implicit receiver evidence must validate");
+    assert_eq!(
+        store
+            .get_exact_proof_resolution_fact_by_edge(EdgeId(7))
+            .unwrap(),
+        Some(fact)
+    );
+}
+
+#[test]
+fn rust_imported_implicit_receiver_rejects_nonliteral_import_and_member_relations() {
+    for sql in [
+        "DELETE FROM edge WHERE id = 8",
+        "UPDATE edge SET candidate_target_node_ids = '[6]' WHERE id = 8",
+        "UPDATE edge SET resolved_source_node_id = 1 WHERE id = 8",
+        "UPDATE edge SET file_node_id = 5 WHERE id = 8",
+        "INSERT INTO edge SELECT 18, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence, certainty, callsite_identity, candidate_target_node_ids FROM edge WHERE id = 8",
+        "DELETE FROM edge WHERE id = 9",
+        "DELETE FROM edge WHERE id = 10",
+        "UPDATE edge SET candidate_target_node_ids = '[2]' WHERE id = 9",
+        "UPDATE edge SET source_node_id = 1, resolved_source_node_id = 6 WHERE id = 9",
+        "UPDATE edge SET target_node_id = 1, resolved_target_node_id = 2 WHERE id = 9",
+        "UPDATE edge SET file_node_id = 5 WHERE id = 9",
+        "INSERT INTO edge SELECT 19, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence, certainty, callsite_identity, candidate_target_node_ids FROM edge WHERE id = 9",
+        "UPDATE edge SET candidate_target_node_ids = '[4]' WHERE id = 10",
+        "UPDATE edge SET source_node_id = 1, resolved_source_node_id = 6 WHERE id = 10",
+        "UPDATE edge SET target_node_id = 1, resolved_target_node_id = 4 WHERE id = 10",
+        "UPDATE edge SET file_node_id = 5 WHERE id = 10",
+        "INSERT INTO edge SELECT 20, source_node_id, target_node_id, kind, file_node_id, line, resolved_source_node_id, resolved_target_node_id, confidence, certainty, callsite_identity, candidate_target_node_ids FROM edge WHERE id = 10",
+        "UPDATE node SET kind = 0 WHERE id = 6",
+        "UPDATE node SET kind = 13 WHERE id = 2",
+        "UPDATE node SET file_node_id = 5 WHERE id = 4",
+    ] {
+        let mut store = Store::new_in_memory().unwrap();
+        seed_rust_imported_implicit_receiver_graph(&mut store);
+        store.get_connection().execute(sql, []).unwrap();
+        let result = store.replace_proof_resolution_projection(
+            &publication(),
+            &rust_receiver_projection(rust_imported_implicit_receiver_fact()),
+        );
+        assert!(
+            result.is_err(),
+            "hostile imported S4 relation was accepted: {sql}"
+        );
+    }
+}
+
+#[test]
 fn literal_receiver_evidence_rejects_permuted_missing_and_unrelated_graph_proof() {
     let assert_local_rejected = |mutate: fn(&mut CallResolutionFact), graph_sql: Option<&str>| {
         let mut store = Store::new_in_memory().unwrap();
@@ -696,6 +915,49 @@ fn literal_receiver_evidence_rejects_permuted_missing_and_unrelated_graph_proof(
     );
     assert_imported_rejected(|_| {}, Some("DELETE FROM edge WHERE id = 8"));
     assert_imported_rejected(|_| {}, Some("DELETE FROM edge WHERE id = 9"));
+    assert_imported_rejected(
+        |_| {},
+        Some("UPDATE edge SET candidate_target_node_ids = '[6]' WHERE id = 8"),
+    );
+    assert_imported_rejected(
+        |_| {},
+        Some("UPDATE edge SET resolved_source_node_id = 1 WHERE id = 8"),
+    );
+    assert_imported_rejected(
+        |_| {},
+        Some("UPDATE edge SET file_node_id = 5 WHERE id = 8"),
+    );
+    assert_imported_rejected(
+        |_| {},
+        Some(
+            "INSERT INTO edge
+             SELECT 18, source_node_id, target_node_id, kind, file_node_id, line,
+                    resolved_source_node_id, resolved_target_node_id, confidence, certainty,
+                    callsite_identity, candidate_target_node_ids
+             FROM edge WHERE id = 8",
+        ),
+    );
+    assert_imported_rejected(
+        |_| {},
+        Some("UPDATE edge SET candidate_target_node_ids = '[7]' WHERE id = 9"),
+    );
+    assert_imported_rejected(
+        |_| {},
+        Some("UPDATE edge SET source_node_id = 1, resolved_source_node_id = 6 WHERE id = 9"),
+    );
+    assert_imported_rejected(
+        |_| {},
+        Some("UPDATE edge SET target_node_id = 1, resolved_target_node_id = 7 WHERE id = 9"),
+    );
+    assert_imported_rejected(
+        |_| {},
+        Some("UPDATE edge SET file_node_id = 1 WHERE id = 9"),
+    );
+    assert_imported_rejected(|_| {}, Some("UPDATE node SET kind = 0 WHERE id = 6"));
+    assert_imported_rejected(
+        |_| {},
+        Some("UPDATE node SET file_node_id = 1 WHERE id = 7"),
+    );
     assert_imported_rejected(|_| {}, Some("UPDATE node SET kind = 13 WHERE id = 7"));
 }
 
