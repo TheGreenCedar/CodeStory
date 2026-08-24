@@ -1,7 +1,8 @@
 use crate::cache::{
     CachedCallResolutionInput, CachedClassBinding, CachedClassDeclaration, CachedClassMethod,
     CachedDeclarationKind, CachedDirectExport, CachedIndexArtifact, CachedInherentMethod,
-    CachedResolutionBinding, CachedResolutionFile, CachedTopLevelDeclaration,
+    CachedResolutionBinding, CachedResolutionFile, CachedRustFileModule, CachedRustModule,
+    CachedRustType, CachedRustUseBinding, CachedTopLevelDeclaration,
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
@@ -21,8 +22,31 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use tree_sitter::{Node as TsNode, Tree};
 
-const ADAPTER_VERSION: &str = "reference-v7";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 5;
+#[cfg(test)]
+thread_local! {
+    static RUST_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_rust_resolution_work(amount: usize) {
+    #[cfg(test)]
+    RUST_RESOLUTION_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_rust_resolution_work() {
+    RUST_RESOLUTION_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn rust_resolution_work() -> usize {
+    RUST_RESOLUTION_WORK.with(std::cell::Cell::get)
+}
+
+const ADAPTER_VERSION: &str = "reference-v9";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 7;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("javascript", ADAPTER_VERSION),
     ("rust", ADAPTER_VERSION),
@@ -50,51 +74,38 @@ pub(crate) fn collect_call_resolution_inputs(
         };
     }
     let complete = !tree.root_node().has_error();
-    let mut lookup_input_complete = complete;
+    let lookup_input_complete = complete;
     let source_sha256 = source_content_hash(source.as_bytes());
     let javascript_index = is_javascript_language(language)
         .then(|| JavascriptResolutionIndex::build(tree, source, file_id, nodes));
+    let rust_index =
+        (language == "rust").then(|| RustResolutionIndex::build(tree, source, file_id, nodes));
     let (direct_exports, export_poison_all, poisoned_export_names) =
         if let Some(index) = &javascript_index {
             index.collect_direct_exports(source)
         } else {
             (Vec::new(), false, Vec::new())
         };
-    if language == "rust" && rust_file_has_item_domain_macro_invocation(tree.root_node()) {
-        lookup_input_complete = false;
-    }
-    if language == "rust" && rust_file_has_attribute_domain(tree.root_node()) {
-        lookup_input_complete = false;
-    }
     let typescript_module = javascript_index
         .as_ref()
         .is_some_and(|index| index.ecmascript_module);
     let top_level_declarations = if let Some(index) = &javascript_index {
         index.cached_top_level_declarations()
-    } else if language == "rust" {
-        match collect_top_level_declarations(tree, source, language, file_id, nodes) {
-            Some(declarations) => declarations,
-            None => {
-                lookup_input_complete = false;
-                Vec::new()
-            }
-        }
+    } else if let Some(index) = &rust_index {
+        index.declarations.clone()
     } else {
         Vec::new()
     };
-    let inherent_methods = if language == "rust" {
-        match collect_rust_inherent_methods(tree, source, file_id, nodes) {
-            Some(methods) => methods,
-            None => {
-                lookup_input_complete = false;
-                Vec::new()
-            }
-        }
+    let inherent_methods = if let Some(index) = &rust_index {
+        index.methods.clone()
     } else {
         Vec::new()
     };
     let mut calls = Vec::new();
-    let mut emit_call = |callee: TsNode<'_>, form: CalleeForm, raw_target: String| {
+    let mut emit_call = |callee: TsNode<'_>,
+                         form: CalleeForm,
+                         raw_target: String,
+                         rust_callable_id: Option<usize>| {
         let mut callsite = ExactCallsite {
             file_id: FileId(file_id.0),
             source_sha256: source_sha256.clone(),
@@ -105,8 +116,8 @@ pub(crate) fn collect_call_resolution_inputs(
             callee_form: form,
             raw_target: raw_target.clone(),
         };
-        let (caller, mut binding) = if language == "rust" {
-            resolve_rust_syntax_claim(tree, source, file_id, nodes, callee, form, &raw_target)
+        let (caller, mut binding) = if let Some(index) = &rust_index {
+            index.resolve_syntax_claim(source, callee, form, &raw_target, rust_callable_id)
         } else if let Some(index) = &javascript_index {
             index.resolve_syntax_claim(source, callee, form, &raw_target)
         } else {
@@ -115,7 +126,15 @@ pub(crate) fn collect_call_resolution_inputs(
         if !lookup_input_complete {
             binding = CachedResolutionBinding::IncompleteDomain;
         }
-        if matches!(binding, CachedResolutionBinding::StaticImport { .. }) {
+        if matches!(binding, CachedResolutionBinding::StaticImport { .. })
+            || matches!(
+                binding,
+                CachedResolutionBinding::RustPath {
+                    import: Some(_),
+                    ..
+                }
+            ) && form == CalleeForm::Identifier
+        {
             callsite.callee_form = CalleeForm::NamedImport;
         }
         calls.push(CachedCallResolutionInput {
@@ -129,10 +148,21 @@ pub(crate) fn collect_call_resolution_inputs(
     };
     if let Some(index) = &javascript_index {
         for call in &index.calls {
-            emit_call(call.callee, call.form, call.raw_target.clone());
+            emit_call(call.callee, call.form, call.raw_target.clone(), None);
+        }
+    } else if let Some(index) = &rust_index {
+        for call in &index.calls {
+            emit_call(
+                call.callee,
+                call.form,
+                call.raw_target.clone(),
+                call.callable_id,
+            );
         }
     } else {
-        collect_calls(tree.root_node(), source, &mut emit_call);
+        collect_calls(tree.root_node(), source, &mut |callee, form, raw_target| {
+            emit_call(callee, form, raw_target, None);
+        });
     }
     calls.sort_by_key(|input| (input.callsite.start_byte, input.callsite.end_byte_exclusive));
     CollectedResolutionInputs {
@@ -154,6 +184,15 @@ pub(crate) fn collect_call_resolution_inputs(
             direct_exports,
             export_poison_all,
             poisoned_export_names,
+            rust_modules: rust_index
+                .as_ref()
+                .map_or_else(Vec::new, |index| index.modules.clone()),
+            rust_types: rust_index
+                .as_ref()
+                .map_or_else(Vec::new, |index| index.types.clone()),
+            rust_uses: rust_index
+                .as_ref()
+                .map_or_else(Vec::new, |index| index.uses.clone()),
         }),
     }
 }
@@ -500,6 +539,8 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
                 self.top_level_declarations.push(CachedTopLevelDeclaration {
                     name: name.clone(),
                     declaration,
+                    module_path: Vec::new(),
+                    cross_module_visible: false,
                 });
                 JavascriptBindingKind::SameFile { declaration }
             } else if direct_class {
@@ -540,6 +581,8 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
                     self.top_level_declarations.push(CachedTopLevelDeclaration {
                         name: name.clone(),
                         declaration,
+                        module_path: Vec::new(),
+                        cross_module_visible: false,
                     });
                     JavascriptBindingKind::SameFile { declaration }
                 } else {
@@ -837,14 +880,14 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
         };
         let line = declaration.start_position().row as u32 + 1;
         let matches = self.callable_nodes.get(&(line, name))?;
-        (matches.len() == 1).then_some(matches[0])
+        matches.first().copied().filter(|_| matches.len() == 1)
     }
 
     fn map_class_declaration(&self, declaration: TsNode<'_>, source: &str) -> Option<NodeId> {
         let name = declaration_name(declaration, source)?.to_string();
         let line = declaration.start_position().row as u32 + 1;
         let matches = self.class_nodes.get(&(line, name))?;
-        (matches.len() == 1).then_some(matches[0])
+        matches.first().copied().filter(|_| matches.len() == 1)
     }
 
     fn resolve_syntax_claim(
@@ -1479,7 +1522,7 @@ fn javascript_supported_caller(
     };
     let line = callable.start_position().row as u32 + 1;
     let matches = callable_nodes.get(&(line, name))?;
-    (matches.len() == 1).then_some(matches[0])
+    matches.first().copied().filter(|_| matches.len() == 1)
 }
 
 fn javascript_direct_export<'tree>(
@@ -1686,133 +1729,1651 @@ fn javascript_enclosing_class(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
     None
 }
 
-fn resolve_rust_syntax_claim(
-    tree: &Tree,
-    source: &str,
-    file_id: NodeId,
-    nodes: &[Node],
-    callee: TsNode<'_>,
+#[derive(Debug, Clone)]
+struct IndexedRustCall<'tree> {
+    callee: TsNode<'tree>,
     form: CalleeForm,
-    raw_target: &str,
-) -> (Option<NodeId>, CachedResolutionBinding) {
-    let Some(callable) = enclosing_ancestor(callee, &["function_item"]) else {
-        return (None, CachedResolutionBinding::MissingBinding);
-    };
-    let Some(caller) = map_callable_declaration(nodes, file_id, callable, source) else {
-        return (None, CachedResolutionBinding::Ambiguous);
-    };
-    if !rust_callable_is_in_root_module(callable) {
-        return (Some(caller), CachedResolutionBinding::Unsupported);
-    }
-    if contains_node_kind(callable, "macro_invocation") {
-        return (Some(caller), CachedResolutionBinding::IncompleteDomain);
-    }
-    if callable_has_shadow_or_write("rust", callable, callee, raw_target, source)
-        || rust_root_has_competing_value_binding(tree.root_node(), raw_target, source)
-    {
-        return (Some(caller), CachedResolutionBinding::Ambiguous);
-    }
-    if form == CalleeForm::Identifier {
-        let declarations = top_level_rust_functions(tree.root_node())
-            .into_iter()
-            .filter(|declaration| declaration_name(*declaration, source) == Some(raw_target))
-            .collect::<Vec<_>>();
-        return match declarations.as_slice() {
-            [declaration] => (
-                Some(caller),
-                map_callable_declaration(nodes, file_id, *declaration, source)
-                    .map(|declaration| CachedResolutionBinding::SameFile { declaration })
-                    .unwrap_or(CachedResolutionBinding::Ambiguous),
-            ),
-            [] => (Some(caller), CachedResolutionBinding::MissingBinding),
-            _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+    raw_target: String,
+    callable_id: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct RustLexicalBinding {
+    start_byte: usize,
+    scope_start: usize,
+    scope_end: usize,
+    scope_depth: usize,
+    receiver_owner: Option<String>,
+    constructor: bool,
+    constructor_record: bool,
+    constructor_method: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum RustBindingDecision {
+    Unique(RustLexicalBinding),
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RustLexicalScope {
+    start_byte: usize,
+    end_byte: usize,
+    depth: usize,
+}
+
+#[derive(Clone)]
+struct RustInherentCallableContext {
+    module_path: Vec<String>,
+    owner_name: String,
+    has_self: bool,
+}
+
+struct RustGraphNodeIndex {
+    callables: HashMap<(u32, String), Vec<NodeId>>,
+    structs: HashMap<(u32, String), Vec<NodeId>>,
+    enums: HashMap<(u32, String), Vec<NodeId>>,
+    modules: HashMap<(u32, u32, String), Vec<NodeId>>,
+    imports_by_line: HashMap<u32, Vec<(u32, String, NodeId)>>,
+}
+
+impl RustGraphNodeIndex {
+    fn prepare(file_id: NodeId, nodes: &[Node]) -> Self {
+        let mut result = Self {
+            callables: HashMap::new(),
+            structs: HashMap::new(),
+            enums: HashMap::new(),
+            modules: HashMap::new(),
+            imports_by_line: HashMap::new(),
         };
+        for node in nodes
+            .iter()
+            .filter(|node| node.file_node_id == Some(file_id))
+        {
+            count_rust_resolution_work(1);
+            let Some(line) = node.start_line else {
+                continue;
+            };
+            let name = graph_leaf_name(&node.serialized_name).to_string();
+            match node.kind {
+                NodeKind::FUNCTION | NodeKind::METHOD => result
+                    .callables
+                    .entry((line, name))
+                    .or_default()
+                    .push(node.id),
+                NodeKind::STRUCT => result
+                    .structs
+                    .entry((line, name))
+                    .or_default()
+                    .push(node.id),
+                NodeKind::ENUM => result.enums.entry((line, name)).or_default().push(node.id),
+                NodeKind::MODULE => {
+                    if let Some(column) = node.start_col {
+                        result.imports_by_line.entry(line).or_default().push((
+                            column,
+                            graph_leaf_name(node.serialized_name.trim_end_matches(" (import)"))
+                                .to_string(),
+                            node.id,
+                        ));
+                        if !node.serialized_name.ends_with(" (import)") {
+                            result
+                                .modules
+                                .entry((line, column, name))
+                                .or_default()
+                                .push(node.id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for imports in result.imports_by_line.values_mut() {
+            imports.sort_by(|left, right| left.0.cmp(&right.0).then(left.2.cmp(&right.2)));
+        }
+        result
     }
-    if form != CalleeForm::ImplicitReceiver {
-        return (Some(caller), CachedResolutionBinding::Unsupported);
+
+    fn callable(&self, declaration: TsNode<'_>, source: &str) -> Option<NodeId> {
+        let name = declaration_name(declaration, source)?;
+        let line = declaration.start_position().row as u32 + 1;
+        let matches = self.callables.get(&(line, name.to_string()))?;
+        matches.first().copied().filter(|_| matches.len() == 1)
     }
-    let Some(impl_item) = enclosing_ancestor(callable, &["impl_item"]) else {
-        return (Some(caller), CachedResolutionBinding::MissingBinding);
-    };
-    let Some(owner_name) = simple_inherent_impl_owner(impl_item, source) else {
-        return (Some(caller), CachedResolutionBinding::Unsupported);
-    };
-    let owner_nodes = nodes
-        .iter()
-        .filter(|node| {
-            node.file_node_id == Some(file_id)
-                && node.kind == NodeKind::STRUCT
-                && node.serialized_name == owner_name
-        })
-        .collect::<Vec<_>>();
-    let methods = direct_impl_functions(impl_item)
-        .into_iter()
-        .filter(|method| declaration_name(*method, source) == Some(raw_target))
-        .collect::<Vec<_>>();
-    let project_visible_methods = collect_simple_inherent_method_nodes(tree.root_node(), source)
-        .into_iter()
-        .filter(|(owner, method)| {
-            *owner == owner_name && declaration_name(*method, source) == Some(raw_target)
-        })
-        .collect::<Vec<_>>();
-    if owner_nodes.len() != 1 || methods.len() != 1 || project_visible_methods.len() != 1 {
-        return (Some(caller), CachedResolutionBinding::Ambiguous);
+
+    fn rust_type(&self, declaration: TsNode<'_>, source: &str) -> Option<NodeId> {
+        let name = declaration_name(declaration, source)?;
+        let line = declaration.start_position().row as u32 + 1;
+        let matches = match declaration.kind() {
+            "struct_item" => self.structs.get(&(line, name.to_string())),
+            "enum_item" => self.enums.get(&(line, name.to_string())),
+            _ => None,
+        }?;
+        matches.first().copied().filter(|_| matches.len() == 1)
     }
-    let Some(declaration) = map_callable_declaration(nodes, file_id, methods[0], source) else {
-        return (Some(caller), CachedResolutionBinding::Ambiguous);
-    };
-    (
-        Some(caller),
-        CachedResolutionBinding::ImplicitReceiver {
-            owner: owner_nodes[0].id,
+
+    fn module(&self, declaration: TsNode<'_>, name: &str) -> Option<NodeId> {
+        let line = declaration.start_position().row as u32 + 1;
+        let column = declaration.start_position().column as u32 + 1;
+        let matches = self.modules.get(&(line, column, name.to_string()))?;
+        matches.first().copied().filter(|_| matches.len() == 1)
+    }
+
+    fn imports_in_range(
+        &self,
+        line: u32,
+        start_column: u32,
+        end_column: u32,
+    ) -> &[(u32, String, NodeId)] {
+        let imports = self
+            .imports_by_line
+            .get(&line)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let start = imports.partition_point(|(column, _, _)| *column < start_column);
+        let end = imports.partition_point(|(column, _, _)| *column <= end_column);
+        &imports[start..end]
+    }
+}
+
+struct RustResolutionIndex<'tree> {
+    calls: Vec<IndexedRustCall<'tree>>,
+    declarations: Vec<CachedTopLevelDeclaration>,
+    methods: Vec<CachedInherentMethod>,
+    modules: Vec<CachedRustModule>,
+    types: Vec<CachedRustType>,
+    uses: Vec<CachedRustUseBinding>,
+    declarations_by_module_name: HashMap<(Vec<String>, String), Vec<NodeId>>,
+    types_by_module_name: HashMap<(Vec<String>, String), Vec<NodeId>>,
+    generic_types: HashSet<NodeId>,
+    methods_by_owner_name: HashMap<(Vec<String>, String, String), Vec<CachedInherentMethod>>,
+    uses_by_module_name: HashMap<(Vec<String>, String), Vec<CachedRustUseBinding>>,
+    module_complete: HashMap<Vec<String>, bool>,
+    module_value_blockers: HashMap<Vec<String>, HashSet<String>>,
+    module_incomplete_value_names: HashMap<Vec<String>, HashSet<String>>,
+    module_unsupported_value_names: HashMap<Vec<String>, HashSet<String>>,
+    incomplete_inherent_owners: HashSet<(Vec<String>, String)>,
+    lexical_bindings: HashMap<usize, HashMap<String, Vec<RustLexicalBinding>>>,
+    binding_decisions: HashMap<(usize, usize, String), RustBindingDecision>,
+    callable_type_blockers: HashMap<usize, HashSet<String>>,
+    inherent_callable_contexts: HashMap<usize, RustInherentCallableContext>,
+    callable_complete: HashMap<usize, bool>,
+    callable_poison_ranges: HashMap<usize, Vec<(usize, usize)>>,
+    callable_nodes: HashMap<usize, NodeId>,
+    callable_module_paths: HashMap<usize, Vec<String>>,
+    callable_start_bytes: HashMap<usize, usize>,
+    attributed_items: HashSet<usize>,
+}
+
+impl<'tree> RustResolutionIndex<'tree> {
+    fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
+        let graph_nodes = RustGraphNodeIndex::prepare(file_id, nodes);
+        let mut result = Self {
+            calls: Vec::new(),
+            declarations: Vec::new(),
+            methods: Vec::new(),
+            modules: Vec::new(),
+            types: Vec::new(),
+            uses: Vec::new(),
+            declarations_by_module_name: HashMap::new(),
+            types_by_module_name: HashMap::new(),
+            generic_types: HashSet::new(),
+            methods_by_owner_name: HashMap::new(),
+            uses_by_module_name: HashMap::new(),
+            module_complete: HashMap::new(),
+            module_value_blockers: HashMap::new(),
+            module_incomplete_value_names: HashMap::new(),
+            module_unsupported_value_names: HashMap::new(),
+            incomplete_inherent_owners: HashSet::new(),
+            lexical_bindings: HashMap::new(),
+            binding_decisions: HashMap::new(),
+            callable_type_blockers: HashMap::new(),
+            inherent_callable_contexts: HashMap::new(),
+            callable_complete: HashMap::new(),
+            callable_poison_ranges: HashMap::new(),
+            callable_nodes: HashMap::new(),
+            callable_module_paths: HashMap::new(),
+            callable_start_bytes: HashMap::new(),
+            attributed_items: HashSet::new(),
+        };
+        result.collect_module(tree.root_node(), Vec::new(), None, source, &graph_nodes);
+        for method in &mut result.methods {
+            if result
+                .incomplete_inherent_owners
+                .contains(&(method.module_path.clone(), method.owner_name.clone()))
+            {
+                method.domain_complete = false;
+            }
+        }
+        for ((module_path, owner_name, _), methods) in &mut result.methods_by_owner_name {
+            if result
+                .incomplete_inherent_owners
+                .contains(&(module_path.clone(), owner_name.clone()))
+            {
+                for method in methods {
+                    method.domain_complete = false;
+                }
+            }
+        }
+        result.collect_execution_tree(tree.root_node(), None, None, &[], source, &graph_nodes);
+        result
+            .calls
+            .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        result.prepare_binding_decisions(source);
+        result.lexical_bindings.clear();
+        result.lexical_bindings.shrink_to_fit();
+        result.declarations.sort_by(|left, right| {
+            left.module_path
+                .cmp(&right.module_path)
+                .then(left.name.cmp(&right.name))
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        result.methods.sort_by(|left, right| {
+            left.module_path
+                .cmp(&right.module_path)
+                .then(left.owner_name.cmp(&right.owner_name))
+                .then(left.method_name.cmp(&right.method_name))
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        result
+    }
+
+    fn collect_module(
+        &mut self,
+        body: TsNode<'tree>,
+        module_path: Vec<String>,
+        declaration: Option<NodeId>,
+        source: &str,
+        graph_nodes: &RustGraphNodeIndex,
+    ) {
+        let mut domain_complete = true;
+        let mut file_children = Vec::new();
+        let mut value_blockers = HashSet::new();
+        let mut incomplete_value_names = HashSet::new();
+        let mut unsupported_value_names = HashSet::new();
+        let mut cursor = body.walk();
+        let items = body.named_children(&mut cursor).collect::<Vec<_>>();
+        let attributed_items = rust_attributed_item_ids(&items);
+        self.attributed_items
+            .extend(attributed_items.iter().copied());
+        for item in &items {
+            if item.kind() == "macro_invocation"
+                || (item.kind() == "inner_attribute_item"
+                    && !rust_inner_allow_preserves_module_bindings(*item, source))
+                || (item.kind() == "attribute_item"
+                    && !rust_attribute_is_bounded_item_metadata(*item, source))
+                || (!matches!(item.kind(), "function_item" | "mod_item" | "impl_item")
+                    && contains_node_kind(*item, "macro_invocation"))
+            {
+                domain_complete = false;
+            }
+            match item.kind() {
+                "function_item" => {
+                    let name = declaration_name(*item, source).map(str::to_string);
+                    if attributed_items.contains(&item.id()) {
+                        if let Some(name) = name {
+                            incomplete_value_names.insert(name);
+                        } else {
+                            domain_complete = false;
+                        }
+                        continue;
+                    }
+                    let Some(name) = name else {
+                        domain_complete = false;
+                        continue;
+                    };
+                    let Some(declaration) = graph_nodes.callable(*item, source) else {
+                        incomplete_value_names.insert(name);
+                        continue;
+                    };
+                    let cached = CachedTopLevelDeclaration {
+                        name: name.clone(),
+                        declaration,
+                        module_path: module_path.clone(),
+                        cross_module_visible: rust_item_is_plain_pub(*item, source),
+                    };
+                    self.declarations_by_module_name
+                        .entry((module_path.clone(), name))
+                        .or_default()
+                        .push(declaration);
+                    self.declarations.push(cached);
+                }
+                "struct_item" | "enum_item" => {
+                    if let Some(name) = declaration_name(*item, source) {
+                        value_blockers.insert(name.to_string());
+                    }
+                    if attributed_items.contains(&item.id()) {
+                        if let Some(name) = declaration_name(*item, source) {
+                            incomplete_value_names.insert(name.to_string());
+                        } else {
+                            domain_complete = false;
+                        }
+                        continue;
+                    }
+                    let (Some(name), Some(declaration)) = (
+                        declaration_name(*item, source).map(str::to_string),
+                        graph_nodes.rust_type(*item, source),
+                    ) else {
+                        domain_complete = false;
+                        continue;
+                    };
+                    self.types_by_module_name
+                        .entry((module_path.clone(), name.clone()))
+                        .or_default()
+                        .push(declaration);
+                    let (unit_constructor, record_constructor) =
+                        rust_struct_constructor_capabilities(*item);
+                    let generic = rust_item_is_generic(*item);
+                    if generic {
+                        self.generic_types.insert(declaration);
+                    }
+                    self.types.push(CachedRustType {
+                        module_path: module_path.clone(),
+                        name,
+                        declaration,
+                        generic,
+                        cross_module_visible: rust_item_is_plain_pub(*item, source),
+                        unit_constructor,
+                        record_constructor,
+                    });
+                }
+                "impl_item" => {
+                    self.collect_impl(
+                        *item,
+                        &module_path,
+                        attributed_items.contains(&item.id()),
+                        source,
+                        graph_nodes,
+                    );
+                }
+                "use_declaration" => {
+                    if attributed_items.contains(&item.id()) {
+                        let names = rust_use_bound_names(*item, source);
+                        if names.is_empty() {
+                            domain_complete = false;
+                        } else {
+                            incomplete_value_names.extend(names);
+                        }
+                        continue;
+                    }
+                    if rust_use_is_renamed(*item, source) {
+                        unsupported_value_names.extend(rust_use_bound_names(*item, source));
+                    } else if let Some(bindings) =
+                        rust_supported_use_bindings(*item, &module_path, source, graph_nodes)
+                    {
+                        for binding in bindings {
+                            self.uses_by_module_name
+                                .entry((module_path.clone(), binding.local_name.clone()))
+                                .or_default()
+                                .push(binding.clone());
+                            self.uses.push(binding);
+                        }
+                    } else {
+                        if node_text(*item, source).is_some_and(|surface| surface.contains('*')) {
+                            domain_complete = false;
+                        }
+                        value_blockers.extend(rust_use_bound_names(*item, source));
+                    }
+                }
+                "const_item" | "static_item" => {
+                    if let Some(name) = declaration_name(*item, source) {
+                        value_blockers.insert(name.to_string());
+                    }
+                }
+                "mod_item" => {
+                    let Some(name) = declaration_name(*item, source).map(str::to_string) else {
+                        domain_complete = false;
+                        continue;
+                    };
+                    if attributed_items.contains(&item.id()) {
+                        incomplete_value_names.insert(name.clone());
+                    }
+                    let module_declaration = graph_nodes.module(*item, &name);
+                    if let Some(child_body) = item.child_by_field_name("body") {
+                        let mut child_path = module_path.clone();
+                        child_path.push(name);
+                        self.collect_module(
+                            child_body,
+                            child_path,
+                            module_declaration,
+                            source,
+                            graph_nodes,
+                        );
+                    } else {
+                        let Some(declaration) = module_declaration else {
+                            domain_complete = false;
+                            continue;
+                        };
+                        file_children.push(CachedRustFileModule { name, declaration });
+                    }
+                }
+                _ => {}
+            }
+        }
+        file_children.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        file_children.dedup();
+        self.module_complete
+            .insert(module_path.clone(), domain_complete);
+        self.module_value_blockers
+            .insert(module_path.clone(), value_blockers.clone());
+        self.module_incomplete_value_names
+            .insert(module_path.clone(), incomplete_value_names.clone());
+        self.module_unsupported_value_names
+            .insert(module_path.clone(), unsupported_value_names);
+        self.modules.push(CachedRustModule {
+            module_path,
             declaration,
-            owner_name: owner_name.to_string(),
-        },
+            domain_complete,
+            value_blockers: {
+                let mut blockers = value_blockers.into_iter().collect::<Vec<_>>();
+                blockers.sort();
+                blockers
+            },
+            incomplete_value_names: {
+                let mut names = incomplete_value_names.into_iter().collect::<Vec<_>>();
+                names.sort();
+                names
+            },
+            file_children,
+        });
+    }
+
+    fn collect_impl(
+        &mut self,
+        impl_item: TsNode<'tree>,
+        module_path: &[String],
+        impl_attributed: bool,
+        source: &str,
+        graph_nodes: &RustGraphNodeIndex,
+    ) {
+        let owner_domain = rust_inherent_impl_owner_domain(impl_item, module_path, source);
+        let Some(owner_name) = simple_inherent_impl_owner(impl_item, source).map(str::to_string)
+        else {
+            if let Some(owner_domain) = owner_domain {
+                self.incomplete_inherent_owners.insert(owner_domain);
+            }
+            return;
+        };
+        let owner_nodes = self
+            .types_by_module_name
+            .get(&(module_path.to_vec(), owner_name.clone()))
+            .cloned()
+            .unwrap_or_default();
+        let owner = owner_nodes
+            .first()
+            .copied()
+            .filter(|_| owner_nodes.len() == 1);
+        let body_items = impl_item
+            .child_by_field_name("body")
+            .map(|body| {
+                let mut cursor = body.walk();
+                body.named_children(&mut cursor).collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let attributed_methods = rust_attributed_item_ids(&body_items);
+        self.attributed_items
+            .extend(attributed_methods.iter().copied());
+        let impl_complete = !impl_attributed
+            && attributed_methods.is_empty()
+            && !rust_impl_has_direct_item_macro(impl_item);
+        if !impl_complete {
+            self.incomplete_inherent_owners
+                .insert((module_path.to_vec(), owner_name.clone()));
+        }
+        for method in direct_impl_functions(impl_item) {
+            let (Some(method_name), Some(declaration)) = (
+                declaration_name(method, source).map(str::to_string),
+                graph_nodes.callable(method, source),
+            ) else {
+                continue;
+            };
+            let cached = CachedInherentMethod {
+                owner_name: owner_name.clone(),
+                method_name: method_name.clone(),
+                declaration,
+                module_path: module_path.to_vec(),
+                owner,
+                has_self: rust_function_has_self_receiver(method),
+                return_owner: rust_exact_return_owner(method, &owner_name, source),
+                domain_complete: impl_complete,
+                cross_module_visible: rust_item_is_plain_pub(method, source),
+            };
+            self.inherent_callable_contexts.insert(
+                method.id(),
+                RustInherentCallableContext {
+                    module_path: module_path.to_vec(),
+                    owner_name: owner_name.clone(),
+                    has_self: cached.has_self,
+                },
+            );
+            self.methods_by_owner_name
+                .entry((module_path.to_vec(), owner_name.clone(), method_name))
+                .or_default()
+                .push(cached.clone());
+            self.methods.push(cached);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_execution_tree(
+        &mut self,
+        node: TsNode<'tree>,
+        current_callable: Option<usize>,
+        current_scope: Option<RustLexicalScope>,
+        module_path: &[String],
+        source: &str,
+        graph_nodes: &RustGraphNodeIndex,
+    ) {
+        count_rust_resolution_work(1);
+        let mut callable_id = current_callable;
+        let mut scope = current_scope;
+
+        if node.kind() == "function_item" {
+            if let (Some(parent_callable), Some(parent_scope)) = (current_callable, current_scope) {
+                let callable_start = self
+                    .callable_start_bytes
+                    .get(&parent_callable)
+                    .copied()
+                    .unwrap_or(parent_scope.start_byte);
+                rust_collect_lexical_bindings(
+                    node,
+                    callable_start,
+                    parent_scope,
+                    source,
+                    self.lexical_bindings.entry(parent_callable).or_default(),
+                );
+            }
+
+            callable_id = Some(node.id());
+            scope = Some(RustLexicalScope {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                depth: 0,
+            });
+            self.callable_start_bytes
+                .insert(node.id(), node.start_byte());
+            self.callable_module_paths
+                .insert(node.id(), module_path.to_vec());
+            self.callable_complete
+                .insert(node.id(), !self.attributed_items.contains(&node.id()));
+            self.callable_poison_ranges
+                .insert(node.id(), rust_callable_poison_ranges(node, source));
+            self.callable_type_blockers
+                .insert(node.id(), rust_callable_type_parameter_names(node, source));
+            self.lexical_bindings.entry(node.id()).or_default();
+            if let Some(caller) = graph_nodes.callable(node, source) {
+                self.callable_nodes.insert(node.id(), caller);
+            }
+        } else if let Some(callable_id) = callable_id {
+            let callable_start = self
+                .callable_start_bytes
+                .get(&callable_id)
+                .copied()
+                .unwrap_or(node.start_byte());
+            let scope = if rust_node_starts_lexical_scope(node) {
+                Some(RustLexicalScope {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    depth: scope.map_or(0, |scope| scope.depth + 1),
+                })
+            } else {
+                scope
+            };
+            if matches!(node.kind(), "type_item" | "struct_item" | "enum_item") {
+                if let Some(name) = declaration_name(node, source) {
+                    self.callable_type_blockers
+                        .entry(callable_id)
+                        .or_default()
+                        .insert(name.to_string());
+                }
+            } else if node.kind() == "use_declaration" {
+                self.callable_type_blockers
+                    .entry(callable_id)
+                    .or_default()
+                    .extend(rust_use_bound_names(node, source));
+            }
+            if let Some(scope) = scope {
+                rust_collect_lexical_bindings(
+                    node,
+                    callable_start,
+                    scope,
+                    source,
+                    self.lexical_bindings.entry(callable_id).or_default(),
+                );
+            }
+            if node.kind() == "call_expression"
+                && let Some(function) = node.child_by_field_name("function")
+                && let Some((callee, form, raw_target)) = classify_callee(function, source)
+            {
+                self.calls.push(IndexedRustCall {
+                    callee,
+                    form,
+                    raw_target,
+                    callable_id: Some(callable_id),
+                });
+            }
+            self.collect_execution_children(
+                node,
+                Some(callable_id),
+                scope,
+                module_path,
+                source,
+                graph_nodes,
+            );
+            return;
+        } else if node.kind() == "call_expression"
+            && let Some(function) = node.child_by_field_name("function")
+            && let Some((callee, form, raw_target)) = classify_callee(function, source)
+        {
+            self.calls.push(IndexedRustCall {
+                callee,
+                form,
+                raw_target,
+                callable_id: None,
+            });
+        }
+
+        self.collect_execution_children(node, callable_id, scope, module_path, source, graph_nodes);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_execution_children(
+        &mut self,
+        node: TsNode<'tree>,
+        callable_id: Option<usize>,
+        scope: Option<RustLexicalScope>,
+        module_path: &[String],
+        source: &str,
+        graph_nodes: &RustGraphNodeIndex,
+    ) {
+        let inline_module = (node.kind() == "mod_item")
+            .then(|| {
+                let body = node.child_by_field_name("body")?;
+                let name = declaration_name(node, source)?;
+                let mut path = module_path.to_vec();
+                path.push(name.to_string());
+                Some((body.id(), path))
+            })
+            .flatten();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            let child_module_path = inline_module
+                .as_ref()
+                .filter(|(body_id, _)| *body_id == child.id())
+                .map_or(module_path, |(_, path)| path.as_slice());
+            self.collect_execution_tree(
+                child,
+                callable_id,
+                scope,
+                child_module_path,
+                source,
+                graph_nodes,
+            );
+        }
+    }
+
+    fn prepare_binding_decisions(&mut self, source: &str) {
+        let mut queries = HashMap::<(usize, String), Vec<usize>>::new();
+        for call in &self.calls {
+            let Some(callable_id) = call.callable_id else {
+                continue;
+            };
+            let name = match call.form {
+                CalleeForm::Identifier => Some(call.raw_target.clone()),
+                CalleeForm::ExplicitReceiver => {
+                    rust_field_receiver_name(call.callee, source).map(str::to_string)
+                }
+                _ => None,
+            };
+            if let Some(name) = name {
+                queries
+                    .entry((callable_id, name))
+                    .or_default()
+                    .push(call.callee.start_byte());
+            }
+        }
+        for ((callable_id, name), mut callsites) in queries {
+            callsites.sort_unstable();
+            callsites.dedup();
+            let bindings = self
+                .lexical_bindings
+                .get(&callable_id)
+                .and_then(|bindings| bindings.get(&name))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let mut events = Vec::with_capacity(bindings.len() * 2 + callsites.len());
+            for (index, binding) in bindings.iter().enumerate() {
+                let start = binding.start_byte.max(binding.scope_start);
+                if start < binding.scope_end {
+                    events.push((start, 1_u8, index));
+                    events.push((binding.scope_end, 0_u8, index));
+                    count_rust_resolution_work(2);
+                }
+            }
+            for (index, callsite) in callsites.iter().copied().enumerate() {
+                events.push((callsite, 2_u8, index));
+                count_rust_resolution_work(1);
+            }
+            events.sort_unstable();
+            let mut active = BTreeMap::<usize, HashSet<usize>>::new();
+            for (byte, kind, index) in events {
+                count_rust_resolution_work(1);
+                match kind {
+                    0 => {
+                        let depth = bindings[index].scope_depth;
+                        if let Some(entries) = active.get_mut(&depth) {
+                            entries.remove(&index);
+                            if entries.is_empty() {
+                                active.remove(&depth);
+                            }
+                        }
+                    }
+                    1 => {
+                        active
+                            .entry(bindings[index].scope_depth)
+                            .or_default()
+                            .insert(index);
+                    }
+                    _ => {
+                        let Some((_, entries)) = active.last_key_value() else {
+                            continue;
+                        };
+                        let decision = if entries.len() == 1 {
+                            RustBindingDecision::Unique(
+                                bindings[*entries.iter().next().expect("one binding")].clone(),
+                            )
+                        } else {
+                            RustBindingDecision::Ambiguous
+                        };
+                        self.binding_decisions
+                            .insert((callable_id, byte, name.clone()), decision);
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_syntax_claim(
+        &self,
+        source: &str,
+        callee: TsNode<'tree>,
+        form: CalleeForm,
+        raw_target: &str,
+        callable_id: Option<usize>,
+    ) -> (Option<NodeId>, CachedResolutionBinding) {
+        let Some(callable_id) = callable_id else {
+            return (None, CachedResolutionBinding::MissingBinding);
+        };
+        let Some(caller) = self.callable_nodes.get(&callable_id).copied() else {
+            return (None, CachedResolutionBinding::Ambiguous);
+        };
+        if !self.callsite_domain_complete(callable_id, callee.start_byte()) {
+            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+        }
+        let Some(module_path) = self.callable_module_paths.get(&callable_id).cloned() else {
+            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+        };
+        if self.module_complete.get(&module_path) != Some(&true) {
+            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+        }
+        match form {
+            CalleeForm::Identifier => {
+                if self
+                    .module_unsupported_value_names
+                    .get(&module_path)
+                    .is_some_and(|names| names.contains(raw_target))
+                {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
+                if self
+                    .module_incomplete_value_names
+                    .get(&module_path)
+                    .is_some_and(|names| names.contains(raw_target))
+                {
+                    return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+                }
+                if self
+                    .binding_decision(callable_id, callee.start_byte(), raw_target)
+                    .is_some()
+                {
+                    return (Some(caller), CachedResolutionBinding::Ambiguous);
+                }
+                if self
+                    .module_value_blockers
+                    .get(&module_path)
+                    .is_some_and(|blockers| blockers.contains(raw_target))
+                {
+                    return (Some(caller), CachedResolutionBinding::Ambiguous);
+                }
+                let declarations = self
+                    .declarations_by_module_name
+                    .get(&(module_path.clone(), raw_target.to_string()))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let uses = self
+                    .uses_by_module_name
+                    .get(&(module_path.clone(), raw_target.to_string()))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                match (declarations, uses) {
+                    ([declaration], []) => (
+                        Some(caller),
+                        CachedResolutionBinding::SameFile {
+                            declaration: *declaration,
+                        },
+                    ),
+                    ([], [binding]) => (
+                        Some(caller),
+                        CachedResolutionBinding::RustPath {
+                            module_path,
+                            components: binding.components.clone(),
+                            import: Some(binding.clone()),
+                            associated_owner: None,
+                        },
+                    ),
+                    ([], []) => (Some(caller), CachedResolutionBinding::MissingBinding),
+                    _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+                }
+            }
+            CalleeForm::ImplicitReceiver => {
+                let Some(context) = self.inherent_callable_contexts.get(&callable_id) else {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                };
+                if !context.has_self || context.module_path != module_path {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
+                let owner_name = &context.owner_name;
+                let owner_nodes = self
+                    .types_by_module_name
+                    .get(&(module_path.clone(), owner_name.clone()))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let methods = self
+                    .methods_by_owner_name
+                    .get(&(
+                        module_path.clone(),
+                        owner_name.clone(),
+                        raw_target.to_string(),
+                    ))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                match (owner_nodes, methods) {
+                    ([owner], [method])
+                        if !self.generic_types.contains(owner)
+                            && method.has_self
+                            && method.domain_complete =>
+                    {
+                        (
+                            Some(caller),
+                            CachedResolutionBinding::ImplicitReceiver {
+                                owner: *owner,
+                                declaration: method.declaration,
+                                owner_name: owner_name.clone(),
+                            },
+                        )
+                    }
+                    ([owner], [_]) if self.generic_types.contains(owner) => {
+                        (Some(caller), CachedResolutionBinding::Unsupported)
+                    }
+                    ([_], [method]) if !method.domain_complete => {
+                        (Some(caller), CachedResolutionBinding::IncompleteDomain)
+                    }
+                    ([_], [method]) if !method.has_self => {
+                        (Some(caller), CachedResolutionBinding::Unsupported)
+                    }
+                    ([], [method]) if method.has_self && method.domain_complete => {
+                        let imports = self
+                            .uses_by_module_name
+                            .get(&(module_path.clone(), owner_name.clone()))
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        match imports {
+                            [import] => (
+                                Some(caller),
+                                CachedResolutionBinding::RustImplicitReceiver {
+                                    module_path,
+                                    owner_name: owner_name.clone(),
+                                    import: import.clone(),
+                                    declaration: method.declaration,
+                                },
+                            ),
+                            [] => (Some(caller), CachedResolutionBinding::MissingBinding),
+                            _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+                        }
+                    }
+                    ([], _) | (_, []) => (Some(caller), CachedResolutionBinding::MissingBinding),
+                    _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+                }
+            }
+            CalleeForm::QualifiedPath => {
+                let components = rust_scoped_call_components(callee, source);
+                let Some(components) = components else {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                };
+                if components
+                    .first()
+                    .is_some_and(|component| component == "super")
+                {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
+                if components
+                    .first()
+                    .is_some_and(|component| component == "Self")
+                {
+                    if components.len() != 2 {
+                        return (Some(caller), CachedResolutionBinding::Unsupported);
+                    }
+                    let Some(context) = self.inherent_callable_contexts.get(&callable_id) else {
+                        return (Some(caller), CachedResolutionBinding::Unsupported);
+                    };
+                    let owner_name = &context.owner_name;
+                    let owners = self
+                        .types_by_module_name
+                        .get(&(module_path.clone(), owner_name.clone()))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    return match owners {
+                        [owner] if !self.generic_types.contains(owner) => (
+                            Some(caller),
+                            CachedResolutionBinding::RustPath {
+                                module_path,
+                                components: vec![owner_name.clone(), raw_target.to_string()],
+                                import: None,
+                                associated_owner: Some(*owner),
+                            },
+                        ),
+                        [_] => (Some(caller), CachedResolutionBinding::Unsupported),
+                        [] => (Some(caller), CachedResolutionBinding::MissingBinding),
+                        _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+                    };
+                }
+                let import = components.first().and_then(|owner| {
+                    self.uses_by_module_name
+                        .get(&(module_path.clone(), owner.clone()))
+                        .and_then(|uses| (uses.len() == 1).then(|| uses[0].clone()))
+                });
+                (
+                    Some(caller),
+                    CachedResolutionBinding::RustPath {
+                        module_path,
+                        components,
+                        import,
+                        associated_owner: None,
+                    },
+                )
+            }
+            CalleeForm::ExplicitReceiver => {
+                let Some(receiver_name) = rust_field_receiver_name(callee, source) else {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                };
+                let binding =
+                    match self.binding_decision(callable_id, callee.start_byte(), receiver_name) {
+                        Some(RustBindingDecision::Unique(binding)) => binding,
+                        Some(RustBindingDecision::Ambiguous) => {
+                            return (Some(caller), CachedResolutionBinding::Ambiguous);
+                        }
+                        None => return (Some(caller), CachedResolutionBinding::Unsupported),
+                    };
+                let Some(owner_name) = binding.receiver_owner.clone() else {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                };
+                if binding.constructor_record
+                    || self
+                        .callable_type_blockers
+                        .get(&callable_id)
+                        .is_some_and(|blockers| blockers.contains(&owner_name))
+                {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
+                let import = self
+                    .uses_by_module_name
+                    .get(&(module_path.clone(), owner_name.clone()))
+                    .and_then(|uses| (uses.len() == 1).then(|| uses[0].clone()));
+                (
+                    Some(caller),
+                    CachedResolutionBinding::RustExplicitReceiver {
+                        module_path,
+                        owner_name,
+                        import,
+                        constructor: binding.constructor,
+                        constructor_record: binding.constructor_record,
+                        constructor_method: binding.constructor_method.clone(),
+                    },
+                )
+            }
+            _ => (Some(caller), CachedResolutionBinding::Unsupported),
+        }
+    }
+
+    fn binding_decision(
+        &self,
+        callable_id: usize,
+        callsite_start: usize,
+        name: &str,
+    ) -> Option<&RustBindingDecision> {
+        count_rust_resolution_work(1);
+        self.binding_decisions
+            .get(&(callable_id, callsite_start, name.to_string()))
+    }
+
+    fn callsite_domain_complete(&self, callable_id: usize, callsite_start: usize) -> bool {
+        if self.callable_complete.get(&callable_id) != Some(&true) {
+            return false;
+        }
+        let Some(ranges) = self.callable_poison_ranges.get(&callable_id) else {
+            return true;
+        };
+        let insertion = ranges.partition_point(|(start, _)| *start <= callsite_start);
+        insertion == 0 || ranges[insertion - 1].1 <= callsite_start
+    }
+}
+
+fn rust_item_is_plain_pub(item: TsNode<'_>, source: &str) -> bool {
+    node_text(item, source).is_some_and(|surface| surface.trim_start().starts_with("pub "))
+}
+
+fn rust_item_is_generic(item: TsNode<'_>) -> bool {
+    item.child_by_field_name("type_parameters").is_some() || {
+        let mut cursor = item.walk();
+        item.named_children(&mut cursor)
+            .any(|child| child.kind() == "type_parameters")
+    }
+}
+
+fn rust_struct_constructor_capabilities(item: TsNode<'_>) -> (bool, bool) {
+    if item.kind() != "struct_item" {
+        return (false, false);
+    }
+    let mut cursor = item.walk();
+    let children = item.named_children(&mut cursor).collect::<Vec<_>>();
+    let record = children
+        .iter()
+        .any(|child| child.kind() == "field_declaration_list");
+    let tuple = children
+        .iter()
+        .any(|child| child.kind() == "ordered_field_declaration_list");
+    (!record && !tuple, record)
+}
+
+fn rust_attributed_item_ids(items: &[TsNode<'_>]) -> HashSet<usize> {
+    let mut result = HashSet::new();
+    let mut pending_attribute = false;
+    for item in items {
+        if item.kind() == "attribute_item" {
+            pending_attribute = true;
+        } else {
+            if pending_attribute {
+                result.insert(item.id());
+            }
+            pending_attribute = false;
+        }
+    }
+    result
+}
+
+fn rust_attribute_is_bounded_item_metadata(attribute: TsNode<'_>, source: &str) -> bool {
+    let Some(surface) = node_text(attribute, source) else {
+        return false;
+    };
+    let Some(body) = surface.trim().strip_prefix("#[") else {
+        return false;
+    };
+    let name = body
+        .split(|character: char| {
+            character == '(' || character == '=' || character == ']' || character.is_whitespace()
+        })
+        .next()
+        .unwrap_or_default();
+    matches!(name, "allow" | "cfg" | "derive" | "doc")
+}
+
+fn rust_inner_allow_preserves_module_bindings(attribute: TsNode<'_>, source: &str) -> bool {
+    let Some(surface) = node_text(attribute, source) else {
+        return false;
+    };
+    let Some(body) = surface.trim().strip_prefix("#![") else {
+        return false;
+    };
+    body.split(|character: char| {
+        character == '(' || character == '=' || character == ']' || character.is_whitespace()
+    })
+    .next()
+        == Some("allow")
+}
+
+fn rust_callable_poison_ranges(function: TsNode<'_>, source: &str) -> Vec<(usize, usize)> {
+    fn collect(
+        node: TsNode<'_>,
+        root_id: usize,
+        scope: (usize, usize),
+        source: &str,
+        output: &mut Vec<(usize, usize)>,
+    ) {
+        count_rust_resolution_work(1);
+        if node.id() != root_id && node.kind() == "function_item" {
+            return;
+        }
+        let scope = if rust_node_starts_lexical_scope(node) {
+            (node.start_byte(), node.end_byte())
+        } else {
+            scope
+        };
+        if node.kind() == "inner_attribute_item"
+            || (node.kind() == "macro_invocation" && rust_macro_can_change_enclosing_bindings(node))
+        {
+            output.push(scope);
+        }
+
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        let mut pending_attributes = Vec::new();
+        for child in children {
+            if child.kind() == "attribute_item" {
+                pending_attributes.push(child);
+                continue;
+            }
+            if !pending_attributes.is_empty() {
+                if pending_attributes
+                    .iter()
+                    .all(|attribute| rust_attribute_is_bounded_item_metadata(*attribute, source))
+                {
+                    output.push((child.start_byte(), child.end_byte()));
+                } else {
+                    output.push(scope);
+                }
+                pending_attributes.clear();
+            }
+            collect(child, root_id, scope, source, output);
+        }
+        if !pending_attributes.is_empty() {
+            output.push(scope);
+        }
+    }
+
+    let mut ranges = Vec::new();
+    collect(
+        function,
+        function.id(),
+        (function.start_byte(), function.end_byte()),
+        source,
+        &mut ranges,
+    );
+    ranges.sort_unstable();
+    let mut merged = Vec::<(usize, usize)>::new();
+    for (start, end) in ranges {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn rust_impl_has_direct_item_macro(item: TsNode<'_>) -> bool {
+    let Some(body) = item.child_by_field_name("body") else {
+        return true;
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .any(|child| child.kind() == "macro_invocation")
+}
+
+fn rust_macro_can_change_enclosing_bindings(invocation: TsNode<'_>) -> bool {
+    invocation
+        .parent()
+        .is_some_and(|parent| parent.kind() == "expression_statement")
+}
+
+fn rust_function_has_self_receiver(function: TsNode<'_>) -> bool {
+    function
+        .child_by_field_name("parameters")
+        .is_some_and(|parameters| {
+            let mut found = false;
+            walk_nodes(parameters, &mut |node| {
+                found |= matches!(node.kind(), "self_parameter" | "self")
+            });
+            found
+        })
+}
+
+fn rust_callable_type_parameter_names(function: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    let Some(parameters) = function.child_by_field_name("type_parameters").or_else(|| {
+        let mut cursor = function.walk();
+        function
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "type_parameters")
+    }) else {
+        return names;
+    };
+    walk_nodes(parameters, &mut |node| {
+        if matches!(node.kind(), "type_identifier" | "identifier")
+            && let Some(name) = node_text(node, source)
+        {
+            names.insert(name.to_string());
+        }
+    });
+    names
+}
+
+fn rust_exact_return_owner(function: TsNode<'_>, owner_name: &str, source: &str) -> Option<String> {
+    let return_type = function
+        .child_by_field_name("return_type")
+        .or_else(|| {
+            let mut cursor = function.walk();
+            function
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "return_type")
+        })
+        .and_then(|node| node_text(node, source))?
+        .trim()
+        .trim_start_matches("->")
+        .trim();
+    match return_type {
+        "Self" => Some(owner_name.to_string()),
+        value if value == owner_name => Some(owner_name.to_string()),
+        _ => None,
+    }
+}
+
+fn rust_supported_use_bindings(
+    declaration: TsNode<'_>,
+    module_path: &[String],
+    source: &str,
+    graph_nodes: &RustGraphNodeIndex,
+) -> Option<Vec<CachedRustUseBinding>> {
+    let surface = node_text(declaration, source)?.trim();
+    if surface.starts_with("pub ") {
+        return None;
+    }
+    let argument = surface.strip_prefix("use ")?.strip_suffix(';')?.trim();
+    if argument.contains(" as ")
+        || argument.contains('*')
+        || argument.contains("::{self")
+        || argument == "self"
+    {
+        return None;
+    }
+    let mut leaves = Vec::<(String, Vec<String>)>::new();
+    if let Some((prefix, group)) = argument.split_once("::{") {
+        let group = group.strip_suffix('}')?;
+        if group.contains('{') || group.contains('}') {
+            return None;
+        }
+        let prefix = rust_path_components(prefix)?;
+        for leaf in group.split(',') {
+            let leaf = leaf.trim();
+            if leaf.is_empty() || leaf == "self" {
+                return None;
+            }
+            let (path_leaf, local) = if let Some((target, alias)) = leaf.rsplit_once(" as ") {
+                (target.trim(), alias.trim())
+            } else {
+                (leaf, leaf)
+            };
+            if !rust_simple_identifier(path_leaf) || !rust_simple_identifier(local) {
+                return None;
+            }
+            let mut components = prefix.clone();
+            components.push(path_leaf.to_string());
+            leaves.push((local.to_string(), components));
+        }
+    } else {
+        let (path, local) = if let Some((target, alias)) = argument.rsplit_once(" as ") {
+            (target.trim(), alias.trim().to_string())
+        } else {
+            let local = rust_path_components(argument)?.last()?.clone();
+            (argument, local)
+        };
+        if !rust_simple_identifier(&local) {
+            return None;
+        }
+        leaves.push((local, rust_path_components(path)?));
+    }
+    if leaves.is_empty()
+        || leaves.iter().any(|(_, components)| {
+            !matches!(
+                components.first().map(String::as_str),
+                Some("crate" | "self" | "super")
+            )
+        })
+    {
+        return None;
+    }
+    let line = declaration.start_position().row as u32 + 1;
+    let start_column = declaration.start_position().column as u32 + 1;
+    let end_column = declaration.end_position().column as u32 + 1;
+    let mut imports_by_name = HashMap::<String, Vec<NodeId>>::new();
+    for (_, name, node_id) in graph_nodes.imports_in_range(line, start_column, end_column) {
+        imports_by_name
+            .entry(name.clone())
+            .or_default()
+            .push(*node_id);
+    }
+    let mut result = Vec::with_capacity(leaves.len());
+    for (local_name, components) in leaves {
+        let mut matches = imports_by_name.remove(&local_name).unwrap_or_default();
+        matches.sort_unstable();
+        matches.dedup();
+        let [import] = matches.as_slice() else {
+            return None;
+        };
+        result.push(CachedRustUseBinding {
+            module_path: module_path.to_vec(),
+            local_name,
+            components,
+            import: *import,
+        });
+    }
+    Some(result)
+}
+
+fn rust_use_is_renamed(declaration: TsNode<'_>, source: &str) -> bool {
+    node_text(declaration, source).is_some_and(|surface| surface.contains(" as "))
+}
+
+fn rust_use_bound_names(declaration: TsNode<'_>, source: &str) -> Vec<String> {
+    let Some(surface) = node_text(declaration, source) else {
+        return Vec::new();
+    };
+    let surface = surface
+        .trim()
+        .strip_prefix("pub ")
+        .unwrap_or(surface.trim())
+        .strip_prefix("use ")
+        .unwrap_or(surface.trim())
+        .trim_end_matches(';');
+    let mut names = Vec::new();
+    if let Some((_, group)) = surface.split_once("::{") {
+        if let Some(group) = group.strip_suffix('}') {
+            for leaf in group.split(',') {
+                let leaf = leaf.trim();
+                if leaf == "self" || leaf == "*" {
+                    continue;
+                }
+                let local = leaf
+                    .rsplit_once(" as ")
+                    .map_or(leaf, |(_, alias)| alias)
+                    .trim();
+                if rust_simple_identifier(local) {
+                    names.push(local.to_string());
+                }
+            }
+        }
+    } else {
+        let local = surface
+            .rsplit_once(" as ")
+            .map_or_else(
+                || surface.rsplit("::").next().unwrap_or(surface),
+                |(_, alias)| alias,
+            )
+            .trim();
+        if rust_simple_identifier(local) {
+            names.push(local.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn rust_path_components(surface: &str) -> Option<Vec<String>> {
+    let components = surface
+        .split("::")
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!components.is_empty()
+        && components.iter().all(|component| {
+            component == "crate"
+                || component == "self"
+                || component == "super"
+                || rust_simple_identifier(component)
+        }))
+    .then_some(components)
+}
+
+fn rust_simple_identifier(value: &str) -> bool {
+    let value = value.strip_prefix("r#").unwrap_or(value);
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn rust_scoped_call_components(callee: TsNode<'_>, source: &str) -> Option<Vec<String>> {
+    let scoped = callee
+        .parent()
+        .filter(|parent| parent.kind() == "scoped_identifier")?;
+    rust_path_components(node_text(scoped, source)?)
+}
+
+fn rust_field_receiver_name<'a>(callee: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    let field = callee
+        .parent()
+        .filter(|parent| parent.kind() == "field_expression")?;
+    let receiver = field.child_by_field_name("value")?;
+    (receiver.kind() == "identifier")
+        .then(|| node_text(receiver, source))
+        .flatten()
+}
+
+fn rust_collect_lexical_bindings(
+    node: TsNode<'_>,
+    callable_start: usize,
+    scope: RustLexicalScope,
+    source: &str,
+    output: &mut HashMap<String, Vec<RustLexicalBinding>>,
+) {
+    if node.kind() == "assignment_expression" || node.kind() == "compound_assignment_expr" {
+        if let Some(left) = node.child_by_field_name("left")
+            && left.kind() == "identifier"
+            && let Some(name) = node_text(left, source)
+        {
+            rust_push_lexical_binding(
+                output,
+                name,
+                node.start_byte(),
+                scope,
+                None,
+                false,
+                false,
+                None,
+            );
+        }
+        return;
+    }
+    let pattern = match node.kind() {
+        "parameter" | "let_declaration" | "let_condition" | "for_expression" | "match_arm" => {
+            node.child_by_field_name("pattern")
+        }
+        "const_parameter" => node.child_by_field_name("name"),
+        "closure_parameters" => Some(node),
+        "function_item" | "const_item" | "static_item" | "struct_item" => {
+            node.child_by_field_name("name")
+        }
+        "use_declaration" => node.child_by_field_name("argument"),
+        _ => None,
+    };
+    let Some(pattern) = pattern else {
+        return;
+    };
+    let mut names = if matches!(
+        node.kind(),
+        "function_item" | "const_item" | "static_item" | "struct_item"
+    ) {
+        node_text(pattern, source)
+            .map(|name| vec![name.to_string()])
+            .unwrap_or_default()
+    } else if node.kind() == "use_declaration" {
+        rust_use_bound_names(node, source)
+    } else {
+        let mut names = Vec::new();
+        rust_pattern_names(pattern, source, &mut names);
+        names
+    };
+    names.sort();
+    names.dedup();
+    let receiver = if names.len() == 1 && matches!(node.kind(), "parameter" | "let_declaration") {
+        rust_receiver_binding(node, source)
+    } else {
+        None
+    };
+    for name in names {
+        let (owner, constructor, constructor_record, constructor_method) = receiver
+            .as_ref()
+            .map(|receiver| {
+                (
+                    Some(receiver.0.clone()),
+                    receiver.1,
+                    receiver.2,
+                    receiver.3.clone(),
+                )
+            })
+            .unwrap_or((None, false, false, None));
+        let start_byte = match node.kind() {
+            "parameter" | "const_parameter" => callable_start,
+            "for_expression" => node
+                .child_by_field_name("body")
+                .map_or(node.start_byte(), |body| body.start_byte()),
+            "match_arm" => node.start_byte(),
+            "function_item" | "const_item" | "static_item" | "struct_item" | "use_declaration" => {
+                scope.start_byte
+            }
+            _ => node.end_byte(),
+        };
+        rust_push_lexical_binding(
+            output,
+            &name,
+            start_byte,
+            scope,
+            owner,
+            constructor,
+            constructor_record,
+            constructor_method,
+        );
+    }
+}
+
+fn rust_pattern_names(node: TsNode<'_>, source: &str, output: &mut Vec<String>) {
+    if matches!(node.kind(), "identifier" | "shorthand_field_identifier") {
+        if let Some(name) = node_text(node, source) {
+            output.push(name.to_string());
+        }
+        return;
+    }
+    if matches!(node.kind(), "type_identifier" | "primitive_type") {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        rust_pattern_names(child, source, output);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rust_push_lexical_binding(
+    output: &mut HashMap<String, Vec<RustLexicalBinding>>,
+    name: &str,
+    start_byte: usize,
+    scope: RustLexicalScope,
+    receiver_owner: Option<String>,
+    constructor: bool,
+    constructor_record: bool,
+    constructor_method: Option<String>,
+) {
+    output
+        .entry(name.to_string())
+        .or_default()
+        .push(RustLexicalBinding {
+            start_byte,
+            scope_start: scope.start_byte,
+            scope_end: scope.end_byte,
+            scope_depth: scope.depth,
+            receiver_owner,
+            constructor,
+            constructor_record,
+            constructor_method,
+        });
+}
+
+fn rust_node_starts_lexical_scope(node: TsNode<'_>) -> bool {
+    matches!(
+        node.kind(),
+        "block"
+            | "for_expression"
+            | "if_expression"
+            | "while_expression"
+            | "match_arm"
+            | "closure_expression"
     )
+}
+
+fn rust_receiver_binding(
+    binding: TsNode<'_>,
+    source: &str,
+) -> Option<(String, bool, bool, Option<String>)> {
+    if let Some(type_node) = binding.child_by_field_name("type") {
+        let owner = rust_exact_type_owner(node_text(type_node, source)?)?;
+        return Some((owner, false, false, None));
+    }
+    let value = binding.child_by_field_name("value")?;
+    if value.kind() == "identifier" {
+        let owner = node_text(value, source)?;
+        return rust_simple_identifier(owner).then(|| (owner.to_string(), true, false, None));
+    }
+    if value.kind() == "struct_expression" {
+        let name = value.child_by_field_name("name")?;
+        let owner = node_text(name, source)?;
+        return rust_simple_identifier(owner).then(|| (owner.to_string(), true, true, None));
+    }
+    if value.kind() == "call_expression" {
+        let function = value.child_by_field_name("function")?;
+        if function.kind() != "scoped_identifier" {
+            return None;
+        }
+        let components = rust_path_components(node_text(function, source)?)?;
+        let [owner, method] = components.as_slice() else {
+            return None;
+        };
+        return Some((owner.clone(), true, false, Some(method.clone())));
+    }
+    None
+}
+
+fn rust_exact_type_owner(surface: &str) -> Option<String> {
+    let mut surface = surface.trim();
+    loop {
+        if surface.starts_with('(') && surface.ends_with(')') {
+            surface = surface.get(1..surface.len().checked_sub(1)?)?.trim();
+            continue;
+        }
+        if let Some(rest) = surface.strip_prefix("&mut ") {
+            surface = rest.trim();
+            continue;
+        }
+        if let Some(rest) = surface.strip_prefix('&') {
+            surface = rest.trim();
+            continue;
+        }
+        break;
+    }
+    rust_simple_identifier(surface).then(|| surface.to_string())
 }
 
 fn node_text<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
     node.utf8_text(source.as_bytes()).ok()
 }
 
-fn enclosing_ancestor<'tree>(mut node: TsNode<'tree>, kinds: &[&str]) -> Option<TsNode<'tree>> {
-    while let Some(parent) = node.parent() {
-        if kinds.contains(&parent.kind()) {
-            return Some(parent);
-        }
-        node = parent;
-    }
-    None
-}
-
 fn declaration_name<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
     node.child_by_field_name("name")
         .and_then(|name| node_text(name, source))
-}
-
-fn map_callable_declaration(
-    nodes: &[Node],
-    file_id: NodeId,
-    declaration: TsNode<'_>,
-    source: &str,
-) -> Option<NodeId> {
-    let name = if declaration.kind() == "arrow_function" {
-        crate::js_like_callable_source_name(declaration, source)?
-    } else {
-        declaration_name(declaration, source)?.to_string()
-    };
-    let line = declaration.start_position().row as u32 + 1;
-    let matches = nodes
-        .iter()
-        .filter(|node| {
-            node.file_node_id == Some(file_id)
-                && matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-                && node.start_line == Some(line)
-                && graph_leaf_name(&node.serialized_name) == name
-        })
-        .map(|node| node.id)
-        .collect::<Vec<_>>();
-    (matches.len() == 1).then_some(matches[0])
 }
 
 fn graph_leaf_name(name: &str) -> &str {
@@ -1821,61 +3382,16 @@ fn graph_leaf_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-fn top_level_rust_functions(root: TsNode<'_>) -> Vec<TsNode<'_>> {
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor)
-        .filter(|child| child.kind() == "function_item")
-        .collect()
-}
-
 fn typescript_file_is_module(root: TsNode<'_>) -> bool {
     let mut cursor = root.walk();
     root.named_children(&mut cursor)
         .any(|child| matches!(child.kind(), "import_statement" | "export_statement"))
 }
 
-fn rust_callable_is_in_root_module(callable: TsNode<'_>) -> bool {
-    match callable.parent().map(|parent| parent.kind()) {
-        Some("source_file") => true,
-        Some("declaration_list") => callable
-            .parent()
-            .and_then(|body| body.parent())
-            .is_some_and(|owner| {
-                owner.kind() == "impl_item"
-                    && owner
-                        .parent()
-                        .is_some_and(|parent| parent.kind() == "source_file")
-            }),
-        _ => false,
-    }
-}
-
 fn contains_node_kind(root: TsNode<'_>, kind: &str) -> bool {
     let mut found = false;
     walk_nodes(root, &mut |node| found |= node.kind() == kind);
     found
-}
-
-fn rust_file_has_item_domain_macro_invocation(root: TsNode<'_>) -> bool {
-    let mut found = false;
-    walk_nodes(root, &mut |node| {
-        if found || node.kind() != "macro_invocation" {
-            return;
-        }
-        let mut ancestor = node.parent();
-        while let Some(current) = ancestor {
-            if current.kind() == "function_item" {
-                return;
-            }
-            ancestor = current.parent();
-        }
-        found = true;
-    });
-    found
-}
-
-fn rust_file_has_attribute_domain(root: TsNode<'_>) -> bool {
-    contains_node_kind(root, "attribute_item") || contains_node_kind(root, "inner_attribute_item")
 }
 
 fn direct_impl_functions(impl_item: TsNode<'_>) -> Vec<TsNode<'_>> {
@@ -1886,28 +3402,6 @@ fn direct_impl_functions(impl_item: TsNode<'_>) -> Vec<TsNode<'_>> {
     body.named_children(&mut cursor)
         .filter(|child| child.kind() == "function_item")
         .collect()
-}
-
-fn collect_simple_inherent_method_nodes<'tree, 'source>(
-    root: TsNode<'tree>,
-    source: &'source str,
-) -> Vec<(&'source str, TsNode<'tree>)> {
-    let mut methods = Vec::new();
-    let mut cursor = root.walk();
-    for item in root.named_children(&mut cursor) {
-        if item.kind() != "impl_item" {
-            continue;
-        }
-        let Some(owner) = simple_inherent_impl_owner(item, source) else {
-            continue;
-        };
-        methods.extend(
-            direct_impl_functions(item)
-                .into_iter()
-                .map(|method| (owner, method)),
-        );
-    }
-    methods
 }
 
 fn simple_inherent_impl_owner<'a>(impl_item: TsNode<'_>, source: &'a str) -> Option<&'a str> {
@@ -1928,67 +3422,42 @@ fn simple_inherent_impl_owner<'a>(impl_item: TsNode<'_>, source: &'a str) -> Opt
     Some(owner)
 }
 
-fn callable_has_shadow_or_write(
-    language: &str,
-    callable: TsNode<'_>,
-    callee: TsNode<'_>,
-    name: &str,
+fn rust_inherent_impl_owner_domain(
+    impl_item: TsNode<'_>,
+    module_path: &[String],
     source: &str,
-) -> bool {
-    let mut found = false;
-    walk_nodes(callable, &mut |node| {
-        if found || node.id() == callee.id() {
-            return;
+) -> Option<(Vec<String>, String)> {
+    let header = node_text(impl_item, source)?.split_once('{')?.0;
+    if header.contains(" for ") {
+        return None;
+    }
+    let owner = impl_item.child_by_field_name("type")?;
+    let owner = node_text(owner, source)?;
+    if rust_simple_identifier(owner) {
+        return Some((module_path.to_vec(), owner.to_string()));
+    }
+    let components = rust_path_components(owner)?;
+    let (owner, path) = components.split_last()?;
+    let mut resolved = module_path.to_vec();
+    let mut path = path.iter();
+    match path.next()?.as_str() {
+        "crate" => resolved.clear(),
+        "self" => {}
+        "super" => {
+            resolved.pop()?;
         }
-        let write_target = match language {
-            "rust" => rust_write_target(node),
-            _ => typescript_write_target(node),
-        };
-        if let Some(target) = write_target {
-            found = target
-                .map(|target| subtree_binds(target, name, source))
-                .unwrap_or(true);
-            if found {
-                return;
+        _ => return None,
+    }
+    for component in path {
+        match component.as_str() {
+            "super" => {
+                resolved.pop()?;
             }
+            "self" | "crate" => return None,
+            _ => resolved.push(component.clone()),
         }
-        let binding_regions = match language {
-            "rust" => rust_binding_regions(node),
-            _ => typescript_binding_regions(node),
-        };
-        match binding_regions {
-            Err(()) => found = true,
-            Ok(Some(regions)) => {
-                let binds_outer_callable = node.id() != callable.id()
-                    || !matches!(node.kind(), "function_item" | "function_declaration");
-                if binds_outer_callable
-                    && regions
-                        .into_iter()
-                        .any(|region| subtree_binds(region, name, source))
-                {
-                    found = true;
-                }
-            }
-            Ok(None) => {}
-        }
-    });
-    found
-}
-
-fn rust_root_has_competing_value_binding(root: TsNode<'_>, name: &str, source: &str) -> bool {
-    let mut cursor = root.walk();
-    root.named_children(&mut cursor).any(|node| {
-        if node.kind() == "function_item" {
-            return false;
-        }
-        match rust_binding_regions(node) {
-            Err(()) => true,
-            Ok(Some(regions)) => regions
-                .into_iter()
-                .any(|region| subtree_binds(region, name, source)),
-            Ok(None) => false,
-        }
-    })
+    }
+    Some((resolved, owner.clone()))
 }
 
 fn typescript_write_target(node: TsNode<'_>) -> Option<Option<TsNode<'_>>> {
@@ -2000,94 +3469,6 @@ fn typescript_write_target(node: TsNode<'_>) -> Option<Option<TsNode<'_>>> {
         "for_in_statement" => Some(node.child_by_field_name("left")),
         _ => None,
     }
-}
-
-fn rust_write_target(node: TsNode<'_>) -> Option<Option<TsNode<'_>>> {
-    match node.kind() {
-        "assignment_expression" | "compound_assignment_expr" => {
-            Some(node.child_by_field_name("left"))
-        }
-        _ => None,
-    }
-}
-
-fn typescript_binding_regions(node: TsNode<'_>) -> Result<Option<Vec<TsNode<'_>>>, ()> {
-    let required = |field| {
-        node.child_by_field_name(field)
-            .map(|child| vec![child])
-            .ok_or(())
-    };
-    let optional = |field| {
-        Ok(node
-            .child_by_field_name(field)
-            .into_iter()
-            .collect::<Vec<_>>())
-    };
-    let one_of = |fields: &[&str]| {
-        let regions = fields
-            .iter()
-            .filter_map(|field| node.child_by_field_name(field))
-            .collect::<Vec<_>>();
-        (!regions.is_empty()).then_some(regions).ok_or(())
-    };
-    match node.kind() {
-        "variable_declarator" => required("name").map(Some),
-        "required_parameter" | "optional_parameter" => one_of(&["name", "pattern"]).map(Some),
-        "arrow_function" => one_of(&["parameter", "parameters"]).map(Some),
-        "formal_parameters" | "rest_pattern" => Ok(Some(vec![node])),
-        "catch_clause" => optional("parameter").map(Some),
-        "function_declaration"
-        | "generator_function_declaration"
-        | "function_signature"
-        | "class_declaration"
-        | "abstract_class_declaration"
-        | "enum_declaration"
-        | "internal_module"
-        | "module" => required("name").map(Some),
-        "function_expression" | "generator_function" | "class" => optional("name").map(Some),
-        "import_statement" => Ok(Some(vec![node])),
-        _ => Ok(None),
-    }
-}
-
-fn rust_binding_regions(node: TsNode<'_>) -> Result<Option<Vec<TsNode<'_>>>, ()> {
-    let required = |field| {
-        node.child_by_field_name(field)
-            .map(|child| vec![child])
-            .ok_or(())
-    };
-    let optional = |field| {
-        Ok(node
-            .child_by_field_name(field)
-            .into_iter()
-            .collect::<Vec<_>>())
-    };
-    match node.kind() {
-        "parameter" => required("pattern").map(Some),
-        "variadic_parameter" => optional("pattern").map(Some),
-        "closure_parameters" => Ok(Some(vec![node])),
-        "let_declaration" | "let_condition" | "for_expression" | "match_arm" => {
-            required("pattern").map(Some)
-        }
-        "function_item" | "const_item" | "const_parameter" | "static_item" | "struct_item"
-        | "enum_variant" => required("name").map(Some),
-        "use_declaration" => required("argument").map(Some),
-        _ => Ok(None),
-    }
-}
-
-fn subtree_binds(node: TsNode<'_>, name: &str, source: &str) -> bool {
-    let mut found = false;
-    walk_nodes(node, &mut |child| {
-        if matches!(
-            child.kind(),
-            "identifier" | "type_identifier" | "shorthand_property_identifier_pattern"
-        ) && node_text(child, source) == Some(name)
-        {
-            found = true;
-        }
-    });
-    found
 }
 
 fn walk_nodes<'tree>(node: TsNode<'tree>, visit: &mut impl FnMut(TsNode<'tree>)) {
@@ -2247,53 +3628,6 @@ fn export_statement_has_default_token(statement: TsNode<'_>) -> Option<bool> {
     (defaults <= 1).then_some(defaults == 1)
 }
 
-fn collect_top_level_declarations(
-    tree: &Tree,
-    source: &str,
-    language: &str,
-    file_id: NodeId,
-    nodes: &[Node],
-) -> Option<Vec<CachedTopLevelDeclaration>> {
-    debug_assert_eq!(language, "rust");
-    let declarations = top_level_rust_functions(tree.root_node());
-    let mut result = Vec::with_capacity(declarations.len());
-    for declaration in declarations {
-        let name = declaration_name(declaration, source)?.to_string();
-        let declaration = map_callable_declaration(nodes, file_id, declaration, source)?;
-        result.push(CachedTopLevelDeclaration { name, declaration });
-    }
-    result.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then(left.declaration.cmp(&right.declaration))
-    });
-    Some(result)
-}
-
-fn collect_rust_inherent_methods(
-    tree: &Tree,
-    source: &str,
-    file_id: NodeId,
-    nodes: &[Node],
-) -> Option<Vec<CachedInherentMethod>> {
-    let methods = collect_simple_inherent_method_nodes(tree.root_node(), source);
-    let mut result = Vec::with_capacity(methods.len());
-    for (owner_name, method) in methods {
-        result.push(CachedInherentMethod {
-            owner_name: owner_name.to_string(),
-            method_name: declaration_name(method, source)?.to_string(),
-            declaration: map_callable_declaration(nodes, file_id, method, source)?,
-        });
-    }
-    result.sort_by(|left, right| {
-        left.owner_name
-            .cmp(&right.owner_name)
-            .then(left.method_name.cmp(&right.method_name))
-            .then(left.declaration.cmp(&right.declaration))
-    });
-    Some(result)
-}
-
 struct ResolutionCacheRecord {
     path: PathBuf,
     file: CachedResolutionFile,
@@ -2375,7 +3709,7 @@ pub fn rematerialize_proof_resolution_projection(
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
     let edges = store.get_edges()?;
-    let exact_evidence_validation = ExactEvidenceValidationIndex::prepare(&edges);
+    let exact_evidence_validation = ExactEvidenceValidationIndex::prepare(&edges, &node_by_id);
     let governed = files
         .iter()
         .filter(|file| file.indexed && is_installed_language(&file.language))
@@ -2568,10 +3902,17 @@ pub fn rematerialize_proof_resolution_projection(
         .iter()
         .map(|record| (record.file.file_id.0, record))
         .collect::<HashMap<_, _>>();
+    let rust_projection_index = RustProjectionIndex::prepare(&records)?;
     let mut claims = inputs
         .into_iter()
         .map(|(source_record, input)| {
-            resolve_syntax_claim(&file_by_id, &record_by_path, &records, source_record, input)
+            resolve_syntax_claim(
+                &file_by_id,
+                &record_by_path,
+                &rust_projection_index,
+                source_record,
+                input,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     enforce_exact_dependency_eligibility(
@@ -2788,33 +4129,110 @@ struct ResolvedSyntaxClaim {
     exact_node_file_expectations: Vec<(NodeId, FileId)>,
 }
 
+#[derive(Default)]
+struct ProofRelationState {
+    admissible: usize,
+    conflicting: usize,
+}
+
+impl ProofRelationState {
+    fn is_unique(&self) -> bool {
+        self.admissible == 1 && self.conflicting == 0
+    }
+}
+
 struct ExactEvidenceValidationIndex {
-    import_relation_counts: HashMap<(NodeId, NodeId, NodeId), usize>,
-    member_relation_counts: HashMap<(NodeId, NodeId), usize>,
+    import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
+    member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
 }
 
 impl ExactEvidenceValidationIndex {
-    fn prepare(edges: &[Edge]) -> Self {
-        let mut import_relation_counts = HashMap::new();
-        let mut member_relation_counts = HashMap::new();
+    fn prepare(edges: &[Edge], nodes: &HashMap<NodeId, &Node>) -> Self {
+        let mut import_relations = HashMap::<_, ProofRelationState>::new();
+        let mut member_relations = HashMap::<_, ProofRelationState>::new();
         for edge in edges {
             if edge.kind == EdgeKind::IMPORT
                 && let (Some(file_id), Some(target)) = (edge.file_node_id, edge.resolved_target)
             {
-                *import_relation_counts
+                let admissible = edge.effective_source() == edge.source
+                    && edge.effective_target() == target
+                    && edge.candidate_targets.is_empty()
+                    && nodes.get(&edge.source).is_some_and(|node| {
+                        matches!(node.kind, NodeKind::MODULE | NodeKind::UNKNOWN)
+                            && node.file_node_id == Some(file_id)
+                    })
+                    && nodes.get(&target).is_some_and(|node| {
+                        matches!(
+                            node.kind,
+                            NodeKind::FUNCTION
+                                | NodeKind::METHOD
+                                | NodeKind::STRUCT
+                                | NodeKind::CLASS
+                                | NodeKind::ENUM
+                        ) && node.file_node_id.is_some()
+                    });
+                let state = import_relations
                     .entry((file_id, edge.source, target))
-                    .or_default() += 1;
+                    .or_default();
+                if admissible {
+                    state.admissible += 1;
+                } else {
+                    state.conflicting += 1;
+                }
             }
             if edge.kind == EdgeKind::MEMBER {
-                *member_relation_counts
-                    .entry((edge.effective_source(), edge.effective_target()))
-                    .or_default() += 1;
+                let owner = nodes.get(&edge.source);
+                let member = nodes.get(&edge.target);
+                let admissible = edge.effective_source() == edge.source
+                    && edge.effective_target() == edge.target
+                    && edge.candidate_targets.is_empty()
+                    && owner.is_some_and(|owner| {
+                        matches!(
+                            (owner.kind, member.map(|member| member.kind)),
+                            (
+                                NodeKind::MODULE,
+                                Some(
+                                    NodeKind::MODULE
+                                        | NodeKind::FUNCTION
+                                        | NodeKind::STRUCT
+                                        | NodeKind::CLASS
+                                        | NodeKind::ENUM
+                                )
+                            ) | (
+                                NodeKind::STRUCT | NodeKind::CLASS | NodeKind::ENUM,
+                                Some(NodeKind::METHOD)
+                            )
+                        )
+                    })
+                    && member.is_some_and(|member| {
+                        member.file_node_id.is_some() && edge.file_node_id == member.file_node_id
+                    });
+                let state = member_relations
+                    .entry((edge.source, edge.target))
+                    .or_default();
+                if admissible {
+                    state.admissible += 1;
+                } else {
+                    state.conflicting += 1;
+                }
             }
         }
         Self {
-            import_relation_counts,
-            member_relation_counts,
+            import_relations,
+            member_relations,
         }
+    }
+
+    fn has_import(&self, file: NodeId, import: NodeId, target: NodeId) -> bool {
+        self.import_relations
+            .get(&(file, import, target))
+            .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn has_member(&self, owner: NodeId, member: NodeId) -> bool {
+        self.member_relations
+            .get(&(owner, member))
+            .is_some_and(ProofRelationState::is_unique)
     }
 
     fn claim_has_literal_corroboration(
@@ -2828,6 +4246,16 @@ impl ExactEvidenceValidationIndex {
         let Some(target_node) = nodes.get(&target) else {
             return false;
         };
+        if claim.evidence_chain.iter().any(|evidence| {
+            let ResolutionEvidence::StaticImportBinding { import, .. } = evidence else {
+                return false;
+            };
+            nodes.get(import).is_none_or(|node| {
+                !proof_import_node_kind_is_literal(&claim.input.language, node.kind)
+            })
+        }) {
+            return false;
+        }
         let source_file = NodeId(claim.input.callsite.file_id.0);
         match (
             claim.input.callsite.callee_form,
@@ -2851,11 +4279,31 @@ impl ExactEvidenceValidationIndex {
                             && graph_leaf_name(&import_node.serialized_name)
                                 == claim.input.callsite.raw_target
                     })
-                    && self
-                        .import_relation_counts
-                        .get(&(source_file, *import, target))
-                        .copied()
-                        == Some(1)
+                    && self.has_import(source_file, *import, target)
+            }
+            (
+                CalleeForm::NamedImport,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration,
+                    },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) => {
+                *declaration == target
+                    && components.last() == Some(&target)
+                    && components.len() >= 2
+                    && nodes.get(import).is_some_and(|import_node| {
+                        import_node.kind == NodeKind::MODULE
+                            && import_node.file_node_id == Some(source_file)
+                            && graph_leaf_name(&import_node.serialized_name)
+                                == claim.input.callsite.raw_target
+                    })
+                    && self.has_import(source_file, *import, target)
+                    && components
+                        .windows(2)
+                        .all(|pair| self.has_member(pair[0], pair[1]))
             }
             (
                 CalleeForm::ImplicitReceiver,
@@ -2868,15 +4316,70 @@ impl ExactEvidenceValidationIndex {
                     && target_node.kind == NodeKind::METHOD
                     && target_node.file_node_id == Some(source_file)
                     && nodes.get(owner).is_some_and(|owner_node| {
-                        matches!(owner_node.kind, NodeKind::STRUCT | NodeKind::CLASS)
-                            && owner_node.file_node_id == Some(source_file)
+                        matches!(
+                            owner_node.kind,
+                            NodeKind::STRUCT | NodeKind::CLASS | NodeKind::ENUM
+                        ) && owner_node.file_node_id == Some(source_file)
                     })
-                    && self
-                        .member_relation_counts
-                        .get(&(*owner, claim.caller))
-                        .copied()
-                        == Some(1)
-                    && self.member_relation_counts.get(&(*owner, target)).copied() == Some(1)
+                    && self.has_member(*owner, claim.caller)
+                    && self.has_member(*owner, target)
+            }
+            (
+                CalleeForm::ImplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: imported_owner,
+                    },
+                    ResolutionEvidence::ImplicitReceiver { owner },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) => {
+                *imported_owner == *owner
+                    && *declaration == target
+                    && target_node.kind == NodeKind::METHOD
+                    && target_node.file_node_id == Some(source_file)
+                    && nodes.get(import).is_some_and(|node| {
+                        node.kind == NodeKind::MODULE && node.file_node_id == Some(source_file)
+                    })
+                    && nodes.get(owner).is_some_and(|node| {
+                        matches!(node.kind, NodeKind::STRUCT | NodeKind::ENUM)
+                            && node.file_node_id.is_some()
+                            && node.file_node_id != Some(source_file)
+                    })
+                    && nodes.get(&claim.caller).is_some_and(|node| {
+                        node.kind == NodeKind::METHOD && node.file_node_id == Some(source_file)
+                    })
+                    && self.has_import(source_file, *import, *owner)
+                    && self.has_member(*owner, claim.caller)
+                    && self.has_member(*owner, target)
+            }
+            (CalleeForm::QualifiedPath, [ResolutionEvidence::QualifiedPath { components }]) => {
+                components.last() == Some(&target)
+                    && components.len() >= 2
+                    && components
+                        .windows(2)
+                        .all(|pair| self.has_member(pair[0], pair[1]))
+            }
+            (
+                CalleeForm::QualifiedPath,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) => {
+                components.first() == Some(owner)
+                    && components.last() == Some(&target)
+                    && nodes
+                        .get(import)
+                        .is_some_and(|node| node.file_node_id == Some(source_file))
+                    && self.has_import(source_file, *import, *owner)
+                    && components
+                        .windows(2)
+                        .all(|pair| self.has_member(pair[0], pair[1]))
             }
             (
                 CalleeForm::ExplicitReceiver,
@@ -2907,6 +4410,49 @@ impl ExactEvidenceValidationIndex {
                 target_node,
                 nodes,
             ),
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) if *owner == *constructor
+                && *owner == *receiver_type
+                && components.as_slice() == [*owner, target] =>
+            {
+                self.imported_receiver_is_correlated(
+                    source_file,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                    nodes,
+                )
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) if *owner == *receiver_type && components.as_slice() == [*owner, target] => self
+                .imported_receiver_is_correlated(
+                    source_file,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                    nodes,
+                ),
             (
                 CalleeForm::ExplicitReceiver,
                 [
@@ -2963,11 +4509,13 @@ impl ExactEvidenceValidationIndex {
         declaration == target
             && target_node.kind == NodeKind::METHOD
             && nodes.get(&owner).is_some_and(|owner_node| {
-                owner_node.kind == NodeKind::CLASS
-                    && owner_node.file_node_id == Some(source_file)
+                matches!(
+                    owner_node.kind,
+                    NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+                ) && owner_node.file_node_id == Some(source_file)
                     && owner_node.file_node_id == target_node.file_node_id
             })
-            && self.member_relation_counts.get(&(owner, target)).copied() == Some(1)
+            && self.has_member(owner, target)
     }
 
     fn imported_receiver_is_correlated(
@@ -2984,15 +4532,23 @@ impl ExactEvidenceValidationIndex {
                 .get(&import)
                 .is_some_and(|import_node| import_node.file_node_id == Some(source_file))
             && nodes.get(&owner).is_some_and(|owner_node| {
-                owner_node.kind == NodeKind::CLASS
-                    && owner_node.file_node_id == target_node.file_node_id
+                matches!(
+                    owner_node.kind,
+                    NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+                ) && owner_node.file_node_id == target_node.file_node_id
             })
-            && self
-                .import_relation_counts
-                .get(&(source_file, import, owner))
-                .copied()
-                == Some(1)
-            && self.member_relation_counts.get(&(owner, target)).copied() == Some(1)
+            && self.has_import(source_file, import, owner)
+            && self.has_member(owner, target)
+    }
+}
+
+fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
+    match language {
+        "rust" => kind == NodeKind::MODULE,
+        "javascript" | "typescript" | "tsx" => {
+            matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
+        }
+        _ => false,
     }
 }
 
@@ -3014,10 +4570,831 @@ fn enforce_exact_evidence_corroboration(
     }
 }
 
+enum RustPathResolution {
+    Function {
+        target: NodeId,
+        target_file: FileId,
+        path_components: Vec<NodeId>,
+    },
+    Associated {
+        owner: NodeId,
+        owner_file: FileId,
+        target: NodeId,
+        target_file: FileId,
+    },
+    Missing,
+    Ambiguous,
+    Incomplete,
+    Unsupported,
+}
+
+enum RustReceiverResolution {
+    Exact {
+        owner: NodeId,
+        owner_file: FileId,
+        declaration: NodeId,
+        declaration_file: FileId,
+    },
+    Missing,
+    Ambiguous,
+    Incomplete,
+    Unsupported,
+}
+
+enum RustImplicitReceiverResolution {
+    Exact {
+        owner: NodeId,
+        owner_file: FileId,
+        declaration: NodeId,
+    },
+    Missing,
+    Ambiguous,
+    Incomplete,
+    Unsupported,
+}
+
+#[derive(Clone)]
+struct RustModuleMatch<'a> {
+    record: &'a ResolutionCacheRecord,
+    relative_module: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RustRecordOrigin {
+    root: PathBuf,
+    base_module: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RustParentClaim {
+    parent_file_id: i64,
+    relative_child_module: Vec<String>,
+}
+
+struct RustProjectionIndex<'a> {
+    origins: HashMap<i64, RustRecordOrigin>,
+    modules: HashMap<(PathBuf, Vec<String>), Vec<RustModuleMatch<'a>>>,
+    module_declarations: HashMap<(PathBuf, Vec<String>), Vec<NodeId>>,
+    node_files: HashMap<NodeId, i64>,
+    module_inputs: HashMap<(i64, Vec<String>), &'a CachedRustModule>,
+    declarations: HashMap<(i64, Vec<String>, String), Vec<&'a CachedTopLevelDeclaration>>,
+    types: HashMap<(i64, Vec<String>, String), Vec<&'a CachedRustType>>,
+    methods: HashMap<(i64, Vec<String>, String, String), Vec<&'a CachedInherentMethod>>,
+}
+
+impl<'a> RustProjectionIndex<'a> {
+    fn prepare(records: &'a [ResolutionCacheRecord]) -> Result<Self> {
+        let rust_records = records
+            .iter()
+            .filter(|record| record.file.language == "rust")
+            .collect::<Vec<_>>();
+        let record_by_id = rust_records
+            .iter()
+            .map(|record| (record.file.file_id.0, *record))
+            .collect::<HashMap<_, _>>();
+        let mut record_by_identity = HashMap::new();
+        for record in &rust_records {
+            count_rust_resolution_work(1);
+            record_by_identity.insert(workspace_path_identity(&record.path)?, *record);
+        }
+        let mut roots = HashMap::<PathBuf, Vec<&ResolutionCacheRecord>>::new();
+        for record in &rust_records {
+            count_rust_resolution_work(1);
+            if matches!(
+                record.path.file_name().and_then(|name| name.to_str()),
+                Some("lib.rs" | "main.rs")
+            ) && let Some(root) = record.path.parent()
+            {
+                roots.entry(root.to_path_buf()).or_default().push(record);
+            }
+        }
+        let valid_roots = roots
+            .into_iter()
+            .filter_map(|(root, records)| {
+                let [record] = records.as_slice() else {
+                    return None;
+                };
+                Some((record.file.file_id.0, root))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut parent_claims = HashMap::<i64, Vec<RustParentClaim>>::new();
+        for parent in &rust_records {
+            count_rust_resolution_work(1);
+            for module in &parent.file.rust_modules {
+                count_rust_resolution_work(1);
+                for child in &module.file_children {
+                    count_rust_resolution_work(1);
+                    let candidates = standard_rust_module_candidates(
+                        &parent.path,
+                        &module.module_path,
+                        &child.name,
+                    );
+                    let mut matches = Vec::new();
+                    for candidate in candidates {
+                        count_rust_resolution_work(1);
+                        if let Ok(identity) = workspace_path_identity(&candidate)
+                            && let Some(record) = record_by_identity.get(&identity)
+                        {
+                            matches.push(*record);
+                        }
+                    }
+                    matches.sort_by_key(|record| record.file.file_id);
+                    matches.dedup_by_key(|record| record.file.file_id);
+                    let [record] = matches.as_slice() else {
+                        continue;
+                    };
+                    let mut relative_child_module = module.module_path.clone();
+                    relative_child_module.push(child.name.clone());
+                    parent_claims
+                        .entry(record.file.file_id.0)
+                        .or_default()
+                        .push(RustParentClaim {
+                            parent_file_id: parent.file.file_id.0,
+                            relative_child_module,
+                        });
+                }
+            }
+        }
+        let mut origins = HashMap::<i64, Option<RustRecordOrigin>>::new();
+        let mut visiting = HashSet::new();
+        for record in &rust_records {
+            count_rust_resolution_work(1);
+            resolve_rust_record_origin(
+                record.file.file_id.0,
+                &record_by_id,
+                &valid_roots,
+                &parent_claims,
+                &mut origins,
+                &mut visiting,
+            );
+        }
+        let origins = origins
+            .into_iter()
+            .filter_map(|(file_id, origin)| origin.map(|origin| (file_id, origin)))
+            .collect::<HashMap<_, _>>();
+        let mut modules = HashMap::<(PathBuf, Vec<String>), Vec<RustModuleMatch<'a>>>::new();
+        let mut module_declarations = HashMap::<(PathBuf, Vec<String>), Vec<NodeId>>::new();
+        let mut node_files = HashMap::new();
+        let mut module_inputs = HashMap::new();
+        let mut declarations = HashMap::<_, Vec<_>>::new();
+        let mut types = HashMap::<_, Vec<_>>::new();
+        let mut methods = HashMap::<_, Vec<_>>::new();
+        for record in rust_records {
+            count_rust_resolution_work(1);
+            let Some(origin) = origins.get(&record.file.file_id.0) else {
+                continue;
+            };
+            for module in &record.file.rust_modules {
+                count_rust_resolution_work(1);
+                module_inputs.insert((record.file.file_id.0, module.module_path.clone()), module);
+                let mut absolute = origin.base_module.clone();
+                absolute.extend(module.module_path.clone());
+                modules
+                    .entry((origin.root.clone(), absolute.clone()))
+                    .or_default()
+                    .push(RustModuleMatch {
+                        record,
+                        relative_module: module.module_path.clone(),
+                    });
+                if let Some(declaration) = module.declaration {
+                    node_files.insert(declaration, record.file.file_id.0);
+                    module_declarations
+                        .entry((origin.root.clone(), absolute.clone()))
+                        .or_default()
+                        .push(declaration);
+                }
+                for child in &module.file_children {
+                    count_rust_resolution_work(1);
+                    node_files.insert(child.declaration, record.file.file_id.0);
+                    let mut child_path = absolute.clone();
+                    child_path.push(child.name.clone());
+                    module_declarations
+                        .entry((origin.root.clone(), child_path))
+                        .or_default()
+                        .push(child.declaration);
+                }
+            }
+            for declaration in &record.file.top_level_declarations {
+                count_rust_resolution_work(1);
+                node_files.insert(declaration.declaration, record.file.file_id.0);
+                declarations
+                    .entry((
+                        record.file.file_id.0,
+                        declaration.module_path.clone(),
+                        declaration.name.clone(),
+                    ))
+                    .or_default()
+                    .push(declaration);
+            }
+            for rust_type in &record.file.rust_types {
+                count_rust_resolution_work(1);
+                node_files.insert(rust_type.declaration, record.file.file_id.0);
+                types
+                    .entry((
+                        record.file.file_id.0,
+                        rust_type.module_path.clone(),
+                        rust_type.name.clone(),
+                    ))
+                    .or_default()
+                    .push(rust_type);
+            }
+            for method in &record.file.inherent_methods {
+                count_rust_resolution_work(1);
+                node_files.insert(method.declaration, record.file.file_id.0);
+                methods
+                    .entry((
+                        record.file.file_id.0,
+                        method.module_path.clone(),
+                        method.owner_name.clone(),
+                        method.method_name.clone(),
+                    ))
+                    .or_default()
+                    .push(method);
+            }
+            for import in &record.file.rust_uses {
+                count_rust_resolution_work(1);
+                node_files.insert(import.import, record.file.file_id.0);
+            }
+        }
+        Ok(Self {
+            origins,
+            modules,
+            module_declarations,
+            node_files,
+            module_inputs,
+            declarations,
+            types,
+            methods,
+        })
+    }
+
+    fn node_file(&self, node: NodeId) -> Option<i64> {
+        count_rust_resolution_work(1);
+        self.node_files.get(&node).copied()
+    }
+
+    fn module(&self, record: &ResolutionCacheRecord, path: &[String]) -> Option<&CachedRustModule> {
+        count_rust_resolution_work(1);
+        self.module_inputs
+            .get(&(record.file.file_id.0, path.to_vec()))
+            .copied()
+    }
+
+    fn declarations(
+        &self,
+        record: &ResolutionCacheRecord,
+        path: &[String],
+        name: &str,
+    ) -> &[&CachedTopLevelDeclaration] {
+        count_rust_resolution_work(1);
+        self.declarations
+            .get(&(record.file.file_id.0, path.to_vec(), name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn types(
+        &self,
+        record: &ResolutionCacheRecord,
+        path: &[String],
+        name: &str,
+    ) -> &[&CachedRustType] {
+        count_rust_resolution_work(1);
+        self.types
+            .get(&(record.file.file_id.0, path.to_vec(), name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn methods(
+        &self,
+        record: &ResolutionCacheRecord,
+        path: &[String],
+        owner: &str,
+        method: &str,
+    ) -> &[&CachedInherentMethod] {
+        count_rust_resolution_work(1);
+        self.methods
+            .get(&(
+                record.file.file_id.0,
+                path.to_vec(),
+                owner.to_string(),
+                method.to_string(),
+            ))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn resolve_module_path(
+        &self,
+        source_record: &ResolutionCacheRecord,
+        relative_module: &[String],
+        components: &[String],
+    ) -> Option<(RustModuleMatch<'a>, String, Vec<NodeId>, bool)> {
+        let (target_name, path_components) = components.split_last()?;
+        let source_origin = self.origins.get(&source_record.file.file_id.0)?;
+        let mut absolute_module = source_origin.base_module.clone();
+        absolute_module.extend_from_slice(relative_module);
+        let source_absolute_module = absolute_module.clone();
+        let mut iter = path_components.iter();
+        match iter.next()?.as_str() {
+            "crate" => absolute_module.clear(),
+            "self" => {}
+            "super" => {
+                absolute_module.pop()?;
+            }
+            _ => return None,
+        }
+        for component in iter {
+            if component == "super" {
+                absolute_module.pop()?;
+            } else if component == "self" || component == "crate" {
+                return None;
+            } else {
+                absolute_module.push(component.clone());
+            }
+        }
+        let modules = self
+            .modules
+            .get(&(source_origin.root.clone(), absolute_module.clone()))?;
+        let [module_match] = modules.as_slice() else {
+            return None;
+        };
+        let mut path_nodes = Vec::with_capacity(absolute_module.len());
+        for length in 1..=absolute_module.len() {
+            let declarations = self.module_declarations.get(&(
+                source_origin.root.clone(),
+                absolute_module[..length].to_vec(),
+            ))?;
+            let [declaration] = declarations.as_slice() else {
+                return None;
+            };
+            path_nodes.push(*declaration);
+        }
+        let private_visible = absolute_module.len() <= source_absolute_module.len()
+            && absolute_module
+                .iter()
+                .zip(&source_absolute_module)
+                .all(|(target, source)| target == source);
+        Some((
+            module_match.clone(),
+            target_name.clone(),
+            path_nodes,
+            private_visible,
+        ))
+    }
+}
+
+fn standard_rust_module_candidates(
+    parent_path: &Path,
+    inline_module_path: &[String],
+    child_name: &str,
+) -> Vec<PathBuf> {
+    let Some(parent) = parent_path.parent() else {
+        return Vec::new();
+    };
+    let Some(file_name) = parent_path.file_name().and_then(|name| name.to_str()) else {
+        return Vec::new();
+    };
+    let mut base = match file_name {
+        "lib.rs" | "main.rs" | "mod.rs" => parent.to_path_buf(),
+        file if file.ends_with(".rs") => {
+            let Some(stem) = file.strip_suffix(".rs") else {
+                return Vec::new();
+            };
+            parent.join(stem)
+        }
+        _ => return Vec::new(),
+    };
+    for component in inline_module_path {
+        base.push(component);
+    }
+    vec![
+        base.join(format!("{child_name}.rs")),
+        base.join(child_name).join("mod.rs"),
+    ]
+}
+
+fn resolve_rust_record_origin(
+    file_id: i64,
+    records: &HashMap<i64, &ResolutionCacheRecord>,
+    roots: &HashMap<i64, PathBuf>,
+    parent_claims: &HashMap<i64, Vec<RustParentClaim>>,
+    memo: &mut HashMap<i64, Option<RustRecordOrigin>>,
+    visiting: &mut HashSet<i64>,
+) -> Option<RustRecordOrigin> {
+    if let Some(origin) = memo.get(&file_id) {
+        return origin.clone();
+    }
+    if !visiting.insert(file_id) {
+        memo.insert(file_id, None);
+        return None;
+    }
+    let claims = parent_claims
+        .get(&file_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let result = match (roots.get(&file_id), claims) {
+        (Some(root), []) => Some(RustRecordOrigin {
+            root: root.clone(),
+            base_module: Vec::new(),
+        }),
+        (None, [claim]) if records.contains_key(&claim.parent_file_id) => {
+            resolve_rust_record_origin(
+                claim.parent_file_id,
+                records,
+                roots,
+                parent_claims,
+                memo,
+                visiting,
+            )
+            .map(|parent| {
+                let mut base_module = parent.base_module;
+                base_module.extend(claim.relative_child_module.clone());
+                RustRecordOrigin {
+                    root: parent.root,
+                    base_module,
+                }
+            })
+        }
+        _ => None,
+    };
+    visiting.remove(&file_id);
+    memo.insert(file_id, result.clone());
+    result
+}
+
+fn resolve_rust_path_binding(
+    rust_index: &RustProjectionIndex<'_>,
+    source_record: &ResolutionCacheRecord,
+    module_path: &[String],
+    components: &[String],
+    import: Option<&CachedRustUseBinding>,
+    associated_owner: Option<NodeId>,
+    raw_target: &str,
+) -> RustPathResolution {
+    if let Some(owner) = associated_owner {
+        let Some(owner_name) = components.first() else {
+            return RustPathResolution::Unsupported;
+        };
+        let methods = rust_index
+            .methods(source_record, module_path, owner_name, raw_target)
+            .iter()
+            .copied()
+            .filter(|method| method.owner == Some(owner) && !method.has_self)
+            .collect::<Vec<_>>();
+        return match methods.as_slice() {
+            [method] if method.domain_complete => RustPathResolution::Associated {
+                owner,
+                owner_file: FileId(source_record.file.file_id.0),
+                target: method.declaration,
+                target_file: FileId(source_record.file.file_id.0),
+            },
+            [] => RustPathResolution::Missing,
+            [method] if !method.domain_complete => RustPathResolution::Incomplete,
+            _ => RustPathResolution::Ambiguous,
+        };
+    }
+
+    if import.is_none()
+        && components.len() == 2
+        && !matches!(components[0].as_str(), "crate" | "self" | "super")
+    {
+        let module_complete = rust_index
+            .module(source_record, module_path)
+            .is_some_and(|module| module.domain_complete);
+        if !module_complete {
+            return RustPathResolution::Incomplete;
+        }
+        let owners = rust_index.types(source_record, module_path, &components[0]);
+        let methods = rust_index
+            .methods(source_record, module_path, &components[0], raw_target)
+            .iter()
+            .copied()
+            .filter(|method| !method.has_self)
+            .collect::<Vec<_>>();
+        return match (owners, methods.as_slice()) {
+            ([owner], [method]) if !owner.generic && method.domain_complete => {
+                RustPathResolution::Associated {
+                    owner: owner.declaration,
+                    owner_file: FileId(source_record.file.file_id.0),
+                    target: method.declaration,
+                    target_file: FileId(source_record.file.file_id.0),
+                }
+            }
+            ([owner], [_]) if owner.generic => RustPathResolution::Unsupported,
+            ([], _) | (_, []) => RustPathResolution::Missing,
+            (_, [method]) if !method.domain_complete => RustPathResolution::Incomplete,
+            _ => RustPathResolution::Ambiguous,
+        };
+    }
+
+    if let Some(import) = import
+        && components.len() == 2
+        && components[0] == import.local_name
+    {
+        let Some((module_match, owner_name, _, private_visible)) =
+            rust_resolve_module_path(rust_index, source_record, module_path, &import.components)
+        else {
+            return RustPathResolution::Incomplete;
+        };
+        let owners = rust_index.types(
+            module_match.record,
+            &module_match.relative_module,
+            &owner_name,
+        );
+        let methods = rust_index
+            .methods(
+                module_match.record,
+                &module_match.relative_module,
+                &owner_name,
+                raw_target,
+            )
+            .iter()
+            .copied()
+            .filter(|method| !method.has_self)
+            .collect::<Vec<_>>();
+        return match (owners, methods.as_slice()) {
+            ([owner], [method])
+                if !owner.generic
+                    && (owner.cross_module_visible || private_visible)
+                    && (method.cross_module_visible || private_visible)
+                    && method.domain_complete =>
+            {
+                RustPathResolution::Associated {
+                    owner: owner.declaration,
+                    owner_file: FileId(module_match.record.file.file_id.0),
+                    target: method.declaration,
+                    target_file: FileId(module_match.record.file.file_id.0),
+                }
+            }
+            ([owner], [_]) if owner.generic => RustPathResolution::Unsupported,
+            ([owner], [_]) if !owner.cross_module_visible && !private_visible => {
+                RustPathResolution::Unsupported
+            }
+            ([_], [method]) if !method.cross_module_visible && !private_visible => {
+                RustPathResolution::Unsupported
+            }
+            ([], _) | (_, []) => RustPathResolution::Missing,
+            (_, [method]) if !method.domain_complete => RustPathResolution::Incomplete,
+            _ => RustPathResolution::Ambiguous,
+        };
+    }
+
+    let path = import.map_or(components, |binding| binding.components.as_slice());
+    let Some((target_module, target_name, path_components, private_visible)) =
+        rust_resolve_module_path(rust_index, source_record, module_path, path)
+    else {
+        return if path
+            .first()
+            .is_some_and(|root| matches!(root.as_str(), "crate" | "self" | "super"))
+        {
+            RustPathResolution::Incomplete
+        } else {
+            RustPathResolution::Unsupported
+        };
+    };
+    let declarations = rust_index.declarations(
+        target_module.record,
+        &target_module.relative_module,
+        &target_name,
+    );
+    let target_module_input =
+        rust_index.module(target_module.record, &target_module.relative_module);
+    let module_complete = target_module_input.is_some_and(|module| module.domain_complete);
+    let target_blocked = target_module_input.is_some_and(|module| {
+        module
+            .value_blockers
+            .iter()
+            .any(|name| name == &target_name)
+    });
+    let target_incomplete = target_module_input.is_some_and(|module| {
+        module
+            .incomplete_value_names
+            .iter()
+            .any(|name| name == &target_name)
+    });
+    match declarations {
+        [declaration]
+            if module_complete
+                && !target_blocked
+                && !target_incomplete
+                && (declaration.cross_module_visible || private_visible) =>
+        {
+            RustPathResolution::Function {
+                target: declaration.declaration,
+                target_file: FileId(target_module.record.file.file_id.0),
+                path_components,
+            }
+        }
+        [_] if target_incomplete || !module_complete => RustPathResolution::Incomplete,
+        [_] if target_blocked => RustPathResolution::Ambiguous,
+        [_] if module_complete => RustPathResolution::Unsupported,
+        [] if target_incomplete || !module_complete => RustPathResolution::Incomplete,
+        [] if target_blocked => RustPathResolution::Ambiguous,
+        [] if module_complete => RustPathResolution::Missing,
+        _ => RustPathResolution::Ambiguous,
+    }
+}
+
+struct RustReceiverQuery<'a> {
+    module_path: &'a [String],
+    owner_name: &'a str,
+    import: Option<&'a CachedRustUseBinding>,
+    method_name: &'a str,
+    constructor: bool,
+    constructor_record: bool,
+    constructor_method: Option<&'a str>,
+}
+
+fn resolve_rust_receiver_binding(
+    rust_index: &RustProjectionIndex<'_>,
+    source_record: &ResolutionCacheRecord,
+    query: RustReceiverQuery<'_>,
+) -> RustReceiverResolution {
+    let RustReceiverQuery {
+        module_path,
+        owner_name,
+        import,
+        method_name,
+        constructor,
+        constructor_record,
+        constructor_method,
+    } = query;
+    let (record, relative_module, owner) = if let Some(import) = import {
+        let Some((module_match, target_name, _, private_visible)) =
+            rust_resolve_module_path(rust_index, source_record, module_path, &import.components)
+        else {
+            return RustReceiverResolution::Incomplete;
+        };
+        if target_name != owner_name {
+            return RustReceiverResolution::Ambiguous;
+        }
+        let owners = rust_index.types(
+            module_match.record,
+            &module_match.relative_module,
+            owner_name,
+        );
+        let [owner] = owners else {
+            return if owners.is_empty() {
+                RustReceiverResolution::Missing
+            } else {
+                RustReceiverResolution::Ambiguous
+            };
+        };
+        if owner.generic {
+            return RustReceiverResolution::Unsupported;
+        }
+        if !owner.cross_module_visible && !private_visible {
+            return RustReceiverResolution::Unsupported;
+        }
+        (module_match.record, module_match.relative_module, *owner)
+    } else {
+        let owners = rust_index.types(source_record, module_path, owner_name);
+        let [owner] = owners else {
+            return if owners.is_empty() {
+                RustReceiverResolution::Missing
+            } else {
+                RustReceiverResolution::Ambiguous
+            };
+        };
+        if owner.generic {
+            return RustReceiverResolution::Unsupported;
+        }
+        (source_record, module_path.to_vec(), *owner)
+    };
+    let module_complete = rust_index
+        .module(record, &relative_module)
+        .is_some_and(|module| module.domain_complete);
+    if !module_complete {
+        return RustReceiverResolution::Incomplete;
+    }
+    let methods = rust_index
+        .methods(record, &relative_module, owner_name, method_name)
+        .iter()
+        .copied()
+        .filter(|method| method.owner == Some(owner.declaration) && method.has_self)
+        .collect::<Vec<_>>();
+    let [method] = methods.as_slice() else {
+        return if methods.is_empty() {
+            RustReceiverResolution::Missing
+        } else {
+            RustReceiverResolution::Ambiguous
+        };
+    };
+    if !method.domain_complete {
+        return RustReceiverResolution::Incomplete;
+    }
+    if import.is_some() && !method.cross_module_visible {
+        return RustReceiverResolution::Unsupported;
+    }
+    if constructor && let Some(constructor_method) = constructor_method {
+        let constructors = rust_index
+            .methods(record, &relative_module, owner_name, constructor_method)
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                candidate.owner == Some(owner.declaration)
+                    && !candidate.has_self
+                    && candidate.return_owner.as_deref() == Some(owner_name)
+                    && candidate.domain_complete
+                    && (import.is_none() || candidate.cross_module_visible)
+            })
+            .count();
+        if constructors != 1 {
+            return if constructors == 0 {
+                RustReceiverResolution::Unsupported
+            } else {
+                RustReceiverResolution::Ambiguous
+            };
+        }
+    } else if constructor
+        && ((constructor_record && !owner.record_constructor)
+            || (!constructor_record && !owner.unit_constructor))
+    {
+        return RustReceiverResolution::Unsupported;
+    }
+    RustReceiverResolution::Exact {
+        owner: owner.declaration,
+        owner_file: FileId(record.file.file_id.0),
+        declaration: method.declaration,
+        declaration_file: FileId(record.file.file_id.0),
+    }
+}
+
+fn resolve_rust_imported_implicit_receiver(
+    rust_index: &RustProjectionIndex<'_>,
+    source_record: &ResolutionCacheRecord,
+    module_path: &[String],
+    owner_name: &str,
+    import: &CachedRustUseBinding,
+    declaration: NodeId,
+    method_name: &str,
+) -> RustImplicitReceiverResolution {
+    let Some((module_match, resolved_owner_name, path_nodes, private_visible)) =
+        rust_resolve_module_path(rust_index, source_record, module_path, &import.components)
+    else {
+        return RustImplicitReceiverResolution::Incomplete;
+    };
+    if resolved_owner_name != owner_name {
+        return RustImplicitReceiverResolution::Ambiguous;
+    }
+    let owners = rust_index.types(
+        module_match.record,
+        &module_match.relative_module,
+        owner_name,
+    );
+    let methods = rust_index
+        .methods(source_record, module_path, owner_name, method_name)
+        .iter()
+        .copied()
+        .filter(|method| method.declaration == declaration && method.has_self)
+        .collect::<Vec<_>>();
+    match (owners, methods.as_slice()) {
+        ([owner], [method])
+            if !owner.generic
+                && (owner.cross_module_visible || private_visible)
+                && method.domain_complete
+                && path_nodes.iter().all(|node| {
+                    rust_index.node_file(*node).is_some_and(|file| {
+                        file == source_record.file.file_id.0
+                            || file == module_match.record.file.file_id.0
+                    })
+                }) =>
+        {
+            RustImplicitReceiverResolution::Exact {
+                owner: owner.declaration,
+                owner_file: FileId(module_match.record.file.file_id.0),
+                declaration,
+            }
+        }
+        ([owner], [_]) if owner.generic => RustImplicitReceiverResolution::Unsupported,
+        ([_], [method]) if !method.domain_complete => RustImplicitReceiverResolution::Incomplete,
+        ([_], [_])
+            if !path_nodes
+                .iter()
+                .all(|node| rust_index.node_file(*node).is_some()) =>
+        {
+            RustImplicitReceiverResolution::Incomplete
+        }
+        ([], _) | (_, []) => RustImplicitReceiverResolution::Missing,
+        _ => RustImplicitReceiverResolution::Ambiguous,
+    }
+}
+
+fn rust_resolve_module_path<'a>(
+    rust_index: &'a RustProjectionIndex<'a>,
+    source_record: &'a ResolutionCacheRecord,
+    relative_module: &[String],
+    components: &[String],
+) -> Option<(RustModuleMatch<'a>, String, Vec<NodeId>, bool)> {
+    rust_index.resolve_module_path(source_record, relative_module, components)
+}
+
 fn resolve_syntax_claim(
     files: &HashMap<i64, &codestory_store::FileInfo>,
     records: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
-    all_records: &[ResolutionCacheRecord],
+    rust_index: &RustProjectionIndex<'_>,
     source_record: &ResolutionCacheRecord,
     input: CachedCallResolutionInput,
 ) -> Result<ResolvedSyntaxClaim> {
@@ -3066,10 +5443,10 @@ fn resolve_syntax_claim(
             owner_name,
         } => {
             let matching_method_count = if source_record.file.language == "rust" {
-                all_records
+                source_record
+                    .file
+                    .inherent_methods
                     .iter()
-                    .filter(|record| record.file.language == "rust")
-                    .flat_map(|record| record.file.inherent_methods.iter())
                     .filter(|method| {
                         method.owner_name == *owner_name
                             && method.method_name == input.callsite.raw_target
@@ -3089,15 +5466,7 @@ fn resolve_syntax_claim(
                     })
                     .count()
             };
-            if source_record.file.language == "rust"
-                && all_records
-                    .iter()
-                    .filter(|record| record.file.language == "rust")
-                    .any(|record| !record.file.lookup_input_complete)
-            {
-                status = ProofResolutionStatus::IncompleteDomain;
-                reason = ProofResolutionReason::LookupDomainIncomplete;
-            } else if matching_method_count != 1 {
+            if matching_method_count != 1 {
                 status = ProofResolutionStatus::Ambiguous;
                 reason = ProofResolutionReason::MultipleBindings;
             } else {
@@ -3173,6 +5542,245 @@ fn resolve_syntax_claim(
             } else {
                 status = ProofResolutionStatus::MissingBinding;
                 reason = ProofResolutionReason::MissingBinding;
+            }
+        }
+        CachedResolutionBinding::RustPath {
+            module_path,
+            components,
+            import,
+            associated_owner,
+        } => {
+            let resolution = resolve_rust_path_binding(
+                rust_index,
+                source_record,
+                module_path,
+                components,
+                import.as_ref(),
+                *associated_owner,
+                &input.callsite.raw_target,
+            );
+            match resolution {
+                RustPathResolution::Function {
+                    target: declaration,
+                    target_file,
+                    path_components,
+                } => {
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(declaration);
+                    if let Some(import) = import {
+                        evidence_chain.push(ResolutionEvidence::StaticImportBinding {
+                            import: import.import,
+                            declaration,
+                        });
+                        exact_node_file_expectations.push((import.import, input.callsite.file_id));
+                        let carries_intermediate_file = path_components.iter().any(|component| {
+                            rust_index.node_file(*component).is_some_and(|file_id| {
+                                file_id != input.callsite.file_id.0 && file_id != target_file.0
+                            })
+                        });
+                        if carries_intermediate_file {
+                            let mut components = path_components;
+                            let mut path_complete = true;
+                            for component in &components {
+                                let Some(file_id) = rust_index.node_file(*component) else {
+                                    path_complete = false;
+                                    break;
+                                };
+                                exact_node_file_expectations.push((*component, FileId(file_id)));
+                            }
+                            if path_complete {
+                                components.push(declaration);
+                                evidence_chain
+                                    .push(ResolutionEvidence::QualifiedPath { components });
+                            } else {
+                                status = ProofResolutionStatus::IncompleteDomain;
+                                reason = ProofResolutionReason::LookupDomainIncomplete;
+                                target = None;
+                                evidence_chain.clear();
+                            }
+                        }
+                    } else if !path_components.is_empty() {
+                        let mut components = path_components;
+                        for component in &components {
+                            if let Some(file_id) = rust_index.node_file(*component) {
+                                exact_node_file_expectations.push((*component, FileId(file_id)));
+                            }
+                        }
+                        components.push(declaration);
+                        evidence_chain.push(ResolutionEvidence::QualifiedPath { components });
+                    } else if target_file == input.callsite.file_id {
+                        evidence_chain
+                            .push(ResolutionEvidence::SameFileDeclaration { declaration });
+                    } else {
+                        status = ProofResolutionStatus::IncompleteDomain;
+                        reason = ProofResolutionReason::LookupDomainIncomplete;
+                        target = None;
+                    }
+                    if status == ProofResolutionStatus::Exact {
+                        exact_node_file_expectations.push((declaration, target_file));
+                    }
+                }
+                RustPathResolution::Associated {
+                    owner,
+                    owner_file,
+                    target: declaration,
+                    target_file,
+                } => {
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(declaration);
+                    if let Some(import) = import {
+                        evidence_chain.push(ResolutionEvidence::StaticImportBinding {
+                            import: import.import,
+                            declaration: owner,
+                        });
+                        exact_node_file_expectations.push((import.import, input.callsite.file_id));
+                    }
+                    evidence_chain.push(ResolutionEvidence::QualifiedPath {
+                        components: vec![owner, declaration],
+                    });
+                    exact_node_file_expectations.push((owner, owner_file));
+                    exact_node_file_expectations.push((declaration, target_file));
+                }
+                RustPathResolution::Missing => {
+                    status = ProofResolutionStatus::MissingBinding;
+                    reason = ProofResolutionReason::MissingBinding;
+                }
+                RustPathResolution::Ambiguous => {
+                    status = ProofResolutionStatus::Ambiguous;
+                    reason = ProofResolutionReason::MultipleBindings;
+                }
+                RustPathResolution::Incomplete => {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                }
+                RustPathResolution::Unsupported => {
+                    status = ProofResolutionStatus::Unsupported;
+                    reason = ProofResolutionReason::UnsupportedConstruct;
+                }
+            }
+        }
+        CachedResolutionBinding::RustImplicitReceiver {
+            module_path,
+            owner_name,
+            import,
+            declaration,
+        } => match resolve_rust_imported_implicit_receiver(
+            rust_index,
+            source_record,
+            module_path,
+            owner_name,
+            import,
+            *declaration,
+            &input.callsite.raw_target,
+        ) {
+            RustImplicitReceiverResolution::Exact {
+                owner,
+                owner_file,
+                declaration,
+            } => {
+                status = ProofResolutionStatus::Exact;
+                reason = ProofResolutionReason::ExactResolution;
+                target = Some(declaration);
+                evidence_chain.push(ResolutionEvidence::StaticImportBinding {
+                    import: import.import,
+                    declaration: owner,
+                });
+                evidence_chain.push(ResolutionEvidence::ImplicitReceiver { owner });
+                evidence_chain.push(ResolutionEvidence::SameFileDeclaration { declaration });
+                exact_node_file_expectations.push((import.import, input.callsite.file_id));
+                exact_node_file_expectations.push((owner, owner_file));
+                exact_node_file_expectations.push((declaration, input.callsite.file_id));
+            }
+            RustImplicitReceiverResolution::Missing => {
+                status = ProofResolutionStatus::MissingBinding;
+                reason = ProofResolutionReason::MissingBinding;
+            }
+            RustImplicitReceiverResolution::Ambiguous => {
+                status = ProofResolutionStatus::Ambiguous;
+                reason = ProofResolutionReason::MultipleBindings;
+            }
+            RustImplicitReceiverResolution::Incomplete => {
+                status = ProofResolutionStatus::IncompleteDomain;
+                reason = ProofResolutionReason::LookupDomainIncomplete;
+            }
+            RustImplicitReceiverResolution::Unsupported => {
+                status = ProofResolutionStatus::Unsupported;
+                reason = ProofResolutionReason::UnsupportedConstruct;
+            }
+        },
+        CachedResolutionBinding::RustExplicitReceiver {
+            module_path,
+            owner_name,
+            import,
+            constructor,
+            constructor_record,
+            constructor_method,
+        } => {
+            match resolve_rust_receiver_binding(
+                rust_index,
+                source_record,
+                RustReceiverQuery {
+                    module_path,
+                    owner_name,
+                    import: import.as_ref(),
+                    method_name: &input.callsite.raw_target,
+                    constructor: *constructor,
+                    constructor_record: *constructor_record,
+                    constructor_method: constructor_method.as_deref(),
+                },
+            ) {
+                RustReceiverResolution::Exact {
+                    owner,
+                    owner_file,
+                    declaration,
+                    declaration_file,
+                } => {
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(declaration);
+                    if let Some(import) = import {
+                        evidence_chain.push(ResolutionEvidence::StaticImportBinding {
+                            import: import.import,
+                            declaration: owner,
+                        });
+                        exact_node_file_expectations.push((import.import, input.callsite.file_id));
+                    }
+                    if *constructor {
+                        evidence_chain
+                            .push(ResolutionEvidence::ConstructorBinding { constructor: owner });
+                    }
+                    evidence_chain.push(ResolutionEvidence::ExplicitReceiverType {
+                        receiver_type: owner,
+                    });
+                    if declaration_file == input.callsite.file_id {
+                        evidence_chain
+                            .push(ResolutionEvidence::SameFileDeclaration { declaration });
+                    } else {
+                        evidence_chain.push(ResolutionEvidence::QualifiedPath {
+                            components: vec![owner, declaration],
+                        });
+                    }
+                    exact_node_file_expectations.push((owner, owner_file));
+                    exact_node_file_expectations.push((declaration, declaration_file));
+                }
+                RustReceiverResolution::Missing => {
+                    status = ProofResolutionStatus::MissingBinding;
+                    reason = ProofResolutionReason::MissingBinding;
+                }
+                RustReceiverResolution::Ambiguous => {
+                    status = ProofResolutionStatus::Ambiguous;
+                    reason = ProofResolutionReason::MultipleBindings;
+                }
+                RustReceiverResolution::Incomplete => {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                }
+                RustReceiverResolution::Unsupported => {
+                    status = ProofResolutionStatus::Unsupported;
+                    reason = ProofResolutionReason::UnsupportedConstruct;
+                }
             }
         }
         CachedResolutionBinding::Ambiguous => {
@@ -3608,4 +6216,170 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
             ))
     });
     result
+}
+
+#[cfg(test)]
+mod rust_complexity_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn measured_source_work(source: &str) -> usize {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .expect("Rust grammar must load");
+        let tree = parser.parse(source, None).expect("source must parse");
+        reset_rust_resolution_work();
+        let _ = RustResolutionIndex::build(&tree, source, NodeId(1), &[]);
+        rust_resolution_work()
+    }
+
+    fn repeated_binding_source(count: usize) -> String {
+        let mut source =
+            String::from("struct Owner; impl Owner { fn target(&self) {} } fn caller() {\n");
+        for _ in 0..count {
+            source.push_str("{ let value: Owner = Owner; value.target(); }\n");
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    fn nested_callable_source(depth: usize) -> String {
+        let mut source = String::new();
+        for index in 0..depth {
+            source.push_str(&format!("fn f{index}() {{\n"));
+        }
+        source.push_str("target();\n");
+        for _ in 0..depth {
+            source.push_str("}\n");
+        }
+        source
+    }
+
+    fn measured_projection_work(count: usize) -> usize {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("lib.rs");
+        std::fs::write(&path, "").expect("write root");
+        let modules = (0..count)
+            .map(|index| CachedRustModule {
+                module_path: vec![format!("module_{index}")],
+                declaration: Some(NodeId(10_000 + index as i64)),
+                domain_complete: true,
+                value_blockers: Vec::new(),
+                incomplete_value_names: Vec::new(),
+                file_children: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let declarations = (0..count)
+            .map(|index| CachedTopLevelDeclaration {
+                name: format!("function_{index}"),
+                declaration: NodeId(20_000 + index as i64),
+                module_path: vec![format!("module_{index}")],
+                cross_module_visible: true,
+            })
+            .collect::<Vec<_>>();
+        let types = (0..count)
+            .map(|index| CachedRustType {
+                module_path: vec![format!("module_{index}")],
+                name: format!("Owner{index}"),
+                declaration: NodeId(30_000 + index as i64),
+                generic: false,
+                cross_module_visible: true,
+                unit_constructor: true,
+                record_constructor: false,
+            })
+            .collect::<Vec<_>>();
+        let methods = (0..count)
+            .map(|index| CachedInherentMethod {
+                owner_name: format!("Owner{index}"),
+                method_name: format!("method_{index}"),
+                declaration: NodeId(40_000 + index as i64),
+                module_path: vec![format!("module_{index}")],
+                owner: Some(NodeId(30_000 + index as i64)),
+                has_self: true,
+                return_owner: None,
+                domain_complete: true,
+                cross_module_visible: true,
+            })
+            .collect::<Vec<_>>();
+        let imports = (0..count)
+            .map(|index| CachedRustUseBinding {
+                module_path: Vec::new(),
+                local_name: format!("Owner{index}"),
+                components: vec!["crate".to_string(), format!("Owner{index}")],
+                import: NodeId(50_000 + index as i64),
+            })
+            .collect::<Vec<_>>();
+        let record = ResolutionCacheRecord {
+            path,
+            file: CachedResolutionFile {
+                file_id: NodeId(1),
+                source_sha256: "0".repeat(64),
+                language: "rust".to_string(),
+                adapter_version: ADAPTER_VERSION.to_string(),
+                parser_fingerprint: "parser".to_string(),
+                complete: true,
+                lookup_input_complete: true,
+                typescript_module: false,
+                top_level_declarations: declarations,
+                inherent_methods: methods,
+                classes: Vec::new(),
+                direct_exports: Vec::new(),
+                export_poison_all: false,
+                poisoned_export_names: Vec::new(),
+                rust_modules: modules,
+                rust_types: types,
+                rust_uses: imports,
+            },
+            calls: Vec::new(),
+        };
+        reset_rust_resolution_work();
+        let records = [record];
+        let index = RustProjectionIndex::prepare(&records).expect("projection index");
+        for item in 0..count {
+            let module = vec![format!("module_{item}")];
+            let _ = index.module(&records[0], &module);
+            let _ = index.declarations(&records[0], &module, &format!("function_{item}"));
+            let _ = index.types(&records[0], &module, &format!("Owner{item}"));
+            let _ = index.methods(
+                &records[0],
+                &module,
+                &format!("Owner{item}"),
+                &format!("method_{item}"),
+            );
+            let _ = index.node_file(NodeId(50_000 + item as i64));
+        }
+        rust_resolution_work()
+    }
+
+    #[test]
+    fn rust_source_resolution_work_is_linear_for_binding_histories_and_nested_callables() {
+        let small_bindings = measured_source_work(&repeated_binding_source(64));
+        let large_bindings = measured_source_work(&repeated_binding_source(128));
+        assert!(
+            large_bindings <= small_bindings * 2 + 64,
+            "binding work grew superlinearly: {small_bindings} -> {large_bindings}"
+        );
+
+        let small_nested = measured_source_work(&nested_callable_source(64));
+        let large_nested = measured_source_work(&nested_callable_source(128));
+        assert!(
+            large_nested <= small_nested * 2 + 64,
+            "nested-callable work grew superlinearly: {small_nested} -> {large_nested}"
+        );
+    }
+
+    #[test]
+    fn rust_projection_preparation_and_lookups_are_linear() {
+        let small = measured_projection_work(64);
+        let large = measured_projection_work(128);
+        assert!(
+            small >= 64 * 5,
+            "projection work was not instrumented: {small}"
+        );
+        assert!(
+            large <= small * 2 + 128,
+            "projection work grew superlinearly: {small} -> {large}"
+        );
+    }
 }

@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 // Bumped to 6 because JavaScript joins the private proof adapter roster and
 // ECMAScript bindings are now collected with name-specific closure semantics.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 7;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 9;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -66,6 +66,26 @@ pub(crate) enum CachedResolutionBinding {
         class_binding: CachedClassBinding,
         method_name: String,
     },
+    RustPath {
+        module_path: Vec<String>,
+        components: Vec<String>,
+        import: Option<CachedRustUseBinding>,
+        associated_owner: Option<NodeId>,
+    },
+    RustImplicitReceiver {
+        module_path: Vec<String>,
+        owner_name: String,
+        import: CachedRustUseBinding,
+        declaration: NodeId,
+    },
+    RustExplicitReceiver {
+        module_path: Vec<String>,
+        owner_name: String,
+        import: Option<CachedRustUseBinding>,
+        constructor: bool,
+        constructor_record: bool,
+        constructor_method: Option<String>,
+    },
     Ambiguous,
     MissingBinding,
     Unsupported,
@@ -106,12 +126,22 @@ pub(crate) struct CachedResolutionFile {
     pub export_poison_all: bool,
     #[serde(default)]
     pub poisoned_export_names: Vec<String>,
+    #[serde(default)]
+    pub rust_modules: Vec<CachedRustModule>,
+    #[serde(default)]
+    pub rust_types: Vec<CachedRustType>,
+    #[serde(default)]
+    pub rust_uses: Vec<CachedRustUseBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CachedTopLevelDeclaration {
     pub name: String,
     pub declaration: NodeId,
+    #[serde(default)]
+    pub module_path: Vec<String>,
+    #[serde(default)]
+    pub cross_module_visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +149,56 @@ pub(crate) struct CachedInherentMethod {
     pub owner_name: String,
     pub method_name: String,
     pub declaration: NodeId,
+    #[serde(default)]
+    pub module_path: Vec<String>,
+    #[serde(default)]
+    pub owner: Option<NodeId>,
+    #[serde(default)]
+    pub has_self: bool,
+    #[serde(default)]
+    pub return_owner: Option<String>,
+    #[serde(default)]
+    pub domain_complete: bool,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustModule {
+    pub module_path: Vec<String>,
+    pub declaration: Option<NodeId>,
+    pub domain_complete: bool,
+    #[serde(default)]
+    pub value_blockers: Vec<String>,
+    #[serde(default)]
+    pub incomplete_value_names: Vec<String>,
+    #[serde(default)]
+    pub file_children: Vec<CachedRustFileModule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustFileModule {
+    pub name: String,
+    pub declaration: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustType {
+    pub module_path: Vec<String>,
+    pub name: String,
+    pub declaration: NodeId,
+    pub generic: bool,
+    pub cross_module_visible: bool,
+    pub unit_constructor: bool,
+    pub record_constructor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustUseBinding {
+    pub module_path: Vec<String>,
+    pub local_name: String,
+    pub components: Vec<String>,
+    pub import: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,7 +243,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 5,
+            resolution_input_schema_version: 7,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

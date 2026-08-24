@@ -182,8 +182,20 @@ struct ProofResolutionValidationContext {
     node_by_id: HashMap<NodeId, Node>,
     edges: Vec<Edge>,
     edge_index_by_id: HashMap<EdgeId, usize>,
-    import_relation_counts: HashMap<(NodeId, NodeId, NodeId), usize>,
-    member_relation_counts: HashMap<(NodeId, NodeId), usize>,
+    import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
+    member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
+}
+
+#[derive(Default)]
+struct ProofRelationState {
+    admissible: usize,
+    conflicting: usize,
+}
+
+impl ProofRelationState {
+    fn is_unique(&self) -> bool {
+        self.admissible == 1 && self.conflicting == 0
+    }
 }
 
 impl ProofResolutionValidationContext {
@@ -194,28 +206,81 @@ impl ProofResolutionValidationContext {
             .map(|file| (file.id, file))
             .collect();
         let file_content_hash_by_id = storage.get_file_content_hashes()?;
-        let node_by_id = storage
+        let node_by_id: HashMap<NodeId, Node> = storage
             .get_nodes()?
             .into_iter()
             .map(|node| (node.id, node))
             .collect();
         let edges = storage.get_edges()?;
         let mut edge_index_by_id = HashMap::with_capacity(edges.len());
-        let mut import_relation_counts = HashMap::new();
-        let mut member_relation_counts = HashMap::new();
+        let mut import_relations = HashMap::<_, ProofRelationState>::new();
+        let mut member_relations = HashMap::<_, ProofRelationState>::new();
         for (index, edge) in edges.iter().enumerate() {
             edge_index_by_id.insert(edge.id, index);
             if edge.kind == EdgeKind::IMPORT
                 && let (Some(file_id), Some(target)) = (edge.file_node_id, edge.resolved_target)
             {
-                *import_relation_counts
+                let admissible = edge.effective_source() == edge.source
+                    && edge.effective_target() == target
+                    && edge.candidate_targets.is_empty()
+                    && node_by_id.get(&edge.source).is_some_and(|node| {
+                        matches!(node.kind, NodeKind::MODULE | NodeKind::UNKNOWN)
+                            && node.file_node_id == Some(file_id)
+                    })
+                    && node_by_id.get(&target).is_some_and(|node| {
+                        matches!(
+                            node.kind,
+                            NodeKind::FUNCTION
+                                | NodeKind::METHOD
+                                | NodeKind::STRUCT
+                                | NodeKind::CLASS
+                                | NodeKind::ENUM
+                        ) && node.file_node_id.is_some()
+                    });
+                let state = import_relations
                     .entry((file_id, edge.source, target))
-                    .or_default() += 1;
+                    .or_default();
+                if admissible {
+                    state.admissible += 1;
+                } else {
+                    state.conflicting += 1;
+                }
             }
             if edge.kind == EdgeKind::MEMBER {
-                *member_relation_counts
-                    .entry((edge.effective_source(), edge.effective_target()))
-                    .or_default() += 1;
+                let owner = node_by_id.get(&edge.source);
+                let member = node_by_id.get(&edge.target);
+                let admissible = edge.effective_source() == edge.source
+                    && edge.effective_target() == edge.target
+                    && edge.candidate_targets.is_empty()
+                    && owner.is_some_and(|owner| {
+                        matches!(
+                            (owner.kind, member.map(|member| member.kind)),
+                            (
+                                NodeKind::MODULE,
+                                Some(
+                                    NodeKind::MODULE
+                                        | NodeKind::FUNCTION
+                                        | NodeKind::STRUCT
+                                        | NodeKind::CLASS
+                                        | NodeKind::ENUM
+                                )
+                            ) | (
+                                NodeKind::STRUCT | NodeKind::CLASS | NodeKind::ENUM,
+                                Some(NodeKind::METHOD)
+                            )
+                        )
+                    })
+                    && member.is_some_and(|member| {
+                        member.file_node_id.is_some() && edge.file_node_id == member.file_node_id
+                    });
+                let state = member_relations
+                    .entry((edge.source, edge.target))
+                    .or_default();
+                if admissible {
+                    state.admissible += 1;
+                } else {
+                    state.conflicting += 1;
+                }
             }
         }
         Ok(Self {
@@ -224,9 +289,21 @@ impl ProofResolutionValidationContext {
             node_by_id,
             edges,
             edge_index_by_id,
-            import_relation_counts,
-            member_relation_counts,
+            import_relations,
+            member_relations,
         })
+    }
+
+    fn has_import(&self, file: NodeId, import: NodeId, target: NodeId) -> bool {
+        self.import_relations
+            .get(&(file, import, target))
+            .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn has_member(&self, owner: NodeId, member: NodeId) -> bool {
+        self.member_relations
+            .get(&(owner, member))
+            .is_some_and(ProofRelationState::is_unique)
     }
 }
 
@@ -446,6 +523,17 @@ impl Storage {
                             ResolutionEvidence::SameFileDeclaration { .. },
                         ],
                     ) if owner == constructor && constructor == receiver_type => Some(*constructor),
+                    (
+                        CalleeForm::ExplicitReceiver,
+                        [
+                            ResolutionEvidence::StaticImportBinding {
+                                declaration: owner, ..
+                            },
+                            ResolutionEvidence::ConstructorBinding { constructor },
+                            ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                            ResolutionEvidence::QualifiedPath { .. },
+                        ],
+                    ) if owner == constructor && constructor == receiver_type => Some(*constructor),
                     _ => None,
                 },
             )
@@ -610,6 +698,23 @@ impl Storage {
         if target_node.file_node_id.is_none() {
             return Err(proof_error("exact target has no indexed dependency file"));
         }
+        for evidence in &fact.evidence_chain {
+            let ResolutionEvidence::StaticImportBinding { import, .. } = evidence else {
+                continue;
+            };
+            let import_node = context
+                .node_by_id
+                .get(import)
+                .ok_or_else(|| proof_error("static import binding is missing"))?;
+            if !proof_import_node_kind_is_literal(
+                &fact.provenance.language_adapter,
+                import_node.kind,
+            ) {
+                return Err(proof_error(
+                    "StaticImportBinding node kind is not literal for the language adapter",
+                ));
+            }
+        }
         let raw_placeholder = context
             .node_by_id
             .get(&raw_edge_target)
@@ -676,14 +781,41 @@ impl Storage {
                     .ok_or_else(|| proof_error("static import binding is missing"))?;
                 if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                     || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
-                    || context
-                        .import_relation_counts
-                        .get(&(NodeId(fact.callsite.file_id.0), *import, target))
-                        .copied()
-                        != Some(1)
+                    || !context.has_import(NodeId(fact.callsite.file_id.0), *import, target)
                 {
                     return Err(proof_error(
                         "StaticImportBinding is not the unique source import bound to target",
+                    ));
+                }
+            }
+            (
+                CalleeForm::NamedImport,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration,
+                    },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) if *declaration == target
+                && components.last() == Some(&target)
+                && components.len() >= 2 =>
+            {
+                let source_file = NodeId(fact.callsite.file_id.0);
+                let import_node = context
+                    .node_by_id
+                    .get(import)
+                    .ok_or_else(|| proof_error("static import binding is missing"))?;
+                if import_node.kind != NodeKind::MODULE
+                    || import_node.file_node_id != Some(source_file)
+                    || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
+                    || !context.has_import(source_file, *import, target)
+                    || components
+                        .windows(2)
+                        .any(|pair| !context.has_member(pair[0], pair[1]))
+                {
+                    return Err(proof_error(
+                        "StaticImportBinding path is not one unique source IMPORT and MEMBER chain",
                     ));
                 }
             }
@@ -698,22 +830,94 @@ impl Storage {
                     .node_by_id
                     .get(owner)
                     .ok_or_else(|| proof_error("implicit receiver owner is missing"))?;
-                if !matches!(owner_node.kind, NodeKind::STRUCT | NodeKind::CLASS)
-                    || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                if !matches!(
+                    owner_node.kind,
+                    NodeKind::STRUCT | NodeKind::CLASS | NodeKind::ENUM
+                ) || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                     || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || context
-                        .member_relation_counts
-                        .get(&(*owner, fact.caller))
-                        .copied()
-                        != Some(1)
-                    || context
-                        .member_relation_counts
-                        .get(&(*owner, target))
-                        .copied()
-                        != Some(1)
+                    || !context.has_member(*owner, fact.caller)
+                    || !context.has_member(*owner, target)
                 {
                     return Err(proof_error(
                         "ImplicitReceiver does not own caller and target through inherent membership",
+                    ));
+                }
+            }
+            (
+                CalleeForm::ImplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: imported_owner,
+                    },
+                    ResolutionEvidence::ImplicitReceiver { owner },
+                    ResolutionEvidence::SameFileDeclaration { declaration },
+                ],
+            ) if *imported_owner == *owner && *declaration == target => {
+                let source_file = NodeId(fact.callsite.file_id.0);
+                let import_node = context
+                    .node_by_id
+                    .get(import)
+                    .ok_or_else(|| proof_error("imported implicit receiver binding is missing"))?;
+                let owner_node = context
+                    .node_by_id
+                    .get(owner)
+                    .ok_or_else(|| proof_error("imported implicit receiver owner is missing"))?;
+                let caller_node = context
+                    .node_by_id
+                    .get(&fact.caller)
+                    .ok_or_else(|| proof_error("imported implicit receiver caller is missing"))?;
+                if import_node.kind != NodeKind::MODULE
+                    || import_node.file_node_id != Some(source_file)
+                    || !matches!(owner_node.kind, NodeKind::STRUCT | NodeKind::ENUM)
+                    || owner_node.file_node_id.is_none()
+                    || owner_node.file_node_id == Some(source_file)
+                    || caller_node.kind != NodeKind::METHOD
+                    || caller_node.file_node_id != Some(source_file)
+                    || target_node.file_node_id != Some(source_file)
+                    || !context.has_import(source_file, *import, *owner)
+                    || !context.has_member(*owner, fact.caller)
+                    || !context.has_member(*owner, target)
+                {
+                    return Err(proof_error(
+                        "imported ImplicitReceiver does not name one IMPORT owner and its literal caller/target members",
+                    ));
+                }
+            }
+            (CalleeForm::QualifiedPath, [ResolutionEvidence::QualifiedPath { components }])
+                if components.last() == Some(&target) && components.len() >= 2 =>
+            {
+                if components
+                    .windows(2)
+                    .any(|pair| !context.has_member(pair[0], pair[1]))
+                {
+                    return Err(proof_error(
+                        "QualifiedPath is not one unique literal MEMBER chain",
+                    ));
+                }
+            }
+            (
+                CalleeForm::QualifiedPath,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) if components.first() == Some(owner) && components.last() == Some(&target) => {
+                let import_node = context
+                    .node_by_id
+                    .get(import)
+                    .ok_or_else(|| proof_error("qualified import binding is missing"))?;
+                if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                    || !context.has_import(NodeId(fact.callsite.file_id.0), *import, *owner)
+                    || components
+                        .windows(2)
+                        .any(|pair| !context.has_member(pair[0], pair[1]))
+                {
+                    return Err(proof_error(
+                        "qualified imported path is not one unique IMPORT and MEMBER chain",
                     ));
                 }
             }
@@ -730,14 +934,12 @@ impl Storage {
                     .node_by_id
                     .get(&owner)
                     .ok_or_else(|| proof_error("constructor receiver owner is missing"))?;
-                if owner_node.kind != NodeKind::CLASS
-                    || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                if !matches!(
+                    owner_node.kind,
+                    NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+                ) || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                     || owner_node.file_node_id != target_node.file_node_id
-                    || context
-                        .member_relation_counts
-                        .get(&(owner, target))
-                        .copied()
-                        != Some(1)
+                    || !context.has_member(owner, target)
                 {
                     return Err(proof_error(
                         "ConstructorBinding and ExplicitReceiverType do not name the unique target owner/member",
@@ -756,19 +958,61 @@ impl Storage {
                     .node_by_id
                     .get(&owner)
                     .ok_or_else(|| proof_error("explicit receiver type is missing"))?;
-                if owner_node.kind != NodeKind::CLASS
-                    || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
+                if !matches!(
+                    owner_node.kind,
+                    NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+                ) || owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                     || owner_node.file_node_id != target_node.file_node_id
-                    || context
-                        .member_relation_counts
-                        .get(&(owner, target))
-                        .copied()
-                        != Some(1)
+                    || !context.has_member(owner, target)
                 {
                     return Err(proof_error(
                         "ExplicitReceiverType does not name the unique target owner/member",
                     ));
                 }
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) if *owner == *constructor
+                && *owner == *receiver_type
+                && components.as_slice() == [*owner, target] =>
+            {
+                Self::validate_imported_receiver_evidence(
+                    fact,
+                    context,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                )?;
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) if *owner == *receiver_type && components.as_slice() == [*owner, target] => {
+                Self::validate_imported_receiver_evidence(
+                    fact,
+                    context,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                )?;
             }
             (
                 CalleeForm::ExplicitReceiver,
@@ -879,18 +1123,13 @@ impl Storage {
             .get(&owner)
             .ok_or_else(|| proof_error("imported receiver owner is missing"))?;
         if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-            || owner_node.kind != NodeKind::CLASS
+            || !matches!(
+                owner_node.kind,
+                NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+            )
             || owner_node.file_node_id != target_node.file_node_id
-            || context
-                .import_relation_counts
-                .get(&(NodeId(fact.callsite.file_id.0), import, owner))
-                .copied()
-                != Some(1)
-            || context
-                .member_relation_counts
-                .get(&(owner, target))
-                .copied()
-                != Some(1)
+            || !context.has_import(NodeId(fact.callsite.file_id.0), import, owner)
+            || !context.has_member(owner, target)
         {
             return Err(proof_error(
                 "imported receiver evidence does not name one IMPORT owner and one MEMBER target",
@@ -1167,6 +1406,16 @@ fn graph_leaf_name(name: &str) -> &str {
     name.rsplit(['.', ':'])
         .find(|part| !part.is_empty())
         .unwrap_or(name)
+}
+
+fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
+    match language {
+        "rust" => kind == NodeKind::MODULE,
+        "javascript" | "typescript" | "tsx" => {
+            matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
+        }
+        _ => false,
+    }
 }
 
 fn publication_integrity_digest(
