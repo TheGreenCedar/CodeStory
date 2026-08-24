@@ -1366,6 +1366,7 @@ fn resolved_node(
             .canonical_id
             .unwrap_or_else(|| format!("node:{}", node.id.0)),
         qualified_name: node.qualified_name.unwrap_or(node.serialized_name),
+        file_node_id: NodeId(file.id),
         project_file_components: components,
     }))
 }
@@ -2515,7 +2516,7 @@ mod tests {
     }
 
     #[test]
-    fn observed_runtime_trace_reports_receipt_and_projection_finalization_failures() {
+    fn observed_runtime_trace_keeps_oversized_complete_roots_for_transport() {
         let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
         let (contract, hashes, rendering) = validated_contract("source-id", &["target-id"]);
         let observed = build_from_store_observed(
@@ -2548,20 +2549,23 @@ mod tests {
         );
 
         let mut receipt_budget = observed.clone();
-        receipt_budget.built.receipts[0].callsite_identity = "x".repeat(70_000);
+        receipt_budget.built.receipts[0].callsite_identity =
+            format!("1:1:1:{}", "x".repeat(70_000));
         let receipt_budget =
             finalize_observed_call_path(&contract, &hashes, &rendering, receipt_budget);
         assert!(matches!(
             receipt_budget.result,
             Ok(IntegratedProjectedCallPathResult {
-                projection: InternalProjection::BudgetExceeded { .. },
+                projection: InternalProjection::Complete { .. },
                 ..
             })
         ));
-        assert_eq!(
+        assert!(matches!(
             receipt_budget.trace.finalization,
-            FinalizationTrace::Failed(FinalizationFailure::ReceiptBudget)
-        );
+            FinalizationTrace::Complete {
+                projection_bytes
+            } if projection_bytes > 70_000
+        ));
 
         let (missing_contract, missing_hashes, missing_rendering) =
             validated_contract("missing-id", &["target-id"]);
@@ -2581,11 +2585,19 @@ mod tests {
             &missing_rendering,
             projection_budget,
         );
-        assert!(projection_budget.result.is_err());
-        assert_eq!(
+        assert!(matches!(
+            projection_budget.result,
+            Ok(IntegratedProjectedCallPathResult {
+                projection: InternalProjection::Complete { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
             projection_budget.trace.finalization,
-            FinalizationTrace::Failed(FinalizationFailure::ProjectionBudget)
-        );
+            FinalizationTrace::Complete {
+                projection_bytes
+            } if projection_bytes > 70_000
+        ));
     }
 
     #[test]

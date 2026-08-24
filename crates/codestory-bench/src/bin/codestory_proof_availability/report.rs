@@ -3250,6 +3250,7 @@ mod tests {
                 },
                 canonical_id: canonical_id.to_owned(),
                 qualified_name: identity.qualified_name.clone(),
+                file_node_id: NodeId(prior.containment.file_node_id),
                 project_file_components: identity.project_file_components.clone(),
             }
         };

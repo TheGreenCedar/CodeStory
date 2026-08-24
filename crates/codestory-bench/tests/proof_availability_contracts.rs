@@ -1325,6 +1325,7 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
             pinned: pinned(node_id),
             canonical_id: format!("canonical-{node_id}"),
             qualified_name: declaration.symbol.clone(),
+            file_node_id: codestory_contracts::graph::NodeId(10),
             project_file_components: project_file_components.clone(),
         }
     };
@@ -1385,6 +1386,7 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
 #[test]
 fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
     use codestory_agent::proof_qualification_support::{PinnedNodeIdentity, ResolvedNodeIdentity};
+    use codestory_contracts::graph::NodeId;
 
     let raws = [
         "/Users/private/worktree/src/caller.rs::caller",
@@ -1410,6 +1412,7 @@ fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
                 },
                 canonical_id: raw.into(),
                 qualified_name: "module::callable".into(),
+                file_node_id: NodeId(node_id.parse().unwrap()),
                 project_file_components: vec!["src".into(), "caller.rs".into()],
             };
             let public = contracts::ResolvedNodeIdentityV1::try_from(&product).unwrap();
@@ -1447,6 +1450,7 @@ fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
         },
         canonical_id: String::new(),
         qualified_name: "module::callable".into(),
+        file_node_id: NodeId(-1),
         project_file_components: vec!["src".into(), "caller.rs".into()],
     };
     contracts::ResolvedNodeIdentityV1::try_from(&empty)
@@ -1481,6 +1485,7 @@ fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
         },
         canonical_id: canonical_id.into(),
         qualified_name: qualified_name.into(),
+        file_node_id: NodeId(-3),
         project_file_components: oracle
             .receipt_line_window
             .path
@@ -2683,6 +2688,7 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         },
         canonical_id: format!("canonical-{node_id}"),
         qualified_name: qualified_name.into(),
+        file_node_id: NodeId(-3),
         project_file_components: vec!["src".into(), "area0".into(), "file0.rs".into()],
     };
     let task6_receipt = IndexedCallEdgeReceipt {
@@ -2895,6 +2901,7 @@ fn admitted_callsite_identity_is_opaque_after_task6() {
             },
             canonical_id: format!("canonical-{node_id}"),
             qualified_name: declaration.symbol.clone(),
+            file_node_id: NodeId(-3),
             project_file_components: project_file_components.clone(),
         };
     let callsite_identity = format!("-3:{}:0:{RAW_TARGET}|fixture", oracle.callsite_line);

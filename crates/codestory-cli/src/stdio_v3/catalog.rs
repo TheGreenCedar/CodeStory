@@ -116,15 +116,6 @@ fn proof_file_schema_v3() -> Value {
 fn proof_symbol_schema_v3() -> Value {
     closed_object_schema_v3(vec![
         ("node_id", string_schema_v3()),
-        (
-            "pinned",
-            nullable_schema_v3(closed_object_schema_v3(vec![
-                ("project_id", string_schema_v3()),
-                ("core_generation_id", string_schema_v3()),
-                ("core_run_id", string_schema_v3()),
-                ("node_id", string_schema_v3()),
-            ])),
-        ),
         ("canonical_id", nullable_schema_v3(string_schema_v3())),
         ("qualified_name", nullable_schema_v3(string_schema_v3())),
         ("file", nullable_schema_v3(unsigned_integer_schema_v3())),
@@ -136,6 +127,8 @@ fn proof_evidence_schema_v3() -> Value {
         ("fact_id", sha256_schema_v3()),
         ("caller", unsigned_integer_schema_v3()),
         ("target", unsigned_integer_schema_v3()),
+        ("edge_id", string_schema_v3()),
+        ("callsite_identity", string_schema_v3()),
         (
             "chain",
             json!({"type":"array","items":closed_object_schema_v3(vec![

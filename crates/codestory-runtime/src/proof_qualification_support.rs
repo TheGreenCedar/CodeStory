@@ -17,6 +17,14 @@ pub use crate::indexed_source_call_path_v1::{
     ResolutionFactFailure, SelectorFailure, SelectorGateOutcome, SelectorQualificationTrace,
     SourceBindingFailure, StepQualificationOutcome, StepQualificationTrace,
 };
+pub use codestory_agent::proof_qualification_support::{
+    BuiltCallPathFacts, CallableContainmentEvidence, ClauseAnchor, ClauseClassification,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    PinnedNodeIdentity, ProofContractField, ReceiptRef, ResolvedNodeIdentity,
+    UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
+    UnvalidatedExactSymbolSelector, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
+    check_built_call_path_integration, project_internal_call_path_result, validate_contract,
+};
 
 /// Executes one observed proof through the runtime's existing core-only public
 /// operation. The benchmark cannot obtain the controller or add a second
