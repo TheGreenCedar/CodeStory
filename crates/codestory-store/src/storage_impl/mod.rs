@@ -1094,7 +1094,7 @@ fn read_proof_resolution_rollback_identity(
         )));
     };
     let receipt = storage
-        .validate_proof_resolution_publication(publication)
+        .validate_stored_proof_resolution_publication(publication)
         .map_err(|error| {
             promotion_error(format!(
                 "Proof resolution rollback identity does not match {}: {error}",

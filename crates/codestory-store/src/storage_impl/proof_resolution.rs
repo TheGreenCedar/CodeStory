@@ -212,6 +212,7 @@ struct ProofResolutionValidationContext {
     go_package_identity_by_file: HashMap<i64, GoPackageIdentity>,
     go_dependency_ids_by_package: HashMap<GoPackageIdentity, BTreeSet<FileId>>,
     go_attestation_error_by_file: HashMap<i64, String>,
+    live_go_sources_authenticated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -309,6 +310,47 @@ fn go_package_dependency_ids(
         .get(source_identity)
         .cloned()
         .ok_or_else(|| proof_error("Go authenticated package closure is missing"))
+}
+
+fn stored_go_package_dependency_ids(
+    source_file_id: FileId,
+    required_evidence_ids: &BTreeSet<FileId>,
+    stored_fact_ids: &BTreeSet<FileId>,
+    context: &ProofResolutionValidationContext,
+) -> Result<BTreeSet<FileId>, StorageError> {
+    if !required_evidence_ids.is_subset(stored_fact_ids) {
+        return Err(proof_error(
+            "stored Go dependency receipt omits source or typed evidence files",
+        ));
+    }
+    let source_file = context
+        .file_by_id
+        .get(&source_file_id.0)
+        .ok_or_else(|| proof_error("stored Go source dependency file is missing"))?;
+    let source_parent = source_file
+        .path
+        .parent()
+        .ok_or_else(|| proof_error("stored Go source path has no package directory"))?;
+    for file_id in stored_fact_ids {
+        count_go_store_replay_work(1);
+        let file = context
+            .file_by_id
+            .get(&file_id.0)
+            .ok_or_else(|| proof_error("stored Go dependency file is missing"))?;
+        if file.language != "go"
+            || file.path.parent() != Some(source_parent)
+            || file
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("_test.go"))
+        {
+            return Err(proof_error(
+                "stored Go dependency receipt crosses its authenticated package domain",
+            ));
+        }
+    }
+    Ok(stored_fact_ids.clone())
 }
 
 type PreparedGoPackageClosure = (
@@ -480,6 +522,7 @@ mod go_replay_complexity_tests {
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
+            live_go_sources_authenticated: true,
         };
         for _ in 0..lookup_count {
             go_package_dependency_ids(FileId(1), &BTreeSet::from([FileId(1)]), &context)
@@ -564,7 +607,10 @@ impl ProofRelationState {
 }
 
 impl ProofResolutionValidationContext {
-    fn prepare(storage: &Storage) -> Result<Self, StorageError> {
+    fn prepare(
+        storage: &Storage,
+        authenticate_live_go_sources: bool,
+    ) -> Result<Self, StorageError> {
         let file_by_id = storage
             .get_files()?
             .into_iter()
@@ -575,7 +621,11 @@ impl ProofResolutionValidationContext {
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
-        ) = prepare_go_package_closure(&file_by_id, &file_content_hash_by_id);
+        ) = if authenticate_live_go_sources {
+            prepare_go_package_closure(&file_by_id, &file_content_hash_by_id)
+        } else {
+            (HashMap::new(), HashMap::new(), HashMap::new())
+        };
         let node_by_id: HashMap<NodeId, Node> = storage
             .get_nodes()?
             .into_iter()
@@ -668,6 +718,7 @@ impl ProofResolutionValidationContext {
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
+            live_go_sources_authenticated: authenticate_live_go_sources,
         })
     }
 
@@ -849,11 +900,13 @@ impl Storage {
     fn validate_facts_against_graph(
         &self,
         facts: &[CallResolutionFact],
+        authenticate_live_go_sources: bool,
     ) -> Result<(), StorageError> {
         for fact in facts {
             validate_fact_seal(fact)?;
         }
-        let context = ProofResolutionValidationContext::prepare(self)?;
+        let context =
+            ProofResolutionValidationContext::prepare(self, authenticate_live_go_sources)?;
         let exact_fact_indices = facts
             .iter()
             .enumerate()
@@ -1039,11 +1092,16 @@ impl Storage {
                     "Go exact import evidence has no authenticated module-domain receipt",
                 ));
             }
-            required_dependency_ids = go_package_dependency_ids(
-                fact.callsite.file_id,
-                &required_dependency_ids,
-                context,
-            )?;
+            required_dependency_ids = if context.live_go_sources_authenticated {
+                go_package_dependency_ids(fact.callsite.file_id, &required_dependency_ids, context)?
+            } else {
+                stored_go_package_dependency_ids(
+                    fact.callsite.file_id,
+                    &required_dependency_ids,
+                    &dependency_file_ids(fact),
+                    context,
+                )?
+            };
         }
         let observed_dependency_ids = dependency_file_ids(fact);
         if observed_dependency_ids != required_dependency_ids {
@@ -1695,7 +1753,7 @@ impl Storage {
                     right.fact_id.as_str(),
                 ))
         });
-        self.validate_facts_against_graph(&facts)?;
+        self.validate_facts_against_graph(&facts, true)?;
         if facts.windows(2).any(|pair| {
             pair[0].callsite.file_id == pair[1].callsite.file_id
                 && pair[0].callsite.start_byte == pair[1].callsite.start_byte
@@ -1854,6 +1912,24 @@ impl Storage {
         &self,
         publication: &IndexPublicationRecord,
     ) -> Result<ProofResolutionPublication, StorageError> {
+        let (manifest, facts) = self.validate_proof_resolution_receipt(publication)?;
+        self.validate_facts_against_graph(&facts, true)?;
+        Ok(manifest)
+    }
+
+    pub(crate) fn validate_stored_proof_resolution_publication(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<ProofResolutionPublication, StorageError> {
+        let (manifest, facts) = self.validate_proof_resolution_receipt(publication)?;
+        self.validate_facts_against_graph(&facts, false)?;
+        Ok(manifest)
+    }
+
+    fn validate_proof_resolution_receipt(
+        &self,
+        publication: &IndexPublicationRecord,
+    ) -> Result<(ProofResolutionPublication, Vec<CallResolutionFact>), StorageError> {
         let manifest = self
             .get_proof_resolution_publication()?
             .ok_or_else(|| proof_error("complete publication receipt is missing"))?;
@@ -1878,8 +1954,10 @@ impl Storage {
                 "fact rows do not match their publication digest",
             ));
         }
-        self.validate_facts_against_graph(&facts)?;
-        Ok(manifest)
+        for fact in &facts {
+            validate_fact_seal(fact)?;
+        }
+        Ok((manifest, facts))
     }
 
     /// Rebind an already authenticated proof projection to a semantic-only
@@ -1893,7 +1971,11 @@ impl Storage {
         if self.get_proof_resolution_publication()?.is_none() {
             return Ok(None);
         }
-        self.validate_proof_resolution_publication(previous)?;
+        // A semantic-only republish is allowed to operate from the stored core
+        // after working-tree sources disappear. The previous publication was
+        // graph-validated before promotion; rebind authenticates its immutable
+        // fact rows and receipt without consulting live source bytes.
+        self.validate_stored_proof_resolution_publication(previous)?;
         if next.generation_id.trim().is_empty()
             || next.run_id.trim().is_empty()
             || next.published_at_epoch_ms < 0
@@ -1921,7 +2003,8 @@ impl Storage {
             ));
         }
         tx.commit()?;
-        self.validate_proof_resolution_publication(next).map(Some)
+        self.validate_stored_proof_resolution_publication(next)
+            .map(Some)
     }
 }
 

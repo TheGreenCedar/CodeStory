@@ -763,7 +763,10 @@ mod tests {
             )
         );
         assert!(
-            crate::proof_resolution::cached_resolution_inputs_are_current(&decoded, "go", "unused",)
+            !crate::proof_resolution::cached_resolution_inputs_are_current(
+                &decoded, "go", "unused",
+            ),
+            "a legacy cache without proof inputs cannot satisfy the installed Go adapter"
         );
     }
 }
