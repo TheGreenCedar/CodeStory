@@ -983,7 +983,7 @@ mod python_replay_complexity_tests {
                 fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
                 algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
                 language_adapter: "python".to_owned(),
-                language_adapter_version: "reference-v12".to_owned(),
+                language_adapter_version: "reference-v13".to_owned(),
                 parser_fingerprint: source_hash.clone(),
                 dependency_file_hashes: vec![DependencyFileHash {
                     file_id: FileId(source_file_id),

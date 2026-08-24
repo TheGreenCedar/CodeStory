@@ -84,8 +84,8 @@ fn python_resolution_work() -> usize {
     PYTHON_RESOLUTION_WORK.with(std::cell::Cell::get)
 }
 
-const ADAPTER_VERSION: &str = "reference-v12";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 10;
+const ADAPTER_VERSION: &str = "reference-v13";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 11;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
@@ -1899,15 +1899,7 @@ impl<'tree> PythonResolutionIndex<'tree> {
                 .parent()
                 .is_some_and(|parent| parent.kind() != "decorated_definition");
         let simple_base = python_single_simple_base(node, source);
-        let header_supported = node
-            .child_by_field_name("body")
-            .and_then(|body| source.get(node.start_byte()..body.start_byte()))
-            .is_some_and(|header| {
-                !header.contains('[')
-                    && (simple_base
-                        || (node.child_by_field_name("superclasses").is_none()
-                            && !header.contains('(')))
-            });
+        let header_supported = simple_base || node.child_by_field_name("superclasses").is_none();
         let closed = direct_module
             && node.child_by_field_name("type_parameters").is_none()
             && header_supported;
