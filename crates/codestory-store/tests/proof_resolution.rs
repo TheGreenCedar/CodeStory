@@ -11,6 +11,9 @@ use codestory_store::{
     seal_call_resolution_fact,
 };
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -118,6 +121,35 @@ fn projection(facts: Vec<CallResolutionFact>) -> ProofResolutionProjection {
     }
 }
 
+fn go_projection(fact: CallResolutionFact) -> ProofResolutionProjection {
+    let mut result = projection(vec![fact.clone()]);
+    result.adapter_roster = vec![ProofResolutionAdapter {
+        language: "go".to_owned(),
+        adapter_version: "reference-v10".to_owned(),
+    }];
+    result.funnel[0].language = "go".to_owned();
+    result.funnel[0].callee_form = Some(fact.callsite.callee_form);
+    result.funnel[0].evidence_kind = fact.evidence_chain.first().map(ResolutionEvidence::kind);
+    result
+}
+
+fn go_exact_fact(dependencies: &[(i64, String)]) -> CallResolutionFact {
+    let mut fact = exact_fact(EdgeId(7));
+    fact.provenance.language_adapter = "go".to_owned();
+    fact.provenance.language_adapter_version = "reference-v10".to_owned();
+    if let Some((_, source_hash)) = dependencies.iter().find(|(file_id, _)| *file_id == 1) {
+        fact.callsite.source_sha256 = source_hash.clone();
+    }
+    fact.provenance.dependency_file_hashes = dependencies
+        .iter()
+        .map(|(file_id, hash)| DependencyFileHash {
+            file_id: FileId(*file_id),
+            source_sha256: hash.clone(),
+        })
+        .collect();
+    seal_call_resolution_fact(fact).expect("seal Go exact fact")
+}
+
 fn incomplete_domain_projection() -> ProofResolutionProjection {
     ProofResolutionProjection {
         adapter_roster: vec![ProofResolutionAdapter {
@@ -217,6 +249,181 @@ fn seed_exact_graph(store: &mut Store) {
             ..Default::default()
         })
         .expect("edge");
+}
+
+fn seed_go_exact_graph(
+    store: &mut Store,
+    sibling: bool,
+) -> (tempfile::TempDir, Vec<(i64, String)>) {
+    seed_exact_graph(store);
+    let temp = tempfile::tempdir().expect("Go exact graph tempdir");
+    let package = temp.path().join("src");
+    fs::create_dir_all(&package).expect("create Go exact package");
+    let source_bytes = b"package proof\nfunc caller() { callee() }\n";
+    let source_path = package.join("main.go");
+    fs::write(&source_path, source_bytes).expect("write Go exact source");
+    let source_hash = sha256_bytes(source_bytes);
+    let source = FileInfo {
+        id: 1,
+        path: source_path,
+        language: "go".to_owned(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 2,
+        file_role: FileRole::Source,
+    };
+    store.insert_file(&source).expect("Go source file");
+    store
+        .update_file_metadata(&source, Some(&source_hash))
+        .expect("Go source hash");
+    let mut dependencies = vec![(1, source_hash)];
+    if sibling {
+        let sibling_bytes = b"package proof\nfunc helper() {}\n";
+        let sibling_path = package.join("helper.go");
+        fs::write(&sibling_path, sibling_bytes).expect("write Go exact sibling");
+        let sibling_hash = sha256_bytes(sibling_bytes);
+        let sibling = FileInfo {
+            id: 5,
+            path: sibling_path,
+            language: "go".to_owned(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 1,
+            file_role: FileRole::Source,
+        };
+        store.insert_file(&sibling).expect("Go sibling file");
+        store
+            .update_file_metadata(&sibling, Some(&sibling_hash))
+            .expect("Go sibling hash");
+        dependencies.push((5, sibling_hash));
+    }
+    (temp, dependencies)
+}
+
+fn sha256_bytes(source: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(source))
+}
+
+fn seed_authenticated_go_cross_file_graph(
+    store: &mut Store,
+    root: &Path,
+    source_package: &str,
+    target_package: &str,
+    target_path_uses_native_alias: bool,
+) -> CallResolutionFact {
+    let package = root.join("package");
+    fs::create_dir_all(&package).expect("create Go package");
+    let source_path = package.join("main.go");
+    let target_path = package.join("target.go");
+    let source = format!("package {source_package}\nfunc caller() {{ callee() }}\n");
+    let target = format!("package {target_package}\nfunc callee() {{}}\n");
+    fs::write(&source_path, source.as_bytes()).expect("write Go source");
+    fs::write(&target_path, target.as_bytes()).expect("write Go target");
+    let recorded_target_path = if target_path_uses_native_alias {
+        package.join("..").join("package").join("target.go")
+    } else {
+        target_path
+    };
+    let source_sha256 = sha256_bytes(source.as_bytes());
+    let target_sha256 = sha256_bytes(target.as_bytes());
+    for (id, path, hash) in [
+        (1, source_path, source_sha256.clone()),
+        (5, recorded_target_path, target_sha256.clone()),
+    ] {
+        let file = FileInfo {
+            id,
+            path,
+            language: "go".to_owned(),
+            modification_time: 0,
+            indexed: true,
+            complete: true,
+            line_count: 2,
+            file_role: FileRole::Source,
+        };
+        store.insert_file(&file).expect("Go file");
+        store
+            .update_file_metadata(&file, Some(&hash))
+            .expect("Go source hash");
+    }
+    for node in [
+        Node {
+            id: NodeId(1),
+            kind: NodeKind::FILE,
+            serialized_name: "main.go".to_owned(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(5),
+            kind: NodeKind::FILE,
+            serialized_name: "target.go".to_owned(),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(2),
+            end_line: Some(2),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "callee".to_owned(),
+            file_node_id: Some(NodeId(5)),
+            start_line: Some(2),
+            end_line: Some(2),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(4),
+            kind: NodeKind::UNKNOWN,
+            serialized_name: "callee".to_owned(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(2),
+            start_col: Some(15),
+            end_line: Some(2),
+            end_col: Some(21),
+            ..Default::default()
+        },
+    ] {
+        store.insert_node(&node).expect("Go graph node");
+    }
+    store
+        .insert_edge(&Edge {
+            id: EdgeId(7),
+            source: NodeId(2),
+            target: NodeId(4),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(NodeId(1)),
+            line: Some(2),
+            resolved_target: Some(NodeId(3)),
+            callsite_identity: Some("1:2:1:4".to_owned()),
+            ..Default::default()
+        })
+        .expect("Go CALL edge");
+
+    let mut fact = exact_fact(EdgeId(7));
+    fact.callsite.source_sha256 = source_sha256.clone();
+    fact.evidence_chain = vec![ResolutionEvidence::SamePackageDeclaration {
+        declaration: NodeId(3),
+    }];
+    fact.provenance.dependency_file_hashes = vec![
+        DependencyFileHash {
+            file_id: FileId(1),
+            source_sha256,
+        },
+        DependencyFileHash {
+            file_id: FileId(5),
+            source_sha256: target_sha256,
+        },
+    ];
+    fact.provenance.language_adapter = "go".to_owned();
+    fact.provenance.language_adapter_version = "reference-v10".to_owned();
+    seal_call_resolution_fact(fact).expect("seal authenticated Go fact")
 }
 
 fn receiver_projection(fact: CallResolutionFact) -> ProofResolutionProjection {
@@ -726,6 +933,127 @@ fn exact_projection_round_trips_with_matching_raw_call_and_deterministic_digest(
         first,
         store.get_proof_resolution_publication().unwrap().unwrap()
     );
+}
+
+#[test]
+fn go_exact_projection_requires_the_complete_package_dependency_set() {
+    let mut accepted = Store::new_in_memory().unwrap();
+    let (_accepted_files, accepted_dependencies) = seed_go_exact_graph(&mut accepted, true);
+    accepted
+        .replace_proof_resolution_projection(
+            &publication(),
+            &go_projection(go_exact_fact(&accepted_dependencies)),
+        )
+        .expect("complete Go package closure must validate");
+
+    let mut missing = Store::new_in_memory().unwrap();
+    let (_missing_files, missing_dependencies) = seed_go_exact_graph(&mut missing, true);
+    missing
+        .replace_proof_resolution_projection(
+            &publication(),
+            &go_projection(go_exact_fact(&missing_dependencies[..1])),
+        )
+        .expect_err("missing Go package dependency must fail closed");
+
+    let mut extra = Store::new_in_memory().unwrap();
+    let (_extra_files, mut extra_dependencies) = seed_go_exact_graph(&mut extra, true);
+    let unrelated = FileInfo {
+        id: 6,
+        path: "other/unrelated.go".into(),
+        language: "go".to_owned(),
+        modification_time: 0,
+        indexed: true,
+        complete: true,
+        line_count: 1,
+        file_role: FileRole::Source,
+    };
+    extra.insert_file(&unrelated).unwrap();
+    extra
+        .update_file_metadata(&unrelated, Some(&"c".repeat(64)))
+        .unwrap();
+    extra_dependencies.push((6, "c".repeat(64)));
+    extra
+        .replace_proof_resolution_projection(
+            &publication(),
+            &go_projection(go_exact_fact(&extra_dependencies)),
+        )
+        .expect_err("extra Go package dependency must fail closed");
+}
+
+#[test]
+fn go_store_rejects_evidence_scope_swaps_and_unauthenticated_imports() {
+    for mutate in [
+        (|fact: &mut CallResolutionFact| {
+            fact.evidence_chain = vec![ResolutionEvidence::SamePackageDeclaration {
+                declaration: NodeId(3),
+            }];
+        }) as fn(&mut CallResolutionFact),
+        |fact: &mut CallResolutionFact| {
+            fact.evidence_chain = vec![ResolutionEvidence::StaticImportBinding {
+                import: NodeId(4),
+                declaration: NodeId(3),
+            }];
+        },
+    ] {
+        let mut store = Store::new_in_memory().unwrap();
+        let (_files, dependencies) = seed_go_exact_graph(&mut store, false);
+        let mut fact = go_exact_fact(&dependencies);
+        mutate(&mut fact);
+        let fact = seal_call_resolution_fact(fact).unwrap();
+        store
+            .replace_proof_resolution_projection(&publication(), &go_projection(fact))
+            .expect_err("forged Go evidence must fail closed");
+    }
+}
+
+#[test]
+fn go_store_replay_requires_exact_package_clause_and_native_directory_identity() {
+    let crossed = tempfile::tempdir().expect("crossed package tempdir");
+    let mut crossed_store = Store::new_in_memory().unwrap();
+    let crossed_fact = seed_authenticated_go_cross_file_graph(
+        &mut crossed_store,
+        crossed.path(),
+        "proof",
+        "other",
+        false,
+    );
+    crossed_store
+        .replace_proof_resolution_projection(&publication(), &go_projection(crossed_fact))
+        .expect_err("resealed cross-package-clause Go evidence must fail closed");
+
+    let aliased = tempfile::tempdir().expect("native alias tempdir");
+    let mut aliased_store = Store::new_in_memory().unwrap();
+    let aliased_fact = seed_authenticated_go_cross_file_graph(
+        &mut aliased_store,
+        aliased.path(),
+        "proof",
+        "proof",
+        true,
+    );
+    aliased_store
+        .replace_proof_resolution_projection(&publication(), &go_projection(aliased_fact))
+        .expect("native aliases of one authenticated Go package directory must agree");
+}
+
+#[test]
+fn go_store_replay_rejects_identifier_authority_over_a_method_target() {
+    let mut store = Store::new_in_memory().unwrap();
+    let (_files, dependencies) = seed_go_exact_graph(&mut store, false);
+    store
+        .get_connection()
+        .execute("UPDATE node SET kind = 14 WHERE id = 3", [])
+        .unwrap();
+    let stored_kind: i32 = store
+        .get_connection()
+        .query_row("SELECT kind FROM node WHERE id = 3", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(stored_kind, NodeKind::METHOD as i32);
+    store
+        .replace_proof_resolution_projection(
+            &publication(),
+            &go_projection(go_exact_fact(&dependencies)),
+        )
+        .expect_err("Go identifier evidence must authorize only a FUNCTION target");
 }
 
 #[test]

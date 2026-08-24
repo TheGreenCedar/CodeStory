@@ -1,7 +1,7 @@
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{
-    ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
+    ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
 };
 use codestory_indexer::{WorkspaceIndexer, rematerialize_proof_resolution_projection};
 use codestory_store::{FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store};
@@ -442,6 +442,918 @@ fn typescript_and_rust_reference_calls_rematerialize_exact_facts() -> anyhow::Re
                 && row.counts.authoritative_receipts == 0
                 && row.counts.complete_proofs == 0)
     );
+    Ok(())
+}
+
+#[test]
+fn go_closed_exact_subset_authorizes_package_functions_and_concrete_receivers() -> anyhow::Result<()>
+{
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("go.mod", "module example.com/proof\n\ngo 1.24\n"),
+            (
+                "worker.go",
+                concat!(
+                    "package proof\n\n",
+                    "type Worker struct{}\n",
+                    "type ValueWorker struct{}\n",
+                    "func localTarget() {}\n",
+                    "func (w *Worker) implicit() { w.step() }\n",
+                    "func (w *Worker) step() {}\n",
+                    "func (w ValueWorker) valueStep() {}\n",
+                    "func parameter(w *Worker) { w.step() }\n",
+                    "func constructed() {\n",
+                    "  a := ValueWorker{}\n",
+                    "  a.valueStep()\n",
+                    "  b := &Worker{}\n",
+                    "  b.step()\n",
+                    "  c := new(Worker)\n",
+                    "  c.step()\n",
+                    "}\n",
+                    "func sameFile() { localTarget() }\n",
+                ),
+            ),
+            (
+                "cross.go",
+                "package proof\n\nfunc crossFile() { localTarget() }\n",
+            ),
+        ],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let exact = facts
+        .iter()
+        .filter(|fact| fact.provenance.language_adapter == "go")
+        .filter(|fact| fact.status == ProofResolutionStatus::Exact)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        exact
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == "localTarget")
+            .count(),
+        2,
+        "same-file and cross-file package functions: {facts:#?}"
+    );
+    assert_eq!(
+        exact
+            .iter()
+            .filter(|fact| matches!(fact.callsite.raw_target.as_str(), "step" | "valueStep"))
+            .count(),
+        5,
+        "implicit, typed, value, pointer, and builtin-new receivers: {facts:#?}"
+    );
+    assert!(exact.iter().all(|fact| {
+        fact.provenance.dependency_file_hashes.len() == 2
+            && fact.edge_id.is_some()
+            && fact.target.is_some()
+    }));
+    Ok(())
+}
+
+#[test]
+fn go_explicit_typed_local_receiver_is_exact_without_reassignment() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller() { var worker *Worker; worker.Run() }\n",
+            ),
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "Run")
+        .expect("typed local fact");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(matches!(
+        fact.evidence_chain.as_slice(),
+        [
+            ResolutionEvidence::ExplicitReceiverType { .. },
+            ResolutionEvidence::SameFileDeclaration { .. }
+        ]
+    ));
+    Ok(())
+}
+
+#[test]
+fn go_type_and_constructor_authority_requires_closed_ast_shapes() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "nested_selector.go",
+            concat!(
+                "package proof\n",
+                "type A struct { B B }\n",
+                "type B struct{}\n",
+                "func (*A) Run() {}\n",
+                "func (*B) Run() {}\n",
+                "func caller() { x := A{B: B{}}.B; x.Run() }\n",
+            ),
+        ),
+        (
+            "double_pointer.go",
+            concat!(
+                "package proof\n",
+                "type A struct{}\n",
+                "func (*A) Run() {}\n",
+                "func caller(x **A) { x.Run() }\n",
+            ),
+        ),
+        (
+            "parenthesized.go",
+            concat!(
+                "package proof\n",
+                "type A struct{}\n",
+                "func (*A) Run() {}\n",
+                "func caller(x (A)) { x.Run() }\n",
+            ),
+        ),
+        (
+            "arbitrary_expression.go",
+            concat!(
+                "package proof\n",
+                "type A struct{}\n",
+                "func (*A) Run() {}\n",
+                "func caller() { x := A{}; y := []A{x}[0]; y.Run() }\n",
+            ),
+        ),
+    ];
+    for (path, source) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let run = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "Run")
+            .unwrap_or_else(|| panic!("missing hostile constructor fact for {path}"));
+        assert_ne!(
+            run.status,
+            ProofResolutionStatus::Exact,
+            "non-closed Go type/constructor surface became Exact for {path}: {run:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn go_relevant_range_select_and_type_switch_bindings_poison_outer_authority() -> anyhow::Result<()>
+{
+    let cases = [
+        (
+            "range_declare.go",
+            concat!(
+                "package proof\n",
+                "type A struct{}\n",
+                "type B struct{}\n",
+                "func (*A) Run() {}\n",
+                "func (*B) Run() {}\n",
+                "func caller(a *A, xs []*B) { for _, a := range xs { a.Run() } }\n",
+            ),
+        ),
+        (
+            "range_assign.go",
+            concat!(
+                "package proof\n",
+                "type A struct{}\n",
+                "type B struct{}\n",
+                "func (*A) Run() {}\n",
+                "func (*B) Run() {}\n",
+                "func caller(a *A, xs []*B) { for _, a = range xs { a.Run() } }\n",
+            ),
+        ),
+        (
+            "select_receive.go",
+            concat!(
+                "package proof\n",
+                "type A struct{}\n",
+                "type B struct{}\n",
+                "func (*A) Run() {}\n",
+                "func (*B) Run() {}\n",
+                "func caller(a *A, ch <-chan *B) { select { case a := <-ch: a.Run() } }\n",
+            ),
+        ),
+        (
+            "type_switch.go",
+            concat!(
+                "package proof\n",
+                "type A struct{}\n",
+                "type B struct{}\n",
+                "func (*A) Run() {}\n",
+                "func (*B) Run() {}\n",
+                "func caller(a *A, value any) { switch a := value.(type) { case *B: a.Run() } }\n",
+            ),
+        ),
+    ];
+    for (path, source) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let run = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "Run")
+            .unwrap_or_else(|| panic!("missing hostile lexical fact for {path}"));
+        assert_ne!(
+            run.status,
+            ProofResolutionStatus::Exact,
+            "incomplete Go lexical closure retained outer authority for {path}: {run:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn go_source_and_owner_closure_rejects_generated_linkname_and_owner_competitors()
+-> anyhow::Result<()> {
+    let leading_comments = (0..21)
+        .map(|index| format!("// leading comment {index}\n"))
+        .collect::<String>();
+    let generated = format!(
+        "{leading_comments}// Code generated by fixture. DO NOT EDIT.\npackage proof\nfunc target() {{}}\nfunc caller() {{ target() }}\n"
+    );
+    let cases = [
+        (
+            vec![("generated.go", generated.as_str())],
+            "target",
+            "generated marker after line 20",
+        ),
+        (
+            vec![(
+                "linkname.go",
+                concat!(
+                    "package proof\n",
+                    "import _ \"unsafe\"\n",
+                    "//go:linkname target runtime.target\n",
+                    "func target() {}\n",
+                    "func caller() { target() }\n",
+                ),
+            )],
+            "target",
+            "go:linkname",
+        ),
+        (
+            vec![
+                (
+                    "main.go",
+                    concat!(
+                        "package proof\n",
+                        "type Worker struct{}\n",
+                        "func (*Worker) Run() {}\n",
+                        "func caller(worker *Worker) { worker.Run() }\n",
+                    ),
+                ),
+                (
+                    "conditional.go",
+                    "//go:build linux\n\npackage proof\nvar Worker = 1\n",
+                ),
+            ],
+            "Run",
+            "conditional owner-name competitor",
+        ),
+    ];
+    for (files, target, label) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == target)
+            .unwrap_or_else(|| panic!("missing source-closure fact for {label}"));
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "{label} became Exact: {fact:#?}"
+        );
+    }
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "string.go",
+            concat!(
+                "package proof\n",
+                "const marker = \"// Code generated by fixture. DO NOT EDIT.\"\n",
+                "func target() {}\n",
+                "func caller() { target() }\n",
+            ),
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let target = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("string non-marker fact");
+    assert_eq!(target.status, ProofResolutionStatus::Exact, "{target:#?}");
+    Ok(())
+}
+
+#[test]
+fn go_unsupported_shadowed_and_open_domains_never_authorize_exact_receipts() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "shadow.go",
+            concat!(
+                "package proof\n",
+                "func target() {}\n",
+                "func caller(target func()) { target() }\n",
+            ),
+            "target",
+        ),
+        (
+            "interface.go",
+            concat!(
+                "package proof\n",
+                "type Runner interface { Run() }\n",
+                "func caller(r Runner) { r.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "embedded.go",
+            concat!(
+                "package proof\n",
+                "type Base struct{}\n",
+                "func (Base) Run() {}\n",
+                "type Child struct { Base }\n",
+                "func caller(c Child) { c.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "rebound.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller(w *Worker) { w = &Worker{}; w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "pointer_promotion.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller(w Worker) { w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "captured.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller(w *Worker) { func() { w = &Worker{} }(); w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "branch_write.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller(w *Worker, condition bool) { if condition { w = &Worker{} }; w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "branch_binding.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller(condition bool) { if condition { w := &Worker{}; w.Run() } }\n",
+            ),
+            "Run",
+        ),
+        (
+            "shadowed_new.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func caller(new func(Worker) *Worker) { w := new(Worker{}); w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "package_new.go",
+            concat!(
+                "package proof\n",
+                "type Worker struct{}\n",
+                "func (*Worker) Run() {}\n",
+                "func new(Worker) *Worker { return &Worker{} }\n",
+                "func caller() { w := new(Worker{}); w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "generic_receiver.go",
+            concat!(
+                "package proof\n",
+                "type Worker[T any] struct{}\n",
+                "func (*Worker[T]) Run() {}\n",
+                "func caller(w *Worker[int]) { w.Run() }\n",
+            ),
+            "Run",
+        ),
+        (
+            "local_const_shadow.go",
+            concat!(
+                "package proof\n",
+                "func target() {}\n",
+                "func caller() { const target = 1; target() }\n",
+            ),
+            "target",
+        ),
+        (
+            "local_type_shadow.go",
+            concat!(
+                "package proof\n",
+                "func target() {}\n",
+                "func caller() { type target int; target() }\n",
+            ),
+            "target",
+        ),
+        (
+            "local_function_shadow.go",
+            concat!(
+                "package proof\n",
+                "func target() {}\n",
+                "func caller() { target := func() {}; target() }\n",
+            ),
+            "target",
+        ),
+        (
+            "import_shadow.go",
+            concat!(
+                "package proof\n",
+                "import target \"example.com/other\"\n",
+                "func target() {}\n",
+                "func caller() { target() }\n",
+            ),
+            "target",
+        ),
+        (
+            "dot_import.go",
+            concat!(
+                "package proof\n",
+                "import . \"example.com/other\"\n",
+                "func target() {}\n",
+                "func caller() { target() }\n",
+            ),
+            "target",
+        ),
+    ];
+    for (path, source, target) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let matching = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.provenance.language_adapter == "go")
+            .filter(|fact| fact.callsite.raw_target == target)
+            .collect::<Vec<_>>();
+        assert!(!matching.is_empty(), "missing Go fact for {path}");
+        assert!(
+            matching
+                .iter()
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "unsupported Go case became Exact for {path}: {matching:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn go_lexical_shadowing_is_callsite_specific() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[((
+            "main.go",
+            concat!(
+                "package proof\n",
+                "func target() {}\n",
+                "func caller() { target(); { target := func() {}; target() }; target() }\n",
+            ),
+        ))],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let matching = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 3, "{matching:#?}");
+    assert_ne!(matching[0].status, ProofResolutionStatus::Unsupported);
+    assert_eq!(matching[1].status, ProofResolutionStatus::Unsupported);
+    assert_ne!(matching[2].status, ProofResolutionStatus::Unsupported);
+    assert!(
+        matching
+            .iter()
+            .all(|fact| fact.status != ProofResolutionStatus::Exact)
+    );
+    Ok(())
+}
+
+#[test]
+fn go_filename_selected_callers_and_competing_declarations_are_incomplete() -> anyhow::Result<()> {
+    for files in [
+        vec![(
+            "main_linux.go",
+            "package proof\nfunc target() {}\nfunc caller() { target() }\n",
+        )],
+        vec![
+            (
+                "main.go",
+                "package proof\nfunc target() {}\nfunc caller() { target() }\n",
+            ),
+            (
+                "target_windows_amd64.go",
+                "package proof\nfunc target() {}\n",
+            ),
+        ],
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let target = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("target fact");
+        assert_eq!(
+            target.status,
+            ProofResolutionStatus::IncompleteDomain,
+            "{target:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn go_package_closure_and_imports_fail_closed_without_complete_authenticated_domains()
+-> anyhow::Result<()> {
+    for (files, target) in [
+        (
+            vec![
+                ("a.go", "package proof\nfunc target() {}\n"),
+                (
+                    "b.go",
+                    "package proof\nfunc target() {}\nfunc caller() { target() }\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            vec![
+                (
+                    "a.go",
+                    "package proof\nfunc target() {}\nfunc caller() { target() }\n",
+                ),
+                (
+                    "conditional.go",
+                    "//go:build linux\n\npackage proof\nfunc target() {}\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            vec![
+                ("go.mod", "module example.com/proof\n\ngo 1.24\n"),
+                ("dep/dep.go", "package dep\nfunc Target() {}\n"),
+                (
+                    "main.go",
+                    "package proof\nimport alias \"example.com/proof/dep\"\nfunc caller() { alias.Target() }\n",
+                ),
+            ],
+            "Target",
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let matching = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.provenance.language_adapter == "go")
+            .filter(|fact| fact.callsite.raw_target == target)
+            .collect::<Vec<_>>();
+        assert!(!matching.is_empty(), "missing Go closure fact for {target}");
+        assert!(
+            matching
+                .iter()
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "open Go package/import domain became Exact: {matching:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn go_imported_receivers_are_incomplete_without_an_authenticated_module_domain()
+-> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("go.mod", "module example.com/proof\n\ngo 1.24\n"),
+            (
+                "dep/dep.go",
+                "package dep\ntype Worker struct{}\nfunc (*Worker) Run() {}\n",
+            ),
+            (
+                "main.go",
+                concat!(
+                    "package proof\n",
+                    "import dep \"example.com/proof/dep\"\n",
+                    "func parameter(worker *dep.Worker) { worker.Run() }\n",
+                    "func constructed() { worker := &dep.Worker{}; worker.Run() }\n",
+                ),
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let matching = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "Run")
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 2, "{matching:#?}");
+    assert!(matching.iter().all(|fact| {
+        fact.status == ProofResolutionStatus::IncompleteDomain
+            && fact.reason == ProofResolutionReason::LookupDomainIncomplete
+    }));
+    Ok(())
+}
+
+#[test]
+fn go_noncompeting_conditional_and_test_siblings_preserve_the_exact_package_domain()
+-> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "main.go",
+                "package proof\nfunc target() {}\nfunc caller() { target() }\n",
+            ),
+            (
+                "conditional.go",
+                "//go:build linux\n\npackage proof\nfunc unrelated() {}\n",
+            ),
+            ("main_test.go", "package proof_test\nfunc testOnly() {}\n"),
+            ("same_package_test.go", "package proof\nfunc target() {}\n"),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let target = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "go" && fact.callsite.raw_target == "target"
+        })
+        .expect("target fact");
+    assert_eq!(target.status, ProofResolutionStatus::Exact, "{target:#?}");
+    assert_eq!(target.provenance.dependency_file_hashes.len(), 2);
+    assert!(
+        target
+            .provenance
+            .dependency_file_hashes
+            .iter()
+            .all(|dependency| dependency.file_id != target.callsite.file_id
+                || dependency.source_sha256 == target.callsite.source_sha256)
+    );
+    Ok(())
+}
+
+#[test]
+fn go_missing_cache_coverage_and_parser_error_siblings_make_the_package_incomplete()
+-> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.go",
+            "package proof\nfunc target() {}\nfunc caller() { target() }\n",
+        )],
+    )?;
+    fs::write(
+        project.path().join("not_indexed.go"),
+        "package proof\nfunc unrelated() {}\n",
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let missing = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("missing-coverage target fact");
+    assert_eq!(missing.status, ProofResolutionStatus::IncompleteDomain);
+
+    let parse_project = tempfile::tempdir()?;
+    let mut parse_store = Store::new_in_memory()?;
+    index_files(
+        parse_project.path(),
+        &mut parse_store,
+        &[
+            (
+                "main.go",
+                "package proof\nfunc target() {}\nfunc caller() { target() }\n",
+            ),
+            ("broken.go", "package proof\nfunc broken( {\n"),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut parse_store, &publication(1))?;
+    let parser_error = parse_store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("parser-error target fact");
+    assert_eq!(parser_error.status, ProofResolutionStatus::IncompleteDomain);
+    Ok(())
+}
+
+#[test]
+fn go_generated_targets_and_same_named_other_owners_stay_non_authoritative() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "types.go",
+                concat!(
+                    "package proof\n",
+                    "type A struct{}\n",
+                    "type B struct{}\n",
+                    "func (*A) Run() {}\n",
+                    "func (*B) Run() {}\n",
+                    "func caller(a *A) { a.Run() }\n",
+                ),
+            ),
+            (
+                "generated.go",
+                "// Code generated by fixture. DO NOT EDIT.\npackage proof\nfunc generatedTarget() {}\nfunc generatedCaller() { generatedTarget() }\n",
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let run = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "Run")
+        .expect("owner-specific method fact");
+    assert_eq!(
+        run.status,
+        ProofResolutionStatus::Exact,
+        "the exact receiver owner must disambiguate same-spelled methods: {run:#?}"
+    );
+    assert!(matches!(
+        run.evidence_chain.as_slice(),
+        [
+            ResolutionEvidence::ExplicitReceiverType { .. },
+            ResolutionEvidence::SameFileDeclaration { .. }
+        ]
+    ));
+    let generated = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "generatedTarget")
+        .expect("generated target fact");
+    assert_ne!(generated.status, ProofResolutionStatus::Exact);
+    Ok(())
+}
+
+#[test]
+fn go_repeated_callsites_and_utf8_crlf_coordinates_are_source_bound_and_distinct()
+-> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let source =
+        "package proof\r\n// λλ\r\nfunc target() {}\r\nfunc caller() { target(); target() }\r\n";
+    index_files(project.path(), &mut store, &[("main.go", source)])?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let mut facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    facts.sort_by_key(|fact| fact.callsite.start_byte);
+    assert_eq!(facts.len(), 2, "{facts:#?}");
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.status == ProofResolutionStatus::Exact)
+    );
+    assert_ne!(facts[0].edge_id, facts[1].edge_id);
+    assert_ne!(
+        facts[0].raw_callsite_identity,
+        facts[1].raw_callsite_identity
+    );
+    for fact in &facts {
+        assert_eq!(
+            &source.as_bytes()
+                [fact.callsite.start_byte as usize..fact.callsite.end_byte_exclusive as usize],
+            b"target"
+        );
+        assert_eq!(fact.callsite.line, 4);
+    }
+    assert!(facts[0].callsite.column < facts[1].callsite.column);
+    Ok(())
+}
+
+#[test]
+fn go_wrong_effective_target_never_becomes_exact_even_with_certain_navigation_metadata()
+-> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.go",
+            concat!(
+                "package proof\n",
+                "type A struct{}\n",
+                "type B struct{}\n",
+                "func (*A) Run() {}\n",
+                "func (*B) Run() {}\n",
+                "func caller(a *A) { a.Run() }\n",
+            ),
+        )],
+    )?;
+    let nodes = store.get_nodes()?;
+    let wrong_target = nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::METHOD && node.serialized_name.ends_with("B.Run"))
+        .map(|node| node.id)
+        .next()
+        .or_else(|| {
+            nodes
+                .iter()
+                .filter(|node| {
+                    node.kind == NodeKind::METHOD && node.serialized_name.ends_with("Run")
+                })
+                .nth(1)
+                .map(|node| node.id)
+        })
+        .expect("B.Run target");
+    let call = store
+        .get_edges()?
+        .into_iter()
+        .find(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(6))
+        .expect("receiver CALL edge");
+    store.get_connection().execute(
+        "UPDATE edge SET resolved_target_node_id = ?1, certainty = 1, confidence = 1.0 WHERE id = ?2",
+        (wrong_target.0, call.id.0),
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "Run")
+        .expect("mutated Run fact");
+    assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(fact.edge_id.is_none());
     Ok(())
 }
 
@@ -2747,7 +3659,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let mut empty = Store::new_in_memory()?;
     let empty_receipt = rematerialize_proof_resolution_projection(&mut empty, &publication(1))?;
     assert_eq!(empty_receipt.fact_count, 0);
-    assert_eq!(empty_receipt.adapter_roster.len(), 4);
+    assert_eq!(empty_receipt.adapter_roster.len(), 5);
 
     let project = tempfile::tempdir()?;
     let mut unsupported = Store::new_in_memory()?;
@@ -2762,7 +3674,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let unsupported_receipt =
         rematerialize_proof_resolution_projection(&mut unsupported, &publication(1))?;
     assert_eq!(unsupported_receipt.fact_count, 0);
-    assert_eq!(unsupported_receipt.adapter_roster.len(), 4);
+    assert_eq!(unsupported_receipt.adapter_roster.len(), 5);
 
     let governed_project = tempfile::tempdir()?;
     let mut governed = Store::new_in_memory()?;
@@ -2990,7 +3902,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v7", "adapter", "language"]
+            ["stale", "schema-v8", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"

@@ -1,8 +1,9 @@
 use crate::cache::{
     CachedCallResolutionInput, CachedClassBinding, CachedClassDeclaration, CachedClassMethod,
-    CachedDeclarationKind, CachedDirectExport, CachedIndexArtifact, CachedInherentMethod,
-    CachedResolutionBinding, CachedResolutionFile, CachedRustFileModule, CachedRustModule,
-    CachedRustType, CachedRustUseBinding, CachedTopLevelDeclaration,
+    CachedDeclarationKind, CachedDirectExport, CachedGoMethod, CachedGoPackage, CachedGoType,
+    CachedIndexArtifact, CachedInherentMethod, CachedResolutionBinding, CachedResolutionFile,
+    CachedRustFileModule, CachedRustModule, CachedRustType, CachedRustUseBinding,
+    CachedTopLevelDeclaration,
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
@@ -25,6 +26,7 @@ use tree_sitter::{Node as TsNode, Tree};
 #[cfg(test)]
 thread_local! {
     static RUST_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -45,9 +47,28 @@ fn rust_resolution_work() -> usize {
     RUST_RESOLUTION_WORK.with(std::cell::Cell::get)
 }
 
-const ADAPTER_VERSION: &str = "reference-v9";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 7;
+#[inline]
+fn count_go_resolution_work(amount: usize) {
+    #[cfg(test)]
+    GO_RESOLUTION_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_go_resolution_work() {
+    GO_RESOLUTION_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn go_resolution_work() -> usize {
+    GO_RESOLUTION_WORK.with(std::cell::Cell::get)
+}
+
+const ADAPTER_VERSION: &str = "reference-v10";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 8;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
+    ("go", ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
     ("rust", ADAPTER_VERSION),
     ("tsx", ADAPTER_VERSION),
@@ -80,6 +101,8 @@ pub(crate) fn collect_call_resolution_inputs(
         .then(|| JavascriptResolutionIndex::build(tree, source, file_id, nodes));
     let rust_index =
         (language == "rust").then(|| RustResolutionIndex::build(tree, source, file_id, nodes));
+    let go_index =
+        (language == "go").then(|| GoResolutionIndex::build(tree, source, file_id, nodes));
     let (direct_exports, export_poison_all, poisoned_export_names) =
         if let Some(index) = &javascript_index {
             index.collect_direct_exports(source)
@@ -93,6 +116,8 @@ pub(crate) fn collect_call_resolution_inputs(
         index.cached_top_level_declarations()
     } else if let Some(index) = &rust_index {
         index.declarations.clone()
+    } else if let Some(index) = &go_index {
+        index.declarations.clone()
     } else {
         Vec::new()
     };
@@ -102,55 +127,67 @@ pub(crate) fn collect_call_resolution_inputs(
         Vec::new()
     };
     let mut calls = Vec::new();
-    let mut emit_call = |callee: TsNode<'_>,
-                         form: CalleeForm,
-                         raw_target: String,
-                         rust_callable_id: Option<usize>| {
-        let mut callsite = ExactCallsite {
-            file_id: FileId(file_id.0),
-            source_sha256: source_sha256.clone(),
-            start_byte: callee.start_byte() as u64,
-            end_byte_exclusive: callee.end_byte() as u64,
-            line: callee.start_position().row as u32 + 1,
-            column: callee.start_position().column as u32 + 1,
-            callee_form: form,
-            raw_target: raw_target.clone(),
-        };
-        let (caller, mut binding) = if let Some(index) = &rust_index {
-            index.resolve_syntax_claim(source, callee, form, &raw_target, rust_callable_id)
-        } else if let Some(index) = &javascript_index {
-            index.resolve_syntax_claim(source, callee, form, &raw_target)
-        } else {
-            (None, CachedResolutionBinding::Unsupported)
-        };
-        if !lookup_input_complete {
-            binding = CachedResolutionBinding::IncompleteDomain;
-        }
-        if matches!(binding, CachedResolutionBinding::StaticImport { .. })
-            || matches!(
+    let mut emit_call =
+        |callee: TsNode<'_>, form: CalleeForm, raw_target: String, callable_id: Option<usize>| {
+            let mut callsite = ExactCallsite {
+                file_id: FileId(file_id.0),
+                source_sha256: source_sha256.clone(),
+                start_byte: callee.start_byte() as u64,
+                end_byte_exclusive: callee.end_byte() as u64,
+                line: callee.start_position().row as u32 + 1,
+                column: callee.start_position().column as u32 + 1,
+                callee_form: form,
+                raw_target: raw_target.clone(),
+            };
+            let (caller, mut binding) = if let Some(index) = &rust_index {
+                index.resolve_syntax_claim(source, callee, form, &raw_target, callable_id)
+            } else if let Some(index) = &go_index {
+                index.resolve_syntax_claim(source, callee, form, &raw_target, callable_id)
+            } else if let Some(index) = &javascript_index {
+                index.resolve_syntax_claim(source, callee, form, &raw_target)
+            } else {
+                (None, CachedResolutionBinding::Unsupported)
+            };
+            if !lookup_input_complete {
+                binding = CachedResolutionBinding::IncompleteDomain;
+            }
+            if matches!(binding, CachedResolutionBinding::GoImplicitReceiver { .. }) {
+                callsite.callee_form = CalleeForm::ImplicitReceiver;
+            }
+            if matches!(binding, CachedResolutionBinding::StaticImport { .. })
+                || matches!(
+                    binding,
+                    CachedResolutionBinding::RustPath {
+                        import: Some(_),
+                        ..
+                    }
+                ) && form == CalleeForm::Identifier
+            {
+                callsite.callee_form = CalleeForm::NamedImport;
+            }
+            calls.push(CachedCallResolutionInput {
+                callsite,
+                caller,
                 binding,
-                CachedResolutionBinding::RustPath {
-                    import: Some(_),
-                    ..
-                }
-            ) && form == CalleeForm::Identifier
-        {
-            callsite.callee_form = CalleeForm::NamedImport;
-        }
-        calls.push(CachedCallResolutionInput {
-            callsite,
-            caller,
-            binding,
-            language: language.to_string(),
-            adapter_version: ADAPTER_VERSION.to_string(),
-            parser_fingerprint: parser_fingerprint.to_string(),
-        });
-    };
+                language: language.to_string(),
+                adapter_version: ADAPTER_VERSION.to_string(),
+                parser_fingerprint: parser_fingerprint.to_string(),
+            });
+        };
     if let Some(index) = &javascript_index {
         for call in &index.calls {
             emit_call(call.callee, call.form, call.raw_target.clone(), None);
         }
     } else if let Some(index) = &rust_index {
+        for call in &index.calls {
+            emit_call(
+                call.callee,
+                call.form,
+                call.raw_target.clone(),
+                call.callable_id,
+            );
+        }
+    } else if let Some(index) = &go_index {
         for call in &index.calls {
             emit_call(
                 call.callee,
@@ -193,6 +230,7 @@ pub(crate) fn collect_call_resolution_inputs(
             rust_uses: rust_index
                 .as_ref()
                 .map_or_else(Vec::new, |index| index.uses.clone()),
+            go_package: go_index.as_ref().map(GoResolutionIndex::cached_package),
         }),
     }
 }
@@ -295,6 +333,1223 @@ fn classify_callee<'tree>(
             ))
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedGoCall<'tree> {
+    callee: TsNode<'tree>,
+    form: CalleeForm,
+    raw_target: String,
+    callable_id: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct GoReceiverBinding {
+    owner_name: String,
+    pointer: bool,
+    constructor: bool,
+    constructor_uses_builtin_new: bool,
+    imported: bool,
+    implicit: bool,
+}
+
+struct GoResolutionIndex<'tree> {
+    calls: Vec<IndexedGoCall<'tree>>,
+    package_name: Option<String>,
+    declarations: Vec<CachedTopLevelDeclaration>,
+    types: Vec<CachedGoType>,
+    methods: Vec<CachedGoMethod>,
+    package_blockers: Vec<String>,
+    import_names: HashSet<String>,
+    import_domain_complete: bool,
+    callable_nodes: HashMap<usize, NodeId>,
+    binding_decisions: HashMap<(usize, usize, String), GoBindingDecision>,
+    build_constrained: bool,
+    generated: bool,
+}
+
+#[derive(Debug, Clone)]
+enum GoBindingDecision {
+    Receiver(GoReceiverBinding),
+    Blocked,
+}
+
+#[derive(Debug, Clone)]
+struct GoBindingInterval {
+    name: String,
+    callable_id: usize,
+    start_byte: usize,
+    end_byte: usize,
+    scope_depth: usize,
+    receiver: Option<GoReceiverBinding>,
+}
+
+impl<'tree> GoResolutionIndex<'tree> {
+    fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
+        let root = tree.root_node();
+        let package_name = go_package_name(root, source);
+        let graph_nodes = GoGraphNodeIndex::prepare(file_id, nodes);
+        let import_domain = go_import_domain(root, source);
+        let mut result = Self {
+            calls: Vec::new(),
+            package_name,
+            declarations: Vec::new(),
+            types: Vec::new(),
+            methods: Vec::new(),
+            package_blockers: Vec::new(),
+            import_names: import_domain.names,
+            import_domain_complete: import_domain.complete,
+            callable_nodes: HashMap::new(),
+            binding_decisions: HashMap::new(),
+            build_constrained: go_source_has_build_constraint(source),
+            generated: go_source_is_generated(root, source),
+        };
+        walk_nodes(root, &mut |node| {
+            count_go_resolution_work(1);
+            match node.kind() {
+                "function_declaration" => {
+                    let Some(name_node) = node.child_by_field_name("name") else {
+                        return;
+                    };
+                    let Some(name) = node_text(name_node, source).map(str::to_string) else {
+                        return;
+                    };
+                    if let Some(declaration) = graph_nodes.unique(
+                        NodeKind::FUNCTION,
+                        node.start_position().row as u32 + 1,
+                        &name,
+                    ) {
+                        result.callable_nodes.insert(node.id(), declaration);
+                        if node.parent().is_some_and(|parent| parent.id() == root.id()) {
+                            result.declarations.push(CachedTopLevelDeclaration {
+                                name,
+                                declaration,
+                                module_path: Vec::new(),
+                                cross_module_visible: false,
+                            });
+                        }
+                    }
+                }
+                "method_declaration" => {
+                    let Some(name_node) = node.child_by_field_name("name") else {
+                        return;
+                    };
+                    let Some(name) = node_text(name_node, source).map(str::to_string) else {
+                        return;
+                    };
+                    let Some(receiver) = node.child_by_field_name("receiver") else {
+                        return;
+                    };
+                    let Some((owner_name, pointer_receiver, _)) =
+                        go_receiver_declaration(receiver, source)
+                    else {
+                        return;
+                    };
+                    if let Some(declaration) = graph_nodes.unique(
+                        NodeKind::METHOD,
+                        node.start_position().row as u32 + 1,
+                        &name,
+                    ) {
+                        result.callable_nodes.insert(node.id(), declaration);
+                        result.methods.push(CachedGoMethod {
+                            owner_name,
+                            method_name: name,
+                            declaration,
+                            pointer_receiver,
+                        });
+                    }
+                }
+                "type_spec" => {
+                    if !go_spec_is_package_level(node, root) {
+                        return;
+                    }
+                    let Some(name_node) = node.child_by_field_name("name") else {
+                        return;
+                    };
+                    let Some(name) = node_text(name_node, source).map(str::to_string) else {
+                        return;
+                    };
+                    let declaration_node = node
+                        .parent()
+                        .filter(|parent| parent.kind() == "type_declaration")
+                        .unwrap_or(node);
+                    if let Some(declaration) = graph_nodes.unique(
+                        NodeKind::STRUCT,
+                        declaration_node.start_position().row as u32 + 1,
+                        &name,
+                    ) {
+                        let kind = node.child_by_field_name("type");
+                        result.types.push(CachedGoType {
+                            name,
+                            declaration,
+                            interface: kind.is_some_and(|kind| kind.kind() == "interface_type"),
+                            generic: node.child_by_field_name("type_parameters").is_some(),
+                        });
+                    }
+                }
+                "var_spec" | "const_spec" => {
+                    if go_spec_is_package_level(node, root) {
+                        go_declared_names(node, source, &mut result.package_blockers);
+                    }
+                }
+                "comment" => {
+                    if let Some(name) = go_linkname_local_name(node, source) {
+                        result.package_blockers.push(name);
+                    }
+                }
+                "call_expression" => {
+                    let Some(function) = node.child_by_field_name("function") else {
+                        return;
+                    };
+                    let callable_id = go_enclosing_callable(node).map(|callable| callable.id());
+                    match function.kind() {
+                        "identifier" => {
+                            if let Some(raw_target) = node_text(function, source) {
+                                result.calls.push(IndexedGoCall {
+                                    callee: function,
+                                    form: CalleeForm::Identifier,
+                                    raw_target: raw_target.to_string(),
+                                    callable_id,
+                                });
+                            }
+                        }
+                        "selector_expression" => {
+                            let Some(field) = function.child_by_field_name("field") else {
+                                return;
+                            };
+                            let Some(raw_target) = node_text(field, source) else {
+                                return;
+                            };
+                            result.calls.push(IndexedGoCall {
+                                callee: field,
+                                form: CalleeForm::ExplicitReceiver,
+                                raw_target: raw_target.to_string(),
+                                callable_id,
+                            });
+                        }
+                        _ => {
+                            let mut cursor = function.walk();
+                            let leaf = function
+                                .named_children(&mut cursor)
+                                .last()
+                                .unwrap_or(function);
+                            result.calls.push(IndexedGoCall {
+                                callee: leaf,
+                                form: CalleeForm::DynamicAccess,
+                                raw_target: node_text(leaf, source)
+                                    .unwrap_or(function.kind())
+                                    .to_string(),
+                                callable_id,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+        result.declarations.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        result.types.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        result.methods.sort_by(|left, right| {
+            (&left.owner_name, &left.method_name, left.declaration).cmp(&(
+                &right.owner_name,
+                &right.method_name,
+                right.declaration,
+            ))
+        });
+        result.package_blockers.sort();
+        result.package_blockers.dedup();
+        result
+            .calls
+            .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        result.binding_decisions =
+            go_prepare_binding_decisions(root, source, &result.calls, &result.import_names);
+        result
+    }
+
+    fn cached_package(&self) -> CachedGoPackage {
+        CachedGoPackage {
+            name: self.package_name.clone().unwrap_or_default(),
+            build_constrained: self.build_constrained,
+            generated: self.generated,
+            package_blockers: self.package_blockers.clone(),
+            types: self.types.clone(),
+            methods: self.methods.clone(),
+        }
+    }
+
+    fn resolve_syntax_claim(
+        &self,
+        source: &str,
+        callee: TsNode<'tree>,
+        form: CalleeForm,
+        raw_target: &str,
+        callable_id: Option<usize>,
+    ) -> (Option<NodeId>, CachedResolutionBinding) {
+        let Some(callable_id) = callable_id else {
+            return (None, CachedResolutionBinding::MissingBinding);
+        };
+        let Some(caller) = self.callable_nodes.get(&callable_id).copied() else {
+            return (None, CachedResolutionBinding::Ambiguous);
+        };
+        let Some(package_name) = self.package_name.clone() else {
+            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+        };
+        if self.build_constrained {
+            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+        }
+        if self.generated {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if !self.import_domain_complete {
+            return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+        }
+        match form {
+            CalleeForm::Identifier => {
+                if self.import_names.contains(raw_target)
+                    || self.binding_decisions.contains_key(&(
+                        callable_id,
+                        callee.start_byte(),
+                        raw_target.to_string(),
+                    ))
+                {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
+                (
+                    Some(caller),
+                    CachedResolutionBinding::GoPackageFunction {
+                        package_name,
+                        name: raw_target.to_string(),
+                    },
+                )
+            }
+            CalleeForm::ExplicitReceiver => {
+                let Some(call) = callee.parent().and_then(|selector| selector.parent()) else {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                };
+                let Some(selector) = call.child_by_field_name("function") else {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                };
+                let Some(receiver) = selector.child_by_field_name("operand") else {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                };
+                let Some(receiver_name) = go_simple_identifier(receiver, source) else {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                };
+                if self.import_names.contains(receiver_name) {
+                    return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+                }
+                let binding = match self.binding_decisions.get(&(
+                    callable_id,
+                    callee.start_byte(),
+                    receiver_name.to_string(),
+                )) {
+                    Some(GoBindingDecision::Receiver(binding)) => binding.clone(),
+                    Some(GoBindingDecision::Blocked) | None => {
+                        return (Some(caller), CachedResolutionBinding::Unsupported);
+                    }
+                };
+                if binding.imported {
+                    return (Some(caller), CachedResolutionBinding::IncompleteDomain);
+                }
+                if binding.implicit {
+                    (
+                        Some(caller),
+                        CachedResolutionBinding::GoImplicitReceiver {
+                            package_name,
+                            owner_name: binding.owner_name,
+                            receiver_is_pointer: binding.pointer,
+                        },
+                    )
+                } else {
+                    (
+                        Some(caller),
+                        CachedResolutionBinding::GoExplicitReceiver {
+                            package_name,
+                            owner_name: binding.owner_name,
+                            receiver_is_pointer: binding.pointer,
+                            constructor: binding.constructor,
+                            constructor_uses_builtin_new: binding.constructor_uses_builtin_new,
+                        },
+                    )
+                }
+            }
+            _ => (Some(caller), CachedResolutionBinding::Unsupported),
+        }
+    }
+}
+
+struct GoGraphNodeIndex {
+    nodes: HashMap<(NodeKind, u32, String), Vec<NodeId>>,
+}
+
+impl GoGraphNodeIndex {
+    fn prepare(file_id: NodeId, nodes: &[Node]) -> Self {
+        let mut result = HashMap::<_, Vec<_>>::new();
+        for node in nodes
+            .iter()
+            .filter(|node| node.file_node_id == Some(file_id))
+        {
+            if let Some(line) = node.start_line {
+                result
+                    .entry((
+                        node.kind,
+                        line,
+                        graph_leaf_name(&node.serialized_name).to_string(),
+                    ))
+                    .or_default()
+                    .push(node.id);
+            }
+        }
+        Self { nodes: result }
+    }
+
+    fn unique(&self, kind: NodeKind, line: u32, name: &str) -> Option<NodeId> {
+        let values = self.nodes.get(&(kind, line, name.to_string()))?;
+        let [value] = values.as_slice() else {
+            return None;
+        };
+        Some(*value)
+    }
+}
+
+fn go_package_name(root: TsNode<'_>, source: &str) -> Option<String> {
+    let mut cursor = root.walk();
+    let clauses = root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "package_clause")
+        .collect::<Vec<_>>();
+    let [clause] = clauses.as_slice() else {
+        return None;
+    };
+    let mut cursor = clause.walk();
+    clause
+        .named_children(&mut cursor)
+        .find(|node| node.kind() == "package_identifier")
+        .and_then(|node| node_text(node, source))
+        .map(str::to_string)
+}
+
+fn go_spec_is_package_level(node: TsNode<'_>, root: TsNode<'_>) -> bool {
+    node.parent()
+        .and_then(|declaration| declaration.parent())
+        .is_some_and(|parent| parent.id() == root.id())
+}
+
+fn go_enclosing_callable(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    loop {
+        if matches!(node.kind(), "function_declaration" | "method_declaration") {
+            return Some(node);
+        }
+        if node.kind() == "func_literal" {
+            return None;
+        }
+        node = node.parent()?;
+    }
+}
+
+fn go_receiver_declaration(receiver: TsNode<'_>, source: &str) -> Option<(String, bool, String)> {
+    let mut cursor = receiver.walk();
+    let parameters = receiver
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "parameter_declaration")
+        .collect::<Vec<_>>();
+    let [parameter] = parameters.as_slice() else {
+        return None;
+    };
+    let type_node = parameter.child_by_field_name("type")?;
+    let binding = go_exact_type_node(type_node, source, &HashSet::new(), true)?;
+    if binding.imported {
+        return None;
+    }
+    let mut cursor = parameter.walk();
+    let names = parameter
+        .named_children(&mut cursor)
+        .take_while(|node| node.start_byte() < type_node.start_byte())
+        .filter_map(|node| go_simple_identifier(node, source).map(str::to_string))
+        .collect::<Vec<_>>();
+    let variable = match names.as_slice() {
+        [] => String::new(),
+        [name] => name.clone(),
+        _ => return None,
+    };
+    Some((binding.owner_name, binding.pointer, variable))
+}
+
+fn go_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|character| character == '_' || character.is_alphabetic())
+        && chars.all(|character| character == '_' || character.is_alphanumeric())
+}
+
+fn go_simple_identifier<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    (node.kind() == "identifier")
+        .then(|| node_text(node, source))
+        .flatten()
+        .filter(|name| go_identifier(name))
+}
+
+fn go_source_has_build_constraint(source: &str) -> bool {
+    source
+        .lines()
+        .take_while(|line| {
+            let trimmed = line.trim();
+            trimmed.is_empty() || trimmed.starts_with("//")
+        })
+        .any(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("//go:build") || trimmed.starts_with("// +build")
+        })
+}
+
+fn go_source_is_generated(root: TsNode<'_>, source: &str) -> bool {
+    let package_start = {
+        let mut cursor = root.walk();
+        root.named_children(&mut cursor)
+            .find(|node| node.kind() == "package_clause")
+            .map(|node| node.start_byte())
+            .unwrap_or(usize::MAX)
+    };
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .take_while(|node| node.start_byte() < package_start)
+        .filter(|node| node.kind() == "comment")
+        .filter_map(|node| node_text(node, source))
+        .flat_map(str::lines)
+        .any(|line| {
+            let line = line
+                .trim()
+                .trim_start_matches("/*")
+                .trim_start_matches('*')
+                .trim_end_matches("*/")
+                .trim();
+            line.starts_with("// Code generated ") && line.ends_with(" DO NOT EDIT.")
+        })
+}
+
+fn go_linkname_local_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    let text = node_text(node, source)?.trim();
+    let mut components = text.strip_prefix("//go:linkname")?.split_whitespace();
+    let local = components.next()?;
+    let remote = components.next()?;
+    (components.next().is_none() && go_identifier(local) && !remote.is_empty())
+        .then(|| local.to_string())
+}
+
+fn go_declared_names(node: TsNode<'_>, source: &str, names: &mut Vec<String>) {
+    let boundary = node
+        .child_by_field_name("type")
+        .or_else(|| node.child_by_field_name("value"))
+        .map(|node| node.start_byte())
+        .unwrap_or(usize::MAX);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.start_byte() >= boundary {
+            break;
+        }
+        if child.kind() == "identifier"
+            && let Some(name) = node_text(child, source)
+        {
+            names.push(name.to_string());
+        }
+    }
+}
+
+struct GoImportDomain {
+    names: HashSet<String>,
+    complete: bool,
+}
+
+fn go_import_domain(root: TsNode<'_>, source: &str) -> GoImportDomain {
+    let mut values = HashSet::new();
+    let mut complete = true;
+    walk_nodes(root, &mut |node| {
+        if node.kind() != "import_spec" {
+            return;
+        }
+        let Some(path) = node.child_by_field_name("path") else {
+            complete = false;
+            return;
+        };
+        let Some(path) = node_text(path, source).and_then(go_string_literal) else {
+            complete = false;
+            return;
+        };
+        let explicit_alias = node
+            .child_by_field_name("name")
+            .and_then(|node| node_text(node, source))
+            .map(str::to_string);
+        if explicit_alias.as_deref() == Some(".") {
+            complete = false;
+            return;
+        }
+        if explicit_alias.as_deref() == Some("_") {
+            return;
+        }
+        let alias = explicit_alias.or_else(|| path.rsplit('/').next().map(str::to_string));
+        let Some(alias) = alias.filter(|alias| !alias.is_empty() && go_identifier(alias)) else {
+            complete = false;
+            return;
+        };
+        if !values.insert(alias) {
+            complete = false;
+        }
+    });
+    GoImportDomain {
+        names: values,
+        complete,
+    }
+}
+
+fn go_string_literal(literal: &str) -> Option<&str> {
+    let literal = literal.trim();
+    let quote = literal.as_bytes().first().copied()?;
+    if !matches!(quote, b'"' | b'`') || literal.as_bytes().last().copied()? != quote {
+        return None;
+    }
+    let value = literal.get(1..literal.len().checked_sub(1)?)?;
+    (quote == b'`' || !value.contains('\\')).then_some(value)
+}
+
+fn go_expression_names(node: TsNode<'_>, source: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut cursor = node.walk();
+    if node.kind() == "expression_list" {
+        for child in node.named_children(&mut cursor) {
+            if let Some(name) = go_simple_identifier(child, source) {
+                result.push(name.to_string());
+            }
+        }
+    } else if let Some(name) = go_simple_identifier(node, source) {
+        result.push(name.to_string());
+    }
+    result
+}
+
+fn go_prepare_binding_decisions(
+    root: TsNode<'_>,
+    source: &str,
+    calls: &[IndexedGoCall<'_>],
+    import_names: &HashSet<String>,
+) -> HashMap<(usize, usize, String), GoBindingDecision> {
+    let shadowed_new = go_callables_declaring_name(root, source, "new");
+    let mut intervals = Vec::<GoBindingInterval>::new();
+    walk_nodes(root, &mut |node| {
+        count_go_resolution_work(1);
+        let Some(callable) = go_enclosing_callable(node) else {
+            return;
+        };
+        if node.id() == callable.id() {
+            if callable.kind() == "method_declaration"
+                && let Some(receiver) = callable.child_by_field_name("receiver")
+                && let Some((owner_name, pointer, variable)) =
+                    go_receiver_declaration(receiver, source)
+                && !variable.is_empty()
+            {
+                intervals.push(GoBindingInterval {
+                    name: variable,
+                    callable_id: callable.id(),
+                    start_byte: callable.start_byte(),
+                    end_byte: callable.end_byte(),
+                    scope_depth: 0,
+                    receiver: Some(GoReceiverBinding {
+                        owner_name,
+                        pointer,
+                        constructor: false,
+                        constructor_uses_builtin_new: false,
+                        imported: false,
+                        implicit: true,
+                    }),
+                });
+            }
+            return;
+        }
+        let Some((scope_start, scope_end, depth)) = go_binding_scope(node, callable) else {
+            return;
+        };
+        match node.kind() {
+            "parameter_declaration" | "variadic_parameter_declaration" => {
+                if callable.kind() == "method_declaration"
+                    && callable
+                        .child_by_field_name("receiver")
+                        .is_some_and(|receiver| {
+                            receiver.start_byte() <= node.start_byte()
+                                && node.end_byte() <= receiver.end_byte()
+                        })
+                {
+                    return;
+                }
+                let Some(type_node) = node.child_by_field_name("type") else {
+                    return;
+                };
+                let receiver = go_typed_receiver_binding(type_node, source, import_names);
+                let mut cursor = node.walk();
+                for name_node in node.named_children(&mut cursor) {
+                    if name_node.start_byte() >= type_node.start_byte() {
+                        break;
+                    }
+                    if let Some(name) = go_simple_identifier(name_node, source) {
+                        intervals.push(GoBindingInterval {
+                            name: name.to_string(),
+                            callable_id: callable.id(),
+                            start_byte: callable.start_byte(),
+                            end_byte: callable.end_byte(),
+                            scope_depth: 0,
+                            receiver: receiver.clone(),
+                        });
+                    }
+                }
+            }
+            "short_var_declaration" | "assignment_statement" => {
+                let names = node
+                    .child_by_field_name("left")
+                    .map(|left| go_expression_names(left, source))
+                    .unwrap_or_default();
+                let values = node
+                    .child_by_field_name("right")
+                    .map(go_expression_items)
+                    .unwrap_or_default();
+                for (index, name) in names.into_iter().enumerate() {
+                    let assignment = node.kind() == "assignment_statement";
+                    let receiver = (!assignment && !go_binding_uses_control_flow(node, callable))
+                        .then(|| {
+                            values.get(index).and_then(|value| {
+                                go_direct_constructor_binding_prepared(
+                                    *value,
+                                    source,
+                                    !shadowed_new.contains(&callable.id())
+                                        && !import_names.contains("new"),
+                                    import_names,
+                                )
+                            })
+                        })
+                        .flatten();
+                    intervals.push(GoBindingInterval {
+                        name,
+                        callable_id: callable.id(),
+                        start_byte: node.end_byte().max(scope_start),
+                        end_byte: if assignment {
+                            callable.end_byte()
+                        } else {
+                            scope_end
+                        },
+                        scope_depth: if assignment { usize::MAX - 1 } else { depth },
+                        receiver,
+                    });
+                }
+            }
+            "var_spec" => {
+                let Some(type_node) = node.child_by_field_name("type") else {
+                    return;
+                };
+                let receiver = (!go_binding_uses_control_flow(node, callable))
+                    .then(|| go_typed_receiver_binding(type_node, source, import_names))
+                    .flatten();
+                let mut names = Vec::new();
+                go_declared_names(node, source, &mut names);
+                for name in names {
+                    intervals.push(GoBindingInterval {
+                        name,
+                        callable_id: callable.id(),
+                        start_byte: node.end_byte().max(scope_start),
+                        end_byte: scope_end,
+                        scope_depth: depth,
+                        receiver: receiver.clone(),
+                    });
+                }
+            }
+            "const_spec" | "type_spec" => {
+                let mut names = Vec::new();
+                go_declared_names(node, source, &mut names);
+                if node.kind() == "type_spec"
+                    && let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|name| node_text(name, source))
+                {
+                    names.push(name.to_string());
+                }
+                for name in names {
+                    intervals.push(GoBindingInterval {
+                        name,
+                        callable_id: callable.id(),
+                        start_byte: node.end_byte().max(scope_start),
+                        end_byte: scope_end,
+                        scope_depth: depth,
+                        receiver: None,
+                    });
+                }
+            }
+            "range_clause" | "receive_statement" | "type_switch_guard" => {
+                let Some(special) = go_special_binding(node, callable, source) else {
+                    return;
+                };
+                for name in special.names {
+                    intervals.push(GoBindingInterval {
+                        name,
+                        callable_id: callable.id(),
+                        start_byte: node.end_byte(),
+                        end_byte: special.end_byte,
+                        scope_depth: special.scope_depth,
+                        receiver: None,
+                    });
+                }
+            }
+            "type_switch_statement" => {
+                let Some(special) = go_type_switch_binding(node, callable, source) else {
+                    return;
+                };
+                for name in special.names {
+                    intervals.push(GoBindingInterval {
+                        name,
+                        callable_id: callable.id(),
+                        start_byte: node.start_byte(),
+                        end_byte: special.end_byte,
+                        scope_depth: special.scope_depth,
+                        receiver: None,
+                    });
+                }
+            }
+            "unary_expression" => {
+                let Some(surface) = node_text(node, source).map(str::trim) else {
+                    return;
+                };
+                let Some(name) = surface.strip_prefix('&').map(str::trim) else {
+                    return;
+                };
+                if go_identifier(name) {
+                    intervals.push(GoBindingInterval {
+                        name: name.to_string(),
+                        callable_id: callable.id(),
+                        start_byte: callable.start_byte(),
+                        end_byte: callable.end_byte(),
+                        scope_depth: usize::MAX,
+                        receiver: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    });
+    walk_nodes(root, &mut |node| {
+        if node.kind() != "identifier" {
+            return;
+        }
+        let Some(callable) = go_outer_callable_for_captured_node(node) else {
+            return;
+        };
+        let Some(name) = node_text(node, source).filter(|name| go_identifier(name)) else {
+            return;
+        };
+        intervals.push(GoBindingInterval {
+            name: name.to_string(),
+            callable_id: callable.id(),
+            start_byte: callable.start_byte(),
+            end_byte: callable.end_byte(),
+            scope_depth: usize::MAX,
+            receiver: None,
+        });
+        count_go_resolution_work(1);
+    });
+    let mut intervals_by_name = HashMap::<(usize, String), Vec<GoBindingInterval>>::new();
+    for interval in intervals {
+        if interval.start_byte < interval.end_byte {
+            intervals_by_name
+                .entry((interval.callable_id, interval.name.clone()))
+                .or_default()
+                .push(interval);
+        }
+    }
+    let mut calls_by_name = HashMap::<(usize, String), Vec<usize>>::new();
+    for call in calls {
+        let Some(callable_id) = call.callable_id else {
+            continue;
+        };
+        let name = if call.form == CalleeForm::Identifier {
+            Some(call.raw_target.clone())
+        } else {
+            call.callee
+                .parent()
+                .and_then(|selector| selector.child_by_field_name("operand"))
+                .and_then(|receiver| go_simple_identifier(receiver, source))
+                .map(str::to_string)
+        };
+        if let Some(name) = name {
+            calls_by_name
+                .entry((callable_id, name))
+                .or_default()
+                .push(call.callee.start_byte());
+        }
+    }
+    let mut decisions = HashMap::new();
+    for (key, mut callsites) in calls_by_name {
+        let bindings = intervals_by_name.remove(&key).unwrap_or_default();
+        callsites.sort_unstable();
+        let mut events = Vec::with_capacity(bindings.len() * 2 + callsites.len());
+        for (index, binding) in bindings.iter().enumerate() {
+            events.push((binding.start_byte, 1_u8, index));
+            events.push((binding.end_byte, 0_u8, index));
+            count_go_resolution_work(2);
+        }
+        for (index, callsite) in callsites.iter().copied().enumerate() {
+            events.push((callsite, 2_u8, index));
+            count_go_resolution_work(1);
+        }
+        events.sort_unstable();
+        let mut active = BTreeMap::<usize, HashSet<usize>>::new();
+        for (byte, kind, index) in events {
+            count_go_resolution_work(1);
+            match kind {
+                0 => {
+                    let depth = bindings[index].scope_depth;
+                    if let Some(entries) = active.get_mut(&depth) {
+                        entries.remove(&index);
+                        if entries.is_empty() {
+                            active.remove(&depth);
+                        }
+                    }
+                }
+                1 => {
+                    active
+                        .entry(bindings[index].scope_depth)
+                        .or_default()
+                        .insert(index);
+                }
+                _ => {
+                    let Some((_, entries)) = active.last_key_value() else {
+                        continue;
+                    };
+                    let decision = if entries.len() == 1 {
+                        let binding = &bindings[*entries.iter().next().expect("one binding")];
+                        binding
+                            .receiver
+                            .clone()
+                            .map_or(GoBindingDecision::Blocked, GoBindingDecision::Receiver)
+                    } else {
+                        GoBindingDecision::Blocked
+                    };
+                    decisions.insert((key.0, byte, key.1.clone()), decision);
+                }
+            }
+        }
+    }
+    decisions
+}
+
+fn go_callables_declaring_name(root: TsNode<'_>, source: &str, wanted: &str) -> HashSet<usize> {
+    let mut result = HashSet::new();
+    walk_nodes(root, &mut |node| {
+        let Some(callable) = go_enclosing_callable(node) else {
+            return;
+        };
+        let declared = match node.kind() {
+            "parameter_declaration" | "variadic_parameter_declaration" => {
+                let boundary = node
+                    .child_by_field_name("type")
+                    .map(|node| node.start_byte())
+                    .unwrap_or(usize::MAX);
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor).any(|child| {
+                    child.start_byte() < boundary
+                        && go_simple_identifier(child, source) == Some(wanted)
+                })
+            }
+            "short_var_declaration" | "assignment_statement" => {
+                node.child_by_field_name("left").is_some_and(|left| {
+                    go_expression_names(left, source)
+                        .iter()
+                        .any(|name| name == wanted)
+                })
+            }
+            "var_spec" | "const_spec" | "type_spec" => {
+                let mut names = Vec::new();
+                go_declared_names(node, source, &mut names);
+                if node.kind() == "type_spec"
+                    && let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|name| node_text(name, source))
+                {
+                    names.push(name.to_string());
+                }
+                names.iter().any(|name| name == wanted)
+            }
+            "range_clause" | "receive_statement" | "type_switch_guard" => {
+                go_special_binding_names(node_text(node, source).unwrap_or_default())
+                    .iter()
+                    .any(|name| name == wanted)
+            }
+            "type_switch_statement" => go_type_switch_header(node, source)
+                .map(go_special_binding_names)
+                .unwrap_or_default()
+                .iter()
+                .any(|name| name == wanted),
+            _ => false,
+        };
+        if declared {
+            result.insert(callable.id());
+        }
+    });
+    result
+}
+
+struct GoSpecialBinding {
+    names: Vec<String>,
+    end_byte: usize,
+    scope_depth: usize,
+}
+
+fn go_special_binding(
+    node: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+) -> Option<GoSpecialBinding> {
+    let surface = node_text(node, source)?;
+    let names = go_special_binding_names(surface);
+    if names.is_empty() {
+        return None;
+    }
+    let declaration = surface.contains(":=");
+    let boundary_kind = match node.kind() {
+        "range_clause" => "for_statement",
+        "receive_statement" => "communication_case",
+        "type_switch_guard" => "type_switch_statement",
+        _ => return None,
+    };
+    let mut boundary = node;
+    while boundary.kind() != boundary_kind {
+        boundary = boundary.parent()?;
+        if boundary.id() == callable.id() {
+            return None;
+        }
+    }
+    Some(GoSpecialBinding {
+        names,
+        end_byte: if declaration {
+            boundary.end_byte()
+        } else {
+            callable.end_byte()
+        },
+        scope_depth: if declaration {
+            go_scope_depth(boundary, callable).saturating_add(1)
+        } else {
+            usize::MAX - 2
+        },
+    })
+}
+
+fn go_type_switch_binding(
+    node: TsNode<'_>,
+    callable: TsNode<'_>,
+    source: &str,
+) -> Option<GoSpecialBinding> {
+    let names = go_type_switch_header(node, source).map(go_special_binding_names)?;
+    (!names.is_empty()).then(|| GoSpecialBinding {
+        names,
+        end_byte: node.end_byte(),
+        scope_depth: go_scope_depth(node, callable).saturating_add(1),
+    })
+}
+
+fn go_type_switch_header<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    let (header, _) = node_text(node, source)?.split_once('{')?;
+    header.trim().strip_prefix("switch").map(str::trim)
+}
+
+fn go_special_binding_names(surface: &str) -> Vec<String> {
+    let left = surface
+        .split_once(":=")
+        .or_else(|| surface.split_once('='))
+        .map(|(left, _)| left)
+        .unwrap_or_default();
+    left.rsplit([';', '{', ':'])
+        .next()
+        .unwrap_or(left)
+        .split(',')
+        .map(str::trim)
+        .filter(|name| *name != "_" && go_identifier(name))
+        .map(str::to_string)
+        .collect()
+}
+
+fn go_scope_depth(mut node: TsNode<'_>, callable: TsNode<'_>) -> usize {
+    let mut depth: usize = 0;
+    while node.id() != callable.id() {
+        depth = depth.saturating_add(usize::from(node.kind() == "block"));
+        let Some(parent) = node.parent() else {
+            break;
+        };
+        node = parent;
+    }
+    depth
+}
+
+fn go_binding_scope(node: TsNode<'_>, callable: TsNode<'_>) -> Option<(usize, usize, usize)> {
+    let mut current = node;
+    let mut depth = 0;
+    loop {
+        if current.kind() == "block" {
+            depth += 1;
+            return Some((current.start_byte(), current.end_byte(), depth));
+        }
+        if current.id() == callable.id() {
+            return Some((callable.start_byte(), callable.end_byte(), 0));
+        }
+        current = current.parent()?;
+    }
+}
+
+fn go_binding_uses_control_flow(mut node: TsNode<'_>, callable: TsNode<'_>) -> bool {
+    while node.id() != callable.id() {
+        if matches!(
+            node.kind(),
+            "if_statement"
+                | "for_statement"
+                | "expression_switch_statement"
+                | "type_switch_statement"
+                | "select_statement"
+        ) {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return true;
+        };
+        node = parent;
+    }
+    false
+}
+
+fn go_outer_callable_for_captured_node(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    let mut crossed_closure = false;
+    loop {
+        crossed_closure |= node.kind() == "func_literal";
+        if crossed_closure && matches!(node.kind(), "function_declaration" | "method_declaration") {
+            return Some(node);
+        }
+        node = node.parent()?;
+    }
+}
+
+fn go_typed_receiver_binding(
+    type_node: TsNode<'_>,
+    source: &str,
+    import_names: &HashSet<String>,
+) -> Option<GoReceiverBinding> {
+    let mut binding = go_exact_type_node(type_node, source, import_names, true)?;
+    binding.constructor = false;
+    binding.constructor_uses_builtin_new = false;
+    binding.implicit = false;
+    Some(binding)
+}
+
+fn go_exact_type_node(
+    node: TsNode<'_>,
+    source: &str,
+    import_names: &HashSet<String>,
+    allow_pointer: bool,
+) -> Option<GoReceiverBinding> {
+    let (base, pointer) = if node.kind() == "pointer_type" && allow_pointer {
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        let [base] = children.as_slice() else {
+            return None;
+        };
+        if base.kind() == "pointer_type" {
+            return None;
+        }
+        (*base, true)
+    } else {
+        (node, false)
+    };
+    let surface = node_text(base, source)?.trim();
+    let (owner_name, imported) = match base.kind() {
+        "type_identifier" => {
+            if !go_identifier(surface) {
+                return None;
+            }
+            (surface, false)
+        }
+        "qualified_type" => {
+            let (qualifier, owner_name) = surface.split_once('.')?;
+            if owner_name.contains('.')
+                || !go_identifier(qualifier)
+                || !go_identifier(owner_name)
+                || !import_names.contains(qualifier)
+            {
+                return None;
+            }
+            (owner_name, true)
+        }
+        _ => return None,
+    };
+    Some(GoReceiverBinding {
+        owner_name: owner_name.to_string(),
+        pointer,
+        constructor: false,
+        constructor_uses_builtin_new: false,
+        imported,
+        implicit: false,
+    })
+}
+
+fn go_direct_constructor_binding_prepared(
+    value: TsNode<'_>,
+    source: &str,
+    builtin_new_unshadowed: bool,
+    import_names: &HashSet<String>,
+) -> Option<GoReceiverBinding> {
+    let (type_node, pointer, constructor_uses_builtin_new) = match value.kind() {
+        "composite_literal" => (value.child_by_field_name("type")?, false, false),
+        "unary_expression" => {
+            let surface = node_text(value, source)?.trim();
+            if !surface.starts_with('&') {
+                return None;
+            }
+            let mut cursor = value.walk();
+            let children = value.named_children(&mut cursor).collect::<Vec<_>>();
+            let [literal] = children.as_slice() else {
+                return None;
+            };
+            if literal.kind() != "composite_literal" {
+                return None;
+            }
+            (literal.child_by_field_name("type")?, true, false)
+        }
+        "call_expression" if builtin_new_unshadowed => {
+            let function = value.child_by_field_name("function")?;
+            if go_simple_identifier(function, source) != Some("new") {
+                return None;
+            }
+            let arguments = value.child_by_field_name("arguments")?;
+            let mut cursor = arguments.walk();
+            let arguments = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+            let [type_node] = arguments.as_slice() else {
+                return None;
+            };
+            (*type_node, true, true)
+        }
+        _ => return None,
+    };
+    let mut binding = go_exact_type_node(type_node, source, import_names, false)?;
+    binding.pointer = pointer;
+    binding.constructor = true;
+    binding.constructor_uses_builtin_new = constructor_uses_builtin_new;
+    Some(binding)
+}
+
+fn go_expression_items(node: TsNode<'_>) -> Vec<TsNode<'_>> {
+    if node.kind() != "expression_list" {
+        return vec![node];
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor).collect()
 }
 
 #[derive(Debug, Clone)]
@@ -3903,6 +5158,7 @@ pub fn rematerialize_proof_resolution_projection(
         .map(|record| (record.file.file_id.0, record))
         .collect::<HashMap<_, _>>();
     let rust_projection_index = RustProjectionIndex::prepare(&records)?;
+    let go_projection_index = GoProjectionIndex::prepare(&records)?;
     let mut claims = inputs
         .into_iter()
         .map(|(source_record, input)| {
@@ -3910,6 +5166,7 @@ pub fn rematerialize_proof_resolution_projection(
                 &file_by_id,
                 &record_by_path,
                 &rust_projection_index,
+                &go_projection_index,
                 source_record,
                 input,
             )
@@ -4127,6 +5384,7 @@ struct ResolvedSyntaxClaim {
     reason: ProofResolutionReason,
     evidence_chain: Vec<ResolutionEvidence>,
     exact_node_file_expectations: Vec<(NodeId, FileId)>,
+    exact_dependency_files: Vec<FileId>,
 }
 
 #[derive(Default)]
@@ -4265,6 +5523,15 @@ impl ExactEvidenceValidationIndex {
                 *declaration == target && target_node.file_node_id == Some(source_file)
             }
             (
+                CalleeForm::Identifier,
+                [ResolutionEvidence::SamePackageDeclaration { declaration }],
+            ) => {
+                claim.input.language == "go"
+                    && *declaration == target
+                    && target_node.file_node_id.is_some()
+                    && target_node.file_node_id != Some(source_file)
+            }
+            (
                 CalleeForm::NamedImport,
                 [
                     ResolutionEvidence::StaticImportBinding {
@@ -4312,14 +5579,36 @@ impl ExactEvidenceValidationIndex {
                     ResolutionEvidence::SameFileDeclaration { declaration },
                 ],
             ) => {
-                *declaration == target
+                let local_shape = *declaration == target
                     && target_node.kind == NodeKind::METHOD
-                    && target_node.file_node_id == Some(source_file)
                     && nodes.get(owner).is_some_and(|owner_node| {
                         matches!(
                             owner_node.kind,
                             NodeKind::STRUCT | NodeKind::CLASS | NodeKind::ENUM
-                        ) && owner_node.file_node_id == Some(source_file)
+                        ) && if claim.input.language == "go" {
+                            owner_node.file_node_id.is_some() && target_node.file_node_id.is_some()
+                        } else {
+                            owner_node.file_node_id == Some(source_file)
+                                && target_node.file_node_id == Some(source_file)
+                        }
+                    });
+                local_shape
+                    && self.has_member(*owner, claim.caller)
+                    && self.has_member(*owner, target)
+            }
+            (
+                CalleeForm::ImplicitReceiver,
+                [
+                    ResolutionEvidence::ImplicitReceiver { owner },
+                    ResolutionEvidence::SamePackageDeclaration { declaration },
+                ],
+            ) => {
+                claim.input.language == "go"
+                    && *declaration == target
+                    && target_node.kind == NodeKind::METHOD
+                    && target_node.file_node_id.is_some()
+                    && nodes.get(owner).is_some_and(|owner_node| {
+                        owner_node.kind == NodeKind::STRUCT && owner_node.file_node_id.is_some()
                     })
                     && self.has_member(*owner, claim.caller)
                     && self.has_member(*owner, target)
@@ -4389,6 +5678,7 @@ impl ExactEvidenceValidationIndex {
                     ResolutionEvidence::SameFileDeclaration { declaration },
                 ],
             ) if *constructor == *receiver_type => self.local_receiver_is_correlated(
+                &claim.input.language,
                 source_file,
                 *constructor,
                 *declaration,
@@ -4403,6 +5693,7 @@ impl ExactEvidenceValidationIndex {
                     ResolutionEvidence::SameFileDeclaration { declaration },
                 ],
             ) => self.local_receiver_is_correlated(
+                &claim.input.language,
                 source_file,
                 *receiver_type,
                 *declaration,
@@ -4493,12 +5784,44 @@ impl ExactEvidenceValidationIndex {
                     target_node,
                     nodes,
                 ),
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SamePackageDeclaration { declaration },
+                ],
+            ) if *constructor == *receiver_type => self.local_receiver_is_correlated(
+                &claim.input.language,
+                source_file,
+                *constructor,
+                *declaration,
+                target,
+                target_node,
+                nodes,
+            ),
+            (
+                CalleeForm::ExplicitReceiver,
+                [
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::SamePackageDeclaration { declaration },
+                ],
+            ) => self.local_receiver_is_correlated(
+                &claim.input.language,
+                source_file,
+                *receiver_type,
+                *declaration,
+                target,
+                target_node,
+                nodes,
+            ),
             _ => false,
         }
     }
 
     fn local_receiver_is_correlated(
         &self,
+        language: &str,
         source_file: NodeId,
         owner: NodeId,
         declaration: NodeId,
@@ -4512,8 +5835,12 @@ impl ExactEvidenceValidationIndex {
                 matches!(
                     owner_node.kind,
                     NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
-                ) && owner_node.file_node_id == Some(source_file)
-                    && owner_node.file_node_id == target_node.file_node_id
+                ) && if language == "go" {
+                    owner_node.file_node_id.is_some() && target_node.file_node_id.is_some()
+                } else {
+                    owner_node.file_node_id == Some(source_file)
+                        && owner_node.file_node_id == target_node.file_node_id
+                }
             })
             && self.has_member(owner, target)
     }
@@ -4544,7 +5871,7 @@ impl ExactEvidenceValidationIndex {
 
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
-        "rust" => kind == NodeKind::MODULE,
+        "go" | "rust" => kind == NodeKind::MODULE,
         "javascript" | "typescript" | "tsx" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
@@ -5391,10 +6718,523 @@ fn rust_resolve_module_path<'a>(
     rust_index.resolve_module_path(source_record, relative_module, components)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct GoPackageKey {
+    directory: WorkspacePathIdentity,
+    package_name: String,
+}
+
+struct GoPackageDeclaration<'a> {
+    declaration: NodeId,
+    record: &'a ResolutionCacheRecord,
+}
+
+struct GoPackageType<'a> {
+    value: &'a CachedGoType,
+    record: &'a ResolutionCacheRecord,
+}
+
+struct GoPackageMethod<'a> {
+    value: &'a CachedGoMethod,
+    record: &'a ResolutionCacheRecord,
+}
+
+struct GoCandidateSet<T> {
+    exact: Option<T>,
+    ambiguous: bool,
+    conditional: bool,
+    generated: bool,
+}
+
+impl<T> Default for GoCandidateSet<T> {
+    fn default() -> Self {
+        Self {
+            exact: None,
+            ambiguous: false,
+            conditional: false,
+            generated: false,
+        }
+    }
+}
+
+impl<T> GoCandidateSet<T> {
+    fn add(&mut self, value: T, conditional: bool, generated: bool) {
+        self.conditional |= conditional;
+        if conditional {
+            return;
+        }
+        if generated {
+            self.ambiguous |= self.generated || self.exact.is_some();
+            self.generated = true;
+            return;
+        }
+        self.ambiguous |= self.generated;
+        if self.exact.replace(value).is_some() {
+            self.ambiguous = true;
+        }
+    }
+}
+
+struct GoPackageDomain<'a> {
+    dependencies: Vec<FileId>,
+    complete: bool,
+    functions: HashMap<String, GoCandidateSet<GoPackageDeclaration<'a>>>,
+    blockers: HashMap<String, usize>,
+    conditional_blockers: HashSet<String>,
+    types: HashMap<String, GoCandidateSet<GoPackageType<'a>>>,
+    methods: HashMap<(String, String), GoCandidateSet<GoPackageMethod<'a>>>,
+}
+
+struct GoProjectionIndex<'a> {
+    keys_by_file: HashMap<i64, GoPackageKey>,
+    domains: HashMap<GoPackageKey, GoPackageDomain<'a>>,
+}
+
+enum GoFunctionResolution {
+    Exact {
+        declaration: NodeId,
+        declaration_file: FileId,
+        dependencies: Vec<FileId>,
+    },
+    Missing,
+    Ambiguous,
+    Incomplete,
+    Unsupported,
+}
+
+enum GoReceiverResolution {
+    Exact {
+        owner: NodeId,
+        owner_file: FileId,
+        declaration: NodeId,
+        declaration_file: FileId,
+        dependencies: Vec<FileId>,
+    },
+    Missing,
+    Ambiguous,
+    Incomplete,
+    Unsupported,
+}
+
+impl<'a> GoProjectionIndex<'a> {
+    fn prepare(records: &'a [ResolutionCacheRecord]) -> Result<Self> {
+        let go_records = records
+            .iter()
+            .filter(|record| record.file.language == "go")
+            .collect::<Vec<_>>();
+        let mut records_by_directory = HashMap::<WorkspacePathIdentity, Vec<_>>::new();
+        let mut records_by_identity = HashMap::<WorkspacePathIdentity, Vec<_>>::new();
+        for record in &go_records {
+            count_go_resolution_work(1);
+            let identity = workspace_path_identity(&record.path)?;
+            records_by_identity
+                .entry(identity)
+                .or_default()
+                .push(*record);
+            let directory = record
+                .path
+                .parent()
+                .ok_or_else(|| anyhow!("Go proof input has no package directory"))?;
+            records_by_directory
+                .entry(workspace_path_identity(directory)?)
+                .or_default()
+                .push(*record);
+        }
+        let mut directory_inventory_complete = HashMap::new();
+        for (identity, directory_records) in &records_by_directory {
+            count_go_resolution_work(1);
+            let Some(directory) = directory_records
+                .first()
+                .and_then(|record| record.path.parent())
+            else {
+                directory_inventory_complete.insert(identity.clone(), false);
+                continue;
+            };
+            let mut complete = true;
+            let entries = match std::fs::read_dir(directory) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    directory_inventory_complete.insert(identity.clone(), false);
+                    continue;
+                }
+            };
+            for entry in entries {
+                count_go_resolution_work(1);
+                let Ok(entry) = entry else {
+                    complete = false;
+                    continue;
+                };
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("go") {
+                    continue;
+                }
+                let Ok(file_type) = entry.file_type() else {
+                    complete = false;
+                    continue;
+                };
+                if !file_type.is_file() {
+                    complete = false;
+                    continue;
+                }
+                let Ok(file_identity) = workspace_path_identity(&path) else {
+                    complete = false;
+                    continue;
+                };
+                if records_by_identity.get(&file_identity).map(Vec::len) != Some(1) {
+                    complete = false;
+                }
+            }
+            directory_inventory_complete.insert(identity.clone(), complete);
+        }
+        let mut keys_by_file = HashMap::new();
+        let mut grouped = HashMap::<GoPackageKey, Vec<&ResolutionCacheRecord>>::new();
+        for record in go_records {
+            count_go_resolution_work(1);
+            let Some(package) = &record.file.go_package else {
+                continue;
+            };
+            if package.name.is_empty() {
+                continue;
+            }
+            let directory = workspace_path_identity(
+                record
+                    .path
+                    .parent()
+                    .ok_or_else(|| anyhow!("Go proof input has no package directory"))?,
+            )?;
+            let key = GoPackageKey {
+                directory,
+                package_name: package.name.clone(),
+            };
+            keys_by_file.insert(record.file.file_id.0, key.clone());
+            grouped.entry(key).or_default().push(record);
+        }
+        let package_names_by_directory = grouped.keys().fold(
+            HashMap::<WorkspacePathIdentity, Vec<String>>::new(),
+            |mut names, key| {
+                names
+                    .entry(key.directory.clone())
+                    .or_default()
+                    .push(key.package_name.clone());
+                names
+            },
+        );
+        let mut domains = HashMap::new();
+        for (key, mut package_records) in grouped {
+            count_go_resolution_work(1);
+            package_records.sort_by_key(|record| record.file.file_id);
+            let names = package_names_by_directory
+                .get(&key.directory)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let allowed_test_split = names.iter().all(|name| {
+                name == &key.package_name
+                    || name == &format!("{}_test", key.package_name)
+                    || key.package_name == format!("{name}_test")
+            });
+            let mut complete = directory_inventory_complete
+                .get(&key.directory)
+                .copied()
+                .unwrap_or(false)
+                && allowed_test_split;
+            let mut functions = HashMap::<String, GoCandidateSet<GoPackageDeclaration<'_>>>::new();
+            let mut blockers = HashMap::<String, usize>::new();
+            let mut conditional_blockers = HashSet::<String>::new();
+            let mut types = HashMap::<String, GoCandidateSet<GoPackageType<'_>>>::new();
+            let mut methods =
+                HashMap::<(String, String), GoCandidateSet<GoPackageMethod<'_>>>::new();
+            for record in &package_records {
+                count_go_resolution_work(1);
+                if go_test_file(&record.path) {
+                    continue;
+                }
+                let Some(package) = &record.file.go_package else {
+                    complete = false;
+                    continue;
+                };
+                let conditional = go_file_is_conditional(&record.path, package);
+                complete &= record.file.complete && record.file.lookup_input_complete;
+                for declaration in &record.file.top_level_declarations {
+                    count_go_resolution_work(1);
+                    functions.entry(declaration.name.clone()).or_default().add(
+                        GoPackageDeclaration {
+                            declaration: declaration.declaration,
+                            record,
+                        },
+                        conditional,
+                        package.generated,
+                    );
+                }
+                for blocker in &package.package_blockers {
+                    count_go_resolution_work(1);
+                    *blockers.entry(blocker.clone()).or_default() += 1;
+                    if conditional {
+                        conditional_blockers.insert(blocker.clone());
+                    }
+                }
+                for value in &package.types {
+                    count_go_resolution_work(1);
+                    types.entry(value.name.clone()).or_default().add(
+                        GoPackageType { value, record },
+                        conditional,
+                        package.generated,
+                    );
+                }
+                for value in &package.methods {
+                    count_go_resolution_work(1);
+                    methods
+                        .entry((value.owner_name.clone(), value.method_name.clone()))
+                        .or_default()
+                        .add(
+                            GoPackageMethod { value, record },
+                            conditional,
+                            package.generated,
+                        );
+                }
+            }
+            let dependencies = package_records
+                .iter()
+                .filter(|record| !go_test_file(&record.path))
+                .map(|record| {
+                    count_go_resolution_work(1);
+                    FileId(record.file.file_id.0)
+                })
+                .collect();
+            domains.insert(
+                key,
+                GoPackageDomain {
+                    dependencies,
+                    complete,
+                    functions,
+                    blockers,
+                    conditional_blockers,
+                    types,
+                    methods,
+                },
+            );
+        }
+        Ok(Self {
+            keys_by_file,
+            domains,
+        })
+    }
+
+    fn domain(
+        &self,
+        source_record: &ResolutionCacheRecord,
+        package_name: &str,
+    ) -> Option<&GoPackageDomain<'a>> {
+        count_go_resolution_work(1);
+        let key = self.keys_by_file.get(&source_record.file.file_id.0)?;
+        (key.package_name == package_name)
+            .then(|| self.domains.get(key))
+            .flatten()
+    }
+
+    fn resolve_function(
+        &self,
+        source_record: &ResolutionCacheRecord,
+        package_name: &str,
+        name: &str,
+    ) -> GoFunctionResolution {
+        let Some(domain) = self.domain(source_record, package_name) else {
+            return GoFunctionResolution::Incomplete;
+        };
+        if !domain.complete
+            || go_test_file(&source_record.path)
+            || source_record
+                .file
+                .go_package
+                .as_ref()
+                .is_none_or(|package| go_file_is_conditional(&source_record.path, package))
+        {
+            return GoFunctionResolution::Incomplete;
+        }
+        if domain.conditional_blockers.contains(name) {
+            return GoFunctionResolution::Incomplete;
+        }
+        if domain.blockers.get(name).copied().unwrap_or_default() > 0 {
+            return GoFunctionResolution::Ambiguous;
+        }
+        if let Some(types) = domain.types.get(name) {
+            if types.conditional {
+                return GoFunctionResolution::Incomplete;
+            }
+            return if types.ambiguous || types.exact.is_some() {
+                GoFunctionResolution::Ambiguous
+            } else {
+                GoFunctionResolution::Unsupported
+            };
+        }
+        let Some(declarations) = domain.functions.get(name) else {
+            return GoFunctionResolution::Missing;
+        };
+        count_go_resolution_work(1);
+        if declarations.conditional {
+            return GoFunctionResolution::Incomplete;
+        }
+        if declarations.ambiguous {
+            return GoFunctionResolution::Ambiguous;
+        }
+        match declarations.exact.as_ref() {
+            Some(declaration) => GoFunctionResolution::Exact {
+                declaration: declaration.declaration,
+                declaration_file: FileId(declaration.record.file.file_id.0),
+                dependencies: go_domain_dependencies(domain),
+            },
+            None if declarations.generated => GoFunctionResolution::Unsupported,
+            None => GoFunctionResolution::Missing,
+        }
+    }
+
+    fn resolve_receiver(
+        &self,
+        source_record: &ResolutionCacheRecord,
+        package_name: &str,
+        owner_name: &str,
+        method_name: &str,
+        receiver_is_pointer: bool,
+        constructor_uses_builtin_new: bool,
+    ) -> GoReceiverResolution {
+        let Some(domain) = self.domain(source_record, package_name) else {
+            return GoReceiverResolution::Incomplete;
+        };
+        if !domain.complete
+            || go_test_file(&source_record.path)
+            || source_record
+                .file
+                .go_package
+                .as_ref()
+                .is_none_or(|package| go_file_is_conditional(&source_record.path, package))
+        {
+            return GoReceiverResolution::Incomplete;
+        }
+        if constructor_uses_builtin_new {
+            let new_functions = domain.functions.get("new");
+            let new_types = domain.types.get("new");
+            if domain.conditional_blockers.contains("new")
+                || new_functions.is_some_and(|declarations| declarations.conditional)
+                || new_types.is_some_and(|declarations| declarations.conditional)
+            {
+                return GoReceiverResolution::Incomplete;
+            }
+            if domain.blockers.get("new").copied().unwrap_or_default() > 0
+                || new_functions.is_some()
+                || new_types.is_some()
+            {
+                return GoReceiverResolution::Unsupported;
+            }
+        }
+        if domain.conditional_blockers.contains(owner_name) {
+            return GoReceiverResolution::Incomplete;
+        }
+        if domain.blockers.get(owner_name).copied().unwrap_or_default() > 0 {
+            return GoReceiverResolution::Ambiguous;
+        }
+        let owners = domain.types.get(owner_name);
+        let methods = domain
+            .methods
+            .get(&(owner_name.to_string(), method_name.to_string()));
+        count_go_resolution_work(2);
+        if owners.is_some_and(|owners| owners.conditional)
+            || methods.is_some_and(|methods| methods.conditional)
+        {
+            return GoReceiverResolution::Incomplete;
+        }
+        if owners.is_some_and(|owners| owners.ambiguous)
+            || methods.is_some_and(|methods| methods.ambiguous)
+        {
+            return GoReceiverResolution::Ambiguous;
+        }
+        let (Some(owner), Some(method)) = (
+            owners.and_then(|owners| owners.exact.as_ref()),
+            methods.and_then(|methods| methods.exact.as_ref()),
+        ) else {
+            if owners.is_some_and(|owners| owners.generated)
+                || methods.is_some_and(|methods| methods.generated)
+            {
+                return GoReceiverResolution::Unsupported;
+            }
+            return GoReceiverResolution::Missing;
+        };
+        if owner.value.interface || owner.value.generic {
+            return GoReceiverResolution::Unsupported;
+        }
+        if !receiver_is_pointer && method.value.pointer_receiver {
+            return GoReceiverResolution::Unsupported;
+        }
+        GoReceiverResolution::Exact {
+            owner: owner.value.declaration,
+            owner_file: FileId(owner.record.file.file_id.0),
+            declaration: method.value.declaration,
+            declaration_file: FileId(method.record.file.file_id.0),
+            dependencies: go_domain_dependencies(domain),
+        }
+    }
+}
+
+fn go_test_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with("_test.go"))
+}
+
+fn go_file_is_conditional(path: &Path, package: &CachedGoPackage) -> bool {
+    package.build_constrained || go_filename_has_build_constraint(path)
+}
+
+fn go_filename_has_build_constraint(path: &Path) -> bool {
+    const GOOS: &[&str] = &[
+        "aix",
+        "android",
+        "darwin",
+        "dragonfly",
+        "freebsd",
+        "illumos",
+        "ios",
+        "js",
+        "linux",
+        "netbsd",
+        "openbsd",
+        "plan9",
+        "solaris",
+        "wasip1",
+        "windows",
+    ];
+    const GOARCH: &[&str] = &[
+        "386", "amd64", "arm", "arm64", "loong64", "mips", "mips64", "mips64le", "mipsle", "ppc64",
+        "ppc64le", "riscv64", "s390x", "wasm",
+    ];
+    let Some(mut stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return true;
+    };
+    if stem.starts_with('.') || stem.starts_with('_') {
+        return true;
+    }
+    if let Some(without_test) = stem.strip_suffix("_test") {
+        stem = without_test;
+    }
+    let components = stem.split('_').collect::<Vec<_>>();
+    let Some(last) = components.last().copied() else {
+        return false;
+    };
+    GOOS.contains(&last)
+        || GOARCH.contains(&last)
+        || components.len() >= 2
+            && GOOS.contains(&components[components.len() - 2])
+            && GOARCH.contains(&last)
+}
+
+fn go_domain_dependencies(domain: &GoPackageDomain<'_>) -> Vec<FileId> {
+    count_go_resolution_work(1);
+    domain.dependencies.clone()
+}
+
 fn resolve_syntax_claim(
     files: &HashMap<i64, &codestory_store::FileInfo>,
     records: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
     rust_index: &RustProjectionIndex<'_>,
+    go_index: &GoProjectionIndex<'_>,
     source_record: &ResolutionCacheRecord,
     input: CachedCallResolutionInput,
 ) -> Result<ResolvedSyntaxClaim> {
@@ -5407,6 +7247,7 @@ fn resolve_syntax_claim(
     let mut evidence_chain = Vec::new();
     let caller = input.caller.unwrap_or(NodeId(input.callsite.file_id.0));
     let mut exact_node_file_expectations = vec![(caller, input.callsite.file_id)];
+    let mut exact_dependency_files = vec![input.callsite.file_id];
     match &input.binding {
         CachedResolutionBinding::SameFile { declaration } => {
             let declaration_is_recorded =
@@ -5783,6 +7624,158 @@ fn resolve_syntax_claim(
                 }
             }
         }
+        CachedResolutionBinding::GoPackageFunction { package_name, name } => {
+            match go_index.resolve_function(source_record, package_name, name) {
+                GoFunctionResolution::Exact {
+                    declaration,
+                    declaration_file,
+                    dependencies,
+                } => {
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(declaration);
+                    if declaration_file == input.callsite.file_id {
+                        evidence_chain
+                            .push(ResolutionEvidence::SameFileDeclaration { declaration });
+                    } else {
+                        evidence_chain
+                            .push(ResolutionEvidence::SamePackageDeclaration { declaration });
+                    }
+                    exact_node_file_expectations.push((declaration, declaration_file));
+                    exact_dependency_files = dependencies;
+                }
+                GoFunctionResolution::Missing => {
+                    status = ProofResolutionStatus::MissingBinding;
+                    reason = ProofResolutionReason::MissingBinding;
+                }
+                GoFunctionResolution::Ambiguous => {
+                    status = ProofResolutionStatus::Ambiguous;
+                    reason = ProofResolutionReason::MultipleBindings;
+                }
+                GoFunctionResolution::Incomplete => {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                }
+                GoFunctionResolution::Unsupported => {
+                    status = ProofResolutionStatus::Unsupported;
+                    reason = ProofResolutionReason::UnsupportedConstruct;
+                }
+            }
+        }
+        CachedResolutionBinding::GoImplicitReceiver {
+            package_name,
+            owner_name,
+            receiver_is_pointer,
+        } => {
+            match go_index.resolve_receiver(
+                source_record,
+                package_name,
+                owner_name,
+                &input.callsite.raw_target,
+                *receiver_is_pointer,
+                false,
+            ) {
+                GoReceiverResolution::Exact {
+                    owner,
+                    owner_file,
+                    declaration,
+                    declaration_file,
+                    dependencies,
+                } => {
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(declaration);
+                    evidence_chain.push(ResolutionEvidence::ImplicitReceiver { owner });
+                    if declaration_file == input.callsite.file_id {
+                        evidence_chain
+                            .push(ResolutionEvidence::SameFileDeclaration { declaration });
+                    } else {
+                        evidence_chain
+                            .push(ResolutionEvidence::SamePackageDeclaration { declaration });
+                    }
+                    exact_node_file_expectations.push((owner, owner_file));
+                    exact_node_file_expectations.push((declaration, declaration_file));
+                    exact_dependency_files = dependencies;
+                }
+                GoReceiverResolution::Missing => {
+                    status = ProofResolutionStatus::MissingBinding;
+                    reason = ProofResolutionReason::MissingBinding;
+                }
+                GoReceiverResolution::Ambiguous => {
+                    status = ProofResolutionStatus::Ambiguous;
+                    reason = ProofResolutionReason::MultipleBindings;
+                }
+                GoReceiverResolution::Incomplete => {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                }
+                GoReceiverResolution::Unsupported => {
+                    status = ProofResolutionStatus::Unsupported;
+                    reason = ProofResolutionReason::UnsupportedConstruct;
+                }
+            }
+        }
+        CachedResolutionBinding::GoExplicitReceiver {
+            package_name,
+            owner_name,
+            receiver_is_pointer,
+            constructor,
+            constructor_uses_builtin_new,
+        } => {
+            match go_index.resolve_receiver(
+                source_record,
+                package_name,
+                owner_name,
+                &input.callsite.raw_target,
+                *receiver_is_pointer,
+                *constructor_uses_builtin_new,
+            ) {
+                GoReceiverResolution::Exact {
+                    owner,
+                    owner_file,
+                    declaration,
+                    declaration_file,
+                    dependencies,
+                } => {
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(declaration);
+                    if *constructor {
+                        evidence_chain
+                            .push(ResolutionEvidence::ConstructorBinding { constructor: owner });
+                    }
+                    evidence_chain.push(ResolutionEvidence::ExplicitReceiverType {
+                        receiver_type: owner,
+                    });
+                    if declaration_file == input.callsite.file_id {
+                        evidence_chain
+                            .push(ResolutionEvidence::SameFileDeclaration { declaration });
+                    } else {
+                        evidence_chain
+                            .push(ResolutionEvidence::SamePackageDeclaration { declaration });
+                    }
+                    exact_node_file_expectations.push((owner, owner_file));
+                    exact_node_file_expectations.push((declaration, declaration_file));
+                    exact_dependency_files = dependencies;
+                }
+                GoReceiverResolution::Missing => {
+                    status = ProofResolutionStatus::MissingBinding;
+                    reason = ProofResolutionReason::MissingBinding;
+                }
+                GoReceiverResolution::Ambiguous => {
+                    status = ProofResolutionStatus::Ambiguous;
+                    reason = ProofResolutionReason::MultipleBindings;
+                }
+                GoReceiverResolution::Incomplete => {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                }
+                GoReceiverResolution::Unsupported => {
+                    status = ProofResolutionStatus::Unsupported;
+                    reason = ProofResolutionReason::UnsupportedConstruct;
+                }
+            }
+        }
         CachedResolutionBinding::Ambiguous => {
             status = ProofResolutionStatus::Ambiguous;
             reason = ProofResolutionReason::MultipleBindings;
@@ -5830,6 +7823,7 @@ fn resolve_syntax_claim(
                             reason,
                             evidence_chain,
                             exact_node_file_expectations,
+                            exact_dependency_files,
                         });
                     }
                     (source_record, None, *owner)
@@ -5854,6 +7848,7 @@ fn resolve_syntax_claim(
                                     reason,
                                     evidence_chain,
                                     exact_node_file_expectations,
+                                    exact_dependency_files,
                                 });
                             }
                             RelativeImportResolution::Incomplete => {
@@ -5867,6 +7862,7 @@ fn resolve_syntax_claim(
                                     reason,
                                     evidence_chain,
                                     exact_node_file_expectations,
+                                    exact_dependency_files,
                                 });
                             }
                         };
@@ -5888,6 +7884,7 @@ fn resolve_syntax_claim(
                             reason,
                             evidence_chain,
                             exact_node_file_expectations,
+                            exact_dependency_files,
                         });
                     }
                     let owners = target_record
@@ -5919,6 +7916,7 @@ fn resolve_syntax_claim(
                             reason,
                             evidence_chain,
                             exact_node_file_expectations,
+                            exact_dependency_files,
                         });
                     };
                     (target_record, Some(*import), export.declaration)
@@ -5987,6 +7985,7 @@ fn resolve_syntax_claim(
         reason,
         evidence_chain,
         exact_node_file_expectations,
+        exact_dependency_files,
     })
 }
 
@@ -6003,7 +8002,12 @@ fn enforce_exact_dependency_eligibility(
         .filter(|claim| claim.status == ProofResolutionStatus::Exact)
     {
         let mut eligible = true;
-        let mut expected_file_ids = HashSet::from([claim.input.callsite.file_id.0]);
+        let mut expected_file_ids = claim
+            .exact_dependency_files
+            .iter()
+            .map(|file| file.0)
+            .collect::<HashSet<_>>();
+        expected_file_ids.insert(claim.input.callsite.file_id.0);
         for (node_id, expected_file_id) in &claim.exact_node_file_expectations {
             expected_file_ids.insert(expected_file_id.0);
             let node = nodes.get(node_id).ok_or_else(|| {
@@ -6117,6 +8121,14 @@ fn seal_resolved_claim(
     };
     let input = &claim.input;
     let mut dependency_ids = HashSet::from([NodeId(input.callsite.file_id.0)]);
+    if status == ProofResolutionStatus::Exact {
+        dependency_ids.extend(
+            claim
+                .exact_dependency_files
+                .iter()
+                .map(|file| NodeId(file.0)),
+        );
+    }
     for node_id in evidence_chain
         .iter()
         .flat_map(ResolutionEvidence::node_ids)
@@ -6330,6 +8342,7 @@ mod rust_complexity_tests {
                 rust_modules: modules,
                 rust_types: types,
                 rust_uses: imports,
+                go_package: None,
             },
             calls: Vec::new(),
         };
@@ -6380,6 +8393,134 @@ mod rust_complexity_tests {
         assert!(
             large <= small * 2 + 128,
             "projection work grew superlinearly: {small} -> {large}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod go_complexity_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn go_source(count: usize) -> String {
+        let mut source = String::from(
+            "package proof\ntype Worker struct{}\nfunc (w *Worker) Run() {}\nfunc caller() {\n",
+        );
+        for index in 0..count {
+            source.push_str(&format!(
+                "  worker{index} := &Worker{{}}\n  worker{index}.Run()\n"
+            ));
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    fn measured_source_work(count: usize) -> usize {
+        let source = go_source(count);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go grammar must load");
+        let tree = parser.parse(&source, None).expect("source must parse");
+        reset_go_resolution_work();
+        let _ = GoResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+        go_resolution_work()
+    }
+
+    fn measured_package_work(file_count: usize, lookup_count: usize) -> usize {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut records = Vec::new();
+        for index in 0..file_count {
+            let path = temp.path().join(format!("file_{index}.go"));
+            std::fs::write(&path, "package proof\n").expect("write Go source");
+            records.push(ResolutionCacheRecord {
+                path,
+                file: CachedResolutionFile {
+                    file_id: NodeId(index as i64 + 1),
+                    source_sha256: "0".repeat(64),
+                    language: "go".to_string(),
+                    adapter_version: ADAPTER_VERSION.to_string(),
+                    parser_fingerprint: "parser".to_string(),
+                    complete: true,
+                    lookup_input_complete: true,
+                    typescript_module: false,
+                    top_level_declarations: vec![CachedTopLevelDeclaration {
+                        name: "Target".to_string(),
+                        declaration: NodeId(10_000 + index as i64),
+                        module_path: Vec::new(),
+                        cross_module_visible: false,
+                    }],
+                    inherent_methods: Vec::new(),
+                    classes: Vec::new(),
+                    direct_exports: Vec::new(),
+                    export_poison_all: false,
+                    poisoned_export_names: Vec::new(),
+                    rust_modules: Vec::new(),
+                    rust_types: Vec::new(),
+                    rust_uses: Vec::new(),
+                    go_package: Some(CachedGoPackage {
+                        name: "proof".to_string(),
+                        build_constrained: false,
+                        generated: false,
+                        package_blockers: Vec::new(),
+                        types: Vec::new(),
+                        methods: Vec::new(),
+                    }),
+                },
+                calls: Vec::new(),
+            });
+        }
+        reset_go_resolution_work();
+        let index = GoProjectionIndex::prepare(&records).expect("Go package projection");
+        for _ in 0..lookup_count {
+            let _ = index.resolve_function(&records[0], "proof", "Target");
+        }
+        go_resolution_work()
+    }
+
+    #[test]
+    fn go_source_resolution_work_is_linear_for_bindings_and_calls() {
+        let small = measured_source_work(64);
+        let large = measured_source_work(128);
+        assert!(small > 0, "Go source work was not instrumented");
+        assert!(
+            large <= small * 2 + 128,
+            "Go source work grew superlinearly: {small} -> {large}"
+        );
+    }
+
+    #[test]
+    fn go_package_projection_work_is_linear() {
+        let small = measured_package_work(64, 64);
+        let large = measured_package_work(128, 128);
+        assert!(small >= 64, "Go package work was not instrumented: {small}");
+        assert!(
+            large <= small * 2 + 128,
+            "Go package work grew superlinearly: {small} -> {large}"
+        );
+    }
+
+    #[test]
+    fn go_package_files_and_call_lookups_are_independently_counted_and_linear() {
+        let baseline = measured_package_work(64, 64);
+        assert!(
+            baseline >= 64 * 8,
+            "Go package dependency preparation/lookups were not fully counted: {baseline}"
+        );
+        let more_files = measured_package_work(128, 64);
+        let more_calls = measured_package_work(64, 128);
+        let combined = measured_package_work(128, 128);
+        assert!(
+            more_files <= baseline * 2 + 128,
+            "Go file preparation grew superlinearly: {baseline} -> {more_files}"
+        );
+        assert!(
+            more_calls <= baseline * 2 + 128,
+            "Go call lookup work grew superlinearly: {baseline} -> {more_calls}"
+        );
+        assert!(
+            combined <= baseline * 2 + 256,
+            "combined Go package/call work grew superlinearly: {baseline} -> {combined}"
         );
     }
 }
