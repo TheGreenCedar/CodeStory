@@ -1322,6 +1322,7 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
                 &[
                     "index_commit.rs",
                     "index_full.rs",
+                    "index_incremental.rs",
                     "indexed_source_call_path_v1.rs",
                     "proof_qualification_support.rs",
                     "semantic_republish.rs",
