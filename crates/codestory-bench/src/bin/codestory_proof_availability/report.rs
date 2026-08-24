@@ -3262,6 +3262,21 @@ mod tests {
             target: resolved(&prior.target, TARGET_CANONICAL_ID),
             resolution_fact_id: "a".repeat(64),
             resolution_evidence_sha256: "b".repeat(64),
+            resolution_evidence_chain: vec![
+                codestory_contracts::proof_resolution::ResolutionEvidence::SameFileDeclaration {
+                    declaration: NodeId(prior.target.pinned.node_id.parse().unwrap()),
+                },
+            ],
+            resolution_provenance: codestory_contracts::proof_resolution::ResolutionProvenance {
+                producer: "codestory-internal".into(),
+                fact_schema_version: 1,
+                algorithm: "exact-call-resolution-v1".into(),
+                language_adapter: "rust".into(),
+                language_adapter_version: "test-v1".into(),
+                parser_fingerprint: "c".repeat(64),
+                dependency_file_hashes: Vec::new(),
+                evidence_sha256: "b".repeat(64),
+            },
             exact_callsite_start_byte: 0,
             callsite_identity: prior.callsite_identity.clone(),
             column_or_ordinal: 0,

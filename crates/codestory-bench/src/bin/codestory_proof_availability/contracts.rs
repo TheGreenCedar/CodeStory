@@ -1939,7 +1939,7 @@ pub(crate) fn product_disposition_from_projection(root: &Value) -> Result<Produc
     let actual = match kind {
         "contract_proven" => ActualProductResultV1::ContractProven {
             contract_digest,
-            receipts: projected_receipts(disposition.get("receipts"))?,
+            receipts: projected_receipts(root, disposition.get("receipts"))?,
         },
         "contract_refuted" => {
             let refutation = disposition
@@ -1947,7 +1947,8 @@ pub(crate) fn product_disposition_from_projection(root: &Value) -> Result<Produc
                 .and_then(Value::as_object)
                 .ok_or_else(|| anyhow::anyhow!("proof_availability_refutation_missing"))?;
             let step_index = projected_u8(refutation, "step_index")?;
-            let connected_receipts = projected_receipts(refutation.get("connected_receipts"))?;
+            let connected_receipts =
+                projected_receipts(root, refutation.get("connected_receipts"))?;
             let basis = match refutation.get("kind").and_then(Value::as_str) {
                 Some("prohibited_scope_traversal") => {
                     ProductRefutationBasisV1::PositiveContradiction {
@@ -1983,7 +1984,7 @@ pub(crate) fn product_disposition_from_projection(root: &Value) -> Result<Produc
                 .map(serde_json::from_value)
                 .transpose()?
                 .unwrap_or_default(),
-            connected_receipts: projected_receipts(disposition.get("connected_receipts"))?,
+            connected_receipts: projected_receipts(root, disposition.get("connected_receipts"))?,
         },
         "unavailable" => ActualProductResultV1::Unavailable {
             contract_digest,
@@ -2057,13 +2058,40 @@ pub(crate) fn product_disposition_from_projection(root: &Value) -> Result<Produc
     })
 }
 
-fn projected_receipts(value: Option<&Value>) -> Result<Vec<ProjectedReceiptReferenceV1>> {
-    value
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map(|value| value.unwrap_or_default())
-        .map_err(Into::into)
+fn projected_receipts(
+    root: &Value,
+    value: Option<&Value>,
+) -> Result<Vec<ProjectedReceiptReferenceV1>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let references = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_compact_receipt_references_invalid"))?;
+    let receipts = root
+        .get("receipts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("proof_availability_compact_receipt_table_missing"))?;
+    references
+        .iter()
+        .map(|reference| {
+            let index = reference
+                .as_u64()
+                .and_then(|index| usize::try_from(index).ok())
+                .filter(|index| *index < receipts.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("proof_availability_compact_receipt_reference_dangling")
+                })?;
+            let receipt = receipts
+                .get(index)
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("proof_availability_compact_receipt_row_invalid"))?;
+            Ok(ProjectedReceiptReferenceV1 {
+                receipt_id: projected_string(receipt, "receipt_id")?,
+                edge_id: projected_string(receipt, "edge_id")?,
+            })
+        })
+        .collect()
 }
 
 fn projected_u8(object: &serde_json::Map<String, Value>, field: &str) -> Result<u8> {

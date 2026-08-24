@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
+use codestory_contracts::proof_resolution::{ResolutionEvidence, ResolutionProvenance};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -86,6 +87,8 @@ pub struct IndexedCallEdgeReceipt {
     pub target: ResolvedNodeIdentity,
     pub resolution_fact_id: String,
     pub resolution_evidence_sha256: String,
+    pub resolution_evidence_chain: Vec<ResolutionEvidence>,
+    pub resolution_provenance: ResolutionProvenance,
     pub exact_callsite_start_byte: u64,
     pub callsite_identity: String,
     pub column_or_ordinal: u32,
@@ -2056,6 +2059,9 @@ fn validate_built_publication_and_receipts(
     for receipt in &built.receipts {
         if receipt.resolution_fact_id.len() != 64
             || receipt.resolution_evidence_sha256.len() != 64
+            || receipt.resolution_evidence_chain.is_empty()
+            || !valid_resolution_provenance(&receipt.resolution_provenance)
+            || receipt.resolution_evidence_sha256 != receipt.resolution_provenance.evidence_sha256
             || !node_matches_publication(&receipt.source, publication)
             || !node_matches_publication(&receipt.target, publication)
         {
@@ -2261,10 +2267,521 @@ pub enum InternalProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InternalProjectionError {
     Serialization(String),
+    InvalidCompactProjection(String),
     FallbackExceedsCap {
         cap_bytes: usize,
         serialized_size: usize,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactFileIdentity {
+    file_node_id: Option<i64>,
+    project_file_components: Option<Vec<String>>,
+    indexed_sha256: Option<String>,
+    observed_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactSymbolIdentity {
+    node_id: String,
+    pinned: Option<PinnedNodeIdentity>,
+    canonical_id: Option<String>,
+    qualified_name: Option<String>,
+    file: Option<u32>,
+}
+
+#[derive(Default)]
+struct CompactIdentityTables {
+    files: Vec<CompactFileIdentity>,
+    file_by_node_id: BTreeMap<i64, u32>,
+    file_by_path: BTreeMap<Vec<String>, u32>,
+    symbols: Vec<CompactSymbolIdentity>,
+    symbol_by_pinned: BTreeMap<String, u32>,
+    evidence: Vec<Value>,
+    evidence_by_fact_id: BTreeMap<String, u32>,
+}
+
+impl CompactIdentityTables {
+    fn intern_file(
+        &mut self,
+        file_node_id: Option<i64>,
+        project_file_components: Option<Vec<String>>,
+        indexed_sha256: Option<String>,
+        observed_sha256: Option<String>,
+    ) -> Result<u32, InternalProjectionError> {
+        let by_id = file_node_id.and_then(|id| self.file_by_node_id.get(&id).copied());
+        let by_path = project_file_components
+            .as_ref()
+            .and_then(|path| self.file_by_path.get(path).copied());
+        if by_id
+            .zip(by_path)
+            .is_some_and(|(left, right)| left != right)
+        {
+            return Err(InternalProjectionError::InvalidCompactProjection(
+                "conflicting_file_identity".to_owned(),
+            ));
+        }
+        let index = by_id
+            .or(by_path)
+            .unwrap_or(bounded_index(self.files.len())?);
+        if usize::try_from(index).expect("u32 index fits usize") == self.files.len() {
+            self.files.push(CompactFileIdentity {
+                file_node_id: None,
+                project_file_components: None,
+                indexed_sha256: None,
+                observed_sha256: None,
+            });
+        }
+        let file = &mut self.files[usize::try_from(index).expect("u32 index fits usize")];
+        merge_compact_field(
+            &mut file.file_node_id,
+            file_node_id,
+            "conflicting_file_identity",
+        )?;
+        merge_compact_field(
+            &mut file.project_file_components,
+            project_file_components,
+            "conflicting_file_identity",
+        )?;
+        merge_compact_field(
+            &mut file.indexed_sha256,
+            indexed_sha256,
+            "conflicting_file_identity",
+        )?;
+        merge_compact_field(
+            &mut file.observed_sha256,
+            observed_sha256,
+            "conflicting_file_identity",
+        )?;
+        if let Some(id) = file.file_node_id {
+            self.file_by_node_id.insert(id, index);
+        }
+        if let Some(path) = &file.project_file_components {
+            self.file_by_path.insert(path.clone(), index);
+        }
+        Ok(index)
+    }
+
+    fn intern_resolved_symbol(
+        &mut self,
+        node: &ResolvedNodeIdentity,
+    ) -> Result<u32, InternalProjectionError> {
+        let file =
+            self.intern_file(None, Some(node.project_file_components.clone()), None, None)?;
+        let identity = CompactSymbolIdentity {
+            node_id: node.pinned.node_id.clone(),
+            pinned: Some(node.pinned.clone()),
+            canonical_id: Some(node.canonical_id.clone()),
+            qualified_name: Some(node.qualified_name.clone()),
+            file: Some(file),
+        };
+        if let Some(index) = self.symbol_by_pinned.get(&identity.node_id).copied() {
+            if self.symbols[usize::try_from(index).expect("u32 index fits usize")] != identity {
+                return Err(InternalProjectionError::InvalidCompactProjection(
+                    "conflicting_symbol_identity".to_owned(),
+                ));
+            }
+            return Ok(index);
+        }
+        let index = bounded_index(self.symbols.len())?;
+        self.symbols.push(identity.clone());
+        self.symbol_by_pinned.insert(identity.node_id, index);
+        Ok(index)
+    }
+
+    fn intern_evidence_symbol(&mut self, node_id: NodeId) -> Result<u32, InternalProjectionError> {
+        let node_id = node_id.0.to_string();
+        if let Some(index) = self.symbol_by_pinned.get(&node_id).copied() {
+            return Ok(index);
+        }
+        let index = bounded_index(self.symbols.len())?;
+        self.symbols.push(CompactSymbolIdentity {
+            node_id: node_id.clone(),
+            pinned: None,
+            canonical_id: None,
+            qualified_name: None,
+            file: None,
+        });
+        self.symbol_by_pinned.insert(node_id, index);
+        Ok(index)
+    }
+
+    fn intern_evidence(
+        &mut self,
+        receipt: &IndexedCallEdgeReceipt,
+        source: u32,
+        target: u32,
+    ) -> Result<u32, InternalProjectionError> {
+        if receipt.resolution_evidence_chain.is_empty()
+            || !valid_resolution_provenance(&receipt.resolution_provenance)
+        {
+            return Err(InternalProjectionError::InvalidCompactProjection(
+                "resolution_provenance_invalid".to_owned(),
+            ));
+        }
+        let chain = receipt
+            .resolution_evidence_chain
+            .iter()
+            .map(|evidence| {
+                Ok(json!({
+                    "kind": evidence.kind().as_str(),
+                    "symbols": evidence.node_ids().into_iter().map(|node| self.intern_evidence_symbol(node).map(Value::from)).collect::<Result<Vec<_>, _>>()?,
+                }))
+            })
+            .collect::<Result<Vec<_>, InternalProjectionError>>()?;
+        let dependency_files = receipt
+            .resolution_provenance
+            .dependency_file_hashes
+            .iter()
+            .map(|dependency| {
+                self.intern_file(
+                    Some(dependency.file_id.0),
+                    None,
+                    Some(dependency.source_sha256.clone()),
+                    None,
+                )
+                .map(Value::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let provenance = &receipt.resolution_provenance;
+        let row = json!({
+            "fact_id": receipt.resolution_fact_id,
+            "caller": source,
+            "target": target,
+            "chain": chain,
+            "provenance": {
+                "producer": provenance.producer,
+                "fact_schema_version": provenance.fact_schema_version,
+                "algorithm": provenance.algorithm,
+                "language_adapter": provenance.language_adapter,
+                "language_adapter_version": provenance.language_adapter_version,
+                "parser_fingerprint": provenance.parser_fingerprint,
+                "dependency_files": dependency_files,
+                "evidence_sha256": provenance.evidence_sha256,
+            },
+        });
+        if let Some(index) = self
+            .evidence_by_fact_id
+            .get(&receipt.resolution_fact_id)
+            .copied()
+        {
+            if self.evidence[usize::try_from(index).expect("u32 index fits usize")] != row {
+                return Err(InternalProjectionError::InvalidCompactProjection(
+                    "conflicting_resolution_fact".to_owned(),
+                ));
+            }
+            return Ok(index);
+        }
+        let index = bounded_index(self.evidence.len())?;
+        self.evidence.push(row);
+        self.evidence_by_fact_id
+            .insert(receipt.resolution_fact_id.clone(), index);
+        Ok(index)
+    }
+
+    fn receipt_json(
+        &mut self,
+        receipt: &IndexedCallEdgeReceipt,
+    ) -> Result<Value, InternalProjectionError> {
+        let file = self.intern_file(
+            Some(receipt.containment.file_node_id.0),
+            Some(receipt.line_window.project_file_components.clone()),
+            Some(receipt.line_window.indexed_sha256.clone()),
+            Some(receipt.line_window.observed_sha256.clone()),
+        )?;
+        let source = self.intern_resolved_symbol(&receipt.source)?;
+        let target = self.intern_resolved_symbol(&receipt.target)?;
+        let source_file = self.symbols[usize::try_from(source).expect("u32 index fits usize")].file;
+        if source_file != Some(file) {
+            return Err(InternalProjectionError::InvalidCompactProjection(
+                "callsite_source_file_mismatch".to_owned(),
+            ));
+        }
+        let owner = self.intern_evidence_symbol(receipt.containment.owner_node_id)?;
+        let evidence = self.intern_evidence(receipt, source, target)?;
+        Ok(json!({
+            "receipt_id": receipt.receipt.receipt_id,
+            "edge_id": receipt.receipt.edge_id,
+            "source": source,
+            "target": target,
+            "evidence": evidence,
+            "exact_callsite_start_byte": receipt.exact_callsite_start_byte,
+            "callsite_identity": receipt.callsite_identity,
+            "column_or_ordinal": receipt.column_or_ordinal,
+            "containment": {
+                "file": file,
+                "owner": owner,
+                "start_line": receipt.containment.start_line,
+                "end_line": receipt.containment.end_line,
+            },
+            "line_window": {
+                "kind": receipt.line_window.kind,
+                "file": file,
+                "anchor_line": receipt.line_window.anchor_line,
+                "byte_start": receipt.line_window.byte_start,
+                "byte_end": receipt.line_window.byte_end,
+                "text": receipt.line_window.text,
+            },
+        }))
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "files": self.files.iter().map(|file| json!({
+                "file_node_id": file.file_node_id.map(|id| id.to_string()),
+                "project_file_components": file.project_file_components,
+                "indexed_sha256": file.indexed_sha256,
+                "observed_sha256": file.observed_sha256,
+            })).collect::<Vec<_>>(),
+            "symbols": self.symbols.iter().map(|symbol| json!({
+                "node_id": symbol.node_id,
+                "pinned": symbol.pinned.as_ref().map(pinned_identity_json),
+                "canonical_id": symbol.canonical_id,
+                "qualified_name": symbol.qualified_name,
+                "file": symbol.file,
+            })).collect::<Vec<_>>(),
+            "evidence": self.evidence,
+        })
+    }
+}
+
+fn bounded_index(length: usize) -> Result<u32, InternalProjectionError> {
+    u32::try_from(length).map_err(|_| {
+        InternalProjectionError::InvalidCompactProjection("compact_table_index_overflow".to_owned())
+    })
+}
+
+fn merge_compact_field<T: PartialEq>(
+    current: &mut Option<T>,
+    incoming: Option<T>,
+    code: &str,
+) -> Result<(), InternalProjectionError> {
+    match (current.as_ref(), incoming) {
+        (Some(existing), Some(incoming)) if existing != &incoming => Err(
+            InternalProjectionError::InvalidCompactProjection(code.to_owned()),
+        ),
+        (None, Some(incoming)) => {
+            *current = Some(incoming);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn valid_resolution_provenance(provenance: &ResolutionProvenance) -> bool {
+    !provenance.producer.is_empty()
+        && provenance.fact_schema_version > 0
+        && !provenance.algorithm.is_empty()
+        && !provenance.language_adapter.is_empty()
+        && !provenance.language_adapter_version.is_empty()
+        && is_lower_hex_sha256(&provenance.parser_fingerprint)
+        && is_lower_hex_sha256(&provenance.evidence_sha256)
+        && provenance
+            .dependency_file_hashes
+            .iter()
+            .all(|dependency| is_lower_hex_sha256(&dependency.source_sha256))
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Rejects compact roots whose numeric references no longer describe one
+/// complete proof. The CLI calls this before serializing every revision.
+pub fn validate_compact_projection(root: &Value) -> Result<(), String> {
+    if root.get("kind") == Some(&json!("budget_exceeded")) {
+        for forbidden in ["identities", "spec", "clauses", "steps", "receipts"] {
+            if root.get(forbidden).is_some() {
+                return Err(format!("budget_fallback_contains_{forbidden}"));
+            }
+        }
+        return Ok(());
+    }
+    if root.get("kind") != Some(&json!("complete")) {
+        return Err("compact_root_kind_invalid".to_owned());
+    }
+    let identities = root
+        .get("identities")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "compact_identities_missing".to_owned())?;
+    let files = compact_array(identities.get("files"), "compact_files_missing")?;
+    let symbols = compact_array(identities.get("symbols"), "compact_symbols_missing")?;
+    let evidence = compact_array(identities.get("evidence"), "compact_evidence_missing")?;
+    let receipts = compact_array(root.get("receipts"), "compact_receipts_missing")?;
+
+    for symbol in symbols {
+        if let Some(file) = symbol.get("file").filter(|file| !file.is_null()) {
+            compact_index(file, files.len(), "compact_symbol_file_reference_invalid")?;
+        }
+    }
+    for evidence_row in evidence {
+        compact_index(
+            evidence_row.get("caller").unwrap_or(&Value::Null),
+            symbols.len(),
+            "compact_evidence_caller_reference_invalid",
+        )?;
+        compact_index(
+            evidence_row.get("target").unwrap_or(&Value::Null),
+            symbols.len(),
+            "compact_evidence_target_reference_invalid",
+        )?;
+        for chain in compact_array(evidence_row.get("chain"), "compact_evidence_chain_missing")? {
+            for symbol in compact_array(
+                chain.get("symbols"),
+                "compact_evidence_chain_symbols_missing",
+            )? {
+                compact_index(
+                    symbol,
+                    symbols.len(),
+                    "compact_evidence_symbol_reference_invalid",
+                )?;
+            }
+        }
+        let provenance = evidence_row
+            .get("provenance")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "compact_evidence_provenance_missing".to_owned())?;
+        for file in compact_array(
+            provenance.get("dependency_files"),
+            "compact_dependency_files_missing",
+        )? {
+            compact_index(
+                file,
+                files.len(),
+                "compact_dependency_file_reference_invalid",
+            )?;
+        }
+    }
+    for receipt in receipts {
+        let source = compact_index(
+            receipt.get("source").unwrap_or(&Value::Null),
+            symbols.len(),
+            "compact_receipt_source_reference_invalid",
+        )?;
+        let target = compact_index(
+            receipt.get("target").unwrap_or(&Value::Null),
+            symbols.len(),
+            "compact_receipt_target_reference_invalid",
+        )?;
+        let evidence_index = compact_index(
+            receipt.get("evidence").unwrap_or(&Value::Null),
+            evidence.len(),
+            "compact_receipt_evidence_reference_invalid",
+        )?;
+        let evidence_row = &evidence[evidence_index];
+        if compact_index(
+            evidence_row.get("caller").unwrap_or(&Value::Null),
+            symbols.len(),
+            "compact_evidence_caller_reference_invalid",
+        )? != source
+            || compact_index(
+                evidence_row.get("target").unwrap_or(&Value::Null),
+                symbols.len(),
+                "compact_evidence_target_reference_invalid",
+            )? != target
+        {
+            return Err("compact_receipt_evidence_endpoint_mismatch".to_owned());
+        }
+        let containment = receipt
+            .get("containment")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "compact_receipt_containment_missing".to_owned())?;
+        let line_window = receipt
+            .get("line_window")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "compact_receipt_line_window_missing".to_owned())?;
+        let containment_file = compact_index(
+            containment.get("file").unwrap_or(&Value::Null),
+            files.len(),
+            "compact_containment_file_reference_invalid",
+        )?;
+        compact_index(
+            containment.get("owner").unwrap_or(&Value::Null),
+            symbols.len(),
+            "compact_containment_owner_reference_invalid",
+        )?;
+        let line_file = compact_index(
+            line_window.get("file").unwrap_or(&Value::Null),
+            files.len(),
+            "compact_line_window_file_reference_invalid",
+        )?;
+        let source_file = symbols[source]
+            .get("file")
+            .ok_or_else(|| "compact_source_file_missing".to_owned())?;
+        if compact_index(
+            source_file,
+            files.len(),
+            "compact_symbol_file_reference_invalid",
+        )? != containment_file
+            || containment_file != line_file
+        {
+            return Err("compact_receipt_file_reference_mismatch".to_owned());
+        }
+    }
+    for step in compact_array(root.get("steps"), "compact_steps_missing")? {
+        if let Some(receipt) = step.get("receipt").filter(|value| !value.is_null()) {
+            compact_index(
+                receipt,
+                receipts.len(),
+                "compact_step_receipt_reference_invalid",
+            )?;
+        }
+        if step.get("target").is_some() {
+            return Err("compact_step_repeats_target".to_owned());
+        }
+    }
+    let disposition = root
+        .get("disposition")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "compact_disposition_missing".to_owned())?;
+    validate_disposition_receipts(disposition, receipts.len())?;
+    Ok(())
+}
+
+fn compact_array<'a>(value: Option<&'a Value>, code: &str) -> Result<&'a Vec<Value>, String> {
+    value
+        .and_then(Value::as_array)
+        .ok_or_else(|| code.to_owned())
+}
+
+fn compact_index(value: &Value, length: usize, code: &str) -> Result<usize, String> {
+    value
+        .as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .filter(|index| *index < length)
+        .ok_or_else(|| code.to_owned())
+}
+
+fn validate_disposition_receipts(
+    disposition: &serde_json::Map<String, Value>,
+    receipt_count: usize,
+) -> Result<(), String> {
+    let validate = |value: Option<&Value>| -> Result<(), String> {
+        for receipt in compact_array(value, "compact_disposition_receipts_missing")? {
+            compact_index(
+                receipt,
+                receipt_count,
+                "compact_disposition_receipt_reference_invalid",
+            )?;
+        }
+        Ok(())
+    };
+    match disposition.get("kind").and_then(Value::as_str) {
+        Some("contract_proven") => validate(disposition.get("receipts")),
+        Some("unknown") => validate(disposition.get("connected_receipts")),
+        Some("contract_refuted") => validate(
+            disposition
+                .get("refutation")
+                .and_then(Value::as_object)
+                .and_then(|refutation| refutation.get("connected_receipts")),
+        ),
+        Some("unavailable") => Ok(()),
+        _ => Err("compact_disposition_kind_invalid".to_owned()),
+    }
 }
 
 pub fn project_internal_call_path_result(
@@ -2277,7 +2794,7 @@ fn project_internal_call_path_result_with_cap(
     integration: &CheckedBuiltCallPathIntegration,
     cap_bytes: usize,
 ) -> Result<InternalProjection, InternalProjectionError> {
-    let complete = complete_projection_json(integration);
+    let complete = complete_projection_json(integration)?;
     let required_complete_size = serialized_json_size(&complete)?;
     if required_complete_size <= cap_bytes {
         return Ok(InternalProjection::Complete {
@@ -2317,8 +2834,25 @@ fn project_internal_call_path_result_with_cap(
     })
 }
 
-fn complete_projection_json(integration: &CheckedBuiltCallPathIntegration) -> Value {
-    json!({
+fn complete_projection_json(
+    integration: &CheckedBuiltCallPathIntegration,
+) -> Result<Value, InternalProjectionError> {
+    let mut tables = CompactIdentityTables::default();
+    let mut receipts = Vec::with_capacity(integration.authoritative_receipts.len());
+    let mut receipt_refs = BTreeMap::new();
+    for receipt in &integration.authoritative_receipts {
+        let receipt_index = bounded_index(receipts.len())?;
+        if receipt_refs
+            .insert(receipt.receipt.clone(), receipt_index)
+            .is_some()
+        {
+            return Err(InternalProjectionError::InvalidCompactProjection(
+                "duplicate_receipt_reference".to_owned(),
+            ));
+        }
+        receipts.push(tables.receipt_json(receipt)?);
+    }
+    let complete = json!({
         "kind": "complete",
         "schema_version": PROOF_CONTRACT_SCHEMA_VERSION,
         "domain": PROOF_DOMAIN,
@@ -2327,6 +2861,7 @@ fn complete_projection_json(integration: &CheckedBuiltCallPathIntegration) -> Va
         "source_text_sha256": integration.hashes.source_text_sha256,
         "contract_digest": integration.hashes.contract_digest,
         "core_publication": publication_json(&integration.built.publication),
+        "identities": tables.json(),
         "spec": spec_json(&integration.contract.spec),
         "clauses": integration
             .rendering
@@ -2334,14 +2869,13 @@ fn complete_projection_json(integration: &CheckedBuiltCallPathIntegration) -> Va
             .iter()
             .map(normalized_clause_json)
             .collect::<Vec<_>>(),
-        "disposition": disposition_json(&integration.disposition),
-        "steps": step_results_json(&integration.contract, &integration.disposition),
-        "receipts": integration
-            .authoritative_receipts
-            .iter()
-            .map(indexed_receipt_json)
-            .collect::<Vec<_>>(),
-    })
+        "disposition": disposition_json(&integration.disposition, &receipt_refs)?,
+        "steps": step_results_json(&integration.contract, &integration.disposition, &receipt_refs)?,
+        "receipts": receipts,
+    });
+    validate_compact_projection(&complete)
+        .map_err(InternalProjectionError::InvalidCompactProjection)?;
+    Ok(complete)
 }
 
 fn publication_json(publication: &InternalCorePublicationIdentity) -> Value {
@@ -2352,79 +2886,76 @@ fn publication_json(publication: &InternalCorePublicationIdentity) -> Value {
     })
 }
 
-fn disposition_json(disposition: &ProofDisposition) -> Value {
+fn disposition_json(
+    disposition: &ProofDisposition,
+    receipt_refs: &BTreeMap<ReceiptRef, u32>,
+) -> Result<Value, InternalProjectionError> {
     match disposition {
         ProofDisposition::ContractProven {
             contract_digest,
             receipts,
-        } => json!({
+        } => Ok(json!({
             "kind": "contract_proven",
             "contract_digest": contract_digest,
-            "receipts": receipts.iter().map(receipt_ref_json).collect::<Vec<_>>(),
-        }),
+            "receipts": receipt_indices_json(receipts, receipt_refs)?,
+        })),
         ProofDisposition::ContractRefuted {
             contract_digest,
             refutation,
-        } => json!({
+        } => Ok(json!({
             "kind": "contract_refuted",
             "contract_digest": contract_digest,
-            "refutation": refutation_json(refutation),
-        }),
+            "refutation": refutation_json(refutation, receipt_refs)?,
+        })),
         ProofDisposition::Unknown {
             contract_digest,
             gaps,
             connected_receipts,
-        } => json!({
+        } => Ok(json!({
             "kind": "unknown",
             "contract_digest": contract_digest,
             "gaps": gaps.iter().map(proof_gap_json).collect::<Vec<_>>(),
-            "connected_receipts": connected_receipts
-                .iter()
-                .map(receipt_ref_json)
-                .collect::<Vec<_>>(),
-        }),
+            "connected_receipts": receipt_indices_json(connected_receipts, receipt_refs)?,
+        })),
         ProofDisposition::Unavailable {
             contract_digest,
             reasons,
-        } => json!({
+        } => Ok(json!({
             "kind": "unavailable",
             "contract_digest": contract_digest,
             "reasons": reasons.iter().map(unavailable_reason_name).collect::<Vec<_>>(),
-        }),
+        })),
     }
 }
 
-fn refutation_json(refutation: &Refutation) -> Value {
+fn refutation_json(
+    refutation: &Refutation,
+    receipt_refs: &BTreeMap<ReceiptRef, u32>,
+) -> Result<Value, InternalProjectionError> {
     match refutation {
         Refutation::ProhibitedScopeTraversal {
             step_index,
             prohibition_index,
             connected_receipts,
-        } => json!({
+        } => Ok(json!({
             "kind": "prohibited_scope_traversal",
             "step_index": step_index,
             "prohibition_index": prohibition_index,
-            "connected_receipts": connected_receipts
-                .iter()
-                .map(receipt_ref_json)
-                .collect::<Vec<_>>(),
-        }),
+            "connected_receipts": receipt_indices_json(connected_receipts, receipt_refs)?,
+        })),
         #[cfg(any(test, feature = "test-support"))]
         Refutation::CertifiedAbsence {
             step_index,
             extractor_capability_receipt_id,
             untruncated_enumeration_receipt_id,
             connected_receipts,
-        } => json!({
+        } => Ok(json!({
             "kind": "certified_absence",
             "step_index": step_index,
             "extractor_capability_receipt_id": extractor_capability_receipt_id,
             "untruncated_enumeration_receipt_id": untruncated_enumeration_receipt_id,
-            "connected_receipts": connected_receipts
-                .iter()
-                .map(receipt_ref_json)
-                .collect::<Vec<_>>(),
-        }),
+            "connected_receipts": receipt_indices_json(connected_receipts, receipt_refs)?,
+        })),
     }
 }
 
@@ -2492,13 +3023,14 @@ fn unavailable_reason_name(reason: &UnavailableReason) -> &'static str {
 fn step_results_json(
     contract: &ValidatedCallPathContract,
     disposition: &ProofDisposition,
-) -> Vec<Value> {
+    receipt_refs: &BTreeMap<ReceiptRef, u32>,
+) -> Result<Vec<Value>, InternalProjectionError> {
     contract
         .spec
         .steps
         .iter()
         .enumerate()
-        .map(|(step_index, step)| {
+        .map(|(step_index, _step)| {
             let (status, receipt) = match disposition {
                 ProofDisposition::ContractProven { receipts, .. } => {
                     ("proven", receipts.get(step_index))
@@ -2552,58 +3084,38 @@ fn step_results_json(
                 ProofDisposition::Unavailable { .. } => ("unavailable", None),
                 _ => ("unknown", None),
             };
-            json!({
+            Ok(json!({
                 "step_index": step_index,
-                "target": symbol_selector_json(&step.target),
                 "status": status,
-                "receipt": receipt.map(receipt_ref_json),
-            })
+                "receipt": receipt.map(|receipt| receipt_index_json(receipt, receipt_refs)).transpose()?,
+            }))
         })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn receipt_indices_json(
+    receipts: &[ReceiptRef],
+    receipt_refs: &BTreeMap<ReceiptRef, u32>,
+) -> Result<Vec<Value>, InternalProjectionError> {
+    receipts
+        .iter()
+        .map(|receipt| receipt_index_json(receipt, receipt_refs))
         .collect()
 }
 
-fn receipt_ref_json(receipt: &ReceiptRef) -> Value {
-    json!({
-        "receipt_id": receipt.receipt_id,
-        "edge_id": receipt.edge_id,
-    })
-}
-
-fn indexed_receipt_json(receipt: &IndexedCallEdgeReceipt) -> Value {
-    json!({
-        "receipt": receipt_ref_json(&receipt.receipt),
-        "source": resolved_node_json(&receipt.source),
-        "target": resolved_node_json(&receipt.target),
-        "resolution_fact_id": receipt.resolution_fact_id,
-        "resolution_evidence_sha256": receipt.resolution_evidence_sha256,
-        "exact_callsite_start_byte": receipt.exact_callsite_start_byte,
-        "callsite_identity": receipt.callsite_identity,
-        "containment": {
-            "file_node_id": receipt.containment.file_node_id.0.to_string(),
-            "owner_node_id": receipt.containment.owner_node_id.0.to_string(),
-            "start_line": receipt.containment.start_line,
-            "end_line": receipt.containment.end_line,
-        },
-        "line_window": {
-            "kind": receipt.line_window.kind,
-            "project_file_components": receipt.line_window.project_file_components,
-            "indexed_sha256": receipt.line_window.indexed_sha256,
-            "observed_sha256": receipt.line_window.observed_sha256,
-            "anchor_line": receipt.line_window.anchor_line,
-            "byte_start": receipt.line_window.byte_start,
-            "byte_end": receipt.line_window.byte_end,
-            "text": receipt.line_window.text,
-        },
-    })
-}
-
-fn resolved_node_json(node: &ResolvedNodeIdentity) -> Value {
-    json!({
-        "pinned": pinned_identity_json(&node.pinned),
-        "canonical_id": node.canonical_id,
-        "qualified_name": node.qualified_name,
-        "project_file_components": node.project_file_components,
-    })
+fn receipt_index_json(
+    receipt: &ReceiptRef,
+    receipt_refs: &BTreeMap<ReceiptRef, u32>,
+) -> Result<Value, InternalProjectionError> {
+    receipt_refs
+        .get(receipt)
+        .copied()
+        .map(Value::from)
+        .ok_or_else(|| {
+            InternalProjectionError::InvalidCompactProjection(
+                "dangling_receipt_reference".to_owned(),
+            )
+        })
 }
 
 fn serialized_json_size(value: &Value) -> Result<usize, InternalProjectionError> {
@@ -2616,6 +3128,7 @@ fn serialized_json_size(value: &Value) -> Result<usize, InternalProjectionError>
 mod tests {
     use super::*;
     use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
+    use codestory_contracts::proof_resolution::{FileId, ResolutionEvidence, ResolutionProvenance};
 
     const MAX_SOURCE_RECEIPT_LINE_BYTES: usize = 8_192;
 
@@ -2743,6 +3256,24 @@ mod tests {
             target: node(target),
             resolution_fact_id: format!("{:064x}", index + 1),
             resolution_evidence_sha256: format!("{:064x}", index + 2),
+            resolution_evidence_chain: vec![ResolutionEvidence::SameFileDeclaration {
+                declaration: NodeId(i64::try_from(index + 2).unwrap()),
+            }],
+            resolution_provenance: ResolutionProvenance {
+                producer: "codestory-internal".to_owned(),
+                fact_schema_version: 1,
+                algorithm: "exact-call-resolution-v1".to_owned(),
+                language_adapter: "rust".to_owned(),
+                language_adapter_version: "test-v1".to_owned(),
+                parser_fingerprint: "f".repeat(64),
+                dependency_file_hashes: vec![
+                    codestory_contracts::proof_resolution::DependencyFileHash {
+                        file_id: FileId(i64::try_from(index + 1).unwrap()),
+                        source_sha256: format!("{:064x}", index + 3),
+                    },
+                ],
+                evidence_sha256: format!("{:064x}", index + 2),
+            },
             exact_callsite_start_byte: (index * 10) as u64,
             callsite_identity: format!("{index}:{}:0:{}|rust", index + 1, index + 2),
             column_or_ordinal: 0,
@@ -2754,9 +3285,9 @@ mod tests {
             },
             line_window: IndexedLineWindow {
                 kind: "indexed_line_v1",
-                project_file_components: vec!["src".to_owned(), format!("step{index}.rs")],
-                indexed_sha256: format!("indexed-{index}"),
-                observed_sha256: format!("indexed-{index}"),
+                project_file_components: vec!["src".to_owned(), format!("{source}.rs")],
+                indexed_sha256: format!("{:064x}", index + 3),
+                observed_sha256: format!("{:064x}", index + 3),
                 anchor_line: u32::try_from(index + 1).unwrap(),
                 byte_start: index * 10,
                 byte_end: index * 10 + text.len(),
@@ -2972,7 +3503,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|receipt| receipt["receipt"]["receipt_id"].as_str().unwrap())
+                .map(|receipt| receipt["receipt_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             ["receipt-0", "receipt-1"]
         );
@@ -3123,7 +3654,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|receipt| receipt["receipt"]["receipt_id"].as_str().unwrap())
+                .map(|receipt| receipt["receipt_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             ["receipt-0", "receipt-1"]
         );
@@ -3175,7 +3706,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|receipt| receipt["receipt"]["receipt_id"].as_str().unwrap())
+                .map(|receipt| receipt["receipt_id"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             ["receipt-0", "receipt-1"]
         );
@@ -3303,9 +3834,99 @@ mod tests {
         assert_eq!(root["domain"], "indexed_source_call_path_v1");
         assert_eq!(root["contract_interpretation"], "host_supplied");
         assert_eq!(root["guard_version"], "clause_guard_v1");
+        assert_eq!(root["identities"]["files"].as_array().unwrap().len(), 2);
+        assert_eq!(root["identities"]["symbols"].as_array().unwrap().len(), 4);
+        assert_eq!(root["identities"]["evidence"].as_array().unwrap().len(), 1);
         assert_eq!(root["receipts"].as_array().unwrap().len(), 1);
+        assert_eq!(root["receipts"][0]["source"], 0);
+        assert_eq!(root["receipts"][0]["target"], 1);
+        assert_eq!(root["receipts"][0]["evidence"], 0);
+        assert_eq!(root["steps"][0]["receipt"], 0);
+        assert_eq!(root["disposition"]["receipts"], json!([0]));
         assert_eq!(root["steps"].as_array().unwrap().len(), 1);
         assert_eq!(serialized_size, serde_json::to_vec(&root).unwrap().len());
+    }
+
+    #[test]
+    fn internal_projection_interns_shared_identities_in_authoritative_receipt_order() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B", "C"]);
+        let first = indexed_receipt(0, "A", "B", "first\n".to_owned());
+        let second = indexed_receipt(1, "B", "C", "second\n".to_owned());
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
+        );
+
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).unwrap()
+        else {
+            panic!("compact projection should fit");
+        };
+        assert_eq!(root["identities"]["symbols"].as_array().unwrap().len(), 7);
+        assert_eq!(root["identities"]["evidence"].as_array().unwrap().len(), 2);
+        assert_eq!(root["receipts"][0]["source"], 0);
+        assert_eq!(root["receipts"][0]["target"], 1);
+        assert_eq!(root["receipts"][1]["source"], 1);
+        assert_ne!(root["receipts"][1]["target"], root["receipts"][1]["source"]);
+        assert_eq!(root["disposition"]["receipts"], json!([0, 1]));
+        assert_eq!(root["steps"][0]["receipt"], 0);
+        assert_eq!(root["steps"][1]["receipt"], 1);
+    }
+
+    #[test]
+    fn compact_projection_rejects_dangling_swapped_and_incomplete_evidence_references() {
+        let (contract, hashes, rendering) = validate_for_projection(&["B"]);
+        let receipt = indexed_receipt(0, "A", "B", "call\n".to_owned());
+        let integration = checked_integration(
+            &contract,
+            &hashes,
+            &rendering,
+            built_from_receipts(vec![receipt], Vec::new(), Vec::new()),
+        );
+        let InternalProjection::Complete { root, .. } =
+            project_internal_call_path_result(&integration).unwrap()
+        else {
+            panic!("compact projection should fit");
+        };
+
+        let mut dangling = root.clone();
+        dangling["receipts"][0]["evidence"] = json!(99);
+        assert_eq!(
+            validate_compact_projection(&dangling),
+            Err("compact_receipt_evidence_reference_invalid".to_owned())
+        );
+
+        let mut swapped = root.clone();
+        swapped["receipts"][0]["source"] = json!(1);
+        swapped["receipts"][0]["target"] = json!(0);
+        assert_eq!(
+            validate_compact_projection(&swapped),
+            Err("compact_receipt_evidence_endpoint_mismatch".to_owned())
+        );
+
+        let mut missing_provenance = root;
+        missing_provenance["identities"]["evidence"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("provenance");
+        assert_eq!(
+            validate_compact_projection(&missing_provenance),
+            Err("compact_evidence_provenance_missing".to_owned())
+        );
+
+        let mut invalid_receipt = indexed_receipt(1, "A", "B", "call\n".to_owned());
+        invalid_receipt.resolution_provenance.producer.clear();
+        assert_eq!(
+            check_built_call_path_integration(
+                &contract,
+                &hashes,
+                &rendering,
+                built_from_receipts(vec![invalid_receipt], Vec::new(), Vec::new()),
+            ),
+            Err(CheckedIntegrationError::PublicationBindingMismatch)
+        );
     }
 
     #[test]
@@ -3384,7 +4005,7 @@ mod tests {
             root["disposition"]["gaps"],
             json!([{ "kind": "output_budget_exceeded" }])
         );
-        for forbidden in ["spec", "clauses", "steps", "receipts"] {
+        for forbidden in ["identities", "spec", "clauses", "steps", "receipts"] {
             assert!(
                 root.get(forbidden).is_none(),
                 "fallback carried {forbidden}"

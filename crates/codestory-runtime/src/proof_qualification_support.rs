@@ -49,6 +49,12 @@ pub fn proof_domain() -> &'static str {
     codestory_agent::proof_qualification_support::proof_domain()
 }
 
+/// The sealed CLI seam validates every compact numeric reference before a
+/// revision-native transport serializes it.
+pub fn validate_compact_projection(root: &serde_json::Value) -> Result<(), String> {
+    codestory_agent::proof_qualification_support::validate_compact_projection(root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

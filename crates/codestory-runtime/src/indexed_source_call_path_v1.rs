@@ -780,7 +780,9 @@ where
                 source: source.clone(),
                 target: target.clone(),
                 resolution_fact_id: resolution_fact.fact_id,
-                resolution_evidence_sha256: resolution_fact.provenance.evidence_sha256,
+                resolution_evidence_sha256: resolution_fact.provenance.evidence_sha256.clone(),
+                resolution_evidence_chain: resolution_fact.evidence_chain,
+                resolution_provenance: resolution_fact.provenance,
                 exact_callsite_start_byte: resolution_fact.callsite.start_byte,
                 callsite_identity: admitted.callsite_identity,
                 column_or_ordinal: admitted.column_or_ordinal,
@@ -3205,15 +3207,7 @@ mod tests {
         };
         assert_eq!(
             root["disposition"]["refutation"]["connected_receipts"],
-            json!(
-                expected_chain
-                    .iter()
-                    .map(|receipt| json!({
-                        "receipt_id": receipt.receipt_id,
-                        "edge_id": receipt.edge_id,
-                    }))
-                    .collect::<Vec<_>>()
-            )
+            json!([0, 1])
         );
 
         let (excluded, excluded_hashes, excluded_rendering) = validated_contract_with_policies(

@@ -87,6 +87,8 @@ pub(crate) fn build_proof_tool_result_v3(
     revision: McpRevisionV3,
     root: &Value,
 ) -> Result<Value, StdioV3InternalError> {
+    codestory_runtime::proof_qualification_support::validate_compact_projection(root)
+        .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let result = build_tool_result_for_surface_v3(
         revision,
         "prove_call_path",
@@ -100,6 +102,8 @@ pub(crate) fn build_proof_tool_result_v3(
     }
 
     let fallback = proof_budget_fallback_v3(root, bytes.len())?;
+    codestory_runtime::proof_qualification_support::validate_compact_projection(&fallback)
+        .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let fallback_result = build_tool_result_for_surface_v3(
         revision,
         "prove_call_path",
@@ -252,11 +256,19 @@ mod tests {
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
+            "identities": {
+                "files":[{"file_node_id":"1","project_file_components":["src","lib.rs"],"indexed_sha256":"c".repeat(64),"observed_sha256":"c".repeat(64)}],
+                "symbols":[
+                    {"node_id":"1","pinned":{"project_id":"p","core_generation_id":"g","core_run_id":"r","node_id":"1"},"canonical_id":"A","qualified_name":"crate::A","file":0},
+                    {"node_id":"2","pinned":{"project_id":"p","core_generation_id":"g","core_run_id":"r","node_id":"2"},"canonical_id":"B","qualified_name":"crate::B","file":0}
+                ],
+                "evidence":[{"fact_id":"d".repeat(64),"caller":0,"target":1,"chain":[{"kind":"same_file_declaration","symbols":[1]}],"provenance":{"producer":"codestory-internal","fact_schema_version":1,"algorithm":"exact-call-resolution-v1","language_adapter":"rust","language_adapter_version":"test-v1","parser_fingerprint":"e".repeat(64),"dependency_files":[0],"evidence_sha256":"f".repeat(64)}}]
+            },
             "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[],"prohibit_traversal_through":[],"exclude_from_projection":[]},
             "clauses": [],
             "disposition": disposition,
             "steps": [],
-            "receipts": []
+            "receipts": [{"receipt_id":"receipt-1","edge_id":"1","source":0,"target":1,"evidence":0,"exact_callsite_start_byte":0,"callsite_identity":"1:1:1:2","column_or_ordinal":1,"containment":{"file":0,"owner":0,"start_line":1,"end_line":1},"line_window":{"kind":"indexed_line_v1","file":0,"anchor_line":1,"byte_start":0,"byte_end":1,"text":"x"}}]
         })
     }
 
@@ -389,7 +401,7 @@ mod tests {
         assert!(response.pointer("/error/data/structuredContent").is_none());
 
         let mut oversized = proof_root("unknown");
-        oversized["receipts"] = json!([{"line_window":{"text":"\\\"é".repeat(24_000)}}]);
+        oversized["receipts"][0]["line_window"]["text"] = json!("\\\"é".repeat(24_000));
         let result = build_proof_tool_result_v3(McpRevisionV3::June2025, &oversized)
             .expect("fallback result");
         assert_eq!(
@@ -609,6 +621,92 @@ mod tests {
                 .expect("exact tool result bytes");
             assert_eq!(measurement.call_tool_result_bytes, direct_bytes);
             assert_eq!(measurement.byte_length, direct_bytes.len());
+        }
+    }
+
+    fn proof_root_at_revision_bytes(revision: McpRevisionV3, target: usize) -> Value {
+        let root = proof_root("unknown");
+        let size = |root: &Value| {
+            let result = build_tool_result_for_surface_v3(
+                revision,
+                "prove_call_path",
+                root,
+                V3SurfaceSet::WithProof,
+            )
+            .expect("unbounded revision-native result");
+            crate::stdio_transport::v3_serialize_call_tool_result(&result)
+                .expect("unbounded revision-native bytes")
+                .len()
+        };
+        for column_or_ordinal in [1, 10] {
+            let mut root = root.clone();
+            root["receipts"][0]["column_or_ordinal"] = json!(column_or_ordinal);
+            let baseline = size(&root);
+            assert!(baseline < target);
+            for quote_count in 0..=16 {
+                let mut seed = root.clone();
+                seed["receipts"][0]["line_window"]["text"] = json!("\"".repeat(quote_count));
+                let seed_size = size(&seed);
+                let mut one_more = seed.clone();
+                one_more["receipts"][0]["line_window"]["text"] =
+                    json!(format!("{}x", "\"".repeat(quote_count)));
+                let byte_step = size(&one_more) - seed_size;
+                let remaining = target.saturating_sub(seed_size);
+                if byte_step > 0 && remaining % byte_step == 0 {
+                    seed["receipts"][0]["line_window"]["text"] = json!(format!(
+                        "{}{}",
+                        "\"".repeat(quote_count),
+                        "x".repeat(remaining / byte_step)
+                    ));
+                    if size(&seed) == target {
+                        return seed;
+                    }
+                }
+            }
+        }
+        panic!("revision {revision:?} cannot reach target {target}");
+    }
+
+    #[test]
+    fn every_revision_measures_the_whole_proof_result_at_the_cap_and_cap_plus_one() {
+        for revision in McpRevisionV3::all() {
+            // Modern results mirror the root in both text and structured content, so every
+            // admissible byte delta is even while this fixture's envelope is odd. Its last
+            // fitting result is therefore cap-minus-one; legacy revisions reach the cap.
+            let fitting_size = if revision.profile().structured_content {
+                PROOF_TOOL_RESULT_MAX_BYTES_V3 - 1
+            } else {
+                PROOF_TOOL_RESULT_MAX_BYTES_V3
+            };
+            let exact = proof_root_at_revision_bytes(*revision, fitting_size);
+            let exact_result = build_proof_tool_result_v3(*revision, &exact).unwrap();
+            assert_eq!(
+                crate::stdio_transport::v3_serialize_call_tool_result(&exact_result)
+                    .unwrap()
+                    .len(),
+                fitting_size
+            );
+
+            let plus_one = proof_root_at_revision_bytes(*revision, fitting_size + 2);
+            let fallback = build_proof_tool_result_v3(*revision, &plus_one).unwrap();
+            assert!(
+                crate::stdio_transport::v3_serialize_call_tool_result(&fallback)
+                    .unwrap()
+                    .len()
+                    <= PROOF_TOOL_RESULT_MAX_BYTES_V3
+            );
+            let fallback_root = serde_json::from_str::<Value>(
+                fallback
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(fallback_root["kind"], "budget_exceeded");
+            assert_eq!(fallback_root["required_complete_size"], fitting_size + 2);
+            for forbidden in ["identities", "spec", "clauses", "steps", "receipts"] {
+                assert!(fallback_root.get(forbidden).is_none());
+            }
         }
     }
 }
