@@ -1958,7 +1958,7 @@ fn exact_call_edge_projection_is_metadata_only_idempotent_and_transactional() {
             exact_projection_fingerprint(999),
         ])
         .expect_err("a missing member must roll back the entire batch");
-    assert_eq!(store.get_edges().unwrap(), [before.clone()]);
+    assert_eq!(store.get_edges().unwrap(), std::slice::from_ref(&before));
 
     let projection = [exact_projection_fingerprint(7)];
     store
