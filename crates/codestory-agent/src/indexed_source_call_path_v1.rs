@@ -20,6 +20,7 @@ use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
 use codestory_contracts::proof_resolution::{
     EXACT_CALL_RESOLUTION_ALGORITHM, INTERNAL_RESOLUTION_PRODUCER,
     PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ResolutionEvidence, ResolutionProvenance,
+    parse_canonical_callsite_identity,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -62,36 +63,6 @@ pub enum RawAdmissionFailure {
     CallsiteFileMismatch,
     CallsiteLineMismatch,
     CallsiteRawTargetMismatch,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CanonicalCallsiteIdentity {
-    file_id: i64,
-    line: u32,
-    column_or_ordinal: u32,
-    raw_target: i64,
-}
-
-fn parse_canonical_callsite_identity(identity: &str) -> Option<CanonicalCallsiteIdentity> {
-    let pre_marker = identity
-        .split_once('|')
-        .map_or(identity, |(identity, _)| identity);
-    let mut fields = pre_marker.split(':');
-    let parsed = CanonicalCallsiteIdentity {
-        file_id: fields.next()?.parse().ok()?,
-        line: fields.next()?.parse().ok()?,
-        column_or_ordinal: fields.next()?.parse().ok()?,
-        raw_target: fields.next()?.parse().ok()?,
-    };
-    if fields.next().is_some()
-        || format!(
-            "{}:{}:{}:{}",
-            parsed.file_id, parsed.line, parsed.column_or_ordinal, parsed.raw_target
-        ) != pre_marker
-    {
-        return None;
-    }
-    Some(parsed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,13 +177,13 @@ pub fn diagnose_raw_call_edge(
         .ok_or(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity)?;
     let parsed = parse_canonical_callsite_identity(callsite_identity)
         .ok_or(RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity)?;
-    if parsed.file_id != file_node_id.0 {
+    if parsed.file_id.0 != file_node_id.0 {
         return Err(RawAdmissionFailure::CallsiteFileMismatch);
     }
     if parsed.line != line {
         return Err(RawAdmissionFailure::CallsiteLineMismatch);
     }
-    if parsed.raw_target != edge.target.0 {
+    if parsed.raw_target.0 != edge.target.0 {
         return Err(RawAdmissionFailure::CallsiteRawTargetMismatch);
     }
     Ok(AdmittedRawCallEdge {
@@ -220,7 +191,7 @@ pub fn diagnose_raw_call_edge(
         file_node_id,
         line,
         column_or_ordinal: parsed.column_or_ordinal,
-        raw_target: NodeId(parsed.raw_target),
+        raw_target: parsed.raw_target,
         callsite_identity: callsite_identity.to_owned(),
     })
 }
@@ -4014,7 +3985,7 @@ fn validate_compact_line_window(
         "exact_callsite_start_byte",
         "compact_receipt_start_invalid",
     )?;
-    if callsite.file_id != expected_file
+    if callsite.file_id.0 != expected_file
         || callsite.line == 0
         || u64::from(callsite.line) != anchor_line
         || u64::from(callsite.column_or_ordinal) != projected_column
@@ -6231,17 +6202,6 @@ mod tests {
     #[test]
     fn compact_callsite_coordinates_require_canonical_widths_and_match_the_receipt() {
         let (contract, hashes, rendering) = validate_for_projection(&["B"]);
-        let mut zero_ordinal = indexed_receipt(0, "A", "B", "A calls B();\n".to_owned());
-        zero_ordinal.column_or_ordinal = 0;
-        zero_ordinal.callsite_identity = "1:1:0:20|rust".to_owned();
-        let valid_zero = projected_root(
-            &contract,
-            &hashes,
-            &rendering,
-            built_from_receipts(vec![zero_ordinal], Vec::new(), Vec::new()),
-        );
-        assert_eq!(validate_compact_projection(&valid_zero), Ok(()));
-
         let base = projected_root(
             &contract,
             &hashes,
@@ -6262,6 +6222,7 @@ mod tests {
         let mut column_mismatch = base.clone();
         column_mismatch["receipts"][0]["column_or_ordinal"] = json!(2);
         mutations.push(column_mismatch);
+        mutations.push(mutate_callsite(&base, "1:1:0:20|rust"));
         mutations.push(mutate_callsite(&base, "1:1:4294967296:20|rust"));
         mutations.push(mutate_callsite(&base, "1:0:1:20|rust"));
         mutations.push(mutate_callsite(&base, "1:4294967296:1:20|rust"));
@@ -6498,7 +6459,7 @@ mod tests {
             line: Some(12),
             resolved_source: Some(NodeId(11)),
             resolved_target: Some(NodeId(23)),
-            callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
+            callsite_identity: Some("-3:12:1:19|collector-marker".to_owned()),
             candidate_targets: Vec::new(),
             ..Default::default()
         };
@@ -6509,9 +6470,9 @@ mod tests {
                 edge_id: EdgeId(41),
                 file_node_id: NodeId(-3),
                 line: 12,
-                column_or_ordinal: 0,
+                column_or_ordinal: 1,
                 raw_target: NodeId(19),
-                callsite_identity: "-3:12:0:19|collector-marker".to_owned(),
+                callsite_identity: "-3:12:1:19|collector-marker".to_owned(),
             })
         );
     }
@@ -6533,7 +6494,7 @@ mod tests {
             line: Some(12),
             resolved_source: Some(NodeId(11)),
             resolved_target: Some(NodeId(23)),
-            callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
+            callsite_identity: Some("-3:12:1:19|collector-marker".to_owned()),
             candidate_targets: Vec::new(),
             ..Default::default()
         };
@@ -6541,9 +6502,9 @@ mod tests {
             edge_id: EdgeId(41),
             file_node_id: NodeId(-3),
             line: 12,
-            column_or_ordinal: 0,
+            column_or_ordinal: 1,
             raw_target: NodeId(19),
-            callsite_identity: "-3:12:0:19|collector-marker".to_owned(),
+            callsite_identity: "-3:12:1:19|collector-marker".to_owned(),
         };
         assert_eq!(
             diagnose_raw_call_edge(&lawful, NodeId(11), NodeId(23)),
@@ -6576,7 +6537,7 @@ mod tests {
                 Box::new(|edge, _, _| {
                     edge.target = NodeId(23);
                     edge.resolved_target = None;
-                    edge.callsite_identity = Some("-3:12:0:23|collector-marker".to_owned());
+                    edge.callsite_identity = Some("-3:12:1:23|collector-marker".to_owned());
                 }),
             ),
             (
@@ -6603,14 +6564,14 @@ mod tests {
                 "callsite file mismatch",
                 RawAdmissionFailure::CallsiteFileMismatch,
                 Box::new(|edge, _, _| {
-                    edge.callsite_identity = Some("-4:12:0:19|collector-marker".to_owned())
+                    edge.callsite_identity = Some("-4:12:1:19|collector-marker".to_owned())
                 }),
             ),
             (
                 "callsite line mismatch",
                 RawAdmissionFailure::CallsiteLineMismatch,
                 Box::new(|edge, _, _| {
-                    edge.callsite_identity = Some("-3:13:0:19|collector-marker".to_owned())
+                    edge.callsite_identity = Some("-3:13:1:19|collector-marker".to_owned())
                 }),
             ),
             (
@@ -6651,7 +6612,7 @@ mod tests {
             line: Some(12),
             resolved_source: Some(NodeId(11)),
             resolved_target: Some(NodeId(23)),
-            callsite_identity: Some("-3:12:0:19|collector-marker".to_owned()),
+            callsite_identity: Some("-3:12:1:19|collector-marker".to_owned()),
             candidate_targets: Vec::new(),
             ..Default::default()
         };
@@ -6693,18 +6654,19 @@ mod tests {
             " ",
             "|marker",
             "-3:12:19",
-            "-3:12:0:19:5",
-            "x:12:0:19",
-            "-3:x:0:19",
+            "-3:12:1:19:5",
+            "x:12:1:19",
+            "-3:x:1:19",
             "-3:12:x:19",
-            "-3:12:0:x",
-            " -3:12:0:19",
-            "-03:12:0:19",
-            "-3:012:0:19",
-            "-3:12:00:19",
-            "-3:12:0:+19",
+            "-3:12:1:x",
+            " -3:12:1:19",
+            "-03:12:1:19",
+            "-3:012:1:19",
+            "-3:12:0:19",
+            "-3:12:01:19",
+            "-3:12:1:+19",
             "opaque-legacy-id",
-            "-3:12:0:18",
+            "-3:12:1:18",
         ] {
             let identity = identity.to_owned();
             mutations.push((
@@ -6735,7 +6697,7 @@ mod tests {
             same_display_different_resolution
                 .callsite_identity
                 .as_deref(),
-            Some("-3:12:0:19|collector-marker")
+            Some("-3:12:1:19|collector-marker")
         );
         assert_eq!(
             admit_raw_call_edge(&same_display_different_resolution, NodeId(11), NodeId(23)),

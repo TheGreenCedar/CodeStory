@@ -1,12 +1,12 @@
 use super::*;
 use codestory_contracts::proof_resolution::{
-    CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
-    ExactCallsite, ExactCallsiteCorrelationFailure, ExactSyntaxCallsiteCorrelationInput, FileId,
-    INTERNAL_RESOLUTION_PRODUCER, OrdinaryCallEdgeCorrelationInput,
-    PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ProofResolutionAdapter, ProofResolutionFunnelCounts,
-    ProofResolutionFunnelRow, ProofResolutionProjection, ProofResolutionReason,
-    ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind, ResolutionProvenance,
-    correlate_exact_syntax_callsites,
+    CallResolutionFact, CalleeForm, CanonicalCallsiteIdentity, DependencyFileHash,
+    EXACT_CALL_RESOLUTION_ALGORITHM, ExactCallsite, ExactCallsiteCorrelationFailure,
+    ExactSyntaxCallsiteCorrelationInput, FileId, INTERNAL_RESOLUTION_PRODUCER,
+    OrdinaryCallEdgeCorrelationInput, PROOF_RESOLUTION_FACT_SCHEMA_VERSION, ProofResolutionAdapter,
+    ProofResolutionFunnelCounts, ProofResolutionFunnelRow, ProofResolutionProjection,
+    ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
+    ResolutionProvenance, correlate_exact_syntax_callsites, parse_canonical_callsite_identity,
 };
 
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-evidence-v1\0";
@@ -255,7 +255,7 @@ struct ProofResolutionValidationContext {
     edges: Vec<Edge>,
     edge_index_by_id: HashMap<EdgeId, usize>,
     ordinary_call_edge_indices: Vec<usize>,
-    parsed_callsite_identity_by_edge: HashMap<EdgeId, StoredCanonicalCallsiteIdentity>,
+    parsed_callsite_identity_by_edge: HashMap<EdgeId, CanonicalCallsiteIdentity>,
     import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
     python_import_paths: HashMap<(NodeId, NodeId), Vec<Vec<NodeId>>>,
@@ -273,29 +273,10 @@ struct GoPackageIdentity {
     package_name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StoredCanonicalCallsiteIdentity {
-    file_id: FileId,
-    line: u32,
-    column_or_ordinal: u32,
-    raw_target: NodeId,
-}
-
-fn parse_stored_callsite_identity(identity: &str) -> Option<StoredCanonicalCallsiteIdentity> {
-    let mut fields = identity.split('|').next()?.split(':');
-    let parsed = StoredCanonicalCallsiteIdentity {
-        file_id: FileId(fields.next()?.parse().ok()?),
-        line: fields.next()?.parse().ok()?,
-        column_or_ordinal: fields.next()?.parse().ok()?,
-        raw_target: NodeId(fields.next()?.parse().ok()?),
-    };
-    (fields.next().is_none() && parsed.column_or_ordinal > 0).then_some(parsed)
-}
-
 fn prepare_call_edge_correlation_index(
     edges: &[Edge],
     node_by_id: &HashMap<NodeId, Node>,
-) -> (Vec<usize>, HashMap<EdgeId, StoredCanonicalCallsiteIdentity>) {
+) -> (Vec<usize>, HashMap<EdgeId, CanonicalCallsiteIdentity>) {
     let mut indices = Vec::new();
     let mut identities = HashMap::new();
     for (index, edge) in edges.iter().enumerate() {
@@ -307,7 +288,7 @@ fn prepare_call_edge_correlation_index(
         if let Some(identity) = edge
             .callsite_identity
             .as_deref()
-            .and_then(parse_stored_callsite_identity)
+            .and_then(parse_canonical_callsite_identity)
         {
             identities.insert(edge.id, identity);
         }
@@ -2267,16 +2248,13 @@ impl Storage {
                 "matching ordinary CALL edge has a different canonical callsite identity",
             ));
         }
-        let mut fields = callsite.split('|').next().unwrap_or_default().split(':');
-        let parsed_file = fields.next().and_then(|value| value.parse::<i64>().ok());
-        let parsed_line = fields.next().and_then(|value| value.parse::<u32>().ok());
-        let parsed_discriminator = fields.next().and_then(|value| value.parse::<u32>().ok());
-        let parsed_raw_target = fields.next().and_then(|value| value.parse::<i64>().ok());
-        if fields.next().is_some()
-            || parsed_file != Some(fact.callsite.file_id.0)
-            || parsed_line != Some(fact.callsite.line)
-            || parsed_discriminator.is_none()
-            || parsed_raw_target != Some(raw_edge_target.0)
+        let parsed = parse_canonical_callsite_identity(callsite).ok_or_else(|| {
+            proof_error("matching ordinary CALL edge has a noncanonical callsite identity")
+        })?;
+        if parsed.file_id != fact.callsite.file_id
+            || parsed.line != fact.callsite.line
+            || parsed.column_or_ordinal == 0
+            || parsed.raw_target != raw_edge_target
         {
             return Err(proof_error(
                 "matching ordinary CALL edge has a different exact callsite identity",
