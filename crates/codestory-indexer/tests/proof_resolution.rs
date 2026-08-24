@@ -1,12 +1,18 @@
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{
-    ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
+    DependencyFileHash, FileId, ProofResolutionProjection, ProofResolutionReason,
+    ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
 };
-use codestory_indexer::{WorkspaceIndexer, rematerialize_proof_resolution_projection};
-use codestory_store::{FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store};
+use codestory_indexer::{
+    WorkspaceIndexer, build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+};
+use codestory_store::{
+    FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
+    seal_call_resolution_fact,
+};
 use codestory_workspace::{BuildMode, RefreshInfo};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
@@ -513,6 +519,862 @@ fn go_closed_exact_subset_authorizes_package_functions_and_concrete_receivers() 
             && fact.edge_id.is_some()
             && fact.target.is_some()
     }));
+    Ok(())
+}
+
+#[test]
+fn python_closed_exact_subset_authorizes_s1_through_s4() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/target.py",
+                "def imported_target():\n    pass\n\nclass ImportedWorker:\n    def run(self):\n        pass\n",
+            ),
+            (
+                "pkg/main.py",
+                concat!(
+                    "from .target import imported_target\n",
+                    "from .target import ImportedWorker\n\n",
+                    "def local_target():\n    pass\n\n",
+                    "class Worker:\n",
+                    "    def run(self):\n        pass\n",
+                    "    def caller(self):\n        self.run()\n\n",
+                    "def local_caller():\n    local_target()\n\n",
+                    "def import_caller():\n    imported_target()\n\n",
+                    "def constructed_caller():\n",
+                    "    local = Worker()\n",
+                    "    local.run()\n",
+                    "    imported: ImportedWorker\n",
+                    "    imported.run()\n",
+                ),
+            ),
+        ],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "python")
+        .collect::<Vec<_>>();
+    for target in ["local_target", "imported_target"] {
+        let fact = facts
+            .iter()
+            .find(|fact| fact.callsite.raw_target == target)
+            .unwrap_or_else(|| panic!("missing Python fact for {target}: {facts:#?}"));
+        assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    }
+    assert_eq!(
+        facts
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == "run"
+                && fact.status == ProofResolutionStatus::Exact)
+            .count(),
+        3,
+        "self, constructor, and explicit annotation receivers: {facts:#?}"
+    );
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.callsite.start_byte < fact.callsite.end_byte_exclusive)
+    );
+    Ok(())
+}
+
+fn assert_python_target_has_closed_status(
+    files: &[(&str, &str)],
+    raw_target: &str,
+    expected: ProofResolutionStatus,
+) -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, files)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == "python" && fact.callsite.raw_target == raw_target
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !facts.is_empty(),
+        "missing closed Python fact for {raw_target}"
+    );
+    assert!(
+        facts.iter().any(|fact| fact.status == expected),
+        "missing {expected:?} Python fact for {raw_target}: {facts:#?}"
+    );
+    assert!(
+        facts.iter().all(|fact| {
+            fact.status != ProofResolutionStatus::Exact
+                && fact.reason.matches_status(fact.status)
+                && fact.evidence_chain.is_empty()
+        }),
+        "unsupported Python family became authoritative: {facts:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn python_closed_statuses_distinguish_unsupported_missing_ambiguous_and_incomplete()
+-> anyhow::Result<()> {
+    assert_python_target_has_closed_status(
+        &[("main.py", "def caller():\n    missing()\n")],
+        "missing",
+        ProofResolutionStatus::MissingBinding,
+    )?;
+    assert_python_target_has_closed_status(
+        &[(
+            "main.py",
+            "def target():\n    pass\ndef target():\n    pass\ndef caller():\n    target()\n",
+        )],
+        "target",
+        ProofResolutionStatus::Ambiguous,
+    )?;
+    assert_python_target_has_closed_status(
+        &[("main.py", "def caller(:\n    target()\n")],
+        "target",
+        ProofResolutionStatus::IncompleteDomain,
+    )?;
+    assert_python_target_has_closed_status(
+        &[("main.py", "def caller(target):\n    target()\n")],
+        "target",
+        ProofResolutionStatus::Unsupported,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn python_dispatch_and_dynamic_language_families_are_closed_unsupported() -> anyhow::Result<()> {
+    for source in [
+        "class Base:\n    def target(self):\n        pass\nclass Child(Base):\n    def caller(self):\n        self.target()\n",
+        "class Left:\n    pass\nclass Right:\n    pass\nclass Child(Left, Right):\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\n",
+        "class Base:\n    def target(self):\n        pass\nclass Child(Base):\n    def caller(self):\n        super().target()\n",
+        "class Worker:\n    def target(self):\n        pass\n    @classmethod\n    def caller(cls):\n        cls.target()\n",
+        "class Worker:\n    @staticmethod\n    def target():\n        pass\n    def caller(self):\n        self.target()\n",
+        "class Worker:\n    @property\n    def target(self):\n        return 1\n    def caller(self):\n        self.target()\n",
+        "def decorate(value):\n    return value\nclass Worker:\n    @decorate\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\n",
+        "class Meta(type):\n    pass\nclass Worker(metaclass=Meta):\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\n",
+        "class Worker[T]:\n    def target(self):\n        pass\n    def caller(self):\n        self.target()\n",
+        "class Worker:\n    def target(self):\n        pass\ndef caller(worker):\n    worker.target()\n",
+        "class Worker:\n    def target(self):\n        pass\ndef factory():\n    return Worker()\ndef caller():\n    factory().target()\n",
+        "class Worker:\n    def target(self):\n        pass\ndef caller(wrapper):\n    wrapper.worker.target()\n",
+        "class Worker:\n    def target(self):\n        pass\ndef caller():\n    worker = Worker()\n    setattr(worker, 'target', lambda: None)\n    worker.target()\n",
+        "def target():\n    pass\ndef caller():\n    eval('target = None')\n    target()\n",
+    ] {
+        assert_python_target_has_closed_status(
+            &[("main.py", source)],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    for mutation in [
+        "Worker.target = lambda self: None",
+        "Worker.target: object = lambda self: None",
+        "Worker.target += other",
+        "del Worker.target",
+    ] {
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\n{mutation}\ndef caller():\n    worker: Worker\n    worker.target()\n"
+        );
+        assert_python_target_has_closed_status(
+            &[("main.py", source.as_str())],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn python_namespace_closure_hostiles_never_become_exact() -> anyhow::Result<()> {
+    let single_file_cases = [
+        concat!(
+            "class Worker:\n",
+            "    def target(self):\n        pass\n",
+            "    target = lambda self: None\n",
+            "    def caller(self):\n        self.target()\n",
+        ),
+        concat!(
+            "class Descriptor:\n    def __get__(self, instance, owner):\n        return lambda: None\n",
+            "class Worker:\n",
+            "    def target(self):\n        pass\n",
+            "    target = Descriptor()\n",
+            "    def caller(self):\n        self.target()\n",
+        ),
+        concat!(
+            "class Worker:\n",
+            "    def target(self):\n        pass\n",
+            "    del target\n",
+            "    def caller(self):\n        self.target()\n",
+        ),
+        concat!(
+            "class Worker:\n",
+            "    def target(self):\n        pass\n",
+            "    from other import target\n",
+            "    def caller(self):\n        self.target()\n",
+        ),
+        concat!(
+            "class Worker:\n",
+            "    def target(self):\n        pass\n",
+            "    def mutate(self):\n        self.target = lambda: None\n",
+            "    def caller(self):\n        self.target()\n",
+        ),
+        concat!(
+            "class Worker:\n",
+            "    def target(self):\n        pass\n",
+            "    def __getattribute__(self, name):\n        return object.__getattribute__(self, name)\n",
+            "    def caller(self):\n        self.target()\n",
+        ),
+        concat!(
+            "def target():\n    pass\n",
+            "def caller():\n    target += other\n    target()\n",
+        ),
+        concat!(
+            "def target():\n    pass\n",
+            "def caller():\n    callback = lambda: target()\n    callback()\n",
+        ),
+        concat!(
+            "def target():\n    pass\n",
+            "def mutate():\n    global target\n    target = other\n",
+            "def caller():\n    target()\n",
+        ),
+        concat!(
+            "class Worker:\n    def target(self):\n        pass\n",
+            "def caller():\n",
+            "    Worker = make_factory()\n",
+            "    worker = Worker()\n",
+            "    worker.target()\n",
+        ),
+        concat!(
+            "class Worker:\n    def target(self):\n        pass\n",
+            "def caller():\n",
+            "    worker: Worker\n",
+            "    Worker = Other\n",
+            "    worker.target()\n",
+        ),
+    ];
+    for source in single_file_cases {
+        assert_python_target_has_closed_status(
+            &[("main.py", source)],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+
+    assert_python_target_has_closed_status(
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/target.py", "def target():\n    pass\n"),
+            (
+                "pkg/main.py",
+                concat!(
+                    "from .target import target\n",
+                    "target = replacement\n",
+                    "def caller():\n    target()\n",
+                ),
+            ),
+        ],
+        "target",
+        ProofResolutionStatus::Unsupported,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn python_import_and_annotation_families_are_closed_non_exact() -> anyhow::Result<()> {
+    for source in [
+        "from external import target\ndef caller():\n    target()\n",
+        "import external\ndef caller():\n    external.target()\n",
+        "from external import *\ndef caller():\n    target()\n",
+        "import importlib\ndef caller():\n    importlib.import_module('external').target()\n",
+        "if enabled:\n    from .target import target\ndef caller():\n    target()\n",
+        "try:\n    from .target import target\nexcept ImportError:\n    pass\ndef caller():\n    target()\n",
+        "if TYPE_CHECKING:\n    from .target import target\ndef caller():\n    target()\n",
+    ] {
+        assert_python_target_has_closed_status(
+            &[("main.py", source)],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+
+    for annotation in ["'Worker'", "Worker | None", "list[Worker]", "Unknown"] {
+        let source = format!(
+            "class Worker:\n    def target(self):\n        pass\ndef caller():\n    worker: {annotation}\n    worker.target()\n"
+        );
+        assert_python_target_has_closed_status(
+            &[("main.py", source.as_str())],
+            "target",
+            ProofResolutionStatus::Unsupported,
+        )?;
+    }
+
+    assert_python_target_has_closed_status(
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/reexport.py", "from .actual import target\n"),
+            ("pkg/actual.py", "def target():\n    pass\n"),
+            (
+                "pkg/main.py",
+                "from .reexport import target\ndef caller():\n    target()\n",
+            ),
+        ],
+        "target",
+        ProofResolutionStatus::Unsupported,
+    )?;
+    assert_python_target_has_closed_status(
+        &[
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/main.py",
+                "from .stubs import target\ndef caller():\n    target()\n",
+            ),
+            ("pkg/stubs.pyi", "def target() -> None: ...\n"),
+        ],
+        "target",
+        ProofResolutionStatus::MissingBinding,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn python_constructor_calls_and_non_straight_line_receivers_never_gain_authority()
+-> anyhow::Result<()> {
+    assert_python_target_has_closed_status(
+        &[(
+            "main.py",
+            "class Worker:\n    def target(self):\n        pass\ndef caller():\n    worker = Worker()\n    if enabled:\n        worker.target()\n",
+        )],
+        "target",
+        ProofResolutionStatus::Unsupported,
+    )?;
+    assert_python_target_has_closed_status(
+        &[(
+            "main.py",
+            "class Worker:\n    def __init__(self):\n        pass\ndef caller():\n    Worker()\n",
+        )],
+        "Worker",
+        ProofResolutionStatus::Unsupported,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn python_unsupported_and_lexical_hostiles_receive_closed_non_exact_facts() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.py",
+            concat!(
+                "def target():\n    pass\n\n",
+                "class Base:\n    def method(self):\n        pass\n\n",
+                "class Child(Base):\n",
+                "    @classmethod\n    def class_call(cls):\n        cls.method()\n",
+                "    def inherited(self):\n        self.method()\n",
+                "    def parent(self):\n        super().method()\n\n",
+                "def parameter(target):\n    target()\n\n",
+                "def future_assignment():\n    target()\n    target = lambda: None\n\n",
+                "def destructuring():\n    target, other = values\n    target()\n\n",
+                "def control_flow():\n    for target in values:\n        target()\n\n",
+                "def dynamic(receiver):\n    getattr(receiver, 'method')()\n\n",
+                "def chained(factory):\n    factory().method()\n\n",
+                "def computed(receiver):\n    receiver['method']()\n\n",
+                "def nested():\n    def inner():\n        target()\n    inner()\n",
+            ),
+        )],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "python")
+        .collect::<Vec<_>>();
+    assert!(
+        facts.len() >= 12,
+        "every Python syntax call must be closed: {facts:#?}"
+    );
+    assert!(
+        facts.iter().all(|fact| {
+            fact.status != ProofResolutionStatus::Exact
+                && fact.reason.matches_status(fact.status)
+                && fact.evidence_chain.is_empty()
+        }),
+        "hostile Python fact became authoritative: {facts:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn python_calls_preserve_utf8_crlf_and_repeated_terminal_coordinates() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let source = "def target():\r\n    pass\r\n\r\ndef caller():\r\n    note = 'é'\r\n    target(); target()\r\n";
+    index_files(project.path(), &mut store, &[("main.py", source)])?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let mut facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "python")
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    facts.sort_by_key(|fact| fact.callsite.start_byte);
+    assert_eq!(facts.len(), 2, "{facts:#?}");
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.status == ProofResolutionStatus::Exact)
+    );
+    assert_eq!(facts[0].callsite.line, 6);
+    assert_eq!(facts[0].callsite.column, 5);
+    assert_eq!(facts[1].callsite.column, 15);
+    assert_eq!(
+        &source.as_bytes()
+            [facts[0].callsite.start_byte as usize..facts[0].callsite.end_byte_exclusive as usize],
+        b"target"
+    );
+    assert_ne!(facts[0].edge_id, facts[1].edge_id);
+    Ok(())
+}
+
+#[test]
+fn python_exact_fact_replay_rejects_graph_correlation_mutations() -> anyhow::Result<()> {
+    for mutation in ["target", "file", "line", "candidate", "identity"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[(
+                "main.py",
+                "def target():\n    pass\n\ndef caller():\n    target()\n",
+            )],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("Python exact fact");
+        assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+        let edge_id = fact.edge_id.expect("linked raw CALL").0;
+        match mutation {
+            "target" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET resolved_target_node_id = source_node_id WHERE id = ?1",
+                    [edge_id],
+                )?;
+            }
+            "file" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET file_node_id = target_node_id WHERE id = ?1",
+                    [edge_id],
+                )?;
+            }
+            "line" => {
+                store
+                    .get_connection()
+                    .execute("UPDATE edge SET line = 99 WHERE id = ?1", [edge_id])?;
+            }
+            "candidate" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET candidate_target_node_ids = ?1 WHERE id = ?2",
+                    (format!("[{}]", fact.target.unwrap().0), edge_id),
+                )?;
+            }
+            "identity" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET callsite_identity = 'opaque' WHERE id = ?1",
+                    [edge_id],
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        let error = store
+            .validate_proof_resolution_publication(&publication(1))
+            .expect_err("resealed Python graph mutation must reject the exact fact");
+        assert!(!error.to_string().is_empty(), "{mutation}");
+    }
+    Ok(())
+}
+
+#[test]
+fn python_exact_fact_replay_rejects_resealed_file_row_move() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let paths = index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.py",
+            "def target():\n    pass\n\ndef caller():\n    target()\n",
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let source = paths.into_iter().next().expect("Python source path");
+    let moved = project.path().join("moved.py");
+    fs::rename(&source, &moved)?;
+    store.get_connection().execute(
+        "UPDATE file SET path = ?1 WHERE language = 'python'",
+        [moved.to_string_lossy().into_owned()],
+    )?;
+    let error = store
+        .validate_proof_resolution_publication(&publication(1))
+        .expect_err("resealed Python file-row move must reject the exact fact");
+    assert!(
+        error.to_string().contains("canonical file node id"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn python_relative_import_domain_fails_closed_for_missing_and_colliding_modules()
+-> anyhow::Result<()> {
+    for files in [
+        vec![
+            (
+                "pkg/main.py",
+                "from .target import target\ndef caller():\n    target()\n",
+            ),
+            ("pkg/target.py", "def target():\n    pass\n"),
+        ],
+        vec![
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/main.py",
+                "from .target import target\ndef caller():\n    target()\n",
+            ),
+            ("pkg/target.py", "def target():\n    pass\n"),
+            ("pkg/target/__init__.py", "def target():\n    pass\n"),
+        ],
+        vec![
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/main.py",
+                "from target import target\ndef caller():\n    target()\n",
+            ),
+            ("pkg/target.py", "def target():\n    pass\n"),
+        ],
+        vec![
+            ("pkg/__init__.py", ""),
+            (
+                "pkg/main.py",
+                "from .sub.target import target\ndef caller():\n    target()\n",
+            ),
+            ("pkg/sub/target.py", "def target():\n    pass\n"),
+        ],
+        vec![
+            ("pkg/__init__.py", ""),
+            ("pkg/sub/__init__.py", ""),
+            (
+                "pkg/main.py",
+                "from .sub.target import target\ndef caller():\n    target()\n",
+            ),
+            ("pkg/sub/target.py", "def target():\n    pass\n"),
+            ("pkg/sub/target/__init__.py", "def target():\n    pass\n"),
+        ],
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == "python" && fact.callsite.raw_target == "target"
+            })
+            .expect("closed import call fact");
+        assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn python_raw_import_marker_hostiles_never_corroborate_exact_evidence() -> anyhow::Result<()> {
+    for mutation in [
+        "wrong_source",
+        "candidate",
+        "cross_file",
+        "non_marker",
+        "inconsistent_resolved",
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/target.py", "def target():\n    pass\n"),
+                (
+                    "pkg/main.py",
+                    "from .target import target\ndef caller():\n    target()\n",
+                ),
+            ],
+        )?;
+        let marker = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| {
+                edge.kind == EdgeKind::IMPORT
+                    && store
+                        .get_node(edge.target)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|node| node.kind == NodeKind::MODULE)
+            })
+            .expect("raw Python import marker edge");
+        match mutation {
+            "wrong_source" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET resolved_source_node_id = target_node_id WHERE id = ?1",
+                    [marker.id.0],
+                )?;
+            }
+            "candidate" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET candidate_target_node_ids = ?1 WHERE id = ?2",
+                    (format!("[{}]", marker.target.0), marker.id.0),
+                )?;
+            }
+            "cross_file" => {
+                let target_file = store
+                    .get_nodes()?
+                    .into_iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION && node.serialized_name == "target"
+                    })
+                    .and_then(|node| node.file_node_id)
+                    .expect("imported target file");
+                store.get_connection().execute(
+                    "UPDATE node SET file_node_id = ?1 WHERE id = ?2",
+                    (target_file.0, marker.target.0),
+                )?;
+            }
+            "non_marker" => {
+                store.get_connection().execute(
+                    "UPDATE node SET kind = ?1 WHERE id = ?2",
+                    (NodeKind::FUNCTION as i32, marker.target.0),
+                )?;
+            }
+            "inconsistent_resolved" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET resolved_target_node_id = source_node_id WHERE id = ?1",
+                    [marker.id.0],
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("closed Python import fact");
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "{mutation}: {fact:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn python_nested_relative_import_authenticates_every_package_marker_exactly() -> anyhow::Result<()>
+{
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/sub/__init__.py", ""),
+            ("pkg/sub/target.py", "def target():\n    pass\n"),
+            (
+                "pkg/main.py",
+                "from .sub.target import target\ndef caller():\n    target()\n",
+            ),
+        ],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "python" && fact.callsite.raw_target == "target"
+        })
+        .expect("nested relative-import fact");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+
+    let files = store.get_files()?;
+    let expected = [
+        "pkg/__init__.py",
+        "pkg/sub/__init__.py",
+        "pkg/sub/target.py",
+        "pkg/main.py",
+    ]
+    .into_iter()
+    .map(|suffix| {
+        FileId(
+            files
+                .iter()
+                .find(|file| file.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing indexed dependency {suffix}"))
+                .id,
+        )
+    })
+    .collect::<BTreeSet<_>>();
+    let observed = fact
+        .provenance
+        .dependency_file_hashes
+        .iter()
+        .map(|dependency| dependency.file_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(observed, expected, "{fact:#?}");
+    Ok(())
+}
+
+#[test]
+fn python_nested_relative_import_store_replay_rejects_dependency_mutations() -> anyhow::Result<()> {
+    for mutation in ["missing", "extra", "hash"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/sub/__init__.py", ""),
+                ("pkg/sub/target.py", "def target():\n    pass\n"),
+                ("pkg/unrelated.py", "unrelated = True\n"),
+                (
+                    "pkg/main.py",
+                    "from .sub.target import target\ndef caller():\n    target()\n",
+                ),
+            ],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let receipt = store
+            .get_proof_resolution_publication()?
+            .expect("Python proof publication");
+        let files = store.get_files()?;
+        let file = |suffix: &str| {
+            files
+                .iter()
+                .find(|file| file.path.ends_with(suffix))
+                .unwrap_or_else(|| panic!("missing {suffix}"))
+        };
+        let intermediate = FileId(file("pkg/sub/__init__.py").id);
+        let unrelated = FileId(file("pkg/unrelated.py").id);
+        let unrelated_hash = store
+            .get_file_content_hash(unrelated.0)?
+            .expect("unrelated source hash");
+        let mut facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter_mut()
+            .find(|fact| {
+                fact.provenance.language_adapter == "python" && fact.callsite.raw_target == "target"
+            })
+            .expect("nested relative-import fact");
+        match mutation {
+            "missing" => fact
+                .provenance
+                .dependency_file_hashes
+                .retain(|dependency| dependency.file_id != intermediate),
+            "extra" => fact
+                .provenance
+                .dependency_file_hashes
+                .push(DependencyFileHash {
+                    file_id: unrelated,
+                    source_sha256: unrelated_hash,
+                }),
+            "hash" => {
+                fact.provenance
+                    .dependency_file_hashes
+                    .iter_mut()
+                    .find(|dependency| dependency.file_id == intermediate)
+                    .expect("intermediate package marker dependency")
+                    .source_sha256 = "0".repeat(64);
+            }
+            _ => unreachable!(),
+        }
+        *fact = seal_call_resolution_fact(fact.clone())?;
+        let projection = ProofResolutionProjection {
+            adapter_roster: receipt.adapter_roster,
+            funnel: build_proof_resolution_funnel(&facts),
+            facts,
+        };
+        let error = store
+            .replace_proof_resolution_projection(&publication(2), &projection)
+            .expect_err("resealed nested Python dependency mutation must fail closed");
+        assert!(
+            error.to_string().contains("depend") || error.to_string().contains("source hash"),
+            "{mutation}: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn python_nested_relative_import_rejects_symlinked_package_marker() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let root_marker = project.path().join("pkg/__init__.py");
+    let nested_marker = project.path().join("pkg/sub/__init__.py");
+    fs::create_dir_all(nested_marker.parent().unwrap())?;
+    fs::write(&root_marker, "")?;
+    symlink(&root_marker, &nested_marker)?;
+    fs::write(
+        project.path().join("pkg/sub/target.py"),
+        "def target():\n    pass\n",
+    )?;
+    fs::write(
+        project.path().join("pkg/main.py"),
+        "from .sub.target import target\ndef caller():\n    target()\n",
+    )?;
+    WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+        &mut store,
+        &RefreshInfo {
+            mode: BuildMode::Incremental,
+            files_to_index: vec![
+                root_marker,
+                nested_marker,
+                project.path().join("pkg/sub/target.py"),
+                project.path().join("pkg/main.py"),
+            ],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
+        .expect_err("symlinked Python package marker must fail closed");
+    assert!(
+        error.to_string().contains("identity collision") || error.to_string().contains("symlink"),
+        "{error}"
+    );
     Ok(())
 }
 
@@ -3659,7 +4521,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let mut empty = Store::new_in_memory()?;
     let empty_receipt = rematerialize_proof_resolution_projection(&mut empty, &publication(1))?;
     assert_eq!(empty_receipt.fact_count, 0);
-    assert_eq!(empty_receipt.adapter_roster.len(), 5);
+    assert_eq!(empty_receipt.adapter_roster.len(), 6);
 
     let project = tempfile::tempdir()?;
     let mut unsupported = Store::new_in_memory()?;
@@ -3674,7 +4536,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let unsupported_receipt =
         rematerialize_proof_resolution_projection(&mut unsupported, &publication(1))?;
     assert_eq!(unsupported_receipt.fact_count, 0);
-    assert_eq!(unsupported_receipt.adapter_roster.len(), 5);
+    assert_eq!(unsupported_receipt.adapter_roster.len(), 6);
 
     let governed_project = tempfile::tempdir()?;
     let mut governed = Store::new_in_memory()?;
@@ -3902,7 +4764,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v8", "adapter", "language"]
+            ["stale", "schema-v9", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"

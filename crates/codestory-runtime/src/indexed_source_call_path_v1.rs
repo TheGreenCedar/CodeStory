@@ -404,6 +404,8 @@ where
     let files = store.files().inventory().map_err(store_error)?;
     let file_rows = store.files().get_files().map_err(store_error)?;
     let mut path_identities = OperationPathIdentityResolver::native();
+    let canonical_index =
+        CanonicalSelectorIndex::prepare(project_root, &file_rows, &mut path_identities);
     let mut resolved = Vec::with_capacity(contract.spec().steps().len() + 1);
     let mut gaps = Vec::new();
     let mut unavailable = Vec::new();
@@ -414,6 +416,7 @@ where
         project_id,
         publication,
         files: &file_rows,
+        canonical_index: &canonical_index,
     };
 
     for (selector_index, selector) in std::iter::once(contract.spec().start())
@@ -962,6 +965,108 @@ struct SelectorContext<'a> {
     project_id: &'a str,
     publication: &'a IndexPublicationRecord,
     files: &'a [FileInfo],
+    canonical_index: &'a CanonicalSelectorIndex,
+}
+
+#[derive(Default)]
+struct CanonicalSelectorIndex {
+    stored_prefixes_by_relative: BTreeMap<String, Vec<String>>,
+    unavailable: bool,
+}
+
+impl CanonicalSelectorIndex {
+    fn prepare(
+        project_root: &Path,
+        files: &[FileInfo],
+        identities: &mut OperationPathIdentityResolver,
+    ) -> Self {
+        let mut index = Self::default();
+        let mut relative_by_identity = HashMap::<WorkspacePathIdentity, String>::new();
+        for file in files {
+            let Some(stored_prefix) = file.path.to_str().map(str::to_owned) else {
+                index.unavailable = true;
+                continue;
+            };
+            let Some(absolute) = stored_absolute(project_root, &file.path) else {
+                index.unavailable = true;
+                continue;
+            };
+            let Ok(native_identity) = identities.resolve(&absolute) else {
+                index.unavailable = true;
+                continue;
+            };
+            let Some(relative) = workspace_relative_path(project_root, &absolute) else {
+                index.unavailable = true;
+                continue;
+            };
+            let Some(relative) = normalized_project_relative_text(&relative) else {
+                index.unavailable = true;
+                continue;
+            };
+            if relative_by_identity
+                .insert(native_identity, relative.clone())
+                .is_some_and(|existing| existing != relative)
+            {
+                index.unavailable = true;
+                continue;
+            }
+            index
+                .stored_prefixes_by_relative
+                .entry(format!("{relative}:"))
+                .or_default()
+                .push(stored_prefix);
+        }
+        for prefixes in index.stored_prefixes_by_relative.values_mut() {
+            prefixes.sort();
+            prefixes.dedup();
+        }
+        index
+    }
+
+    fn reconstruct(&self, canonical_id: &str) -> Result<Vec<String>, ()> {
+        if self.unavailable {
+            return Err(());
+        }
+        let Some((relative_prefix, stored_prefixes)) = self
+            .stored_prefixes_by_relative
+            .range(..=canonical_id.to_owned())
+            .next_back()
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(suffix) = canonical_id.strip_prefix(relative_prefix) else {
+            return Ok(Vec::new());
+        };
+        if suffix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reconstructed = stored_prefixes
+            .iter()
+            .map(|stored| format!("{stored}:{suffix}"))
+            .collect::<Vec<_>>();
+        reconstructed.sort();
+        reconstructed.dedup();
+        Ok(reconstructed)
+    }
+}
+
+fn normalized_project_relative_text(path: &Path) -> Option<String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return None;
+        };
+        let component = component.to_str()?;
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.contains(['/', '\\', '\0'])
+        {
+            return None;
+        }
+        components.push(component);
+    }
+    (!components.is_empty()).then(|| components.join("/"))
 }
 
 fn resolve_scope_selector(
@@ -1031,13 +1136,103 @@ fn resolve_canonical(
     canonical_id: &str,
     identities: &mut OperationPathIdentityResolver,
 ) -> Result<SelectorResolution, ApiError> {
-    let matches = context
+    let mut matched_canonical = canonical_id.to_owned();
+    let mut matches = context
         .store
         .node_ids_by_canonical_ids(&[canonical_id.to_owned()])
         .map_err(store_error)?
         .remove(canonical_id)
         .unwrap_or_default();
-    resolve_unique_node(context, matches, identities)
+    if matches.is_empty() {
+        let reconstructed = match context.canonical_index.reconstruct(canonical_id) {
+            Ok(reconstructed) => reconstructed,
+            Err(()) => {
+                return Ok(SelectorResolution::Unavailable(
+                    UnavailableReason::SourceNotBoundToPublication,
+                ));
+            }
+        };
+        if reconstructed.len() > 1 {
+            return Ok(SelectorResolution::Ambiguous);
+        }
+        if let Some(reconstructed) = reconstructed.first() {
+            matched_canonical.clone_from(reconstructed);
+            matches = context
+                .store
+                .node_ids_by_canonical_ids(std::slice::from_ref(reconstructed))
+                .map_err(store_error)?
+                .remove(reconstructed)
+                .unwrap_or_default();
+        }
+    }
+    if !matches.is_empty()
+        && !canonical_id_authenticates_selected_files(
+            context,
+            &matched_canonical,
+            &matches,
+            identities,
+        )
+    {
+        return Ok(SelectorResolution::Unavailable(
+            UnavailableReason::SourceNotBoundToPublication,
+        ));
+    }
+    let resolved = resolve_unique_node(context, matches, identities)?;
+    Ok(match resolved {
+        SelectorResolution::Resolved(mut identity) => {
+            identity.canonical_id = canonical_id.to_owned();
+            SelectorResolution::Resolved(identity)
+        }
+        other => other,
+    })
+}
+
+fn canonical_id_authenticates_selected_files(
+    context: &SelectorContext<'_>,
+    canonical_id: &str,
+    node_ids: &[NodeId],
+    identities: &mut OperationPathIdentityResolver,
+) -> bool {
+    if !canonical_id.contains('#') {
+        return true;
+    }
+    node_ids.iter().all(|node_id| {
+        let Ok(Some(node)) = context.store.get_node(*node_id) else {
+            return false;
+        };
+        let Some(file_id) = node.file_node_id else {
+            return false;
+        };
+        let Some(file) = context.files.iter().find(|file| file.id == file_id.0) else {
+            return false;
+        };
+        let Some(stored_path) = stored_absolute(context.project_root, &file.path) else {
+            return false;
+        };
+        let Ok(stored_identity) = identities.resolve(&stored_path) else {
+            return false;
+        };
+        let mut matching_prefixes = 0usize;
+        for (index, character) in canonical_id.char_indices() {
+            if character != ':' || index == 0 {
+                continue;
+            }
+            let candidate = Path::new(&canonical_id[..index]);
+            let Some(candidate) = stored_absolute(context.project_root, candidate) else {
+                continue;
+            };
+            if workspace_relative_path(context.project_root, &candidate).is_none() {
+                continue;
+            }
+            if identities
+                .resolve(&candidate)
+                .is_ok_and(|identity| identity == stored_identity)
+            {
+                matching_prefixes += 1;
+            }
+        }
+        matching_prefixes == 1
+    })
 }
 
 fn resolve_qualified(
@@ -2531,6 +2726,79 @@ mod tests {
     }
 
     #[test]
+    fn python_exact_fact_accepts_reconstructed_project_relative_selectors() {
+        let fixture = source_built_fixture_with_extension(
+            "py",
+            "def target():\n    pass\n\ndef source():\n    target()\n",
+        );
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let facts = fixture.store.get_proof_resolution_facts().unwrap();
+        let exact_fact = facts
+            .iter()
+            .find(|fact| {
+                fact.callsite.raw_target == "target"
+                    && fact.status == ProofResolutionStatus::Exact
+                    && fact.edge_id.is_some()
+            })
+            .unwrap_or_else(|| panic!("{facts:#?}"));
+        let edge = fixture
+            .store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .find(|edge| Some(edge.id) == exact_fact.edge_id)
+            .unwrap();
+        let admitted = diagnose_raw_call_edge(&edge, source.id, target.id).unwrap();
+        assert!(resolution_fact_matches_raw_edge(
+            exact_fact, &admitted, source.id, target.id
+        ));
+        assert!(canonical_id(&source).ends_with(":source#0"));
+        assert!(canonical_id(&target).ends_with(":target#0"));
+        let (contract, hashes, rendering) =
+            validated_contract("src/lib.py:source#0", &["src/lib.py:target#0"]);
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                observed.trace.steps.as_slice(),
+                [StepQualificationTrace {
+                    outcome: StepQualificationOutcome::Admitted { edge_ids },
+                    ..
+                }] if edge_ids == &[edge.id]
+            ),
+            "{:#?}",
+            observed.trace
+        );
+        let result =
+            check_built_call_path_integration(&contract, &hashes, &rendering, observed.built)
+                .unwrap();
+        assert!(
+            matches!(
+                result.disposition(),
+                ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 1
+            ),
+            "{:#?}",
+            result.disposition()
+        );
+        assert_eq!(
+            result.built_facts().receipts[0].source.pinned.node_id,
+            source.id.0.to_string()
+        );
+        assert_eq!(
+            result.built_facts().receipts[0].target.pinned.node_id,
+            target.id.0.to_string()
+        );
+    }
+
+    #[test]
     fn source_built_resealed_span_cannot_move_to_an_identical_same_line_token() {
         let source_text = "fn target() {}\n\
                            fn source() { target(); let _label = \"target\"; }\n";
@@ -3143,6 +3411,71 @@ mod tests {
     }
 
     #[test]
+    fn python_resealed_path_move_is_rejected_by_the_public_operation_freshness_fence() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("src/lib.py");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(
+            &source_path,
+            "def target():\n    pass\n\ndef source():\n    target()\n",
+        )
+        .unwrap();
+        let storage_path = project.path().join(".codestory-test/codestory.db");
+        let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let contract = contract("src/lib.py:source#0", &["src/lib.py:target#0"]);
+        let service = crate::services::PublicOperationService::new(controller.clone());
+        let builds = Cell::new(0_usize);
+        let operation = service
+            .run_with_cancel(PROOF_DOMAIN, Arc::new(AtomicBool::new(false)), || {
+                let attempt = builds.get() + 1;
+                builds.set(attempt);
+                let built = build_indexed_source_call_path_facts(&controller, &contract)?;
+                if attempt == 1 {
+                    assert_eq!(built.receipts.len(), 1, "{built:#?}");
+                    let moved = project.path().join("src/moved.py");
+                    fs::rename(&source_path, &moved).unwrap();
+                    let store = Store::open(&storage_path).unwrap();
+                    let file_id = store
+                        .get_files()
+                        .unwrap()
+                        .into_iter()
+                        .find(|file| file.language == "python")
+                        .expect("indexed Python source")
+                        .id;
+                    store
+                        .get_connection()
+                        .execute(
+                            "UPDATE file SET path = ?1 WHERE id = ?2",
+                            (moved.to_string_lossy().into_owned(), file_id),
+                        )
+                        .unwrap();
+                }
+                Ok(built)
+            })
+            .unwrap();
+        assert_eq!(operation.attempt, 2);
+        assert!(
+            operation.value.receipts.is_empty(),
+            "{:#?}",
+            operation.value
+        );
+        assert_eq!(
+            operation.value.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
+        );
+        assert_eq!(builds.get(), 2);
+    }
+
+    #[test]
     fn builds_a_hash_bound_raw_edge_receipt_and_reads_source_once() {
         let fixture = fixture(b"fn source() { target(); }\r\nfn target() {}\n");
         fixture
@@ -3633,15 +3966,202 @@ mod tests {
     }
 
     #[test]
-    fn qualified_resolution_uses_exact_names_components_and_native_file_identity() {
+    fn canonical_selector_reconstructs_one_exact_project_relative_file_identity() {
         let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
-        let files = fixture.store.files().get_files().unwrap();
+        let absolute_prefix = fixture.source_path.to_string_lossy();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE node SET canonical_id = ?1 WHERE id = 2",
+                [format!("{absolute_prefix}:crate::source#0")],
+            )
+            .unwrap();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE node SET canonical_id = ?1 WHERE id = 3",
+                [format!("{absolute_prefix}:crate::target#0")],
+            )
+            .unwrap();
+
+        let relative = contract(
+            "src/lib.rs:crate::source#0",
+            &["src/lib.rs:crate::target#0"],
+        );
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &relative,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert!(
+            !observed.trace.selector_early_return,
+            "{:#?}",
+            observed.trace
+        );
+        assert!(
+            observed
+                .trace
+                .selectors
+                .iter()
+                .all(|selector| matches!(selector.outcome, SelectorGateOutcome::Resolved { .. }))
+        );
+    }
+
+    #[test]
+    fn exact_canonical_selector_rejects_resealed_file_path_move() {
+        let fixture = source_built_fixture("fn source() { target(); }\nfn target() {}\n");
+        let source = source_callable(&fixture.store, "source");
+        let old_canonical = canonical_id(&source).to_owned();
+        let moved = fixture.root.join("src/moved.rs");
+        fs::rename(&fixture.source_path, &moved).unwrap();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE file SET path = ?1 WHERE id = ?2",
+                (
+                    moved.to_string_lossy().into_owned(),
+                    source.file_node_id.unwrap().0,
+                ),
+            )
+            .unwrap();
+
+        let files = fixture.store.get_files().unwrap();
+        let mut identities = OperationPathIdentityResolver::native();
+        let canonical_index =
+            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
         let context = SelectorContext {
             store: &fixture.store,
             project_root: &fixture.root,
             project_id: &fixture.project_id,
             publication: &fixture.publication,
             files: &files,
+            canonical_index: &canonical_index,
+        };
+        assert!(matches!(
+            resolve_canonical(
+                &context,
+                &old_canonical,
+                &mut OperationPathIdentityResolver::native(),
+            )
+            .unwrap(),
+            SelectorResolution::Unavailable(UnavailableReason::SourceNotBoundToPublication)
+        ));
+    }
+
+    #[test]
+    fn canonical_selector_reconstruction_fails_closed_for_hostile_file_identity_cases() {
+        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let absolute_prefix = fixture.source_path.to_string_lossy();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE node SET canonical_id = ?1 WHERE id = 3",
+                [format!("{absolute_prefix}:crate::target#0")],
+            )
+            .unwrap();
+        let files = fixture.store.files().get_files().unwrap();
+        let mut identities = OperationPathIdentityResolver::native();
+        let canonical_index =
+            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
+        let context = SelectorContext {
+            store: &fixture.store,
+            project_root: &fixture.root,
+            project_id: &fixture.project_id,
+            publication: &fixture.publication,
+            files: &files,
+            canonical_index: &canonical_index,
+        };
+
+        for missing in ["src/index:crate::target#0", "src/indexer:crate::target#0"] {
+            assert!(matches!(
+                resolve_canonical(
+                    &context,
+                    missing,
+                    &mut OperationPathIdentityResolver::native(),
+                )
+                .unwrap(),
+                SelectorResolution::Missing
+            ));
+        }
+
+        fixture
+            .store
+            .insert_node(&node(
+                4,
+                NodeKind::FUNCTION,
+                "target",
+                &format!("{absolute_prefix}:crate::target#0"),
+                1,
+                2,
+                2,
+            ))
+            .unwrap();
+        assert!(matches!(
+            resolve_canonical(
+                &context,
+                "src/lib.rs:crate::target#0",
+                &mut OperationPathIdentityResolver::native(),
+            )
+            .unwrap(),
+            SelectorResolution::Ambiguous
+        ));
+
+        #[cfg(unix)]
+        {
+            let alias = fixture.root.join("src/alias.rs");
+            std::fs::hard_link(&fixture.source_path, &alias).unwrap();
+            let mut colliding_files = files.clone();
+            let mut alias_file = colliding_files[0].clone();
+            alias_file.id += 100;
+            alias_file.path = PathBuf::from("src/alias.rs");
+            colliding_files.push(alias_file);
+            let collision = CanonicalSelectorIndex::prepare(
+                &fixture.root,
+                &colliding_files,
+                &mut OperationPathIdentityResolver::native(),
+            );
+            assert!(collision.reconstruct("src/lib.rs:crate::target#0").is_err());
+
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("outside.rs"), "fn outside() {}\n").unwrap();
+            std::os::unix::fs::symlink(outside.path(), fixture.root.join("src/escape")).unwrap();
+            let mut escaped_files = files.clone();
+            let mut escaped_file = escaped_files[0].clone();
+            escaped_file.id += 101;
+            escaped_file.path = PathBuf::from("src/escape/outside.rs");
+            escaped_files.push(escaped_file);
+            let escaped = CanonicalSelectorIndex::prepare(
+                &fixture.root,
+                &escaped_files,
+                &mut OperationPathIdentityResolver::native(),
+            );
+            assert!(escaped.reconstruct("src/lib.rs:crate::target#0").is_err());
+        }
+    }
+
+    #[test]
+    fn qualified_resolution_uses_exact_names_components_and_native_file_identity() {
+        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let files = fixture.store.files().get_files().unwrap();
+        let mut identities = OperationPathIdentityResolver::native();
+        let canonical_index =
+            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
+        let context = SelectorContext {
+            store: &fixture.store,
+            project_root: &fixture.root,
+            project_id: &fixture.project_id,
+            publication: &fixture.publication,
+            files: &files,
+            canonical_index: &canonical_index,
         };
         let exact_path = ["src".to_owned(), "lib.rs".to_owned()];
         let exact = resolve_qualified(
@@ -3744,12 +4264,16 @@ mod tests {
             node_id: "2".to_owned(),
         };
         let files = fixture.store.files().get_files().unwrap();
+        let mut identities = OperationPathIdentityResolver::native();
+        let canonical_index =
+            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
         let context = SelectorContext {
             store: &fixture.store,
             project_root: &fixture.root,
             project_id: &fixture.project_id,
             publication: &wrong_publication,
             files: &files,
+            canonical_index: &canonical_index,
         };
         assert!(matches!(
             resolve_pinned(&context, &pin, &mut OperationPathIdentityResolver::native(),).unwrap(),

@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 
 // Bumped to 6 because JavaScript joins the private proof adapter roster and
 // ECMAScript bindings are now collected with name-specific closure semantics.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 10;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 11;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -287,7 +287,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 8,
+            resolution_input_schema_version: 9,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

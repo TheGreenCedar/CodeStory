@@ -37,6 +37,29 @@ use tree_sitter_graph::ast::File as GraphFile;
 use tree_sitter_graph::functions::Functions;
 use tree_sitter_graph::{ExecutionConfig, NoCancellation, Variables};
 
+#[cfg(test)]
+thread_local! {
+    static MANUAL_RECEIVER_LOOKUP_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_manual_receiver_lookup_work(amount: usize) {
+    #[cfg(test)]
+    MANUAL_RECEIVER_LOOKUP_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_manual_receiver_lookup_work() {
+    MANUAL_RECEIVER_LOOKUP_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn manual_receiver_lookup_work() -> usize {
+    MANUAL_RECEIVER_LOOKUP_WORK.with(std::cell::Cell::get)
+}
+
 mod cache;
 pub mod cancellation;
 pub mod compilation_database;
@@ -8504,6 +8527,9 @@ fn append_manual_receiver_call_edges(
     } else {
         HashSet::new()
     };
+    let member_targets = PreparedMemberTargetIndex::prepare(unique_nodes, result_edges);
+    let python_local_owner_lines =
+        (language_name == "python").then(|| PythonLocalOwnerLineIndex::prepare(tree, source));
 
     for spec in language_receiver_call_specs(language_name, tree, source) {
         let extra_callsite_marker = context_manager_alias_callsites
@@ -8702,13 +8728,15 @@ fn append_manual_receiver_call_edges(
             continue;
         }
 
-        let Some(target_id) = member_target_id_by_owner_and_method(
-            unique_nodes,
-            result_edges,
+        let python_local_owner_line = python_local_owner_lines
+            .as_ref()
+            .and_then(|index| index.unique_line(&spec.owner_name));
+        let Some(target_id) = member_targets.target(
             &spec.owner_name,
             &spec.method_name,
             file_id,
             spec.allow_global_fallback,
+            python_local_owner_line,
         ) else {
             let should_annotate = match language_name {
                 "python" => !languages::python::is_implicit_receiver(&spec.receiver_name),
@@ -9474,81 +9502,216 @@ fn callsite_has_receiver_annotation(callsite_identity: Option<&str>) -> bool {
     })
 }
 
-fn member_target_id_by_owner_and_method(
-    nodes: &HashMap<NodeId, Node>,
-    edges: &[Edge],
-    owner_name: &str,
-    method_name: &str,
-    file_id: NodeId,
-    allow_global_fallback: bool,
-) -> Option<NodeId> {
-    let mut owners = nodes
-        .values()
-        .filter(|node| is_type_like_kind(node.kind))
-        .filter(|node| node_matches_name(node, owner_name))
-        .collect::<Vec<_>>();
-    owners.sort_by(|left, right| {
-        left.start_line
-            .unwrap_or(u32::MAX)
-            .cmp(&right.start_line.unwrap_or(u32::MAX))
-            .then_with(|| node_span_width(right).cmp(&node_span_width(left)))
-            .then_with(|| left.id.cmp(&right.id))
-    });
+#[derive(Clone, Copy)]
+struct PreparedMemberOwner {
+    id: NodeId,
+    file_node_id: Option<NodeId>,
+    start_line: Option<u32>,
+    span_width: u32,
+}
 
-    let mut candidates = Vec::new();
-    for owner in owners {
-        let mut targets = edges
+#[derive(Clone, Copy)]
+struct PreparedMemberTarget {
+    file_node_id: Option<NodeId>,
+    id: NodeId,
+    start_line: Option<u32>,
+}
+
+#[derive(Default)]
+struct PreparedMemberTargetIndex {
+    owners_by_name: HashMap<String, Vec<PreparedMemberOwner>>,
+    targets_by_owner_and_name: HashMap<(NodeId, String), Vec<PreparedMemberTarget>>,
+}
+
+impl PreparedMemberTargetIndex {
+    fn prepare(nodes: &HashMap<NodeId, Node>, edges: &[Edge]) -> Self {
+        let mut index = Self::default();
+        for node in nodes.values() {
+            count_manual_receiver_lookup_work(1);
+            if !is_type_like_kind(node.kind) {
+                continue;
+            }
+            let owner = PreparedMemberOwner {
+                id: node.id,
+                file_node_id: node.file_node_id,
+                start_line: node.start_line,
+                span_width: node_span_width(node),
+            };
+            for name in prepared_node_names(node, true) {
+                index.owners_by_name.entry(name).or_default().push(owner);
+            }
+        }
+        for edge in edges {
+            count_manual_receiver_lookup_work(1);
+            if edge.kind != EdgeKind::MEMBER {
+                continue;
+            }
+            let Some(target) = nodes.get(&edge.target) else {
+                continue;
+            };
+            if !matches!(target.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+                continue;
+            }
+            let prepared = PreparedMemberTarget {
+                file_node_id: target.file_node_id,
+                id: target.id,
+                start_line: target.start_line,
+            };
+            for name in prepared_node_names(target, false) {
+                index
+                    .targets_by_owner_and_name
+                    .entry((edge.source, name))
+                    .or_default()
+                    .push(prepared);
+            }
+        }
+        for owners in index.owners_by_name.values_mut() {
+            owners.sort_by(|left, right| {
+                left.start_line
+                    .unwrap_or(u32::MAX)
+                    .cmp(&right.start_line.unwrap_or(u32::MAX))
+                    .then_with(|| right.span_width.cmp(&left.span_width))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            owners.dedup_by_key(|owner| owner.id);
+        }
+        for targets in index.targets_by_owner_and_name.values_mut() {
+            targets.sort_by_key(|target| (target.start_line.unwrap_or(u32::MAX), target.id));
+            targets.dedup_by_key(|target| target.id);
+        }
+        index
+    }
+
+    fn target(
+        &self,
+        owner_name: &str,
+        method_name: &str,
+        file_id: NodeId,
+        allow_global_fallback: bool,
+        owner_start_line: Option<u32>,
+    ) -> Option<NodeId> {
+        count_manual_receiver_lookup_work(1);
+        let owner_lookup_name = owner_start_line
+            .and_then(|_| owner_name.rsplit_once('.').map(|(_, name)| name))
+            .unwrap_or(owner_name);
+        let owners = self
+            .owners_by_name
+            .get(owner_lookup_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut candidates = Vec::new();
+        for owner in owners {
+            count_manual_receiver_lookup_work(1);
+            if owner_start_line.is_some_and(|line| owner.start_line != Some(line)) {
+                continue;
+            }
+            if let Some(targets) = self
+                .targets_by_owner_and_name
+                .get(&(owner.id, method_name.to_owned()))
+            {
+                for target in targets {
+                    count_manual_receiver_lookup_work(1);
+                    candidates.push((owner.file_node_id, target.file_node_id, target.id));
+                }
+            }
+        }
+        let mut same_file_matches = candidates
             .iter()
-            .filter(|edge| edge.kind == EdgeKind::MEMBER && edge.source == owner.id)
-            .filter_map(|edge| nodes.get(&edge.target))
-            .filter(|node| {
-                matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-                    && node_matches_name(node, method_name)
+            .filter_map(|(owner_file_id, target_file_id, target_id)| {
+                (owner_file_id.is_none()
+                    || target_file_id.is_none()
+                    || *owner_file_id == Some(file_id)
+                    || *target_file_id == Some(file_id))
+                .then_some(*target_id)
             })
             .collect::<Vec<_>>();
-        targets.sort_by(|left, right| {
-            left.start_line
-                .unwrap_or(u32::MAX)
-                .cmp(&right.start_line.unwrap_or(u32::MAX))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        for target in targets {
-            candidates.push((owner.file_node_id, target.file_node_id, target.id));
+        same_file_matches.sort_unstable();
+        same_file_matches.dedup();
+        match same_file_matches.as_slice() {
+            [target] => return Some(*target),
+            [] => {}
+            _ => return None,
+        }
+        if !allow_global_fallback {
+            return None;
+        }
+        let mut global_matches = candidates
+            .into_iter()
+            .map(|(_, _, target_id)| target_id)
+            .collect::<Vec<_>>();
+        global_matches.sort_unstable();
+        global_matches.dedup();
+        match global_matches.as_slice() {
+            [target] => Some(*target),
+            _ => None,
         }
     }
+}
 
-    let mut same_file_matches = candidates
-        .iter()
-        .filter_map(|(owner_file_id, target_file_id, target_id)| {
-            (owner_file_id.is_none()
-                || target_file_id.is_none()
-                || *owner_file_id == Some(file_id)
-                || *target_file_id == Some(file_id))
-            .then_some(*target_id)
-        })
-        .collect::<Vec<_>>();
-    same_file_matches.sort_unstable();
-    same_file_matches.dedup();
-    if same_file_matches.len() == 1 {
-        return Some(same_file_matches[0]);
+fn prepared_node_names(node: &Node, include_qualified_suffixes: bool) -> Vec<String> {
+    let mut names = vec![
+        node.serialized_name.clone(),
+        short_member_name(&node.serialized_name).to_owned(),
+    ];
+    if let Some(qualified) = node.qualified_name.as_deref() {
+        names.push(qualified.to_owned());
+        names.push(short_member_name(qualified).to_owned());
+        if include_qualified_suffixes {
+            names.extend(
+                qualified
+                    .match_indices('.')
+                    .map(|(index, _)| qualified[index + 1..].to_owned()),
+            );
+        }
     }
-    if same_file_matches.len() > 1 {
-        return None;
-    }
-    if !allow_global_fallback {
-        return None;
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[derive(Default)]
+struct PythonLocalOwnerLineIndex {
+    lines_by_owner: HashMap<String, Vec<u32>>,
+}
+
+impl PythonLocalOwnerLineIndex {
+    fn prepare(tree: &Tree, source: &str) -> Self {
+        let mut index = Self::default();
+        walk_tree_nodes(tree.root_node(), &mut |node| {
+            count_manual_receiver_lookup_work(1);
+            if node.kind() != "class_definition" {
+                return;
+            }
+            let Some(class_name) = declaration_name(node, source) else {
+                return;
+            };
+            let Some(callable) = enclosing_node_with_kind(node, &["function_definition"]) else {
+                return;
+            };
+            let Some(callable_name) = declaration_name(callable, source) else {
+                return;
+            };
+            index
+                .lines_by_owner
+                .entry(format!("{callable_name}.{class_name}"))
+                .or_default()
+                .push(node.start_position().row as u32 + 1);
+        });
+        for lines in index.lines_by_owner.values_mut() {
+            lines.sort_unstable();
+            lines.dedup();
+        }
+        index
     }
 
-    let mut global_matches = candidates
-        .into_iter()
-        .map(|(_, _, target_id)| target_id)
-        .collect::<Vec<_>>();
-    global_matches.sort_unstable();
-    global_matches.dedup();
-    if global_matches.len() == 1 {
-        Some(global_matches[0])
-    } else {
-        None
+    fn unique_line(&self, owner_name: &str) -> Option<u32> {
+        count_manual_receiver_lookup_work(1);
+        self.lines_by_owner
+            .get(owner_name)
+            .and_then(|lines| match lines.as_slice() {
+                [line] => Some(*line),
+                _ => None,
+            })
     }
 }
 
@@ -10023,27 +10186,6 @@ fn normalize_js_ts_private_receiver_surface(receiver: &str) -> String {
         .map(|segment| segment.strip_prefix('#').unwrap_or(segment))
         .collect::<Vec<_>>()
         .join(".")
-}
-
-fn surface_member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    let text = trimmed_node_text(node, source)?;
-    let callable = text
-        .split('(')
-        .next()
-        .unwrap_or(text.as_str())
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    let separator = callable.rfind('.')?;
-    let receiver = callable[..separator].trim().trim_end_matches('?').trim();
-    let method = callable[separator + 1..]
-        .trim()
-        .trim_start_matches('?')
-        .trim();
-    Some((
-        normalized_receiver_surface(receiver)?,
-        normalize_parameter_name(method)?,
-    ))
 }
 
 fn normalized_receiver_surface(raw: &str) -> Option<String> {

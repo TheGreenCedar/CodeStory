@@ -27,6 +27,7 @@ use tree_sitter::{Node as TsNode, Tree};
 thread_local! {
     static RUST_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GO_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PYTHON_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -65,11 +66,30 @@ fn go_resolution_work() -> usize {
     GO_RESOLUTION_WORK.with(std::cell::Cell::get)
 }
 
-const ADAPTER_VERSION: &str = "reference-v10";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 8;
+#[inline]
+fn count_python_resolution_work(amount: usize) {
+    #[cfg(test)]
+    PYTHON_RESOLUTION_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_python_resolution_work() {
+    PYTHON_RESOLUTION_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn python_resolution_work() -> usize {
+    PYTHON_RESOLUTION_WORK.with(std::cell::Cell::get)
+}
+
+const ADAPTER_VERSION: &str = "reference-v11";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 9;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
+    ("python", ADAPTER_VERSION),
     ("rust", ADAPTER_VERSION),
     ("tsx", ADAPTER_VERSION),
     ("typescript", ADAPTER_VERSION),
@@ -103,9 +123,17 @@ pub(crate) fn collect_call_resolution_inputs(
         (language == "rust").then(|| RustResolutionIndex::build(tree, source, file_id, nodes));
     let go_index =
         (language == "go").then(|| GoResolutionIndex::build(tree, source, file_id, nodes));
+    let python_index =
+        (language == "python").then(|| PythonResolutionIndex::build(tree, source, file_id, nodes));
     let (direct_exports, export_poison_all, poisoned_export_names) =
         if let Some(index) = &javascript_index {
             index.collect_direct_exports(source)
+        } else if let Some(index) = &python_index {
+            (
+                Vec::new(),
+                index.module_dynamic,
+                index.poisoned_export_names(),
+            )
         } else {
             (Vec::new(), false, Vec::new())
         };
@@ -117,6 +145,8 @@ pub(crate) fn collect_call_resolution_inputs(
     } else if let Some(index) = &rust_index {
         index.declarations.clone()
     } else if let Some(index) = &go_index {
+        index.declarations.clone()
+    } else if let Some(index) = &python_index {
         index.declarations.clone()
     } else {
         Vec::new()
@@ -143,6 +173,8 @@ pub(crate) fn collect_call_resolution_inputs(
                 index.resolve_syntax_claim(source, callee, form, &raw_target, callable_id)
             } else if let Some(index) = &go_index {
                 index.resolve_syntax_claim(source, callee, form, &raw_target, callable_id)
+            } else if let Some(index) = &python_index {
+                index.resolve_syntax_claim(source, callee, form, &raw_target)
             } else if let Some(index) = &javascript_index {
                 index.resolve_syntax_claim(source, callee, form, &raw_target)
             } else {
@@ -196,6 +228,10 @@ pub(crate) fn collect_call_resolution_inputs(
                 call.callable_id,
             );
         }
+    } else if let Some(index) = &python_index {
+        for call in &index.calls {
+            emit_call(call.callee, call.form, call.raw_target.clone(), None);
+        }
     } else {
         collect_calls(tree.root_node(), source, &mut |callee, form, raw_target| {
             emit_call(callee, form, raw_target, None);
@@ -215,9 +251,14 @@ pub(crate) fn collect_call_resolution_inputs(
             typescript_module,
             top_level_declarations,
             inherent_methods,
-            classes: javascript_index
-                .as_ref()
-                .map_or_else(Vec::new, |index| index.cached_classes()),
+            classes: javascript_index.as_ref().map_or_else(
+                || {
+                    python_index
+                        .as_ref()
+                        .map_or_else(Vec::new, |index| index.classes.clone())
+                },
+                |index| index.cached_classes(),
+            ),
             direct_exports,
             export_poison_all,
             poisoned_export_names,
@@ -1548,6 +1589,1141 @@ fn go_expression_items(node: TsNode<'_>) -> Vec<TsNode<'_>> {
     }
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
+}
+
+#[derive(Debug, Clone)]
+struct IndexedPythonCall<'tree> {
+    callee: TsNode<'tree>,
+    form: CalleeForm,
+    raw_target: String,
+}
+
+#[derive(Debug, Clone)]
+enum PythonNameBinding {
+    Receiver {
+        class_binding: CachedClassBinding,
+        constructor: bool,
+        type_name: String,
+    },
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct PythonBindingEvent {
+    at: usize,
+    binding: PythonNameBinding,
+}
+
+#[derive(Debug, Clone)]
+struct PythonFunctionInfo {
+    graph_id: Option<NodeId>,
+    direct_method: bool,
+    owner: Option<(NodeId, String)>,
+    plain_self: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PythonImportBinding {
+    import: Option<NodeId>,
+    module_specifier: String,
+    imported_name: String,
+}
+
+struct PythonResolutionIndex<'tree> {
+    calls: Vec<IndexedPythonCall<'tree>>,
+    declarations: Vec<CachedTopLevelDeclaration>,
+    classes: Vec<CachedClassDeclaration>,
+    functions: HashMap<usize, PythonFunctionInfo>,
+    bindings: HashMap<usize, HashMap<String, Vec<PythonBindingEvent>>>,
+    imports: HashMap<String, Vec<PythonImportBinding>>,
+    module_blockers: HashMap<String, usize>,
+    module_dynamic: bool,
+    dynamic_functions: HashSet<usize>,
+    declarations_by_name: HashMap<String, Vec<NodeId>>,
+    classes_by_name: HashMap<String, Vec<CachedClassDeclaration>>,
+    class_owner_by_syntax_id: HashMap<usize, NodeId>,
+    closed_class_owners: HashSet<NodeId>,
+    dynamic_class_owners: HashSet<NodeId>,
+    methods_by_owner_and_name: HashMap<(NodeId, String), Vec<NodeId>>,
+    method_blockers_by_owner_and_name: HashSet<(NodeId, String)>,
+    global_names_by_function: HashMap<usize, HashSet<String>>,
+    writes_by_function: HashMap<usize, HashSet<String>>,
+}
+
+impl<'tree> PythonResolutionIndex<'tree> {
+    fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
+        let root = tree.root_node();
+        let mut callable_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        let mut class_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        let mut import_nodes = HashMap::<(u32, u32, String), Vec<NodeId>>::new();
+        for node in nodes
+            .iter()
+            .filter(|node| node.file_node_id == Some(file_id))
+        {
+            count_python_resolution_work(1);
+            let Some(line) = node.start_line else {
+                continue;
+            };
+            let name = graph_leaf_name(&node.serialized_name).to_string();
+            if matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
+                callable_nodes
+                    .entry((line, name.clone()))
+                    .or_default()
+                    .push(node.id);
+            } else if node.kind == NodeKind::CLASS {
+                class_nodes
+                    .entry((line, name.clone()))
+                    .or_default()
+                    .push(node.id);
+            }
+            if let Some(column) = node.start_col {
+                import_nodes
+                    .entry((line, column, name))
+                    .or_default()
+                    .push(node.id);
+            }
+        }
+
+        let mut result = Self {
+            calls: Vec::new(),
+            declarations: Vec::new(),
+            classes: Vec::new(),
+            functions: HashMap::new(),
+            bindings: HashMap::new(),
+            imports: HashMap::new(),
+            module_blockers: HashMap::new(),
+            module_dynamic: false,
+            dynamic_functions: HashSet::new(),
+            declarations_by_name: HashMap::new(),
+            classes_by_name: HashMap::new(),
+            class_owner_by_syntax_id: HashMap::new(),
+            closed_class_owners: HashSet::new(),
+            dynamic_class_owners: HashSet::new(),
+            methods_by_owner_and_name: HashMap::new(),
+            method_blockers_by_owner_and_name: HashSet::new(),
+            global_names_by_function: HashMap::new(),
+            writes_by_function: HashMap::new(),
+        };
+
+        walk_nodes(root, &mut |node| {
+            count_python_resolution_work(1);
+            match node.kind() {
+                "function_definition" => {
+                    result.collect_function(node, root, source, &callable_nodes, &class_nodes);
+                }
+                "class_definition" => {
+                    result.collect_class(node, root, source, &class_nodes, &callable_nodes);
+                }
+                "import_from_statement" => {
+                    result.collect_import(node, root, source, &import_nodes);
+                    if python_enclosing_function(node).is_some() {
+                        result.collect_local_binding_node(node, source);
+                    }
+                }
+                "call" => {
+                    result.collect_call(node, source);
+                    if python_direct_call_name(node, source)
+                        .is_some_and(|name| matches!(name, "exec" | "eval" | "globals"))
+                    {
+                        if let Some(function) = python_enclosing_function(node) {
+                            result.dynamic_functions.insert(function.id());
+                        } else {
+                            result.module_dynamic = true;
+                        }
+                    }
+                }
+                "assignment" | "augmented_assignment" => result.collect_assignment(node, source),
+                "parameters" => result.collect_parameter_bindings(node, source),
+                "for_statement"
+                | "with_item"
+                | "except_clause"
+                | "named_expression"
+                | "global_statement"
+                | "nonlocal_statement"
+                | "delete_statement"
+                | "case_pattern"
+                | "list_comprehension"
+                | "set_comprehension"
+                | "dictionary_comprehension"
+                | "generator_expression"
+                | "import_statement" => result.collect_local_binding_node(node, source),
+                _ => {}
+            }
+        });
+        result.collect_module_class_member_mutations(root, source);
+        for (function, global_names) in &result.global_names_by_function {
+            if let Some(writes) = result.writes_by_function.get(function) {
+                for name in global_names.intersection(writes) {
+                    *result.module_blockers.entry(name.clone()).or_default() += 1;
+                }
+            }
+        }
+        for events in result.bindings.values_mut().flat_map(HashMap::values_mut) {
+            events.sort_by_key(|event| event.at);
+        }
+        result
+            .calls
+            .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        result.declarations.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        result.classes.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        for declaration in &result.declarations {
+            result
+                .declarations_by_name
+                .entry(declaration.name.clone())
+                .or_default()
+                .push(declaration.declaration);
+        }
+        for class in &result.classes {
+            for method in &class.methods {
+                result
+                    .methods_by_owner_and_name
+                    .entry((class.declaration, method.name.clone()))
+                    .or_default()
+                    .push(method.declaration);
+            }
+        }
+        result
+    }
+
+    fn poisoned_export_names(&self) -> Vec<String> {
+        let mut names = self.module_blockers.keys().cloned().collect::<HashSet<_>>();
+        names.extend(self.imports.keys().cloned());
+        for class in &self.classes {
+            if self
+                .method_blockers_by_owner_and_name
+                .iter()
+                .any(|(owner, _)| *owner == class.declaration)
+            {
+                names.insert(class.name.clone());
+            }
+        }
+        let mut names = names.into_iter().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn collect_function(
+        &mut self,
+        node: TsNode<'tree>,
+        root: TsNode<'tree>,
+        source: &str,
+        callable_nodes: &HashMap<(u32, String), Vec<NodeId>>,
+        class_nodes: &HashMap<(u32, String), Vec<NodeId>>,
+    ) {
+        let Some(name) = declaration_name(node, source).map(str::to_string) else {
+            return;
+        };
+        let graph_id = python_unique_graph_node(callable_nodes, node, &name);
+        let direct_module = python_direct_child_of(node, root)
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() != "decorated_definition");
+        let owner_node = python_direct_enclosing_class(node);
+        let owner = owner_node.and_then(|owner_node| {
+            let owner_name = declaration_name(owner_node, source)?.to_string();
+            let owner = python_unique_graph_node(class_nodes, owner_node, &owner_name)?;
+            Some((owner, owner_name))
+        });
+        let direct_method = owner_node
+            .is_some_and(|owner| python_direct_function_in_class(node, owner))
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() != "decorated_definition");
+        if let Some((owner, _)) = &owner
+            && (!direct_method || graph_id.is_none())
+        {
+            self.method_blockers_by_owner_and_name
+                .insert((*owner, name.clone()));
+        }
+        if let Some((owner, _)) = &owner
+            && matches!(
+                name.as_str(),
+                "__getattribute__" | "__getattr__" | "__setattr__" | "__delattr__"
+            )
+        {
+            self.dynamic_class_owners.insert(*owner);
+        }
+        self.functions.insert(
+            node.id(),
+            PythonFunctionInfo {
+                graph_id,
+                direct_method,
+                owner,
+                plain_self: direct_method && python_plain_self_parameter(node, source),
+            },
+        );
+        if direct_module {
+            if let Some(declaration) = graph_id {
+                self.declarations.push(CachedTopLevelDeclaration {
+                    name: name.clone(),
+                    declaration,
+                    module_path: Vec::new(),
+                    cross_module_visible: true,
+                });
+            } else {
+                *self.module_blockers.entry(name.clone()).or_default() += 1;
+            }
+        } else if python_enclosing_function(node).is_none() && owner_node.is_none() {
+            *self.module_blockers.entry(name.clone()).or_default() += 1;
+        }
+        if let Some(enclosing) = python_enclosing_function(node)
+            && enclosing.id() != node.id()
+        {
+            self.push_binding(enclosing, name, node.start_byte(), PythonNameBinding::Other);
+        }
+    }
+
+    fn collect_class(
+        &mut self,
+        node: TsNode<'tree>,
+        root: TsNode<'tree>,
+        source: &str,
+        class_nodes: &HashMap<(u32, String), Vec<NodeId>>,
+        callable_nodes: &HashMap<(u32, String), Vec<NodeId>>,
+    ) {
+        let Some(name) = declaration_name(node, source).map(str::to_string) else {
+            return;
+        };
+        let direct_module = python_direct_child_of(node, root)
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() != "decorated_definition");
+        let closed = direct_module
+            && node.child_by_field_name("superclasses").is_none()
+            && node.child_by_field_name("type_parameters").is_none()
+            && node
+                .child_by_field_name("body")
+                .and_then(|body| source.get(node.start_byte()..body.start_byte()))
+                .is_some_and(|header| !header.contains('(') && !header.contains('['));
+        if closed && let Some(owner) = python_unique_graph_node(class_nodes, node, &name) {
+            self.class_owner_by_syntax_id.insert(node.id(), owner);
+            let mut methods = Vec::new();
+            if let Some(body) = node.child_by_field_name("body") {
+                let mut cursor = body.walk();
+                for method in body.named_children(&mut cursor) {
+                    count_python_resolution_work(1);
+                    if method.kind() != "function_definition"
+                        || method
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "decorated_definition")
+                    {
+                        continue;
+                    }
+                    let Some(method_name) = declaration_name(method, source) else {
+                        continue;
+                    };
+                    if let Some(declaration) =
+                        python_unique_graph_node(callable_nodes, method, method_name)
+                    {
+                        methods.push(CachedClassMethod {
+                            name: method_name.to_string(),
+                            declaration,
+                        });
+                    }
+                }
+            }
+            let class = CachedClassDeclaration {
+                name: name.clone(),
+                declaration: owner,
+                methods,
+            };
+            self.classes_by_name
+                .entry(name.clone())
+                .or_default()
+                .push(class.clone());
+            self.closed_class_owners.insert(owner);
+            self.classes.push(class);
+        } else if python_enclosing_function(node).is_none() {
+            *self.module_blockers.entry(name.clone()).or_default() += 1;
+        }
+        if let Some(function) = python_enclosing_function(node) {
+            self.push_binding(function, name, node.start_byte(), PythonNameBinding::Other);
+        }
+    }
+
+    fn collect_import(
+        &mut self,
+        node: TsNode<'tree>,
+        root: TsNode<'tree>,
+        source: &str,
+        import_nodes: &HashMap<(u32, u32, String), Vec<NodeId>>,
+    ) {
+        let direct = python_direct_child_of(node, root);
+        let module = node
+            .child_by_field_name("module_name")
+            .and_then(|module| node_text(module, source))
+            .map(str::trim)
+            .unwrap_or_default();
+        let mut cursor = node.walk();
+        let names = node
+            .children_by_field_name("name", &mut cursor)
+            .collect::<Vec<_>>();
+        if !direct || !python_exact_relative_module(module) || names.len() != 1 {
+            if direct
+                && (names.iter().any(|name| name.kind() == "wildcard_import")
+                    || node_text(node, source).is_some_and(|surface| surface.contains('*')))
+            {
+                self.module_dynamic = true;
+            }
+            let binding_names = python_binding_names(node, source);
+            if let Some(owner) = self.enclosing_class_owner(node) {
+                self.poison_class_members(owner, binding_names);
+            } else {
+                for name in binding_names {
+                    *self.module_blockers.entry(name).or_default() += 1;
+                }
+            }
+            return;
+        }
+        let imported = names[0];
+        let (imported_name_node, local_node) = if imported.kind() == "aliased_import" {
+            let Some(name) = imported.child_by_field_name("name") else {
+                return;
+            };
+            let Some(alias) = imported.child_by_field_name("alias") else {
+                return;
+            };
+            (name, alias)
+        } else {
+            (imported, imported)
+        };
+        let Some(imported_name) = node_text(imported_name_node, source)
+            .map(str::trim)
+            .filter(|name| python_identifier(name))
+        else {
+            return;
+        };
+        let Some(local_name) = node_text(local_node, source)
+            .map(str::trim)
+            .filter(|name| python_identifier(name))
+        else {
+            return;
+        };
+        let key = (
+            local_node.start_position().row as u32 + 1,
+            local_node.start_position().column as u32 + 1,
+            local_name.to_string(),
+        );
+        let import = import_nodes
+            .get(&key)
+            .and_then(|nodes| match nodes.as_slice() {
+                [node] => Some(*node),
+                _ => None,
+            });
+        self.imports
+            .entry(local_name.to_string())
+            .or_default()
+            .push(PythonImportBinding {
+                import,
+                module_specifier: module.to_string(),
+                imported_name: imported_name.to_string(),
+            });
+    }
+
+    fn collect_call(&mut self, node: TsNode<'tree>, source: &str) {
+        let Some(function) = node.child_by_field_name("function") else {
+            return;
+        };
+        let (callee, form, raw_target) = match function.kind() {
+            "identifier" => (
+                function,
+                CalleeForm::Identifier,
+                node_text(function, source).unwrap_or_default().to_string(),
+            ),
+            "attribute" => {
+                let Some(attribute) = function.child_by_field_name("attribute") else {
+                    return;
+                };
+                let Some(object) = function.child_by_field_name("object") else {
+                    return;
+                };
+                let form = if node_text(object, source).is_some_and(|value| value == "self") {
+                    CalleeForm::ImplicitReceiver
+                } else if object.kind() == "identifier" {
+                    CalleeForm::ExplicitReceiver
+                } else {
+                    CalleeForm::DynamicAccess
+                };
+                (
+                    attribute,
+                    form,
+                    node_text(attribute, source).unwrap_or_default().to_string(),
+                )
+            }
+            _ => (
+                function,
+                CalleeForm::DynamicAccess,
+                node_text(function, source)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            ),
+        };
+        self.calls.push(IndexedPythonCall {
+            callee,
+            form,
+            raw_target,
+        });
+        if python_direct_call_name(node, source)
+            .is_some_and(|name| matches!(name, "getattr" | "setattr" | "delattr"))
+            && let Some(function) = python_enclosing_function(node)
+        {
+            self.dynamic_functions.insert(function.id());
+        }
+    }
+
+    fn collect_assignment(&mut self, node: TsNode<'tree>, source: &str) {
+        let Some(function) = python_enclosing_function(node) else {
+            if let Some(left) = node.child_by_field_name("left") {
+                let names = python_binding_names(left, source);
+                if let Some(owner) = self.enclosing_class_owner(node) {
+                    self.poison_class_members(owner, names);
+                } else {
+                    for name in names {
+                        *self.module_blockers.entry(name).or_default() += 1;
+                    }
+                }
+            }
+            return;
+        };
+        let Some(left) = node.child_by_field_name("left") else {
+            return;
+        };
+        let names = python_binding_names(left, source);
+        self.writes_by_function
+            .entry(function.id())
+            .or_default()
+            .extend(names.iter().cloned());
+        if let Some((owner, _)) = self
+            .functions
+            .get(&function.id())
+            .and_then(|info| info.owner.as_ref())
+            .cloned()
+        {
+            self.poison_class_members(owner, python_self_member_binding_names(left, source));
+        }
+        let direct_block = python_direct_statement_in_function(node, function);
+        let receiver = if names.len() == 1 && left.kind() == "identifier" && direct_block {
+            let class_name = match node.child_by_field_name("right") {
+                Some(right) => {
+                    python_direct_constructor_name(right, source).map(|name| (name, true))
+                }
+                None => node
+                    .child_by_field_name("type")
+                    .and_then(|annotation| python_exact_annotation(annotation, source))
+                    .map(|name| (name, false)),
+            };
+            class_name.and_then(|(class_name, constructor)| {
+                self.resolve_class_binding(&class_name)
+                    .map(|class_binding| PythonNameBinding::Receiver {
+                        class_binding,
+                        constructor,
+                        type_name: class_name,
+                    })
+            })
+        } else {
+            None
+        };
+        for name in names {
+            self.push_binding(
+                function,
+                name,
+                node.start_byte(),
+                receiver.clone().unwrap_or(PythonNameBinding::Other),
+            );
+        }
+    }
+
+    fn collect_parameter_bindings(&mut self, node: TsNode<'tree>, source: &str) {
+        let Some(function) = node
+            .parent()
+            .filter(|parent| parent.kind() == "function_definition")
+        else {
+            return;
+        };
+        let plain_self = self
+            .functions
+            .get(&function.id())
+            .is_some_and(|info| info.plain_self);
+        for name in python_binding_names(node, source) {
+            if plain_self && name == "self" {
+                continue;
+            }
+            self.push_binding(function, name, node.start_byte(), PythonNameBinding::Other);
+        }
+    }
+
+    fn collect_module_class_member_mutations(&mut self, root: TsNode<'tree>, source: &str) {
+        walk_nodes(root, &mut |node| {
+            count_python_resolution_work(1);
+            if !matches!(
+                node.kind(),
+                "assignment" | "augmented_assignment" | "delete_statement"
+            ) {
+                return;
+            }
+            let direct_module = node.parent().is_some_and(|parent| parent.id() == root.id())
+                || node.parent().is_some_and(|parent| {
+                    parent.kind() == "expression_statement"
+                        && parent
+                            .parent()
+                            .is_some_and(|grandparent| grandparent.id() == root.id())
+                });
+            if !direct_module {
+                return;
+            }
+
+            let mut targets = Vec::new();
+            if node.kind() == "delete_statement" {
+                let mut cursor = node.walk();
+                targets.extend(node.named_children(&mut cursor));
+            } else if let Some(left) = node.child_by_field_name("left") {
+                targets.push(left);
+            }
+            for target in targets {
+                if target.kind() != "attribute" {
+                    continue;
+                }
+                let Some(class_name) = target
+                    .child_by_field_name("object")
+                    .filter(|object| object.kind() == "identifier")
+                    .and_then(|object| node_text(object, source))
+                    .filter(|name| python_identifier(name))
+                else {
+                    continue;
+                };
+                let Some(member) = target
+                    .child_by_field_name("attribute")
+                    .filter(|attribute| attribute.kind() == "identifier")
+                    .and_then(|attribute| node_text(attribute, source))
+                    .filter(|name| python_identifier(name))
+                else {
+                    continue;
+                };
+                let owner = match self
+                    .classes_by_name
+                    .get(class_name)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                {
+                    [class] => class.declaration,
+                    _ => continue,
+                };
+                self.method_blockers_by_owner_and_name
+                    .insert((owner, member.to_string()));
+            }
+        });
+    }
+
+    fn collect_local_binding_node(&mut self, node: TsNode<'tree>, source: &str) {
+        let names = python_binding_names(node, source);
+        if let Some(function) = python_enclosing_function(node) {
+            if node.kind() == "global_statement" {
+                self.global_names_by_function
+                    .entry(function.id())
+                    .or_default()
+                    .extend(names.iter().cloned());
+            } else {
+                self.writes_by_function
+                    .entry(function.id())
+                    .or_default()
+                    .extend(names.iter().cloned());
+            }
+            if let Some((owner, _)) = self
+                .functions
+                .get(&function.id())
+                .and_then(|info| info.owner.as_ref())
+                .cloned()
+            {
+                self.poison_class_members(owner, python_self_member_binding_names(node, source));
+            }
+            for name in names {
+                self.push_binding(function, name, node.start_byte(), PythonNameBinding::Other);
+            }
+        } else if let Some(owner) = self.enclosing_class_owner(node) {
+            self.poison_class_members(owner, names);
+        } else {
+            for name in names {
+                *self.module_blockers.entry(name).or_default() += 1;
+            }
+        }
+    }
+
+    fn enclosing_class_owner(&self, node: TsNode<'tree>) -> Option<NodeId> {
+        python_direct_enclosing_class(node)
+            .and_then(|class| self.class_owner_by_syntax_id.get(&class.id()).copied())
+    }
+
+    fn poison_class_members(&mut self, owner: NodeId, names: impl IntoIterator<Item = String>) {
+        self.method_blockers_by_owner_and_name
+            .extend(names.into_iter().map(|name| (owner, name)));
+    }
+
+    fn push_binding(
+        &mut self,
+        function: TsNode<'tree>,
+        name: String,
+        at: usize,
+        binding: PythonNameBinding,
+    ) {
+        self.bindings
+            .entry(function.id())
+            .or_default()
+            .entry(name)
+            .or_default()
+            .push(PythonBindingEvent { at, binding });
+    }
+
+    fn resolve_class_binding(&self, name: &str) -> Option<CachedClassBinding> {
+        if self.module_dynamic || self.module_blockers.contains_key(name) {
+            return None;
+        }
+        let classes = self
+            .classes_by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if let [class] = classes {
+            return Some(CachedClassBinding::SameFile {
+                owner: class.declaration,
+                owner_name: class.name.clone(),
+            });
+        }
+        let imports = self.imports.get(name)?;
+        let [import] = imports.as_slice() else {
+            return None;
+        };
+        Some(CachedClassBinding::StaticImport {
+            import: import.import?,
+            module_specifier: import.module_specifier.clone(),
+            imported_name: import.imported_name.clone(),
+            is_default: false,
+        })
+    }
+
+    fn resolve_syntax_claim(
+        &self,
+        source: &str,
+        callee: TsNode<'tree>,
+        form: CalleeForm,
+        raw_target: &str,
+    ) -> (Option<NodeId>, CachedResolutionBinding) {
+        let Some(call) = callee.parent().and_then(|parent| {
+            if parent.kind() == "call" {
+                Some(parent)
+            } else {
+                parent
+                    .parent()
+                    .filter(|grandparent| grandparent.kind() == "call")
+            }
+        }) else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        let Some(function) = python_enclosing_function(call) else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        let Some(info) = self.functions.get(&function.id()) else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        let Some(caller) = info.graph_id else {
+            return (None, CachedResolutionBinding::IncompleteDomain);
+        };
+        if python_enclosing_function(function).is_some() {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if python_has_enclosing_lambda(call, function) {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if self.dynamic_functions.contains(&function.id()) {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        let binding = match form {
+            CalleeForm::Identifier => {
+                if self.module_dynamic
+                    || self
+                        .bindings
+                        .get(&function.id())
+                        .and_then(|bindings| bindings.get(raw_target))
+                        .is_some()
+                    || self
+                        .module_blockers
+                        .get(raw_target)
+                        .copied()
+                        .unwrap_or_default()
+                        > 0
+                {
+                    CachedResolutionBinding::Unsupported
+                } else if let Some(imports) = self.imports.get(raw_target) {
+                    match imports.as_slice() {
+                        [import] if import.import.is_some() => {
+                            CachedResolutionBinding::StaticImport {
+                                import: import.import.expect("checked"),
+                                module_specifier: import.module_specifier.clone(),
+                                imported_name: import.imported_name.clone(),
+                                is_default: false,
+                            }
+                        }
+                        [_] => CachedResolutionBinding::IncompleteDomain,
+                        _ => CachedResolutionBinding::Ambiguous,
+                    }
+                } else {
+                    let declarations = self
+                        .declarations_by_name
+                        .get(raw_target)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    if let [declaration] = declarations {
+                        CachedResolutionBinding::SameFile {
+                            declaration: *declaration,
+                        }
+                    } else if declarations.len() > 1 {
+                        CachedResolutionBinding::Ambiguous
+                    } else if self.classes_by_name.contains_key(raw_target) {
+                        CachedResolutionBinding::Unsupported
+                    } else {
+                        CachedResolutionBinding::MissingBinding
+                    }
+                }
+            }
+            CalleeForm::ImplicitReceiver => {
+                let owner = info.owner.as_ref();
+                let valid = info.direct_method
+                    && info.plain_self
+                    && !self
+                        .bindings
+                        .get(&function.id())
+                        .and_then(|bindings| bindings.get("self"))
+                        .is_some_and(|events| {
+                            events.iter().any(|event| event.at > function.start_byte())
+                        });
+                if !valid {
+                    CachedResolutionBinding::Unsupported
+                } else if let Some((owner, owner_name)) = owner {
+                    if !self.closed_class_owners.contains(owner)
+                        || self.dynamic_class_owners.contains(owner)
+                        || self
+                            .method_blockers_by_owner_and_name
+                            .contains(&(*owner, raw_target.to_owned()))
+                    {
+                        return (Some(caller), CachedResolutionBinding::Unsupported);
+                    }
+                    let methods = self
+                        .methods_by_owner_and_name
+                        .get(&(*owner, raw_target.to_string()))
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    if let [method] = methods {
+                        CachedResolutionBinding::ImplicitReceiver {
+                            owner: *owner,
+                            declaration: *method,
+                            owner_name: owner_name.clone(),
+                        }
+                    } else if methods.len() > 1 {
+                        CachedResolutionBinding::Ambiguous
+                    } else {
+                        CachedResolutionBinding::MissingBinding
+                    }
+                } else {
+                    CachedResolutionBinding::Unsupported
+                }
+            }
+            CalleeForm::ExplicitReceiver => {
+                if !python_direct_statement_in_function(call, function) {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
+                let receiver = callee
+                    .parent()
+                    .and_then(|attribute| attribute.child_by_field_name("object"))
+                    .and_then(|receiver| (receiver.kind() == "identifier").then_some(receiver))
+                    .and_then(|receiver| node_text(receiver, source));
+                let events =
+                    receiver.and_then(|receiver| self.bindings.get(&function.id())?.get(receiver));
+                match events.map(Vec::as_slice) {
+                    Some(
+                        [
+                            PythonBindingEvent {
+                                at,
+                                binding:
+                                    PythonNameBinding::Receiver {
+                                        class_binding,
+                                        constructor,
+                                        type_name,
+                                    },
+                            },
+                        ],
+                    ) if *at < call.start_byte()
+                        && !self
+                            .bindings
+                            .get(&function.id())
+                            .is_some_and(|bindings| bindings.contains_key(type_name)) =>
+                    {
+                        if let CachedClassBinding::SameFile { owner, .. } = class_binding
+                            && (self.dynamic_class_owners.contains(owner)
+                                || self
+                                    .method_blockers_by_owner_and_name
+                                    .contains(&(*owner, raw_target.to_owned())))
+                        {
+                            return (Some(caller), CachedResolutionBinding::Unsupported);
+                        }
+                        if *constructor {
+                            CachedResolutionBinding::ConstructorBinding {
+                                class_binding: class_binding.clone(),
+                                method_name: raw_target.to_string(),
+                            }
+                        } else {
+                            CachedResolutionBinding::ExplicitReceiverType {
+                                class_binding: class_binding.clone(),
+                                method_name: raw_target.to_string(),
+                            }
+                        }
+                    }
+                    Some(_) => CachedResolutionBinding::Unsupported,
+                    None => CachedResolutionBinding::Unsupported,
+                }
+            }
+            _ => CachedResolutionBinding::Unsupported,
+        };
+        (Some(caller), binding)
+    }
+}
+
+fn python_unique_graph_node(
+    nodes: &HashMap<(u32, String), Vec<NodeId>>,
+    syntax: TsNode<'_>,
+    name: &str,
+) -> Option<NodeId> {
+    nodes
+        .get(&(syntax.start_position().row as u32 + 1, name.to_string()))
+        .and_then(|matches| match matches.as_slice() {
+            [node] => Some(*node),
+            _ => None,
+        })
+}
+
+fn python_direct_child_of(node: TsNode<'_>, owner: TsNode<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.id() == owner.id())
+        || node.parent().is_some_and(|parent| {
+            parent.kind() == "decorated_definition"
+                && parent
+                    .parent()
+                    .is_some_and(|grandparent| grandparent.id() == owner.id())
+        })
+}
+
+fn python_direct_function_in_class(function: TsNode<'_>, class: TsNode<'_>) -> bool {
+    class.child_by_field_name("body").is_some_and(|body| {
+        function
+            .parent()
+            .is_some_and(|parent| parent.id() == body.id())
+            || function.parent().is_some_and(|parent| {
+                parent.kind() == "decorated_definition"
+                    && parent
+                        .parent()
+                        .is_some_and(|grandparent| grandparent.id() == body.id())
+            })
+    })
+}
+
+fn python_direct_enclosing_class(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "function_definition" {
+            return None;
+        }
+        if parent.kind() == "class_definition" {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn python_enclosing_function(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "function_definition" {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn python_has_enclosing_lambda(mut node: TsNode<'_>, function: TsNode<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.id() == function.id() {
+            return false;
+        }
+        if parent.kind() == "lambda" {
+            return true;
+        }
+        node = parent;
+    }
+    false
+}
+
+fn python_plain_self_parameter(function: TsNode<'_>, source: &str) -> bool {
+    let Some(parameters) = function.child_by_field_name("parameters") else {
+        return false;
+    };
+    let mut cursor = parameters.walk();
+    let params = parameters.named_children(&mut cursor).collect::<Vec<_>>();
+    params.first().is_some_and(|parameter| {
+        parameter.kind() == "identifier" && node_text(*parameter, source) == Some("self")
+    })
+}
+
+fn python_direct_statement_in_function(node: TsNode<'_>, function: TsNode<'_>) -> bool {
+    function.child_by_field_name("body").is_some_and(|body| {
+        node.parent().is_some_and(|parent| parent.id() == body.id())
+            || node.parent().is_some_and(|parent| {
+                parent.kind() == "expression_statement"
+                    && parent
+                        .parent()
+                        .is_some_and(|grandparent| grandparent.id() == body.id())
+            })
+    })
+}
+
+fn python_direct_constructor_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let function = node.child_by_field_name("function")?;
+    let name = (function.kind() == "identifier").then(|| node_text(function, source))??;
+    python_identifier(name).then(|| name.to_string())
+}
+
+fn python_exact_annotation(node: TsNode<'_>, source: &str) -> Option<String> {
+    let surface = node_text(node, source)?.trim();
+    python_identifier(surface).then(|| surface.to_string())
+}
+
+fn python_direct_call_name<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    let function = node.child_by_field_name("function")?;
+    (function.kind() == "identifier").then(|| node_text(function, source))?
+}
+
+fn python_exact_relative_module(module: &str) -> bool {
+    module.starts_with('.')
+        && !module.starts_with("..")
+        && module[1..].split('.').all(python_identifier)
+        && module.len() > 1
+}
+
+fn python_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn python_binding_names(node: TsNode<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    match node.kind() {
+        "assignment" | "augmented_assignment" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                python_binding_target_names(left, source, &mut names);
+            }
+        }
+        "for_statement"
+        | "list_comprehension"
+        | "set_comprehension"
+        | "dictionary_comprehension"
+        | "generator_expression" => {
+            if let Some(left) = node.child_by_field_name("left") {
+                python_binding_target_names(left, source, &mut names);
+            }
+        }
+        "named_expression" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                python_binding_target_names(name, source, &mut names);
+            }
+        }
+        "with_item" => {
+            if let Some(alias) = node.child_by_field_name("alias") {
+                python_binding_target_names(alias, source, &mut names);
+            }
+        }
+        "except_clause" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                python_binding_target_names(name, source, &mut names);
+            }
+        }
+        "parameters"
+        | "global_statement"
+        | "nonlocal_statement"
+        | "delete_statement"
+        | "case_pattern"
+        | "import_statement"
+        | "import_from_statement" => {
+            python_binding_target_names(node, source, &mut names);
+        }
+        _ => python_binding_target_names(node, source, &mut names),
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn python_binding_target_names(node: TsNode<'_>, source: &str, names: &mut Vec<String>) {
+    count_python_resolution_work(1);
+    if node.kind() == "identifier" {
+        if let Some(name) = node_text(node, source).filter(|name| python_identifier(name)) {
+            names.push(name.to_string());
+        }
+        return;
+    }
+    if node.kind() == "attribute" {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        python_binding_target_names(child, source, names);
+    }
+}
+
+fn python_self_member_binding_names(node: TsNode<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    python_collect_self_member_binding_names(node, source, &mut names);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn python_collect_self_member_binding_names(
+    node: TsNode<'_>,
+    source: &str,
+    names: &mut Vec<String>,
+) {
+    count_python_resolution_work(1);
+    if node.kind() == "attribute"
+        && node
+            .child_by_field_name("object")
+            .and_then(|object| node_text(object, source))
+            == Some("self")
+    {
+        if let Some(name) = node
+            .child_by_field_name("attribute")
+            .and_then(|attribute| node_text(attribute, source))
+            .filter(|name| python_identifier(name))
+        {
+            names.push(name.to_string());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        python_collect_self_member_binding_names(child, source, names);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4924,21 +6100,60 @@ fn cache_entry_identity_for_indexed_file(
     })
 }
 
-fn cache_entry_matches_any_governed_file(
-    cache_path: &Path,
-    governed: &[&codestory_store::FileInfo],
-    governed_identities: &HashMap<i64, WorkspacePathIdentity>,
-) -> Result<bool> {
-    for file in governed {
-        let observed = cache_entry_identity_for_indexed_file(cache_path, &file.path)?;
-        if governed_identities
-            .get(&file.id)
-            .is_some_and(|identity| *identity == observed)
-        {
-            return Ok(true);
+struct PreparedGovernedCachePaths {
+    relative_suffixes: HashSet<PathBuf>,
+    absolute_identities: HashSet<WorkspacePathIdentity>,
+}
+
+impl PreparedGovernedCachePaths {
+    fn prepare(
+        governed: &[&codestory_store::FileInfo],
+        governed_identities: &HashMap<i64, WorkspacePathIdentity>,
+    ) -> Self {
+        let mut relative_suffixes = HashSet::new();
+        for file in governed {
+            let components = file
+                .path
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(component) => Some(component),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for start in 0..components.len() {
+                count_python_resolution_work(1);
+                relative_suffixes.insert(components[start..].iter().copied().collect());
+            }
+        }
+        Self {
+            relative_suffixes,
+            absolute_identities: governed_identities.values().cloned().collect(),
         }
     }
-    Ok(false)
+
+    fn contains(&self, cache_path: &Path) -> Result<bool> {
+        count_python_resolution_work(1);
+        if cache_path.is_absolute() {
+            let observed = workspace_path_identity(cache_path).with_context(|| {
+                format!(
+                    "proof resolution native identity is unavailable for parser cache path {}",
+                    cache_path.display()
+                )
+            })?;
+            return Ok(self.absolute_identities.contains(&observed));
+        }
+        if cache_path.as_os_str().is_empty()
+            || cache_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(anyhow!(
+                "proof resolution parser cache path is not a portable project path: {}",
+                cache_path.display()
+            ));
+        }
+        Ok(self.relative_suffixes.contains(cache_path))
+    }
 }
 
 pub fn rematerialize_proof_resolution_projection(
@@ -4990,16 +6205,13 @@ pub fn rematerialize_proof_resolution_projection(
         }
         governed_identities.insert(file.id, identity);
     }
+    let governed_cache_paths = PreparedGovernedCachePaths::prepare(&governed, &governed_identities);
     let mut records_by_id = HashMap::<i64, Vec<ResolutionCacheRecord>>::new();
     for entry in store.get_index_artifact_cache_entries()? {
         let artifact: CachedIndexArtifact = match serde_json::from_slice(&entry.artifact_blob) {
             Ok(artifact) => artifact,
             Err(error) => {
-                if cache_entry_matches_any_governed_file(
-                    &entry.file_path,
-                    &governed,
-                    &governed_identities,
-                )? {
+                if governed_cache_paths.contains(&entry.file_path)? {
                     return Err(anyhow!(
                         "proof resolution parser cache is corrupt for {}: {error}",
                         entry.file_path.display()
@@ -5009,11 +6221,7 @@ pub fn rematerialize_proof_resolution_projection(
             }
         };
         let Some(file) = artifact.resolution_file else {
-            if cache_entry_matches_any_governed_file(
-                &entry.file_path,
-                &governed,
-                &governed_identities,
-            )? {
+            if governed_cache_paths.contains(&entry.file_path)? {
                 return Err(anyhow!(
                     "proof resolution parser cache has no file coverage for {}",
                     entry.file_path.display()
@@ -5157,6 +6365,7 @@ pub fn rematerialize_proof_resolution_projection(
         .collect::<HashMap<_, _>>();
     let rust_projection_index = RustProjectionIndex::prepare(&records)?;
     let go_projection_index = GoProjectionIndex::prepare(&records)?;
+    let python_projection_index = PythonProjectionIndex::prepare(&records, &record_by_path)?;
     let mut claims = inputs
         .into_iter()
         .map(|(source_record, input)| {
@@ -5165,6 +6374,7 @@ pub fn rematerialize_proof_resolution_projection(
                 &record_by_path,
                 &rust_projection_index,
                 &go_projection_index,
+                &python_projection_index,
                 source_record,
                 input,
             )
@@ -5226,7 +6436,8 @@ pub fn rematerialize_proof_resolution_projection(
             let edge = &edges[*index];
             let raw = node_by_id[&edge.target];
             let direct_member_edge = edge.target == edge.effective_target()
-                && (raw.kind == NodeKind::METHOD || raw.file_node_id != edge.file_node_id);
+                && (matches!(raw.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                    || raw.file_node_id != edge.file_node_id);
             OrdinaryCallEdgeCorrelationInput {
                 file_id: edge.file_node_id.map(|file| FileId(file.0)),
                 line: edge.line,
@@ -5294,6 +6505,278 @@ enum RelativeImportResolution<'a> {
     Unique(&'a ResolutionCacheRecord),
     Missing,
     Incomplete,
+}
+
+struct PythonRelativeImportResolution<'a> {
+    target: RelativeImportResolution<'a>,
+    dependencies: Vec<FileId>,
+}
+
+#[derive(Default)]
+struct PythonProjectionIndex {
+    complete_directories: HashSet<WorkspacePathIdentity>,
+    declarations_by_file_and_name: HashMap<(i64, String), Vec<NodeId>>,
+    classes_by_file_and_name: HashMap<(i64, String), Vec<NodeId>>,
+    methods_by_file_owner_and_name: HashMap<(i64, NodeId, String), Vec<NodeId>>,
+}
+
+impl PythonProjectionIndex {
+    fn prepare(
+        records: &[ResolutionCacheRecord],
+        records_by_path: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
+    ) -> Result<Self> {
+        let mut index = Self::default();
+        let mut directories = HashMap::<WorkspacePathIdentity, PathBuf>::new();
+        for record in records
+            .iter()
+            .filter(|record| record.file.language == "python")
+        {
+            count_python_resolution_work(1);
+            let directory = record.path.parent().ok_or_else(|| {
+                anyhow!(
+                    "Python proof resolution source has no package directory: {}",
+                    record.path.display()
+                )
+            })?;
+            let identity = workspace_path_identity(directory).map_err(|error| {
+                anyhow!(
+                    "Python proof resolution package directory has no native identity ({}): {error}",
+                    directory.display()
+                )
+            })?;
+            directories
+                .entry(identity)
+                .or_insert_with(|| directory.to_path_buf());
+            for declaration in &record.file.top_level_declarations {
+                count_python_resolution_work(1);
+                index
+                    .declarations_by_file_and_name
+                    .entry((record.file.file_id.0, declaration.name.clone()))
+                    .or_default()
+                    .push(declaration.declaration);
+            }
+            for class in &record.file.classes {
+                count_python_resolution_work(1);
+                index
+                    .classes_by_file_and_name
+                    .entry((record.file.file_id.0, class.name.clone()))
+                    .or_default()
+                    .push(class.declaration);
+                for method in &class.methods {
+                    count_python_resolution_work(1);
+                    index
+                        .methods_by_file_owner_and_name
+                        .entry((
+                            record.file.file_id.0,
+                            class.declaration,
+                            method.name.clone(),
+                        ))
+                        .or_default()
+                        .push(method.declaration);
+                }
+            }
+        }
+        for (identity, directory) in directories {
+            let mut complete = true;
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    continue;
+                }
+            };
+            for entry in entries {
+                count_python_resolution_work(1);
+                let Ok(entry) = entry else {
+                    complete = false;
+                    break;
+                };
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("py") {
+                    continue;
+                }
+                if entry.file_type().map_or(true, |kind| kind.is_symlink()) {
+                    complete = false;
+                    break;
+                }
+                let Ok(entry_identity) = workspace_path_identity(&path) else {
+                    complete = false;
+                    break;
+                };
+                if !records_by_path.contains_key(&entry_identity) {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
+                index.complete_directories.insert(identity);
+            }
+        }
+        Ok(index)
+    }
+
+    fn directory_is_complete(&self, directory: &Path) -> bool {
+        count_python_resolution_work(1);
+        workspace_path_identity(directory)
+            .ok()
+            .is_some_and(|identity| self.complete_directories.contains(&identity))
+    }
+
+    fn classes(&self, file_id: FileId, name: &str) -> &[NodeId] {
+        count_python_resolution_work(1);
+        self.classes_by_file_and_name
+            .get(&(file_id.0, name.to_owned()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn declarations(&self, file_id: FileId, name: &str) -> &[NodeId] {
+        count_python_resolution_work(1);
+        self.declarations_by_file_and_name
+            .get(&(file_id.0, name.to_owned()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn methods(&self, file_id: FileId, owner: NodeId, name: &str) -> &[NodeId] {
+        count_python_resolution_work(1);
+        self.methods_by_file_owner_and_name
+            .get(&(file_id.0, owner, name.to_owned()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+fn resolve_python_relative_import<'a>(
+    source_record: &ResolutionCacheRecord,
+    module_specifier: &str,
+    records: &'a HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
+    python_index: &PythonProjectionIndex,
+) -> Result<PythonRelativeImportResolution<'a>> {
+    if !python_exact_relative_module(module_specifier) {
+        return Ok(PythonRelativeImportResolution {
+            target: RelativeImportResolution::Missing,
+            dependencies: Vec::new(),
+        });
+    }
+    let Some(source_directory) = source_record.path.parent() else {
+        return Ok(PythonRelativeImportResolution {
+            target: RelativeImportResolution::Missing,
+            dependencies: Vec::new(),
+        });
+    };
+    let mut dependency_records = Vec::new();
+    let source_marker = source_directory.join("__init__.py");
+    let source_marker_identity = match workspace_path_identity(&source_marker) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return Ok(PythonRelativeImportResolution {
+                target: RelativeImportResolution::Incomplete,
+                dependencies: Vec::new(),
+            });
+        }
+    };
+    let Some(source_marker_record) = records.get(&source_marker_identity).copied() else {
+        return Ok(PythonRelativeImportResolution {
+            target: RelativeImportResolution::Incomplete,
+            dependencies: Vec::new(),
+        });
+    };
+    dependency_records.push(source_marker_record);
+
+    let components = module_specifier[1..].split('.').collect::<Vec<_>>();
+    let mut base = source_directory.to_path_buf();
+    for component in &components[..components.len().saturating_sub(1)] {
+        base.push(component);
+        let marker = base.join("__init__.py");
+        let identity = match workspace_path_identity(&marker) {
+            Ok(identity) => identity,
+            Err(_) => {
+                return Ok(PythonRelativeImportResolution {
+                    target: RelativeImportResolution::Incomplete,
+                    dependencies: Vec::new(),
+                });
+            }
+        };
+        let Some(record) = records.get(&identity).copied() else {
+            return Ok(PythonRelativeImportResolution {
+                target: RelativeImportResolution::Incomplete,
+                dependencies: Vec::new(),
+            });
+        };
+        dependency_records.push(record);
+    }
+    let leaf = components
+        .last()
+        .expect("exact relative module has a component");
+    let file_candidate = base.join(leaf).with_extension("py");
+    let package_candidate = base.join(leaf).join("__init__.py");
+    let mut matches: Vec<&ResolutionCacheRecord> = Vec::new();
+    let mut uncovered = false;
+    for candidate in [&file_candidate, &package_candidate] {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                uncovered = true;
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                uncovered = true;
+                continue;
+            }
+        }
+        let identity = match workspace_path_identity(candidate) {
+            Ok(identity) => identity,
+            Err(_) => {
+                uncovered = true;
+                continue;
+            }
+        };
+        if let Some(record) = records.get(&identity) {
+            matches.push(*record);
+        } else {
+            uncovered = true;
+        }
+    }
+    matches.sort_by_key(|record| record.file.file_id);
+    matches.dedup_by_key(|record| record.file.file_id);
+    if uncovered || matches.len() != 1 {
+        return Ok(PythonRelativeImportResolution {
+            target: if matches.is_empty() && !uncovered {
+                RelativeImportResolution::Missing
+            } else {
+                RelativeImportResolution::Incomplete
+            },
+            dependencies: Vec::new(),
+        });
+    }
+    let target = matches[0];
+    if package_candidate == target.path {
+        dependency_records.push(target);
+    }
+    if [
+        source_directory,
+        target.path.parent().unwrap_or(source_directory),
+    ]
+    .into_iter()
+    .any(|directory| !python_index.directory_is_complete(directory))
+    {
+        return Ok(PythonRelativeImportResolution {
+            target: RelativeImportResolution::Incomplete,
+            dependencies: Vec::new(),
+        });
+    }
+    let mut dependencies = dependency_records
+        .into_iter()
+        .map(|record| FileId(record.file.file_id.0))
+        .chain(std::iter::once(FileId(target.file.file_id.0)))
+        .collect::<Vec<_>>();
+    dependencies.sort();
+    dependencies.dedup();
+    Ok(PythonRelativeImportResolution {
+        target: RelativeImportResolution::Unique(target),
+        dependencies,
+    })
 }
 
 fn resolve_relative_import<'a>(
@@ -5400,12 +6883,43 @@ impl ProofRelationState {
 struct ExactEvidenceValidationIndex {
     import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
+    python_import_paths: HashMap<(NodeId, NodeId, String), Vec<Vec<NodeId>>>,
+    python_import_path_counts: HashMap<(NodeId, NodeId, Vec<NodeId>), usize>,
+}
+
+fn python_raw_import_marker_is_admissible(edge: &Edge, nodes: &HashMap<NodeId, &Node>) -> bool {
+    if edge.kind != EdgeKind::IMPORT
+        || edge.effective_source() != edge.source
+        || !edge.candidate_targets.is_empty()
+    {
+        return false;
+    }
+    let Some(file_id) = edge.file_node_id else {
+        return false;
+    };
+    let raw_markers_are_local = [edge.source, edge.target].into_iter().all(|node_id| {
+        nodes.get(&node_id).is_some_and(|node| {
+            node.file_node_id == Some(file_id)
+                && matches!(node.kind, NodeKind::UNKNOWN | NodeKind::MODULE)
+        })
+    });
+    let target_relation_is_consistent = match edge.resolved_target {
+        None => edge.effective_target() == edge.target,
+        Some(resolved) => {
+            edge.effective_target() == resolved
+                && resolved != edge.source
+                && resolved != edge.target
+                && nodes.contains_key(&resolved)
+        }
+    };
+    raw_markers_are_local && target_relation_is_consistent
 }
 
 impl ExactEvidenceValidationIndex {
     fn prepare(edges: &[Edge], nodes: &HashMap<NodeId, &Node>) -> Self {
         let mut import_relations = HashMap::<_, ProofRelationState>::new();
         let mut member_relations = HashMap::<_, ProofRelationState>::new();
+        let mut python_import_edges = HashMap::<NodeId, Vec<NodeId>>::new();
         for edge in edges {
             if edge.kind == EdgeKind::IMPORT
                 && let (Some(file_id), Some(target)) = (edge.file_node_id, edge.resolved_target)
@@ -5436,6 +6950,12 @@ impl ExactEvidenceValidationIndex {
                     state.conflicting += 1;
                 }
             }
+            if python_raw_import_marker_is_admissible(edge, nodes) {
+                python_import_edges
+                    .entry(edge.source)
+                    .or_default()
+                    .push(edge.target);
+            }
             if edge.kind == EdgeKind::MEMBER {
                 let owner = nodes.get(&edge.source);
                 let member = nodes.get(&edge.target);
@@ -5454,10 +6974,8 @@ impl ExactEvidenceValidationIndex {
                                         | NodeKind::CLASS
                                         | NodeKind::ENUM
                                 )
-                            ) | (
-                                NodeKind::STRUCT | NodeKind::CLASS | NodeKind::ENUM,
-                                Some(NodeKind::METHOD)
-                            )
+                            ) | (NodeKind::STRUCT | NodeKind::ENUM, Some(NodeKind::METHOD))
+                                | (NodeKind::CLASS, Some(NodeKind::METHOD | NodeKind::FUNCTION))
                         )
                     })
                     && member.is_some_and(|member| {
@@ -5473,9 +6991,53 @@ impl ExactEvidenceValidationIndex {
                 }
             }
         }
+        for targets in python_import_edges.values_mut() {
+            targets.sort();
+            targets.dedup();
+        }
+        let python_import_targets = python_import_edges
+            .values()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut python_import_paths = HashMap::<_, Vec<Vec<NodeId>>>::new();
+        let mut python_import_path_counts = HashMap::<_, usize>::new();
+        for &source in python_import_edges
+            .keys()
+            .filter(|source| !python_import_targets.contains(source))
+        {
+            let Some(file_id) = nodes.get(&source).and_then(|node| node.file_node_id) else {
+                continue;
+            };
+            let mut path = vec![source];
+            let mut visited = HashSet::from([source]);
+            let mut current = source;
+            while let Some([next]) = python_import_edges.get(&current).map(Vec::as_slice) {
+                if !visited.insert(*next) {
+                    break;
+                }
+                path.push(*next);
+                let Some(node) = nodes.get(next) else {
+                    break;
+                };
+                if node.kind == NodeKind::MODULE {
+                    python_import_paths
+                        .entry((file_id, source, node.serialized_name.clone()))
+                        .or_default()
+                        .push(path.clone());
+                    *python_import_path_counts
+                        .entry((file_id, source, path))
+                        .or_default() += 1;
+                    break;
+                }
+                current = *next;
+            }
+        }
         Self {
             import_relations,
             member_relations,
+            python_import_paths,
+            python_import_path_counts,
         }
     }
 
@@ -5489,6 +7051,27 @@ impl ExactEvidenceValidationIndex {
         self.member_relations
             .get(&(owner, member))
             .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn python_import_path(
+        &self,
+        file: NodeId,
+        import: NodeId,
+        module_specifier: &str,
+    ) -> Option<&[NodeId]> {
+        self.python_import_paths
+            .get(&(file, import, module_specifier.to_string()))
+            .and_then(|paths| match paths.as_slice() {
+                [path] => Some(path.as_slice()),
+                _ => None,
+            })
+    }
+
+    fn has_python_import_path(&self, file: NodeId, import: NodeId, components: &[NodeId]) -> bool {
+        self.python_import_path_counts
+            .get(&(file, import, components.to_vec()))
+            .copied()
+            == Some(1)
     }
 
     fn claim_has_literal_corroboration(
@@ -5556,19 +7139,33 @@ impl ExactEvidenceValidationIndex {
                     ResolutionEvidence::QualifiedPath { components },
                 ],
             ) => {
-                *declaration == target
+                let python_relative = claim.input.language == "python"
+                    && components.first() == Some(import)
                     && components.last() == Some(&target)
-                    && components.len() >= 2
                     && nodes.get(import).is_some_and(|import_node| {
-                        import_node.kind == NodeKind::MODULE
+                        import_node.kind == NodeKind::UNKNOWN
                             && import_node.file_node_id == Some(source_file)
                             && graph_leaf_name(&import_node.serialized_name)
                                 == claim.input.callsite.raw_target
                     })
-                    && self.has_import(source_file, *import, target)
-                    && components
-                        .windows(2)
-                        .all(|pair| self.has_member(pair[0], pair[1]))
+                    && components.len() >= 3
+                    && nodes
+                        .get(&components[components.len() - 2])
+                        .is_some_and(|node| node.kind == NodeKind::MODULE);
+                python_relative
+                    || (*declaration == target
+                        && components.last() == Some(&target)
+                        && components.len() >= 2
+                        && nodes.get(import).is_some_and(|import_node| {
+                            import_node.kind == NodeKind::MODULE
+                                && import_node.file_node_id == Some(source_file)
+                                && graph_leaf_name(&import_node.serialized_name)
+                                    == claim.input.callsite.raw_target
+                        })
+                        && self.has_import(source_file, *import, target)
+                        && components
+                            .windows(2)
+                            .all(|pair| self.has_member(pair[0], pair[1])))
             }
             (
                 CalleeForm::ImplicitReceiver,
@@ -5578,7 +7175,11 @@ impl ExactEvidenceValidationIndex {
                 ],
             ) => {
                 let local_shape = *declaration == target
-                    && target_node.kind == NodeKind::METHOD
+                    && if claim.input.language == "python" {
+                        target_node.kind == NodeKind::FUNCTION
+                    } else {
+                        target_node.kind == NodeKind::METHOD
+                    }
                     && nodes.get(owner).is_some_and(|owner_node| {
                         matches!(
                             owner_node.kind,
@@ -5710,19 +7311,17 @@ impl ExactEvidenceValidationIndex {
                     ResolutionEvidence::ExplicitReceiverType { receiver_type },
                     ResolutionEvidence::QualifiedPath { components },
                 ],
-            ) if *owner == *constructor
-                && *owner == *receiver_type
-                && components.as_slice() == [*owner, target] =>
-            {
-                self.imported_receiver_is_correlated(
+            ) if *owner == *constructor && *owner == *receiver_type => self
+                .imported_receiver_is_correlated(
+                    &claim.input.language,
                     source_file,
                     *import,
                     *owner,
                     target,
                     target_node,
+                    components,
                     nodes,
-                )
-            }
+                ),
             (
                 CalleeForm::ExplicitReceiver,
                 [
@@ -5733,15 +7332,16 @@ impl ExactEvidenceValidationIndex {
                     ResolutionEvidence::ExplicitReceiverType { receiver_type },
                     ResolutionEvidence::QualifiedPath { components },
                 ],
-            ) if *owner == *receiver_type && components.as_slice() == [*owner, target] => self
-                .imported_receiver_is_correlated(
-                    source_file,
-                    *import,
-                    *owner,
-                    target,
-                    target_node,
-                    nodes,
-                ),
+            ) if *owner == *receiver_type => self.imported_receiver_is_correlated(
+                &claim.input.language,
+                source_file,
+                *import,
+                *owner,
+                target,
+                target_node,
+                components,
+                nodes,
+            ),
             (
                 CalleeForm::ExplicitReceiver,
                 [
@@ -5755,11 +7355,13 @@ impl ExactEvidenceValidationIndex {
                 ],
             ) if *owner == *constructor && *owner == *receiver_type && *declaration == target => {
                 self.imported_receiver_is_correlated(
+                    &claim.input.language,
                     source_file,
                     *import,
                     *owner,
                     target,
                     target_node,
+                    &[],
                     nodes,
                 )
             }
@@ -5775,11 +7377,13 @@ impl ExactEvidenceValidationIndex {
                 ],
             ) if *owner == *receiver_type && *declaration == target => self
                 .imported_receiver_is_correlated(
+                    &claim.input.language,
                     source_file,
                     *import,
                     *owner,
                     target,
                     target_node,
+                    &[],
                     nodes,
                 ),
             (
@@ -5831,7 +7435,11 @@ impl ExactEvidenceValidationIndex {
         nodes: &HashMap<NodeId, &Node>,
     ) -> bool {
         declaration == target
-            && target_node.kind == NodeKind::METHOD
+            && if language == "python" {
+                target_node.kind == NodeKind::FUNCTION
+            } else {
+                target_node.kind == NodeKind::METHOD
+            }
             && nodes.get(&owner).is_some_and(|owner_node| {
                 matches!(
                     owner_node.kind,
@@ -5846,26 +7454,42 @@ impl ExactEvidenceValidationIndex {
             && self.has_member(owner, target)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn imported_receiver_is_correlated(
         &self,
+        language: &str,
         source_file: NodeId,
         import: NodeId,
         owner: NodeId,
         target: NodeId,
         target_node: &Node,
+        components: &[NodeId],
         nodes: &HashMap<NodeId, &Node>,
     ) -> bool {
-        target_node.kind == NodeKind::METHOD
-            && nodes
-                .get(&import)
-                .is_some_and(|import_node| import_node.file_node_id == Some(source_file))
+        let python_path = language == "python"
+            && components.len() >= 4
+            && components[components.len() - 2] == owner
+            && components.last() == Some(&target)
+            && self.has_python_import_path(
+                source_file,
+                import,
+                &components[..components.len() - 2],
+            );
+        (if language == "python" {
+            target_node.kind == NodeKind::FUNCTION && python_path
+        } else {
+            target_node.kind == NodeKind::METHOD
+                && (components.is_empty() || components == [owner, target])
+        }) && nodes
+            .get(&import)
+            .is_some_and(|import_node| import_node.file_node_id == Some(source_file))
             && nodes.get(&owner).is_some_and(|owner_node| {
                 matches!(
                     owner_node.kind,
                     NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
                 ) && owner_node.file_node_id == target_node.file_node_id
             })
-            && self.has_import(source_file, import, owner)
+            && (python_path || self.has_import(source_file, import, owner))
             && self.has_member(owner, target)
     }
 }
@@ -5873,7 +7497,7 @@ impl ExactEvidenceValidationIndex {
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
         "go" | "rust" => kind == NodeKind::MODULE,
-        "javascript" | "typescript" | "tsx" => {
+        "javascript" | "typescript" | "tsx" | "python" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
         _ => false,
@@ -5889,6 +7513,71 @@ fn enforce_exact_evidence_corroboration(
         .iter_mut()
         .filter(|claim| claim.status == ProofResolutionStatus::Exact)
     {
+        let python_import = match &claim.input.binding {
+            CachedResolutionBinding::StaticImport {
+                import,
+                module_specifier,
+                ..
+            } => Some((*import, module_specifier.as_str())),
+            CachedResolutionBinding::ConstructorBinding {
+                class_binding:
+                    CachedClassBinding::StaticImport {
+                        import,
+                        module_specifier,
+                        ..
+                    },
+                ..
+            }
+            | CachedResolutionBinding::ExplicitReceiverType {
+                class_binding:
+                    CachedClassBinding::StaticImport {
+                        import,
+                        module_specifier,
+                        ..
+                    },
+                ..
+            } => Some((*import, module_specifier.as_str())),
+            _ => None,
+        };
+        if claim.input.language == "python"
+            && let Some((import, module_specifier)) = python_import
+            && let Some(path) = validation.python_import_path(
+                NodeId(claim.input.callsite.file_id.0),
+                import,
+                module_specifier,
+            )
+        {
+            let mut components = path.to_vec();
+            for evidence in &claim.evidence_chain {
+                match evidence {
+                    ResolutionEvidence::StaticImportBinding { declaration, .. }
+                        if components.last() != Some(declaration) =>
+                    {
+                        components.push(*declaration);
+                    }
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type }
+                        if components.last() != Some(receiver_type) =>
+                    {
+                        components.push(*receiver_type);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(target) = claim.target
+                && components.last() != Some(&target)
+            {
+                components.push(target);
+            }
+            if let Some(ResolutionEvidence::QualifiedPath {
+                components: evidence_components,
+            }) = claim
+                .evidence_chain
+                .iter_mut()
+                .find(|evidence| matches!(evidence, ResolutionEvidence::QualifiedPath { .. }))
+            {
+                *evidence_components = components;
+            }
+        }
         if !validation.claim_has_literal_corroboration(claim, nodes) {
             claim.status = ProofResolutionStatus::IncompleteDomain;
             claim.reason = ProofResolutionReason::LookupDomainIncomplete;
@@ -7236,6 +8925,7 @@ fn resolve_syntax_claim(
     records: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
     rust_index: &RustProjectionIndex<'_>,
     go_index: &GoProjectionIndex<'_>,
+    python_index: &PythonProjectionIndex,
     source_record: &ResolutionCacheRecord,
     input: CachedCallResolutionInput,
 ) -> Result<ResolvedSyntaxClaim> {
@@ -7251,7 +8941,12 @@ fn resolve_syntax_claim(
     let mut exact_dependency_files = vec![input.callsite.file_id];
     match &input.binding {
         CachedResolutionBinding::SameFile { declaration } => {
-            let declaration_is_recorded =
+            let declaration_is_recorded = if source_record.file.language == "python" {
+                python_index
+                    .declarations(input.callsite.file_id, &input.callsite.raw_target)
+                    .iter()
+                    .any(|candidate| candidate == declaration)
+            } else {
                 source_record
                     .file
                     .top_level_declarations
@@ -7259,7 +8954,8 @@ fn resolve_syntax_claim(
                     .any(|binding| {
                         binding.name == input.callsite.raw_target
                             && binding.declaration == *declaration
-                    });
+                    })
+            };
             let typescript_script =
                 matches!(source_record.file.language.as_str(), "typescript" | "tsx")
                     && !source_record.file.typescript_module;
@@ -7295,6 +8991,12 @@ fn resolve_syntax_claim(
                             && method.declaration == *declaration
                     })
                     .count()
+            } else if source_record.file.language == "python" {
+                python_index
+                    .methods(input.callsite.file_id, *owner, &input.callsite.raw_target)
+                    .iter()
+                    .filter(|method| **method == *declaration)
+                    .count()
             } else {
                 source_record
                     .file
@@ -7329,61 +9031,130 @@ fn resolve_syntax_claim(
             imported_name,
             is_default,
         } => {
-            let target_resolution =
-                resolve_relative_import(source_record, module_specifier, records)?;
-            let target_record = match target_resolution {
-                RelativeImportResolution::Unique(record) => Some(record),
-                RelativeImportResolution::Missing | RelativeImportResolution::Incomplete => None,
-            };
-            let target_domain_poisoned = target_record.is_some_and(|record| {
-                record.file.export_poison_all
-                    || record
-                        .file
-                        .poisoned_export_names
-                        .iter()
-                        .any(|name| name == imported_name)
-            });
-            let declarations = target_record
-                .filter(|record| record.file.lookup_input_complete && !target_domain_poisoned)
-                .into_iter()
-                .flat_map(|record| record.file.direct_exports.iter())
-                .filter(|export| {
-                    export.is_default == *is_default
-                        && export.exported_name == *imported_name
-                        && export.declaration_kind == CachedDeclarationKind::Callable
-                })
-                .collect::<Vec<_>>();
-            if target_domain_poisoned {
-                status = ProofResolutionStatus::IncompleteDomain;
-                reason = ProofResolutionReason::LookupDomainIncomplete;
-            } else if let [declaration] = declarations.as_slice() {
-                let target_file_id = FileId(
-                    target_record
-                        .expect("one direct export requires a resolved target record")
-                        .file
-                        .file_id
-                        .0,
-                );
-                status = ProofResolutionStatus::Exact;
-                reason = ProofResolutionReason::ExactResolution;
-                target = Some(declaration.declaration);
-                evidence_chain.push(ResolutionEvidence::StaticImportBinding {
-                    import: *import,
-                    declaration: declaration.declaration,
+            if source_record.file.language == "python" {
+                let resolution = resolve_python_relative_import(
+                    source_record,
+                    module_specifier,
+                    records,
+                    python_index,
+                )?;
+                let target_record = match resolution.target {
+                    RelativeImportResolution::Unique(record) => Some(record),
+                    RelativeImportResolution::Missing | RelativeImportResolution::Incomplete => {
+                        None
+                    }
+                };
+                let target_domain_unsupported = target_record.is_some_and(|record| {
+                    record.file.export_poison_all
+                        || record
+                            .file
+                            .poisoned_export_names
+                            .iter()
+                            .any(|name| name == imported_name)
                 });
-                exact_node_file_expectations.push((*import, input.callsite.file_id));
-                exact_node_file_expectations.push((declaration.declaration, target_file_id));
-            } else if matches!(target_resolution, RelativeImportResolution::Incomplete)
-                || target_record.is_some_and(|record| !record.file.lookup_input_complete)
-            {
-                status = ProofResolutionStatus::IncompleteDomain;
-                reason = ProofResolutionReason::LookupDomainIncomplete;
-            } else if declarations.len() > 1 {
-                status = ProofResolutionStatus::Ambiguous;
-                reason = ProofResolutionReason::MultipleBindings;
+                let declarations = target_record
+                    .filter(|record| {
+                        record.file.lookup_input_complete && !target_domain_unsupported
+                    })
+                    .map(|record| {
+                        python_index.declarations(FileId(record.file.file_id.0), imported_name)
+                    })
+                    .unwrap_or_default();
+                if target_domain_unsupported {
+                    status = ProofResolutionStatus::Unsupported;
+                    reason = ProofResolutionReason::UnsupportedConstruct;
+                } else if let [declaration] = declarations {
+                    let target_file_id = FileId(
+                        target_record
+                            .expect("one Python declaration requires a target record")
+                            .file
+                            .file_id
+                            .0,
+                    );
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(*declaration);
+                    evidence_chain.push(ResolutionEvidence::StaticImportBinding {
+                        import: *import,
+                        declaration: *declaration,
+                    });
+                    evidence_chain.push(ResolutionEvidence::QualifiedPath {
+                        components: vec![*import, *declaration],
+                    });
+                    exact_node_file_expectations.push((*import, input.callsite.file_id));
+                    exact_node_file_expectations.push((*declaration, target_file_id));
+                    exact_dependency_files = resolution.dependencies;
+                } else if matches!(resolution.target, RelativeImportResolution::Incomplete)
+                    || target_record.is_some_and(|record| !record.file.lookup_input_complete)
+                {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                } else if declarations.len() > 1 {
+                    status = ProofResolutionStatus::Ambiguous;
+                    reason = ProofResolutionReason::MultipleBindings;
+                } else {
+                    status = ProofResolutionStatus::MissingBinding;
+                    reason = ProofResolutionReason::MissingBinding;
+                }
             } else {
-                status = ProofResolutionStatus::MissingBinding;
-                reason = ProofResolutionReason::MissingBinding;
+                let target_resolution =
+                    resolve_relative_import(source_record, module_specifier, records)?;
+                let target_record = match target_resolution {
+                    RelativeImportResolution::Unique(record) => Some(record),
+                    RelativeImportResolution::Missing | RelativeImportResolution::Incomplete => {
+                        None
+                    }
+                };
+                let target_domain_poisoned = target_record.is_some_and(|record| {
+                    record.file.export_poison_all
+                        || record
+                            .file
+                            .poisoned_export_names
+                            .iter()
+                            .any(|name| name == imported_name)
+                });
+                let declarations = target_record
+                    .filter(|record| record.file.lookup_input_complete && !target_domain_poisoned)
+                    .into_iter()
+                    .flat_map(|record| record.file.direct_exports.iter())
+                    .filter(|export| {
+                        export.is_default == *is_default
+                            && export.exported_name == *imported_name
+                            && export.declaration_kind == CachedDeclarationKind::Callable
+                    })
+                    .collect::<Vec<_>>();
+                if target_domain_poisoned {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                } else if let [declaration] = declarations.as_slice() {
+                    let target_file_id = FileId(
+                        target_record
+                            .expect("one direct export requires a resolved target record")
+                            .file
+                            .file_id
+                            .0,
+                    );
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(declaration.declaration);
+                    evidence_chain.push(ResolutionEvidence::StaticImportBinding {
+                        import: *import,
+                        declaration: declaration.declaration,
+                    });
+                    exact_node_file_expectations.push((*import, input.callsite.file_id));
+                    exact_node_file_expectations.push((declaration.declaration, target_file_id));
+                } else if matches!(target_resolution, RelativeImportResolution::Incomplete)
+                    || target_record.is_some_and(|record| !record.file.lookup_input_complete)
+                {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                } else if declarations.len() > 1 {
+                    status = ProofResolutionStatus::Ambiguous;
+                    reason = ProofResolutionReason::MultipleBindings;
+                } else {
+                    status = ProofResolutionStatus::MissingBinding;
+                    reason = ProofResolutionReason::MissingBinding;
+                }
             }
         }
         CachedResolutionBinding::RustPath {
@@ -7807,13 +9578,23 @@ fn resolve_syntax_claim(
             );
             let (target_record, import, owner) = match class_binding {
                 CachedClassBinding::SameFile { owner, owner_name } => {
-                    let matches = source_record
-                        .file
-                        .classes
-                        .iter()
-                        .filter(|class| class.declaration == *owner && class.name == *owner_name)
-                        .collect::<Vec<_>>();
-                    if matches.len() != 1 {
+                    let match_count = if source_record.file.language == "python" {
+                        python_index
+                            .classes(input.callsite.file_id, owner_name)
+                            .iter()
+                            .filter(|candidate| **candidate == *owner)
+                            .count()
+                    } else {
+                        source_record
+                            .file
+                            .classes
+                            .iter()
+                            .filter(|class| {
+                                class.declaration == *owner && class.name == *owner_name
+                            })
+                            .count()
+                    };
+                    if match_count != 1 {
                         status = ProofResolutionStatus::Ambiguous;
                         reason = ProofResolutionReason::MultipleBindings;
                         return Ok(ResolvedSyntaxClaim {
@@ -7835,48 +9616,69 @@ fn resolve_syntax_claim(
                     imported_name,
                     is_default,
                 } => {
-                    let target_record =
-                        match resolve_relative_import(source_record, module_specifier, records)? {
-                            RelativeImportResolution::Unique(record) => record,
-                            RelativeImportResolution::Missing => {
-                                status = ProofResolutionStatus::MissingBinding;
-                                reason = ProofResolutionReason::MissingBinding;
-                                return Ok(ResolvedSyntaxClaim {
-                                    input,
-                                    caller,
-                                    target,
-                                    status,
-                                    reason,
-                                    evidence_chain,
-                                    exact_node_file_expectations,
-                                    exact_dependency_files,
-                                });
-                            }
-                            RelativeImportResolution::Incomplete => {
-                                status = ProofResolutionStatus::IncompleteDomain;
-                                reason = ProofResolutionReason::LookupDomainIncomplete;
-                                return Ok(ResolvedSyntaxClaim {
-                                    input,
-                                    caller,
-                                    target,
-                                    status,
-                                    reason,
-                                    evidence_chain,
-                                    exact_node_file_expectations,
-                                    exact_dependency_files,
-                                });
-                            }
-                        };
-                    if target_record.file.export_poison_all
+                    let python_resolution = (source_record.file.language == "python")
+                        .then(|| {
+                            resolve_python_relative_import(
+                                source_record,
+                                module_specifier,
+                                records,
+                                python_index,
+                            )
+                        })
+                        .transpose()?;
+                    let target_resolution = if let Some(resolution) = &python_resolution {
+                        resolution.target
+                    } else {
+                        resolve_relative_import(source_record, module_specifier, records)?
+                    };
+                    let target_record = match target_resolution {
+                        RelativeImportResolution::Unique(record) => record,
+                        RelativeImportResolution::Missing => {
+                            status = ProofResolutionStatus::MissingBinding;
+                            reason = ProofResolutionReason::MissingBinding;
+                            return Ok(ResolvedSyntaxClaim {
+                                input,
+                                caller,
+                                target,
+                                status,
+                                reason,
+                                evidence_chain,
+                                exact_node_file_expectations,
+                                exact_dependency_files,
+                            });
+                        }
+                        RelativeImportResolution::Incomplete => {
+                            status = ProofResolutionStatus::IncompleteDomain;
+                            reason = ProofResolutionReason::LookupDomainIncomplete;
+                            return Ok(ResolvedSyntaxClaim {
+                                input,
+                                caller,
+                                target,
+                                status,
+                                reason,
+                                evidence_chain,
+                                exact_node_file_expectations,
+                                exact_dependency_files,
+                            });
+                        }
+                    };
+                    let target_domain_poisoned = target_record.file.export_poison_all
                         || target_record
                             .file
                             .poisoned_export_names
                             .iter()
                             .any(|name| name == imported_name)
-                        || !target_record.file.lookup_input_complete
-                    {
-                        status = ProofResolutionStatus::IncompleteDomain;
-                        reason = ProofResolutionReason::LookupDomainIncomplete;
+                        || !target_record.file.lookup_input_complete;
+                    if target_domain_poisoned {
+                        if source_record.file.language == "python"
+                            && target_record.file.lookup_input_complete
+                        {
+                            status = ProofResolutionStatus::Unsupported;
+                            reason = ProofResolutionReason::UnsupportedConstruct;
+                        } else {
+                            status = ProofResolutionStatus::IncompleteDomain;
+                            reason = ProofResolutionReason::LookupDomainIncomplete;
+                        }
                         return Ok(ResolvedSyntaxClaim {
                             input,
                             caller,
@@ -7888,17 +9690,24 @@ fn resolve_syntax_claim(
                             exact_dependency_files,
                         });
                     }
-                    let owners = target_record
-                        .file
-                        .direct_exports
-                        .iter()
-                        .filter(|export| {
-                            export.is_default == *is_default
-                                && export.exported_name == *imported_name
-                                && export.declaration_kind == CachedDeclarationKind::Class
-                        })
-                        .collect::<Vec<_>>();
-                    let [export] = owners.as_slice() else {
+                    let owners = if source_record.file.language == "python" {
+                        python_index
+                            .classes(FileId(target_record.file.file_id.0), imported_name)
+                            .to_vec()
+                    } else {
+                        target_record
+                            .file
+                            .direct_exports
+                            .iter()
+                            .filter(|export| {
+                                export.is_default == *is_default
+                                    && export.exported_name == *imported_name
+                                    && export.declaration_kind == CachedDeclarationKind::Class
+                            })
+                            .map(|export| export.declaration)
+                            .collect::<Vec<_>>()
+                    };
+                    let [owner] = owners.as_slice() else {
                         status = if owners.is_empty() {
                             ProofResolutionStatus::MissingBinding
                         } else {
@@ -7920,9 +9729,15 @@ fn resolve_syntax_claim(
                             exact_dependency_files,
                         });
                     };
-                    (target_record, Some(*import), export.declaration)
+                    if let Some(resolution) = python_resolution {
+                        exact_dependency_files = resolution.dependencies;
+                    }
+                    (target_record, Some(*import), *owner)
                 }
             };
+            let python_methods = (source_record.file.language == "python").then(|| {
+                python_index.methods(FileId(target_record.file.file_id.0), owner, method_name)
+            });
             let methods = target_record
                 .file
                 .classes
@@ -7931,11 +9746,14 @@ fn resolve_syntax_claim(
                 .flat_map(|class| class.methods.iter())
                 .filter(|method| method.name == *method_name)
                 .collect::<Vec<_>>();
-            if let [method] = methods.as_slice() {
+            let method_declarations = python_methods
+                .map(|methods| methods.to_vec())
+                .unwrap_or_else(|| methods.iter().map(|method| method.declaration).collect());
+            if let [method] = method_declarations.as_slice() {
                 let target_file_id = FileId(target_record.file.file_id.0);
                 status = ProofResolutionStatus::Exact;
                 reason = ProofResolutionReason::ExactResolution;
-                target = Some(method.declaration);
+                target = Some(*method);
                 if let Some(import) = import {
                     evidence_chain.push(ResolutionEvidence::StaticImportBinding {
                         import,
@@ -7950,18 +9768,24 @@ fn resolve_syntax_claim(
                 evidence_chain.push(ResolutionEvidence::ExplicitReceiverType {
                     receiver_type: owner,
                 });
-                evidence_chain.push(ResolutionEvidence::SameFileDeclaration {
-                    declaration: method.declaration,
-                });
+                if import.is_some() && source_record.file.language == "python" {
+                    evidence_chain.push(ResolutionEvidence::QualifiedPath {
+                        components: vec![owner, *method],
+                    });
+                } else {
+                    evidence_chain.push(ResolutionEvidence::SameFileDeclaration {
+                        declaration: *method,
+                    });
+                }
                 exact_node_file_expectations.push((owner, target_file_id));
-                exact_node_file_expectations.push((method.declaration, target_file_id));
+                exact_node_file_expectations.push((*method, target_file_id));
             } else {
-                status = if methods.is_empty() {
+                status = if method_declarations.is_empty() {
                     ProofResolutionStatus::MissingBinding
                 } else {
                     ProofResolutionStatus::Ambiguous
                 };
-                reason = if methods.is_empty() {
+                reason = if method_declarations.is_empty() {
                     ProofResolutionReason::MissingBinding
                 } else {
                     ProofResolutionReason::MultipleBindings
@@ -8522,6 +10346,212 @@ mod go_complexity_tests {
         assert!(
             combined <= baseline * 2 + 256,
             "combined Go package/call work grew superlinearly: {baseline} -> {combined}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod python_complexity_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn python_record(path: PathBuf, file_id: i64) -> ResolutionCacheRecord {
+        ResolutionCacheRecord {
+            path,
+            file: CachedResolutionFile {
+                file_id: NodeId(file_id),
+                source_sha256: "0".repeat(64),
+                language: "python".to_owned(),
+                adapter_version: ADAPTER_VERSION.to_owned(),
+                parser_fingerprint: "parser".to_owned(),
+                complete: true,
+                lookup_input_complete: true,
+                typescript_module: false,
+                top_level_declarations: vec![CachedTopLevelDeclaration {
+                    name: "target".to_owned(),
+                    declaration: NodeId(10_000 + file_id),
+                    module_path: Vec::new(),
+                    cross_module_visible: false,
+                }],
+                inherent_methods: Vec::new(),
+                classes: vec![CachedClassDeclaration {
+                    name: "Worker".to_owned(),
+                    declaration: NodeId(20_000 + file_id),
+                    methods: vec![CachedClassMethod {
+                        name: "run".to_owned(),
+                        declaration: NodeId(30_000 + file_id),
+                    }],
+                }],
+                direct_exports: Vec::new(),
+                export_poison_all: false,
+                poisoned_export_names: Vec::new(),
+                rust_modules: Vec::new(),
+                rust_types: Vec::new(),
+                rust_uses: Vec::new(),
+                go_package: None,
+            },
+            calls: Vec::new(),
+        }
+    }
+
+    fn measured_source_work(call_count: usize) -> usize {
+        let mut source = String::from(
+            "class Worker:\n    def run(self):\n        pass\n\ndef target():\n    pass\n\ndef caller():\n",
+        );
+        for index in 0..call_count {
+            source.push_str(&format!(
+                "    worker_{index} = Worker()\n    worker_{index}.run()\n    target()\n"
+            ));
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .expect("Python grammar must load");
+        let tree = parser.parse(&source, None).expect("source must parse");
+        reset_python_resolution_work();
+        let _ = PythonResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+        python_resolution_work()
+    }
+
+    fn measured_projection_work(file_count: usize, lookup_count: usize) -> usize {
+        let temp = tempfile::tempdir().expect("Python projection tempdir");
+        let package = temp.path().join("proof");
+        std::fs::create_dir(&package).expect("create Python package");
+        let mut records = Vec::new();
+        for index in 0..file_count {
+            let name = if index == 0 {
+                "__init__.py".to_owned()
+            } else {
+                format!("module_{index}.py")
+            };
+            let path = package.join(name);
+            std::fs::write(&path, "def target():\n    pass\n").expect("write Python source");
+            records.push(python_record(path, index as i64 + 1));
+        }
+        let source = &records[0];
+        let records_by_path = records
+            .iter()
+            .map(|record| {
+                (
+                    workspace_path_identity(&record.path).expect("Python file identity"),
+                    record,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        reset_python_resolution_work();
+        let index = PythonProjectionIndex::prepare(&records, &records_by_path)
+            .expect("Python projection index");
+        for _ in 0..lookup_count {
+            let resolution =
+                resolve_python_relative_import(source, ".module_1", &records_by_path, &index)
+                    .expect("relative import resolution");
+            assert!(matches!(
+                resolution.target,
+                RelativeImportResolution::Unique(_)
+            ));
+            let _ = index.declarations(FileId(2), "target");
+            let owners = index.classes(FileId(2), "Worker");
+            assert_eq!(owners.len(), 1);
+            let _ = index.methods(FileId(2), owners[0], "run");
+        }
+        python_resolution_work()
+    }
+
+    #[test]
+    fn python_source_index_work_is_counted_and_linear() {
+        let small = measured_source_work(64);
+        let large = measured_source_work(128);
+        assert!(small > 0, "Python source work was not counted");
+        assert!(
+            large <= small * 2 + 256,
+            "Python source work grew superlinearly: {small} -> {large}"
+        );
+    }
+
+    #[test]
+    fn python_package_projection_preparation_and_lookups_are_independently_linear() {
+        let baseline = measured_projection_work(32, 32);
+        let more_files = measured_projection_work(64, 32);
+        let more_calls = measured_projection_work(32, 64);
+        let combined = measured_projection_work(64, 64);
+        assert!(
+            baseline >= 64,
+            "Python projection work was not counted: {baseline}"
+        );
+        assert!(
+            more_files <= baseline * 2 + 64,
+            "Python package preparation grew superlinearly: {baseline} -> {more_files}"
+        );
+        assert!(
+            more_calls <= baseline * 2 + 64,
+            "Python projection lookup grew superlinearly: {baseline} -> {more_calls}"
+        );
+        assert!(
+            combined <= baseline * 2 + 128,
+            "combined Python package/lookup work grew superlinearly: {baseline} -> {combined}"
+        );
+    }
+
+    fn measured_hostile_cache_lookup_work(file_count: usize, lookup_count: usize) -> usize {
+        let temp = tempfile::tempdir().expect("hostile cache tempdir");
+        let files = (0..file_count)
+            .map(|index| {
+                let path = temp.path().join(format!("pkg_{index}/module.py"));
+                std::fs::create_dir_all(path.parent().expect("cache parent"))
+                    .expect("create cache parent");
+                std::fs::write(&path, "def target():\n    pass\n").expect("write cache source");
+                codestory_store::FileInfo {
+                    id: index as i64 + 1,
+                    path,
+                    language: "python".to_owned(),
+                    modification_time: 0,
+                    indexed: true,
+                    complete: true,
+                    line_count: 2,
+                    file_role: codestory_store::FileRole::Source,
+                }
+            })
+            .collect::<Vec<_>>();
+        let governed = files.iter().collect::<Vec<_>>();
+        let identities = files
+            .iter()
+            .map(|file| {
+                (
+                    file.id,
+                    workspace_path_identity(&file.path).expect("cache identity"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        reset_python_resolution_work();
+        let prepared = PreparedGovernedCachePaths::prepare(&governed, &identities);
+        for index in 0..lookup_count {
+            assert!(
+                prepared
+                    .contains(Path::new(&format!("pkg_{}/module.py", index % file_count)))
+                    .expect("hostile cache lookup")
+            );
+        }
+        python_resolution_work()
+    }
+
+    #[test]
+    fn hostile_cache_preparation_and_lookup_work_are_independently_linear() {
+        let baseline = measured_hostile_cache_lookup_work(32, 32);
+        let more_files = measured_hostile_cache_lookup_work(64, 32);
+        let more_lookups = measured_hostile_cache_lookup_work(32, 64);
+        let combined = measured_hostile_cache_lookup_work(64, 64);
+        assert!(baseline > 0, "hostile cache work was not counted");
+        assert!(
+            more_files <= baseline * 2 + 64,
+            "cache files: {baseline} -> {more_files}"
+        );
+        assert!(
+            more_lookups <= baseline * 2 + 64,
+            "cache lookups: {baseline} -> {more_lookups}"
+        );
+        assert!(
+            combined <= baseline * 2 + 128,
+            "cache combined: {baseline} -> {combined}"
         );
     }
 }

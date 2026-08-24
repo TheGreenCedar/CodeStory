@@ -1664,6 +1664,108 @@ fn publication_digest_authenticates_roster_and_funnel() {
 }
 
 #[test]
+fn stored_proof_json_requires_exact_typed_canonical_bytes() {
+    fn serialize_with_object_key_order(value: &serde_json::Value, reverse: bool) -> String {
+        match value {
+            serde_json::Value::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(|value| serialize_with_object_key_order(value, reverse))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            serde_json::Value::Object(fields) => {
+                let mut fields = fields.iter().collect::<Vec<_>>();
+                if reverse {
+                    fields.reverse();
+                }
+                format!(
+                    "{{{}}}",
+                    fields
+                        .into_iter()
+                        .map(|(key, value)| format!(
+                            "{}:{}",
+                            serde_json::to_string(key).unwrap(),
+                            serialize_with_object_key_order(value, reverse)
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            }
+            _ => serde_json::to_string(value).unwrap(),
+        }
+    }
+
+    for mutation in ["whitespace", "key_order"] {
+        for (table, column, reader) in [
+            ("proof_resolution_fact", "evidence_json", "facts"),
+            ("proof_resolution_fact", "dependency_json", "facts"),
+            (
+                "proof_resolution_publication",
+                "adapter_roster_json",
+                "publication",
+            ),
+            ("proof_resolution_publication", "funnel_json", "publication"),
+        ] {
+            let mut store = Store::new_in_memory().unwrap();
+            if column == "evidence_json" && mutation == "key_order" {
+                seed_imported_receiver_graph(&mut store);
+                store
+                    .replace_proof_resolution_projection(
+                        &publication(),
+                        &receiver_projection(imported_receiver_fact(false)),
+                    )
+                    .unwrap();
+            } else {
+                seed_exact_graph(&mut store);
+                store
+                    .replace_proof_resolution_projection(
+                        &publication(),
+                        &projection(vec![exact_fact(EdgeId(7))]),
+                    )
+                    .unwrap();
+            }
+            let stored = store
+                .get_connection()
+                .query_row(&format!("SELECT {column} FROM {table}"), [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .unwrap();
+            let hostile = if mutation == "whitespace" {
+                format!(" {stored}")
+            } else {
+                let parsed = serde_json::from_str(&stored).expect("stored JSON");
+                let forward = serialize_with_object_key_order(&parsed, false);
+                if forward != stored {
+                    forward
+                } else {
+                    serialize_with_object_key_order(&parsed, true)
+                }
+            };
+            assert_ne!(hostile, stored, "{column} {mutation} fixture");
+            store
+                .get_connection()
+                .execute(&format!("UPDATE {table} SET {column} = ?1"), [hostile])
+                .unwrap();
+            let error = if reader == "facts" {
+                store
+                    .get_proof_resolution_facts()
+                    .expect_err("noncanonical fact JSON must reject")
+            } else {
+                store
+                    .get_proof_resolution_publication()
+                    .expect_err("noncanonical publication JSON must reject")
+            };
+            assert!(
+                error.to_string().contains("canonical"),
+                "{column} {mutation}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
 fn failed_replacement_and_stale_validation_preserve_the_previous_complete_publication() {
     let mut store = Store::new_in_memory().unwrap();
     seed_exact_graph(&mut store);

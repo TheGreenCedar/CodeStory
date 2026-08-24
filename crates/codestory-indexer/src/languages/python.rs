@@ -50,10 +50,10 @@ use crate::{
     ManualMemberEdgeSpec, ManualReceiverCallSpec, ManualReceiverSource,
     OptionalReceiverOwnerBinding, ReceiverCallSiteKey, collect_colon_parameter_types,
     collect_receiver_call_specs_in_callable, declaration_name, enclosing_node_with_kind,
-    first_descendant_with_kind, member_call_method_col, node_source_text, normalize_parameter_name,
+    member_call_method_col, node_source_text, normalize_parameter_name,
     normalized_receiver_variable, parameter_name_before_colon, receiver_call_belongs_to_callable,
     receiver_callsite_key, same_ts_span, signature_parameter_surface, split_top_level_parameters,
-    surface_member_call, trimmed_node_text, ts_node_graph_span, walk_tree_nodes,
+    trimmed_node_text, ts_node_graph_span, walk_tree_nodes,
 };
 
 /// Callsite marker written onto edges produced from Python attribute-call
@@ -1012,7 +1012,7 @@ fn python_property_constructor_receiver_owner(
     let owner_name = node
         .child_by_field_name("right")
         .and_then(|right_node| python_direct_constructor_call_type(right_node, source))?;
-    if python_visible_local_type_name(method, node, &owner_name, source) {
+    if let Some(owner_name) = python_visible_local_type_name(method, node, &owner_name, source) {
         return Some((owner_name, None));
     }
     if python_callable_has_local_binding_name(method, &owner_name, source) {
@@ -1131,10 +1131,14 @@ fn python_constructor_receiver_owner(
     source: &str,
     imported_type_bindings: &HashMap<String, ImportedTypeBinding>,
 ) -> OptionalReceiverOwnerBinding {
-    let owner_name = node
-        .child_by_field_name("right")
-        .and_then(|right_node| python_direct_constructor_call_type(right_node, source))?;
-    if python_visible_local_type_name(callable, node, &owner_name, source) {
+    let owner_name = match node.child_by_field_name("right") {
+        Some(right) => python_direct_constructor_call_type(right, source)?,
+        None => node
+            .child_by_field_name("type")
+            .and_then(|annotation| trimmed_node_text(annotation, source))
+            .and_then(|name| normalize_parameter_name(&name))?,
+    };
+    if let Some(owner_name) = python_visible_local_type_name(callable, node, &owner_name, source) {
         return Some((owner_name, None));
     }
     if python_callable_has_local_binding_name(callable, &owner_name, source) {
@@ -1169,10 +1173,10 @@ fn python_visible_local_type_name(
     before_node: TsNode<'_>,
     owner_name: &str,
     source: &str,
-) -> bool {
-    let mut found = false;
+) -> Option<String> {
+    let mut found = None;
     walk_tree_nodes(callable, &mut |node| {
-        if found
+        if found.is_some()
             || node.kind() != "class_definition"
             || !receiver_call_belongs_to_callable(node, callable)
             || node.end_byte() > before_node.start_byte()
@@ -1180,7 +1184,8 @@ fn python_visible_local_type_name(
             return;
         }
         if declaration_name(node, source).as_deref() == Some(owner_name) {
-            found = true;
+            found = declaration_name(callable, source)
+                .map(|callable_name| format!("{callable_name}.{owner_name}"));
         }
     });
     found
@@ -1674,12 +1679,16 @@ fn python_attribute_call_nodes<'tree>(
     if node.kind() != "call" {
         return None;
     }
-    let function = node.child_by_field_name("function")?;
-    let attribute = if function.kind() == "attribute" {
-        function
-    } else {
-        first_descendant_with_kind(function, "attribute")?
-    };
+    let mut function = node.child_by_field_name("function")?;
+    while function.kind() == "parenthesized_expression" {
+        let mut cursor = function.walk();
+        let children = function.named_children(&mut cursor).collect::<Vec<_>>();
+        let [child] = children.as_slice() else {
+            return None;
+        };
+        function = *child;
+    }
+    let attribute = (function.kind() == "attribute").then_some(function)?;
     Some((
         attribute.child_by_field_name("object")?,
         attribute.child_by_field_name("attribute")?,
@@ -1699,14 +1708,9 @@ pub(crate) fn attribute_method_col(
 }
 
 fn member_call(node: TsNode<'_>, source: &str) -> Option<(String, String)> {
-    if node.kind() != "call" {
-        return None;
-    }
-    if let Some((receiver, method)) = python_attribute_call_nodes(node) {
-        return Some((
-            normalized_receiver_variable(receiver, source)?,
-            trimmed_node_text(method, source)?,
-        ));
-    }
-    surface_member_call(node, source)
+    let (receiver, method) = python_attribute_call_nodes(node)?;
+    Some((
+        normalized_receiver_variable(receiver, source)?,
+        trimmed_node_text(method, source)?,
+    ))
 }
