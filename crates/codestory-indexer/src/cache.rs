@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 // Versioned with proof-input semantics so older parser artifacts fail closed.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 18;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 19;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -108,6 +108,22 @@ pub(crate) enum CachedResolutionBinding {
         owner_name: String,
         method_name: String,
         import: NodeId,
+        constructor: bool,
+    },
+    JavaKotlinPackageFunction {
+        package_name: String,
+        name: String,
+    },
+    JavaKotlinImportedFunction {
+        package_name: String,
+        owner_name: Option<String>,
+        name: String,
+        import: NodeId,
+    },
+    JavaKotlinPackageReceiver {
+        package_name: String,
+        owner_name: String,
+        method_name: String,
         constructor: bool,
     },
     Ambiguous,
@@ -297,7 +313,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 17,
+            resolution_input_schema_version: 18,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

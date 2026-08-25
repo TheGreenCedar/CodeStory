@@ -265,6 +265,8 @@ struct ProofResolutionValidationContext {
     python_import_paths: HashMap<(NodeId, NodeId), Vec<Vec<NodeId>>>,
     python_file_ids_by_path: HashMap<PathBuf, Vec<FileId>>,
     python_attestation_error_by_file: HashMap<i64, String>,
+    java_package_identity_by_file: HashMap<i64, String>,
+    java_dependency_ids_by_package: HashMap<String, BTreeSet<FileId>>,
     go_package_identity_by_file: HashMap<i64, GoPackageIdentity>,
     go_dependency_ids_by_package: HashMap<GoPackageIdentity, BTreeSet<FileId>>,
     go_attestation_error_by_file: HashMap<i64, String>,
@@ -508,6 +510,111 @@ fn stored_go_package_dependency_ids(
         }
     }
     Ok(stored_fact_ids.clone())
+}
+
+fn prepare_java_package_closure(
+    file_by_id: &HashMap<i64, FileInfo>,
+    node_by_id: &HashMap<NodeId, Node>,
+) -> (HashMap<i64, String>, HashMap<String, BTreeSet<FileId>>) {
+    let class_qualified_names = node_by_id
+        .values()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+            ) && node.file_node_id.is_some_and(|file| {
+                file_by_id
+                    .get(&file.0)
+                    .is_some_and(|file| file.language == "java")
+            })
+        })
+        .filter_map(|node| node.qualified_name.clone())
+        .collect::<HashSet<_>>();
+    let mut packages_by_file = HashMap::<i64, BTreeSet<String>>::new();
+    for node in node_by_id.values().filter(|node| {
+        matches!(
+            node.kind,
+            NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
+        ) && node.file_node_id.is_some_and(|file| {
+            file_by_id
+                .get(&file.0)
+                .is_some_and(|file| file.language == "java")
+        })
+    }) {
+        count_store_replay_work(1);
+        let Some(file_id) = node.file_node_id else {
+            continue;
+        };
+        let Some((parent, _)) = node
+            .qualified_name
+            .as_deref()
+            .and_then(|qualified| qualified.rsplit_once('.'))
+        else {
+            continue;
+        };
+        if parent.is_empty() || class_qualified_names.contains(parent) {
+            continue;
+        }
+        packages_by_file
+            .entry(file_id.0)
+            .or_default()
+            .insert(parent.to_owned());
+    }
+    let mut package_identity_by_file = HashMap::new();
+    let mut dependency_ids_by_package = HashMap::<String, BTreeSet<FileId>>::new();
+    for (file_id, packages) in packages_by_file {
+        count_store_replay_work(1);
+        if packages.len() != 1 {
+            continue;
+        }
+        let package = packages.into_iter().next().expect("one Java package");
+        package_identity_by_file.insert(file_id, package.clone());
+        dependency_ids_by_package
+            .entry(package.clone())
+            .or_default()
+            .insert(FileId(file_id));
+    }
+    (package_identity_by_file, dependency_ids_by_package)
+}
+
+fn java_same_package_dependency_ids(
+    fact: &CallResolutionFact,
+    required_evidence_ids: &BTreeSet<FileId>,
+    context: &ProofResolutionValidationContext,
+) -> Result<Option<BTreeSet<FileId>>, StorageError> {
+    if fact.provenance.language_adapter != "java"
+        || fact.callsite.callee_form != CalleeForm::ExplicitReceiver
+    {
+        return Ok(None);
+    }
+    let owner = match fact.evidence_chain.as_slice() {
+        [
+            ResolutionEvidence::ConstructorBinding { constructor },
+            ResolutionEvidence::ExplicitReceiverType { receiver_type },
+            ResolutionEvidence::SamePackageDeclaration { .. },
+        ] if constructor == receiver_type => *constructor,
+        [
+            ResolutionEvidence::ExplicitReceiverType { receiver_type },
+            ResolutionEvidence::SamePackageDeclaration { .. },
+        ] => *receiver_type,
+        _ => return Ok(None),
+    };
+    let package = Storage::validate_java_package_receiver(
+        context,
+        fact,
+        owner,
+        fact.target.expect("Exact Java fact has a target"),
+    )?;
+    let expected = context
+        .java_dependency_ids_by_package
+        .get(&package)
+        .ok_or_else(|| proof_error("Java authenticated package closure is missing"))?;
+    if !required_evidence_ids.is_subset(expected) {
+        return Err(proof_error(
+            "Java package dependency closure omits source or typed evidence files",
+        ));
+    }
+    Ok(Some(expected.clone()))
 }
 
 fn python_dependency_ids(
@@ -1137,6 +1244,8 @@ mod go_replay_complexity_tests {
             python_import_paths: HashMap::new(),
             python_file_ids_by_path: HashMap::new(),
             python_attestation_error_by_file: HashMap::new(),
+            java_package_identity_by_file: HashMap::new(),
+            java_dependency_ids_by_package: HashMap::new(),
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
@@ -1301,6 +1410,8 @@ mod python_replay_complexity_tests {
             python_import_paths: HashMap::new(),
             python_file_ids_by_path,
             python_attestation_error_by_file,
+            java_package_identity_by_file: HashMap::new(),
+            java_dependency_ids_by_package: HashMap::new(),
             go_package_identity_by_file: HashMap::new(),
             go_dependency_ids_by_package: HashMap::new(),
             go_attestation_error_by_file: HashMap::new(),
@@ -1448,6 +1559,8 @@ impl ProofResolutionValidationContext {
             .into_iter()
             .map(|node| (node.id, node))
             .collect();
+        let (java_package_identity_by_file, java_dependency_ids_by_package) =
+            prepare_java_package_closure(&file_by_id, &node_by_id);
         let edges = storage.get_edges()?;
         let (ordinary_call_edge_indices, parsed_callsite_identity_by_edge) =
             prepare_call_edge_correlation_index(&edges, &node_by_id);
@@ -1600,6 +1713,8 @@ impl ProofResolutionValidationContext {
             python_import_paths,
             python_file_ids_by_path,
             python_attestation_error_by_file,
+            java_package_identity_by_file,
+            java_dependency_ids_by_package,
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
@@ -2017,6 +2132,12 @@ impl Storage {
         }
         let observed_dependency_ids = dependency_file_ids(fact);
         if fact.status == ProofResolutionStatus::Exact
+            && let Some(java_dependencies) =
+                java_same_package_dependency_ids(fact, &required_dependency_ids, context)?
+        {
+            required_dependency_ids = java_dependencies;
+        }
+        if fact.status == ProofResolutionStatus::Exact
             && fact.provenance.language_adapter == "python"
         {
             required_dependency_ids = python_dependency_ids(
@@ -2177,12 +2298,14 @@ impl Storage {
             (
                 CalleeForm::Identifier,
                 [ResolutionEvidence::SamePackageDeclaration { declaration }],
-            ) if fact.provenance.language_adapter == "go" && *declaration == target => {
+            ) if matches!(fact.provenance.language_adapter.as_str(), "go" | "kotlin")
+                && *declaration == target =>
+            {
                 if target_node.file_node_id.is_none()
                     || target_node.file_node_id == Some(NodeId(fact.callsite.file_id.0))
                 {
                     return Err(proof_error(
-                        "SamePackageDeclaration is not an exact cross-file Go target",
+                        "SamePackageDeclaration is not an exact cross-file package target",
                     ));
                 }
             }
@@ -2207,6 +2330,12 @@ impl Storage {
                         typescript_directory_import_target_is_authenticated(
                             context, fact, *import, target,
                         )
+                    } else if matches!(fact.provenance.language_adapter.as_str(), "java" | "kotlin")
+                    {
+                        target_node
+                            .qualified_name
+                            .as_deref()
+                            .is_some_and(|name| name.ends_with(&fact.callsite.raw_target))
                     } else {
                         context.has_import(NodeId(fact.callsite.file_id.0), *import, target)
                     })
@@ -2467,17 +2596,21 @@ impl Storage {
                     ResolutionEvidence::ExplicitReceiverType { receiver_type },
                     ResolutionEvidence::SamePackageDeclaration { declaration },
                 ],
-            ) if fact.provenance.language_adapter == "go"
+            ) if matches!(fact.provenance.language_adapter.as_str(), "go" | "java")
                 && *constructor == *receiver_type
                 && *declaration == target =>
             {
-                Self::validate_go_package_receiver(
-                    context,
-                    fact.callsite.file_id,
-                    *constructor,
-                    target,
-                    target_node,
-                )?;
+                if fact.provenance.language_adapter == "go" {
+                    Self::validate_go_package_receiver(
+                        context,
+                        fact.callsite.file_id,
+                        *constructor,
+                        target,
+                        target_node,
+                    )?;
+                } else {
+                    Self::validate_java_package_receiver(context, fact, *constructor, target)?;
+                }
             }
             (
                 CalleeForm::ExplicitReceiver,
@@ -2485,14 +2618,20 @@ impl Storage {
                     ResolutionEvidence::ExplicitReceiverType { receiver_type },
                     ResolutionEvidence::SamePackageDeclaration { declaration },
                 ],
-            ) if fact.provenance.language_adapter == "go" && *declaration == target => {
-                Self::validate_go_package_receiver(
-                    context,
-                    fact.callsite.file_id,
-                    *receiver_type,
-                    target,
-                    target_node,
-                )?;
+            ) if matches!(fact.provenance.language_adapter.as_str(), "go" | "java")
+                && *declaration == target =>
+            {
+                if fact.provenance.language_adapter == "go" {
+                    Self::validate_go_package_receiver(
+                        context,
+                        fact.callsite.file_id,
+                        *receiver_type,
+                        target,
+                        target_node,
+                    )?;
+                } else {
+                    Self::validate_java_package_receiver(context, fact, *receiver_type, target)?;
+                }
             }
             (
                 CalleeForm::ExplicitReceiver,
@@ -2694,7 +2833,7 @@ impl Storage {
             .node_by_id
             .get(&owner)
             .ok_or_else(|| proof_error("Go receiver owner is missing"))?;
-        if owner_node.kind != NodeKind::STRUCT
+        if !matches!(owner_node.kind, NodeKind::STRUCT | NodeKind::CLASS)
             || owner_node.file_node_id.is_none()
             || target_node.file_node_id.is_none()
             || target_node.file_node_id == Some(NodeId(source_file.0))
@@ -2705,6 +2844,77 @@ impl Storage {
             ));
         }
         Ok(())
+    }
+
+    fn validate_java_package_receiver(
+        context: &ProofResolutionValidationContext,
+        fact: &CallResolutionFact,
+        owner: NodeId,
+        target: NodeId,
+    ) -> Result<String, StorageError> {
+        let source_file = fact.callsite.file_id;
+        let owner_node = context
+            .node_by_id
+            .get(&owner)
+            .ok_or_else(|| proof_error("Java same-package receiver owner is missing"))?;
+        let target_node = context
+            .node_by_id
+            .get(&target)
+            .ok_or_else(|| proof_error("Java same-package receiver target is missing"))?;
+        let caller_node = context
+            .node_by_id
+            .get(&fact.caller)
+            .ok_or_else(|| proof_error("Java same-package receiver caller is missing"))?;
+        let owner_file = owner_node
+            .file_node_id
+            .ok_or_else(|| proof_error("Java same-package receiver owner has no source file"))?;
+        let target_file = target_node
+            .file_node_id
+            .ok_or_else(|| proof_error("Java same-package receiver target has no source file"))?;
+        let source_package = context
+            .java_package_identity_by_file
+            .get(&source_file.0)
+            .ok_or_else(|| proof_error("Java proof source has no unique package identity"))?;
+        let target_package = context
+            .java_package_identity_by_file
+            .get(&target_file.0)
+            .ok_or_else(|| proof_error("Java receiver target has no unique package identity"))?;
+        let owner_qualified = owner_node
+            .qualified_name
+            .as_deref()
+            .ok_or_else(|| proof_error("Java receiver owner has no qualified identity"))?;
+        let target_owner_qualified = target_node
+            .qualified_name
+            .as_deref()
+            .and_then(|qualified| qualified.rsplit_once('.'))
+            .map(|(owner, _)| owner);
+        let caller_package_prefix = format!("{source_package}.");
+        if owner_node.kind != NodeKind::CLASS
+            || target_node.kind != NodeKind::METHOD
+            || caller_node.kind != NodeKind::METHOD
+            || caller_node.file_node_id != Some(NodeId(source_file.0))
+            || owner_file == NodeId(source_file.0)
+            || owner_file != target_file
+            || source_package != target_package
+            || owner_qualified
+                .strip_prefix(&caller_package_prefix)
+                .is_none_or(|owner_name| owner_name.is_empty() || owner_name.contains('.'))
+            || target_owner_qualified != Some(owner_qualified)
+            || caller_node
+                .qualified_name
+                .as_deref()
+                .is_none_or(|qualified| {
+                    qualified
+                        .strip_prefix(&caller_package_prefix)
+                        .is_none_or(|relative| !relative.contains('.'))
+                })
+            || !context.has_member(owner, target)
+        {
+            return Err(proof_error(
+                "Java same-package receiver does not name one authenticated package owner/member",
+            ));
+        }
+        Ok(source_package.clone())
     }
 
     pub fn replace_proof_resolution_projection(

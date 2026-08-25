@@ -922,6 +922,168 @@ fn java_and_kotlin_exact_facts_reject_resealed_raw_call_mutation() -> anyhow::Re
 }
 
 #[test]
+fn java_and_kotlin_cross_file_package_and_import_receipts_are_exact() -> anyhow::Result<()> {
+    for (language, files, target) in [
+        (
+            "java",
+            vec![
+                (
+                    "api/Lib.java",
+                    "package api; public class Lib { public static void target() {} }\n",
+                ),
+                (
+                    "app/Caller.java",
+                    "package app;\nimport static api.Lib.target;\nclass Caller {\n  void caller() { target(); }\n}\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            "kotlin",
+            vec![
+                ("api/target.kt", "package api\nfun target() {}\n"),
+                (
+                    "client/caller.kt",
+                    "package client\nimport api.target\nfun caller() { target() }\n",
+                ),
+            ],
+            "target",
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let exact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+            })
+            .expect("cross-file fact");
+        assert_eq!(exact.status, ProofResolutionStatus::Exact, "{exact:#?}");
+        assert!(
+            exact.provenance.dependency_file_hashes.len() >= 2,
+            "{exact:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn java_same_package_receiver_receipt_replays_and_rejects_domain_mutations() -> anyhow::Result<()> {
+    for mutation in ["none", "package", "member", "source"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    "p/Lib.java",
+                    "package p; public class Lib { public static void target() {} }\n",
+                ),
+                (
+                    "p/Caller.java",
+                    "package p; class Caller { void caller() { Lib.target(); } }\n",
+                ),
+            ],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == "java" && fact.callsite.raw_target == "target"
+            })
+            .expect("two-file Java same-package receiver fact");
+        assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+        assert_eq!(
+            fact.provenance.dependency_file_hashes.len(),
+            2,
+            "the complete package domain must be bound: {fact:#?}"
+        );
+
+        let owner = fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::ExplicitReceiverType { receiver_type } => Some(*receiver_type),
+                _ => None,
+            })
+            .expect("same-package receiver owner");
+        let target = fact.target.expect("same-package target");
+        match mutation {
+            "none" => {
+                store.validate_proof_resolution_publication(&publication(1))?;
+                continue;
+            }
+            "package" => {
+                store.get_connection().execute(
+                    "UPDATE node SET qualified_name = CASE id WHEN ?1 THEN 'q.Lib' ELSE 'q.Lib.target' END WHERE id IN (?1, ?2)",
+                    [owner.0, target.0],
+                )?;
+            }
+            "member" => {
+                let member = store
+                    .get_edges()?
+                    .into_iter()
+                    .find(|edge| {
+                        edge.kind == EdgeKind::MEMBER
+                            && edge.effective_source() == owner
+                            && edge.effective_target() == target
+                    })
+                    .expect("unique Lib.target MEMBER relation");
+                store
+                    .get_connection()
+                    .execute("DELETE FROM edge WHERE id = ?1", [member.id.0])?;
+            }
+            "source" => {
+                store.get_connection().execute(
+                    "UPDATE file SET complete = 0 WHERE id = ?1",
+                    [fact.callsite.file_id.0],
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        let error = store
+            .validate_proof_resolution_publication(&publication(1))
+            .expect_err("mutated Java same-package evidence must fail replay");
+        assert!(!error.to_string().is_empty(), "{mutation}");
+    }
+    Ok(())
+}
+
+#[test]
+fn kotlin_parameter_shadow_never_proves_package_or_import_target() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("api/target.kt", "package api\nfun target() {}\n"),
+            (
+                "client/caller.kt",
+                "package client\nimport api.target\nfun caller(target: () -> Unit) { target() }\n",
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "kotlin" && fact.callsite.raw_target == "target"
+        })
+        .expect("shadowed Kotlin call fact");
+    assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty());
+    Ok(())
+}
+
+#[test]
 fn python_closed_exact_subset_authorizes_s1_through_s4() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
@@ -7727,7 +7889,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v17", "adapter", "language"]
+            ["stale", "schema-v18", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -8154,7 +8316,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
                 .iter()
                 .find(|adapter| adapter.language == language)
                 .map(|adapter| adapter.adapter_version.as_str()),
-            Some("reference-v1"),
+            Some("reference-v2"),
             "{language} must invalidate parser inputs through its explicit adapter identity"
         );
     }
