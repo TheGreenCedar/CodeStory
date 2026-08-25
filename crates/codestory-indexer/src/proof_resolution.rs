@@ -87,7 +87,7 @@ fn python_resolution_work() -> usize {
 }
 
 const ADAPTER_VERSION: &str = "reference-v15";
-const PYTHON_ADAPTER_VERSION: &str = "reference-v16";
+const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 14;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
@@ -2037,6 +2037,13 @@ impl<'tree> PythonResolutionIndex<'tree> {
         else {
             return;
         };
+        if !python_exact_single_name_import(node, module, imported_name, local_name, source) {
+            *self
+                .module_blockers
+                .entry(local_name.to_string())
+                .or_default() += 1;
+            return;
+        }
         let key = (
             local_node.start_position().row as u32 + 1,
             local_node.start_position().column as u32 + 1,
@@ -2736,10 +2743,36 @@ fn python_call_on_self_dict(node: TsNode<'_>, source: &str) -> bool {
 }
 
 fn python_exact_relative_module(module: &str) -> bool {
-    module.starts_with('.')
-        && !module.starts_with("..")
-        && module[1..].split('.').all(python_identifier)
-        && module.len() > 1
+    python_relative_module_components(module).is_some()
+}
+
+fn python_exact_single_name_import(
+    node: TsNode<'_>,
+    module: &str,
+    imported_name: &str,
+    local_name: &str,
+    source: &str,
+) -> bool {
+    let Some(surface) = node_text(node, source).map(str::trim) else {
+        return false;
+    };
+    let expected = if imported_name == local_name {
+        format!("from {module} import {imported_name}")
+    } else {
+        format!("from {module} import {imported_name} as {local_name}")
+    };
+    surface == expected
+}
+
+fn python_relative_module_components(module: &str) -> Option<(usize, Vec<&str>)> {
+    let depth = module.bytes().take_while(|byte| *byte == b'.').count();
+    let components = module.get(depth..)?.split('.').collect::<Vec<_>>();
+    (depth > 0
+        && !components.is_empty()
+        && components
+            .iter()
+            .all(|component| python_identifier(component)))
+    .then_some((depth, components))
 }
 
 fn python_identifier(name: &str) -> bool {
@@ -7170,9 +7203,27 @@ struct PythonRelativeImportResolution<'a> {
     dependencies: Vec<FileId>,
 }
 
+#[derive(Clone)]
+struct PythonPackageMarker {
+    file_id: FileId,
+}
+
+#[derive(Default)]
+struct PythonModuleCandidates {
+    indexed: Vec<FileId>,
+    uncovered: bool,
+}
+
 #[derive(Default)]
 struct PythonProjectionIndex {
     complete_directories: HashSet<WorkspacePathIdentity>,
+    aliased_directories: HashSet<WorkspacePathIdentity>,
+    package_markers: HashMap<WorkspacePathIdentity, PythonPackageMarker>,
+    package_ancestry_by_file: HashMap<i64, Vec<WorkspacePathIdentity>>,
+    module_candidates: HashMap<(WorkspacePathIdentity, String), PythonModuleCandidates>,
+    package_directories_by_marker: HashMap<i64, WorkspacePathIdentity>,
+    file_directories: HashMap<i64, WorkspacePathIdentity>,
+    record_identities_by_file: HashMap<i64, WorkspacePathIdentity>,
     declarations_by_file_and_name: HashMap<(i64, String), Vec<NodeId>>,
     classes_by_file_and_name: HashMap<(i64, String), Vec<NodeId>>,
     methods_by_file_owner_and_name: HashMap<(i64, NodeId, String), Vec<NodeId>>,
@@ -7202,9 +7253,23 @@ impl PythonProjectionIndex {
                     directory.display()
                 )
             })?;
-            directories
-                .entry(identity)
-                .or_insert_with(|| directory.to_path_buf());
+            if let Some(existing) = directories.insert(identity.clone(), directory.to_path_buf())
+                && existing != directory
+            {
+                index.aliased_directories.insert(identity.clone());
+            }
+            index
+                .file_directories
+                .insert(record.file.file_id.0, identity);
+            index.record_identities_by_file.insert(
+                record.file.file_id.0,
+                workspace_path_identity(&record.path).map_err(|error| {
+                    anyhow!(
+                        "Python proof resolution source has no native identity ({}): {error}",
+                        record.path.display()
+                    )
+                })?,
+            );
             for declaration in &record.file.top_level_declarations {
                 count_python_resolution_work(1);
                 index
@@ -7234,8 +7299,104 @@ impl PythonProjectionIndex {
                 }
             }
         }
+        for record in records
+            .iter()
+            .filter(|record| record.file.language == "python")
+        {
+            count_python_resolution_work(1);
+            if record
+                .path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("py")
+            {
+                continue;
+            }
+            let Some(directory) = record.path.parent() else {
+                continue;
+            };
+            let Ok(directory_identity) = workspace_path_identity(directory) else {
+                continue;
+            };
+            let Some(file_name) = record.path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if file_name == "__init__.py" {
+                if std::fs::symlink_metadata(&record.path)
+                    .map_or(true, |metadata| metadata.file_type().is_symlink())
+                {
+                    continue;
+                }
+                let Some(parent) = directory.parent() else {
+                    continue;
+                };
+                let Ok(parent_identity) = workspace_path_identity(parent) else {
+                    continue;
+                };
+                if index.aliased_directories.contains(&directory_identity)
+                    || std::fs::symlink_metadata(directory)
+                        .map_or(true, |metadata| metadata.file_type().is_symlink())
+                {
+                    continue;
+                }
+                index.package_markers.insert(
+                    directory_identity.clone(),
+                    PythonPackageMarker {
+                        file_id: FileId(record.file.file_id.0),
+                    },
+                );
+                index
+                    .package_directories_by_marker
+                    .insert(record.file.file_id.0, directory_identity);
+                let Some(package_name) = directory.file_name().and_then(|name| name.to_str())
+                else {
+                    continue;
+                };
+                if python_identifier(package_name) {
+                    index
+                        .module_candidates
+                        .entry((parent_identity, package_name.to_owned()))
+                        .or_default()
+                        .indexed
+                        .push(FileId(record.file.file_id.0));
+                }
+            } else if let Some(stem) = record.path.file_stem().and_then(|stem| stem.to_str())
+                && python_identifier(stem)
+            {
+                index
+                    .module_candidates
+                    .entry((directory_identity, stem.to_owned()))
+                    .or_default()
+                    .indexed
+                    .push(FileId(record.file.file_id.0));
+            }
+        }
+        for candidates in index.module_candidates.values_mut() {
+            candidates.indexed.sort();
+            candidates.indexed.dedup();
+        }
+        for record in records
+            .iter()
+            .filter(|record| record.file.language == "python")
+        {
+            if let Some(ancestry) = python_prepared_package_ancestry(
+                &record.path,
+                &index.package_markers,
+                &index.aliased_directories,
+            ) {
+                index
+                    .package_ancestry_by_file
+                    .insert(record.file.file_id.0, ancestry);
+            }
+        }
         for (identity, directory) in directories {
             let mut complete = true;
+            if index.aliased_directories.contains(&identity)
+                || std::fs::symlink_metadata(&directory)
+                    .map_or(true, |metadata| metadata.file_type().is_symlink())
+            {
+                continue;
+            }
             let entries = match std::fs::read_dir(&directory) {
                 Ok(entries) => entries,
                 Err(_) => {
@@ -7266,17 +7427,75 @@ impl PythonProjectionIndex {
                 }
             }
             if complete {
+                let entries = match std::fs::read_dir(&directory) {
+                    Ok(entries) => entries,
+                    Err(_) => continue,
+                };
+                for entry in entries {
+                    count_python_resolution_work(1);
+                    let Ok(entry) = entry else {
+                        complete = false;
+                        break;
+                    };
+                    let path = entry.path();
+                    let Ok(kind) = entry.file_type() else {
+                        complete = false;
+                        break;
+                    };
+                    if !kind.is_dir() && !kind.is_symlink() {
+                        continue;
+                    }
+                    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    if !python_identifier(name) {
+                        continue;
+                    }
+                    let domain = index
+                        .module_candidates
+                        .entry((identity.clone(), name.to_owned()))
+                        .or_default();
+                    if kind.is_symlink() {
+                        domain.uncovered = true;
+                        continue;
+                    }
+                    let marker = path.join("__init__.py");
+                    match std::fs::symlink_metadata(&marker) {
+                        Ok(metadata) if metadata.file_type().is_symlink() || kind.is_symlink() => {
+                            domain.uncovered = true;
+                        }
+                        Ok(_) => match workspace_path_identity(&marker) {
+                            Ok(marker_identity)
+                                if records_by_path.contains_key(&marker_identity) => {}
+                            _ => domain.uncovered = true,
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(_) => domain.uncovered = true,
+                    }
+                }
+            }
+            if complete {
                 index.complete_directories.insert(identity);
             }
         }
         Ok(index)
     }
 
-    fn directory_is_complete(&self, directory: &Path) -> bool {
+    fn directory_identity_is_complete(&self, directory: &WorkspacePathIdentity) -> bool {
         count_python_resolution_work(1);
-        workspace_path_identity(directory)
-            .ok()
-            .is_some_and(|identity| self.complete_directories.contains(&identity))
+        self.complete_directories.contains(directory)
+    }
+
+    fn module_candidates(
+        &self,
+        directory: &WorkspacePathIdentity,
+        name: &str,
+    ) -> (&[FileId], bool) {
+        count_python_resolution_work(1);
+        self.module_candidates
+            .get(&(directory.clone(), name.to_owned()))
+            .map(|domain| (domain.indexed.as_slice(), domain.uncovered))
+            .unwrap_or_default()
     }
 
     fn classes(&self, file_id: FileId, name: &str) -> &[NodeId] {
@@ -7304,131 +7523,158 @@ impl PythonProjectionIndex {
     }
 }
 
+fn python_prepared_package_ancestry(
+    source: &Path,
+    package_markers: &HashMap<WorkspacePathIdentity, PythonPackageMarker>,
+    aliased_directories: &HashSet<WorkspacePathIdentity>,
+) -> Option<Vec<WorkspacePathIdentity>> {
+    let mut directory = source.parent()?.to_path_buf();
+    let mut ancestry = Vec::new();
+    let mut visited = HashSet::new();
+    loop {
+        count_python_resolution_work(1);
+        if !visited.insert(directory.clone()) {
+            return None;
+        }
+        let marker = directory.join("__init__.py");
+        match std::fs::symlink_metadata(&marker) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(ancestry),
+            Err(_) => return None,
+            Ok(marker_metadata)
+                if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() =>
+            {
+                return None;
+            }
+            Ok(_) => {}
+        }
+        let directory_metadata = std::fs::symlink_metadata(&directory).ok()?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            return None;
+        }
+        let identity = workspace_path_identity(&directory).ok()?;
+        if aliased_directories.contains(&identity) || !package_markers.contains_key(&identity) {
+            return None;
+        }
+        ancestry.push(identity);
+        directory = directory.parent()?.to_path_buf();
+    }
+}
+
 fn resolve_python_relative_import<'a>(
     source_record: &ResolutionCacheRecord,
     module_specifier: &str,
     records: &'a HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
     python_index: &PythonProjectionIndex,
 ) -> Result<PythonRelativeImportResolution<'a>> {
-    if !python_exact_relative_module(module_specifier) {
-        return Ok(PythonRelativeImportResolution {
-            target: RelativeImportResolution::Missing,
-            dependencies: Vec::new(),
-        });
-    }
-    let Some(source_directory) = source_record.path.parent() else {
+    let Some((depth, components)) = python_relative_module_components(module_specifier) else {
         return Ok(PythonRelativeImportResolution {
             target: RelativeImportResolution::Missing,
             dependencies: Vec::new(),
         });
     };
-    let mut dependency_records = Vec::new();
-    let source_marker = source_directory.join("__init__.py");
-    let source_marker_identity = match workspace_path_identity(&source_marker) {
-        Ok(identity) => identity,
-        Err(_) => {
-            return Ok(PythonRelativeImportResolution {
-                target: RelativeImportResolution::Incomplete,
-                dependencies: Vec::new(),
-            });
-        }
-    };
-    let Some(source_marker_record) = records.get(&source_marker_identity).copied() else {
+    let Some(ancestry) = python_index
+        .package_ancestry_by_file
+        .get(&source_record.file.file_id.0)
+    else {
         return Ok(PythonRelativeImportResolution {
             target: RelativeImportResolution::Incomplete,
             dependencies: Vec::new(),
         });
     };
-    dependency_records.push(source_marker_record);
-
-    let components = module_specifier[1..].split('.').collect::<Vec<_>>();
-    let mut base = source_directory.to_path_buf();
-    for component in &components[..components.len().saturating_sub(1)] {
-        base.push(component);
-        let marker = base.join("__init__.py");
-        let identity = match workspace_path_identity(&marker) {
-            Ok(identity) => identity,
-            Err(_) => {
-                return Ok(PythonRelativeImportResolution {
-                    target: RelativeImportResolution::Incomplete,
-                    dependencies: Vec::new(),
-                });
-            }
-        };
-        let Some(record) = records.get(&identity).copied() else {
+    let Some(base) = ancestry.get(depth - 1).cloned() else {
+        return Ok(PythonRelativeImportResolution {
+            target: RelativeImportResolution::Missing,
+            dependencies: Vec::new(),
+        });
+    };
+    let mut package_directories = ancestry[..depth].to_vec();
+    let mut dependency_ids = package_directories
+        .iter()
+        .filter_map(|directory| python_index.package_markers.get(directory))
+        .map(|marker| marker.file_id)
+        .collect::<Vec<_>>();
+    let mut current = base;
+    for component in &components[..components.len() - 1] {
+        let (candidates, uncovered) = python_index.module_candidates(&current, component);
+        if uncovered {
             return Ok(PythonRelativeImportResolution {
                 target: RelativeImportResolution::Incomplete,
                 dependencies: Vec::new(),
             });
-        };
-        dependency_records.push(record);
-    }
-    let leaf = components
-        .last()
-        .expect("exact relative module has a component");
-    let file_candidate = base.join(leaf).with_extension("py");
-    let package_candidate = base.join(leaf).join("__init__.py");
-    let mut matches: Vec<&ResolutionCacheRecord> = Vec::new();
-    let mut uncovered = false;
-    for candidate in [&file_candidate, &package_candidate] {
-        match std::fs::symlink_metadata(candidate) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                uncovered = true;
-                continue;
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                uncovered = true;
-                continue;
-            }
         }
-        let identity = match workspace_path_identity(candidate) {
-            Ok(identity) => identity,
-            Err(_) => {
-                uncovered = true;
-                continue;
-            }
+        let Some(marker_file) = (match candidates {
+            [file_id] => python_index.package_directories_by_marker.get(&file_id.0),
+            _ => None,
+        })
+        .cloned() else {
+            return Ok(PythonRelativeImportResolution {
+                target: if candidates.is_empty() && !uncovered {
+                    RelativeImportResolution::Missing
+                } else {
+                    RelativeImportResolution::Incomplete
+                },
+                dependencies: Vec::new(),
+            });
         };
-        if let Some(record) = records.get(&identity) {
-            matches.push(*record);
-        } else {
-            uncovered = true;
-        }
+        let marker = python_index
+            .package_markers
+            .get(&marker_file)
+            .expect("package marker directory maps to a marker");
+        dependency_ids.push(marker.file_id);
+        package_directories.push(marker_file.clone());
+        current = marker_file;
     }
-    matches.sort_by_key(|record| record.file.file_id);
-    matches.dedup_by_key(|record| record.file.file_id);
-    if uncovered || matches.len() != 1 {
+    let (candidates, uncovered) =
+        python_index.module_candidates(&current, components.last().expect("relative module leaf"));
+    if uncovered {
         return Ok(PythonRelativeImportResolution {
-            target: if matches.is_empty() && !uncovered {
+            target: RelativeImportResolution::Incomplete,
+            dependencies: Vec::new(),
+        });
+    }
+    let [target_file_id] = candidates else {
+        return Ok(PythonRelativeImportResolution {
+            target: if candidates.is_empty() && !uncovered {
                 RelativeImportResolution::Missing
             } else {
                 RelativeImportResolution::Incomplete
             },
             dependencies: Vec::new(),
         });
-    }
-    let target = matches[0];
-    if package_candidate == target.path {
-        dependency_records.push(target);
-    }
-    if [
-        source_directory,
-        target.path.parent().unwrap_or(source_directory),
-    ]
-    .into_iter()
-    .any(|directory| !python_index.directory_is_complete(directory))
+    };
+    let Some(target_identity) = python_index
+        .record_identities_by_file
+        .get(&target_file_id.0)
+    else {
+        return Ok(PythonRelativeImportResolution {
+            target: RelativeImportResolution::Incomplete,
+            dependencies: Vec::new(),
+        });
+    };
+    let Some(target) = records.get(target_identity).copied() else {
+        return Ok(PythonRelativeImportResolution {
+            target: RelativeImportResolution::Incomplete,
+            dependencies: Vec::new(),
+        });
+    };
+    let Some(target_directory) = python_index.file_directories.get(&target_file_id.0) else {
+        return Ok(PythonRelativeImportResolution {
+            target: RelativeImportResolution::Incomplete,
+            dependencies: Vec::new(),
+        });
+    };
+    package_directories.push(target_directory.clone());
+    if package_directories
+        .iter()
+        .any(|directory| !python_index.directory_identity_is_complete(directory))
     {
         return Ok(PythonRelativeImportResolution {
             target: RelativeImportResolution::Incomplete,
             dependencies: Vec::new(),
         });
     }
-    let mut dependencies = dependency_records
-        .into_iter()
-        .map(|record| FileId(record.file.file_id.0))
-        .chain(std::iter::once(FileId(target.file.file_id.0)))
-        .collect::<Vec<_>>();
+    dependency_ids.push(*target_file_id);
+    let mut dependencies = dependency_ids;
     dependencies.sort();
     dependencies.dedup();
     Ok(PythonRelativeImportResolution {
@@ -7712,10 +7958,6 @@ impl ExactEvidenceValidationIndex {
                     state.conflicting += 1;
                 }
             }
-        }
-        for targets in python_import_edges.values_mut() {
-            targets.sort();
-            targets.dedup();
         }
         let python_import_targets = python_import_edges
             .values()

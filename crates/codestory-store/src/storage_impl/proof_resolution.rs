@@ -437,34 +437,35 @@ fn python_dependency_ids(
                 })
             })
             .ok_or_else(|| proof_error("Python relative import has no authenticated module"))?;
-        if !python_exact_relative_module(module_specifier) {
+        let Some((depth, components)) = python_relative_module_components(module_specifier) else {
             return Err(proof_error(
                 "Python relative import module is outside the exact subset",
             ));
-        }
-        let parent = source
+        };
+        let mut base = source
             .path
             .parent()
-            .ok_or_else(|| proof_error("Python source path has no package directory"))?;
-        let components = module_specifier[1..].split('.').collect::<Vec<_>>();
-        let mut base = parent.to_path_buf();
-        for marker_path in std::iter::once(parent.join("__init__.py")).chain(
-            components[..components.len() - 1].iter().map(|component| {
-                base.push(component);
-                base.join("__init__.py")
-            }),
-        ) {
-            let markers = context
-                .python_file_ids_by_path
-                .get(&marker_path)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let [marker] = markers else {
-                return Err(proof_error(
-                    "Python relative import has no unique indexed package marker",
-                ));
-            };
-            expected.insert(*marker);
+            .ok_or_else(|| proof_error("Python source path has no package directory"))?
+            .to_path_buf();
+        for _ in 0..depth {
+            expected.insert(python_live_package_marker(context, &base)?);
+            base = base.parent().map(Path::to_path_buf).ok_or_else(|| {
+                proof_error("Python relative import escapes the classic package root")
+            })?;
+        }
+        base = source
+            .path
+            .parent()
+            .expect("checked Python source package directory")
+            .to_path_buf();
+        for _ in 1..depth {
+            base = base.parent().map(Path::to_path_buf).ok_or_else(|| {
+                proof_error("Python relative import escapes the classic package root")
+            })?;
+        }
+        for component in &components[..components.len() - 1] {
+            base.push(component);
+            expected.insert(python_live_package_marker(context, &base)?);
         }
         let target = fact.target.expect("Exact Python fact has a target");
         let target_file_id = context
@@ -477,19 +478,7 @@ fn python_dependency_ids(
             .get(&target_file_id.0)
             .ok_or_else(|| proof_error("Python imported target file is missing"))?;
         let leaf = components.last().expect("relative module has a component");
-        let file_target = base.join(leaf).with_extension("py");
-        let package_target = base.join(leaf).join("__init__.py");
-        let target_ids = [file_target, package_target]
-            .into_iter()
-            .flat_map(|path| {
-                context
-                    .python_file_ids_by_path
-                    .get(&path)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-            })
-            .collect::<Vec<_>>();
+        let target_ids = python_live_module_candidates(context, &base, leaf)?;
         if target_ids.as_slice() != [FileId(target_file.id)] {
             return Err(proof_error(
                 "Python relative import has no unique indexed native module target",
@@ -541,17 +530,102 @@ fn prepare_python_file_ids_by_path(
     by_path
 }
 
-fn python_exact_relative_module(module: &str) -> bool {
-    module.starts_with('.')
-        && !module.starts_with("..")
-        && module.len() > 1
-        && module[1..].split('.').all(|component| {
+fn python_live_package_marker(
+    context: &ProofResolutionValidationContext,
+    directory: &Path,
+) -> Result<FileId, StorageError> {
+    let directory_metadata = fs::symlink_metadata(directory)
+        .map_err(|_| proof_error("Python package directory cannot be inspected"))?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(proof_error(
+            "Python package directory is not a native in-project directory",
+        ));
+    }
+    let marker = directory.join("__init__.py");
+    let marker_metadata = fs::symlink_metadata(&marker)
+        .map_err(|_| proof_error("Python relative import has no unique indexed package marker"))?;
+    if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        return Err(proof_error(
+            "Python relative import package marker is not a regular source file",
+        ));
+    }
+    let markers = context
+        .python_file_ids_by_path
+        .get(&marker)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let [marker] = markers else {
+        return Err(proof_error(
+            "Python relative import has no unique indexed package marker",
+        ));
+    };
+    Ok(*marker)
+}
+
+fn python_live_module_candidates(
+    context: &ProofResolutionValidationContext,
+    base: &Path,
+    leaf: &str,
+) -> Result<Vec<FileId>, StorageError> {
+    let file = base.join(leaf).with_extension("py");
+    let package = base.join(leaf);
+    let mut candidates = Vec::new();
+    for path in [&file, &package.join("__init__.py")] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(proof_error(
+                    "Python relative import candidate is not a regular source file",
+                ));
+            }
+            Ok(_) => {
+                if path != &file {
+                    let package_metadata = fs::symlink_metadata(&package).map_err(|_| {
+                        proof_error("Python relative import package candidate cannot be inspected")
+                    })?;
+                    if package_metadata.file_type().is_symlink() || !package_metadata.is_dir() {
+                        return Err(proof_error(
+                            "Python relative import package candidate is not a native directory",
+                        ));
+                    }
+                }
+                let indexed = context
+                    .python_file_ids_by_path
+                    .get(path)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let [file_id] = indexed else {
+                    return Err(proof_error(
+                        "Python relative import candidate is present but not uniquely indexed",
+                    ));
+                };
+                candidates.push(*file_id);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(proof_error(
+                    "Python relative import candidate cannot be inspected",
+                ));
+            }
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
+fn python_relative_module_components(module: &str) -> Option<(usize, Vec<&str>)> {
+    let depth = module.bytes().take_while(|byte| *byte == b'.').count();
+    let components = module.get(depth..)?.split('.').collect::<Vec<_>>();
+    (depth > 0
+        && !components.is_empty()
+        && components.iter().all(|component| {
             let mut chars = component.chars();
             chars
                 .next()
                 .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
                 && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        })
+        }))
+    .then_some((depth, components))
 }
 
 #[cfg(unix)]
@@ -604,6 +678,8 @@ fn prepare_python_source_attestation(
 ) -> HashMap<i64, String> {
     let mut errors = HashMap::new();
     let mut native_owners = HashMap::<PythonNativeFileIdentity, i64>::new();
+    let python_file_ids_by_path = prepare_python_file_ids_by_path(file_by_id);
+    let mut package_ancestry_cache = HashMap::<PathBuf, Result<(), String>>::new();
     for file in file_by_id.values().filter(|file| file.language == "python") {
         count_store_replay_work(1);
         if canonical_file_node_id_for_path(&file.path) != file.id {
@@ -614,6 +690,18 @@ fn prepare_python_source_attestation(
             continue;
         }
         if !authenticate_live_sources {
+            continue;
+        }
+        let Some(directory) = file.path.parent() else {
+            errors.insert(file.id, "source has no package directory".to_owned());
+            continue;
+        };
+        if let Err(error) = attest_python_classic_package_ancestry(
+            directory,
+            &python_file_ids_by_path,
+            &mut package_ancestry_cache,
+        ) {
+            errors.insert(file.id, error);
             continue;
         }
         let identity = match python_native_file_identity(&file.path) {
@@ -653,6 +741,69 @@ fn prepare_python_source_attestation(
     errors
 }
 
+fn attest_python_classic_package_ancestry(
+    source_directory: &Path,
+    indexed_files: &HashMap<PathBuf, Vec<FileId>>,
+    cache: &mut HashMap<PathBuf, Result<(), String>>,
+) -> Result<(), String> {
+    let mut directory = source_directory.to_path_buf();
+    let mut traversed = Vec::new();
+    let mut visited = HashSet::new();
+    loop {
+        count_store_replay_work(1);
+        if !visited.insert(directory.clone()) {
+            return Err("package ancestry is cyclic".to_owned());
+        }
+        if let Some(result) = cache.get(&directory) {
+            let result = result.clone();
+            for visited in traversed {
+                cache.insert(visited, result.clone());
+            }
+            return result;
+        }
+        let marker = directory.join("__init__.py");
+        let result = match fs::symlink_metadata(&marker) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("package marker cannot be inspected: {error}")),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err("package marker is not a regular source file".to_owned())
+            }
+            Ok(_) => {
+                let directory_metadata = fs::symlink_metadata(&directory)
+                    .map_err(|error| format!("package directory cannot be inspected: {error}"));
+                match directory_metadata {
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                        Err("package directory is not a native directory".to_owned())
+                    }
+                    Err(error) => Err(error),
+                    Ok(_) => match indexed_files
+                        .get(&marker)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                    {
+                        [_] => {
+                            traversed.push(directory.clone());
+                            match directory.parent() {
+                                Some(parent) => {
+                                    directory = parent.to_path_buf();
+                                    continue;
+                                }
+                                None => Err("package ancestry has no parent".to_owned()),
+                            }
+                        }
+                        _ => Err("package marker is not uniquely indexed".to_owned()),
+                    },
+                }
+            }
+        };
+        for visited in traversed {
+            cache.insert(visited, result.clone());
+        }
+        cache.insert(directory, result.clone());
+        return result;
+    }
+}
+
 fn validate_python_import_target(
     context: &ProofResolutionValidationContext,
     source_file: NodeId,
@@ -674,24 +825,22 @@ fn validate_python_import_target(
         return false;
     };
     let module_specifier = module_node.serialized_name.as_str();
-    if !module_specifier.starts_with('.')
-        || module_specifier.starts_with("..")
-        || module_specifier.len() <= 1
-        || !module_specifier[1..].split('.').all(|component| {
-            let mut chars = component.chars();
-            chars
-                .next()
-                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
-                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-        })
-    {
-        return false;
-    }
-    let Some(parent) = source.path.parent() else {
+    let Some((depth, components)) = python_relative_module_components(module_specifier) else {
         return false;
     };
-    let relative = module_specifier[1..].replace('.', std::path::MAIN_SEPARATOR_STR);
-    let base = parent.join(relative);
+    let Some(mut base) = source.path.parent().map(Path::to_path_buf) else {
+        return false;
+    };
+    for _ in 1..depth {
+        let Some(parent) = base.parent() else {
+            return false;
+        };
+        base = parent.to_path_buf();
+    }
+    for component in &components[..components.len() - 1] {
+        base.push(component);
+    }
+    let base = base.join(components.last().expect("relative module leaf"));
     target_file.path == base.with_extension("py") || target_file.path == base.join("__init__.py")
 }
 
@@ -1273,10 +1422,6 @@ impl ProofResolutionValidationContext {
                     state.conflicting += 1;
                 }
             }
-        }
-        for targets in python_import_edges.values_mut() {
-            targets.sort();
-            targets.dedup();
         }
         let python_import_targets = python_import_edges
             .values()
