@@ -88,14 +88,15 @@ fn python_resolution_work() -> usize {
 
 const ADAPTER_VERSION: &str = "reference-v15";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v16";
+const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 14;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
     ("python", PYTHON_ADAPTER_VERSION),
     ("rust", ADAPTER_VERSION),
-    ("tsx", ADAPTER_VERSION),
-    ("typescript", ADAPTER_VERSION),
+    ("tsx", TYPESCRIPT_ADAPTER_VERSION),
+    ("typescript", TYPESCRIPT_ADAPTER_VERSION),
 ];
 
 fn adapter_version(language: &str) -> &str {
@@ -125,6 +126,7 @@ pub(crate) struct CollectedResolutionInputs {
 pub(crate) fn collect_call_resolution_inputs(
     tree: &Tree,
     source: &str,
+    source_path: &Path,
     language: &str,
     parser_fingerprint: &str,
     file_id: NodeId,
@@ -139,8 +141,9 @@ pub(crate) fn collect_call_resolution_inputs(
     let complete = !tree.root_node().has_error();
     let lookup_input_complete = complete;
     let source_sha256 = source_content_hash(source.as_bytes());
-    let javascript_index = is_javascript_language(language)
-        .then(|| JavascriptResolutionIndex::build(tree, source, file_id, nodes));
+    let javascript_index = is_javascript_language(language).then(|| {
+        JavascriptResolutionIndex::build(tree, source, source_path, language, file_id, nodes)
+    });
     let rust_index =
         (language == "rust").then(|| RustResolutionIndex::build(tree, source, file_id, nodes));
     let go_index =
@@ -3177,10 +3180,18 @@ struct JavascriptResolutionIndex<'tree> {
     module_dynamic_breaker: bool,
     export_statements: Vec<TsNode<'tree>>,
     ecmascript_module: bool,
+    typescript_directory_imports_enabled: bool,
 }
 
 impl<'tree> JavascriptResolutionIndex<'tree> {
-    fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
+    fn build(
+        tree: &'tree Tree,
+        source: &str,
+        source_path: &Path,
+        language: &str,
+        file_id: NodeId,
+        nodes: &[Node],
+    ) -> Self {
         let root = tree.root_node();
         let mut callable_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
         let mut class_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
@@ -3226,6 +3237,10 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
             module_dynamic_breaker: false,
             export_statements: Vec::new(),
             ecmascript_module: typescript_file_is_module(root),
+            typescript_directory_imports_enabled: typescript_directory_imports_enabled(
+                language,
+                source_path,
+            ),
         };
         walk_nodes(root, &mut |node| {
             if node.kind() == "export_statement" {
@@ -3277,7 +3292,11 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
             return;
         }
         if node.kind() == "import_statement" {
-            let supported = typescript_import_bindings_for_statement(node, source);
+            let supported = typescript_import_bindings_for_statement(
+                node,
+                source,
+                self.typescript_directory_imports_enabled,
+            );
             let mut supported_by_name = supported
                 .unwrap_or_default()
                 .into_iter()
@@ -6395,13 +6414,19 @@ struct TypescriptImportBinding {
 fn typescript_import_bindings_for_statement(
     statement: TsNode<'_>,
     source: &str,
+    directory_imports_enabled: bool,
 ) -> Option<Vec<TypescriptImportBinding>> {
     let source_node = statement.child_by_field_name("source")?;
     let module_specifier = simple_typescript_string(source_node, source)?;
-    if !module_specifier.starts_with("./") && !module_specifier.starts_with("../") {
+    let directory_specifier = matches!(module_specifier, "." | "..");
+    if (directory_specifier && !directory_imports_enabled)
+        || (!directory_specifier
+            && !module_specifier.starts_with("./")
+            && !module_specifier.starts_with("../"))
+    {
         return None;
     }
-    if contains_unnamed_token(statement, "type") {
+    if has_direct_unnamed_token(statement, "type") {
         return None;
     }
     let mut statement_cursor = statement.walk();
@@ -6445,7 +6470,9 @@ fn typescript_import_bindings_for_statement(
             {
                 return None;
             }
+            let mut parsed = Vec::with_capacity(specifiers.len());
             for specifier in specifiers {
+                let type_only = has_direct_unnamed_token(specifier, "type");
                 let imported = specifier.child_by_field_name("name")?;
                 if imported.kind() != "identifier" {
                     return None;
@@ -6455,14 +6482,29 @@ fn typescript_import_bindings_for_statement(
                     return None;
                 }
                 let imported_name = node_text(imported, source)?;
-                bindings.push(typescript_import_binding(
-                    local,
-                    imported_name,
-                    module_specifier,
-                    false,
-                    source,
-                )?);
+                parsed.push((
+                    typescript_import_binding(
+                        local,
+                        imported_name,
+                        module_specifier,
+                        false,
+                        source,
+                    )?,
+                    type_only,
+                ));
             }
+            let mut local_counts = HashMap::<String, usize>::new();
+            for (binding, _) in &parsed {
+                *local_counts.entry(binding.local_name.clone()).or_default() += 1;
+            }
+            if local_counts.values().any(|count| *count != 1) {
+                return None;
+            }
+            bindings.extend(
+                parsed
+                    .into_iter()
+                    .filter_map(|(binding, type_only)| (!type_only).then_some(binding)),
+            );
         }
         _ => return None,
     }
@@ -6497,6 +6539,14 @@ fn typescript_identifier_is_supported(identifier: &str) -> bool {
             .all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
 }
 
+fn typescript_directory_imports_enabled(language: &str, source_path: &Path) -> bool {
+    matches!(language, "typescript" | "tsx")
+        && source_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| matches!(extension, "ts" | "tsx"))
+}
+
 fn simple_typescript_string<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
     let literal = node_text(node, source)?;
     let quote = literal.as_bytes().first().copied()?;
@@ -6505,21 +6555,6 @@ fn simple_typescript_string<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a
     }
     let value = literal.get(1..literal.len().checked_sub(1)?)?;
     (!value.contains('\\')).then_some(value)
-}
-
-fn contains_unnamed_token(node: TsNode<'_>, token: &str) -> bool {
-    let mut found = false;
-    let mut visit = |current: TsNode<'_>| {
-        let mut cursor = current.walk();
-        for child in current.children(&mut cursor) {
-            if !child.is_named() && child.kind() == token {
-                found = true;
-                return;
-            }
-        }
-    };
-    walk_nodes(node, &mut visit);
-    found
 }
 
 fn export_statement_has_default_token(statement: TsNode<'_>) -> Option<bool> {
@@ -7411,7 +7446,11 @@ fn resolve_relative_import<'a>(
         return Ok(RelativeImportResolution::Missing);
     };
     let base = parent.join(module_specifier);
-    let candidates = if base.extension().is_some() {
+    let candidates = if matches!(source_record.file.language.as_str(), "typescript" | "tsx")
+        && matches!(module_specifier, "." | "..")
+    {
+        vec![base.join("index.ts"), base.join("index.tsx")]
+    } else if base.extension().is_some() {
         let supported = match source_record.file.language.as_str() {
             "typescript" | "tsx" => ["ts", "tsx", "mts", "cts"].as_slice(),
             "javascript" => ["js", "jsx", "mjs", "cjs"].as_slice(),
@@ -7503,8 +7542,45 @@ impl ProofRelationState {
     }
 }
 
+#[derive(Default)]
+struct TypescriptDirectoryImportState {
+    marker: Option<&'static str>,
+    marker_seen: bool,
+    admissible: usize,
+    conflicting: usize,
+}
+
+impl TypescriptDirectoryImportState {
+    fn record(&mut self, marker: Option<&'static str>, admissible: bool) {
+        self.marker_seen |= marker.is_some();
+        if admissible {
+            let marker = marker.expect("directory marker admission requires a marker");
+            self.marker.get_or_insert(marker);
+            self.admissible += 1;
+        } else {
+            self.conflicting += 1;
+        }
+    }
+
+    fn unique_marker(&self) -> Option<&'static str> {
+        (self.admissible == 1 && self.conflicting == 0)
+            .then_some(self.marker)
+            .flatten()
+    }
+}
+
+fn typescript_directory_specifier(literal: &str) -> Option<&'static str> {
+    match literal {
+        "'.'" | "\".\"" => Some("."),
+        "'..'" | "\"..\"" => Some(".."),
+        _ => None,
+    }
+}
+
 struct ExactEvidenceValidationIndex {
     import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
+    typescript_directory_import_relations:
+        HashMap<(NodeId, NodeId), TypescriptDirectoryImportState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
     python_import_paths: HashMap<(NodeId, NodeId, String), Vec<Vec<NodeId>>>,
     python_import_path_counts: HashMap<(NodeId, NodeId, Vec<NodeId>), usize>,
@@ -7541,6 +7617,8 @@ fn python_raw_import_marker_is_admissible(edge: &Edge, nodes: &HashMap<NodeId, &
 impl ExactEvidenceValidationIndex {
     fn prepare(edges: &[Edge], nodes: &HashMap<NodeId, &Node>) -> Self {
         let mut import_relations = HashMap::<_, ProofRelationState>::new();
+        let mut typescript_directory_import_relations =
+            HashMap::<_, TypescriptDirectoryImportState>::new();
         let mut member_relations = HashMap::<_, ProofRelationState>::new();
         let mut python_import_edges = HashMap::<NodeId, Vec<NodeId>>::new();
         for edge in edges {
@@ -7572,6 +7650,27 @@ impl ExactEvidenceValidationIndex {
                 } else {
                     state.conflicting += 1;
                 }
+            }
+            if edge.kind == EdgeKind::IMPORT
+                && let Some(import) = nodes.get(&edge.source)
+                && import.kind == NodeKind::UNKNOWN
+                && let Some(source_file) = import.file_node_id
+            {
+                let target = nodes.get(&edge.target);
+                let marker = target
+                    .filter(|target| target.kind == NodeKind::MODULE)
+                    .and_then(|target| typescript_directory_specifier(&target.serialized_name));
+                let admissible = marker.is_some()
+                    && edge.file_node_id == Some(source_file)
+                    && target.is_some_and(|target| target.file_node_id == Some(source_file))
+                    && edge.effective_source() == edge.source
+                    && edge.effective_target() == edge.target
+                    && edge.resolved_target.is_none()
+                    && edge.candidate_targets.is_empty();
+                typescript_directory_import_relations
+                    .entry((source_file, edge.source))
+                    .or_default()
+                    .record(marker, admissible);
             }
             if python_raw_import_marker_is_admissible(edge, nodes) {
                 python_import_edges
@@ -7658,6 +7757,7 @@ impl ExactEvidenceValidationIndex {
         }
         Self {
             import_relations,
+            typescript_directory_import_relations,
             member_relations,
             python_import_paths,
             python_import_path_counts,
@@ -7668,6 +7768,18 @@ impl ExactEvidenceValidationIndex {
         self.import_relations
             .get(&(file, import, target))
             .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn typescript_directory_import(&self, file: NodeId, import: NodeId) -> Option<&'static str> {
+        self.typescript_directory_import_relations
+            .get(&(file, import))
+            .and_then(TypescriptDirectoryImportState::unique_marker)
+    }
+
+    fn typescript_directory_marker_seen(&self, file: NodeId, import: NodeId) -> bool {
+        self.typescript_directory_import_relations
+            .get(&(file, import))
+            .is_some_and(|state| state.marker_seen)
     }
 
     fn has_member(&self, owner: NodeId, member: NodeId) -> bool {
@@ -7719,6 +7831,29 @@ impl ExactEvidenceValidationIndex {
             return false;
         }
         let source_file = NodeId(claim.input.callsite.file_id.0);
+        let typescript_directory_import =
+            matches!(claim.input.language.as_str(), "typescript" | "tsx")
+                && matches!(
+                    &claim.input.binding,
+                    CachedResolutionBinding::StaticImport { module_specifier, .. }
+                        if matches!(module_specifier.as_str(), "." | "..")
+                );
+        let typescript_directory_import_is_correlated = typescript_directory_import
+            && matches!(
+                &claim.input.binding,
+                CachedResolutionBinding::StaticImport {
+                    module_specifier,
+                    ..
+                } if matches!(module_specifier.as_str(), "." | "..")
+            )
+            && matches!(
+                &claim.input.binding,
+                CachedResolutionBinding::StaticImport {
+                    module_specifier,
+                    import,
+                    ..
+                } if self.typescript_directory_import(source_file, *import) == Some(module_specifier)
+            );
         match (
             claim.input.callsite.callee_form,
             claim.evidence_chain.as_slice(),
@@ -7750,7 +7885,13 @@ impl ExactEvidenceValidationIndex {
                             && graph_leaf_name(&import_node.serialized_name)
                                 == claim.input.callsite.raw_target
                     })
-                    && self.has_import(source_file, *import, target)
+                    && if typescript_directory_import {
+                        typescript_directory_import_is_correlated
+                    } else if self.typescript_directory_marker_seen(source_file, *import) {
+                        false
+                    } else {
+                        self.has_import(source_file, *import, target)
+                    }
             }
             (
                 CalleeForm::NamedImport,
@@ -10782,6 +10923,73 @@ mod exact_edge_projection_tests {
                 (EdgeId(8), NodeId(2), NodeId(4))
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod typescript_import_binding_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn bindings(source: &str) -> Option<Vec<TypescriptImportBinding>> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript grammar must load");
+        let tree = parser.parse(source, None).expect("source must parse");
+        let mut cursor = tree.root_node().walk();
+        let statement = tree
+            .root_node()
+            .named_children(&mut cursor)
+            .find(|node| node.kind() == "import_statement")?;
+        typescript_import_bindings_for_statement(statement, source, true)
+    }
+
+    #[test]
+    fn type_and_value_specifiers_share_one_local_binding_domain() {
+        assert!(bindings("import { type target, target } from './target';").is_none());
+        assert!(
+            bindings(
+                "import { target as local, /* duplicate */ type target as local, } from './target';"
+            )
+            .is_none()
+        );
+        assert!(bindings("import { target as local, other as local } from './target';").is_none());
+        let parsed = bindings("import { type target as TargetType, target } from './target';")
+            .expect("different locals sharing one imported spelling are supported");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].local_name, "target");
+        assert_eq!(parsed[0].imported_name, "target");
+        assert!(bindings("import { target } from '.';").is_some());
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+            .expect("TypeScript grammar must load");
+        let source = "import { target } from '.';";
+        let tree = parser.parse(source, None).expect("source must parse");
+        let mut cursor = tree.root_node().walk();
+        let statement = tree
+            .root_node()
+            .named_children(&mut cursor)
+            .find(|node| node.kind() == "import_statement")
+            .expect("import statement");
+        assert!(typescript_import_bindings_for_statement(statement, source, false).is_none());
+        assert!(typescript_directory_imports_enabled(
+            "typescript",
+            Path::new("source.tsx")
+        ));
+        assert!(!typescript_directory_imports_enabled(
+            "javascript",
+            Path::new("source.ts")
+        ));
+        assert!(!typescript_directory_imports_enabled(
+            "javascript",
+            Path::new("source.tsx")
+        ));
+        assert!(!typescript_directory_imports_enabled(
+            "typescript",
+            Path::new("source.mts")
+        ));
     }
 }
 

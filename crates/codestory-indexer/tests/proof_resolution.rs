@@ -2846,6 +2846,345 @@ fn javascript_and_typescript_direct_imports_are_exact() -> anyhow::Result<()> {
 }
 
 #[test]
+fn typescript_direct_imports_separate_type_specifiers_and_resolve_literal_directories()
+-> anyhow::Result<()> {
+    for (files, called_name) in [
+        (
+            vec![
+                ("src/target.ts", "export function target() {}\n"),
+                (
+                    "src/importer.ts",
+                    "import { type Target, target } from './target';\nexport function caller() { target(); }\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            vec![
+                ("src/target.ts", "export function target() {}\n"),
+                (
+                    "src/importer.ts",
+                    "import { target, /* type remains non-authoritative */ type Target, } from './target';\nexport function caller() { target(); }\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            vec![
+                ("src/index.ts", "export function target() {}\n"),
+                ("src.ts", "export function target() {}\n"),
+                (
+                    "src/importer.ts",
+                    "import { target } from '.';\nexport function caller() { target(); }\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            vec![
+                ("src/index.tsx", "export const target = () => <></>;\n"),
+                (
+                    "src/importer.ts",
+                    "import { target } from '.';\nexport function caller() { target(); }\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            vec![
+                ("src/index.ts", "export function target() {}\n"),
+                (
+                    "src/child/importer.ts",
+                    "import { target } from '..';\nexport function caller() { target(); }\n",
+                ),
+            ],
+            "target",
+        ),
+    ] {
+        assert_call_named_is_exact(&files, called_name)?;
+    }
+
+    for files in [
+        vec![
+            ("src/target.ts", "export function target() {}\n"),
+            (
+                "src/importer.ts",
+                "import type { target } from './target';\nexport function caller() { target(); }\n",
+            ),
+        ],
+        vec![
+            (
+                "src/target.ts",
+                "export default function fallback() {}\nexport function target() {}\n",
+            ),
+            (
+                "src/importer.ts",
+                "import fallback, { target } from './target';\nexport function caller() { target(); }\n",
+            ),
+        ],
+        vec![
+            ("src/index.js", "export function target() {}\n"),
+            (
+                "src/importer.js",
+                "import { target } from '.';\nexport function caller() { target(); }\n",
+            ),
+        ],
+    ] {
+        assert_no_exact_calls(&files)?;
+    }
+    assert_no_exact_calls(&[
+        ("src/target.ts", "export function target() {}\n"),
+        (
+            "src/aliased_type.ts",
+            "import { type Target as LocalTarget, target as local } from './target';\nexport function caller() { local(); }\n",
+        ),
+    ])?;
+    Ok(())
+}
+
+#[test]
+fn typescript_type_specifier_local_collisions_close_the_entire_import_binding() -> anyhow::Result<()>
+{
+    for files in [
+        vec![
+            ("src/target.ts", "export function target() {}\n"),
+            (
+                "src/importer.ts",
+                "import { type target, target } from './target';\nexport function caller() { target(); }\n",
+            ),
+        ],
+        vec![
+            ("src/target.ts", "export function target() {}\n"),
+            (
+                "src/importer.ts",
+                "import { target as local, /* duplicate local */ type target as local, } from './target';\nexport function caller() { local(); }\n",
+            ),
+        ],
+        vec![
+            (
+                "src/target.ts",
+                "export function target() {}\nexport function other() {}\n",
+            ),
+            (
+                "src/importer.ts",
+                "import { target as local, other as local } from './target';\nexport function caller() { local(); }\n",
+            ),
+        ],
+    ] {
+        assert_no_exact_calls(&files)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn literal_directory_imports_are_limited_to_ts_and_tsx_sources() -> anyhow::Result<()> {
+    for index in ["src/index.ts", "src/index.tsx"] {
+        assert_call_named_is_exact(
+            &[
+                (index, "export function target() {}\n"),
+                (
+                    "src/importer.ts",
+                    "import { target } from '.';\nexport function caller() { target(); }\n",
+                ),
+            ],
+            "target",
+        )?;
+    }
+    for importer in [
+        "src/importer.js",
+        "src/importer.jsx",
+        "src/importer.mjs",
+        "src/importer.cjs",
+        "src/importer.mts",
+        "src/importer.cts",
+    ] {
+        assert_only_call_is_not_exact(&[
+            ("src/index.ts", "export function target() {}\n"),
+            (
+                importer,
+                "import { target } from '.';\nexport function caller() { target(); }\n",
+            ),
+        ])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn typescript_literal_directory_import_markers_fail_closed_when_tampered() -> anyhow::Result<()> {
+    for mutation in [
+        "missing",
+        "duplicate",
+        "conflicting",
+        "resolved_marker",
+        "dotdot_marker",
+        "wrong_marker",
+        "direct_resolved_extra",
+        "wrong_effective_endpoint",
+        "wrong_edge_file",
+        "wrong_index",
+        "wrong_declaration",
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                ("src/index.ts", "export function target() {}\n"),
+                ("src.ts", "export function sibling() {}\n"),
+                (
+                    "src/importer.ts",
+                    "import { target } from '.';\nexport function caller() { target(); }\n",
+                ),
+            ],
+        )?;
+        let nodes = store.get_nodes()?;
+        let marker = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| {
+                edge.kind == EdgeKind::IMPORT
+                    && nodes
+                        .iter()
+                        .find(|node| node.id == edge.source)
+                        .is_some_and(|node| node.serialized_name == "target")
+                    && nodes
+                        .iter()
+                        .find(|node| node.id == edge.target)
+                        .is_some_and(|node| {
+                            node.kind == NodeKind::MODULE && node.serialized_name == "'.'"
+                        })
+            })
+            .expect("literal directory import marker");
+        match mutation {
+            "missing" => {
+                store
+                    .get_connection()
+                    .execute("DELETE FROM edge WHERE id = ?1", [marker.id.0])?;
+            }
+            "duplicate" => {
+                let mut duplicate = marker.clone();
+                duplicate.id = EdgeId(
+                    8_700_000_000_000_000_000 + marker.id.0.unsigned_abs() as i64 % 1_000_000,
+                );
+                store.insert_edge(&duplicate)?;
+            }
+            "conflicting" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET candidate_target_node_ids = ?1 WHERE id = ?2",
+                    (format!("[{}]", marker.target.0), marker.id.0),
+                )?;
+            }
+            "resolved_marker" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET resolved_target_node_id = target_node_id WHERE id = ?1",
+                    [marker.id.0],
+                )?;
+            }
+            "dotdot_marker" => {
+                store.get_connection().execute(
+                    "UPDATE node SET serialized_name = \"'..'\" WHERE id = ?1",
+                    [marker.target.0],
+                )?;
+            }
+            "wrong_marker" => {
+                store.get_connection().execute(
+                    "UPDATE edge SET source_node_id = file_node_id, resolved_source_node_id = file_node_id WHERE id = ?1",
+                    [marker.id.0],
+                )?;
+            }
+            "direct_resolved_extra" => {
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION && node.serialized_name == "target"
+                    })
+                    .expect("indexed target declaration");
+                let mut extra = marker.clone();
+                extra.id = EdgeId(
+                    8_600_000_000_000_000_000 + marker.id.0.unsigned_abs() as i64 % 1_000_000,
+                );
+                extra.target = target.id;
+                extra.resolved_target = Some(target.id);
+                store.insert_edge(&extra)?;
+            }
+            "wrong_effective_endpoint" => {
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION && node.serialized_name == "target"
+                    })
+                    .expect("indexed target declaration");
+                store.get_connection().execute(
+                    "UPDATE edge SET resolved_source_node_id = ?1 WHERE id = ?2",
+                    (target.id.0, marker.id.0),
+                )?;
+            }
+            "wrong_edge_file" => {
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION && node.serialized_name == "target"
+                    })
+                    .expect("indexed target declaration");
+                let target_file = target.file_node_id.expect("target file");
+                store.get_connection().execute(
+                    "UPDATE edge SET file_node_id = ?1 WHERE id = ?2",
+                    (target_file.0, marker.id.0),
+                )?;
+            }
+            "wrong_index" => {
+                let sibling_file = store
+                    .get_files()?
+                    .into_iter()
+                    .find(|file| file.path.ends_with("src.ts"))
+                    .expect("sibling TypeScript file");
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION && node.serialized_name == "target"
+                    })
+                    .expect("indexed target declaration");
+                store.get_connection().execute(
+                    "UPDATE node SET file_node_id = ?1 WHERE id = ?2",
+                    (sibling_file.id, target.id.0),
+                )?;
+            }
+            "wrong_declaration" => {
+                let target = nodes
+                    .iter()
+                    .find(|node| {
+                        node.kind == NodeKind::FUNCTION && node.serialized_name == "target"
+                    })
+                    .expect("indexed target declaration");
+                store.get_connection().execute(
+                    "UPDATE node SET serialized_name = 'other' WHERE id = ?1",
+                    [target.id.0],
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        let projection = rematerialize_proof_resolution_projection(&mut store, &publication(1));
+        if mutation == "wrong_declaration" {
+            assert!(
+                projection.is_err(),
+                "{mutation} tampering produced a literal-directory import fact"
+            );
+            continue;
+        }
+        projection?;
+        let facts = store.get_proof_resolution_facts()?;
+        assert!(
+            facts.iter().all(|fact| {
+                fact.callsite.raw_target != "target" || fact.status != ProofResolutionStatus::Exact
+            }),
+            "{mutation} tampering authorized a literal-directory import: {facts:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn relative_module_resolution_uses_one_closed_language_family() -> anyhow::Result<()> {
     for files in [
         vec![
