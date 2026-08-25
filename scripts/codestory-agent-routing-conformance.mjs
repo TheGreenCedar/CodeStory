@@ -7,6 +7,8 @@ import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
+const PROOF_CONTRACT_DIGEST_DOMAIN = Buffer.from("codestory.proof-contract.digest.v1\0", "utf8");
+const PROOF_FACT_ID_DOMAIN = Buffer.from("codestory-proof-resolution-fact-id-v1\0", "utf8");
 const PROOF_DISPOSITIONS = new Set([
   "contract_proven",
   "contract_refuted",
@@ -290,6 +292,10 @@ function canonical(value) {
 
 function equalJson(left, right) {
   return canonical(left) === canonical(right);
+}
+
+function compareUtf8(left, right) {
+  return Buffer.compare(Buffer.from(left), Buffer.from(right));
 }
 
 function normalizeToolName(name, server = "") {
@@ -582,6 +588,12 @@ function validateExactIdentity(installed, expected) {
 
 function sha256Bytes(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function proofFactId(evidenceSha256) {
+  const length = Buffer.alloc(8);
+  length.writeBigUInt64BE(BigInt(Buffer.byteLength(evidenceSha256)));
+  return sha256Bytes(Buffer.concat([PROOF_FACT_ID_DOMAIN, length, Buffer.from(evidenceSha256)]));
 }
 
 function fileInsideInstalledRoot(root, relativePath, label) {
@@ -912,6 +924,123 @@ function validTypedContract(contract) {
   }
 }
 
+const PROOF_FIELD_RANK = Object.freeze({
+  start: 0,
+  step_target: 1,
+  directness: 2,
+  ordering: 3,
+  relation: 4,
+  traversal_prohibition: 5,
+  projection_exclusion: 6,
+});
+const UNRESOLVED_REASON_RANK = Object.freeze({
+  missing_selector_resolution: 0,
+  ambiguous_selector_resolution: 1,
+  unsupported_interpretation: 2,
+});
+const NON_MATERIAL_RANK = Object.freeze({ whitespace: 0, punctuation: 1, connector: 2, commentary: 3 });
+
+function normalizedFieldOrder(field) {
+  return [PROOF_FIELD_RANK[field.kind], field.step ?? field.index ?? -1];
+}
+
+function normalizedClassificationOrder(row) {
+  if (row.classification === "resolved_material") return [0, 0];
+  if (row.classification === "unresolved_material") return [1, UNRESOLVED_REASON_RANK[row.reason]];
+  return [2, NON_MATERIAL_RANK[row.non_material_kind]];
+}
+
+function compareTuples(left, right) {
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    if (left[index] === right[index]) continue;
+    return left[index] < right[index] ? -1 : 1;
+  }
+  return 0;
+}
+
+function normalizedContractClauses(contract) {
+  const rows = [];
+  for (const clause of contract.clauses) {
+    if (clause.classification === "resolved_material") {
+      const fields = [...clause.fields].sort((left, right) => compareTuples(normalizedFieldOrder(left), normalizedFieldOrder(right)));
+      for (const field of fields) {
+        rows.push({
+          start: clause.start,
+          end: clause.end,
+          clause_id: clause.clause_id,
+          quote: clause.quote,
+          classification: clause.classification,
+          field,
+          reason: null,
+          non_material_kind: null,
+        });
+      }
+    } else {
+      rows.push({
+        start: clause.start,
+        end: clause.end,
+        clause_id: clause.clause_id,
+        quote: clause.quote,
+        classification: clause.classification,
+        field: null,
+        reason: clause.reason,
+        non_material_kind: clause.non_material_kind,
+      });
+    }
+  }
+  rows.sort((left, right) => left.start - right.start
+    || left.end - right.end
+    || compareUtf8(left.clause_id, right.clause_id)
+    || compareTuples(normalizedClassificationOrder(left), normalizedClassificationOrder(right))
+    || compareTuples(left.field === null ? [-1, -1] : normalizedFieldOrder(left.field), right.field === null ? [-1, -1] : normalizedFieldOrder(right.field))
+    || compareUtf8(left.quote, right.quote));
+  return rows.filter((row, index) => index === 0 || !equalJson(row, rows[index - 1]));
+}
+
+function groupedContractClauses(contract) {
+  const grouped = [];
+  for (const row of normalizedContractClauses(contract)) {
+    const prior = grouped.at(-1);
+    const sameGroup = prior !== undefined
+      && prior.start === row.start
+      && prior.end === row.end
+      && prior.clause_id === row.clause_id
+      && prior.quote === row.quote
+      && prior.classification === row.classification
+      && prior.reason === row.reason
+      && prior.non_material_kind === row.non_material_kind;
+    if (sameGroup) {
+      prior.fields.push(row.field);
+    } else {
+      grouped.push({
+        start: row.start,
+        end: row.end,
+        clause_id: row.clause_id,
+        quote: row.quote,
+        classification: row.classification,
+        fields: row.field === null ? [] : [row.field],
+        reason: row.reason,
+        non_material_kind: row.non_material_kind,
+      });
+    }
+  }
+  return grouped;
+}
+
+export function canonicalRequestContractDigest(contract) {
+  if (!validTypedContract(contract)) fail("typed proof contract is not canonicalizable");
+  const sourceTextSha256 = sha256Bytes(Buffer.from(contract.source_text));
+  const document = {
+    schema_version: 1,
+    proof_domain: "indexed_source_call_path_v1",
+    guard_version: "clause_guard_v1",
+    source_text_sha256: sourceTextSha256,
+    clauses: normalizedContractClauses(contract),
+    spec: contract.spec,
+  };
+  return sha256Bytes(Buffer.concat([PROOF_CONTRACT_DIGEST_DOMAIN, Buffer.from(canonical(document))]));
+}
+
 function validatePublication(value, label) {
   requireExactKeys(value, ["core_generation_id", "retrieval_generation_id"], label);
   if (!nonemptyString(value.core_generation_id) || !nonemptyString(value.retrieval_generation_id)) fail(`${label} is invalid`);
@@ -1018,22 +1147,33 @@ function validateProofClauseSchema(clause, index) {
   ));
 }
 
-function validateProofGap(gap, index) {
-  const selectorKinds = ["selector_missing", "selector_ambiguous", "non_callable_selector"];
-  const stepKinds = [
-    "direct_call_missing", "recursive_call_not_representable", "source_window_too_large", "invalid_utf8",
-    "source_line_out_of_range", "edge_containment_unproven", "missing_direct_call_receipt",
-    "receipt_or_edge_already_used", "projection_exclusion_conflicts_with_required_receipt",
-  ];
-  if (selectorKinds.includes(gap?.kind)) {
+const SELECTOR_PROOF_GAP_RANKS = Object.freeze({ selector_missing: 0, selector_ambiguous: 1, non_callable_selector: 2 });
+const STEP_PROOF_GAP_RANKS = Object.freeze({
+  direct_call_missing: 3,
+  recursive_call_not_representable: 4,
+  source_window_too_large: 5,
+  invalid_utf8: 6,
+  source_line_out_of_range: 7,
+  edge_containment_unproven: 8,
+  missing_direct_call_receipt: 9,
+  receipt_or_edge_already_used: 10,
+  projection_exclusion_conflicts_with_required_receipt: 11,
+});
+
+function canonicalProofGapKey(gap, index, stepCount) {
+  if (Object.hasOwn(SELECTOR_PROOF_GAP_RANKS, gap?.kind)) {
     requireExactKeys(gap, ["kind", "selector_index"], `proof result gap ${index}`);
-    if (!Number.isInteger(gap.selector_index) || gap.selector_index < 0 || gap.selector_index > 6) fail(`proof result gap ${index} is invalid`);
-    return;
+    if (!Number.isInteger(gap.selector_index) || gap.selector_index < 0 || gap.selector_index > stepCount) {
+      proofSemanticFail(`gap index ${gap.selector_index} exceeds selector boundary ${stepCount}`);
+    }
+    return [SELECTOR_PROOF_GAP_RANKS[gap.kind], gap.selector_index];
   }
-  if (stepKinds.includes(gap?.kind)) {
+  if (Object.hasOwn(STEP_PROOF_GAP_RANKS, gap?.kind)) {
     requireExactKeys(gap, ["kind", "step_index"], `proof result gap ${index}`);
-    if (!Number.isInteger(gap.step_index) || gap.step_index < 0 || gap.step_index > 5) fail(`proof result gap ${index} is invalid`);
-    return;
+    if (!Number.isInteger(gap.step_index) || gap.step_index < 0 || gap.step_index >= stepCount) {
+      proofSemanticFail(`gap index ${gap.step_index} exceeds step boundary ${stepCount - 1}`);
+    }
+    return [STEP_PROOF_GAP_RANKS[gap.kind], gap.step_index];
   }
   fail(`proof result gap ${index} has an unsupported kind`);
 }
@@ -1178,7 +1318,6 @@ function validateProofResult(body) {
     if (!Array.isArray(disposition.gaps) || disposition.gaps.length === 0 || !Array.isArray(disposition.connected_receipts)) {
       fail("proof result Unknown gaps are missing");
     }
-    disposition.gaps.forEach(validateProofGap);
   } else {
     requireExactKeys(disposition, ["kind", "contract_digest", "reasons"], "proof result Unavailable disposition");
     if (!Array.isArray(disposition.reasons) || disposition.reasons.length === 0 || !disposition.reasons.every(nonemptyString)) {
@@ -1205,7 +1344,6 @@ function validateToolResultSchema(action, projection) {
   if (action.kind === "search") validateSearchResult(projection.body);
   if (action.kind === "context") validateContextResult(projection.body);
   if (action.kind === "packet") validatePacketResult(projection.body);
-  if (action.kind === "prove_call_path" && !projection.isError) validateProofResult(projection.body);
 }
 
 function projectedSelectorValue(selector, result, label) {
@@ -1238,25 +1376,286 @@ function projectedSelectorValue(selector, result, label) {
   };
 }
 
-function validateProofResultAgainstRequest(result, contract) {
+function proofSemanticFail(reason) {
+  fail(`proof result semantic invariant failed: ${reason}`);
+}
+
+function semanticReceiptSequence(values, receiptCount, label) {
+  if (!Array.isArray(values) || new Set(values).size !== values.length) proofSemanticFail(`${label} is not edge-distinct`);
+  values.forEach((receipt) => {
+    if (!Number.isInteger(receipt) || receipt < 0 || receipt >= receiptCount) proofSemanticFail(`${label} contains an invalid receipt reference`);
+  });
+  return values;
+}
+
+function validateSemanticPrefix(steps, sequence, trailingStatus, terminal = null) {
+  const terminalIndex = terminal?.index ?? sequence.length;
+  if (sequence.length > steps.length || terminalIndex >= steps.length) proofSemanticFail("receipt prefix exceeds the proof steps");
+  for (let index = 0; index < terminalIndex; index += 1) {
+    if (steps[index].status !== "proven" || steps[index].receipt !== sequence[index]) {
+      proofSemanticFail("ordered proven prefix does not match its receipt sequence");
+    }
+  }
+  if (terminal) {
+    const expectedReceipt = terminal.status === "certified_absence" ? null : sequence.at(-1);
+    if (steps[terminal.index].status !== terminal.status || steps[terminal.index].receipt !== expectedReceipt) {
+      proofSemanticFail("refutation step contradicts its disposition");
+    }
+  }
+  const suffixStart = terminal ? terminal.index + 1 : sequence.length;
+  for (const step of steps.slice(suffixStart)) {
+    if (step.status !== trailingStatus || step.receipt !== null) proofSemanticFail("proof suffix contradicts its disposition");
+  }
+}
+
+function dispositionReceiptSequence(result, stepCount) {
+  const { disposition, receipts, steps } = result;
+  if (disposition.kind === "contract_proven") {
+    const sequence = semanticReceiptSequence(disposition.receipts, receipts.length, "ContractProven receipt sequence");
+    if (sequence.length !== steps.length) proofSemanticFail("ContractProven must authorize one receipt per step");
+    steps.forEach((step, index) => {
+      if (step.status !== "proven" || step.receipt !== sequence[index]) proofSemanticFail("ContractProven step contradicts its receipt");
+    });
+    return sequence;
+  }
+  if (disposition.kind === "unknown") {
+    const sequence = semanticReceiptSequence(disposition.connected_receipts, receipts.length, "Unknown connected receipt sequence");
+    let priorGap = null;
+    for (const [index, gap] of disposition.gaps.entries()) {
+      const key = canonicalProofGapKey(gap, index, stepCount);
+      if (priorGap !== null && compareTuples(priorGap, key) >= 0) proofSemanticFail("Unknown gaps are not canonical and edge-distinct");
+      priorGap = key;
+    }
+    validateSemanticPrefix(steps, sequence, "unknown");
+    return sequence;
+  }
+  if (disposition.kind === "contract_refuted") {
+    const refutation = disposition.refutation;
+    const sequence = semanticReceiptSequence(refutation.connected_receipts, receipts.length, "ContractRefuted connected receipt sequence");
+    if (refutation.kind === "prohibited_scope_traversal") {
+      if (sequence.length !== refutation.step_index + 1) proofSemanticFail("positive contradiction receipt sequence has the wrong length");
+      validateSemanticPrefix(steps, sequence, "unknown", { index: refutation.step_index, status: "positive_contradiction" });
+    } else {
+      if (sequence.length !== refutation.step_index) proofSemanticFail("certified absence receipt sequence has the wrong length");
+      validateSemanticPrefix(steps, sequence, "unknown", { index: refutation.step_index, status: "certified_absence" });
+    }
+    return sequence;
+  }
+  if (steps.some((step) => step.status !== "unavailable" || step.receipt !== null)) {
+    proofSemanticFail("Unavailable disposition contains a non-Unavailable step or receipt");
+  }
+  const reasonOrder = [
+    "validated_contract_hash_mismatch",
+    "publication_pin_mismatch",
+    "source_not_bound_to_publication",
+    "proof_facts_unavailable",
+    "proof_semantic_projection_unavailable",
+  ];
+  const ranks = disposition.reasons.map((reason) => reasonOrder.indexOf(reason));
+  if (ranks.some((rank) => rank < 0) || ranks.some((rank, index) => index > 0 && ranks[index - 1] >= rank)) {
+    proofSemanticFail("Unavailable reasons are not canonical");
+  }
+  return [];
+}
+
+function parseProofCallsiteIdentity(identity) {
+  const separator = identity.indexOf("|");
+  const prefix = separator === -1 ? identity : identity.slice(0, separator);
+  const marker = separator === -1 ? null : identity.slice(separator + 1);
+  if (marker === "") return null;
+  const fields = prefix.split(":");
+  if (fields.length !== 4 || !/^-?[0-9]+$/u.test(fields[0]) || !/^[0-9]+$/u.test(fields[1])
+      || !/^[0-9]+$/u.test(fields[2]) || !/^-?[0-9]+$/u.test(fields[3])) return null;
+  const [fileId, rawLine, rawColumn, rawTarget] = fields;
+  const line = Number(rawLine);
+  const column = Number(rawColumn);
+  if (!Number.isSafeInteger(line) || line < 1 || line > 0xffff_ffff
+      || !Number.isSafeInteger(column) || column < 1 || column > 0xffff_ffff) return null;
+  try {
+    const normalized = `${BigInt(fileId)}:${line}:${column}:${BigInt(rawTarget)}`;
+    if (normalized !== prefix || BigInt(fileId) === 0n || BigInt(rawTarget) === 0n) return null;
+  } catch {
+    return null;
+  }
+  return { fileId, line, column, rawTarget };
+}
+
+function canonicalNonzeroInteger(value) {
+  if (typeof value !== "string" || !/^-?[0-9]+$/u.test(value)) return null;
+  try {
+    const parsed = BigInt(value);
+    return parsed !== 0n && parsed.toString() === value ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function validateSemanticReceiptTable(result, sequence) {
+  if (sequence.length !== result.receipts.length || sequence.some((receipt, index) => receipt !== index)) {
+    proofSemanticFail("disposition does not exhaust receipts in canonical order");
+  }
+  const fileIds = new Set();
+  const filePaths = new Set();
+  result.identities.files.forEach((file, index) => {
+    const fileId = canonicalNonzeroInteger(file.file_node_id);
+    if (fileId === null || fileIds.has(file.file_node_id) || !SHA256.test(file.indexed_sha256)
+        || !(file.observed_sha256 === null || file.observed_sha256 === file.indexed_sha256)) {
+      proofSemanticFail(`file identity ${index} is not canonical and hash-bound`);
+    }
+    fileIds.add(file.file_node_id);
+    if (file.project_file_components !== null) {
+      if (file.project_file_components.length === 0) proofSemanticFail(`file identity ${index} has an empty path`);
+      const path = canonical(file.project_file_components);
+      if (filePaths.has(path)) proofSemanticFail(`file identity ${index} repeats a project path`);
+      filePaths.add(path);
+    }
+  });
+  const symbolIds = new Set();
+  result.identities.symbols.forEach((symbol, index) => {
+    if (symbolIds.has(symbol.node_id)) proofSemanticFail(`symbol identity ${index} is duplicated`);
+    symbolIds.add(symbol.node_id);
+  });
+  const profiles = new Set();
+  result.identities.provenance_profiles.forEach((profile, index) => {
+    const key = canonical(profile);
+    if (profiles.has(key)) proofSemanticFail(`provenance profile ${index} is duplicated`);
+    profiles.add(key);
+  });
+  const factIds = new Set();
+  const referencedProfiles = new Set();
+  let nextProfile = 0;
+  result.identities.evidence.forEach((evidence, index) => {
+    if (factIds.has(evidence.fact_id) || proofFactId(evidence.provenance.evidence_sha256) !== evidence.fact_id) {
+      proofSemanticFail(`exact-resolution evidence ${index} has an invalid fact identity`);
+    }
+    factIds.add(evidence.fact_id);
+    const caller = result.identities.symbols[evidence.caller];
+    const target = result.identities.symbols[evidence.target];
+    if (!nonemptyString(caller.canonical_id) || !nonemptyString(caller.qualified_name) || caller.file === null
+        || !nonemptyString(target.canonical_id) || !nonemptyString(target.qualified_name) || target.file === null) {
+      proofSemanticFail(`exact-resolution evidence ${index} does not bind complete symbols`);
+    }
+    const chainArities = {
+      same_file_declaration: 1,
+      same_package_declaration: 1,
+      static_import_binding: 2,
+      qualified_path: null,
+      explicit_receiver_type: 1,
+      constructor_binding: 1,
+      implicit_receiver: 1,
+    };
+    for (const entry of evidence.chain) {
+      if (!Object.hasOwn(chainArities, entry.kind)
+          || (chainArities[entry.kind] === null ? entry.symbols.length === 0 : entry.symbols.length !== chainArities[entry.kind])) {
+        proofSemanticFail(`exact-resolution evidence ${index} has an invalid evidence chain`);
+      }
+    }
+    const profile = evidence.provenance.profile;
+    if (!referencedProfiles.has(profile)) {
+      if (profile !== nextProfile) proofSemanticFail("provenance profiles are not referenced in canonical order");
+      referencedProfiles.add(profile);
+      nextProfile += 1;
+    }
+    if (evidence.provenance.dependency_files.length === 0) proofSemanticFail(`exact-resolution evidence ${index} has no dependency files`);
+    let priorFileId = null;
+    for (const fileIndex of evidence.provenance.dependency_files) {
+      const fileId = canonicalNonzeroInteger(result.identities.files[fileIndex].file_node_id);
+      if (fileId === null || (priorFileId !== null && priorFileId >= fileId)) {
+        proofSemanticFail(`exact-resolution evidence ${index} dependency files are not canonical`);
+      }
+      priorFileId = fileId;
+    }
+  });
+  if (referencedProfiles.size !== result.identities.provenance_profiles.length) {
+    proofSemanticFail("a provenance profile is unreferenced");
+  }
+  const receiptIds = new Set();
+  const edgeIds = new Set();
+  const evidenceIndices = new Set();
+  const sourceFiles = new Set();
+  for (const [index, receipt] of result.receipts.entries()) {
+    if (receiptIds.has(receipt.receipt_id) || edgeIds.has(receipt.edge_id) || evidenceIndices.has(receipt.evidence)) {
+      proofSemanticFail("receipt identities, edges, and exact-resolution evidence must be edge-distinct");
+    }
+    receiptIds.add(receipt.receipt_id);
+    edgeIds.add(receipt.edge_id);
+    evidenceIndices.add(receipt.evidence);
+    const source = result.identities.symbols[receipt.source];
+    const target = result.identities.symbols[receipt.target];
+    if (!nonemptyString(source.canonical_id) || !nonemptyString(source.qualified_name) || source.file === null
+        || !nonemptyString(target.canonical_id) || !nonemptyString(target.qualified_name) || target.file === null) {
+      proofSemanticFail(`receipt ${index} source and target must be complete symbols`);
+    }
+    if (source.file !== receipt.containment.file || receipt.containment.file !== receipt.line_window.file) {
+      proofSemanticFail(`receipt ${index} source, containment, and line-window files disagree`);
+    }
+    const file = result.identities.files[source.file];
+    if (!nonemptyString(file.file_node_id) || !SHA256.test(file.indexed_sha256)
+        || file.observed_sha256 !== file.indexed_sha256) proofSemanticFail(`receipt ${index} line window is not hash-bound`);
+    const callsite = parseProofCallsiteIdentity(receipt.callsite_identity);
+    if (callsite === null || callsite.fileId !== file.file_node_id || callsite.rawTarget !== target.node_id
+        || callsite.line !== receipt.line_window.anchor_line || callsite.column !== receipt.column_or_ordinal
+        || receipt.line_window.anchor_line < receipt.containment.start_line
+        || receipt.line_window.anchor_line > receipt.containment.end_line
+        || receipt.exact_callsite_start_byte < receipt.line_window.byte_start
+        || receipt.exact_callsite_start_byte >= receipt.line_window.byte_end) {
+      proofSemanticFail(`receipt ${index} callsite is outside its hash-bound source window`);
+    }
+    const evidence = result.identities.evidence[receipt.evidence];
+    sourceFiles.add(source.file);
+  }
+  if (evidenceIndices.size !== result.identities.evidence.length) proofSemanticFail("exact-resolution evidence is unreferenced");
+  result.identities.files.forEach((file, index) => {
+    if (file.observed_sha256 !== null && !sourceFiles.has(index)) proofSemanticFail("observed source hash belongs to a non-callsite file");
+  });
+  for (let index = 1; index < sequence.length; index += 1) {
+    if (result.receipts[sequence[index - 1]].target !== result.receipts[sequence[index]].source) {
+      proofSemanticFail("receipt trail is disconnected");
+    }
+  }
+}
+
+function validateSelectorReceiptBinding(selector, expectedSymbol, label) {
+  const isReference = ["pinned_node_ref", "canonical_id_ref", "qualified_name_ref"].includes(selector.kind);
+  if (expectedSymbol === null) {
+    if (isReference) proofSemanticFail(`${label} is a disconnected compact reference`);
+  } else if (!isReference || selector.symbol !== expectedSymbol) {
+    proofSemanticFail(`${label} does not match the authorized receipt endpoint`);
+  }
+}
+
+function validateCanonicalProofResult(result, contract) {
+  validateProofResult(result);
+  const sequence = dispositionReceiptSequence(result, result.spec.steps.length);
+  validateSemanticReceiptTable(result, sequence);
   if (result.source_text_sha256 !== sha256Bytes(Buffer.from(contract.source_text))) {
-    fail("proof result source_text_sha256 does not match the host-supplied contract");
+    proofSemanticFail("source_text_sha256 does not match the unchanged typed request");
   }
-  if (!equalJson(result.clauses, contract.clauses)) fail("proof result clauses do not match the host-supplied contract");
+  const expectedDigest = canonicalRequestContractDigest(contract);
+  if (result.contract_digest !== expectedDigest || result.disposition.contract_digest !== expectedDigest) {
+    proofSemanticFail("contract digest is not derived from the unchanged typed request");
+  }
+  if (!equalJson(result.clauses, groupedContractClauses(contract))) {
+    proofSemanticFail("clauses do not match the canonical unchanged typed request");
+  }
+  const firstSource = sequence.length === 0 ? null : result.receipts[sequence[0]].source;
+  validateSelectorReceiptBinding(result.spec.start, firstSource, "proof start selector");
   if (!equalJson(projectedSelectorValue(result.spec.start, result, "proof result start selector"), contract.spec.start)) {
-    fail("proof result start selector does not match the host-supplied contract");
+    proofSemanticFail("start selector does not match the unchanged typed request");
   }
-  if (result.spec.steps.length !== contract.spec.steps.length) fail("proof result steps do not match the host-supplied contract");
+  if (result.spec.steps.length !== contract.spec.steps.length) proofSemanticFail("steps do not match the unchanged typed request");
   result.spec.steps.forEach((step, index) => {
+    const expectedTarget = index < sequence.length ? result.receipts[sequence[index]].target : null;
+    validateSelectorReceiptBinding(step.target, expectedTarget, `proof step ${index} target`);
     const projected = {
       relation: step.relation,
       target: projectedSelectorValue(step.target, result, `proof result step ${index} target`),
     };
-    if (!equalJson(projected, contract.spec.steps[index])) fail(`proof result step ${index} does not match the host-supplied contract`);
+    if (!equalJson(projected, contract.spec.steps[index])) proofSemanticFail(`step ${index} does not match the unchanged typed request`);
   });
   if (!equalJson(result.spec.prohibit_traversal_through, contract.spec.prohibit_traversal_through)
       || !equalJson(result.spec.exclude_from_projection, contract.spec.exclude_from_projection)) {
-    fail("proof result scope selectors do not match the host-supplied contract");
+    proofSemanticFail("scope selectors do not match the unchanged typed request");
   }
 }
 
@@ -1289,7 +1688,7 @@ function validateProofCalls(scenarioContract, request, actions, results) {
     return;
   }
   if (projection?.isError) fail(`${scenarioContract.id} typed proof unexpectedly returned a tool error`);
-  validateProofResultAgainstRequest(projection.body, request.proof_contract);
+  validateCanonicalProofResult(projection.body, request.proof_contract);
 }
 
 function validatePacketContinuation(scenarioContract, actions, results) {
@@ -1424,6 +1823,9 @@ function expectedFinalClaim(scenarioContract, actions, results) {
     if (disposition?.kind === "contract_proven") {
       const receipts = results.get(proof).body.receipts;
       expected.evidence_ids = disposition.receipts.map((index) => receipts[index]?.receipt_id);
+    } else if (disposition?.kind === "contract_refuted") {
+      const receipts = results.get(proof).body.receipts;
+      expected.evidence_ids = disposition.refutation.connected_receipts.map((index) => receipts[index]?.receipt_id);
     } else {
       expected.evidence_ids = [];
     }

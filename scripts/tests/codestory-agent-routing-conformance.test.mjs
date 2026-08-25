@@ -20,6 +20,7 @@ import {
   INSTALLED_IDENTITY_FIELDS,
   ROUTING_SCENARIOS,
   STATIC_PARITY_HOSTS,
+  canonicalRequestContractDigest,
   parseInstalledTranscript,
   validateInstalledSession,
   validateStaticHostParity,
@@ -179,33 +180,33 @@ function result(body, { isError = false, meta = runtimeMeta() } = {}) {
 }
 
 function proofBody(disposition, contract, detail = {}) {
-  const contractDigest = "f".repeat(64);
+  const contractDigest = canonicalRequestContractDigest(contract);
   const common = { kind: disposition, contract_digest: contractDigest };
   let projectedDisposition;
   let stepStatus;
-  let receipts = [];
+  const hasReceipt = ["contract_proven", "contract_refuted"].includes(disposition);
+  const receipts = hasReceipt ? [{
+    receipt_id: "receipt-1",
+    edge_id: "edge-1",
+    source: 0,
+    target: 1,
+    evidence: 0,
+    exact_callsite_start_byte: 0,
+    callsite_identity: "1:1:1:2|rust",
+    column_or_ordinal: 1,
+    containment: { file: 0, owner: 0, start_line: 1, end_line: 1 },
+    line_window: {
+      kind: "indexed_line_v1",
+      file: 0,
+      anchor_line: 1,
+      byte_start: 0,
+      byte_end: 10,
+      text: "finish();\n",
+    },
+  }] : [];
   if (disposition === "contract_proven") {
     projectedDisposition = { ...common, receipts: [0] };
     stepStatus = "proven";
-    receipts = [{
-      receipt_id: "receipt-1",
-      edge_id: "edge-1",
-      source: 0,
-      target: 1,
-      evidence: 0,
-      exact_callsite_start_byte: 0,
-      callsite_identity: "file-1:1:1:finish|rust",
-      column_or_ordinal: 1,
-      containment: { file: 0, owner: 0, start_line: 1, end_line: 1 },
-      line_window: {
-        kind: "indexed_line_v1",
-        file: 0,
-        anchor_line: 1,
-        byte_start: 0,
-        byte_end: 10,
-        text: "finish();\n",
-      },
-    }];
   } else if (disposition === "contract_refuted") {
     projectedDisposition = {
       ...common,
@@ -213,7 +214,7 @@ function proofBody(disposition, contract, detail = {}) {
         kind: detail.basis?.kind ?? "prohibited_scope_traversal",
         step_index: 0,
         prohibition_index: 0,
-        connected_receipts: [],
+        connected_receipts: [0],
       },
     };
     stepStatus = "positive_contradiction";
@@ -239,16 +240,16 @@ function proofBody(disposition, contract, detail = {}) {
     source_text_sha256: sha256(Buffer.from(contract.source_text)),
     contract_digest: contractDigest,
     core_publication: { project_id: "project-1", generation_id: "core-1", run_id: "run-1" },
-    identities: {
+    identities: hasReceipt ? {
       files: [{
-        file_node_id: "file-1",
+        file_node_id: "1",
         project_file_components: ["src", "lib.rs"],
         indexed_sha256: "a".repeat(64),
         observed_sha256: "a".repeat(64),
       }],
       symbols: [
-        { node_id: "node-1", canonical_id: "rust:crate::start", qualified_name: "crate::start", file: 0 },
-        { node_id: "node-2", canonical_id: "rust:crate::finish", qualified_name: "crate::finish", file: 0 },
+        { node_id: "1", canonical_id: "rust:crate::start", qualified_name: "crate::start", file: 0 },
+        { node_id: "2", canonical_id: "rust:crate::finish", qualified_name: "crate::finish", file: 0 },
       ],
       provenance_profiles: [{
         producer: "codestory-internal",
@@ -259,24 +260,27 @@ function proofBody(disposition, contract, detail = {}) {
         parser_fingerprint: "b".repeat(64),
       }],
       evidence: [{
-        fact_id: "c".repeat(64),
+        fact_id: "c475943eeae97a7565be3dba007562b65e662b5111d1165b72ce2401e0d88eac",
         caller: 0,
         target: 1,
         edge_id: "edge-1",
-        callsite_identity: "file-1:1:1:finish|rust",
+        callsite_identity: "1:1:1:2|rust",
         chain: [{ kind: "same_file_declaration", symbols: [1] }],
         provenance: { profile: 0, dependency_files: [0], evidence_sha256: "d".repeat(64) },
       }],
-    },
+    } : { files: [], symbols: [], provenance_profiles: [], evidence: [] },
     spec: {
-      start: { kind: "canonical_id_ref", symbol: 0 },
-      steps: [{ relation: "direct_outgoing_call", target: { kind: "canonical_id_ref", symbol: 1 } }],
+      start: hasReceipt ? { kind: "canonical_id_ref", symbol: 0 } : clone(contract.spec.start),
+      steps: [{
+        relation: "direct_outgoing_call",
+        target: hasReceipt ? { kind: "canonical_id_ref", symbol: 1 } : clone(contract.spec.steps[0].target),
+      }],
       prohibit_traversal_through: clone(contract.spec.prohibit_traversal_through),
       exclude_from_projection: clone(contract.spec.exclude_from_projection),
     },
     clauses: clone(contract.clauses),
     disposition: projectedDisposition,
-    steps: [{ step_index: 0, status: stepStatus, receipt: receipts.length ? 0 : null }],
+    steps: [{ step_index: 0, status: stepStatus, receipt: hasReceipt ? 0 : null }],
     receipts,
   };
 }
@@ -474,6 +478,7 @@ function baseRun(scenarioId) {
       run.final = finalClaim({
         authority: "typed_proof",
         outcome: "refuted",
+        evidence_ids: ["receipt-1"],
         proof_disposition: "contract_refuted",
         refutation_basis: "prohibited_scope_traversal",
       });
@@ -914,7 +919,7 @@ const MUTATIONS = [
         body.source_text_sha256 = "a".repeat(64);
       });
     },
-    error: /source_text_sha256.*host-supplied contract/u,
+    error: /semantic invariant.*source_text_sha256/u,
   },
   {
     name: "proof receipt must match exact-resolution evidence",
@@ -1047,6 +1052,114 @@ for (const host of ["codex", "cursor"]) {
       mutation.mutate(run);
       assert.throws(() => validate(host, run), mutation.error, mutation.name);
     }
+  });
+}
+
+const SEMANTIC_BINDING_MUTATIONS = [
+  {
+    name: "ContractProven with Unknown step and no receipt",
+    scenario: "typed_proof_contract_proven",
+    mutate(body) {
+      body.steps[0].status = "unknown";
+      body.steps[0].receipt = null;
+    },
+  },
+  {
+    name: "ContractRefuted with Unknown step",
+    scenario: "typed_proof_contract_refuted",
+    mutate(body) {
+      body.steps[0].status = "unknown";
+      body.steps[0].receipt = null;
+    },
+  },
+  {
+    name: "Unknown with Proven step",
+    scenario: "typed_proof_unknown",
+    mutate(body) {
+      body.steps[0].status = "proven";
+    },
+  },
+  {
+    name: "Unavailable with Proven step",
+    scenario: "typed_proof_unavailable",
+    mutate(body) {
+      body.steps[0].status = "proven";
+    },
+  },
+  {
+    name: "changed digest not derived from the request",
+    scenario: "typed_proof_contract_proven",
+    mutate(body) {
+      body.contract_digest = "a".repeat(64);
+      body.disposition.contract_digest = body.contract_digest;
+    },
+  },
+  {
+    name: "exact callsite start outside its hash-bound window",
+    scenario: "typed_proof_contract_proven",
+    mutate(body) {
+      body.receipts[0].exact_callsite_start_byte = body.receipts[0].line_window.byte_end;
+    },
+  },
+];
+
+for (const host of ["codex", "cursor"]) {
+  test(`${host} canonical proof semantic-binding matrix fails closed`, () => {
+    const accepted = [];
+    for (const mutation of SEMANTIC_BINDING_MUTATIONS) {
+      const run = baseRun(mutation.scenario);
+      mutateBody(run, 0, mutation.mutate);
+      try {
+        validate(host, run);
+        accepted.push(mutation.name);
+      } catch (error) {
+        assert.match(error.message, /proof result semantic invariant/u, mutation.name);
+      }
+    }
+    assert.deepEqual(accepted, [], `semantic mutations accepted through ${host}`);
+  });
+}
+
+const SELECTOR_GAP_KINDS = ["selector_missing", "selector_ambiguous", "non_callable_selector"];
+const STEP_GAP_KINDS = [
+  "direct_call_missing",
+  "recursive_call_not_representable",
+  "source_window_too_large",
+  "invalid_utf8",
+  "source_line_out_of_range",
+  "edge_containment_unproven",
+  "missing_direct_call_receipt",
+  "receipt_or_edge_already_used",
+  "projection_exclusion_conflicts_with_required_receipt",
+];
+
+for (const host of ["codex", "cursor"]) {
+  test(`${host} canonical proof gap indices use the projected step count`, () => {
+    const acceptedOutOfRange = [];
+    for (const [kind, indexField, validIndex, invalidIndex] of [
+      ...SELECTOR_GAP_KINDS.map((kind) => [kind, "selector_index", 1, 2]),
+      ...STEP_GAP_KINDS.map((kind) => [kind, "step_index", 0, 1]),
+    ]) {
+      const boundary = baseRun("typed_proof_unknown");
+      mutateBody(boundary, 0, (body) => {
+        body.disposition.gaps = [{ kind, [indexField]: validIndex }];
+      });
+      boundary.final.gap_ids = [kind];
+      assert.equal(validate(host, boundary).status, "pass", `${kind} accepted boundary`);
+
+      const outOfRange = baseRun("typed_proof_unknown");
+      mutateBody(outOfRange, 0, (body) => {
+        body.disposition.gaps = [{ kind, [indexField]: invalidIndex }];
+      });
+      outOfRange.final.gap_ids = [kind];
+      try {
+        validate(host, outOfRange);
+        acceptedOutOfRange.push(kind);
+      } catch (error) {
+        assert.match(error.message, /proof result semantic invariant.*gap index/u, kind);
+      }
+    }
+    assert.deepEqual(acceptedOutOfRange, [], `out-of-range gaps accepted through ${host}`);
   });
 }
 
