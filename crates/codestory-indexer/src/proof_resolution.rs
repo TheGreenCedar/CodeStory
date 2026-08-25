@@ -16759,6 +16759,111 @@ mod ruby_php_complexity_tests {
         ruby_php_resolution_work()
     }
 
+    fn ruby_declaration_work(declarations: usize, duplicate: bool) -> usize {
+        let mut source = String::new();
+        let mut nodes = Vec::new();
+        for index in 0..declarations {
+            let name = if duplicate {
+                "target".to_owned()
+            } else {
+                format!("target_{index}")
+            };
+            source.push_str(&format!("def {name}\nend\n"));
+            nodes.push(graph_node(
+                i64::try_from(index + 2).expect("node id"),
+                NodeKind::FUNCTION,
+                &name,
+                u32::try_from(index * 2 + 1).expect("line"),
+            ));
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .expect("Ruby grammar");
+        let tree = parser.parse(&source, None).expect("Ruby declarations");
+        reset_ruby_php_resolution_work();
+        let _ = RubyResolutionIndex::build(&tree, &source, NodeId(1), &nodes);
+        ruby_php_resolution_work()
+    }
+
+    fn projection_record(
+        language: &str,
+        file_id: i64,
+        declarations: usize,
+        duplicate: bool,
+    ) -> ResolutionCacheRecord {
+        let declarations = (0..declarations)
+            .map(|index| CachedTopLevelDeclaration {
+                name: if duplicate {
+                    "target".to_owned()
+                } else {
+                    format!("target_{file_id}_{index}")
+                },
+                declaration: NodeId(file_id * 10_000 + index as i64 + 1),
+                module_path: Vec::new(),
+                cross_module_visible: true,
+            })
+            .collect();
+        ResolutionCacheRecord {
+            path: PathBuf::from(format!(
+                "file_{file_id}.{}",
+                if language == "ruby" { "rb" } else { "php" }
+            )),
+            file: CachedResolutionFile {
+                file_id: NodeId(file_id),
+                source_sha256: "0".repeat(64),
+                language: language.to_owned(),
+                adapter_version: adapter_version(language).to_owned(),
+                parser_fingerprint: "0".repeat(64),
+                complete: true,
+                lookup_input_complete: true,
+                typescript_module: false,
+                top_level_declarations: declarations,
+                inherent_methods: Vec::new(),
+                classes: Vec::new(),
+                direct_exports: Vec::new(),
+                export_poison_all: false,
+                poisoned_export_names: Vec::new(),
+                rust_modules: Vec::new(),
+                rust_types: Vec::new(),
+                rust_uses: Vec::new(),
+                go_package: None,
+                java_kotlin_package: None,
+                php_namespace: (language == "php").then(|| "App".to_owned()),
+                c_cpp_file: None,
+            },
+            calls: Vec::new(),
+        }
+    }
+
+    fn projection_domain_work(files: usize, declarations: usize, duplicate: bool) -> usize {
+        let records = (0..files)
+            .flat_map(|index| {
+                [
+                    projection_record("ruby", index as i64 + 1, declarations, duplicate),
+                    projection_record(
+                        "php",
+                        index as i64 + files as i64 + 1,
+                        declarations,
+                        duplicate,
+                    ),
+                ]
+            })
+            .collect::<Vec<_>>();
+        reset_ruby_php_resolution_work();
+        let index = JavaKotlinProjectionIndex::prepare(&records);
+        for record in &records {
+            for declaration in &record.file.top_level_declarations {
+                if record.file.language == "ruby" {
+                    let _ = index.ruby_function(&declaration.name, declaration.declaration);
+                } else if let Some(namespace) = record.file.php_namespace.as_deref() {
+                    let _ = index.resolve("php", namespace, None, &declaration.name);
+                }
+            }
+        }
+        ruby_php_resolution_work()
+    }
+
     #[test]
     fn receiver_heavy_ruby_and_php_resolution_work_is_linear() {
         for (language, small, large) in [
@@ -16768,6 +16873,36 @@ mod ruby_php_complexity_tests {
             assert!(
                 large <= small.saturating_mul(2).saturating_add(32),
                 "{language} work grew superlinearly: 1x={small}, 2x={large}"
+            );
+        }
+    }
+
+    #[test]
+    fn ruby_php_preparation_domain_and_projection_work_is_independently_linear() {
+        let calls_1x = ruby_receiver_work(64) + php_receiver_work(64);
+        let calls_2x = ruby_receiver_work(128) + php_receiver_work(128);
+        let declarations_1x = ruby_declaration_work(64, false);
+        let declarations_2x = ruby_declaration_work(128, false);
+        let hostile_1x = ruby_declaration_work(64, true);
+        let hostile_2x = ruby_declaration_work(128, true);
+        let files_1x = projection_domain_work(32, 1, false);
+        let files_2x = projection_domain_work(64, 1, false);
+        let domains_1x = projection_domain_work(8, 8, true);
+        let domains_2x = projection_domain_work(16, 8, true);
+        let combined_1x = projection_domain_work(16, 4, false);
+        let combined_2x = projection_domain_work(32, 4, false);
+        for (class, small, large, allowance) in [
+            ("calls", calls_1x, calls_2x, 64),
+            ("declarations", declarations_1x, declarations_2x, 64),
+            ("duplicate hostile declarations", hostile_1x, hostile_2x, 64),
+            ("files", files_1x, files_2x, 64),
+            ("hostile domains", domains_1x, domains_2x, 64),
+            ("combined", combined_1x, combined_2x, 128),
+        ] {
+            assert!(small > 0, "{class} work was not counted");
+            assert!(
+                large <= small.saturating_mul(2).saturating_add(allowance),
+                "{class} work grew superlinearly: 1x={small}, 2x={large}"
             );
         }
     }

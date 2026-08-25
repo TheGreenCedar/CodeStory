@@ -1253,6 +1253,331 @@ fn ruby_require_relative_rejects_a_symlinked_source_target() -> anyhow::Result<(
 }
 
 #[test]
+fn ruby_and_php_dynamic_declaration_domains_never_authorize_a_fact() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "ruby_conditional_top_level",
+            "ruby",
+            "fixture.rb",
+            "if enabled\n  def target\n  end\nend\ndef caller\n  target\nend\n",
+            "target",
+        ),
+        (
+            "ruby_conditional_member",
+            "ruby",
+            "fixture.rb",
+            "class Worker\n  if enabled\n    def target\n    end\n  end\n  def caller\n    self.target\n  end\nend\n",
+            "target",
+        ),
+        (
+            "ruby_magic_declaration",
+            "ruby",
+            "fixture.rb",
+            "class Worker\n  def method_missing(name, *args)\n  end\n  def target\n  end\n  def caller\n    self.target\n  end\nend\n",
+            "target",
+        ),
+        (
+            "php_conditional_function",
+            "php",
+            "fixture.php",
+            "<?php\nnamespace App;\nif ($enabled) { function target() {} }\nfunction caller() { target(); }\n",
+            "target",
+        ),
+        (
+            "php_nested_function",
+            "php",
+            "fixture.php",
+            "<?php\nnamespace App;\nfunction caller() { function target() {} target(); }\n",
+            "target",
+        ),
+        (
+            "php_conditional_member",
+            "php",
+            "fixture.php",
+            "<?php\nnamespace App;\nclass Worker {\n  if ($enabled) { public function target() {} }\n  public function caller() { $this->target(); }\n}\n",
+            "target",
+        ),
+        (
+            "php_magic_declaration",
+            "php",
+            "fixture.php",
+            "<?php\nnamespace App;\nclass Worker {\n  public function __invoke() {}\n  public function target() {}\n  public function caller() { $this->target(); }\n}\n",
+            "target",
+        ),
+    ];
+    for (name, language, path, source, target) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+            })
+            .unwrap_or_else(|| panic!("{name} emitted no canonical fact: {facts:#?}"));
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "{name}: {fact:#?}"
+        );
+        assert!(
+            fact.target.is_none() && fact.edge_id.is_none(),
+            "{name}: {fact:#?}"
+        );
+        assert!(fact.evidence_chain.is_empty(), "{name}: {fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn ruby_complete_domain_closes_duplicates_reopening_and_relative_imports() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "cross_file_local_and_class_reopening",
+            vec![
+                (
+                    "lib/main.rb",
+                    concat!(
+                        "def local_target\nend\n",
+                        "def local_caller\n  local_target\nend\n",
+                        "class Worker\n",
+                        "  def member_target\n  end\n",
+                        "  def self_caller\n    self.member_target\n  end\n",
+                        "end\n",
+                        "def constructor_caller\n  Worker.new.member_target\nend\n",
+                    ),
+                ),
+                (
+                    "lib/reopen.rb",
+                    "def local_target\nend\nclass Worker\n  def unrelated\n  end\nend\n",
+                ),
+            ],
+            vec!["local_target", "member_target"],
+        ),
+        (
+            "relative_import_reopening",
+            vec![
+                (
+                    "lib/worker.rb",
+                    "class Worker\n  def imported_target\n  end\nend\n",
+                ),
+                (
+                    "lib/caller.rb",
+                    "require_relative \"worker\"\ndef caller\n  Worker.new.imported_target\nend\n",
+                ),
+                (
+                    "lib/reopen.rb",
+                    "class Worker\n  def unrelated\n  end\nend\n",
+                ),
+            ],
+            vec!["imported_target"],
+        ),
+    ];
+    for (name, files, targets) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        for target in targets {
+            let matching = facts
+                .iter()
+                .filter(|fact| {
+                    fact.provenance.language_adapter == "ruby" && fact.callsite.raw_target == target
+                })
+                .collect::<Vec<_>>();
+            assert!(!matching.is_empty(), "{name} {target}: {facts:#?}");
+            assert!(
+                matching.iter().all(|fact| {
+                    fact.status != ProofResolutionStatus::Exact
+                        && fact.target.is_none()
+                        && fact.edge_id.is_none()
+                        && fact.evidence_chain.is_empty()
+                }),
+                "{name} {target}: {matching:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn php_global_and_named_namespace_domains_are_complete_and_replay_bound() -> anyhow::Result<()> {
+    let exact_domains = [
+        (
+            "global",
+            vec![
+                (
+                    "src/Caller.php",
+                    concat!(
+                        "<?php\nfunction global_target() {}\n",
+                        "class Worker { public function memberTarget() {} }\n",
+                        "function global_caller() { global_target(); (new Worker())->memberTarget(); }\n",
+                    ),
+                ),
+                (
+                    "src/Unrelated.php",
+                    "<?php\nfunction unrelated_global() {}\n",
+                ),
+            ],
+            vec!["global_target", "memberTarget"],
+        ),
+        (
+            "named",
+            vec![
+                (
+                    "src/App/Caller.php",
+                    concat!(
+                        "<?php\nnamespace App;\nfunction named_target() {}\n",
+                        "class Worker { public function memberTarget() {} }\n",
+                        "function named_caller() { named_target(); (new Worker())->memberTarget(); }\n",
+                    ),
+                ),
+                (
+                    "src/App/Unrelated.php",
+                    "<?php\nnamespace App;\nfunction unrelated_named() {}\n",
+                ),
+                (
+                    "src/Other/Other.php",
+                    "<?php\nnamespace Other;\nfunction outside_domain() {}\n",
+                ),
+            ],
+            vec!["named_target", "memberTarget"],
+        ),
+    ];
+    for (name, files, targets) in exact_domains {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let domain_file_ids = store
+            .get_files()?
+            .into_iter()
+            .filter(|file| {
+                file.path.ends_with("Caller.php") || file.path.ends_with("Unrelated.php")
+            })
+            .map(|file| FileId(file.id))
+            .collect::<BTreeSet<_>>();
+        for target in targets {
+            let fact = facts
+                .iter()
+                .find(|fact| {
+                    fact.provenance.language_adapter == "php"
+                        && fact.callsite.raw_target == target
+                        && fact.status == ProofResolutionStatus::Exact
+                })
+                .unwrap_or_else(|| panic!("{name} {target}: {facts:#?}"));
+            let dependencies = fact
+                .provenance
+                .dependency_file_hashes
+                .iter()
+                .map(|dependency| dependency.file_id)
+                .collect::<BTreeSet<_>>();
+            assert!(
+                domain_file_ids.is_subset(&dependencies),
+                "{name} {target}: {fact:#?}"
+            );
+        }
+    }
+
+    for sibling in [
+        "<?php\nnamespace App;\nfunction target() {}\n",
+        "<?php\nnamespace App;\nfunction broken( {\n",
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    "src/App/Caller.php",
+                    "<?php\nnamespace App;\nfunction target() {}\nfunction caller() { target(); }\n",
+                ),
+                ("src/App/Sibling.php", sibling),
+            ],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == "php" && fact.callsite.raw_target == "target"
+            })
+            .expect("PHP duplicate/incomplete domain fact");
+        assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+        assert!(fact.target.is_none() && fact.edge_id.is_none());
+    }
+
+    for mutation in ["source_drift", "missing_dependency"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    "src/App/Caller.php",
+                    "<?php\nnamespace App;\nfunction target() {}\nfunction caller() { target(); }\n",
+                ),
+                (
+                    "src/App/Sibling.php",
+                    "<?php\nnamespace App;\nfunction unrelated() {}\n",
+                ),
+            ],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let sibling = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path.ends_with("Sibling.php"))
+            .expect("PHP namespace sibling");
+        if mutation == "source_drift" {
+            store.get_connection().execute(
+                "UPDATE file SET content_hash = ?1 WHERE id = ?2",
+                ("0".repeat(64), sibling.id),
+            )?;
+            assert!(
+                store
+                    .validate_proof_resolution_publication(&publication(1))
+                    .is_err()
+            );
+        } else {
+            let receipt = store
+                .get_proof_resolution_publication()?
+                .expect("PHP proof publication");
+            let mut facts = store.get_proof_resolution_facts()?;
+            let fact = facts
+                .iter_mut()
+                .find(|fact| {
+                    fact.provenance.language_adapter == "php"
+                        && fact.callsite.raw_target == "target"
+                })
+                .expect("PHP exact target fact");
+            fact.provenance
+                .dependency_file_hashes
+                .retain(|dependency| dependency.file_id != FileId(sibling.id));
+            *fact = seal_call_resolution_fact(fact.clone())?;
+            let projection = ProofResolutionProjection {
+                adapter_roster: receipt.adapter_roster,
+                funnel: build_proof_resolution_funnel(&facts),
+                facts,
+            };
+            assert!(
+                store
+                    .replace_proof_resolution_projection(&publication(2), &projection)
+                    .is_err()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn java_and_kotlin_exact_facts_reject_resealed_raw_call_mutation() -> anyhow::Result<()> {
     for (language, path, source) in [
         (
