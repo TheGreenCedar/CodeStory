@@ -55,6 +55,7 @@ plugin result unless the user explicitly asks.
 | Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
 | Find a symbol | `symbol`, then `definition` or `snippet`. |
 | Follow a call path | `callers`, `callees`, `trace`, or `trail`. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node. |
+| Verify an already translated exact call-path contract | `prove_call_path`, only when the host or user supplied the complete `source_text`, typed clauses, and exact spec. Do not infer or assemble this contract automatically. |
 | Review change impact | `affected` with explicit Git-changed `paths` (or `changed_paths` / `change_records`). Never omit the path source. |
 | One graph node | `get_node`, `definition`, `references`, or `symbols`. |
 | Broad structural question | `packet`; answer only from its evidence rows, name its gaps, and stop unless it returns one bounded continuation. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
@@ -71,6 +72,10 @@ plugin result unless the user explicitly asks.
   claim is true. Cite only the returned evidence rows and state every material
   returned gap. Never turn `available` into authority for a claim the rows do
   not establish.
+- `prove_call_path` is the only surface that returns `contract_proven` or
+  `contract_refuted`. It verifies a host-supplied interpretation; it does not
+  translate prose. Never call it automatically from a packet, search result,
+  context result, or guessed natural-language contract.
 - When `packet.status=continuation_available`, execute only the returned bounded
   continuation, once, against its pinned publication: repeat the question with
   `parent_packet_id=continuation.continuation_id`, use

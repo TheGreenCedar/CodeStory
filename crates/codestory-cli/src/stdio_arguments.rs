@@ -94,8 +94,17 @@ pub(crate) fn validate_tool_arguments(
     tool: &str,
     arguments: Option<&Value>,
 ) -> Result<(), Vec<ArgumentViolation>> {
-    let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
-        return Ok(());
+    let proof_schema;
+    let schema = if tool == "prove_call_path" {
+        proof_schema = crate::stdio_v3::catalog::proof_tool_source_v3();
+        proof_schema
+            .get("inputSchema")
+            .expect("proof tool source declares inputSchema")
+    } else {
+        let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
+            return Ok(());
+        };
+        schema
     };
     // The dispatcher deliberately admits absent and null arguments; both mean
     // "no arguments supplied", which the schema still has to accept or reject.

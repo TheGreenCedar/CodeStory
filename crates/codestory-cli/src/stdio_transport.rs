@@ -1665,7 +1665,7 @@ fn handle_stdio_request(
                     "Invalid params: missing tool name",
                 ));
             };
-            if !is_stdio_tool_name(name) {
+            if !is_stdio_tool_name(name) && name != "prove_call_path" {
                 return Some(stdio_jsonrpc_error(
                     id,
                     -32602,
@@ -1688,6 +1688,12 @@ fn handle_stdio_request(
             }
             let prepared = match prepare_stdio_tool_call(session, name, &request) {
                 Ok(prepared) => prepared,
+                Err(error) if name == "prove_call_path" => {
+                    return Some(crate::stdio_v3::jsonrpc_invalid_params_v3(
+                        id,
+                        &error.message,
+                    ));
+                }
                 Err(error) => {
                     return Some(stdio_jsonrpc_success(
                         id,
@@ -1729,7 +1735,15 @@ fn handle_stdio_request(
                     });
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
                 }
-                let activation = if observes_complete_core {
+                let activation = if name == "prove_call_path" {
+                    runtime
+                        .activation
+                        .bind_existing_complete_core_for_observation(
+                            &runtime.project_root,
+                            &runtime.storage_path,
+                            Arc::clone(cancelled),
+                        )
+                } else if observes_complete_core {
                     runtime.activation.ensure_complete_core_for_observation(
                         &runtime.project_root,
                         &runtime.storage_path,
@@ -1855,6 +1869,82 @@ fn handle_stdio_request(
                     }
                 }
                 state.status_cache = None;
+            }
+            if name == "prove_call_path" {
+                let PreparedStdioToolCall::ProveCallPath(proof_request) = &prepared else {
+                    return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
+                };
+                let validation =
+                    match crate::prove_call_path::validate_request(proof_request.clone()) {
+                        Ok(validation) => validation,
+                        Err(message) => {
+                            return Some(stdio_jsonrpc_success(
+                                id,
+                                crate::stdio_v3::semantic_tool_error_v3(&message),
+                            ));
+                        }
+                    };
+                let root = match validation {
+                    codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
+                        contract,
+                        hashes,
+                        rendering,
+                    } => {
+                        let operation = match codestory_runtime::proof_qualification_support::
+                            run_observed_call_path_public_operation(
+                                &runtime.runtime,
+                                &contract,
+                                &hashes,
+                                &rendering,
+                                Arc::clone(cancelled),
+                            ) {
+                            Ok(operation) => operation,
+                            Err(error) => {
+                                return Some(stdio_jsonrpc_success(
+                                    id,
+                                    crate::stdio_v3::semantic_tool_error_v3(&error.message),
+                                ));
+                            }
+                        };
+                        match crate::prove_call_path::projection_root(&operation) {
+                            Ok(root) => root,
+                            Err(_) => {
+                                return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
+                            }
+                        }
+                    }
+                    codestory_runtime::proof_qualification_support::ValidationOutcome::Unknown {
+                        spec,
+                        hashes,
+                        rendering,
+                        gaps,
+                    } => {
+                        let operation = match codestory_runtime::proof_qualification_support::
+                            run_translation_unknown_public_operation(
+                                &runtime.runtime,
+                                &spec,
+                                &hashes,
+                                &rendering,
+                                &gaps,
+                                Arc::clone(cancelled),
+                            ) {
+                            Ok(operation) => operation,
+                            Err(error) => {
+                                return Some(stdio_jsonrpc_success(
+                                    id,
+                                    crate::stdio_v3::semantic_tool_error_v3(&error.message),
+                                ));
+                            }
+                        };
+                        crate::prove_call_path::internal_projection_root(&operation.value)
+                    }
+                };
+                return Some(
+                    match crate::stdio_v3::build_proof_tool_result_v3(revision, &root) {
+                        Ok(result) => stdio_jsonrpc_success(id, result),
+                        Err(error) => crate::stdio_v3::jsonrpc_internal_error_v3(id, &error),
+                    },
+                );
             }
             // Public-operation retry belongs to codestory-runtime's pinned
             // retrieval wrapper. The transport executes one logical operation
@@ -2632,7 +2722,7 @@ fn stdio_tool_reads_publication(name: &str) -> bool {
 }
 
 fn stdio_tool_observes_complete_core(name: &str) -> bool {
-    name == "affected"
+    matches!(name, "affected" | "prove_call_path")
 }
 
 fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -> &'a str {
@@ -3456,6 +3546,7 @@ enum PreparedStdioToolCall {
     Raw,
     Affected(AffectedAnalysisRequest),
     Snippet(StdioSnippetRequest),
+    ProveCallPath(crate::prove_call_path::ProveCallPathRequestDto),
 }
 
 #[derive(Debug, Clone)]
@@ -3478,6 +3569,19 @@ fn prepare_stdio_tool_call(
             Ok(PreparedStdioToolCall::Affected(affected))
         }
         "snippet" => stdio_snippet_request(request).map(PreparedStdioToolCall::Snippet),
+        "prove_call_path" => {
+            let mut arguments = request
+                .pointer("/params/arguments")
+                .cloned()
+                .ok_or_else(|| ApiError::invalid_argument("proof arguments must be an object"))?;
+            arguments
+                .as_object_mut()
+                .ok_or_else(|| ApiError::invalid_argument("proof arguments must be an object"))?
+                .remove("project");
+            crate::prove_call_path::parse_request(arguments)
+                .map(PreparedStdioToolCall::ProveCallPath)
+                .map_err(ApiError::invalid_argument)
+        }
         _ => Ok(PreparedStdioToolCall::Raw),
     }
 }

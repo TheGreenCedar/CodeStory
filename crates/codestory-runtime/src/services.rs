@@ -742,6 +742,36 @@ impl ActivationService {
         }
     }
 
+    /// Bind an already-complete core publication without starting managed
+    /// activation. Strictly observational tools use this path so a cold or
+    /// fenced cache stays unavailable instead of triggering indexing or
+    /// retrieval preparation.
+    pub fn bind_existing_complete_core_for_observation(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<(), ApiError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ApiError::new(
+                "cancelled",
+                "request cancelled before observational core admission",
+            ));
+        }
+        match self.classify_complete_core_admission(project_root, storage_path) {
+            CompleteCoreAdmission::Complete => Ok(()),
+            CompleteCoreAdmission::Corrupt(error) => Err(error),
+            CompleteCoreAdmission::Cold => Err(ApiError::new(
+                "proof_semantic_projection_unavailable",
+                "no complete exact-proof core publication is available",
+            )),
+            CompleteCoreAdmission::Fenced => Err(ApiError::new(
+                "proof_semantic_projection_unavailable",
+                "the exact-proof core publication is fenced by an incomplete index run",
+            )),
+        }
+    }
+
     fn classify_complete_core_admission(
         &self,
         project_root: &Path,

@@ -1,4 +1,4 @@
-mod catalog;
+pub(crate) mod catalog;
 mod diagnostics;
 mod discovery;
 mod profile;
@@ -13,8 +13,8 @@ pub(crate) use discovery::NativeSessionV3;
 pub(crate) use discovery::discovery_contract_v3;
 pub(crate) use profile::McpRevisionV3;
 pub(crate) use transport::{
-    FrameResponseV3, build_tool_result_v3, jsonrpc_internal_error_v3, process_jsonrpc_frame_v3,
-    semantic_tool_error_v3,
+    FrameResponseV3, build_proof_tool_result_v3, build_tool_result_v3, jsonrpc_internal_error_v3,
+    jsonrpc_invalid_params_v3, process_jsonrpc_frame_v3, semantic_tool_error_v3,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

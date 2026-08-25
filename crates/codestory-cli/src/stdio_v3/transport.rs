@@ -95,7 +95,6 @@ pub(crate) fn build_proof_tool_result_v3(
     {
         return Err(StdioV3InternalError::OutputSchemaViolation);
     }
-    #[cfg(feature = "proof-qualification-support")]
     codestory_runtime::proof_qualification_support::validate_compact_projection(root)
         .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let result = build_tool_result_for_surface_v3(
@@ -119,7 +118,6 @@ pub(crate) fn build_proof_tool_result_v3(
     {
         return Err(StdioV3InternalError::OutputSchemaViolation);
     }
-    #[cfg(feature = "proof-qualification-support")]
     codestory_runtime::proof_qualification_support::validate_compact_projection(&fallback)
         .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let fallback_result = build_tool_result_for_surface_v3(

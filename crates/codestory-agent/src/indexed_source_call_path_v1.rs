@@ -469,7 +469,9 @@ pub enum ValidationOutcome {
         rendering: ValidatedContractRendering,
     },
     Unknown {
+        spec: CallPathSpec,
         hashes: ProofHashes,
+        rendering: ValidatedContractRendering,
         gaps: Vec<TranslationGap>,
     },
 }
@@ -605,7 +607,12 @@ fn validate_contract_with_domain(
             rendering: ValidatedContractRendering { normalized_clauses },
         })
     } else {
-        Ok(ValidationOutcome::Unknown { hashes, gaps })
+        Ok(ValidationOutcome::Unknown {
+            spec,
+            hashes,
+            rendering: ValidatedContractRendering { normalized_clauses },
+            gaps,
+        })
     }
 }
 
@@ -4241,31 +4248,129 @@ fn validate_compact_gaps(gaps: &[Value], step_count: usize) -> Result<(), String
     for gap in gaps {
         let gap = compact_object(gap, "compact_disposition_gap_invalid")?;
         let kind = compact_string(gap, "kind", "compact_disposition_gap_invalid")?;
-        let (rank, index, index_field) = match kind {
-            "selector_missing" => (0_u8, selector_gap_index(gap, step_count)?, "selector_index"),
-            "selector_ambiguous" => (1, selector_gap_index(gap, step_count)?, "selector_index"),
-            "non_callable_selector" => (2, selector_gap_index(gap, step_count)?, "selector_index"),
-            "direct_call_missing" => (3, step_gap_index(gap, step_count)?, "step_index"),
-            "recursive_call_not_representable" => {
-                (4, step_gap_index(gap, step_count)?, "step_index")
+        let (rank, identity, fields): (u8, String, &[&str]) = match kind {
+            "unclassified_source_text" => (0, String::new(), &["kind"]),
+            "unresolved_material_clause" => {
+                let clause_id =
+                    compact_string(gap, "clause_id", "compact_disposition_gap_invalid")?;
+                let reason = compact_string(gap, "reason", "compact_disposition_gap_invalid")?;
+                if clause_id.is_empty()
+                    || !matches!(
+                        reason,
+                        "missing_selector_resolution"
+                            | "ambiguous_selector_resolution"
+                            | "unsupported_interpretation"
+                    )
+                {
+                    return Err("compact_disposition_gap_invalid".to_owned());
+                }
+                (
+                    1,
+                    format!("{clause_id}\0{reason}"),
+                    &["kind", "clause_id", "reason"],
+                )
             }
-            "source_window_too_large" => (5, step_gap_index(gap, step_count)?, "step_index"),
-            "invalid_utf8" => (6, step_gap_index(gap, step_count)?, "step_index"),
-            "source_line_out_of_range" => (7, step_gap_index(gap, step_count)?, "step_index"),
-            "edge_containment_unproven" => (8, step_gap_index(gap, step_count)?, "step_index"),
-            "missing_direct_call_receipt" => (9, step_gap_index(gap, step_count)?, "step_index"),
-            "receipt_or_edge_already_used" => (10, step_gap_index(gap, step_count)?, "step_index"),
-            "projection_exclusion_conflicts_with_required_receipt" => {
-                (11, step_gap_index(gap, step_count)?, "step_index")
+            "material_token_misclassified" => {
+                let clause_id =
+                    compact_string(gap, "clause_id", "compact_disposition_gap_invalid")?;
+                let families =
+                    compact_array(gap.get("guard_families"), "compact_disposition_gap_invalid")?;
+                if clause_id.is_empty() || families.is_empty() || families.len() > 8 {
+                    return Err("compact_disposition_gap_invalid".to_owned());
+                }
+                let mut prior_family = None;
+                let mut family_names = Vec::with_capacity(families.len());
+                for family in families {
+                    let family = family
+                        .as_str()
+                        .ok_or_else(|| "compact_disposition_gap_invalid".to_owned())?;
+                    let rank = match family {
+                        "quoted_or_backticked_identifier" => 0,
+                        "arrow_or_relation_notation" => 1,
+                        "directness" => 2,
+                        "ordering_or_ordinal" => 3,
+                        "only" => 4,
+                        "negation_or_exclusion" => 5,
+                        "path_like_string" => 6,
+                        "qualified_symbol_notation" => 7,
+                        _ => return Err("compact_disposition_gap_invalid".to_owned()),
+                    };
+                    if prior_family.is_some_and(|prior| prior >= rank) {
+                        return Err("compact_disposition_gap_invalid".to_owned());
+                    }
+                    prior_family = Some(rank);
+                    family_names.push(family);
+                }
+                (
+                    2,
+                    format!("{clause_id}\0{}", family_names.join("\0")),
+                    &["kind", "clause_id", "guard_families"],
+                )
             }
+            "selector_missing" => (
+                3,
+                format!("{:020}", selector_gap_index(gap, step_count)?),
+                &["kind", "selector_index"],
+            ),
+            "selector_ambiguous" => (
+                4,
+                format!("{:020}", selector_gap_index(gap, step_count)?),
+                &["kind", "selector_index"],
+            ),
+            "non_callable_selector" => (
+                5,
+                format!("{:020}", selector_gap_index(gap, step_count)?),
+                &["kind", "selector_index"],
+            ),
+            "direct_call_missing" => (
+                6,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
+            "recursive_call_not_representable" => (
+                7,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
+            "source_window_too_large" => (
+                8,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
+            "invalid_utf8" => (
+                9,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
+            "source_line_out_of_range" => (
+                10,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
+            "edge_containment_unproven" => (
+                11,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
+            "missing_direct_call_receipt" => (
+                12,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
+            "receipt_or_edge_already_used" => (
+                13,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
+            "projection_exclusion_conflicts_with_required_receipt" => (
+                14,
+                format!("{:020}", step_gap_index(gap, step_count)?),
+                &["kind", "step_index"],
+            ),
             _ => return Err("compact_disposition_gap_invalid".to_owned()),
         };
-        compact_closed_object(
-            gap,
-            &["kind", index_field],
-            "compact_disposition_gap_invalid",
-        )?;
-        let key = (rank, index);
+        compact_closed_object(gap, fields, "compact_disposition_gap_invalid")?;
+        let key = (rank, identity);
         if prior.is_some_and(|prior| prior >= key) {
             return Err("compact_disposition_gaps_noncanonical".to_owned());
         }
@@ -4382,6 +4487,81 @@ pub fn project_internal_call_path_result(
         serialized_size: serialized_json_size(&complete)?,
         root: complete,
     })
+}
+
+pub fn project_translation_unknown_result(
+    spec: &CallPathSpec,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    gaps: &[TranslationGap],
+    publication: &InternalCorePublicationIdentity,
+) -> Result<InternalProjection, InternalProjectionError> {
+    let identities = CompactIdentityTables::default();
+    let complete = json!({
+        "kind": "complete",
+        "schema_version": PROOF_CONTRACT_SCHEMA_VERSION,
+        "domain": PROOF_DOMAIN,
+        "contract_interpretation": "host_supplied",
+        "guard_version": CLAUSE_GUARD_VERSION,
+        "source_text_sha256": hashes.source_text_sha256,
+        "contract_digest": hashes.contract_digest,
+        "core_publication": publication_json(publication),
+        "identities": identities.json(),
+        "spec": compact_spec_json(spec, &[], &identities)?,
+        "clauses": grouped_clauses_json(&rendering.normalized_clauses),
+        "disposition": {
+            "kind": "unknown",
+            "contract_digest": hashes.contract_digest,
+            "gaps": gaps.iter().map(translation_gap_json).collect::<Vec<_>>(),
+            "connected_receipts": [],
+        },
+        "steps": spec.steps.iter().enumerate().map(|(step_index, _)| json!({
+            "step_index": step_index,
+            "status": "unknown",
+            "receipt": null,
+        })).collect::<Vec<_>>(),
+        "receipts": [],
+    });
+    validate_compact_projection(&complete)
+        .map_err(InternalProjectionError::InvalidCompactProjection)?;
+    Ok(InternalProjection::Complete {
+        serialized_size: serialized_json_size(&complete)?,
+        root: complete,
+    })
+}
+
+fn translation_gap_json(gap: &TranslationGap) -> Value {
+    match gap {
+        TranslationGap::UnclassifiedSourceText => {
+            json!({ "kind": "unclassified_source_text" })
+        }
+        TranslationGap::UnresolvedMaterialClause { clause_id, reason } => json!({
+            "kind": "unresolved_material_clause",
+            "clause_id": clause_id,
+            "reason": reason.canonical_name(),
+        }),
+        TranslationGap::MaterialTokenMisclassified {
+            clause_id,
+            guard_families,
+        } => json!({
+            "kind": "material_token_misclassified",
+            "clause_id": clause_id,
+            "guard_families": guard_families.iter().map(clause_guard_family_name).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn clause_guard_family_name(family: &ClauseGuardFamily) -> &'static str {
+    match family {
+        ClauseGuardFamily::QuotedOrBacktickedIdentifier => "quoted_or_backticked_identifier",
+        ClauseGuardFamily::ArrowOrRelationNotation => "arrow_or_relation_notation",
+        ClauseGuardFamily::Directness => "directness",
+        ClauseGuardFamily::OrderingOrOrdinal => "ordering_or_ordinal",
+        ClauseGuardFamily::Only => "only",
+        ClauseGuardFamily::NegationOrExclusion => "negation_or_exclusion",
+        ClauseGuardFamily::PathLikeString => "path_like_string",
+        ClauseGuardFamily::QualifiedSymbolNotation => "qualified_symbol_notation",
+    }
 }
 
 fn grouped_clauses_json(clauses: &[NormalizedClause]) -> Vec<Value> {

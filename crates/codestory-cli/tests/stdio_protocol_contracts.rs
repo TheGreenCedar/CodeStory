@@ -49,7 +49,7 @@ const GROUNDING_ORIENTATION_UNCERTAINTY_WIRE_VALUES: [&str; 7] = {
 };
 
 #[test]
-fn public_v3_outcome_c_negotiates_revision_native_evidence_only_discovery() {
+fn public_v3_outcome_a_negotiates_revision_native_discovery_with_exact_proof() {
     let profiles: Value = serde_json::from_str(include_str!("fixtures/mcp_protocol_profiles.json"))
         .expect("compatibility profile fixture json");
     let revisions = profiles
@@ -160,15 +160,32 @@ fn public_v3_outcome_c_negotiates_revision_native_evidence_only_discovery() {
         let tools = assert_success_envelope(&listed, json!("list"))["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 20);
-        for route in ["packet", "context", "search"] {
+        assert_eq!(tools.len(), 21);
+        for route in ["packet", "context", "search", "prove_call_path"] {
             assert_eq!(
                 tools.iter().filter(|tool| tool["name"] == route).count(),
                 1,
                 "{route} must register exactly once"
             );
         }
-        assert!(!tools.iter().any(|tool| tool["name"] == "prove_call_path"));
+        let proof = tools
+            .iter()
+            .find(|tool| tool["name"] == "prove_call_path")
+            .expect("exact proof tool");
+        assert!(proof.get("safety").is_none());
+        if revision >= "2025-03-26" {
+            assert_eq!(
+                proof.pointer("/annotations/readOnlyHint"),
+                Some(&json!(true))
+            );
+        } else {
+            assert!(proof.get("annotations").is_none());
+        }
+        if revision >= "2025-06-18" {
+            assert_eq!(proof.pointer("/outputSchema/type"), Some(&json!("object")));
+        } else {
+            assert!(proof.get("outputSchema").is_none());
+        }
         let packet = tools
             .iter()
             .find(|tool| tool["name"] == "packet")
@@ -229,6 +246,119 @@ fn public_v3_outcome_c_negotiates_revision_native_evidence_only_discovery() {
         );
         assert_eq!(invalid.pointer("/error/code"), Some(&json!(-32602)));
     }
+}
+
+#[test]
+fn public_exact_proof_call_is_revision_native_and_keeps_uncertainty_successful() {
+    let fixture = indexed_proof_fixture();
+    let exact = exact_proof_arguments(&fixture);
+    for revision in ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"] {
+        let mut server = spawn_stdio_server(&fixture);
+        let initialized = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"init",
+                "method":"initialize",
+                "params":{
+                    "protocolVersion":revision,
+                    "capabilities":{},
+                    "clientInfo":{"name":"proof-contract","version":"0"}
+                }
+            }),
+        );
+        assert_success_envelope(&initialized, json!("init"));
+
+        let proven = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"proven",
+                "method":"tools/call",
+                "params":{"name":"prove_call_path","arguments":exact}
+            }),
+        );
+        let result = assert_success_envelope(&proven, json!("proven"));
+        assert_eq!(result["isError"], false, "{proven}");
+        let text_root = serde_json::from_str::<Value>(
+            result
+                .pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .unwrap(),
+        )
+        .expect("proof text JSON");
+        assert_eq!(
+            text_root.pointer("/disposition/kind"),
+            Some(&json!("contract_proven")),
+            "{text_root}"
+        );
+        if revision >= "2025-06-18" {
+            assert_eq!(result["structuredContent"], text_root);
+        } else {
+            assert!(result.get("structuredContent").is_none());
+        }
+
+        let mut unknown_arguments = exact.clone();
+        unknown_arguments["spec"]["steps"][0]["target"]["canonical_id"] =
+            json!("rust:missing-proof-target");
+        let unknown = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"unknown",
+                "method":"tools/call",
+                "params":{"name":"prove_call_path","arguments":unknown_arguments}
+            }),
+        );
+        let result = assert_success_envelope(&unknown, json!("unknown"));
+        assert_eq!(result["isError"], false, "{unknown}");
+        let root = serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+            .expect("unknown proof JSON");
+        assert_eq!(root.pointer("/disposition/kind"), Some(&json!("unknown")));
+
+        let mut incomplete_translation = exact.clone();
+        incomplete_translation["source_text"] = json!(format!(
+            "{} extra",
+            incomplete_translation["source_text"].as_str().unwrap()
+        ));
+        let incomplete_translation = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"translation-unknown",
+                "method":"tools/call",
+                "params":{"name":"prove_call_path","arguments":incomplete_translation}
+            }),
+        );
+        let result = assert_success_envelope(&incomplete_translation, json!("translation-unknown"));
+        assert_eq!(result["isError"], false, "{incomplete_translation}");
+        let root = serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+            .expect("translation unknown proof JSON");
+        assert_eq!(root.pointer("/disposition/kind"), Some(&json!("unknown")));
+        assert_eq!(
+            root.pointer("/disposition/gaps/0/kind"),
+            Some(&json!("unclassified_source_text"))
+        );
+
+        let mut invalid = exact.clone();
+        invalid["clauses"][0]["quote"] = json!("different text");
+        let invalid = send_json(
+            &mut server,
+            json!({
+                "jsonrpc":"2.0",
+                "id":"semantic",
+                "method":"tools/call",
+                "params":{"name":"prove_call_path","arguments":invalid}
+            }),
+        );
+        let result = assert_success_envelope(&invalid, json!("semantic"));
+        assert_eq!(result["isError"], true, "{invalid}");
+        assert!(result.get("structuredContent").is_none());
+    }
+    assert!(
+        !fixture.cache_dir.path().join("search-generations").exists(),
+        "proof execution must not initialize semantic retrieval"
+    );
 }
 
 #[test]
@@ -379,7 +509,7 @@ fn native_v3_rejects_the_launcher_invalid_argument_parity_matrix() {
 }
 
 #[test]
-fn public_v3_packet_cli_exposes_diagnostics_without_evidence_or_proof_switches() {
+fn public_v3_cli_exposes_exact_proof_without_packet_proof_switches() {
     let output = test_support::cli_command()
         .args(["packet", "--help"])
         .output()
@@ -396,6 +526,193 @@ fn public_v3_packet_cli_exposes_diagnostics_without_evidence_or_proof_switches()
     );
     assert!(!help.contains("--no-evidence"), "{help}");
     assert!(!help.contains("prove-call-path"), "{help}");
+
+    let output = test_support::cli_command()
+        .args(["prove-call-path", "--help"])
+        .output()
+        .expect("run prove-call-path help");
+    assert!(
+        output.status.success(),
+        "prove-call-path help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let help = String::from_utf8(output.stdout).expect("UTF-8 prove-call-path help");
+    assert!(help.contains("--project <ROOT>"), "{help}");
+    assert!(help.contains("--spec <PATH>"), "{help}");
+    for forbidden in [
+        "--profile",
+        "--run-id",
+        "--retrieval-generation",
+        "--latency-budget",
+        "--evidence",
+    ] {
+        assert!(!help.contains(forbidden), "{help}");
+    }
+}
+
+#[test]
+fn prove_call_path_cli_keeps_file_stdin_dto_parity_and_caps_before_deserialization() {
+    let workspace = tempfile::tempdir().expect("CLI proof workspace");
+    let cache_root = tempfile::tempdir().expect("CLI proof cache root");
+    let spec_root = tempfile::tempdir().expect("CLI proof spec root");
+    write_tiny_rust_workspace(workspace.path());
+    let mut index = test_support::cli_command();
+    index
+        .args([
+            "index",
+            "--refresh",
+            "full",
+            "--format",
+            "json",
+            "--project",
+        ])
+        .arg(workspace.path())
+        .env("CODESTORY_CACHE_ROOT", cache_root.path())
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root.path());
+    allow_explicit_cpu_embeddings(&mut index);
+    let indexed = index.output().expect("index CLI proof workspace");
+    assert!(
+        indexed.status.success(),
+        "index failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let spec = unknown_proof_spec();
+    let spec_file = spec_root.path().join("proof-spec.json");
+    fs::write(&spec_file, serde_json::to_vec(&spec).unwrap()).expect("write proof spec");
+    let mut from_file = test_support::cli_command();
+    from_file
+        .args(["prove-call-path", "--project"])
+        .arg(workspace.path())
+        .arg("--spec")
+        .arg(&spec_file)
+        .env("CODESTORY_CACHE_ROOT", cache_root.path())
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root.path());
+    let from_file = from_file.output().expect("run file proof");
+    assert!(
+        from_file.status.success(),
+        "file proof failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&from_file.stdout),
+        String::from_utf8_lossy(&from_file.stderr)
+    );
+
+    let mut from_stdin = test_support::cli_command();
+    from_stdin
+        .args(["prove-call-path", "--project"])
+        .arg(workspace.path())
+        .args(["--spec", "-"])
+        .env("CODESTORY_CACHE_ROOT", cache_root.path())
+        .env("CODESTORY_STDIO_CACHE_ROOT", cache_root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child = from_stdin.spawn().expect("spawn stdin proof");
+    child
+        .stdin
+        .take()
+        .expect("proof stdin")
+        .write_all(&serde_json::to_vec(&spec).unwrap())
+        .expect("write stdin proof");
+    let from_stdin = child.wait_with_output().expect("wait stdin proof");
+    assert!(
+        from_stdin.status.success(),
+        "stdin proof failed: {}",
+        String::from_utf8_lossy(&from_stdin.stderr)
+    );
+    let file_root: Value = serde_json::from_slice(&from_file.stdout).expect("file proof JSON");
+    let stdin_root: Value = serde_json::from_slice(&from_stdin.stdout).expect("stdin proof JSON");
+    assert_eq!(file_root, stdin_root);
+    assert_eq!(
+        file_root.pointer("/disposition/kind"),
+        Some(&json!("unknown"))
+    );
+
+    let mut capped = unknown_proof_spec();
+    capped["padding"] = json!("");
+    let baseline = serde_json::to_vec(&capped).unwrap().len();
+    capped["padding"] = json!("x".repeat(64 * 1024 - baseline));
+    let capped = serde_json::to_vec(&capped).unwrap();
+    assert_eq!(capped.len(), 64 * 1024);
+    for (label, bytes, exceeds) in [
+        ("cap", capped.clone(), false),
+        ("cap-plus-one", [capped, vec![b' ']].concat(), true),
+    ] {
+        let path = spec_root.path().join(format!("{label}.json"));
+        fs::write(&path, bytes).expect("write capped proof input");
+        let mut command = test_support::cli_command();
+        command
+            .args(["prove-call-path", "--project"])
+            .arg(workspace.path())
+            .arg("--spec")
+            .arg(path)
+            .env("CODESTORY_CACHE_ROOT", cache_root.path())
+            .env("CODESTORY_STDIO_CACHE_ROOT", cache_root.path());
+        let output = command.output().expect("run capped proof input");
+        assert!(!output.status.success(), "padding is intentionally invalid");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            combined.contains("exceeds the 65536 byte input limit"),
+            exceeds
+        );
+    }
+}
+
+#[test]
+fn public_exact_proof_never_activates_a_cold_project() {
+    let fixture = unindexed_fixture();
+    let cli_cache = fixture
+        .cache_dir
+        .path()
+        .join(codestory_workspace::workspace_id_v3_for_root(
+            fixture.workspace.path(),
+        ));
+    let spec_root = tempfile::tempdir().expect("cold proof spec root");
+    let spec_file = spec_root.path().join("proof-spec.json");
+    fs::write(
+        &spec_file,
+        serde_json::to_vec(&unknown_proof_spec()).unwrap(),
+    )
+    .expect("write cold proof spec");
+
+    let mut cli = test_support::cli_command();
+    cli.args(["prove-call-path", "--project"])
+        .arg(fixture.workspace.path())
+        .arg("--spec")
+        .arg(&spec_file)
+        .env("CODESTORY_CACHE_ROOT", fixture.cache_dir.path())
+        .env("CODESTORY_STDIO_CACHE_ROOT", fixture.cache_dir.path());
+    let cli = cli.output().expect("run cold CLI proof");
+    assert!(!cli.status.success(), "cold CLI proof must be unavailable");
+
+    let mut server = spawn_stdio_server(&fixture);
+    let mut arguments = unknown_proof_spec();
+    arguments["project"] = json!(fixture.workspace.path());
+    let response = send_json(
+        &mut server,
+        json!({
+            "jsonrpc":"2.0",
+            "id":"cold-proof",
+            "method":"tools/call",
+            "params":{"name":"prove_call_path","arguments":arguments}
+        }),
+    );
+    let result = assert_success_envelope(&response, json!("cold-proof"));
+    assert_eq!(result["isError"], true, "{response}");
+    assert!(result.get("structuredContent").is_none(), "{response}");
+    assert!(!result.to_string().contains("preparing"), "{response}");
+    assert!(
+        !fixture.cache_dir.path().join("codestory.db").exists()
+            && !cli_cache.join("codestory.db").exists(),
+        "strict proof observation must not create a core store"
+    );
+    assert!(
+        !fixture.cache_dir.path().join("search-generations").exists()
+            && !cli_cache.join("search-generations").exists(),
+        "strict proof observation must not initialize semantic retrieval"
+    );
 }
 
 struct StdioFixture {
@@ -515,6 +832,49 @@ fn indexed_fixture() -> StdioFixture {
     assert!(
         output.status.success(),
         "index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    StdioFixture {
+        workspace,
+        cache_dir,
+        latest_release_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        disable_release_probe: false,
+        disable_installed_cli_probe: false,
+        plugin_data_dir: None,
+        plugin_cli_source: None,
+        dirty_marker_path: None,
+        dirty_marker_project_root: None,
+        local_refresh_timeout_ms: None,
+    }
+}
+
+fn indexed_proof_fixture() -> StdioFixture {
+    let workspace = tempfile::tempdir().expect("workspace dir");
+    let cache_dir = tempfile::tempdir().expect("cache dir");
+    write_tiny_rust_workspace(workspace.path());
+    let source_path = workspace.path().join("src/lib.rs");
+    let mut source = fs::read_to_string(&source_path).expect("read proof fixture source");
+    source.push_str("\npub fn exact_callee() {}\npub fn exact_caller() { exact_callee(); }\n");
+    fs::write(source_path, source).expect("write proof fixture source");
+
+    let mut command = test_support::cli_command();
+    command
+        .arg("index")
+        .arg("--refresh")
+        .arg("full")
+        .arg("--format")
+        .arg("json")
+        .arg("--project")
+        .arg(workspace.path())
+        .arg("--cache-dir")
+        .arg(cache_dir.path());
+    allow_explicit_cpu_embeddings(&mut command);
+    let output = command.output().expect("run proof fixture index");
+    assert!(
+        output.status.success(),
+        "proof fixture index failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -945,6 +1305,85 @@ fn assert_error_code(error: &Value, code: i64) {
     );
 }
 
+fn proof_canonical_id(fixture: &StdioFixture, name: &str) -> String {
+    let connection = rusqlite::Connection::open(fixture.cache_dir.path().join("codestory.db"))
+        .expect("open indexed proof fixture");
+    connection
+        .query_row(
+            "SELECT canonical_id FROM node WHERE serialized_name = ?1 AND kind = 13 AND canonical_id IS NOT NULL ORDER BY id LIMIT 1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("fixture function {name}: {error}"))
+}
+
+fn exact_proof_arguments(fixture: &StdioFixture) -> Value {
+    let source_text = "exact direct ordered call path";
+    json!({
+        "project": fixture.workspace.path(),
+        "source_text": source_text,
+        "clauses": [{
+            "clause_id": "contract",
+            "start_byte": 0,
+            "end_byte_exclusive": source_text.len(),
+            "quote": source_text,
+            "classification": {
+                "kind": "resolved_material",
+                "fields": [
+                    {"kind":"start"},
+                    {"kind":"step_target","step":0},
+                    {"kind":"directness","step":0},
+                    {"kind":"ordering","step":0},
+                    {"kind":"relation","step":0}
+                ]
+            }
+        }],
+        "spec": {
+            "start": {
+                "kind": "canonical_id",
+                "canonical_id": proof_canonical_id(fixture, "exact_caller")
+            },
+            "steps": [{
+                "target": {
+                    "kind": "canonical_id",
+                    "canonical_id": proof_canonical_id(fixture, "exact_callee")
+                }
+            }],
+            "prohibit_traversal_through": [],
+            "exclude_from_projection": []
+        }
+    })
+}
+
+fn unknown_proof_spec() -> Value {
+    let source_text = "exact direct ordered call path";
+    json!({
+        "source_text": source_text,
+        "clauses": [{
+            "clause_id":"contract",
+            "start_byte":0,
+            "end_byte_exclusive":source_text.len(),
+            "quote":source_text,
+            "classification":{
+                "kind":"resolved_material",
+                "fields":[
+                    {"kind":"start"},
+                    {"kind":"step_target","step":0},
+                    {"kind":"directness","step":0},
+                    {"kind":"ordering","step":0},
+                    {"kind":"relation","step":0}
+                ]
+            }
+        }],
+        "spec":{
+            "start":{"kind":"canonical_id","canonical_id":"missing:start"},
+            "steps":[{"target":{"kind":"canonical_id","canonical_id":"missing:target"}}],
+            "prohibit_traversal_through":[],
+            "exclude_from_projection":[]
+        }
+    })
+}
+
 /// True when activation terminated instead of staying retryable.
 ///
 /// Activation can end terminally for more than one environment reason: the package may
@@ -1322,7 +1761,7 @@ fn project_resource_uri(base_uri: &str, project: &Path) -> String {
 
 fn assert_tool_safety_metadata(tool: &Value) {
     let name = tool["name"].as_str().expect("tool name");
-    let observational = name == "status";
+    let observational = matches!(name, "status" | "prove_call_path");
     let safety = tool
         .pointer("/_meta/com.thegreencedar.codestory~1safety")
         .unwrap_or_else(|| panic!("{name} should include namespaced safety metadata: {tool}"));
@@ -2323,6 +2762,7 @@ fn tool_catalog_keeps_stable_product_tool_names() {
             "ground",
             "neighbors",
             "packet",
+            "prove_call_path",
             "query_subgraph",
             "references",
             "search",
