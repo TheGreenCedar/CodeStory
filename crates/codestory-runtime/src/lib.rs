@@ -629,6 +629,12 @@ pub struct AppController {
     pub(crate) canonical_symbol_names:
         Arc<Mutex<crate::agent::retrieval_primary::CanonicalSymbolNamesState>>,
     source_observer: Arc<Mutex<SourceObserverState>>,
+    #[cfg(any(
+        test,
+        feature = "test-support",
+        feature = "proof-qualification-support"
+    ))]
+    proof_validation_cache: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
     runtime_config: Arc<codestory_retrieval::SidecarRuntimeConfig>,
