@@ -87,7 +87,7 @@ fn python_resolution_work() -> usize {
 }
 
 const ADAPTER_VERSION: &str = "reference-v15";
-const GO_ADAPTER_VERSION: &str = "reference-v17";
+const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
 const RUST_ADAPTER_VERSION: &str = "reference-v18";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";

@@ -110,90 +110,109 @@ fn go_language() -> tree_sitter::Language {
 
 pub(crate) fn member_edge_specs(tree: &Tree, source: &str) -> Vec<ManualMemberEdgeSpec> {
     let mut edges = Vec::new();
-    walk_tree_nodes(tree.root_node(), &mut |node| match node.kind() {
-        "method_declaration" => {
-            let Some(method_name_node) = node.child_by_field_name("name") else {
-                return;
-            };
-            let Some(receiver_node) = node.child_by_field_name("receiver") else {
-                return;
-            };
-            let Some(source_name) = go_receiver_owner_name(receiver_node, source) else {
-                return;
-            };
-            let Some(target_name) = trimmed_node_text(method_name_node, source) else {
-                return;
-            };
+    let owner_specs = go_package_type_specs_by_name(tree.root_node(), source);
+    walk_tree_nodes(tree.root_node(), &mut |node| {
+        count_go_navigation_resolution_work(1);
+        match node.kind() {
+            "method_declaration" => {
+                if node.has_error() || node.is_error() || node.is_missing() {
+                    return;
+                }
+                let Some(method_name_node) = node.child_by_field_name("name") else {
+                    return;
+                };
+                let Some(receiver_node) = node.child_by_field_name("receiver") else {
+                    return;
+                };
+                let Some(source_name) = go_declared_receiver_owner_name(receiver_node, source)
+                else {
+                    return;
+                };
+                let Some(target_name) = trimmed_node_text(method_name_node, source) else {
+                    return;
+                };
+                let source_span = owner_specs
+                    .get(&source_name)
+                    .copied()
+                    .flatten()
+                    .and_then(|owner| owner.parent())
+                    .filter(|parent| parent.kind() == "type_declaration")
+                    .map(ts_node_graph_span)
+                    .unwrap_or_else(|| ts_node_graph_span(receiver_node));
 
-            edges.push(ManualMemberEdgeSpec {
-                source_name,
-                target_name,
-                source_span: ts_node_graph_span(
-                    receiver_owner_declaration_node(tree.root_node(), source, receiver_node)
-                        .unwrap_or(receiver_node),
-                ),
-                target_span: ts_node_graph_span(node),
-                line: Some(node.start_position().row as u32 + 1),
-            });
-        }
-        "method_elem" => {
-            let Some(owner_node) = enclosing_node_with_kind(node, &["type_declaration"]) else {
-                return;
-            };
-            let Some(owner_name_node) = descendant_by_field_name(owner_node, "name") else {
-                return;
-            };
-            let Some(source_name) = trimmed_node_text(owner_name_node, source) else {
-                return;
-            };
-            let Some(method_name_node) = node.child_by_field_name("name") else {
-                return;
-            };
-            let Some(target_name) = trimmed_node_text(method_name_node, source) else {
-                return;
-            };
+                edges.push(ManualMemberEdgeSpec {
+                    source_name,
+                    target_name,
+                    source_span,
+                    target_span: ts_node_graph_span(node),
+                    line: Some(node.start_position().row as u32 + 1),
+                });
+            }
+            "method_elem" => {
+                let Some(owner_node) = enclosing_node_with_kind(node, &["type_declaration"]) else {
+                    return;
+                };
+                let Some(owner_name_node) = descendant_by_field_name(owner_node, "name") else {
+                    return;
+                };
+                let Some(source_name) = trimmed_node_text(owner_name_node, source) else {
+                    return;
+                };
+                let Some(method_name_node) = node.child_by_field_name("name") else {
+                    return;
+                };
+                let Some(target_name) = trimmed_node_text(method_name_node, source) else {
+                    return;
+                };
 
-            edges.push(ManualMemberEdgeSpec {
-                source_name,
-                target_name,
-                source_span: ts_node_graph_span(owner_node),
-                target_span: ts_node_graph_span(node),
-                line: Some(node.start_position().row as u32 + 1),
-            });
+                edges.push(ManualMemberEdgeSpec {
+                    source_name,
+                    target_name,
+                    source_span: ts_node_graph_span(owner_node),
+                    target_span: ts_node_graph_span(node),
+                    line: Some(node.start_position().row as u32 + 1),
+                });
+            }
+            _ => {}
         }
-        _ => {}
     });
     edges
 }
 
-fn receiver_owner_declaration_node<'tree>(
+fn go_package_type_specs_by_name<'tree>(
     root: TsNode<'tree>,
     source: &str,
-    receiver_node: TsNode<'tree>,
-) -> Option<TsNode<'tree>> {
-    let owner_name = go_receiver_owner_name(receiver_node, source)?;
-    find_go_type_declaration_by_name(root, source, &owner_name)
-}
-
-fn find_go_type_declaration_by_name<'tree>(
-    node: TsNode<'tree>,
-    source: &str,
-    owner_name: &str,
-) -> Option<TsNode<'tree>> {
-    if node.kind() == "type_declaration"
-        && let Some(name_node) = descendant_by_field_name(node, "name")
-        && trimmed_node_text(name_node, source).as_deref() == Some(owner_name)
-    {
-        return Some(node);
-    }
-
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = find_go_type_declaration_by_name(child, source, owner_name) {
-            return Some(found);
+) -> HashMap<String, Option<TsNode<'tree>>> {
+    let mut specs = HashMap::new();
+    let mut root_cursor = root.walk();
+    for declaration in root.named_children(&mut root_cursor) {
+        count_go_navigation_resolution_work(1);
+        if declaration.kind() != "type_declaration" {
+            continue;
+        }
+        let mut declaration_cursor = declaration.walk();
+        for spec in declaration.named_children(&mut declaration_cursor) {
+            count_go_navigation_resolution_work(1);
+            if spec.kind() != "type_spec" {
+                continue;
+            }
+            let Some(name) = spec
+                .child_by_field_name("name")
+                .and_then(|name_node| trimmed_node_text(name_node, source))
+            else {
+                continue;
+            };
+            match specs.entry(name) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(spec));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
         }
     }
-    None
+    specs
 }
 
 fn go_receiver_owner_name(receiver_node: TsNode<'_>, source: &str) -> Option<String> {
@@ -205,6 +224,69 @@ fn go_receiver_owner_name(receiver_node: TsNode<'_>, source: &str) -> Option<Str
         .trim();
     let raw_owner = inner.split_whitespace().last()?.trim();
     normalize_go_type_surface(raw_owner)
+}
+
+fn go_declared_receiver_owner_name(receiver_node: TsNode<'_>, source: &str) -> Option<String> {
+    if receiver_node.kind() != "parameter_list"
+        || receiver_node.has_error()
+        || receiver_node.is_error()
+        || receiver_node.is_missing()
+    {
+        return None;
+    }
+    let mut receiver_cursor = receiver_node.walk();
+    let parameters = receiver_node
+        .named_children(&mut receiver_cursor)
+        .collect::<Vec<_>>();
+    let [parameter] = parameters.as_slice() else {
+        return None;
+    };
+    if parameter.kind() != "parameter_declaration"
+        || parameter.has_error()
+        || parameter.is_error()
+        || parameter.is_missing()
+    {
+        return None;
+    }
+    let mut name_cursor = parameter.walk();
+    if parameter
+        .children_by_field_name("name", &mut name_cursor)
+        .count()
+        > 1
+    {
+        return None;
+    }
+    let type_node = parameter.child_by_field_name("type")?;
+    if type_node.has_error() || type_node.is_error() || type_node.is_missing() {
+        return None;
+    }
+    let owner_node = match type_node.kind() {
+        "type_identifier" => type_node,
+        "pointer_type" => {
+            let mut pointer_cursor = type_node.walk();
+            let children = type_node
+                .named_children(&mut pointer_cursor)
+                .collect::<Vec<_>>();
+            let [owner] = children.as_slice() else {
+                return None;
+            };
+            if owner.kind() != "type_identifier"
+                || owner.has_error()
+                || owner.is_error()
+                || owner.is_missing()
+            {
+                return None;
+            }
+            *owner
+        }
+        _ => return None,
+    };
+    let owner = trimmed_node_text(owner_node, source)?;
+    if normalize_parameter_name(&owner).as_deref() == Some(owner.as_str()) {
+        Some(owner)
+    } else {
+        None
+    }
 }
 
 fn normalize_go_type_surface(raw: &str) -> Option<String> {
@@ -245,6 +327,8 @@ fn go_exact_type_surface(raw: &str) -> Option<(Option<String>, String)> {
 pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiverCallSpec> {
     let mut edges = Vec::new();
     let import_bindings = collect_go_import_bindings(source);
+    let package_owner_specs = go_package_type_specs_by_name(tree.root_node(), source);
+    let file_scope_names = go_file_scope_names(tree.root_node(), source);
     walk_tree_nodes(tree.root_node(), &mut |callable| {
         count_go_navigation_resolution_work(1);
         if !matches!(
@@ -269,14 +353,15 @@ pub(crate) fn receiver_call_specs(tree: &Tree, source: &str) -> Vec<ManualReceiv
                 span: call_source.span,
             },
             &import_bindings,
+            &file_scope_names,
             &mut local_binding_callsites,
             &mut edges,
         );
         let method_receiver_bindings = collect_go_method_receiver_bindings(
             callable,
-            tree.root_node(),
             source,
             &import_bindings,
+            &package_owner_specs,
         );
         let mut receiver_types = method_receiver_bindings
             .iter()
@@ -324,13 +409,14 @@ fn collect_go_local_composite_receiver_call_specs(
     source: &str,
     call_source: ManualReceiverSource<'_>,
     import_bindings: &HashMap<String, String>,
+    file_scope_names: &HashSet<String>,
     local_binding_callsites: &mut HashSet<ReceiverCallSiteKey>,
     edges: &mut Vec<ManualReceiverCallSpec>,
 ) {
     let mut calls = Vec::new();
     let mut intervals = Vec::new();
     let builtin_new_unshadowed = !import_bindings.contains_key("new")
-        && !go_file_scope_name_is_shadowed(callable, "new", source)
+        && !file_scope_names.contains("new")
         && !go_callable_declares_name(callable, "new", source);
     walk_tree_nodes(callable, &mut |node| {
         count_go_navigation_resolution_work(1);
@@ -488,7 +574,12 @@ fn collect_go_local_composite_receiver_call_specs(
             owner: None,
         });
     });
-    let decisions = go_navigation_binding_decisions(source.len(), &intervals, &calls);
+    let decisions = go_navigation_binding_decisions(
+        callable.start_byte(),
+        callable.end_byte(),
+        &intervals,
+        &calls,
+    );
     for call in calls {
         let Some(owner) = decisions.get(&call.node.id()) else {
             continue;
@@ -542,22 +633,26 @@ enum GoNavigationEvent {
 }
 
 fn go_navigation_binding_decisions(
-    source_len: usize,
+    range_start: usize,
+    range_end: usize,
     intervals: &[GoNavigationBindingInterval],
     calls: &[GoNavigationCall<'_>],
 ) -> HashMap<usize, OptionalReceiverOwnerBinding> {
-    let mut events = vec![Vec::new(); source_len.saturating_add(1)];
+    let mut events = vec![Vec::new(); range_end.saturating_sub(range_start).saturating_add(1)];
     for (index, interval) in intervals.iter().enumerate() {
-        if interval.start_byte >= interval.end_byte || interval.end_byte > source_len {
+        if interval.start_byte < range_start
+            || interval.start_byte >= interval.end_byte
+            || interval.end_byte > range_end
+        {
             continue;
         }
-        events[interval.start_byte].push(GoNavigationEvent::Start(index));
-        events[interval.end_byte].push(GoNavigationEvent::End(index));
+        events[interval.start_byte - range_start].push(GoNavigationEvent::Start(index));
+        events[interval.end_byte - range_start].push(GoNavigationEvent::End(index));
         count_go_navigation_resolution_work(2);
     }
     for (index, call) in calls.iter().enumerate() {
-        if call.node.start_byte() <= source_len {
-            events[call.node.start_byte()].push(GoNavigationEvent::Call(index));
+        if (range_start..=range_end).contains(&call.node.start_byte()) {
+            events[call.node.start_byte() - range_start].push(GoNavigationEvent::Call(index));
             count_go_navigation_resolution_work(1);
         }
     }
@@ -863,43 +958,47 @@ fn go_callable_declares_name(callable: TsNode<'_>, name: &str, source: &str) -> 
     shadowed
 }
 
-fn go_file_scope_name_is_shadowed(call: TsNode<'_>, name: &str, source: &str) -> bool {
-    let mut root = call;
-    while let Some(parent) = root.parent() {
-        root = parent;
-    }
+fn go_file_scope_names(root: TsNode<'_>, source: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
     let mut cursor = root.walk();
-    root.named_children(&mut cursor)
-        .any(|declaration| match declaration.kind() {
+    for declaration in root.named_children(&mut cursor) {
+        count_go_navigation_resolution_work(1);
+        match declaration.kind() {
             "function_declaration" => {
-                declaration
+                if let Some(name) = declaration
                     .child_by_field_name("name")
                     .and_then(|node| trimmed_node_text(node, source))
-                    .as_deref()
-                    == Some(name)
+                {
+                    names.insert(name);
+                }
             }
             "type_declaration" | "var_declaration" | "const_declaration" => {
-                let mut found = false;
-                walk_tree_nodes(declaration, &mut |node| {
-                    if found || !matches!(node.kind(), "type_spec" | "var_spec" | "const_spec") {
-                        return;
+                let mut declaration_cursor = declaration.walk();
+                let mut pending = declaration
+                    .named_children(&mut declaration_cursor)
+                    .collect::<Vec<_>>();
+                while let Some(spec) = pending.pop() {
+                    count_go_navigation_resolution_work(1);
+                    if spec.kind() == "var_spec_list" {
+                        let mut list_cursor = spec.walk();
+                        pending.extend(spec.named_children(&mut list_cursor));
+                        continue;
                     }
-                    let boundary = node
-                        .child_by_field_name("type")
-                        .or_else(|| node.child_by_field_name("value"))
-                        .map(|child| child.start_byte())
-                        .unwrap_or(usize::MAX);
-                    let mut cursor = node.walk();
-                    found = node.named_children(&mut cursor).any(|child| {
-                        child.start_byte() < boundary
-                            && matches!(child.kind(), "identifier" | "field_identifier")
-                            && normalized_receiver_variable(child, source).as_deref() == Some(name)
-                    });
-                });
-                found
+                    if !matches!(spec.kind(), "type_spec" | "var_spec" | "const_spec") {
+                        continue;
+                    }
+                    let mut name_cursor = spec.walk();
+                    for name_node in spec.children_by_field_name("name", &mut name_cursor) {
+                        if let Some(name) = normalized_receiver_variable(name_node, source) {
+                            names.insert(name);
+                        }
+                    }
+                }
             }
-            _ => false,
-        })
+            _ => {}
+        }
+    }
+    names
 }
 
 fn go_composite_literal_owner_binding_from_type(
@@ -922,11 +1021,11 @@ fn go_composite_literal_owner_binding_from_type(
     Some((owner_name, None))
 }
 
-fn collect_go_method_receiver_bindings(
+fn collect_go_method_receiver_bindings<'tree>(
     callable: TsNode<'_>,
-    root: TsNode<'_>,
     source: &str,
     import_bindings: &HashMap<String, String>,
+    package_owner_specs: &HashMap<String, Option<TsNode<'tree>>>,
 ) -> HashMap<String, ReceiverOwnerBinding> {
     let mut receiver_types = HashMap::new();
     if callable.kind() != "method_declaration" {
@@ -942,11 +1041,11 @@ fn collect_go_method_receiver_bindings(
         return receiver_types;
     };
     receiver_types.insert(receiver_name.clone(), (owner_name.clone(), None));
-    let Some(owner_node) = find_go_type_declaration_by_name(root, source, &owner_name) else {
+    let Some(Some(owner_node)) = package_owner_specs.get(&owner_name) else {
         return receiver_types;
     };
     for (field_name, field_owner) in
-        collect_go_struct_field_types(owner_node, source, import_bindings)
+        collect_go_struct_field_types(*owner_node, source, import_bindings)
     {
         receiver_types.insert(format!("{receiver_name}.{field_name}"), field_owner);
     }
@@ -1268,6 +1367,55 @@ mod complexity_tests {
         go_navigation_resolution_work()
     }
 
+    fn measured_method_identity_collection_work(owner_count: usize) -> usize {
+        let mut source = String::from("package proof\ntype (\n");
+        for index in 0..owner_count {
+            source.push_str(&format!("  Owner{index} struct{{}}\n"));
+        }
+        source.push_str(")\n");
+        for index in 0..owner_count {
+            source.push_str(&format!("func (Owner{index}) Method{index}() {{}}\n"));
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go grammar must load");
+        let tree = parser.parse(&source, None).expect("Go source must parse");
+        reset_go_navigation_resolution_work();
+        let specs = member_edge_specs(&tree, &source);
+        assert_eq!(specs.len(), owner_count);
+        go_navigation_resolution_work()
+    }
+
+    fn measured_complete_receiver_call_work(callable_count: usize) -> usize {
+        let mut source = String::from("package proof\ntype (\n");
+        for index in 0..callable_count {
+            if index % 2 == 0 {
+                source.push_str(&format!("  Owner{index} struct{{}}\n"));
+            }
+        }
+        source.push_str(")\n");
+        for index in 0..callable_count {
+            let owner = if index % 2 == 0 {
+                format!("Owner{index}")
+            } else {
+                format!("CrossFileOwner{index}")
+            };
+            source.push_str(&format!(
+                "func (value *{owner}) Method{index}() {{ copy := new({owner}); copy.Method{index}() }}\n"
+            ));
+        }
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go grammar must load");
+        let tree = parser.parse(&source, None).expect("Go source must parse");
+        reset_go_navigation_resolution_work();
+        let specs = receiver_call_specs(&tree, &source);
+        assert_eq!(specs.len(), callable_count);
+        go_navigation_resolution_work()
+    }
+
     #[test]
     fn receiver_binding_preparation_and_lookup_work_is_independently_linear() {
         let baseline = measured_receiver_work(32, 32);
@@ -1286,6 +1434,28 @@ mod complexity_tests {
         assert!(
             combined <= baseline * 2 + 256,
             "combined Go receiver work grew superlinearly: {baseline} -> {combined}"
+        );
+    }
+
+    #[test]
+    fn grouped_method_identity_collection_work_is_linear() {
+        let baseline = measured_method_identity_collection_work(64);
+        let doubled = measured_method_identity_collection_work(128);
+        assert!(baseline > 0, "Go method identity work was not counted");
+        assert!(
+            doubled <= baseline * 2 + 64,
+            "Go method identity collection grew superlinearly: {baseline} -> {doubled}"
+        );
+    }
+
+    #[test]
+    fn complete_receiver_call_collection_work_is_linear() {
+        let baseline = measured_complete_receiver_call_work(24);
+        let doubled = measured_complete_receiver_call_work(48);
+        assert!(baseline > 0, "Go receiver-call work was not counted");
+        assert!(
+            doubled <= baseline * 2 + 512,
+            "complete Go receiver-call collection grew superlinearly: {baseline} -> {doubled}"
         );
     }
 }

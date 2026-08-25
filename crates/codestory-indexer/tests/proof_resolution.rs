@@ -2651,6 +2651,139 @@ fn go_unsupported_shadowed_and_open_domains_never_authorize_exact_receipts() -> 
 }
 
 #[test]
+fn go_unsupported_receiver_declarations_gain_no_identity_member_or_exact_fact() -> anyhow::Result<()>
+{
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "receiver-shapes.go",
+            concat!(
+                "package proof\n",
+                "type Left struct{}\n",
+                "type Right struct{}\n",
+                "type Generic[T any] struct{}\n",
+                "func (Generic[T]) GenericMethod() {}\n",
+                "func (external.Left) QualifiedMethod() {}\n",
+                "func (**Left) MultiplyIndirectMethod() {}\n",
+                "func ([]Left) CompositeMethod() {}\n",
+                "func (first, second Left) MultipleNamesMethod() {}\n",
+                "func (first Left, second Right) MultipleParametersMethod() {}\n",
+                "func caller(left Left, right Right, generic Generic[int]) {\n",
+                "  generic.GenericMethod()\n",
+                "  left.QualifiedMethod()\n",
+                "  left.MultiplyIndirectMethod()\n",
+                "  left.CompositeMethod()\n",
+                "  left.MultipleNamesMethod()\n",
+                "  right.MultipleParametersMethod()\n",
+                "}\n",
+            ),
+        )],
+    )?;
+    let unsupported = [
+        ("GenericMethod", "Generic.GenericMethod"),
+        ("QualifiedMethod", "Left.QualifiedMethod"),
+        ("MultiplyIndirectMethod", "Left.MultiplyIndirectMethod"),
+        ("CompositeMethod", "Left.CompositeMethod"),
+        ("MultipleNamesMethod", "Left.MultipleNamesMethod"),
+        ("MultipleParametersMethod", "Right.MultipleParametersMethod"),
+    ];
+    let nodes = store.get_nodes()?;
+    let edges = store.get_edges()?;
+    for (leaf, qualified) in unsupported {
+        assert!(
+            nodes.iter().all(|node| {
+                node.serialized_name != qualified
+                    && node.qualified_name.as_deref() != Some(qualified)
+            }),
+            "unsupported receiver declaration gained identity `{qualified}`"
+        );
+        let method_ids = nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::METHOD && node.serialized_name == leaf)
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            edges.iter().all(|edge| {
+                edge.kind != EdgeKind::MEMBER || !method_ids.contains(&edge.target)
+            }),
+            "unsupported receiver declaration gained MEMBER `{qualified}`"
+        );
+    }
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    for (leaf, _) in unsupported {
+        let matching = facts
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == leaf)
+            .collect::<Vec<_>>();
+        assert!(!matching.is_empty(), "missing hostile fact for `{leaf}`");
+        assert!(
+            matching
+                .iter()
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "unsupported receiver declaration became Exact: {matching:#?}"
+        );
+    }
+
+    let malformed_project = tempfile::tempdir()?;
+    let mut malformed = Store::new_in_memory()?;
+    index_files(
+        malformed_project.path(),
+        &mut malformed,
+        &[(
+            "malformed.go",
+            concat!(
+                "package proof\n",
+                "type Left struct{}\n",
+                "func caller(left Left) { left.MissingReceiverMethod(); left.BrokenMethod() }\n",
+                "func () MissingReceiverMethod() {}\n",
+                "func (Left) BrokenMethod( {}\n",
+            ),
+        )],
+    )?;
+    let malformed_nodes = malformed.get_nodes()?;
+    let malformed_edges = malformed.get_edges()?;
+    for (leaf, qualified) in [
+        ("MissingReceiverMethod", "Left.MissingReceiverMethod"),
+        ("BrokenMethod", "Left.BrokenMethod"),
+    ] {
+        assert!(malformed_nodes.iter().all(|node| {
+            node.serialized_name != qualified && node.qualified_name.as_deref() != Some(qualified)
+        }));
+        let method_ids = malformed_nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::METHOD && node.serialized_name == leaf)
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        assert!(
+            malformed_edges.iter().all(|edge| {
+                edge.kind != EdgeKind::MEMBER || !method_ids.contains(&edge.target)
+            })
+        );
+    }
+    rematerialize_proof_resolution_projection(&mut malformed, &publication(1))?;
+    let malformed_facts = malformed.get_proof_resolution_facts()?;
+    for leaf in ["MissingReceiverMethod", "BrokenMethod"] {
+        let matching = malformed_facts
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == leaf)
+            .collect::<Vec<_>>();
+        assert!(!matching.is_empty(), "missing recovery fact for `{leaf}`");
+        assert!(
+            matching
+                .iter()
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "recovered receiver declaration became Exact: {matching:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn go_lexical_shadowing_is_callsite_specific() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
@@ -3810,7 +3943,7 @@ fn go_returned_closure_h6_seals_current_go_cache_and_fact_provenance() -> anyhow
         .expect("sealed returned-closure fact");
     assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
     assert_eq!(fact.provenance.language_adapter, "go");
-    assert_eq!(fact.provenance.language_adapter_version, "reference-v17");
+    assert_eq!(fact.provenance.language_adapter_version, "reference-v19");
     assert_eq!(fact.provenance.parser_fingerprint.len(), 64);
     assert_eq!(fact.provenance.dependency_file_hashes.len(), 2);
     assert_eq!(fact.provenance.evidence_sha256.len(), 64);
