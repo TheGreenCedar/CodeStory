@@ -105,27 +105,29 @@ struct ProofPublicationValidationCacheEntry {
 
 enum PreparedProofPublicationValidation {
     Unavailable,
-    Warm(ProofPublicationValidationToken),
-    Cold {
-        project_root: PathBuf,
-        project_id: String,
-        storage_path: PathBuf,
-        native_storage_identity: String,
-        observed: ObservedProofPublicationIdentity,
-        observer: Store,
-    },
+    Warm(Box<ProofPublicationValidationToken>),
+    Cold(Box<ColdPreparedProofPublicationValidation>),
+}
+
+struct ColdPreparedProofPublicationValidation {
+    project_root: PathBuf,
+    project_id: String,
+    storage_path: PathBuf,
+    native_storage_identity: String,
+    observed: ObservedProofPublicationIdentity,
+    observer: Store,
 }
 
 pub(crate) enum ProofPublicationValidationUse {
-    Direct {
-        proof_projection_available: bool,
-    },
+    Direct { proof_projection_available: bool },
     Unavailable,
-    Warm(ProofPublicationValidationToken),
-    Cold {
-        token: ProofPublicationValidationToken,
-        observer: Store,
-    },
+    Warm(Box<ProofPublicationValidationToken>),
+    Cold(Box<ColdProofPublicationValidationUse>),
+}
+
+pub(crate) struct ColdProofPublicationValidationUse {
+    token: ProofPublicationValidationToken,
+    observer: Store,
 }
 
 impl ProofPublicationValidationUse {
@@ -146,20 +148,11 @@ impl ProofPublicationValidationUse {
 /// The observer is deliberately a persistent, nonmutating SQLite connection:
 /// `data_version` is meaningful only when the same connection observes both
 /// the full validation and a later warm proof.
+#[derive(Default)]
 struct ProofPublicationValidationCache {
     entry: Option<ProofPublicationValidationCacheEntry>,
     prepared: Option<PreparedProofPublicationValidation>,
     armed: bool,
-}
-
-impl Default for ProofPublicationValidationCache {
-    fn default() -> Self {
-        Self {
-            entry: None,
-            prepared: None,
-            armed: false,
-        }
-    }
 }
 
 fn proof_validation_cache(
@@ -297,9 +290,9 @@ impl AppController {
                         && observed.manifest.as_ref() == Some(&entry.token.manifest)
                 });
             if scope_matches && observer_matches {
-                cache.prepared = Some(PreparedProofPublicationValidation::Warm(
+                cache.prepared = Some(PreparedProofPublicationValidation::Warm(Box::new(
                     entry.token.clone(),
-                ));
+                )));
                 return Ok(());
             }
             cache.clear();
@@ -324,14 +317,16 @@ impl AppController {
             cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
             return Ok(());
         }
-        cache.prepared = Some(PreparedProofPublicationValidation::Cold {
-            project_root,
-            project_id,
-            storage_path,
-            native_storage_identity,
-            observed,
-            observer,
-        });
+        cache.prepared = Some(PreparedProofPublicationValidation::Cold(Box::new(
+            ColdPreparedProofPublicationValidation {
+                project_root,
+                project_id,
+                storage_path,
+                native_storage_identity,
+                observed,
+                observer,
+            },
+        )));
         Ok(())
     }
 
@@ -369,14 +364,15 @@ impl AppController {
                 }
                 Ok(ProofPublicationValidationUse::Warm(token))
             }
-            PreparedProofPublicationValidation::Cold {
-                project_root,
-                project_id,
-                storage_path,
-                native_storage_identity,
-                observed,
-                observer,
-            } => {
+            PreparedProofPublicationValidation::Cold(cold) => {
+                let ColdPreparedProofPublicationValidation {
+                    project_root,
+                    project_id,
+                    storage_path,
+                    native_storage_identity,
+                    observed,
+                    observer,
+                } = *cold;
                 let manifest = match count_and_validate_complete_proof_publication(
                     active_storage,
                     active_publication,
@@ -395,18 +391,20 @@ impl AppController {
                         "the observer differs from the active proof-validation snapshot",
                     ));
                 }
-                Ok(ProofPublicationValidationUse::Cold {
-                    token: ProofPublicationValidationToken {
-                        project_root,
-                        project_id,
-                        storage_path,
-                        native_storage_identity,
-                        core_publication: active_publication.clone(),
-                        manifest,
-                        data_version: observed.data_version,
+                Ok(ProofPublicationValidationUse::Cold(Box::new(
+                    ColdProofPublicationValidationUse {
+                        token: ProofPublicationValidationToken {
+                            project_root,
+                            project_id,
+                            storage_path,
+                            native_storage_identity,
+                            core_publication: active_publication.clone(),
+                            manifest,
+                            data_version: observed.data_version,
+                        },
+                        observer,
                     },
-                    observer,
-                })
+                )))
             }
         }
     }
@@ -429,7 +427,7 @@ impl AppController {
             | ProofPublicationValidationUse::Unavailable => return Ok(()),
             ProofPublicationValidationUse::Warm(token) => {
                 cache.entry.as_ref().is_some_and(|entry| {
-                    entry.token == token
+                    entry.token == *token
                         && proof_validation_fence_matches(
                             &token,
                             &project_root,
@@ -441,7 +439,8 @@ impl AppController {
                         )
                 })
             }
-            ProofPublicationValidationUse::Cold { token, observer } => {
+            ProofPublicationValidationUse::Cold(cold) => {
+                let ColdProofPublicationValidationUse { token, observer } = *cold;
                 if proof_validation_fence_matches(
                     &token,
                     &project_root,
