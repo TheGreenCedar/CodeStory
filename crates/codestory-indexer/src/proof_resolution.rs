@@ -89,9 +89,9 @@ fn python_resolution_work() -> usize {
 const ADAPTER_VERSION: &str = "reference-v15";
 const GO_ADAPTER_VERSION: &str = "reference-v17";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
-const RUST_ADAPTER_VERSION: &str = "reference-v17";
+const RUST_ADAPTER_VERSION: &str = "reference-v18";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 14;
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 15;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
@@ -5001,11 +5001,20 @@ struct RustResolutionIndex<'tree> {
     callable_module_paths: HashMap<usize, Vec<String>>,
     callable_start_bytes: HashMap<usize, usize>,
     attributed_items: HashSet<usize>,
+    bounded_outer_attribute_ids: HashSet<usize>,
+    bounded_attributed_callers: HashSet<usize>,
+    bounded_attributed_callsites: HashSet<usize>,
 }
 
 impl<'tree> RustResolutionIndex<'tree> {
     fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
         let graph_nodes = RustGraphNodeIndex::prepare(file_id, nodes);
+        let (
+            attributed_items,
+            bounded_outer_attribute_ids,
+            bounded_attributed_callers,
+            bounded_attributed_callsites,
+        ) = rust_prepare_attribute_index(tree.root_node(), source);
         let mut result = Self {
             calls: Vec::new(),
             declarations: Vec::new(),
@@ -5034,7 +5043,10 @@ impl<'tree> RustResolutionIndex<'tree> {
             callable_nodes: HashMap::new(),
             callable_module_paths: HashMap::new(),
             callable_start_bytes: HashMap::new(),
-            attributed_items: HashSet::new(),
+            attributed_items,
+            bounded_outer_attribute_ids,
+            bounded_attributed_callers,
+            bounded_attributed_callsites,
         };
         result.collect_module(
             tree.root_node(),
@@ -5102,15 +5114,12 @@ impl<'tree> RustResolutionIndex<'tree> {
         let mut unsupported_value_names = HashSet::new();
         let mut cursor = body.walk();
         let items = body.named_children(&mut cursor).collect::<Vec<_>>();
-        let attributed_items = rust_attributed_item_ids(&items);
-        let bounded_attribute_ids = rust_bounded_outer_attribute_ids(&items, source);
-        self.attributed_items
-            .extend(attributed_items.iter().copied());
         for item in &items {
             let direct_domain_poison = item.kind() == "macro_invocation"
                 || (item.kind() == "inner_attribute_item"
                     && !rust_inner_allow_preserves_module_bindings(*item, source))
-                || (item.kind() == "attribute_item" && !bounded_attribute_ids.contains(&item.id()))
+                || (item.kind() == "attribute_item"
+                    && !self.bounded_outer_attribute_ids.contains(&item.id()))
                 || (item.kind() == "expression_statement"
                     && contains_node_kind(*item, "macro_invocation"));
             if direct_domain_poison {
@@ -5142,7 +5151,7 @@ impl<'tree> RustResolutionIndex<'tree> {
             match item.kind() {
                 "function_item" => {
                     let name = declaration_name(*item, source).map(str::to_string);
-                    if attributed_items.contains(&item.id()) {
+                    if self.attributed_items.contains(&item.id()) {
                         if let Some(name) = name {
                             incomplete_value_names.insert(name);
                         } else {
@@ -5176,7 +5185,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                     if let Some(name) = declaration_name(*item, source) {
                         value_blockers.insert(name.to_string());
                     }
-                    if attributed_items.contains(&item.id()) {
+                    if self.attributed_items.contains(&item.id()) {
                         if let Some(name) = declaration_name(*item, source) {
                             incomplete_value_names.insert(name.to_string());
                         } else {
@@ -5217,13 +5226,13 @@ impl<'tree> RustResolutionIndex<'tree> {
                     self.collect_impl(
                         *item,
                         &module_path,
-                        attributed_items.contains(&item.id()),
+                        self.attributed_items.contains(&item.id()),
                         source,
                         graph_nodes,
                     );
                 }
                 "use_declaration" => {
-                    if attributed_items.contains(&item.id()) {
+                    if self.attributed_items.contains(&item.id()) {
                         let names = rust_use_bound_names(*item, source);
                         if names.is_empty() {
                             domain_complete = false;
@@ -5272,7 +5281,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                         identifier_module_complete = false;
                         continue;
                     };
-                    if attributed_items.contains(&item.id()) {
+                    if self.attributed_items.contains(&item.id()) {
                         incomplete_value_names.insert(name.clone());
                     }
                     let module_declaration = graph_nodes.module(*item, &name);
@@ -5283,12 +5292,12 @@ impl<'tree> RustResolutionIndex<'tree> {
                             child_body,
                             child_path,
                             module_declaration,
-                            inherited_attributed || attributed_items.contains(&item.id()),
+                            inherited_attributed || self.attributed_items.contains(&item.id()),
                             source,
                             graph_nodes,
                         );
                     } else {
-                        if inherited_attributed || attributed_items.contains(&item.id()) {
+                        if inherited_attributed || self.attributed_items.contains(&item.id()) {
                             continue;
                         }
                         let Some(declaration) = module_declaration else {
@@ -5361,27 +5370,20 @@ impl<'tree> RustResolutionIndex<'tree> {
             .first()
             .copied()
             .filter(|_| owner_nodes.len() == 1);
-        let body_items = impl_item
-            .child_by_field_name("body")
-            .map(|body| {
-                let mut cursor = body.walk();
-                body.named_children(&mut cursor).collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let attributed_methods = rust_attributed_item_ids(&body_items);
-        self.attributed_items
-            .extend(attributed_methods.iter().copied());
+        let has_attributed_impl_item = impl_item.child_by_field_name("body").is_none_or(|body| {
+            let mut cursor = body.walk();
+            body.named_children(&mut cursor)
+                .any(|item| self.attributed_items.contains(&item.id()))
+        });
+        let methods = direct_impl_functions(impl_item);
         let impl_complete = !impl_attributed
-            && attributed_methods.is_empty()
+            && !has_attributed_impl_item
             && !rust_impl_has_direct_item_macro(impl_item);
         if !impl_complete {
             self.incomplete_inherent_owners
                 .insert((module_path.to_vec(), owner_name.clone()));
         }
-        for method in direct_impl_functions(impl_item) {
-            if impl_attributed {
-                self.attributed_items.insert(method.id());
-            }
+        for method in methods {
             let (Some(method_name), Some(declaration)) = (
                 declaration_name(method, source).map(str::to_string),
                 graph_nodes.callable(method, source),
@@ -5430,6 +5432,8 @@ impl<'tree> RustResolutionIndex<'tree> {
         let mut scope = current_scope;
 
         if node.kind() == "function_item" {
+            let inherited_domain_complete = current_callable
+                .is_none_or(|parent| self.callsite_domain_complete(parent, node.start_byte()));
             if let (Some(parent_callable), Some(parent_scope)) = (current_callable, current_scope) {
                 let callable_start = self
                     .callable_start_bytes
@@ -5455,10 +5459,22 @@ impl<'tree> RustResolutionIndex<'tree> {
                 .insert(node.id(), node.start_byte());
             self.callable_module_paths
                 .insert(node.id(), module_path.to_vec());
-            self.callable_complete
-                .insert(node.id(), !self.attributed_items.contains(&node.id()));
-            self.callable_poison_ranges
-                .insert(node.id(), rust_callable_poison_ranges(node, source));
+            let attributed = self.attributed_items.contains(&node.id());
+            let bounded_free_function = self.bounded_attributed_callers.contains(&node.id())
+                && !self.inherent_callable_contexts.contains_key(&node.id());
+            self.callable_complete.insert(
+                node.id(),
+                inherited_domain_complete && (!attributed || bounded_free_function),
+            );
+            self.callable_poison_ranges.insert(
+                node.id(),
+                rust_callable_poison_ranges(
+                    node,
+                    &self.bounded_outer_attribute_ids,
+                    &self.bounded_attributed_callers,
+                    &self.bounded_attributed_callsites,
+                ),
+            );
             self.callable_type_blockers
                 .insert(node.id(), rust_callable_type_parameter_names(node, source));
             self.lexical_bindings.entry(node.id()).or_default();
@@ -5982,36 +5998,168 @@ fn rust_struct_constructor_capabilities(item: TsNode<'_>) -> (bool, bool) {
     (!record && !tuple, record)
 }
 
-fn rust_attributed_item_ids(items: &[TsNode<'_>]) -> HashSet<usize> {
-    let mut result = HashSet::new();
-    let mut pending_attribute = false;
-    for item in items {
-        if item.kind() == "attribute_item" {
-            pending_attribute = true;
-        } else {
-            if pending_attribute {
-                result.insert(item.id());
+fn rust_prepare_attribute_index(
+    root: TsNode<'_>,
+    source: &str,
+) -> (
+    HashSet<usize>,
+    HashSet<usize>,
+    HashSet<usize>,
+    HashSet<usize>,
+) {
+    fn collect(
+        node: TsNode<'_>,
+        source: &str,
+        attributed_items: &mut HashSet<usize>,
+        bounded_outer_attribute_ids: &mut HashSet<usize>,
+        bounded_attributed_callers: &mut HashSet<usize>,
+        bounded_attributed_callsites: &mut HashSet<usize>,
+        direct_method_ids: &mut HashSet<usize>,
+    ) {
+        count_rust_resolution_work(1);
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        let direct_method_owner = node
+            .parent()
+            .filter(|parent| matches!(parent.kind(), "impl_item" | "trait_item"));
+        let mut attributes = Vec::new();
+        for child in children {
+            count_rust_resolution_work(1);
+            if child.kind() == "attribute_item" || rust_is_outer_doc_comment(child, source) {
+                attributes.push(child);
+                continue;
             }
-            pending_attribute = false;
+            let direct_method = child.kind() == "function_item" && direct_method_owner.is_some();
+            if direct_method {
+                count_rust_resolution_work(1);
+                direct_method_ids.insert(child.id());
+                if direct_method_owner.is_some_and(|owner| attributed_items.contains(&owner.id())) {
+                    attributed_items.insert(child.id());
+                }
+            }
+            if !attributes.is_empty() {
+                attributed_items.insert(child.id());
+                if rust_attribute_group_is_bounded(&attributes, child, source) {
+                    bounded_outer_attribute_ids
+                        .extend(attributes.iter().map(|attribute| attribute.id()));
+                }
+                if child.kind() == "function_item"
+                    && !direct_method_ids.contains(&child.id())
+                    && rust_attribute_group_preserves_caller(&attributes, source)
+                {
+                    bounded_attributed_callers.insert(child.id());
+                }
+                if rust_bounded_callsite_category(child)
+                    && rust_attribute_group_preserves_callsite(&attributes, source)
+                {
+                    bounded_attributed_callsites.insert(child.id());
+                }
+                attributes.clear();
+            }
+            collect(
+                child,
+                source,
+                attributed_items,
+                bounded_outer_attribute_ids,
+                bounded_attributed_callers,
+                bounded_attributed_callsites,
+                direct_method_ids,
+            );
         }
     }
-    result
+
+    let mut attributed_items = HashSet::new();
+    let mut bounded_outer_attribute_ids = HashSet::new();
+    let mut bounded_attributed_callers = HashSet::new();
+    let mut bounded_attributed_callsites = HashSet::new();
+    let mut direct_method_ids = HashSet::new();
+    collect(
+        root,
+        source,
+        &mut attributed_items,
+        &mut bounded_outer_attribute_ids,
+        &mut bounded_attributed_callers,
+        &mut bounded_attributed_callsites,
+        &mut direct_method_ids,
+    );
+    (
+        attributed_items,
+        bounded_outer_attribute_ids,
+        bounded_attributed_callers,
+        bounded_attributed_callsites,
+    )
 }
 
-fn rust_bounded_outer_attribute_ids(items: &[TsNode<'_>], source: &str) -> HashSet<usize> {
-    let mut result = HashSet::new();
-    let mut attributes = Vec::new();
-    for item in items {
-        if item.kind() == "attribute_item" {
-            attributes.push(*item);
-        } else {
-            if rust_attribute_group_is_bounded(&attributes, *item, source) {
-                result.extend(attributes.iter().map(|attribute| attribute.id()));
-            }
-            attributes.clear();
-        }
+fn rust_bounded_callsite_category(node: TsNode<'_>) -> bool {
+    node.kind() == "block"
+        || node.kind() == "expression_statement"
+        || node.kind().ends_with("_expression")
+}
+
+fn rust_attribute_body<'source>(
+    attribute: TsNode<'_>,
+    source: &'source str,
+) -> Option<&'source str> {
+    node_text(attribute, source)?
+        .trim()
+        .strip_prefix("#[")?
+        .strip_suffix(']')
+        .map(str::trim)
+}
+
+fn rust_is_outer_doc_comment(node: TsNode<'_>, source: &str) -> bool {
+    let Some(surface) = node_text(node, source).map(str::trim_start) else {
+        return false;
+    };
+    match node.kind() {
+        "line_comment" => surface.starts_with("///") && !surface.starts_with("////"),
+        "block_comment" => surface.starts_with("/**") && !surface.starts_with("/***"),
+        _ => false,
     }
-    result
+}
+
+fn rust_attribute_has_bounded_shape(attribute: TsNode<'_>, source: &str, name: &str) -> bool {
+    let Some(body) = rust_attribute_body(attribute, source) else {
+        return false;
+    };
+    let Some(remainder) = body.strip_prefix(name).map(str::trim) else {
+        return false;
+    };
+    match name {
+        "cfg" | "allow" => remainder
+            .strip_prefix('(')
+            .and_then(|arguments| arguments.strip_suffix(')'))
+            .is_some_and(|arguments| !arguments.trim().is_empty()),
+        "doc" => {
+            remainder
+                .strip_prefix('=')
+                .is_some_and(|value| !value.trim().is_empty())
+                || remainder
+                    .strip_prefix('(')
+                    .and_then(|arguments| arguments.strip_suffix(')'))
+                    .is_some_and(|arguments| !arguments.trim().is_empty())
+        }
+        "inline" => remainder.is_empty() || matches!(remainder, "(always)" | "(never)"),
+        _ => false,
+    }
+}
+
+fn rust_attribute_group_preserves_caller(attributes: &[TsNode<'_>], source: &str) -> bool {
+    attributes.iter().all(|attribute| {
+        rust_is_outer_doc_comment(*attribute, source)
+            || ["cfg", "allow", "doc", "inline"]
+                .into_iter()
+                .any(|name| rust_attribute_has_bounded_shape(*attribute, source, name))
+    })
+}
+
+fn rust_attribute_group_preserves_callsite(attributes: &[TsNode<'_>], source: &str) -> bool {
+    attributes.iter().all(|attribute| {
+        rust_is_outer_doc_comment(*attribute, source)
+            || ["cfg", "allow", "doc"]
+                .into_iter()
+                .any(|name| rust_attribute_has_bounded_shape(*attribute, source, name))
+    })
 }
 
 fn rust_attribute_group_is_bounded(
@@ -6029,6 +6177,9 @@ fn rust_attribute_group_is_bounded(
         })
     });
     attributes.iter().all(|attribute| {
+        if rust_is_outer_doc_comment(*attribute, source) {
+            return true;
+        }
         let Some(surface) = node_text(*attribute, source) else {
             return false;
         };
@@ -6075,12 +6226,19 @@ fn rust_inner_allow_preserves_module_bindings(attribute: TsNode<'_>, source: &st
         == Some("allow")
 }
 
-fn rust_callable_poison_ranges(function: TsNode<'_>, source: &str) -> Vec<(usize, usize)> {
+fn rust_callable_poison_ranges(
+    function: TsNode<'_>,
+    bounded_outer_attribute_ids: &HashSet<usize>,
+    bounded_attributed_callers: &HashSet<usize>,
+    bounded_attributed_callsites: &HashSet<usize>,
+) -> Vec<(usize, usize)> {
     fn collect(
         node: TsNode<'_>,
         root_id: usize,
         scope: (usize, usize),
-        source: &str,
+        bounded_outer_attribute_ids: &HashSet<usize>,
+        bounded_attributed_callers: &HashSet<usize>,
+        bounded_attributed_callsites: &HashSet<usize>,
         output: &mut Vec<(usize, usize)>,
     ) {
         count_rust_resolution_work(1);
@@ -6094,6 +6252,7 @@ fn rust_callable_poison_ranges(function: TsNode<'_>, source: &str) -> Vec<(usize
         };
         if node.kind() == "inner_attribute_item"
             || (node.kind() == "macro_invocation" && rust_macro_can_change_enclosing_bindings(node))
+            || (node.kind() == "use_declaration" && contains_node_kind(node, "use_wildcard"))
         {
             output.push(scope);
         }
@@ -6102,19 +6261,29 @@ fn rust_callable_poison_ranges(function: TsNode<'_>, source: &str) -> Vec<(usize
         let children = node.named_children(&mut cursor).collect::<Vec<_>>();
         let mut pending_attributes = Vec::new();
         for child in children {
-            if child.kind() == "attribute_item" {
+            if child.kind() == "attribute_item" || bounded_outer_attribute_ids.contains(&child.id())
+            {
                 pending_attributes.push(child);
                 continue;
             }
             if !pending_attributes.is_empty() {
-                if rust_attribute_group_is_bounded(&pending_attributes, child, source) {
-                    output.push((child.start_byte(), child.end_byte()));
-                } else {
+                if bounded_attributed_callers.contains(&child.id()) {
+                    output.push((scope.0, child.start_byte()));
+                    output.push((child.end_byte(), scope.1));
+                } else if !bounded_attributed_callsites.contains(&child.id()) {
                     output.push(scope);
                 }
                 pending_attributes.clear();
             }
-            collect(child, root_id, scope, source, output);
+            collect(
+                child,
+                root_id,
+                scope,
+                bounded_outer_attribute_ids,
+                bounded_attributed_callers,
+                bounded_attributed_callsites,
+                output,
+            );
         }
         if !pending_attributes.is_empty() {
             output.push(scope);
@@ -6126,7 +6295,9 @@ fn rust_callable_poison_ranges(function: TsNode<'_>, source: &str) -> Vec<(usize
         function,
         function.id(),
         (function.start_byte(), function.end_byte()),
-        source,
+        bounded_outer_attribute_ids,
+        bounded_attributed_callers,
+        bounded_attributed_callsites,
         &mut ranges,
     );
     ranges.sort_unstable();
@@ -11736,6 +11907,31 @@ mod rust_complexity_tests {
         source
     }
 
+    fn bounded_attribute_source(count: usize) -> String {
+        let mut source =
+            String::from("fn target() {}\n#[cfg(any())]\n#[allow(dead_code)]\nfn caller() {\n");
+        for _ in 0..count {
+            source.push_str(
+                "#[cfg(any())]\n#[allow(dead_code)]\n#[doc = \"bounded\"]\n{ target(); }\n",
+            );
+        }
+        source.push_str("}\n");
+        source
+    }
+
+    fn nested_attributed_module_source(depth: usize) -> String {
+        let mut source = String::new();
+        for index in 0..depth {
+            source.push_str(&format!(
+                "fn target_{index}() {{}}\n#[allow(dead_code)]\nfn caller_{index}() {{ target_{index}(); }}\nmod nested_{index} {{\n"
+            ));
+        }
+        for _ in 0..depth {
+            source.push_str("}\n");
+        }
+        source
+    }
+
     fn measured_projection_work(count: usize) -> usize {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("lib.rs");
@@ -11858,6 +12054,28 @@ mod rust_complexity_tests {
         assert!(
             large_glob <= small_glob * 2 + 128,
             "glob-local declaration and call work grew superlinearly: {small_glob} -> {large_glob}"
+        );
+
+        let small_attributes = measured_source_work(&bounded_attribute_source(64));
+        let large_attributes = measured_source_work(&bounded_attribute_source(128));
+        assert!(
+            small_attributes >= 64 * 8,
+            "bounded attribute preparation and lookup work was not fully counted: {small_attributes}"
+        );
+        assert!(
+            large_attributes <= small_attributes * 2 + 128,
+            "bounded attribute preparation and lookup work grew superlinearly: {small_attributes} -> {large_attributes}"
+        );
+
+        let small_modules = measured_source_work(&nested_attributed_module_source(64));
+        let large_modules = measured_source_work(&nested_attributed_module_source(128));
+        assert!(
+            small_modules >= 64 * 8,
+            "nested-module attribute preparation was not fully counted: {small_modules}"
+        );
+        assert!(
+            large_modules <= small_modules * 2 + 128,
+            "nested-module attribute preparation grew superlinearly: {small_modules} -> {large_modules}"
         );
     }
 
