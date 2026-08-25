@@ -879,6 +879,266 @@ fn java_and_kotlin_closed_nonexact_matrix_never_proves() -> anyhow::Result<()> {
 }
 
 #[test]
+fn ruby_and_php_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "ruby_same_file_and_self",
+            vec![(
+                "lib/exact.rb",
+                concat!(
+                    "def same_file_target\nend\n",
+                    "def same_file_caller\n  same_file_target\n  same_file_target\nend\n",
+                    "class Worker\n",
+                    "  def member_target\n  end\n",
+                    "  def self_caller\n    self.member_target\n  end\n",
+                    "end\n",
+                ),
+            )],
+            "ruby",
+            vec![("same_file_target", 2), ("member_target", 1)],
+        ),
+        (
+            "ruby_constructor_receiver",
+            vec![(
+                "lib/exact.rb",
+                concat!(
+                    "class Worker\n  def target\n  end\nend\n",
+                    "def caller\n  worker = Worker.new\n  worker.target\nend\n",
+                ),
+            )],
+            "ruby",
+            vec![("target", 1)],
+        ),
+        (
+            "ruby_literal_require_relative",
+            vec![
+                ("lib/worker.rb", "class Worker\n  def target\n  end\nend\n"),
+                (
+                    "lib/caller.rb",
+                    concat!(
+                        "require_relative \"worker\"\n",
+                        "def caller\n  worker = Worker.new\n  worker.target\nend\n",
+                    ),
+                ),
+            ],
+            "ruby",
+            vec![("target", 1)],
+        ),
+        (
+            "php_same_file_namespace_this_constructor_and_typed_receiver",
+            vec![(
+                "src/Exact.php",
+                concat!(
+                    "<?php\nnamespace App;\n",
+                    "function same_file_target() {}\n",
+                    "function same_file_caller() { same_file_target(); same_file_target(); }\n",
+                    "class Worker {\n",
+                    "  public function memberTarget() {}\n",
+                    "  public function thisCaller() { $this->memberTarget(); }\n",
+                    "}\n",
+                    "function constructorCaller() { (new Worker())->memberTarget(); }\n",
+                    "function typedCaller(Worker $worker) { $worker->memberTarget(); }\n",
+                ),
+            )],
+            "php",
+            vec![("same_file_target", 2), ("memberTarget", 3)],
+        ),
+        (
+            "php_exact_use_aliases",
+            vec![
+                (
+                    "src/Lib/Worker.php",
+                    concat!(
+                        "<?php\nnamespace Lib;\n",
+                        "function imported_target() {}\n",
+                        "class Worker { public function memberTarget() {} }\n",
+                    ),
+                ),
+                (
+                    "src/App/Caller.php",
+                    concat!(
+                        "<?php\nnamespace App;\n",
+                        "use function Lib\\imported_target as target_alias;\n",
+                        "use Lib\\Worker as WorkerAlias;\n",
+                        "function functionCaller() { target_alias(); }\n",
+                        "function receiverCaller(WorkerAlias $worker) { $worker->memberTarget(); }\n",
+                    ),
+                ),
+            ],
+            "php",
+            vec![("target_alias", 1), ("memberTarget", 1)],
+        ),
+    ];
+
+    for (name, files, language, targets) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.provenance.language_adapter == language)
+            .collect::<Vec<_>>();
+        for (target, expected_count) in targets {
+            let exact = facts
+                .iter()
+                .filter(|fact| fact.callsite.raw_target == target)
+                .filter(|fact| fact.status == ProofResolutionStatus::Exact)
+                .collect::<Vec<_>>();
+            assert_eq!(exact.len(), expected_count, "{name} {target}: {facts:#?}");
+            assert!(exact.iter().all(|fact| {
+                fact.edge_id.is_some()
+                    && fact.raw_edge_target == fact.target
+                    && fact.raw_callsite_identity.is_some()
+                    && fact.target.is_some()
+                    && !fact.evidence_chain.is_empty()
+                    && fact.lookup_domain_complete
+                    && fact.provenance.evidence_sha256.len() == 64
+                    && !fact.provenance.dependency_file_hashes.is_empty()
+            }));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn ruby_and_php_closed_hostile_matrix_never_proves() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "ruby",
+            "class_reopening",
+            "class Worker\n  def target\n  end\nend\nclass Worker\n  def other\n  end\nend\ndef caller\n  Worker.new.target\nend\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "ruby",
+            "monkey_patch",
+            "class Worker\n  def target\n  end\nend\nWorker.define_method(:other) {}\ndef caller\n  Worker.new.target\nend\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "ruby",
+            "mixin",
+            "module M\n  def target\n  end\nend\nclass Worker\n  include M\n  def caller\n    target\n  end\nend\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "ruby",
+            "metaprogramming",
+            "class Worker\n  define_method(:target) {}\n  def caller\n    send(:target)\n  end\nend\n",
+            "send",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "ruby",
+            "dynamic_require",
+            "path = \"worker\"\nrequire_relative path\ndef caller\n  Worker.new.target\nend\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "ruby",
+            "receiver_rebinding",
+            "class Worker\n  def target\n  end\nend\ndef caller\n  worker = Worker.new\n  worker = Object.new\n  worker.target\nend\n",
+            "target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "php",
+            "dynamic_include",
+            "<?php\n$file = 'target.php'; include $file; function caller() { target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "php",
+            "magic_call",
+            "<?php\nclass Worker { public function __call($name, $args) {} } function caller(Worker $worker) { $worker->target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "php",
+            "late_static_binding",
+            "<?php\nclass Worker { public static function target() {} public static function caller() { static::target(); } }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "php",
+            "trait",
+            "<?php\ntrait Targets { public function target() {} } class Worker { use Targets; public function caller() { $this->target(); } }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "php",
+            "interface_receiver",
+            "<?php\ninterface Worker { public function target(); } function caller(Worker $worker) { $worker->target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "php",
+            "variable_function",
+            "<?php\nfunction target() {} function caller() { $call = 'target'; $call(); }\n",
+            "$call",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "php",
+            "variable_class",
+            "<?php\nclass Worker { public function target() {} } function caller() { $class = Worker::class; (new $class())->target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "php",
+            "autoload_ambiguity",
+            "<?php\nspl_autoload_register(function ($name) {}); function caller() { (new Worker())->target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "php",
+            "receiver_rebinding",
+            "<?php\nclass Worker { public function target() {} } function caller() { $worker = new Worker(); $worker = new stdClass(); $worker->target(); }\n",
+            "target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+    ];
+
+    for (language, name, source, target, expected) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let path = if language == "ruby" {
+            "hostile.rb"
+        } else {
+            "hostile.php"
+        };
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+            })
+            .unwrap_or_else(|| panic!("{language} {name} emitted no canonical fact: {facts:#?}"));
+        assert_eq!(fact.status, expected, "{language} {name}: {fact:#?}");
+        assert!(fact.reason.matches_status(fact.status), "{fact:#?}");
+        assert!(fact.edge_id.is_none() && fact.target.is_none(), "{fact:#?}");
+        assert!(fact.evidence_chain.is_empty(), "{fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn java_and_kotlin_exact_facts_reject_resealed_raw_call_mutation() -> anyhow::Result<()> {
     for (language, path, source) in [
         (
