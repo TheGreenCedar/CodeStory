@@ -3551,21 +3551,18 @@ fn go_returned_closure_h4_requires_one_matching_raw_call_edge_and_one_syntax_fac
             }
             _ => unreachable!(),
         }
-        match rematerialize_proof_resolution_projection(&mut store, &publication(1)) {
-            Ok(_) => {
-                let matching = store
-                    .get_proof_resolution_facts()?
-                    .into_iter()
-                    .filter(|fact| fact.callsite.raw_target == "target")
-                    .collect::<Vec<_>>();
-                assert!(
-                    matching
-                        .iter()
-                        .all(|fact| fact.status != ProofResolutionStatus::Exact),
-                    "graph/fact mutation {mutation} retained Exact: {matching:#?}"
-                );
-            }
-            Err(_) => {}
+        if rematerialize_proof_resolution_projection(&mut store, &publication(1)).is_ok() {
+            let matching = store
+                .get_proof_resolution_facts()?
+                .into_iter()
+                .filter(|fact| fact.callsite.raw_target == "target")
+                .collect::<Vec<_>>();
+            assert!(
+                matching
+                    .iter()
+                    .all(|fact| fact.status != ProofResolutionStatus::Exact),
+                "graph/fact mutation {mutation} retained Exact: {matching:#?}"
+            );
         }
     }
 

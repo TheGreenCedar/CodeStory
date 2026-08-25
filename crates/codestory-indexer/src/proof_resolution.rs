@@ -650,15 +650,13 @@ impl<'tree> GoResolutionIndex<'tree> {
         result
             .calls
             .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
-        (
-            result.binding_decisions,
-            result.returned_closure_outer_blockers,
-        ) = go_prepare_binding_decisions(
+        result.binding_decisions = go_prepare_binding_decisions(
             root,
             source,
             &result.calls,
             &result.import_names,
             &returned_closures,
+            &mut result.returned_closure_outer_blockers,
         );
         result
     }
@@ -1156,13 +1154,10 @@ fn go_prepare_binding_decisions(
     calls: &[IndexedGoCall<'_>],
     import_names: &HashSet<String>,
     returned_closures: &GoReturnedClosureIndex<'_>,
-) -> (
-    HashMap<(usize, usize, String), GoBindingDecision>,
-    HashSet<(usize, String)>,
-) {
+    outer_blockers: &mut HashSet<(usize, String)>,
+) -> HashMap<(usize, usize, String), GoBindingDecision> {
     let shadowed_new = go_callables_declaring_name(root, source, "new", returned_closures);
     let mut intervals = Vec::<GoBindingInterval>::new();
-    let mut outer_blockers = HashSet::new();
     walk_nodes(root, &mut |node| {
         count_go_resolution_work(1);
         let Some(callable) = go_enclosing_callable(node, returned_closures) else {
@@ -1499,7 +1494,7 @@ fn go_prepare_binding_decisions(
             }
         }
     }
-    (decisions, outer_blockers)
+    decisions
 }
 
 fn go_callables_declaring_name(
