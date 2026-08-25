@@ -189,13 +189,13 @@ fn repeated_call_facts_after_graph_mutation(
         &mut store,
         &[(
             "src/lib.rs",
-            "fn target() {}\nfn source() { target(); target(); }\n",
+            "use crate::*;\nfn target() {}\nfn source() { target(); target(); }\n",
         )],
     )?;
     let mut calls = store
         .get_edges()?
         .into_iter()
-        .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(2))
+        .filter(|edge| edge.kind == EdgeKind::CALL && edge.line == Some(3))
         .collect::<Vec<_>>();
     calls.sort_by_key(|edge| {
         edge.callsite_identity
@@ -7330,11 +7330,267 @@ fn rust_closed_expression_macros_only_relax_bare_same_file_calls() -> anyhow::Re
 }
 
 #[test]
-fn rust_identifier_local_closure_keeps_glob_import_domains_incomplete() -> anyhow::Result<()> {
+fn rust_local_function_precedence_over_globs_is_closed_and_name_specific() -> anyhow::Result<()> {
+    for files in [
+        vec![(
+            "src/lib.rs",
+            "use crate::*;\nfn target() {}\nfn caller() { target(); }\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "use crate::*;\nuse std::prelude::rust_2024::*;\nfn target() {}\nfn caller() { target(); }\n",
+        )],
+        vec![(
+            "src/lib.rs",
+            "mod other { fn target() {} }\nmod child { use super::*; fn target() {} fn caller() { target(); } }\n",
+        )],
+        vec![
+            ("src/lib.rs", "mod child;\n"),
+            (
+                "src/child.rs",
+                "use super::*;\nfn target() {}\nfn caller() { target(); }\n",
+            ),
+        ],
+        vec![(
+            "src/lib.rs",
+            "use crate::*;\nstruct Unrelated;\nconst OTHER: usize = 0;\nfn helper() {}\nfn target() {}\nfn caller() { target(); }\n",
+        )],
+    ] {
+        assert_only_call_is_exact(&files)?;
+    }
+
+    for source in [
+        "use crate::*;\nfn caller() { target(); }\n",
+        "use crate::*;\nfn target() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "mod other { pub fn target() {} }\nuse crate::*;\nuse crate::other::target;\nfn target() {}\nfn caller() { target(); }\n",
+        "mod other { pub fn different() {} }\nuse crate::*;\nuse crate::other::different as target;\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nconst target: fn() = || {};\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nstatic target: fn() = target;\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nstruct target;\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nenum target { Value }\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\ntype target = fn();\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nunsafe extern \"C\" { fn target(); }\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nfn target() {}\nfn caller() { fn target() {} target(); }\n",
+        "use crate::*;\nfn target() {}\nfn caller(target: fn()) { target(); }\n",
+        "use crate::*;\nfn target() {}\nfn caller() { let target: fn() = || {}; target(); }\n",
+        "use crate::*;\nfn target() {}\nfn caller<target>() { target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_glob_local_nested_explicit_imports_remain_same_name_blockers() -> anyhow::Result<()> {
+    for source in [
+        "mod other { pub fn target() {} }\nuse crate::{other::{target}, *};\nfn target() {}\nfn caller() { target(); }\n",
+        "mod other { pub fn target() {} }\nuse crate::{other::target, *};\nfn target() {}\nfn caller() { target(); }\n",
+        "mod other { pub fn different() {} }\nuse crate::{other::{different as target}, *};\nfn target() {}\nfn caller() { target(); }\n",
+        "mod other { pub fn target() {} }\nuse crate::*;\nfn target() {}\nfn caller() { use crate::{other::{target}}; target(); }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_glob_local_precedence_keeps_attributes_macros_and_incomplete_domains_closed()
+-> anyhow::Result<()> {
+    for source in [
+        "use crate::*;\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nfn target() {}\n#[cfg(any())]\nfn caller() { target(); }\n",
+        "use crate::*;\nfn target() {}\nfn caller() { #[cfg(any())] { target(); } }\n",
+        "use crate::*;\nmacro_rules! duplicate { () => { fn target() {} }; }\nduplicate!();\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nmacro_rules! shadow { () => { let target: fn() = || {}; }; }\nfn target() {}\nfn caller() { shadow!(); target(); }\n",
+        "use crate::*;\ninclude!(\"generated.rs\");\nfn target() {}\nfn caller() { target(); }\n",
+        "#![unknown]\nuse crate::*;\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\n#[unknown]\nstruct Other;\nfn target() {}\nfn caller() { target(); }\n",
+        "use crate::*;\nfn target() {}\nfn caller() { target(); }\n<",
+        "#[cfg(any())]\nmod child { use super::*; fn target() {} fn caller() { target(); } }\n",
+        "#[unresolved_attribute_macro]\nmod child { use super::*; fn target() {} fn caller() { target(); } }\n",
+        "use crate::*;\nfn target() {}\nstruct Worker;\n#[cfg(any())]\nimpl Worker { fn caller() { target(); } }\n",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
     assert_only_call_is_not_exact(&[(
         "src/lib.rs",
-        "use crate::*;\nfn target() {}\nfn caller() { target(); }\n",
-    )])
+        "mod possible { pub fn target() {} }\nuse possible::*;\nfn caller() { target(); }\n",
+    )])?;
+    Ok(())
+}
+
+#[test]
+fn rust_glob_local_file_modules_require_unique_authenticated_parent_ownership() -> anyhow::Result<()>
+{
+    for files in [
+        vec![(
+            "src/child.rs",
+            "use super::*;\nfn target() {}\nfn caller() { target(); }\n",
+        )],
+        vec![
+            ("src/lib.rs", "#[cfg(any())]\nmod child;\n"),
+            (
+                "src/child.rs",
+                "use super::*;\nfn target() {}\nfn caller() { target(); }\n",
+            ),
+        ],
+        vec![
+            ("src/lib.rs", "#[path = \"actual.rs\"]\nmod selected;\n"),
+            (
+                "src/actual.rs",
+                "use super::*;\nfn target() {}\nfn caller() { target(); }\n",
+            ),
+        ],
+        vec![
+            ("src/lib.rs", "mod foo;\n"),
+            (
+                "src/foo.rs",
+                "use super::*;\nfn target() {}\nfn caller() { target(); }\n",
+            ),
+            ("src/foo/mod.rs", "fn unrelated() {}\n"),
+        ],
+    ] {
+        assert_only_call_is_not_exact(&files)?;
+    }
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("src/lib.rs", "mod child;\n"),
+            (
+                "src/child.rs",
+                "use super::*;\nfn target() {}\nfn caller() { target(); }\n",
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("file-module call fact");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(matches!(
+        fact.evidence_chain.as_slice(),
+        [ResolutionEvidence::SameFileDeclaration { declaration }]
+            if Some(*declaration) == fact.target
+    ));
+    assert_eq!(
+        fact.provenance.dependency_file_hashes.len(),
+        2,
+        "the parent module declaration must be hash-bound: {fact:#?}"
+    );
+    let mut parent = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with("src/lib.rs"))
+        .expect("parent module file");
+    parent.path = project.path().join("unrelated/lib.rs");
+    store.insert_file(&parent)?;
+    let error = store
+        .validate_proof_resolution_publication(&publication(1))
+        .expect_err("a non-ancestor dependency path must not replay as module ownership");
+    assert!(error.to_string().contains("dependency hashes"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn rust_glob_local_calls_preserve_repeated_source_coordinates_and_provenance() -> anyhow::Result<()>
+{
+    let source = "use crate::*;\r\nfn target() {}\r\nfn caller() { /* é */\ttarget(); target(); target(); }\r\n";
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(project.path(), &mut store, &[("src/lib.rs", source)])?;
+    let first = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let mut facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    facts.sort_by_key(|fact| fact.callsite.start_byte);
+    assert_eq!(facts.len(), 3, "one fact per repeated callsite: {facts:#?}");
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.status == ProofResolutionStatus::Exact),
+        "glob-local calls must all be exact: {facts:#?}"
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter_map(|fact| fact.edge_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        3,
+        "one ordinary edge per repeated callsite"
+    );
+    let expected_starts = source
+        .match_indices("target();")
+        .map(|(start, _)| start as u64)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        facts
+            .iter()
+            .map(|fact| fact.callsite.start_byte)
+            .collect::<Vec<_>>(),
+        expected_starts
+    );
+    assert!(facts.iter().all(|fact| {
+        fact.provenance.language_adapter == "rust"
+            && fact.provenance.language_adapter_version == "reference-v17"
+            && fact.provenance.dependency_file_hashes.len() == 1
+            && matches!(
+                fact.evidence_chain.as_slice(),
+                [ResolutionEvidence::SameFileDeclaration { declaration }] if Some(*declaration) == fact.target
+            )
+    }));
+
+    let second = rematerialize_proof_resolution_projection(&mut store, &publication(2))?;
+    assert_eq!(first.fact_count, second.fact_count);
+    assert_eq!(first.fact_digest, second.fact_digest);
+    Ok(())
+}
+
+#[test]
+fn stale_rust_glob_local_adapter_inputs_reject_rematerialization() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "src/lib.rs",
+            "use crate::*;\nfn target() {}\nfn caller() { target(); }\n",
+        )],
+    )?;
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    artifact["resolution_file"]["adapter_version"] = "reference-v16".into();
+    for call in artifact["call_resolution_inputs"]
+        .as_array_mut()
+        .expect("call inputs")
+    {
+        call["adapter_version"] = "reference-v16".into();
+    }
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(1))
+        .expect_err("stale Rust adapter inputs must not authenticate changed lookup semantics");
+    assert!(
+        error.to_string().contains("adapter") || error.to_string().contains("stale"),
+        "{error}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -7359,7 +7615,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "rust")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v15")
+        Some("reference-v17")
     );
     assert_eq!(
         receipt
