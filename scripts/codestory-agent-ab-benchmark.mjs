@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { copyFile, mkdir, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -48,6 +48,40 @@ const PUBLIC_PACKET_MAX_OUTPUT_BYTES = 128 * 1024;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
 const REQUIRED_MANAGED_CODESTORY_VERSION = "0.17.0";
+const EXACT_CANDIDATE_ARMS = Object.freeze([
+  "without_codestory",
+  "published_0_17_4",
+  "candidate_0_18",
+]);
+const EXACT_CANDIDATE_TASK_IDS = Object.freeze([
+  "python-requests-session-flow",
+  "java-commons-lang-string-utils",
+  "rust-ripgrep-search-pipeline",
+  "javascript-express-routing-flow",
+  "typescript-swr-hook-flow",
+  "cpp-fmt-formatting-flow",
+  "c-redis-command-loop",
+  "go-gin-route-dispatch",
+  "ruby-jekyll-site-build",
+  "php-monolog-record-flow",
+  "csharp-automapper-map-flow",
+  "kotlin-okio-buffer-flow",
+  "swift-alamofire-request-flow",
+  "dart-http-client-flow",
+  "bash-nvm-install-dispatch",
+  "html-mdn-form-validation",
+  "css-animate-base-and-keyframes",
+  "sql-chinook-schema-relations",
+]);
+const EXACT_CANDIDATE_PACKAGE_CONTRACT = "codestory.agent-benchmark-package/v1";
+const EXACT_CANDIDATE_TASK_CONTRACT_SHA256 =
+  "51598fdfcadc6585eb45bae4f2836185f389f9707ff565581a863f3720dc7065";
+const MCP_PROTOCOL_REVISIONS = new Set([
+  "2024-11-05",
+  "2025-03-26",
+  "2025-06-18",
+  "2025-11-25",
+]);
 const PINNED_CODEX_RUNNER_CONFIG = [
   'model_reasoning_effort="xhigh"',
   'service_tier="default"',
@@ -144,12 +178,21 @@ const LOCAL_REPOS = {
 
 const ALL_REPOS = { ...PUBLIC_REPOS, ...LOCAL_REPOS };
 
+const CODESTORY_ARM_INSTRUCTION =
+  "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.";
+
 const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    CODESTORY_ARM_INSTRUCTION,
+  published_0_17_4: CODESTORY_ARM_INSTRUCTION,
+  candidate_0_18: CODESTORY_ARM_INSTRUCTION,
 };
+
+function isCodeStoryArm(arm) {
+  return arm === "with_codestory" || arm === "published_0_17_4" || arm === "candidate_0_18";
+}
 
 function usage() {
   console.log(`Usage:
@@ -158,6 +201,7 @@ function usage() {
   node scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
   node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite <suite> [--materialize-repos] [--repeats n]
   node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--canary-task-id id] [--shard-count n --shard-index n] [--allow-failures] [--publishable]
+  node scripts/codestory-agent-ab-benchmark.mjs --exact-candidate --task-suite language-expansion-holdout --published-package-receipt <path> --candidate-package-receipt <path>
 
 Options:
   --list          Print configured benchmark repositories or selected manifest tasks and exit.
@@ -165,7 +209,7 @@ Options:
   --reanalyze-dir Recompute transcript analysis, quality scores, and summaries from an existing run directory.
   --quick         Default to repo=codestory and repeats=1 unless explicitly set.
   --repos         Comma-separated repo names. Public: ${Object.keys(PUBLIC_REPOS).join(", ")}. Local optional: ${Object.keys(LOCAL_REPOS).join(", ")}
-  --arms          Comma-separated A/B arms. Default: ${Object.keys(ARMS).join(", ")}.
+  --arms          Comma-separated A/B arms. Default: without_codestory, with_codestory.
   --task-suite    Task suite folder under benchmarks/tasks, such as public-core or holdout-retrieval.
   --task-ids      Comma-separated manifest task ids to include after suite/path loading.
   --task-manifest Task manifest JSON file or directory. When set, tasks drive repos and prompts.
@@ -191,6 +235,12 @@ Options:
   --jobs          Parallel jobs for independent packet-runtime cold-cli rows or independent agent repo groups. Default: 1.
   --reuse-baseline-from
                   Reuse matching without-CodeStory rows from an earlier run directory when the task snapshot is unchanged.
+  --exact-candidate
+                  Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.4, and the frozen 0.18 candidate.
+  --published-package-receipt
+                  Checksum-bound package/CLI/source/schema/protocol/discovery receipt for published CodeStory 0.17.4.
+  --candidate-package-receipt
+                  Checksum-bound package/CLI/source/schema/protocol/discovery receipt for the frozen CodeStory 0.18 candidate.
   --prepare-codestory-cache
                   Before timed with-CodeStory runs, refresh stale or semantic-empty local caches and record indexing cost separately.
                   Packet-runtime mode enables this by default because packets require prepared local indexes.
@@ -264,6 +314,9 @@ function parseArgs(argv) {
       "timeout-ms": { type: "string" },
       jobs: { type: "string" },
       "reuse-baseline-from": { type: "string" },
+      "exact-candidate": { type: "boolean" },
+      "published-package-receipt": { type: "string" },
+      "candidate-package-receipt": { type: "string" },
       "prepare-codestory-cache": { type: "boolean" },
       "no-prepare-codestory-cache": { type: "boolean" },
       "prepare-codestory-timeout-ms": { type: "string" },
@@ -302,6 +355,10 @@ function parseArgs(argv) {
     timeoutMs: 600000,
     jobs: 1,
     reuseBaselineFrom: null,
+    exactCandidate: false,
+    publishedPackageReceipt: null,
+    candidatePackageReceipt: null,
+    exactCandidatePackageByArm: null,
     prepareCodestoryCache: null,
     prepareCodestoryJobs: 2,
     prepareCodestoryTimeoutMs: 1_800_000,
@@ -361,6 +418,9 @@ function parseArgs(argv) {
   opts.timeoutMs = values["timeout-ms"] == null ? opts.timeoutMs : Number.parseInt(values["timeout-ms"], 10);
   opts.jobs = values.jobs == null ? opts.jobs : Number.parseInt(values.jobs, 10);
   opts.reuseBaselineFrom = values["reuse-baseline-from"] ?? null;
+  opts.exactCandidate = values["exact-candidate"] === true;
+  opts.publishedPackageReceipt = values["published-package-receipt"] ?? null;
+  opts.candidatePackageReceipt = values["candidate-package-receipt"] ?? null;
   opts.prepareCodestoryCache = values["prepare-codestory-cache"] === true ? true : null;
   opts.prepareCodestoryTimeoutMs =
     values["prepare-codestory-timeout-ms"] == null
@@ -379,7 +439,7 @@ function parseArgs(argv) {
     throw new Error("--task-suite and --task-manifest are mutually exclusive");
   }
 
-  if (!opts.reanalyzeDir && !opts.repos && !opts.taskSuite && !opts.taskManifest) {
+  if (!opts.reanalyzeDir && !opts.repos && !opts.taskSuite && !opts.taskManifest && !opts.exactCandidate) {
     opts.repos = opts.quick
       ? ["codestory"]
       : [
@@ -387,13 +447,50 @@ function parseArgs(argv) {
           ...(opts.includeLocalRepos ? Object.keys(LOCAL_REPOS) : []),
         ];
   }
-  opts.arms ??= Object.keys(ARMS);
+  if (opts.exactCandidate) {
+    if (opts.reuseBaselineFrom) {
+      throw new Error("baseline reuse is forbidden in exact-candidate mode");
+    }
+    if (opts.quick || opts.packetRuntime || opts.aggregateShards || opts.shardCount !== 1 || opts.shardIndex !== 0) {
+      throw new Error("exact-candidate mode forbids quick, packet-runtime, aggregation, and sharding");
+    }
+    if (opts.runner !== "codex" || (opts.model != null && opts.model !== DEFAULT_BENCHMARK_MODEL)) {
+      throw new Error(`exact-candidate mode requires runner=codex and model=${DEFAULT_BENCHMARK_MODEL}`);
+    }
+    if (opts.sandbox !== "workspace-write" || opts.jobs !== 1 || opts.timeoutMs !== 600_000) {
+      throw new Error("exact-candidate mode requires the pinned workspace-write, single-job, 600000ms run window");
+    }
+    if (opts.taskIds || opts.repos) {
+      throw new Error("exact-candidate mode forbids task and repository subsets");
+    }
+    opts.taskSuite ??= "language-expansion-holdout";
+    if (opts.taskSuite !== "language-expansion-holdout") {
+      throw new Error("exact-candidate mode requires the language-expansion-holdout task suite");
+    }
+    if (!opts.publishedPackageReceipt || !opts.candidatePackageReceipt) {
+      throw new Error("exact-candidate mode requires both published and candidate package receipts");
+    }
+    if (opts.arms && opts.arms.join(",") !== EXACT_CANDIDATE_ARMS.join(",")) {
+      throw new Error(`exact-candidate arms are frozen as ${EXACT_CANDIDATE_ARMS.join(",")}`);
+    }
+    if (opts.repeats != null && opts.repeats !== 3) {
+      throw new Error("exact-candidate mode requires exactly 3 repeats");
+    }
+    opts.arms = [...EXACT_CANDIDATE_ARMS];
+    opts.repeats = 3;
+    opts.model = DEFAULT_BENCHMARK_MODEL;
+    opts.prepareCodestoryCache = true;
+  }
+  opts.arms ??= ["without_codestory", "with_codestory"];
   if (!opts.arms.length) {
     throw new Error("--arms must include at least one arm");
   }
   for (const arm of opts.arms) {
     if (!ARMS[arm]) {
       throw new Error(`Unknown arm '${arm}'. Known: ${Object.keys(ARMS).join(", ")}`);
+    }
+    if (!opts.exactCandidate && EXACT_CANDIDATE_ARMS.includes(arm) && arm !== "without_codestory") {
+      throw new Error(`Arm '${arm}' is available only with --exact-candidate`);
     }
   }
   if (!opts.repeats) {
@@ -482,8 +579,47 @@ function retrievalEnv() {
   return benchmarkRetrievalEnv(benchmarkChildEnv(process.env));
 }
 
-function selectedBenchmarkChildEnv(opts = {}) {
-  return { ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)) };
+function exactCandidateArmEnv(opts, arm) {
+  if (!opts.exactCandidate || !isCodeStoryArm(arm)) return {};
+  const armRoot = path.join(opts.exactCandidateStateRoot, arm);
+  return {
+    CODESTORY_CACHE_ROOT: path.join(armRoot, "cache"),
+    CODESTORY_STDIO_CACHE_ROOT: path.join(armRoot, "stdio-cache"),
+    CODESTORY_PLUGIN_DATA: path.join(armRoot, "plugin-data"),
+  };
+}
+
+function selectedBenchmarkChildEnv(opts = {}, arm = null) {
+  return {
+    ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)),
+    ...exactCandidateArmEnv(opts, arm),
+  };
+}
+
+function exactCandidatePackageIdentity(receipt, arm) {
+  if (arm === "without_codestory") {
+    return {
+      contract: EXACT_CANDIDATE_PACKAGE_CONTRACT,
+      arm,
+      package_version: null,
+      package_sha256: null,
+      cli_sha256: null,
+      source_commit: null,
+      source_tree: null,
+      schema_version: null,
+      protocol_revision: null,
+      discovery_contract_sha256: null,
+    };
+  }
+  return Object.fromEntries([
+    "contract", "arm", "package_version", "package_sha256", "cli_sha256",
+    "source_commit", "source_tree", "schema_version", "protocol_revision",
+    "discovery_contract_sha256", "receipt_sha256",
+  ].map((field) => [field, receipt?.[field] ?? null]));
+}
+
+function resolveCodeStoryCliForArm(opts, arm) {
+  return opts.exactCandidatePackageByArm?.get(arm)?.cli_path ?? resolveCodeStoryCli(opts);
 }
 
 function runnerCommand(opts, repoPath, prompt, arm = null) {
@@ -547,14 +683,50 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
     model: opts.model ?? DEFAULT_BENCHMARK_MODEL,
     runner_config: PINNED_CODEX_RUNNER_CONFIG,
   };
+  let homes = null;
+  if (opts.exactCandidate) {
+    homes = {};
+    for (const arm of EXACT_CANDIDATE_ARMS) {
+      const armRoot = path.join(opts.exactCandidateStateRoot, arm);
+      const codexHome = path.join(armRoot, "host");
+      await mkdir(codexHome, { recursive: true });
+      await copyFile(authPath, path.join(codexHome, "auth.json"));
+      homes[arm] = codexHome;
+      for (const value of Object.values(exactCandidateArmEnv(opts, arm))) {
+        await mkdir(value, { recursive: true });
+      }
+      if (isCodeStoryArm(arm)) {
+        const cli = resolveCodeStoryCliForArm(opts, arm);
+        await writeFile(
+          path.join(codexHome, "config.toml"),
+          `[mcp_servers.codestory]\ncommand = ${JSON.stringify(cli)}\nargs = ["serve", "--stdio", "--multi-project"]\n`,
+          "utf8",
+        );
+      }
+    }
+    receipt.contract = "codestory.agent-benchmark-codex-isolation/v3";
+    receipt.with_codestory_config = "arm_specific_checksum_bound_cli";
+    receipt.homes = Object.fromEntries(
+      EXACT_CANDIDATE_ARMS.map((arm) => [arm, path.relative(outDir, homes[arm])]),
+    );
+    receipt.cache_roots = Object.fromEntries(
+      EXACT_CANDIDATE_ARMS.map((arm) => [
+        arm,
+        Object.fromEntries(Object.entries(exactCandidateArmEnv(opts, arm)).map(([key, value]) => [
+          key,
+          path.relative(outDir, value),
+        ])),
+      ]),
+    );
+  }
   await writeFile(
     path.join(outDir, "codex-agent-isolation.json"),
     `${JSON.stringify(receipt, null, 2)}\n`,
     "utf8",
   );
   return {
-    root: null,
-    homes: null,
+    root: opts.exactCandidate ? opts.exactCandidateStateRoot : null,
+    homes,
     receipt,
   };
 }
@@ -632,6 +804,110 @@ function normalizeSha256(value, label) {
     throw new Error(`${label} must be a lowercase SHA-256 digest`);
   }
   return normalized;
+}
+
+async function loadExactCandidatePackageReceipt(receiptPath, expectedArm) {
+  if (!EXACT_CANDIDATE_ARMS.includes(expectedArm) || expectedArm === "without_codestory") {
+    throw new Error(`unsupported exact-candidate package arm '${expectedArm}'`);
+  }
+  const resolvedReceiptPath = path.resolve(receiptPath);
+  const raw = JSON.parse(await readFile(resolvedReceiptPath, "utf8"));
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`package receipt must be an object: ${resolvedReceiptPath}`);
+  }
+  const allowed = new Set([
+    "contract", "arm", "package_version", "package_path", "package_sha256",
+    "cli_path", "cli_sha256", "source_commit", "source_tree", "schema_version",
+    "protocol_revision", "discovery_contract_sha256",
+  ]);
+  const extra = Object.keys(raw).filter((key) => !allowed.has(key));
+  if (extra.length) {
+    throw new Error(`package receipt contains unknown fields: ${extra.join(", ")}`);
+  }
+  if (raw.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT || raw.arm !== expectedArm) {
+    throw new Error(`package receipt identity does not match ${expectedArm}`);
+  }
+  const expectedVersion = expectedArm === "published_0_17_4" ? "0.17.4" : "0.18.0";
+  if (raw.package_version !== expectedVersion) {
+    throw new Error(`${expectedArm} package version must be ${expectedVersion}`);
+  }
+  const packagePath = path.resolve(path.dirname(resolvedReceiptPath), String(raw.package_path ?? ""));
+  const cliPath = path.resolve(path.dirname(resolvedReceiptPath), String(raw.cli_path ?? ""));
+  for (const [label, filePath] of [["package", packagePath], ["CLI", cliPath]]) {
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) {
+      throw new Error(`${label} path is not a regular file: ${filePath}`);
+    }
+  }
+  const packageSha256 = normalizeSha256(raw.package_sha256, "package_sha256");
+  const cliSha256 = normalizeSha256(raw.cli_sha256, "cli_sha256");
+  if (sha256Bytes(await readFile(packagePath)) !== packageSha256) {
+    throw new Error(`${expectedArm} package checksum mismatch`);
+  }
+  if (sha256Bytes(await readFile(cliPath)) !== cliSha256) {
+    throw new Error(`${expectedArm} CLI checksum mismatch`);
+  }
+  for (const field of ["source_commit", "source_tree"]) {
+    if (!/^[0-9a-f]{40}$/.test(String(raw[field] ?? ""))) {
+      throw new Error(`${field} must be a lowercase 40-character Git object id`);
+    }
+  }
+  if (!Number.isInteger(raw.schema_version) || raw.schema_version < 1) {
+    throw new Error("schema_version must be a positive integer");
+  }
+  if (!MCP_PROTOCOL_REVISIONS.has(raw.protocol_revision)) {
+    throw new Error(`unsupported MCP protocol revision '${raw.protocol_revision ?? "missing"}'`);
+  }
+  const discoveryContractSha256 = normalizeSha256(
+    raw.discovery_contract_sha256,
+    "discovery_contract_sha256",
+  );
+  return {
+    contract: raw.contract,
+    arm: raw.arm,
+    package_version: raw.package_version,
+    package_path: packagePath,
+    package_sha256: packageSha256,
+    cli_path: cliPath,
+    cli_sha256: cliSha256,
+    source_commit: raw.source_commit,
+    source_tree: raw.source_tree,
+    schema_version: raw.schema_version,
+    protocol_revision: raw.protocol_revision,
+    discovery_contract_sha256: discoveryContractSha256,
+    receipt_path: resolvedReceiptPath,
+    receipt_sha256: sha256Bytes(await readFile(resolvedReceiptPath)),
+  };
+}
+
+function validateExactCandidateShape(opts, tasks) {
+  if (!opts.exactCandidate) return;
+  if (tasks.length !== 18 || new Set(tasks.map((task) => task.id)).size !== 18) {
+    throw new Error("exact-candidate mode requires exactly 18 pinned tasks");
+  }
+  if (
+    tasks.some((task) => task.suite != null) &&
+    tasks.map((task) => task.id).join(",") !== EXACT_CANDIDATE_TASK_IDS.join(",")
+  ) {
+    throw new Error("exact-candidate task ids or order differ from the pinned 18-task window");
+  }
+  if (tasks.some((task) => task.suite != null)) {
+    const taskContract = tasks.map((task) => {
+      const { manifest_path: _manifestPath, ...snapshot } = taskSnapshotForResult(task);
+      return snapshot;
+    });
+    if (sha256Bytes(stableJsonForHash(taskContract)) !== EXACT_CANDIDATE_TASK_CONTRACT_SHA256) {
+      throw new Error("exact-candidate prompts or qualification inputs differ from the pinned task window");
+    }
+  }
+  if (opts.taskSuite !== "language-expansion-holdout") {
+    throw new Error("exact-candidate mode requires the pinned language-expansion-holdout suite");
+  }
+  if (opts.repeats !== 3 || opts.arms.join(",") !== EXACT_CANDIDATE_ARMS.join(",")) {
+    throw new Error("exact-candidate mode requires the frozen three arms and exactly 3 repeats");
+  }
+  if (opts.reuseBaselineFrom) {
+    throw new Error("baseline reuse is forbidden in exact-candidate mode");
+  }
 }
 
 function normalizeCodestoryProjectManifest(filePath, value) {
@@ -1573,7 +1849,7 @@ function composePrompt(repoName, repoConfig, armName, task = null, context = {})
 Task class: ${task.task_class ?? "unspecified"}`
     : "";
   const packetFirstCommand =
-    armName === "with_codestory"
+    isCodeStoryArm(armName)
       ? packetFirstCommandForPrompt(taskPrompt, task)
       : null;
   const packetFirstBlock = packetFirstCommand && !context.codestoryPrelude?.packet
@@ -1586,7 +1862,7 @@ ${packetFirstCommand}
 Run that answer packet before any repository search, direct source read, git command, CodeStory primitive, or help/probe command. The benchmark treats help/probe commands such as \`--help\` as not packet-first.`
     : "";
   const stopContractBlock =
-    armName === "with_codestory"
+    isCodeStoryArm(armName)
       ? `
 The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. A \`not_established\` packet can still contain directly useful support: answer those established parts, identify the material gaps, and do not infer the missing links. On \`drill_once\`, execute exactly the declared one-shot packet continuation, apply the same terminal answer rule, and then stop regardless of its result.`
       : "";
@@ -2164,7 +2440,47 @@ function interactionTurnTelemetry(events) {
   };
 }
 
-function analyzeTranscript(events, projectRoot = null) {
+function directSourceReadAuthorization(read, commands, events, projectRoot, context) {
+  if (context.arm === "without_codestory") {
+    return { status: "baseline_local_exploration", reason: "without_codestory" };
+  }
+  const prompt = String(context.task?.prompt ?? "").replaceAll("\\", "/");
+  const normalizedPath = normalizePathLike(read.path);
+  const relativePath = isAbsolutePathLike(normalizedPath) && projectRoot
+    ? normalizePathLike(path.relative(projectRoot, normalizedPath))
+    : normalizedPath;
+  if (relativePath && prompt.includes(relativePath)) {
+    return { status: "authorized", reason: "user_named_file" };
+  }
+  const gapPattern = /\b(?:unknown|unavailable|not_established|evidence gap|material gap|missing evidence)\b/i;
+  const priorCommand = [...commands].reverse().find((command) =>
+    command.category === "codestory_cli" &&
+    (command.completed_event_index ?? -1) < (read.event_index ?? -1) &&
+    gapPattern.test(String(command.aggregated_output ?? ""))
+  );
+  if (priorCommand) {
+    return {
+      status: "authorized",
+      reason: "explicit_evidence_gap",
+      evidence_command_id: priorCommand.id,
+    };
+  }
+  const priorMcpEventIndex = events.findLastIndex((event, index) =>
+    index < (read.event_index ?? -1) &&
+    isSuccessfulCodeStoryMcpToolCallEvent(event) &&
+    gapPattern.test(JSON.stringify(event)),
+  );
+  if (priorMcpEventIndex >= 0) {
+    return {
+      status: "authorized",
+      reason: "explicit_evidence_gap",
+      evidence_event_index: priorMcpEventIndex,
+    };
+  }
+  return { status: "unauthorized", reason: null };
+}
+
+function analyzeTranscript(events, projectRoot = null, context = {}) {
   const commands = extractCommandExecutions(events);
   const toolCategories = toolCallCategories(events);
   const codestoryMcpToolCalls = events.filter(isCodeStoryMcpToolCallStartEvent);
@@ -2205,6 +2521,10 @@ function analyzeTranscript(events, projectRoot = null) {
   );
   const firstSuccessfulContextCommand = commands.find(isSuccessfulContextCommand);
   const sourceReads = directFileReads.filter((read) => read.source_like && read.repo_like);
+  const authorizedSourceReads = sourceReads.map((read) => ({
+    ...read,
+    authorization: directSourceReadAuthorization(read, commands, events, projectRoot, context),
+  }));
   const afterIndex = (first) =>
     first == null
       ? null
@@ -2223,6 +2543,7 @@ function analyzeTranscript(events, projectRoot = null) {
     output_chars_by_category: outputCharsByCategory,
     direct_file_reads_total: directFileReads.length,
     direct_source_reads_total: sourceReads.length,
+    direct_source_reads: authorizedSourceReads,
     direct_file_reads_duplicated: duplicateCounts(directFileReads.map((read) => read.path)),
     first_successful_codestory_command: firstSuccessfulCodeStory
       ? {
@@ -2719,7 +3040,34 @@ function scoreQuality(events, task) {
   const transcript = commands
     .map((command) => `${command.command}\n${command.aggregated_output ?? ""}`)
     .join("\n");
-  return scoreQualityFromText(finalAnswer, transcript, task);
+  const quality = scoreQualityFromText(finalAnswer, transcript, task);
+  const proofClaims = forbiddenCandidateSentences(finalAnswer).filter((sentence) =>
+    /\b(?:contractproven|contractrefuted)\b/i.test(sentence) ||
+    /\bcodestory\s+(?:proved|proves|refuted|refutes|verified)\b/i.test(sentence)
+  );
+  const proofEvidence = [
+    ...commands
+      .filter((command) => command.category === "codestory_cli" && command.exit_code === 0)
+      .map((command) => command.aggregated_output ?? ""),
+    ...events.filter(isSuccessfulCodeStoryMcpToolCallEvent).map((event) => JSON.stringify(event)),
+  ].join("\n");
+  const unsupportedProofClaims = proofClaims.filter((claim) => {
+    const refutationClaim = /\b(?:contractrefuted|refuted|refutes)\b/i.test(claim);
+    return refutationClaim
+      ? !/\bContractRefuted\b/.test(proofEvidence)
+      : !/\bContractProven\b/.test(proofEvidence);
+  });
+  return {
+    ...quality,
+    material_factual_errors: {
+      found: quality.forbidden_claims.found,
+      found_anchors: quality.forbidden_claims.found_anchors,
+    },
+    unsupported_proof_claims: {
+      found: unsupportedProofClaims.length,
+      found_claims: unsupportedProofClaims,
+    },
+  };
 }
 
 function scoreQualityFromText(finalAnswer, transcript, task) {
@@ -3960,7 +4308,9 @@ async function runOne(opts, run, outDir) {
     run.arm,
     String(run.repeat).padStart(2, "0"),
   ]);
-  const resolvedCodeStoryCli = run.arm === "with_codestory" ? resolveCodeStoryCli(opts) : null;
+  const resolvedCodeStoryCli = isCodeStoryArm(run.arm)
+    ? resolveCodeStoryCliForArm(opts, run.arm)
+    : null;
   const codestoryPreludeCli = resolvedCodeStoryCli
     ? path.isAbsolute(resolvedCodeStoryCli) || /[\\/]/.test(resolvedCodeStoryCli)
       ? path.resolve(resolvedCodeStoryCli)
@@ -3969,13 +4319,16 @@ async function runOne(opts, run, outDir) {
   const codestoryPreludeCliSha256 = codestoryPreludeCli && existsSync(codestoryPreludeCli)
     ? sha256Bytes(await readFile(codestoryPreludeCli))
     : null;
-  const env = agentRunnerEnv(process.env, opts.agentCodexHomes?.[run.arm] ?? null);
+  const env = agentRunnerEnv(
+    selectedBenchmarkChildEnv(opts, run.arm),
+    opts.agentCodexHomes?.[run.arm] ?? null,
+  );
   const baselinePrelude =
     run.arm === "without_codestory"
       ? await runBaselinePrelude(opts, run, repoConfig, outDir, runId)
       : null;
   const codestoryPrelude =
-    run.arm === "with_codestory"
+    isCodeStoryArm(run.arm)
       ? await runCodeStoryPacketPrelude(
           opts,
           run,
@@ -4039,8 +4392,8 @@ async function runOne(opts, run, outDir) {
   const usage = extractUsage(parsed);
   const codexToolCalls = parsed.filter(isToolCallStartEvent).length;
   const toolCalls = analysisEvents.filter(isToolCallStartEvent).length;
-  const analysis = analyzeTranscript(analysisEvents, repoConfig.path);
-  const codestoryBinaryIdentity = run.arm === "with_codestory"
+  const analysis = analyzeTranscript(analysisEvents, repoConfig.path, { task: run.task, arm: run.arm });
+  const codestoryBinaryIdentity = isCodeStoryArm(run.arm)
     ? codeStoryBinaryIdentity(codestoryPreludeCliSha256, analysis)
     : null;
   const binaryIdentityFailed = codestoryBinaryIdentity != null && ![
@@ -4048,11 +4401,11 @@ async function runOne(opts, run, outDir) {
     "exact_match",
   ].includes(codestoryBinaryIdentity.status);
   const provenance = await repoProvenance(repoConfig, opts.signal);
-  const packetFirstRequired = run.arm === "with_codestory";
+  const packetFirstRequired = isCodeStoryArm(run.arm);
   const packetFirstPass =
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
   const quality = scoreQuality(analysisEvents, run.task);
-  const cacheProvenance = run.arm === "with_codestory"
+  const cacheProvenance = isCodeStoryArm(run.arm)
     ? await codestoryCacheProvenance(
         opts,
         repoConfig,
@@ -4061,7 +4414,9 @@ async function runOne(opts, run, outDir) {
           run.repo,
           codestoryPrelude?.packet ?? null,
           analysis,
+          run.arm,
         ),
+        run.arm,
       )
     : null;
   const benchmarkContract = benchmarkContractForRun(opts, run, env);
@@ -4086,9 +4441,12 @@ async function runOne(opts, run, outDir) {
     args,
     stdin: stdin == null ? null : "<prompt>",
     codestory_cli_env: null,
-    codestory_prelude_cli: run.arm === "with_codestory" ? codestoryPreludeCli : null,
-    codestory_prelude_cli_sha256: run.arm === "with_codestory"
+    codestory_prelude_cli: isCodeStoryArm(run.arm) ? codestoryPreludeCli : null,
+    codestory_prelude_cli_sha256: isCodeStoryArm(run.arm)
       ? codestoryPreludeCliSha256
+      : null,
+    package_identity: opts.exactCandidate
+      ? exactCandidatePackageIdentity(opts.exactCandidatePackageByArm?.get(run.arm), run.arm)
       : null,
     codestory_binary_identity: codestoryBinaryIdentity,
     repo_path: repoConfig.path,
@@ -4107,6 +4465,17 @@ async function runOne(opts, run, outDir) {
       ? `CodeStory binary identity ${codestoryBinaryIdentity.status}`
       : result.error,
     wall_ms: wallMs,
+    exact_candidate_timing: opts.exactCandidate
+      ? {
+          cold_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.preparation_wall_ms ?? 0,
+          warm_ms: codestoryPrelude?.public.wall_ms ?? 0,
+          incremental_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.incremental_wall_ms ?? 0,
+          all_in_ms:
+            wallMs +
+            (cachePreparationForRepo(opts, run.repo, run.arm)?.preparation_wall_ms ?? 0) +
+            (cachePreparationForRepo(opts, run.repo, run.arm)?.incremental_wall_ms ?? 0),
+        }
+      : null,
     agent_runner_wall_ms: runnerWallMs,
     baseline_harness_prelude: baselinePrelude?.public ?? null,
     codestory_harness_prelude: codestoryPrelude?.public ?? null,
@@ -5037,6 +5406,62 @@ function cachePreparationIdentityBlockers(referencePreparation, preparation) {
 }
 
 async function prepareCodeStoryCaches(opts, tasks) {
+  if (opts.exactCandidate) {
+    const preparedByArm = new Map();
+    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      const childEnv = selectedBenchmarkChildEnv(opts, arm);
+      for (const value of Object.values(exactCandidateArmEnv(opts, arm))) {
+        await mkdir(value, { recursive: true });
+      }
+      const rows = await prepareCodeStoryCaches(
+        {
+          ...opts,
+          exactCandidate: false,
+          arms: ["with_codestory"],
+          codestoryCli: resolveCodeStoryCliForArm(opts, arm),
+          packetRuntimeChildEnv: childEnv,
+        },
+        tasks,
+      );
+      for (const row of rows) {
+        row.arm = arm;
+        row.package_identity = exactCandidatePackageIdentity(
+          opts.exactCandidatePackageByArm.get(arm),
+          arm,
+        );
+        const incrementalStarted = performance.now();
+        const incrementalArgs = retrievalIndexCommandArgs(row.project);
+        incrementalArgs[incrementalArgs.indexOf("auto")] = "incremental";
+        const incremental = await runProcess(
+          resolveCodeStoryCliForArm(opts, arm),
+          incrementalArgs,
+          {
+            env: childEnv,
+            signal: opts.signal,
+            timeoutMs: opts.prepareCodestoryTimeoutMs,
+            timeoutMessage: `incremental timing run timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
+          },
+        );
+        row.incremental_wall_ms = Math.round((performance.now() - incrementalStarted) * 1000) / 1000;
+        row.incremental_status = incremental.status;
+        row.incremental_exit_code = incremental.exitCode;
+        if (incremental.status !== "pass") {
+          throw new Error(`incremental timing failed for ${row.repo}/${arm}: ${trimTail(incremental.stderr || incremental.stdout)}`);
+        }
+      }
+      preparedByArm.set(arm, rows);
+    }
+    const publishedByRepo = new Map(preparedByArm.get("published_0_17_4").map((row) => [row.repo, row]));
+    const candidateByRepo = new Map(preparedByArm.get("candidate_0_18").map((row) => [row.repo, row]));
+    return [...new Set(tasks.map((task) => task.repo))].map((repo) => ({
+      ...candidateByRepo.get(repo),
+      arm: "candidate_0_18",
+      arm_preparations: {
+        published_0_17_4: publishedByRepo.get(repo),
+        candidate_0_18: candidateByRepo.get(repo),
+      },
+    }));
+  }
   if (!opts.arms.includes("with_codestory")) {
     return [];
   }
@@ -5194,15 +5619,16 @@ function cachePolicyForRun(observations = {}) {
   return observations.cache_prepared ? "prepared-retrieval-cache-read-only" : "unprepared-cache-blocked";
 }
 
-function cachePreparationForRepo(opts, repoName) {
+function cachePreparationForRepo(opts, repoName, arm = null) {
   const preparation = opts.cachePreparationByRepo;
+  let row = null;
   if (preparation instanceof Map) {
-    return preparation.get(repoName) ?? null;
+    row = preparation.get(repoName) ?? null;
   }
-  if (Array.isArray(preparation)) {
-    return preparation.find((row) => row?.repo === repoName) ?? null;
+  if (!row && Array.isArray(preparation)) {
+    row = preparation.find((entry) => entry?.repo === repoName) ?? null;
   }
-  return null;
+  return arm && row?.arm_preparations?.[arm] ? row.arm_preparations[arm] : row;
 }
 
 function packetRuntimeCacheObservations(opts, repoName, transportMode) {
@@ -5216,12 +5642,16 @@ function packetRuntimeCacheObservations(opts, repoName, transportMode) {
   };
 }
 
-function agentPacketPreludeCacheObservations(opts, repoName, packet, analysis) {
+function agentPacketPreludeCacheObservations(opts, repoName, packet, analysis, arm = null) {
   const observations = packetRuntimeCacheObservations(
     opts,
     repoName,
     "agent_harness_prelude",
   );
+  if (arm) {
+    observations.cache_preparation = cachePreparationForRepo(opts, repoName, arm);
+    observations.cache_prepared = Boolean(observations.cache_preparation);
+  }
   observations.codestory_index_commands_observed =
     analysis?.codestory_index_commands_observed ?? 0;
   observations.indexing_in_timed_run =
@@ -5279,10 +5709,10 @@ function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) 
   };
 }
 
-async function codestoryCacheProvenance(opts, config, observations = {}) {
+async function codestoryCacheProvenance(opts, config, observations = {}, arm = null) {
   let codestoryCli;
   try {
-    codestoryCli = resolveCodeStoryCli(opts);
+    codestoryCli = arm ? resolveCodeStoryCliForArm(opts, arm) : resolveCodeStoryCli(opts);
   } catch (error) {
     return {
       codestory_cli: null,
@@ -5475,7 +5905,11 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
   const packetManifestQuality = await reanalysisPacketManifestQuality(result, runDir, task);
   const repoConfig = ALL_REPOS[result.repo] ?? null;
   const usage = extractUsage(parsed);
-  const analysis = analyzeTranscript(analysisEvents, result.repo_path ?? repoConfig?.path ?? runDir);
+  const analysis = analyzeTranscript(
+    analysisEvents,
+    result.repo_path ?? repoConfig?.path ?? runDir,
+    { task, arm: result.arm },
+  );
   const packetFirstRequired = result.packet_first_required ?? result.arm === "with_codestory";
   const cacheProvenance = result.codestory_cache_provenance ?? (
     repoConfig && result.arm === "with_codestory"
@@ -8756,6 +9190,18 @@ function runSelfTest() {
 
 function planAgentRuns(opts, tasks) {
   const plannedRuns = [];
+  if (opts.exactCandidate) {
+    for (const [taskIndex, task] of tasks.entries()) {
+      for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
+        const rotation = (taskIndex * opts.repeats + repeat - 1) % opts.arms.length;
+        for (let position = 0; position < opts.arms.length; position += 1) {
+          const arm = opts.arms[(rotation + position) % opts.arms.length];
+          plannedRuns.push({ repo: task.repo, arm, repeat, task });
+        }
+      }
+    }
+    return plannedRuns;
+  }
   if (tasks.length) {
     for (const task of tasks) {
       for (const arm of opts.arms) {
@@ -8774,6 +9220,192 @@ function planAgentRuns(opts, tasks) {
     }
   }
   return plannedRuns;
+}
+
+function exactCandidateAcceptance(rows) {
+  const reasons = [];
+  const expectedRuns = 18 * 3 * EXACT_CANDIDATE_ARMS.length;
+  const completeRows = rows.filter((row) => row?.status === "pass");
+  const uniqueKeys = new Set(rows.map((row) => [row.task_id, row.arm, row.repeat].join("\t")));
+  const armCounts = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [
+    arm,
+    rows.filter((row) => row.arm === arm).length,
+  ]));
+  if (
+    rows.length !== expectedRuns ||
+    completeRows.length !== expectedRuns ||
+    uniqueKeys.size !== expectedRuns ||
+    EXACT_CANDIDATE_ARMS.some((arm) => armCounts[arm] !== 54)
+  ) {
+    reasons.push(
+      `162 complete runs required; rows=${rows.length} complete=${completeRows.length} unique=${uniqueKeys.size}`,
+    );
+  }
+
+  const byArm = Object.fromEntries(
+    EXACT_CANDIDATE_ARMS.map((arm) => [arm, rows.filter((row) => row.arm === arm)]),
+  );
+  const qualityPasses = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [
+    arm,
+    byArm[arm].filter((row) => row.quality?.pass === true).length,
+  ]));
+  if (qualityPasses.candidate_0_18 < qualityPasses.published_0_17_4) {
+    reasons.push(
+      `candidate quality ${qualityPasses.candidate_0_18} is below published 0.17.4 ${qualityPasses.published_0_17_4}`,
+    );
+  }
+  if (qualityPasses.candidate_0_18 < qualityPasses.without_codestory) {
+    reasons.push(
+      `candidate quality ${qualityPasses.candidate_0_18} is below without_codestory ${qualityPasses.without_codestory}`,
+    );
+  }
+
+  const comparatorErrors = new Set(
+    [...byArm.without_codestory, ...byArm.published_0_17_4].flatMap((row) =>
+      (row.quality?.material_factual_errors?.found_anchors ?? []).map((anchor) =>
+        `${row.task_id}\t${row.repeat}\t${anchor}`
+      )
+    ),
+  );
+  const candidateOnlyErrors = byArm.candidate_0_18.flatMap((row) =>
+    (row.quality?.material_factual_errors?.found_anchors ?? []).filter((anchor) =>
+      !comparatorErrors.has(`${row.task_id}\t${row.repeat}\t${anchor}`)
+    ).map((anchor) => ({ task_id: row.task_id, repeat: row.repeat, anchor }))
+  );
+  if (candidateOnlyErrors.length) {
+    reasons.push(`candidate-only material factual errors=${candidateOnlyErrors.length}`);
+  }
+  const unsupportedProofClaims = byArm.candidate_0_18.reduce(
+    (sum, row) => sum + Number(row.quality?.unsupported_proof_claims?.found ?? 0),
+    0,
+  );
+  if (unsupportedProofClaims > 0) {
+    reasons.push(`candidate unsupported proof claims=${unsupportedProofClaims}`);
+  }
+
+  const taskIds = [...new Set(rows.map((row) => row.task_id).filter(Boolean))];
+  for (const taskId of taskIds) {
+    const publishedPasses = byArm.published_0_17_4.filter(
+      (row) => row.task_id === taskId && row.quality?.pass === true,
+    ).length;
+    const candidatePasses = byArm.candidate_0_18.filter(
+      (row) => row.task_id === taskId && row.quality?.pass === true,
+    ).length;
+    if (publishedPasses - candidatePasses >= 2) {
+      reasons.push(`${taskId} loses 2 repeats or more versus published 0.17.4`);
+    }
+  }
+
+  const sum = (arm, selector) => byArm[arm].reduce((total, row) => {
+    const value = Number(selector(row));
+    return total + (Number.isFinite(value) ? value : 0);
+  }, 0);
+  const resourceThresholds = [
+    ["tokens", (row) => row.usage?.total_tokens],
+    ["tool calls", (row) => row.tool_calls_observed],
+    ["cost", (row) => row.estimated_cost_usd],
+  ];
+  const resourceTotals = {};
+  for (const [label, selector] of resourceThresholds) {
+    const baseline = sum("without_codestory", selector);
+    const published = sum("published_0_17_4", selector);
+    const candidate = sum("candidate_0_18", selector);
+    resourceTotals[label] = { without_codestory: baseline, published_0_17_4: published, candidate_0_18: candidate };
+    if (candidate > published * 1.05) reasons.push(`${label} exceed 105% of published 0.17.4`);
+    if (candidate > baseline * 0.8) reasons.push(`${label} exceed 80% of without_codestory`);
+  }
+
+  const timingThresholds = [
+    ["warm", "warm_ms", 1.05, "105%"],
+    ["cold", "cold_ms", 1.05, "5%"],
+    ["incremental", "incremental_ms", 1.05, "5%"],
+    ["all-in", "all_in_ms", 1.10, "110%"],
+  ];
+  const timingTotals = {};
+  for (const [label, field, factor, display] of timingThresholds) {
+    const published = sum("published_0_17_4", (row) => row.exact_candidate_timing?.[field]);
+    const candidate = sum("candidate_0_18", (row) => row.exact_candidate_timing?.[field]);
+    timingTotals[label] = { published_0_17_4: published, candidate_0_18: candidate };
+    if (candidate > published * factor) reasons.push(`${label} timing exceeds ${display} gate`);
+  }
+
+  for (const row of rows) {
+    if (!row.quality || !row.usage || !Number.isFinite(Number(row.usage.total_tokens))) {
+      reasons.push(`missing quality or token accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (!row.transcript_analysis?.tool_categories) {
+      reasons.push(`missing tool categories for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (!row.transcript_analysis?.command_categories || !row.transcript_analysis?.interaction_turns) {
+      reasons.push(`missing command or interaction accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (!Array.isArray(row.transcript_analysis?.direct_source_reads)) {
+      reasons.push(`missing direct source-read accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (!Number.isFinite(Number(row.tool_calls_observed)) || !Number.isFinite(Number(row.estimated_cost_usd))) {
+      reasons.push(`missing tool call or cost accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    for (const field of ["cold_ms", "warm_ms", "incremental_ms", "all_in_ms"]) {
+      if (!Number.isFinite(Number(row.exact_candidate_timing?.[field]))) {
+        reasons.push(`missing ${field} timing for ${row.task_id}/${row.arm}/${row.repeat}`);
+      }
+    }
+    if (
+      !row.quality?.material_factual_errors ||
+      !row.quality?.unsupported_proof_claims
+    ) {
+      reasons.push(`missing factual-error or proof-claim accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (isCodeStoryArm(row.arm)) {
+      for (const read of row.transcript_analysis?.direct_source_reads ?? []) {
+        if (read.authorization?.status !== "authorized") {
+          reasons.push(`unauthorized direct source read ${read.path ?? "unknown"} in ${row.task_id}/${row.arm}/${row.repeat}`);
+        }
+      }
+    }
+  }
+
+  const identityFields = [
+    "contract", "arm", "package_version", "package_sha256", "cli_sha256",
+    "source_commit", "source_tree", "schema_version", "protocol_revision",
+    "discovery_contract_sha256",
+  ];
+  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    const identities = byArm[arm].map((row) => row.package_identity);
+    const reference = identities[0];
+    const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : "0.18.0";
+    const invalidReference =
+      reference?.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT ||
+      reference?.arm !== arm ||
+      reference?.package_version !== expectedVersion ||
+      !SHA256_PATTERN.test(String(reference?.package_sha256 ?? "")) ||
+      !SHA256_PATTERN.test(String(reference?.cli_sha256 ?? "")) ||
+      !/^[0-9a-f]{40}$/.test(String(reference?.source_commit ?? "")) ||
+      !/^[0-9a-f]{40}$/.test(String(reference?.source_tree ?? "")) ||
+      !Number.isInteger(reference?.schema_version) ||
+      !MCP_PROTOCOL_REVISIONS.has(reference?.protocol_revision) ||
+      !SHA256_PATTERN.test(String(reference?.discovery_contract_sha256 ?? ""));
+    const invalid = invalidReference || identities.some((identity) =>
+      !identity || identityFields.some((field) => identity[field] !== reference[field])
+    );
+    if (invalid) {
+      reasons.push(`${arm === "candidate_0_18" ? "candidate" : "published"} package identity mismatch`);
+    }
+  }
+
+  return {
+    contract: "codestory.agent-benchmark-exact-candidate-acceptance/v1",
+    pass: reasons.length === 0,
+    reasons: [...new Set(reasons)],
+    expected_runs: expectedRuns,
+    completed_runs: completeRows.length,
+    arm_counts: armCounts,
+    quality_passes: qualityPasses,
+    candidate_only_material_factual_errors: candidateOnlyErrors,
+    unsupported_candidate_proof_claims: unsupportedProofClaims,
+    resource_totals: resourceTotals,
+    timing_totals: timingTotals,
+  };
 }
 
 function agentRunKey(run) {
@@ -8835,7 +9467,9 @@ function benchmarkContractForRun(opts, run, env = process.env) {
     env,
     harnessPath: benchmarkHarnessPath,
     scorerPath: benchmarkScorerPath,
-    cliIdentity: run.arm === "with_codestory" ? opts.codestoryCli ?? env.CODESTORY_CLI ?? null : null,
+    cliIdentity: isCodeStoryArm(run.arm)
+      ? opts.exactCandidatePackageByArm?.get(run.arm)?.cli_path ?? opts.codestoryCli ?? env.CODESTORY_CLI ?? null
+      : null,
   });
 }
 
@@ -9669,6 +10303,94 @@ function pipelineStageFailure(stage, group, error) {
   };
 }
 
+async function runExactCandidatePipeline({
+  opts,
+  tasks,
+  plannedRuns,
+  executeRun,
+  outDir,
+  materializeGroup,
+  prepareGroup,
+  prepareIsolation,
+  recordResult,
+  recordPreparation,
+  recordPreparationState,
+  recordFirstFailure,
+}) {
+  const cachePreparation = [];
+  opts.cachePreparationByRepo ??= new Map();
+  const groups = [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({ repo, tasks: repoTasks }));
+  let firstFailure = null;
+  for (const group of groups) {
+    try {
+      await materializeGroup(group, null);
+      await recordPreparationState({ kind: "materialized", repo: group.repo });
+      const rows = await prepareGroup(group, null);
+      if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.repo !== group.repo) {
+        throw new Error(`preparation must return exactly one row for ${group.repo}`);
+      }
+      const row = rows[0];
+      await recordPreparation(row);
+      cachePreparation.push(row);
+      opts.cachePreparationByRepo.set(row.repo, row);
+      await recordPreparationState({ kind: "prepared", repo: group.repo });
+    } catch (error) {
+      firstFailure = pipelineStageFailure("preparation", group, error);
+      await recordFirstFailure(firstFailure);
+      return {
+        results: [],
+        firstFailure,
+        comparativeFailure: null,
+        comparativePublishable: false,
+        cachePreparation,
+        agentCodexIsolation: null,
+        aborted: true,
+      };
+    }
+  }
+  let agentCodexIsolation;
+  try {
+    agentCodexIsolation = await prepareIsolation();
+  } catch (error) {
+    firstFailure = pipelineStageFailure("agent_isolation", null, error);
+    await recordFirstFailure(firstFailure);
+    return {
+      results: [],
+      firstFailure,
+      comparativeFailure: null,
+      comparativePublishable: false,
+      cachePreparation,
+      agentCodexIsolation: null,
+      aborted: true,
+    };
+  }
+  const outcome = await runPlannedAgentRuns(
+    { ...opts, jobs: 1 },
+    plannedRuns,
+    new Map(),
+    outDir,
+    {
+      runOne: executeRun,
+      failFast: false,
+      onResult: recordResult,
+      onFirstFailure: async (failure) => {
+        firstFailure ??= failure;
+        if (firstFailure === failure) await recordFirstFailure(failure);
+      },
+    },
+  );
+  firstFailure ??= outcome.firstFailure;
+  return {
+    results: outcome.results,
+    firstFailure,
+    comparativeFailure: null,
+    comparativePublishable: firstFailure == null,
+    cachePreparation,
+    agentCodexIsolation,
+    aborted: false,
+  };
+}
+
 async function runAgentBenchmarkPipeline({
   opts,
   tasks,
@@ -9685,6 +10407,22 @@ async function runAgentBenchmarkPipeline({
   recordFirstFailure = async () => {},
   recordComparativeFailure = async () => {},
 }) {
+  if (opts.exactCandidate) {
+    return await runExactCandidatePipeline({
+      opts,
+      tasks,
+      plannedRuns,
+      executeRun,
+      outDir,
+      materializeGroup,
+      prepareGroup,
+      prepareIsolation,
+      recordResult,
+      recordPreparation,
+      recordPreparationState,
+      recordFirstFailure,
+    });
+  }
   const results = [];
   const cachePreparation = [];
   const abortController = new AbortController();
@@ -10031,6 +10769,21 @@ async function main() {
     return;
   }
   const allTasks = await loadTasks(opts);
+  validateExactCandidateShape(opts, allTasks);
+  if (opts.exactCandidate) {
+    const published = await loadExactCandidatePackageReceipt(
+      opts.publishedPackageReceipt,
+      "published_0_17_4",
+    );
+    const candidate = await loadExactCandidatePackageReceipt(
+      opts.candidatePackageReceipt,
+      "candidate_0_18",
+    );
+    opts.exactCandidatePackageByArm = new Map([
+      [published.arm, published],
+      [candidate.arm, candidate],
+    ]);
+  }
   opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(allTasks, opts);
   if (opts.aggregateShards) {
     await aggregateShardRuns(opts, allTasks);
@@ -10089,6 +10842,11 @@ async function main() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
   await mkdir(outDir, { recursive: true });
+  if (opts.exactCandidate) {
+    opts.exactCandidateStateRoot = await mkdtemp(
+      path.join(os.tmpdir(), "codestory-agent-exact-candidate-"),
+    );
+  }
   const runsPath = path.join(outDir, "runs.jsonl");
   if (existsSync(runsPath)) {
     throw new Error(`Refusing to append a new benchmark to an existing ledger: ${runsPath}`);
@@ -10150,8 +10908,9 @@ async function main() {
   } finally {
     await ledger.close();
     await preparationLedger.close();
-    if (agentCodexIsolation?.root) {
-      await rm(agentCodexIsolation.root, { recursive: true, force: true });
+    const isolationRoot = agentCodexIsolation?.root ?? opts.exactCandidateStateRoot;
+    if (isolationRoot) {
+      await rm(isolationRoot, { recursive: true, force: true });
     }
   }
 
@@ -10231,12 +10990,21 @@ async function main() {
     packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
+    exact_candidate_acceptance: opts.exactCandidate
+      ? exactCandidateAcceptance(canonicalResults)
+      : null,
   };
   await writeFile(path.join(outDir, "summary.json"), `${JSON.stringify(summaryPayload, null, 2)}\n`, "utf8");
   await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts, costAccounting), "utf8");
 
   const failedRuns = canonicalResults.filter((result) => result.status !== "pass");
   let exitCode = firstFailure ? 1 : 0;
+  if (opts.exactCandidate && !summaryPayload.exact_candidate_acceptance.pass) {
+    console.error(
+      `exact-candidate acceptance failed: ${summaryPayload.exact_candidate_acceptance.reasons.join(" | ")}`,
+    );
+    exitCode = 1;
+  }
   if (failedRuns.length && !opts.allowFailures) {
     console.error("benchmark failed: every run must pass unless --allow-failures is set.");
     for (const failed of failedRuns) {
@@ -10346,6 +11114,9 @@ export {
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
   planAgentRuns,
+  exactCandidateAcceptance,
+  loadExactCandidatePackageReceipt,
+  validateExactCandidateShape,
   repoProvenanceBlockers,
   repoProvenance,
   runnerCommand,

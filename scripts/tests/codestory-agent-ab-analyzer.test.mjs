@@ -95,6 +95,7 @@ import {
   cachePolicyForRun,
   cacheProvenanceBlockers,
 } from "../codestory-agent-ab-benchmark.mjs";
+import * as benchmarkHarness from "../codestory-agent-ab-benchmark.mjs";
 import {
   packetGateSelectionOrThrow,
   packetGateStderrPath,
@@ -106,6 +107,261 @@ const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
 const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
 const RUNTIME_REFRESH_CLAIM =
   "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.";
+
+const EXACT_CANDIDATE_ARMS = [
+  "without_codestory",
+  "published_0_17_4",
+  "candidate_0_18",
+];
+
+function exactCandidateRows() {
+  const rows = [];
+  for (let taskIndex = 0; taskIndex < 18; taskIndex += 1) {
+    const taskId = `task-${String(taskIndex + 1).padStart(2, "0")}`;
+    for (let repeat = 1; repeat <= 3; repeat += 1) {
+      for (const arm of EXACT_CANDIDATE_ARMS) {
+        const codestory = arm !== "without_codestory";
+        const packageVersion = arm === "published_0_17_4" ? "0.17.4" : "0.18.0";
+        const packageByte = arm === "published_0_17_4" ? "a" : "b";
+        rows.push({
+          repo: `repo-${taskIndex + 1}`,
+          task_id: taskId,
+          arm,
+          repeat,
+          status: "pass",
+          quality: {
+            pass: true,
+            material_factual_errors: { found: 0, found_anchors: [] },
+            unsupported_proof_claims: { found: 0, found_claims: [] },
+          },
+          usage: { total_tokens: codestory ? 70 : 100 },
+          estimated_cost_usd: codestory ? 0.7 : 1,
+          tool_calls_observed: codestory ? 7 : 10,
+          transcript_analysis: {
+            command_count: codestory ? 7 : 10,
+            tool_categories: { command_execution: codestory ? 7 : 10 },
+            command_categories: { codestory_cli: codestory ? 1 : 0 },
+            interaction_turns: { total: codestory ? 9 : 12 },
+            direct_source_reads: codestory
+              ? [{ path: "src/named.rs", authorization: { status: "authorized", reason: "user_named_file" } }]
+              : [{ path: "src/read.rs", authorization: { status: "baseline_local_exploration", reason: "without_codestory" } }],
+          },
+          exact_candidate_timing: codestory
+            ? {
+                cold_ms: arm === "candidate_0_18" ? 100 : 100,
+                warm_ms: arm === "candidate_0_18" ? 50 : 50,
+                incremental_ms: arm === "candidate_0_18" ? 20 : 20,
+                all_in_ms: arm === "candidate_0_18" ? 80 : 80,
+              }
+            : { cold_ms: 0, warm_ms: 0, incremental_ms: 0, all_in_ms: 100 },
+          package_identity: codestory
+            ? {
+                contract: "codestory.agent-benchmark-package/v1",
+                arm,
+                package_version: packageVersion,
+                package_sha256: packageByte.repeat(64),
+                cli_sha256: (arm === "published_0_17_4" ? "c" : "d").repeat(64),
+                source_commit: (arm === "published_0_17_4" ? "e" : "f").repeat(40),
+                source_tree: (arm === "published_0_17_4" ? "1" : "2").repeat(40),
+                schema_version: arm === "published_0_17_4" ? 2 : 3,
+                protocol_revision: "2025-11-25",
+                discovery_contract_sha256: (arm === "published_0_17_4" ? "3" : "4").repeat(64),
+              }
+            : {
+                contract: "codestory.agent-benchmark-package/v1",
+                arm,
+                package_version: null,
+                package_sha256: null,
+                cli_sha256: null,
+                source_commit: null,
+                source_tree: null,
+                schema_version: null,
+                protocol_revision: null,
+                discovery_contract_sha256: null,
+              },
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+test("exact-candidate mode freezes the 18x3x3 shape and rejects baseline reuse", () => {
+  assert.throws(
+    () => benchmarkHarness.parseArgs([
+      "--exact-candidate",
+      "--task-suite", "language-expansion-holdout",
+      "--published-package-receipt", "/tmp/published.json",
+      "--candidate-package-receipt", "/tmp/candidate.json",
+      "--reuse-baseline-from", "/tmp/old",
+    ]),
+    /baseline reuse is forbidden/i,
+  );
+  const opts = benchmarkHarness.parseArgs([
+    "--exact-candidate",
+    "--task-suite", "language-expansion-holdout",
+    "--published-package-receipt", "/tmp/published.json",
+    "--candidate-package-receipt", "/tmp/candidate.json",
+  ]);
+  assert.deepEqual(opts.arms, EXACT_CANDIDATE_ARMS);
+  assert.equal(opts.repeats, 3);
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateShape(opts, Array.from({ length: 17 }, (_, index) => ({ id: `t-${index}` }))),
+    /exactly 18 pinned tasks/i,
+  );
+  assert.doesNotThrow(() =>
+    benchmarkHarness.validateExactCandidateShape(
+      opts,
+      Array.from({ length: 18 }, (_, index) => ({ id: `t-${index}` })),
+    )
+  );
+});
+
+test("exact-candidate planning balances deterministic arm position across 162 fresh rows", () => {
+  const tasks = Array.from({ length: 18 }, (_, index) => ({
+    id: `task-${index + 1}`,
+    repo: `repo-${index + 1}`,
+  }));
+  const opts = { exactCandidate: true, arms: EXACT_CANDIDATE_ARMS, repeats: 3, repos: null };
+  const first = benchmarkHarness.planAgentRuns(opts, tasks);
+  const second = benchmarkHarness.planAgentRuns(opts, tasks);
+  assert.deepEqual(first, second);
+  assert.equal(first.length, 162);
+  const positions = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [arm, [0, 0, 0]]));
+  for (let index = 0; index < first.length; index += 3) {
+    const triplet = first.slice(index, index + 3);
+    assert.equal(new Set(triplet.map((run) => run.task.id)).size, 1);
+    assert.equal(new Set(triplet.map((run) => run.repeat)).size, 1);
+    assert.deepEqual(new Set(triplet.map((run) => run.arm)), new Set(EXACT_CANDIDATE_ARMS));
+    triplet.forEach((run, position) => {
+      positions[run.arm][position] += 1;
+    });
+  }
+  for (const arm of EXACT_CANDIDATE_ARMS) {
+    assert.deepEqual(positions[arm], [18, 18, 18]);
+  }
+});
+
+test("exact package receipts bind package CLI source schema protocol and discovery identity", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-three-arm-receipt-"));
+  try {
+    const archivePath = path.join(root, "package.tgz");
+    const cliPath = path.join(root, "codestory-cli");
+    await writeFile(archivePath, "package-bytes");
+    await writeFile(cliPath, "cli-bytes");
+    const sha = (value) => createHash("sha256").update(value).digest("hex");
+    const receipt = {
+      contract: "codestory.agent-benchmark-package/v1",
+      arm: "published_0_17_4",
+      package_version: "0.17.4",
+      package_path: archivePath,
+      package_sha256: sha("package-bytes"),
+      cli_path: cliPath,
+      cli_sha256: sha("cli-bytes"),
+      source_commit: "a".repeat(40),
+      source_tree: "b".repeat(40),
+      schema_version: 2,
+      protocol_revision: "2025-11-25",
+      discovery_contract_sha256: "c".repeat(64),
+    };
+    const receiptPath = path.join(root, "receipt.json");
+    await writeFile(receiptPath, JSON.stringify(receipt));
+    const loaded = await benchmarkHarness.loadExactCandidatePackageReceipt(
+      receiptPath,
+      "published_0_17_4",
+    );
+    assert.equal(loaded.package_sha256, receipt.package_sha256);
+    for (const mutate of [
+      (row) => { row.arm = "candidate_0_18"; },
+      (row) => { row.package_version = "0.17.3"; },
+      (row) => { row.package_sha256 = "0".repeat(64); },
+      (row) => { row.cli_sha256 = "0".repeat(64); },
+      (row) => { row.source_commit = null; },
+      (row) => { row.schema_version = null; },
+      (row) => { row.protocol_revision = "2024-01-01"; },
+      (row) => { row.discovery_contract_sha256 = null; },
+    ]) {
+      const hostile = structuredClone(receipt);
+      mutate(hostile);
+      await writeFile(receiptPath, JSON.stringify(hostile));
+      await assert.rejects(
+        benchmarkHarness.loadExactCandidatePackageReceipt(receiptPath, "published_0_17_4"),
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact-candidate acceptance closes the complete causal threshold matrix", () => {
+  const passing = exactCandidateRows();
+  const accepted = benchmarkHarness.exactCandidateAcceptance(passing);
+  assert.equal(accepted.pass, true, JSON.stringify(accepted));
+  assert.equal(accepted.expected_runs, 162);
+  assert.equal(accepted.completed_runs, 162);
+
+  const mutations = [
+    ["complete rows", (rows) => rows.pop(), /162 complete runs/i],
+    ["candidate quality vs published", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").quality.pass = false;
+    }, /candidate quality.*published/i],
+    ["candidate quality vs baseline", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.quality.pass = false;
+    }, /candidate quality.*without_codestory/i],
+    ["candidate-only factual error", (rows) => {
+      const row = rows.find((entry) => entry.arm === "candidate_0_18");
+      row.quality.material_factual_errors = { found: 1, found_anchors: ["false fact"] };
+    }, /candidate-only material factual error/i],
+    ["unsupported proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").quality.unsupported_proof_claims = { found: 1, found_claims: ["ContractProven"] };
+    }, /unsupported proof claim/i],
+    ["task repeat loss", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18" && entry.task_id === "task-01" && entry.repeat <= 2)) row.quality.pass = false;
+      rows.find((entry) => entry.arm === "without_codestory" && entry.task_id === "task-01").quality.pass = false;
+    }, /loses 2 repeats/i],
+    ["tokens vs published", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.usage.total_tokens = 74;
+    }, /tokens.*105%/i],
+    ["tokens vs baseline", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.usage.total_tokens = 81;
+      for (const row of rows.filter((entry) => entry.arm === "published_0_17_4")) row.usage.total_tokens = 80;
+    }, /tokens.*80%/i],
+    ["tools", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.tool_calls_observed = 8;
+    }, /tool calls/i],
+    ["cost", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.estimated_cost_usd = 0.81;
+    }, /cost/i],
+    ["warm", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.warm_ms = 53;
+    }, /warm.*105%/i],
+    ["cold", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.cold_ms = 106;
+    }, /cold.*5%/i],
+    ["incremental", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.incremental_ms = 22;
+    }, /incremental.*5%/i],
+    ["all-in", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.all_in_ms = 89;
+    }, /all-in.*110%/i],
+    ["source authorization", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.direct_source_reads[0].authorization = { status: "unauthorized", reason: null };
+    }, /unauthorized direct source read/i],
+    ["identity", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").package_identity.cli_sha256 = "0".repeat(64);
+    }, /candidate package identity mismatch/i],
+    ["accounting", (rows) => {
+      delete rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.tool_categories;
+    }, /missing tool categories/i],
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const rows = exactCandidateRows();
+    mutate(rows);
+    const result = benchmarkHarness.exactCandidateAcceptance(rows);
+    assert.equal(result.pass, false, `${label}: ${JSON.stringify(result)}`);
+    assert.match(result.reasons.join("\n"), expected, label);
+  }
+});
 
 test("keeps CLI overrides out of both isolated agent arms", () => {
   const opts = {

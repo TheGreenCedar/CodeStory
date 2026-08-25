@@ -22,6 +22,10 @@ The latest nested 18×3 sheet (`language-support-ab-window6`) is the ChatGPT Cod
 | Accelerator | `embedding_device_observation_source=per_user_server`, Metal, `embedding_accelerator_execution_verified=true` |
 | Publication | No `summary.json` (dirty-tree attestation). Not `--publishable`. |
 
+The token and tool-call deltas below are historical, non-current evidence from
+that rejected two-arm window. The fresh three-arm exact-candidate harness owns
+the next product-value decision.
+
 | Metric | Without | With | Change |
 | --- | ---: | ---: | ---: |
 | Total tokens | 19,819,661 | 1,723,654 | −91% |
