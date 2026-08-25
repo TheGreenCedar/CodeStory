@@ -87,7 +87,7 @@ fn python_resolution_work() -> usize {
 }
 
 const ADAPTER_VERSION: &str = "reference-v15";
-const GO_ADAPTER_VERSION: &str = "reference-v16";
+const GO_ADAPTER_VERSION: &str = "reference-v17";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 14;
@@ -862,7 +862,13 @@ impl<'tree> GoReturnedClosureIndex<'tree> {
         });
         let mut member_owners = HashMap::new();
         for (literal, owner) in literals {
-            go_record_returned_closure_members(literal, literal.id(), owner, &mut member_owners);
+            go_record_returned_closure_members(
+                literal,
+                literal.id(),
+                owner,
+                true,
+                &mut member_owners,
+            );
         }
         Self {
             member_owners,
@@ -890,17 +896,35 @@ fn go_record_returned_closure_members<'tree>(
     node: TsNode<'tree>,
     literal_id: usize,
     owner: TsNode<'tree>,
+    allow_deferred_child: bool,
     members: &mut HashMap<usize, TsNode<'tree>>,
 ) {
     count_go_resolution_work(1);
     if node.id() != literal_id && node.kind() == "func_literal" {
+        if allow_deferred_child && go_is_immediate_deferred_literal(node) {
+            go_record_returned_closure_members(node, node.id(), owner, false, members);
+        }
         return;
     }
     members.insert(node.id(), owner);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        go_record_returned_closure_members(child, literal_id, owner, members);
+        go_record_returned_closure_members(child, literal_id, owner, allow_deferred_child, members);
     }
+}
+
+fn go_is_immediate_deferred_literal(literal: TsNode<'_>) -> bool {
+    let Some(call) = literal
+        .parent()
+        .filter(|parent| parent.kind() == "call_expression")
+    else {
+        return false;
+    };
+    call.child_by_field_name("function")
+        .is_some_and(|function| function.id() == literal.id())
+        && call
+            .parent()
+            .is_some_and(|parent| parent.kind() == "defer_statement")
 }
 
 fn go_enclosing_callable<'tree>(
@@ -11760,6 +11784,21 @@ mod go_complexity_tests {
         measured_source(&nested_returned_closure_source(depth))
     }
 
+    fn many_deferred_children_source(count: usize) -> String {
+        let mut source = String::from(
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc caller() Handler { return func() {\n",
+        );
+        for _ in 0..count {
+            source.push_str("defer func() { target() }()\n");
+        }
+        source.push_str("} }\n");
+        source
+    }
+
+    fn measured_many_deferred_children_work(count: usize) -> usize {
+        measured_source(&many_deferred_children_source(count))
+    }
+
     fn measured_source(source: &str) -> usize {
         let mut parser = Parser::new();
         parser
@@ -11852,6 +11891,17 @@ mod go_complexity_tests {
         assert!(
             deep_nested <= shallow_nested * 2 + 128,
             "Go nested returned-closure membership work grew superlinearly: {shallow_nested} -> {deep_nested}"
+        );
+
+        let small_deferred = measured_many_deferred_children_work(64);
+        let large_deferred = measured_many_deferred_children_work(128);
+        assert!(
+            small_deferred >= 64 * 8,
+            "Go deferred-child membership work was not fully counted: {small_deferred}"
+        );
+        assert!(
+            large_deferred <= small_deferred * 2 + 128,
+            "Go deferred-child membership work grew superlinearly: {small_deferred} -> {large_deferred}"
         );
     }
 

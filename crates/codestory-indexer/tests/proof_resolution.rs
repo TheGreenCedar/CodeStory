@@ -2999,8 +2999,8 @@ fn go_repeated_callsites_and_utf8_crlf_coordinates_are_source_bound_and_distinct
 }
 
 #[test]
-fn go_returned_closure_h1_authorizes_only_direct_non_nested_return_ownership() -> anyhow::Result<()>
-{
+fn go_returned_closure_h1_authorizes_only_returned_and_immediate_deferred_child_ownership()
+-> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
     index_files(
@@ -3015,11 +3015,14 @@ fn go_returned_closure_h1_authorizes_only_direct_non_nested_return_ownership() -
                     "type Factory struct{}\n",
                     "func shouldRecord() {}\n",
                     "func captureFrames() {}\n",
-                    "func buildLocal() Handler { return func() { shouldRecord(); captureFrames() } }\n",
-                    "func (Factory) buildRemote() Handler { return func() { remoteLeaf() } }\n",
+                    "func buildLocal() Handler { return func() { shouldRecord(); defer func() { captureFrames() }() } }\n",
+                    "func (Factory) buildRemote() Handler { return func() { remoteLeaf(); defer func() { remoteDeferred() }() } }\n",
                 ),
             ),
-            ("remote.go", "package proof\nfunc remoteLeaf() {}\n"),
+            (
+                "remote.go",
+                "package proof\nfunc remoteLeaf() {}\nfunc remoteDeferred() {}\n",
+            ),
         ],
     )?;
     rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
@@ -3037,6 +3040,10 @@ fn go_returned_closure_h1_authorizes_only_direct_non_nested_return_ownership() -
         .iter()
         .find(|fact| fact.callsite.raw_target == "remoteLeaf")
         .expect("same-package returned-closure call");
+    let remote_deferred = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "remoteDeferred")
+        .expect("same-package immediately deferred child call");
     assert_eq!(
         should_record.status,
         ProofResolutionStatus::Exact,
@@ -3048,6 +3055,11 @@ fn go_returned_closure_h1_authorizes_only_direct_non_nested_return_ownership() -
         "{capture_frames:#?}"
     );
     assert_eq!(remote.status, ProofResolutionStatus::Exact, "{remote:#?}");
+    assert_eq!(
+        remote_deferred.status,
+        ProofResolutionStatus::Exact,
+        "{remote_deferred:#?}"
+    );
     assert!(matches!(
         should_record.evidence_chain.as_slice(),
         [ResolutionEvidence::SameFileDeclaration { .. }]
@@ -3058,6 +3070,10 @@ fn go_returned_closure_h1_authorizes_only_direct_non_nested_return_ownership() -
     ));
     assert!(matches!(
         remote.evidence_chain.as_slice(),
+        [ResolutionEvidence::SamePackageDeclaration { .. }]
+    ));
+    assert!(matches!(
+        remote_deferred.evidence_chain.as_slice(),
         [ResolutionEvidence::SamePackageDeclaration { .. }]
     ));
     let nodes = store.get_nodes()?;
@@ -3072,6 +3088,7 @@ fn go_returned_closure_h1_authorizes_only_direct_non_nested_return_ownership() -
     assert_eq!(should_record.caller, build_local.id);
     assert_eq!(capture_frames.caller, build_local.id);
     assert_eq!(remote.caller, build_remote.id);
+    assert_eq!(remote_deferred.caller, build_remote.id);
 
     let unsupported = [
         (
@@ -3105,6 +3122,34 @@ fn go_returned_closure_h1_authorizes_only_direct_non_nested_return_ownership() -
         (
             "nested.go",
             "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { func() { target() }() } }\n",
+        ),
+        (
+            "child_go.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { go func() { target() }() } }\n",
+        ),
+        (
+            "child_assigned.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { child := func() { target() }; child() } }\n",
+        ),
+        (
+            "child_passed.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc consume(Handler) {}\nfunc outer() Handler { return func() { consume(func() { target() }) } }\n",
+        ),
+        (
+            "child_stored.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { children := []Handler{func() { target() }}; _ = children } }\n",
+        ),
+        (
+            "child_non_immediate_defer.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { child := func() { target() }; defer child() } }\n",
+        ),
+        (
+            "child_defer_argument.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc consume(Handler) {}\nfunc outer() Handler { return func() { defer consume(func() { target() }) } }\n",
+        ),
+        (
+            "child_deferred_nested.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { func() { target() }() }() } }\n",
         ),
         (
             "initializer.go",
@@ -3176,12 +3221,64 @@ fn go_returned_closure_h2_closes_closure_and_outer_lexical_capture_domains() -> 
             "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target(); target := func() {}; _ = target } }\n",
         ),
         (
+            "closure_var_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target(); var target func(); _ = target } }\n",
+        ),
+        (
             "closure_const_after_call.go",
             "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target(); const target = 1; _ = target } }\n",
         ),
         (
             "closure_type_after_call.go",
             "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target(); type target int; var _ target } }\n",
+        ),
+        (
+            "closure_assignment_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target(); target = func() {} } }\n",
+        ),
+        (
+            "deferred_parameter.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func(target func()) { target() }(target) } }\n",
+        ),
+        (
+            "deferred_var_before_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { var target func(); target() }() } }\n",
+        ),
+        (
+            "deferred_var_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target(); var target func(); _ = target }() } }\n",
+        ),
+        (
+            "deferred_const_before_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { const target = 1; target() }() } }\n",
+        ),
+        (
+            "deferred_const_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target(); const target = 1; _ = target }() } }\n",
+        ),
+        (
+            "deferred_type_before_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { type target int; target() }() } }\n",
+        ),
+        (
+            "deferred_type_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target(); type target int; var _ target }() } }\n",
+        ),
+        (
+            "deferred_short_before_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target := func() {}; target() }() } }\n",
+        ),
+        (
+            "deferred_short_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target(); target := func() {}; _ = target }() } }\n",
+        ),
+        (
+            "deferred_assignment_before_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target = func() {}; target() }() } }\n",
+        ),
+        (
+            "deferred_assignment_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target(); target = func() {} }() } }\n",
         ),
         (
             "outer_parameter.go",
@@ -3198,6 +3295,10 @@ fn go_returned_closure_h2_closes_closure_and_outer_lexical_capture_domains() -> 
         (
             "outer_local.go",
             "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { target := func() {}; return func() { target() } }\n",
+        ),
+        (
+            "outer_var.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { var target func(); return func() { target() } }\n",
         ),
         (
             "outer_const.go",
@@ -3269,6 +3370,7 @@ fn go_returned_closure_h2_closes_closure_and_outer_lexical_capture_domains() -> 
                 "func unrelated(other func()) Handler { return func() { other(); target() } }\n",
                 "func lateUnrelated() Handler { return func() { target() }; var other func(); _ = other }\n",
                 "func lateDisjoint() Handler { return func() { target() }; { var target func(); _ = target } }\n",
+                "func deferredVisible(other func()) Handler { return func() { defer func() { { var target func(); _ = target }; other(); target() }() } }\n",
             ),
         )],
     )?;
@@ -3283,8 +3385,8 @@ fn go_returned_closure_h2_closes_closure_and_outer_lexical_capture_domains() -> 
             .iter()
             .filter(|fact| fact.status == ProofResolutionStatus::Exact)
             .count(),
-        4,
-        "a disjoint binding and an unrelated capture must preserve both package calls: {target_facts:#?}"
+        5,
+        "disjoint bindings and unrelated captures must preserve package calls in both supported closure domains: {target_facts:#?}"
     );
     Ok(())
 }
@@ -3300,7 +3402,7 @@ fn go_returned_closure_requires_the_outer_to_be_the_sole_containing_graph_callab
             &mut store,
             &[(
                 "main.go",
-                "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+                "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target() }() } }\n",
             )],
         )?;
         if mutate_after_seal {
@@ -3494,7 +3596,7 @@ fn go_returned_closure_h4_requires_one_matching_raw_call_edge_and_one_syntax_fac
                     "type Handler func()\n",
                     "func target() {}\n",
                     "func sibling() {}\n",
-                    "func outer() Handler { return func() { target() } }\n",
+                    "func outer() Handler { return func() { defer func() { target() }() } }\n",
                 ),
             )],
         )?;
@@ -3573,7 +3675,7 @@ fn go_returned_closure_h4_requires_one_matching_raw_call_edge_and_one_syntax_fac
         &mut store,
         &[(
             "main.go",
-            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target() }() } }\n",
         )],
     )?;
     store.get_connection().execute(
@@ -3595,7 +3697,7 @@ fn go_returned_closure_h4_requires_one_matching_raw_call_edge_and_one_syntax_fac
         &mut store,
         &[(
             "main.go",
-            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { defer func() { target() }() } }\n",
         )],
     )?;
     let artifact_blob = store.get_connection().query_row(
@@ -3629,9 +3731,11 @@ fn go_returned_closure_h5_preserves_repeated_native_source_coordinates() -> anyh
         "type Handler func()\r\n",
         "func target() {}\r\n",
         "func outer() Handler { return func() {\r\n",
-        "\t// λλ\r\n",
-        "\ttarget(); target(); target()\r\n",
-        "\ttarget()\r\n",
+        "\tdefer func() {\r\n",
+        "\t\t// λλ\r\n",
+        "\t\ttarget(); target(); target()\r\n",
+        "\t\ttarget()\r\n",
+        "\t}()\r\n",
         "} }\r\n",
     );
     index_files(project.path(), &mut store, &[("main.go", source)])?;
@@ -3670,7 +3774,7 @@ fn go_returned_closure_h5_preserves_repeated_native_source_coordinates() -> anyh
             .iter()
             .map(|fact| fact.callsite.line)
             .collect::<Vec<_>>(),
-        [6, 6, 6, 7]
+        [7, 7, 7, 8]
     );
     for fact in &facts {
         assert_eq!(
@@ -3692,7 +3796,7 @@ fn go_returned_closure_h6_seals_current_go_cache_and_fact_provenance() -> anyhow
         &[
             (
                 "main.go",
-                "package proof\ntype Handler func()\nfunc outer() Handler { return func() { target() } }\n",
+                "package proof\ntype Handler func()\nfunc outer() Handler { return func() { defer func() { target() }() } }\n",
             ),
             ("target.go", "package proof\nfunc target() {}\n"),
         ],
@@ -3706,7 +3810,7 @@ fn go_returned_closure_h6_seals_current_go_cache_and_fact_provenance() -> anyhow
         .expect("sealed returned-closure fact");
     assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
     assert_eq!(fact.provenance.language_adapter, "go");
-    assert_eq!(fact.provenance.language_adapter_version, "reference-v16");
+    assert_eq!(fact.provenance.language_adapter_version, "reference-v17");
     assert_eq!(fact.provenance.parser_fingerprint.len(), 64);
     assert_eq!(fact.provenance.dependency_file_hashes.len(), 2);
     assert_eq!(fact.provenance.evidence_sha256.len(), 64);
