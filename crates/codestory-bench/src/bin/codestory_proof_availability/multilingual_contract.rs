@@ -30,7 +30,7 @@ pub const PUBLIC_PROOF_ROUTE_DARK: bool = true;
 /// Closed, temporary boundary for parser-backed languages without an installed
 /// proof adapter. The observed adapter roster is compared to this list in the
 /// contract test; this is not an expectation of a resolution result.
-pub const MISSING_ADAPTER_ALLOWLIST: &[&str] = &["ruby", "php", "csharp", "swift", "dart", "bash"];
+pub const MISSING_ADAPTER_ALLOWLIST: &[&str] = &["csharp", "swift", "dart", "bash"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureClass {
@@ -1254,7 +1254,7 @@ fn direct_call_source(language: &str, target: &str, caller: &str) -> String {
         }
         "ruby" => format!("def {target}\nend\ndef {caller}\n  {target}()\nend\n"),
         "php" => format!(
-            "<?php\nclass Fixture {{ function {target}(): void {{}} function {caller}(): void {{ $this->{target}(); }} }}\n"
+            "<?php\nnamespace Fixture\\{caller};\nclass Fixture {{ function {target}(): void {{}} function {caller}(): void {{ $this->{target}(); }} }}\n"
         ),
         "csharp" => format!(
             "class Fixture {{ static void {target}() {{}} static void {caller}() {{ {target}(); }} }}\n"

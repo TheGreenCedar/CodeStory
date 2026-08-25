@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 // Versioned with proof-input semantics so older parser artifacts fail closed.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 22;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 23;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -180,6 +180,8 @@ pub(crate) struct CachedResolutionFile {
     #[serde(default)]
     pub java_kotlin_package: Option<String>,
     #[serde(default)]
+    pub php_namespace: Option<String>,
+    #[serde(default)]
     pub c_cpp_file: Option<CachedCCppFile>,
 }
 
@@ -338,7 +340,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 21,
+            resolution_input_schema_version: 22,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

@@ -2206,6 +2206,15 @@ impl Storage {
                 context,
             )?;
         }
+        if fact.status == ProofResolutionStatus::Exact && fact.provenance.language_adapter == "ruby"
+        {
+            required_dependency_ids = context
+                .file_by_id
+                .values()
+                .filter(|file| file.indexed && file.complete && file.language == "ruby")
+                .map(|file| FileId(file.id))
+                .collect();
+        }
         if let Some(rust_dependencies) = rust_same_file_dependency_ids(
             fact,
             &required_dependency_ids,
@@ -2304,10 +2313,13 @@ impl Storage {
             .node_by_id
             .get(&raw_edge_target)
             .ok_or_else(|| proof_error("raw CALL placeholder node is missing"))?;
-        let direct_member_target = matches!(
+        let direct_member_target = (matches!(
             fact.callsite.callee_form,
             CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver | CalleeForm::NamedImport
-        ) && raw_edge_target == target
+        ) || matches!(
+            fact.provenance.language_adapter.as_str(),
+            "ruby" | "php"
+        )) && raw_edge_target == target
             && (matches!(raw_placeholder.kind, NodeKind::FUNCTION | NodeKind::METHOD)
                 || raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0)));
         if !direct_member_target
@@ -2384,7 +2396,9 @@ impl Storage {
                     .get(import)
                     .ok_or_else(|| proof_error("static import binding is missing"))?;
                 if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
+                    || (fact.provenance.language_adapter != "php"
+                        && graph_leaf_name(&import_node.serialized_name)
+                            != fact.callsite.raw_target)
                     || !(if context
                         .typescript_directory_marker_seen(NodeId(fact.callsite.file_id.0), *import)
                     {
@@ -3276,7 +3290,7 @@ fn graph_leaf_name(name: &str) -> &str {
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
         "rust" => kind == NodeKind::MODULE,
-        "java" | "kotlin" | "javascript" | "typescript" | "tsx" | "python" => {
+        "java" | "kotlin" | "javascript" | "typescript" | "tsx" | "python" | "php" | "ruby" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
         _ => false,

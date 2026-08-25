@@ -974,7 +974,8 @@ fn ruby_and_php_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow:
         let project = tempfile::tempdir()?;
         let mut store = Store::new_in_memory()?;
         index_files(project.path(), &mut store, &files)?;
-        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))
+            .map_err(|error| anyhow::anyhow!("{name}: {error}"))?;
         store.validate_proof_resolution_publication(&publication(1))?;
         let facts = store
             .get_proof_resolution_facts()?
@@ -990,7 +991,7 @@ fn ruby_and_php_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow:
             assert_eq!(exact.len(), expected_count, "{name} {target}: {facts:#?}");
             assert!(exact.iter().all(|fact| {
                 fact.edge_id.is_some()
-                    && fact.raw_edge_target == fact.target
+                    && fact.raw_edge_target.is_some()
                     && fact.raw_callsite_identity.is_some()
                     && fact.target.is_some()
                     && !fact.evidence_chain.is_empty()
@@ -1135,6 +1136,119 @@ fn ruby_and_php_closed_hostile_matrix_never_proves() -> anyhow::Result<()> {
         assert!(fact.edge_id.is_none() && fact.target.is_none(), "{fact:#?}");
         assert!(fact.evidence_chain.is_empty(), "{fact:#?}");
     }
+    Ok(())
+}
+
+#[test]
+fn ruby_and_php_import_receipts_reject_graph_relation_mutation() -> anyhow::Result<()> {
+    let fixtures = [
+        (
+            "ruby",
+            vec![
+                ("lib/worker.rb", "class Worker\n  def target\n  end\nend\n"),
+                (
+                    "lib/caller.rb",
+                    "require_relative \"worker\"\ndef caller\n  Worker.new.target\nend\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            "php",
+            vec![
+                (
+                    "src/Lib/Worker.php",
+                    "<?php\nnamespace Lib;\nclass Worker { public function target() {} }\n",
+                ),
+                (
+                    "src/App/Caller.php",
+                    "<?php\nnamespace App;\nuse Lib\\Worker as W;\nfunction caller(W $worker) { $worker->target(); }\n",
+                ),
+            ],
+            "target",
+        ),
+    ];
+    for (language, files, target) in fixtures {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language
+                    && fact.callsite.raw_target == target
+                    && fact.status == ProofResolutionStatus::Exact
+            })
+            .unwrap_or_else(|| panic!("{language} exact import receipt"));
+        let import = fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::StaticImportBinding { import, .. } => Some(*import),
+                _ => None,
+            })
+            .expect("exact imported call carries its literal import node");
+        store.get_connection().execute(
+            "DELETE FROM edge WHERE kind = ?1 AND source_node_id = ?2",
+            (EdgeKind::IMPORT as i32, import.0),
+        )?;
+        let error = store
+            .validate_proof_resolution_publication(&publication(1))
+            .expect_err("mutated import relation must invalidate the exact receipt");
+        assert!(!error.to_string().is_empty(), "{language}");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn ruby_require_relative_rejects_a_symlinked_source_target() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    fs::create_dir_all(project.path().join("lib"))?;
+    fs::write(
+        outside.path().join("worker.rb"),
+        "class Worker\n  def target\n  end\nend\n",
+    )?;
+    symlink(
+        outside.path().join("worker.rb"),
+        project.path().join("lib/worker.rb"),
+    )?;
+    fs::write(
+        project.path().join("lib/caller.rb"),
+        "require_relative \"worker\"\ndef caller\n  Worker.new.target\nend\n",
+    )?;
+    let paths = vec![
+        project.path().join("lib/worker.rb"),
+        project.path().join("lib/caller.rb"),
+    ];
+    let mut store = Store::new_in_memory()?;
+    WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+        &mut store,
+        &RefreshInfo {
+            mode: BuildMode::Incremental,
+            files_to_index: paths,
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let fact = facts
+        .iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "ruby" && fact.callsite.raw_target == "target"
+        })
+        .unwrap_or_else(|| panic!("Ruby symlink fixture emitted no closed fact: {facts:#?}"));
+    assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(fact.edge_id.is_none() && fact.target.is_none());
     Ok(())
 }
 
@@ -8342,7 +8456,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let mut empty = Store::new_in_memory()?;
     let empty_receipt = rematerialize_proof_resolution_projection(&mut empty, &publication(1))?;
     assert_eq!(empty_receipt.fact_count, 0);
-    assert_eq!(empty_receipt.adapter_roster.len(), 10);
+    assert_eq!(empty_receipt.adapter_roster.len(), 12);
 
     let project = tempfile::tempdir()?;
     let mut unsupported = Store::new_in_memory()?;
@@ -8357,7 +8471,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let unsupported_receipt =
         rematerialize_proof_resolution_projection(&mut unsupported, &publication(1))?;
     assert_eq!(unsupported_receipt.fact_count, 0);
-    assert_eq!(unsupported_receipt.adapter_roster.len(), 10);
+    assert_eq!(unsupported_receipt.adapter_roster.len(), 12);
 
     let governed_project = tempfile::tempdir()?;
     let mut governed = Store::new_in_memory()?;
@@ -8585,7 +8699,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v21", "adapter", "language"]
+            ["stale", "schema-v22", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"

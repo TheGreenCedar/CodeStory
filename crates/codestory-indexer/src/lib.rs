@@ -16721,6 +16721,7 @@ mod proof_resolution_cache_tests {
                 rust_uses: Vec::new(),
                 go_package: None,
                 java_kotlin_package: None,
+                php_namespace: None,
                 c_cpp_file: None,
             }),
         };
