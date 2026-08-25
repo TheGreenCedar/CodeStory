@@ -89,13 +89,14 @@ fn python_resolution_work() -> usize {
 const ADAPTER_VERSION: &str = "reference-v15";
 const GO_ADAPTER_VERSION: &str = "reference-v17";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
+const RUST_ADAPTER_VERSION: &str = "reference-v17";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 14;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
     ("python", PYTHON_ADAPTER_VERSION),
-    ("rust", ADAPTER_VERSION),
+    ("rust", RUST_ADAPTER_VERSION),
     ("tsx", TYPESCRIPT_ADAPTER_VERSION),
     ("typescript", TYPESCRIPT_ADAPTER_VERSION),
 ];
@@ -2670,6 +2671,7 @@ impl<'tree> PythonResolutionIndex<'tree> {
                     if let [declaration] = declarations {
                         CachedResolutionBinding::SameFile {
                             declaration: *declaration,
+                            rust_glob_local_module: None,
                         }
                     } else if declarations.len() > 1 {
                         CachedResolutionBinding::Ambiguous
@@ -4154,6 +4156,7 @@ impl<'tree> JavascriptResolutionIndex<'tree> {
         let binding = match &binding.kind {
             JavascriptBindingKind::SameFile { declaration } => CachedResolutionBinding::SameFile {
                 declaration: *declaration,
+                rust_glob_local_module: None,
             },
             JavascriptBindingKind::StaticImport {
                 import,
@@ -4983,6 +4986,7 @@ struct RustResolutionIndex<'tree> {
     uses_by_module_name: HashMap<(Vec<String>, String), Vec<CachedRustUseBinding>>,
     module_complete: HashMap<Vec<String>, bool>,
     identifier_module_complete: HashMap<Vec<String>, bool>,
+    module_has_glob_import: HashSet<Vec<String>>,
     module_value_blockers: HashMap<Vec<String>, HashSet<String>>,
     module_incomplete_value_names: HashMap<Vec<String>, HashSet<String>>,
     module_unsupported_value_names: HashMap<Vec<String>, HashSet<String>>,
@@ -5016,6 +5020,7 @@ impl<'tree> RustResolutionIndex<'tree> {
             uses_by_module_name: HashMap::new(),
             module_complete: HashMap::new(),
             identifier_module_complete: HashMap::new(),
+            module_has_glob_import: HashSet::new(),
             module_value_blockers: HashMap::new(),
             module_incomplete_value_names: HashMap::new(),
             module_unsupported_value_names: HashMap::new(),
@@ -5031,7 +5036,14 @@ impl<'tree> RustResolutionIndex<'tree> {
             callable_start_bytes: HashMap::new(),
             attributed_items: HashSet::new(),
         };
-        result.collect_module(tree.root_node(), Vec::new(), None, source, &graph_nodes);
+        result.collect_module(
+            tree.root_node(),
+            Vec::new(),
+            None,
+            false,
+            source,
+            &graph_nodes,
+        );
         for method in &mut result.methods {
             if result
                 .incomplete_inherent_owners
@@ -5078,11 +5090,12 @@ impl<'tree> RustResolutionIndex<'tree> {
         body: TsNode<'tree>,
         module_path: Vec<String>,
         declaration: Option<NodeId>,
+        inherited_attributed: bool,
         source: &str,
         graph_nodes: &RustGraphNodeIndex,
     ) {
-        let mut domain_complete = true;
-        let mut identifier_module_complete = true;
+        let mut domain_complete = !inherited_attributed;
+        let mut identifier_module_complete = !inherited_attributed;
         let mut file_children = Vec::new();
         let mut value_blockers = HashSet::new();
         let mut incomplete_value_names = HashSet::new();
@@ -5235,7 +5248,7 @@ impl<'tree> RustResolutionIndex<'tree> {
                     } else {
                         if node_text(*item, source).is_some_and(|surface| surface.contains('*')) {
                             domain_complete = false;
-                            identifier_module_complete = false;
+                            self.module_has_glob_import.insert(module_path.clone());
                         }
                         value_blockers.extend(rust_use_bound_names(*item, source));
                     }
@@ -5244,6 +5257,14 @@ impl<'tree> RustResolutionIndex<'tree> {
                     if let Some(name) = declaration_name(*item, source) {
                         value_blockers.insert(name.to_string());
                     }
+                }
+                "type_item" => {
+                    if let Some(name) = declaration_name(*item, source) {
+                        value_blockers.insert(name.to_string());
+                    }
+                }
+                "foreign_mod_item" => {
+                    value_blockers.extend(rust_foreign_function_names(*item, source));
                 }
                 "mod_item" => {
                     let Some(name) = declaration_name(*item, source).map(str::to_string) else {
@@ -5262,10 +5283,14 @@ impl<'tree> RustResolutionIndex<'tree> {
                             child_body,
                             child_path,
                             module_declaration,
+                            inherited_attributed || attributed_items.contains(&item.id()),
                             source,
                             graph_nodes,
                         );
                     } else {
+                        if inherited_attributed || attributed_items.contains(&item.id()) {
+                            continue;
+                        }
                         let Some(declaration) = module_declaration else {
                             domain_complete = false;
                             identifier_module_complete = false;
@@ -5354,6 +5379,9 @@ impl<'tree> RustResolutionIndex<'tree> {
                 .insert((module_path.to_vec(), owner_name.clone()));
         }
         for method in direct_impl_functions(impl_item) {
+            if impl_attributed {
+                self.attributed_items.insert(method.id());
+            }
             let (Some(method_name), Some(declaration)) = (
                 declaration_name(method, source).map(str::to_string),
                 graph_nodes.callable(method, source),
@@ -5687,6 +5715,13 @@ impl<'tree> RustResolutionIndex<'tree> {
                     return (Some(caller), CachedResolutionBinding::Ambiguous);
                 }
                 if self
+                    .callable_type_blockers
+                    .get(&callable_id)
+                    .is_some_and(|blockers| blockers.contains(raw_target))
+                {
+                    return (Some(caller), CachedResolutionBinding::Unsupported);
+                }
+                if self
                     .module_value_blockers
                     .get(&module_path)
                     .is_some_and(|blockers| blockers.contains(raw_target))
@@ -5708,6 +5743,10 @@ impl<'tree> RustResolutionIndex<'tree> {
                         Some(caller),
                         CachedResolutionBinding::SameFile {
                             declaration: *declaration,
+                            rust_glob_local_module: self
+                                .module_has_glob_import
+                                .contains(&module_path)
+                                .then_some(module_path),
                         },
                     ),
                     ([], [binding]) => (
@@ -6268,43 +6307,89 @@ fn rust_use_is_renamed(declaration: TsNode<'_>, source: &str) -> bool {
 }
 
 fn rust_use_bound_names(declaration: TsNode<'_>, source: &str) -> Vec<String> {
-    let Some(surface) = node_text(declaration, source) else {
+    let Some(argument) = declaration.child_by_field_name("argument") else {
         return Vec::new();
     };
-    let surface = surface
-        .trim()
-        .strip_prefix("pub ")
-        .unwrap_or(surface.trim())
-        .strip_prefix("use ")
-        .unwrap_or(surface.trim())
-        .trim_end_matches(';');
     let mut names = Vec::new();
-    if let Some((_, group)) = surface.split_once("::{") {
-        if let Some(group) = group.strip_suffix('}') {
-            for leaf in group.split(',') {
-                let leaf = leaf.trim();
-                if leaf == "self" || leaf == "*" {
-                    continue;
-                }
-                let local = leaf
-                    .rsplit_once(" as ")
-                    .map_or(leaf, |(_, alias)| alias)
-                    .trim();
-                if rust_simple_identifier(local) {
-                    names.push(local.to_string());
-                }
+    rust_collect_use_bound_names(argument, None, source, &mut names);
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn rust_collect_use_bound_names(
+    clause: TsNode<'_>,
+    scoped_name: Option<&str>,
+    source: &str,
+    names: &mut Vec<String>,
+) {
+    match clause.kind() {
+        "use_as_clause" => {
+            if let Some(alias) = clause
+                .child_by_field_name("alias")
+                .and_then(|alias| node_text(alias, source))
+                .filter(|alias| rust_simple_identifier(alias))
+            {
+                names.push(alias.to_string());
             }
         }
+        "scoped_use_list" => {
+            let path_name = clause
+                .child_by_field_name("path")
+                .and_then(|path| rust_use_terminal_name(path, source));
+            if let Some(list) = clause.child_by_field_name("list") {
+                rust_collect_use_bound_names(list, path_name.as_deref(), source, names);
+            }
+        }
+        "use_list" => {
+            let mut cursor = clause.walk();
+            for child in clause.named_children(&mut cursor) {
+                rust_collect_use_bound_names(child, scoped_name, source, names);
+            }
+        }
+        "scoped_identifier" => {
+            if let Some(name) = rust_use_terminal_name(clause, source) {
+                names.push(name);
+            }
+        }
+        "identifier" => {
+            if let Some(name) =
+                node_text(clause, source).filter(|name| rust_simple_identifier(name))
+            {
+                names.push(name.to_string());
+            }
+        }
+        "self" => {
+            if let Some(name) = scoped_name {
+                names.push(name.to_string());
+            }
+        }
+        "use_wildcard" | "crate" | "super" | "metavariable" => {}
+        _ => {}
+    }
+}
+
+fn rust_use_terminal_name(path: TsNode<'_>, source: &str) -> Option<String> {
+    let name = if path.kind() == "scoped_identifier" {
+        path.child_by_field_name("name")?
     } else {
-        let local = surface
-            .rsplit_once(" as ")
-            .map_or_else(
-                || surface.rsplit("::").next().unwrap_or(surface),
-                |(_, alias)| alias,
-            )
-            .trim();
-        if rust_simple_identifier(local) {
-            names.push(local.to_string());
+        path
+    };
+    node_text(name, source)
+        .filter(|name| rust_simple_identifier(name))
+        .map(str::to_string)
+}
+
+fn rust_foreign_function_names(declaration: TsNode<'_>, source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(body) = declaration.child_by_field_name("body") {
+        let mut cursor = body.walk();
+        for item in body.named_children(&mut cursor) {
+            if item.kind() == "function_signature_item"
+                && let Some(name) = declaration_name(item, source)
+            {
+                names.push(name.to_string());
+            }
         }
     }
     names.sort();
@@ -8971,6 +9056,7 @@ struct RustModuleMatch<'a> {
 struct RustRecordOrigin {
     root: PathBuf,
     base_module: Vec<String>,
+    dependency_files: Vec<FileId>,
 }
 
 #[derive(Clone)]
@@ -9188,6 +9274,24 @@ impl<'a> RustProjectionIndex<'a> {
             .copied()
     }
 
+    fn glob_local_module_dependencies(
+        &self,
+        record: &ResolutionCacheRecord,
+        relative_module: &[String],
+    ) -> Option<Vec<FileId>> {
+        count_rust_resolution_work(1);
+        let origin = self.origins.get(&record.file.file_id.0)?;
+        let mut absolute_module = origin.base_module.clone();
+        absolute_module.extend_from_slice(relative_module);
+        let modules = self.modules.get(&(origin.root.clone(), absolute_module))?;
+        let [module_match] = modules.as_slice() else {
+            return None;
+        };
+        (module_match.record.file.file_id == record.file.file_id
+            && module_match.relative_module == relative_module)
+            .then(|| origin.dependency_files.clone())
+    }
+
     fn declarations(
         &self,
         record: &ResolutionCacheRecord,
@@ -9346,6 +9450,7 @@ fn resolve_rust_record_origin(
         (Some(root), []) => Some(RustRecordOrigin {
             root: root.clone(),
             base_module: Vec::new(),
+            dependency_files: vec![FileId(file_id)],
         }),
         (None, [claim]) if records.contains_key(&claim.parent_file_id) => {
             resolve_rust_record_origin(
@@ -9359,9 +9464,12 @@ fn resolve_rust_record_origin(
             .map(|parent| {
                 let mut base_module = parent.base_module;
                 base_module.extend(claim.relative_child_module.clone());
+                let mut dependency_files = parent.dependency_files;
+                dependency_files.push(FileId(file_id));
                 RustRecordOrigin {
                     root: parent.root,
                     base_module,
+                    dependency_files,
                 }
             })
         }
@@ -10271,7 +10379,10 @@ fn resolve_syntax_claim(
     let mut exact_node_file_expectations = vec![(caller, input.callsite.file_id)];
     let mut exact_dependency_files = vec![input.callsite.file_id];
     match &input.binding {
-        CachedResolutionBinding::SameFile { declaration } => {
+        CachedResolutionBinding::SameFile {
+            declaration,
+            rust_glob_local_module,
+        } => {
             let declaration_is_recorded = if source_record.file.language == "python" {
                 python_index
                     .declarations(input.callsite.file_id, &input.callsite.raw_target)
@@ -10296,6 +10407,22 @@ fn resolve_syntax_claim(
             } else if !declaration_is_recorded {
                 status = ProofResolutionStatus::Ambiguous;
                 reason = ProofResolutionReason::MultipleBindings;
+            } else if let Some(module_path) = rust_glob_local_module {
+                if let Some(dependencies) =
+                    rust_index.glob_local_module_dependencies(source_record, module_path)
+                {
+                    status = ProofResolutionStatus::Exact;
+                    reason = ProofResolutionReason::ExactResolution;
+                    target = Some(*declaration);
+                    evidence_chain.push(ResolutionEvidence::SameFileDeclaration {
+                        declaration: *declaration,
+                    });
+                    exact_node_file_expectations.push((*declaration, input.callsite.file_id));
+                    exact_dependency_files = dependencies;
+                } else {
+                    status = ProofResolutionStatus::IncompleteDomain;
+                    reason = ProofResolutionReason::LookupDomainIncomplete;
+                }
             } else {
                 status = ProofResolutionStatus::Exact;
                 reason = ProofResolutionReason::ExactResolution;
@@ -11598,6 +11725,17 @@ mod rust_complexity_tests {
         source
     }
 
+    fn glob_local_source(count: usize) -> String {
+        let mut source = String::from("use crate::*;\nuse std::prelude::rust_2024::*;\n");
+        for index in 0..count {
+            source.push_str(&format!("fn target_{index}() {{}}\n"));
+        }
+        for index in 0..count {
+            source.push_str(&format!("fn caller_{index}() {{ target_{index}(); }}\n"));
+        }
+        source
+    }
+
     fn measured_projection_work(count: usize) -> usize {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("lib.rs");
@@ -11658,7 +11796,7 @@ mod rust_complexity_tests {
                 file_id: NodeId(1),
                 source_sha256: "0".repeat(64),
                 language: "rust".to_string(),
-                adapter_version: ADAPTER_VERSION.to_string(),
+                adapter_version: RUST_ADAPTER_VERSION.to_string(),
                 parser_fingerprint: "parser".to_string(),
                 complete: true,
                 lookup_input_complete: true,
@@ -11709,6 +11847,17 @@ mod rust_complexity_tests {
         assert!(
             large_nested <= small_nested * 2 + 64,
             "nested-callable work grew superlinearly: {small_nested} -> {large_nested}"
+        );
+
+        let small_glob = measured_source_work(&glob_local_source(64));
+        let large_glob = measured_source_work(&glob_local_source(128));
+        assert!(
+            small_glob >= 64 * 8,
+            "glob-local declaration and call work was not fully counted: {small_glob}"
+        );
+        assert!(
+            large_glob <= small_glob * 2 + 128,
+            "glob-local declaration and call work grew superlinearly: {small_glob} -> {large_glob}"
         );
     }
 

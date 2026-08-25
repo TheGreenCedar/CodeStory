@@ -4304,11 +4304,13 @@ fn rebase_cached_index_artifact(
             .map(|caller| id_remap.get(&caller).copied().unwrap_or(caller));
         use cache::CachedResolutionBinding;
         input.binding = match input.binding.clone() {
-            CachedResolutionBinding::SameFile { declaration } => {
-                CachedResolutionBinding::SameFile {
-                    declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
-                }
-            }
+            CachedResolutionBinding::SameFile {
+                declaration,
+                rust_glob_local_module,
+            } => CachedResolutionBinding::SameFile {
+                declaration: id_remap.get(&declaration).copied().unwrap_or(declaration),
+                rust_glob_local_module,
+            },
             CachedResolutionBinding::StaticImport {
                 import,
                 module_specifier,

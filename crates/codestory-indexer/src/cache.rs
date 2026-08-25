@@ -45,6 +45,8 @@ pub(crate) struct CachedCallResolutionInput {
 pub(crate) enum CachedResolutionBinding {
     SameFile {
         declaration: NodeId,
+        #[serde(default)]
+        rust_glob_local_module: Option<Vec<String>>,
     },
     StaticImport {
         import: NodeId,

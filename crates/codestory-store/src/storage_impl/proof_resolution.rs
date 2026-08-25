@@ -251,6 +251,8 @@ fn dependency_file_ids(fact: &CallResolutionFact) -> BTreeSet<FileId> {
 struct ProofResolutionValidationContext {
     file_by_id: HashMap<i64, FileInfo>,
     file_content_hash_by_id: HashMap<i64, String>,
+    rust_file_ids_by_path: HashMap<PathBuf, Vec<FileId>>,
+    rust_root_count_by_directory: HashMap<PathBuf, usize>,
     node_by_id: HashMap<NodeId, Node>,
     edges: Vec<Edge>,
     edge_index_by_id: HashMap<EdgeId, usize>,
@@ -267,6 +269,125 @@ struct ProofResolutionValidationContext {
     go_dependency_ids_by_package: HashMap<GoPackageIdentity, BTreeSet<FileId>>,
     go_attestation_error_by_file: HashMap<i64, String>,
     live_go_sources_authenticated: bool,
+}
+
+fn prepare_rust_file_identity(
+    file_by_id: &HashMap<i64, FileInfo>,
+) -> (HashMap<PathBuf, Vec<FileId>>, HashMap<PathBuf, usize>) {
+    let mut file_ids_by_path = HashMap::<PathBuf, Vec<FileId>>::new();
+    let mut root_count_by_directory = HashMap::<PathBuf, usize>::new();
+    for file in file_by_id.values().filter(|file| file.language == "rust") {
+        count_store_replay_work(1);
+        file_ids_by_path
+            .entry(file.path.clone())
+            .or_default()
+            .push(FileId(file.id));
+        if matches!(
+            file.path.file_name().and_then(|name| name.to_str()),
+            Some("lib.rs" | "main.rs")
+        ) && let Some(directory) = file.path.parent()
+        {
+            *root_count_by_directory
+                .entry(directory.to_path_buf())
+                .or_default() += 1;
+        }
+    }
+    (file_ids_by_path, root_count_by_directory)
+}
+
+fn rust_dependency_path_is_ancestor(
+    source: &FileInfo,
+    dependency: &FileInfo,
+    context: &ProofResolutionValidationContext,
+) -> bool {
+    if dependency.language != "rust" || dependency.id == source.id {
+        return false;
+    }
+    if context
+        .rust_file_ids_by_path
+        .get(&dependency.path)
+        .is_none_or(|files| files.len() != 1)
+    {
+        return false;
+    }
+    let Some(file_name) = dependency.path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(directory) = dependency.path.parent() else {
+        return false;
+    };
+    let (module_base, conflicting_form) = match file_name {
+        "lib.rs" | "main.rs" => {
+            if context.rust_root_count_by_directory.get(directory).copied() != Some(1) {
+                return false;
+            }
+            (directory.to_path_buf(), None)
+        }
+        "mod.rs" => {
+            let Some(module_directory) = directory.parent() else {
+                return false;
+            };
+            (
+                directory.to_path_buf(),
+                Some(module_directory.join(format!(
+                    "{}.rs",
+                    directory.file_name().and_then(|name| name.to_str()).unwrap_or("")
+                ))),
+            )
+        }
+        name if name.ends_with(".rs") => (
+            dependency.path.with_extension(""),
+            Some(dependency.path.with_extension("").join("mod.rs")),
+        ),
+        _ => return false,
+    };
+    if conflicting_form.is_some_and(|path| {
+        context
+            .rust_file_ids_by_path
+            .get(&path)
+            .is_some_and(|files| !files.is_empty())
+    }) {
+        return false;
+    }
+    source.path.starts_with(&module_base) && source.path != dependency.path
+}
+
+fn rust_same_file_dependency_ids(
+    fact: &CallResolutionFact,
+    required: &BTreeSet<FileId>,
+    observed: &BTreeSet<FileId>,
+    context: &ProofResolutionValidationContext,
+) -> Option<BTreeSet<FileId>> {
+    if fact.provenance.language_adapter != "rust"
+        || fact.callsite.callee_form != CalleeForm::Identifier
+        || !matches!(
+            fact.evidence_chain.as_slice(),
+            [ResolutionEvidence::SameFileDeclaration { declaration }]
+                if Some(*declaration) == fact.target
+        )
+        || !required.is_subset(observed)
+    {
+        return None;
+    }
+    let source = context.file_by_id.get(&fact.callsite.file_id.0)?;
+    if context
+        .rust_file_ids_by_path
+        .get(&source.path)
+        .is_none_or(|files| files.as_slice() != [fact.callsite.file_id])
+    {
+        return None;
+    }
+    observed
+        .difference(required)
+        .all(|file_id| {
+            context
+                .file_by_id
+                .get(&file_id.0)
+                .is_some_and(|dependency| {
+                    rust_dependency_path_is_ancestor(source, dependency, context)
+                })
+        })
+        .then(|| observed.clone())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -1003,6 +1124,8 @@ mod go_replay_complexity_tests {
         let context = ProofResolutionValidationContext {
             file_by_id,
             file_content_hash_by_id,
+            rust_file_ids_by_path: HashMap::new(),
+            rust_root_count_by_directory: HashMap::new(),
             node_by_id: HashMap::new(),
             edges: Vec::new(),
             edge_index_by_id: HashMap::new(),
@@ -1165,6 +1288,8 @@ mod python_replay_complexity_tests {
         let context = ProofResolutionValidationContext {
             file_content_hash_by_id,
             file_by_id,
+            rust_file_ids_by_path: HashMap::new(),
+            rust_root_count_by_directory: HashMap::new(),
             node_by_id: HashMap::new(),
             edges: Vec::new(),
             edge_index_by_id: HashMap::new(),
@@ -1300,6 +1425,8 @@ impl ProofResolutionValidationContext {
             .into_iter()
             .map(|file| (file.id, file))
             .collect();
+        let (rust_file_ids_by_path, rust_root_count_by_directory) =
+            prepare_rust_file_identity(&file_by_id);
         let python_file_ids_by_path = prepare_python_file_ids_by_path(&file_by_id);
         let file_content_hash_by_id = storage.get_file_content_hashes()?;
         let python_attestation_error_by_file = prepare_python_source_attestation(
@@ -1460,6 +1587,8 @@ impl ProofResolutionValidationContext {
         Ok(Self {
             file_by_id,
             file_content_hash_by_id,
+            rust_file_ids_by_path,
+            rust_root_count_by_directory,
             node_by_id,
             edges,
             edge_index_by_id,
@@ -1896,6 +2025,14 @@ impl Storage {
                 &observed_dependency_ids,
                 context,
             )?;
+        }
+        if let Some(rust_dependencies) = rust_same_file_dependency_ids(
+            fact,
+            &required_dependency_ids,
+            &observed_dependency_ids,
+            context,
+        ) {
+            required_dependency_ids = rust_dependencies;
         }
         if observed_dependency_ids != required_dependency_ids {
             return Err(proof_error(format!(
