@@ -2291,6 +2291,8 @@ fn crate_source_git_spawns_are_limited_to_named_non_product_boundaries() {
         .collect::<BTreeSet<_>>();
     let expected = BTreeSet::from([
         "crates/codestory-bench/src/bin/codestory_proof_availability/materialize.rs".to_owned(),
+        "crates/codestory-bench/src/bin/codestory_proof_availability/multilingual_contract.rs"
+            .to_owned(),
         "crates/codestory-runtime/src/test_support.rs".to_owned(),
     ]);
 

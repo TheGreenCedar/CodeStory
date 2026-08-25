@@ -13,6 +13,10 @@ mod corpus;
 #[allow(dead_code)] // Task 11 consumes the completed qualification inventory.
 mod inventory;
 mod materialize;
+// The multilingual matrix is benchmark-only input for the later closed
+// adapter groups. It is deliberately unreferenced by the public CLI grammar.
+#[allow(dead_code)]
+mod multilingual_contract;
 mod report;
 mod resolution_funnel;
 mod runner;
