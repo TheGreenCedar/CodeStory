@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -95,6 +95,7 @@ import {
   cachePolicyForRun,
   cacheProvenanceBlockers,
 } from "../codestory-agent-ab-benchmark.mjs";
+import * as benchmarkHarness from "../codestory-agent-ab-benchmark.mjs";
 import {
   packetGateSelectionOrThrow,
   packetGateStderrPath,
@@ -106,6 +107,876 @@ const RUNTIME_SERVICE_FILE = "crates/codestory-runtime/src/services.rs";
 const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
 const RUNTIME_REFRESH_CLAIM =
   "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.";
+
+const EXACT_CANDIDATE_ARMS = [
+  "without_codestory",
+  "published_0_17_4",
+  "candidate_0_18",
+];
+const EXACT_TASKS = [
+  ["python-requests-session-flow", "psf-requests"],
+  ["java-commons-lang-string-utils", "apache-commons-lang"],
+  ["rust-ripgrep-search-pipeline", "BurntSushi-ripgrep"],
+  ["javascript-express-routing-flow", "expressjs-express"],
+  ["typescript-swr-hook-flow", "vercel-swr"],
+  ["cpp-fmt-formatting-flow", "fmtlib-fmt"],
+  ["c-redis-command-loop", "redis-redis"],
+  ["go-gin-route-dispatch", "gin-gonic-gin"],
+  ["ruby-jekyll-site-build", "jekyll-jekyll"],
+  ["php-monolog-record-flow", "Seldaek-monolog"],
+  ["csharp-automapper-map-flow", "AutoMapper-AutoMapper"],
+  ["kotlin-okio-buffer-flow", "square-okio"],
+  ["swift-alamofire-request-flow", "Alamofire-Alamofire"],
+  ["dart-http-client-flow", "dart-lang-http"],
+  ["bash-nvm-install-dispatch", "nvm-sh-nvm"],
+  ["html-mdn-form-validation", "mdn-learning-area"],
+  ["css-animate-base-and-keyframes", "animate-css-animate-css"],
+  ["sql-chinook-schema-relations", "lerocha-chinook-database"],
+];
+
+function exactLifecycle() {
+  return {
+    contract: "codestory.agent-benchmark-exact-lifecycle/v1",
+    package_authentication_order: ["published_0_17_4", "candidate_0_18"],
+    package_authentication_ms: { published_0_17_4: 10, candidate_0_18: 10 },
+    total_package_authentication_ms: 20,
+    model_initialization_ms: { published_0_17_4: 5, candidate_0_18: 5 },
+    preparation_order: EXACT_TASKS.map(([_, repo], index) => ({
+      repo,
+      arms: index % 2 === 0
+        ? ["published_0_17_4", "candidate_0_18"]
+        : ["candidate_0_18", "published_0_17_4"],
+    })),
+  };
+}
+
+function passingCacheProvenance() {
+  return {
+    doctor_status: "pass",
+    storage_path: "/isolated/cache.db",
+    cache_policy: "prepared-retrieval-cache-read-only",
+    retrieval_mode: "full",
+    semantic_generation: "semantic-1",
+    manifest_embedding_backend: `per-user-server:coderank-embed:q8_0:sha256-${"a".repeat(64)}:fixture`,
+    embedding_engine_instance_id: "engine-1",
+    embedding_policy: "accelerated",
+    semantic_backend: "embedded",
+    local_only: true,
+    indexed: true,
+    freshness_status: "fresh",
+    semantic_ready: true,
+    indexing_in_timed_run: false,
+    transport_mode: "agent_harness_prelude",
+    packet_embedding_execution: {
+      source: "packet.answer.retrieval_trace",
+      transport_mode: "agent_harness_prelude",
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      embedding_policy: "accelerated",
+      retrieval_mode: "full",
+      diagnostic_count: 1,
+      full_diagnostic_count: 1,
+      semantic_stage_count: 1,
+      completed_semantic_stage_count: 1,
+      invalid_semantic_stage_count: 0,
+      shadow_degraded_reason: null,
+      shadow_error: null,
+      shadow_cancel_reason: null,
+      semantic_fallback_count: 0,
+      semantic_generation: "semantic-1",
+      prepared_semantic_generation: "semantic-1",
+    },
+    cache_preparation: {
+      preparation_wall_ms: 100,
+      incremental_status: "pass",
+      incremental_wall_ms: 20,
+      incremental_source_mutation: {
+        path: "src/named.rs",
+        original_sha256: "b".repeat(64),
+        mutated_sha256: "c".repeat(64),
+        restored_sha256: "b".repeat(64),
+      },
+    },
+  };
+}
+
+function exactCandidateRows() {
+  const rows = [];
+  for (const [taskId, repo] of EXACT_TASKS) {
+    for (let repeat = 1; repeat <= 3; repeat += 1) {
+      for (const arm of EXACT_CANDIDATE_ARMS) {
+        const codestory = arm !== "without_codestory";
+        const packageVersion = arm === "published_0_17_4" ? "0.17.4" : "0.18.0";
+        const packageByte = arm === "published_0_17_4" ? "a" : "b";
+        rows.push({
+          repo,
+          task_id: taskId,
+          arm,
+          repeat,
+          status: "pass",
+          quality: {
+            pass: true,
+            material_factual_errors: { found: 0, found_anchors: [] },
+            unsupported_proof_claims: { found: 0, found_claims: [] },
+          },
+          usage: codestory
+            ? { input_tokens: 50, output_tokens: 20, total_tokens: 70 }
+            : { input_tokens: 70, output_tokens: 30, total_tokens: 100 },
+          estimated_cost_usd: codestory ? 0.7 : 1,
+          tool_calls_observed: codestory ? 7 : 10,
+          transcript_analysis: {
+            command_count: codestory ? 7 : 10,
+            tool_categories: { command_execution: codestory ? 7 : 10 },
+            command_categories: codestory
+              ? { codestory_cli: 1, direct_file_read: 6 }
+              : { codestory_cli: 0, direct_file_read: 10 },
+            interaction_turns: codestory
+              ? {
+                  total: 9, model_messages: 2, tool_actions: 7, failed_tool_actions: 0,
+                  reasoning_items_excluded: 0, error_items_excluded: 0,
+                }
+              : {
+                  total: 12, model_messages: 2, tool_actions: 10, failed_tool_actions: 0,
+                  reasoning_items_excluded: 0, error_items_excluded: 0,
+                },
+            codestory_mcp_tool_calls_observed: 0,
+            codestory_mcp_completed_calls_observed: 0,
+            codestory_mcp_runtime_identities: [],
+            external_context_tool_calls: 0,
+            direct_source_reads: codestory
+              ? [{ path: "src/named.rs", authorization: { status: "authorized", reason: "user_named_file" } }]
+              : [{ path: "src/read.rs", authorization: { status: "baseline_local_exploration", reason: "without_codestory" } }],
+            direct_source_reads_total: 1,
+          },
+          exact_candidate_timing: codestory
+            ? {
+                cold_ms: arm === "candidate_0_18" ? 100 : 100,
+                warm_ms: arm === "candidate_0_18" ? 50 : 50,
+                incremental_ms: arm === "candidate_0_18" ? 20 : 20,
+                all_in_ms: arm === "candidate_0_18" ? 50 : 50,
+              }
+            : { cold_ms: 0, warm_ms: 100, incremental_ms: 0, all_in_ms: 100 },
+          wall_ms: codestory ? 50 : 100,
+          malformed_stdout_lines: 0,
+          json_events: 1,
+          analysis_events: 1,
+          event_types: { fixture: 1 },
+          packet_first_required: codestory,
+          packet_first_pass: true,
+          repo_provenance: pinnedRepoProvenance(),
+          task_manifest_snapshot: {
+            repo,
+            repo_metadata: {
+              name: repo,
+              url: "https://github.com/example/fixture.git",
+              ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+            },
+          },
+          package_identity: codestory
+            ? {
+                contract: "codestory.agent-benchmark-package/v2",
+                arm,
+                package_version: packageVersion,
+                package_sha256: packageByte.repeat(64),
+                cli_sha256: (arm === "published_0_17_4" ? "c" : "d").repeat(64),
+                source_commit: (arm === "published_0_17_4" ? "e" : "f").repeat(40),
+                source_tree: (arm === "published_0_17_4" ? "1" : "2").repeat(40),
+                schema_version: arm === "published_0_17_4" ? 2 : 3,
+                protocol_revision: "2025-11-25",
+                discovery_contract_sha256: (arm === "published_0_17_4" ? "3" : "4").repeat(64),
+                trust_root_kind: arm === "published_0_17_4"
+                  ? "official_published_checksum"
+                  : "immutable_candidate_receipt",
+                trust_root_sha256: (arm === "published_0_17_4" ? "5" : "6").repeat(64),
+              }
+            : null,
+          codestory_prelude_cli: codestory ? "/authenticated/codestory-cli" : null,
+          codestory_prelude_cli_sha256: codestory
+            ? (arm === "published_0_17_4" ? "c" : "d").repeat(64)
+            : null,
+          codestory_binary_identity: codestory
+            ? {
+                status: "prelude_only",
+                prelude_cli_sha256: (arm === "published_0_17_4" ? "c" : "d").repeat(64),
+              }
+            : null,
+          codestory_cache_provenance: codestory ? passingCacheProvenance() : null,
+          codestory_harness_prelude: codestory
+            ? {
+                status: "pass",
+                packet_extra_probe_strategy: null,
+                packet_contract_runtime: {
+                  plugin_version: packageVersion,
+                  plugin_cli_version: packageVersion,
+                  cli_version: packageVersion,
+                  pinned_pair_matches: true,
+                  cli_source: "managed",
+                  known_override_skew_channel: false,
+                },
+                packet_sufficiency: {
+                  obligation_accounting: {
+                    total: 0,
+                    material: 0,
+                    nonmaterial: 0,
+                    material_status_buckets: {},
+                  },
+                },
+              }
+            : null,
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+function exactArgs(extra = []) {
+  return [
+    "--exact-candidate",
+    "--task-suite", "language-expansion-holdout",
+    "--published-archive", "/tmp/published.tar.gz",
+    "--published-checksum-manifest", "/tmp/SHA256SUMS.txt",
+    "--published-checksum-sha256", "a".repeat(64),
+    "--candidate-package-receipt", "/tmp/candidate.json",
+    "--candidate-receipt-sha256", "b".repeat(64),
+    ...extra,
+  ];
+}
+
+test("exact-candidate mode freezes the 18x3x3 shape and rejects baseline reuse", () => {
+  assert.throws(
+    () => benchmarkHarness.parseArgs(exactArgs(["--reuse-baseline-from", "/tmp/old"])),
+    /forbids option.*reuse-baseline/i,
+  );
+  const opts = benchmarkHarness.parseArgs(exactArgs());
+  assert.deepEqual(opts.arms, EXACT_CANDIDATE_ARMS);
+  assert.equal(opts.repeats, 3);
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateShape(opts, Array.from({ length: 17 }, (_, index) => ({ id: `t-${index}` }))),
+    /exactly 18 pinned tasks/i,
+  );
+  assert.doesNotThrow(() =>
+    benchmarkHarness.validateExactCandidateShape(
+      opts,
+      Array.from({ length: 18 }, (_, index) => ({ id: `t-${index}` })),
+    )
+  );
+});
+
+test("exact-candidate mode closes every option that can change freshness oracle or run shape", () => {
+  const forbidden = [
+    ["--list"],
+    ["--self-test"],
+    ["--reanalyze-dir", "/tmp/old"],
+    ["--quick"],
+    ["--publishable"],
+    ["--allow-failures"],
+    ["--diagnostic-extra-probes-from-manifest"],
+    ["--include-local-repos"],
+    ["--packet-runtime"],
+    ["--packet-runtime-mode", "cold-cli"],
+    ["--codestory-cli", "/tmp/local-codestory-cli"],
+    ["--repos", "psf-requests"],
+    ["--arms", EXACT_CANDIDATE_ARMS.join(",")],
+    ["--task-ids", EXACT_TASKS[0][0]],
+    ["--task-manifest", "/tmp/tasks"],
+    ["--repeats", "3"],
+    ["--runner", "codex"],
+    ["--model", "gpt-5.6-sol"],
+    ["--sandbox", "workspace-write"],
+    ["--benchmark-run-id", "reused"],
+    ["--timeout-ms", "600000"],
+    ["--jobs", "1"],
+    ["--reuse-baseline-from", "/tmp/old"],
+    ["--prepare-codestory-cache"],
+    ["--no-prepare-codestory-cache"],
+    ["--prepare-codestory-timeout-ms", "1800000"],
+    ["--prepare-codestory-jobs", "1"],
+    ["--canary-task-id", EXACT_TASKS[0][0]],
+    ["--shard-count", "1"],
+    ["--shard-index", "0"],
+    ["--aggregate-shards", "/tmp/shard"],
+    ["--candidate-package-sha256", "c".repeat(64)],
+    ["--collect-all-failures"],
+    ["--max-source-reads-after-packet", "0"],
+  ];
+  for (const args of forbidden) {
+    assert.throws(
+      () => benchmarkHarness.parseArgs(exactArgs(args)),
+      /exact-candidate mode forbids|unsupported|mutually exclusive/i,
+      args[0],
+    );
+  }
+
+  for (const required of [
+    "--published-archive",
+    "--published-checksum-manifest",
+    "--published-checksum-sha256",
+    "--candidate-package-receipt",
+    "--candidate-receipt-sha256",
+  ]) {
+    const args = exactArgs();
+    args.splice(args.indexOf(required), 2);
+    assert.throws(
+      () => benchmarkHarness.parseArgs(args),
+      /requires authenticated published and candidate package inputs/i,
+      required,
+    );
+  }
+  for (const digestOption of ["--published-checksum-sha256", "--candidate-receipt-sha256"]) {
+    const args = exactArgs();
+    args[args.indexOf(digestOption) + 1] = "0".repeat(64);
+    assert.throws(() => benchmarkHarness.parseArgs(args), /all-zero digest/i, digestOption);
+  }
+
+  const permitted = benchmarkHarness.parseArgs(exactArgs([
+    "--materialize-repos",
+    "--repo-cache-dir", "/tmp/exact-repos",
+    "--out-dir", "/tmp/exact-output",
+  ]));
+  assert.equal(permitted.materializeRepos, true);
+  assert.equal(permitted.diagnosticExtraProbesFromManifest, false);
+});
+
+test("exact-candidate planning balances deterministic arm position across 162 fresh rows", () => {
+  const tasks = Array.from({ length: 18 }, (_, index) => ({
+    id: `task-${index + 1}`,
+    repo: `repo-${index + 1}`,
+  }));
+  const opts = { exactCandidate: true, arms: EXACT_CANDIDATE_ARMS, repeats: 3, repos: null };
+  const first = benchmarkHarness.planAgentRuns(opts, tasks);
+  const second = benchmarkHarness.planAgentRuns(opts, tasks);
+  assert.deepEqual(first, second);
+  assert.equal(first.length, 162);
+  const positions = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [arm, [0, 0, 0]]));
+  for (let index = 0; index < first.length; index += 3) {
+    const triplet = first.slice(index, index + 3);
+    assert.equal(new Set(triplet.map((run) => run.task.id)).size, 1);
+    assert.equal(new Set(triplet.map((run) => run.repeat)).size, 1);
+    assert.deepEqual(new Set(triplet.map((run) => run.arm)), new Set(EXACT_CANDIDATE_ARMS));
+    triplet.forEach((run, position) => {
+      positions[run.arm][position] += 1;
+    });
+  }
+  for (const arm of EXACT_CANDIDATE_ARMS) {
+    assert.deepEqual(positions[arm], [18, 18, 18]);
+  }
+});
+
+async function makeExactArchive(root, name, { version, schema, source, tree, discovery, executionMarker = null }) {
+  const packageRoot = path.join(root, `${name}-root`);
+  await mkdir(packageRoot, { recursive: true });
+  const cliPath = path.join(packageRoot, "codestory-cli");
+  await writeFile(
+    cliPath,
+    `#!/usr/bin/env node
+const readline = require("node:readline");
+const fs = require("node:fs");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method !== "initialize") return;
+  ${executionMarker ? `fs.writeFileSync(${JSON.stringify(executionMarker)}, "executed");` : ""}
+  const response = {
+    jsonrpc: "2.0",
+    id: request.id,
+    result: {
+      protocolVersion: request.params.protocolVersion,
+      serverInfo: { name: "codestory", version: ${JSON.stringify(version)} },
+      _meta: {
+        codestory_publication: { schema_version: ${schema} },
+        codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discovery)} },
+      },
+    },
+  };
+  process.stdout.write(JSON.stringify(response) + "\\n");
+});
+`,
+  );
+  await chmod(cliPath, 0o755);
+  const cliSha = createHash("sha256").update(await readFile(cliPath)).digest("hex");
+  await writeFile(path.join(packageRoot, "codestory-native-manifest.json"), JSON.stringify({
+    schema_version: 3,
+    release_version: version,
+    source: { commit: source, tree, tracked_dirty: false },
+    binary: { name: "codestory-cli", sha256: cliSha },
+  }));
+  const archivePath = path.join(root, `${name}.tar.gz`);
+  const packed = spawnSync("tar", ["-czf", archivePath, "-C", root, path.basename(packageRoot)], {
+    encoding: "utf8",
+  });
+  assert.equal(packed.status, 0, packed.stderr);
+  return {
+    archivePath,
+    sha256: createHash("sha256").update(await readFile(archivePath)).digest("hex"),
+  };
+}
+
+test("exact package authentication rejects archive CLI receipt and runtime substitution as one trust class", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-three-arm-receipt-"));
+  try {
+    const published = await makeExactArchive(root, "published", {
+      version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
+    });
+    const candidate = await makeExactArchive(root, "candidate", {
+      version: "0.18.0", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+    });
+    const checksumPath = path.join(root, "SHA256SUMS.txt");
+    await writeFile(checksumPath, `${published.sha256}  ${path.basename(published.archivePath)}\n`);
+    const checksumSha = createHash("sha256").update(await readFile(checksumPath)).digest("hex");
+    const receiptPath = path.join(root, "candidate-receipt.json");
+    const baseReceipt = {
+      contract: "codestory.agent-benchmark-package/v2",
+      arm: "candidate_0_18",
+      package_version: "0.18.0",
+      archive_path: candidate.archivePath,
+      archive_sha256: candidate.sha256,
+      source_commit: "d".repeat(40),
+      source_tree: "e".repeat(40),
+      schema_version: 3,
+      protocol_revision: "2025-11-25",
+      discovery_contract_sha256: "f".repeat(64),
+    };
+    const run = async (receipt, overrides = {}) => {
+      await writeFile(receiptPath, JSON.stringify(receipt));
+      const receiptSha = createHash("sha256").update(await readFile(receiptPath)).digest("hex");
+      const state = await mkdtemp(path.join(root, "state-"));
+      return await benchmarkHarness.authenticateExactCandidatePackages({
+        exactCandidate: true,
+        exactCandidateStateRoot: state,
+        publishedArchive: published.archivePath,
+        publishedChecksumManifest: checksumPath,
+        publishedChecksumSha256: checksumSha,
+        candidatePackageReceipt: receiptPath,
+        candidateReceiptSha256: receiptSha,
+        ...overrides,
+      });
+    };
+    const accepted = await run(baseReceipt);
+    assert.equal(accepted.packages.get("published_0_17_4").package_sha256, published.sha256);
+    assert.equal(accepted.packages.get("candidate_0_18").package_sha256, candidate.sha256);
+    assert.match(accepted.packages.get("candidate_0_18").cli_path, /state-/);
+
+    const hostile = [
+      ["archive substitution", { ...baseReceipt, archive_path: published.archivePath, archive_sha256: published.sha256 }, {}, /version|source|runtime/i],
+      ["local CLI substitution", { ...baseReceipt, cli_path: path.join(root, "decoy") }, {}, /exactly.*fields/i],
+      ["runtime drift", { ...baseReceipt, schema_version: 4 }, {}, /runtime\/source identity/i],
+      ["source drift", { ...baseReceipt, source_tree: "9".repeat(40) }, {}, /source tree drifted/i],
+      ["null source", { ...baseReceipt, source_commit: null }, {}, /runtime\/source identity/i],
+      ["all-zero archive digest", { ...baseReceipt, archive_sha256: "0".repeat(64) }, {}, /all-zero digest/i],
+      ["forged receipt", baseReceipt, { candidateReceiptSha256: "1".repeat(64) }, /external digest/i],
+      ["forged published manifest", baseReceipt, { publishedChecksumSha256: "2".repeat(64) }, /external digest/i],
+    ];
+    for (const [label, receipt, overrides, expected] of hostile) {
+      await assert.rejects(run(receipt, overrides), expected, label);
+    }
+    await writeFile(receiptPath, "");
+    await truncate(receiptPath, 64 * 1024 + 1);
+    await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
+      exactCandidate: true,
+      exactCandidateStateRoot: await mkdtemp(path.join(root, "state-")),
+      publishedArchive: published.archivePath,
+      publishedChecksumManifest: checksumPath,
+      publishedChecksumSha256: checksumSha,
+      candidatePackageReceipt: receiptPath,
+      candidateReceiptSha256: "7".repeat(64),
+    }), /bound/i);
+
+    await writeFile(checksumPath, "");
+    await truncate(checksumPath, 1024 * 1024 + 1);
+    await writeFile(receiptPath, JSON.stringify(baseReceipt));
+    await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
+      exactCandidate: true,
+      exactCandidateStateRoot: await mkdtemp(path.join(root, "state-")),
+      publishedArchive: published.archivePath,
+      publishedChecksumManifest: checksumPath,
+      publishedChecksumSha256: "8".repeat(64),
+      candidatePackageReceipt: receiptPath,
+      candidateReceiptSha256: createHash("sha256").update(await readFile(receiptPath)).digest("hex"),
+    }), /bound/i);
+
+    const oversizedArchive = path.join(root, "oversized.tar.gz");
+    await writeFile(oversizedArchive, "");
+    await truncate(oversizedArchive, 8 * 1024 * 1024 * 1024 + 1);
+    await writeFile(checksumPath, `${"a".repeat(64)}  ${path.basename(oversizedArchive)}\n`);
+    await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
+      exactCandidate: true,
+      exactCandidateStateRoot: await mkdtemp(path.join(root, "state-")),
+      publishedArchive: oversizedArchive,
+      publishedChecksumManifest: checksumPath,
+      publishedChecksumSha256: createHash("sha256").update(await readFile(checksumPath)).digest("hex"),
+      candidatePackageReceipt: receiptPath,
+      candidateReceiptSha256: createHash("sha256").update(await readFile(receiptPath)).digest("hex"),
+    }), /bound/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact input ingestion makes every caller path irrelevant before parsing extraction or execution", async () => {
+  for (const kind of [
+    "published_checksum_manifest",
+    "published_0_17_4_archive",
+    "candidate_receipt",
+    "candidate_0_18_archive",
+  ]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), `codestory-exact-race-${kind}-`));
+    try {
+      const marker = path.join(root, "substituted-cli-executed");
+      const published = await makeExactArchive(root, "published-original", {
+        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
+      });
+      const candidate = await makeExactArchive(root, "candidate-original", {
+        version: "0.18.0", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+      });
+      const publishedSubstitute = await makeExactArchive(root, "published-substitute", {
+        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
+        executionMarker: marker,
+      });
+      const candidateSubstitute = await makeExactArchive(root, "candidate-substitute", {
+        version: "0.18.0", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+        executionMarker: marker,
+      });
+      const publishedInput = path.join(root, "published-input.tar.gz");
+      const candidateInput = path.join(root, "candidate-input.tar.gz");
+      await copyFile(published.archivePath, publishedInput);
+      await copyFile(candidate.archivePath, candidateInput);
+      const checksumPath = path.join(root, "SHA256SUMS.txt");
+      await writeFile(checksumPath, `${published.sha256}  ${path.basename(publishedInput)}\n`);
+      const receiptPath = path.join(root, "candidate-receipt.json");
+      await writeFile(receiptPath, JSON.stringify({
+        contract: "codestory.agent-benchmark-package/v2",
+        arm: "candidate_0_18",
+        package_version: "0.18.0",
+        archive_path: candidateInput,
+        archive_sha256: candidate.sha256,
+        source_commit: "d".repeat(40),
+        source_tree: "e".repeat(40),
+        schema_version: 3,
+        protocol_revision: "2025-11-25",
+        discovery_contract_sha256: "f".repeat(64),
+      }));
+      const state = await mkdtemp(path.join(root, "state-"));
+      const result = await benchmarkHarness.authenticateExactCandidatePackages({
+        exactCandidate: true,
+        exactCandidateStateRoot: state,
+        publishedArchive: publishedInput,
+        publishedChecksumManifest: checksumPath,
+        publishedChecksumSha256: createHash("sha256").update(await readFile(checksumPath)).digest("hex"),
+        candidatePackageReceipt: receiptPath,
+        candidateReceiptSha256: createHash("sha256").update(await readFile(receiptPath)).digest("hex"),
+        exactCandidateAfterInputIngest: async (event) => {
+          if (event.kind !== kind) return;
+          if (kind === "published_checksum_manifest" || kind === "candidate_receipt") {
+            await writeFile(event.source_path, "substituted after ingest");
+          } else if (kind === "published_0_17_4_archive") {
+            await copyFile(publishedSubstitute.archivePath, event.source_path);
+          } else {
+            await copyFile(candidateSubstitute.archivePath, event.source_path);
+          }
+        },
+      });
+      assert.equal(result.packages.get("published_0_17_4").package_sha256, published.sha256, kind);
+      assert.equal(result.packages.get("candidate_0_18").package_sha256, candidate.sha256, kind);
+      assert.equal(existsSync(marker), false, `${kind} executed the substituted CLI`);
+      for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+        assert.ok(
+          isPathInside(path.join(state, "authenticated-inputs"), result.packages.get(arm).package_path),
+          `${kind} did not consume its private staged archive`,
+        );
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("exact-candidate acceptance closes the complete causal threshold matrix", () => {
+  const passing = exactCandidateRows();
+  const accepted = benchmarkHarness.exactCandidateAcceptance(passing, exactLifecycle());
+  assert.equal(accepted.pass, true, JSON.stringify(accepted));
+  assert.equal(accepted.expected_runs, 162);
+  assert.equal(accepted.completed_runs, 162);
+
+  const mutations = [
+    ["complete rows", (rows) => rows.pop(), /162 complete runs/i],
+    ["candidate quality vs published", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").quality.pass = false;
+    }, /candidate quality.*published/i],
+    ["candidate quality vs baseline", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.quality.pass = false;
+    }, /candidate quality.*without_codestory/i],
+    ["candidate-only factual error", (rows) => {
+      const row = rows.find((entry) => entry.arm === "candidate_0_18");
+      row.quality.material_factual_errors = { found: 1, found_anchors: ["false fact"] };
+    }, /candidate-only material factual error/i],
+    ["unsupported proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").quality.unsupported_proof_claims = { found: 1, found_claims: ["ContractProven"] };
+    }, /unsupported proof claim/i],
+    ["task repeat loss", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18" && entry.task_id === EXACT_TASKS[0][0] && entry.repeat <= 2)) row.quality.pass = false;
+      rows.find((entry) => entry.arm === "without_codestory" && entry.task_id === EXACT_TASKS[0][0]).quality.pass = false;
+    }, /loses 2 repeats/i],
+    ["tokens vs published", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
+        row.usage.input_tokens = 54;
+        row.usage.total_tokens = 74;
+      }
+    }, /tokens.*105%/i],
+    ["tokens vs baseline", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
+        row.usage.input_tokens = 61;
+        row.usage.total_tokens = 81;
+      }
+      for (const row of rows.filter((entry) => entry.arm === "published_0_17_4")) {
+        row.usage.input_tokens = 60;
+        row.usage.total_tokens = 80;
+      }
+    }, /tokens.*80%/i],
+    ["tools", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
+        row.tool_calls_observed = 8;
+        row.transcript_analysis.tool_categories.command_execution = 8;
+      }
+    }, /tool calls/i],
+    ["cost", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.estimated_cost_usd = 0.81;
+    }, /cost/i],
+    ["warm", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
+        row.exact_candidate_timing.warm_ms = 53;
+        row.exact_candidate_timing.all_in_ms = 53;
+      }
+    }, /warm.*105%/i],
+    ["cold", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.cold_ms = 106;
+    }, /cold.*5%/i],
+    ["incremental", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.incremental_ms = 22;
+    }, /incremental.*5%/i],
+    ["row all-in mismatch", (rows) => {
+      rows.find((entry) => entry.arm === "candidate_0_18").exact_candidate_timing.all_in_ms = 89;
+    }, /row all-in timing/i],
+    ["source authorization", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.direct_source_reads[0].authorization = { status: "unauthorized", reason: null };
+    }, /unauthorized direct source read/i],
+    ["forged source authorization", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").transcript_analysis.direct_source_reads[0].authorization = { status: "authorized", reason: "reviewer_said_ok" };
+    }, /unauthorized direct source read/i],
+    ["identity", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").package_identity.cli_sha256 = "0".repeat(64);
+    }, /candidate package identity mismatch/i],
+    ["accounting", (rows) => {
+      delete rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.tool_categories;
+    }, /missing tool categories/i],
+    ["arbitrary task id", (rows) => {
+      rows[0].task_id = "invented-task";
+    }, /exact task\/repository\/arm\/repeat keys/i],
+    ["arbitrary repository id", (rows) => {
+      rows[0].repo = "invented-repository";
+    }, /exact task\/repository\/arm\/repeat keys/i],
+    ["null token telemetry", (rows) => {
+      rows[0].usage.total_tokens = null;
+    }, /token accounting/i],
+    ["negative category telemetry", (rows) => {
+      rows[0].transcript_analysis.tool_categories.command_execution = -1;
+      rows[0].tool_calls_observed = -1;
+    }, /tool or command categories|tool call or cost/i],
+    ["empty category telemetry", (rows) => {
+      rows[0].transcript_analysis.tool_categories = {};
+    }, /tool or command categories/i],
+    ["factual count mismatch", (rows) => {
+      rows[0].quality.material_factual_errors.found = 1;
+    }, /error or proof-claim counts/i],
+    ["timing repeat mismatch", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").exact_candidate_timing.cold_ms = 99;
+    }, /timing disagrees across repeats/i],
+    ["baseline CodeStory visibility", (rows) => {
+      rows.find((row) => row.arm === "without_codestory").transcript_analysis.command_categories.codestory_cli = 1;
+    }, /baseline has CodeStory visibility/i],
+    ["published runtime proof", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_contract_runtime = null;
+    }, /missing per-arm managed runtime proof/i],
+    ["candidate cache proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance = null;
+    }, /missing per-arm cache proof/i],
+    ["published obligation proof", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_sufficiency = null;
+    }, /missing per-arm obligation proof/i],
+    ["candidate source mutation proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_source_mutation = null;
+    }, /missing verified source mutation/i],
+    ["candidate source mutation digest", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_source_mutation.original_sha256 = null;
+    }, /missing verified source mutation/i],
+    ["cache timing mismatch", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").codestory_cache_provenance.cache_preparation.incremental_wall_ms = 19;
+    }, /cache lifecycle timings do not reconcile/i],
+    ["executed CLI substitution", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_prelude_cli_sha256 = "9".repeat(64);
+    }, /executed CLI is not bound/i],
+    ["zero trust root", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").package_identity.trust_root_sha256 = "0".repeat(64);
+    }, /published package identity mismatch/i],
+    ["malformed JSONL", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").malformed_stdout_lines = 1;
+    }, /malformed or unreconciled JSONL parser telemetry/i],
+    ["external web context", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").transcript_analysis.external_context_tool_calls = 1;
+    }, /external web\/search context is forbidden/i],
+    ["zero baseline local commands", (rows) => {
+      const row = rows.find((entry) => entry.arm === "without_codestory");
+      row.transcript_analysis.command_count = 0;
+      row.transcript_analysis.command_categories = {};
+    }, /baseline local inspection telemetry is incomplete/i],
+    ["packet-first failure", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").packet_first_pass = false;
+    }, /packet-first contract failed/i],
+    ["dirty repo provenance", (rows) => {
+      rows[0].repo_provenance.git_dirty = true;
+    }, /owning repo provenance.*dirty/i],
+    ["moving repo provenance", (rows) => {
+      rows[0].repo_provenance.configured.ref = "main";
+    }, /owning repo provenance.*not pinned/i],
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const rows = exactCandidateRows();
+    mutate(rows);
+    const result = benchmarkHarness.exactCandidateAcceptance(rows, exactLifecycle());
+    assert.equal(result.pass, false, `${label}: ${JSON.stringify(result)}`);
+    assert.match(result.reasons.join("\n"), expected, label);
+  }
+
+  for (const [label, mutate, expected] of [
+    ["missing lifecycle", () => null, /one-time package and model lifecycle/i],
+    ["missing model lifecycle", (lifecycle) => {
+      delete lifecycle.model_initialization_ms;
+      return lifecycle;
+    }, /one-time package and model lifecycle/i],
+    ["unbalanced lifecycle", (lifecycle) => {
+      for (const entry of lifecycle.preparation_order) {
+        entry.arms = ["published_0_17_4", "candidate_0_18"];
+      }
+      return lifecycle;
+    }, /balanced deterministic 9\/9 rotation/i],
+    ["all-in lifecycle", (lifecycle) => {
+      lifecycle.package_authentication_ms.candidate_0_18 = 1000;
+      return lifecycle;
+    }, /all-in timing exceeds 110%/i],
+  ]) {
+    const lifecycle = mutate(exactLifecycle());
+    const result = benchmarkHarness.exactCandidateAcceptance(exactCandidateRows(), lifecycle);
+    assert.equal(result.pass, false, `${label}: ${JSON.stringify(result)}`);
+    assert.match(result.reasons.join("\n"), expected, label);
+  }
+});
+
+test("exact lifecycle alternates preparation and restores the selected source bytes", async () => {
+  assert.deepEqual(benchmarkHarness.exactCandidatePreparationArmOrder(0), [
+    "published_0_17_4", "candidate_0_18",
+  ]);
+  assert.deepEqual(benchmarkHarness.exactCandidatePreparationArmOrder(1), [
+    "candidate_0_18", "published_0_17_4",
+  ]);
+  const firstArms = Array.from({ length: 18 }, (_, index) =>
+    benchmarkHarness.exactCandidatePreparationArmOrder(index)[0]
+  );
+  assert.equal(firstArms.filter((arm) => arm === "published_0_17_4").length, 9);
+  assert.equal(firstArms.filter((arm) => arm === "candidate_0_18").length, 9);
+
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-mutation-"));
+  const sourcePath = path.join(root, "source.ts");
+  const original = Buffer.from("export function run() {}\n", "utf8");
+  await writeFile(sourcePath, original);
+  const spy = [];
+  try {
+    const receipt = await benchmarkHarness.withExactSourceMutation(
+      sourcePath,
+      async ({ original_sha256, mutated_sha256 }) => {
+        spy.push("incremental");
+        assert.notEqual(mutated_sha256, original_sha256);
+        assert.notDeepEqual(await readFile(sourcePath), original);
+        return { status: "pass" };
+      },
+      async ({ original_sha256, restored_sha256 }) => {
+        spy.push("restore");
+        assert.equal(restored_sha256, original_sha256);
+        assert.deepEqual(await readFile(sourcePath), original);
+      },
+    );
+    assert.deepEqual(spy, ["incremental", "restore"]);
+    assert.equal(receipt.result.status, "pass");
+    assert.deepEqual(await readFile(sourcePath), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact baseline child gets an allowlisted disjoint environment with no CodeStory surface", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-exact-baseline-env-"));
+  const codeStoryRoot = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-arm-env-"));
+  try {
+    const baselineContainer = path.join(root, "baseline-container");
+    const baselineRoot = path.join(baselineContainer, "private-state");
+    const exposedBin = path.join(root, "exposed-bin");
+    await mkdir(baselineRoot, { recursive: true });
+    await mkdir(codeStoryRoot, { recursive: true });
+    await mkdir(exposedBin, { recursive: true });
+    await writeFile(path.join(exposedBin, "codestory-cli"), "not executable");
+    const baselineEnv = benchmarkHarness.exactCandidateBaselineEnv({
+      exactCandidate: true,
+      exactCandidateBaselineStateRoot: baselineRoot,
+      exactCandidateStateRoot: codeStoryRoot,
+    }, {
+      ...process.env,
+      PATH: `${exposedBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      CODESTORY_CLI: path.join(exposedBin, "codestory-cli"),
+      CODESTORY_CACHE_ROOT: path.join(codeStoryRoot, "cache"),
+      CODESTORY_PLUGIN_DATA: path.join(codeStoryRoot, "plugin"),
+    });
+    for (const directory of [
+      baselineEnv.HOME, baselineEnv.TMPDIR, baselineEnv.XDG_CACHE_HOME,
+      baselineEnv.XDG_CONFIG_HOME, baselineEnv.XDG_DATA_HOME,
+    ]) {
+      await mkdir(directory, { recursive: true });
+    }
+    const childEnv = agentRunnerEnv(baselineEnv, path.join(baselineRoot, "host"), false);
+    await mkdir(childEnv.CODEX_HOME, { recursive: true });
+    const child = await runProcess(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const entries = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+      const executableHits = entries.filter((entry) =>
+        ["codestory", "codestory-cli", "codestory.exe", "codestory-cli.exe", "codestory.cmd"]
+          .some((name) => fs.existsSync(path.join(entry, name)))
+      );
+      const readableParent = path.dirname(path.dirname(process.env.HOME));
+      process.stdout.write(JSON.stringify({
+        env: process.env,
+        executableHits,
+        readableParent,
+        parentEntries: fs.readdirSync(readableParent),
+      }));
+    `], { env: childEnv, timeoutMs: 10_000 });
+    assert.equal(child.status, "pass", child.stderr);
+    const observed = JSON.parse(child.stdout);
+    assert.deepEqual(observed.executableHits, []);
+    assert.equal(Object.keys(observed.env).some((key) => key.startsWith("CODESTORY_")), false);
+    assert.equal(
+      Object.values(observed.env).some((value) => String(value).includes(codeStoryRoot)),
+      false,
+    );
+    assert.equal(
+      Object.values(observed.env).some((value) => /codestory/i.test(String(value))),
+      false,
+    );
+    assert.deepEqual(observed.parentEntries, ["private-state"]);
+    assert.equal(observed.env.PATH.includes(exposedBin), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(codeStoryRoot, { recursive: true, force: true });
+  }
+});
 
 test("keeps CLI overrides out of both isolated agent arms", () => {
   const opts = {
@@ -790,7 +1661,6 @@ test("canary preparation requires complete live accelerator and server identity"
     [{ embedding_offloaded_layer_count: 12 }, /not every embedding model layer was offloaded/],
     [{ embedding_server_identity: { peer_verified: false } }, /peer identity is not verified/],
     [{ embedding_server_identity: { load_generation: 2 } }, /load identities disagree/],
-    [{ embedding_server_identity: { executable_version: "0.16.0" } }, /expected 0\.17\.0/],
   ]) {
     const blockers = cachePreparationCanaryBlockers(
       pipelinePreparation("canary", overrides),
@@ -798,6 +1668,14 @@ test("canary preparation requires complete live accelerator and server identity"
     );
     assert.match(blockers.join("\n"), expected);
   }
+  const versionDrift = pipelinePreparation("canary", {
+    embedding_server_identity: { executable_version: "0.17.4" },
+  });
+  versionDrift.package_identity = { package_version: "0.18.0" };
+  assert.match(
+    cachePreparationCanaryBlockers(versionDrift, { CODESTORY_EMBED_ALLOW_CPU: "0" }).join("\n"),
+    /expected 0\.18\.0/,
+  );
 });
 
 function retrievalEngineDiagnosticsPayload(overrides = {}) {
@@ -3043,6 +3921,9 @@ test("packet and cache preparation share one explicit agent retrieval namespace"
 
   const args = packetCommandArgs({ path: "C:\\repo" }, task);
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
+  for (const anchor of [...task.expected_files, ...task.expected_symbol_probes]) {
+    assert.equal(args.includes(anchor), false, `expected anchor leaked into packet arguments: ${anchor}`);
+  }
   assert.deepEqual(benchmarkAgentScopeArgs(), ["--profile", "agent", "--run-id", "shared-agent"]);
   assert.deepEqual(args.slice(3, 7), benchmarkAgentScopeArgs());
 
@@ -3458,6 +4339,66 @@ test("counts direct source reads for every supported language extension family",
   const analysis = analyzeTranscript(events);
   assert.equal(analysis.command_categories.direct_file_read, paths.length);
   assert.equal(analysis.direct_source_reads_total, paths.length);
+});
+
+test("transcript analysis authorizes source reads only from user-named files or prior explicit evidence gaps", () => {
+  const project = "/tmp/exact-transcript-project";
+  const namedEvents = [
+    commandEvent("named", "item.started", "Get-Content src/named.ts"),
+    commandEvent("named", "item.completed", "Get-Content src/named.ts", "source"),
+  ];
+  const named = analyzeTranscript(namedEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Inspect src/named.ts and explain the call." },
+  });
+  assert.equal(named.direct_source_reads[0].authorization.reason, "user_named_file");
+
+  const gapEvents = [
+    commandEvent("packet", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent("packet", "item.completed", "$CODESTORY_CLI packet --project . --question flow", "Unknown: explicit evidence gap"),
+    commandEvent("gap-read", "item.started", "Get-Content src/gap.ts"),
+    commandEvent("gap-read", "item.completed", "Get-Content src/gap.ts", "source"),
+  ];
+  const gap = analyzeTranscript(gapEvents, project, {
+    arm: "published_0_17_4",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(gap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
+  assert.equal(gap.direct_source_reads[0].authorization.evidence_command_id, "packet");
+
+  const unauthorized = analyzeTranscript(namedEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(unauthorized.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const baseline = analyzeTranscript(gapEvents.slice(2), project, {
+    arm: "without_codestory",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(baseline.direct_source_reads[0].authorization.status, "baseline_local_exploration");
+});
+
+test("exact telemetry sees malformed JSONL web context and an empty local transcript through the real parser", () => {
+  const jsonl = [
+    JSON.stringify({ type: "item.started", item: { id: "web", type: "web_search", query: "upstream source" } }),
+    "{malformed-jsonl",
+  ].join("\n");
+  const { parsed, malformed } = parseJsonLines(jsonl);
+  assert.equal(parsed.length, 1);
+  assert.equal(malformed.length, 1);
+  const web = analyzeTranscript(parsed, "/tmp/exact-parser", {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the local repository." },
+  });
+  assert.equal(web.external_context_tool_calls, 1);
+  assert.equal(web.tool_categories.web_search, 1);
+  const empty = analyzeTranscript([], "/tmp/exact-parser", {
+    arm: "without_codestory",
+    task: { prompt: "Explain the local repository." },
+  });
+  assert.equal(empty.command_count, 0);
+  assert.equal(empty.direct_source_reads_total, 0);
 });
 
 test("counts PowerShell LiteralPath source reads after a CodeStory packet", () => {
