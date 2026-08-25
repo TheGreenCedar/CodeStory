@@ -2646,6 +2646,11 @@ impl Storage {
             .get(&owner)
             .ok_or_else(|| proof_error("imported receiver owner is missing"))?;
         let source_file = NodeId(fact.callsite.file_id.0);
+        let java_kotlin_literal_import =
+            matches!(fact.provenance.language_adapter.as_str(), "java" | "kotlin")
+                && matches!(import_node.kind, NodeKind::MODULE | NodeKind::UNKNOWN)
+                && owner_node.qualified_name.as_deref()
+                    == Some(import_node.serialized_name.as_str());
         let python_relative = fact.provenance.language_adapter == "python"
             && components.is_some_and(|components| {
                 components.len() >= 4
@@ -2666,7 +2671,9 @@ impl Storage {
                 NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
             )
             || owner_node.file_node_id != target_node.file_node_id
-            || !(python_relative || context.has_import(source_file, import, owner))
+            || !(python_relative
+                || java_kotlin_literal_import
+                || context.has_import(source_file, import, owner))
             || !context.has_member(owner, target)
         {
             return Err(proof_error(
@@ -2992,7 +2999,7 @@ fn graph_leaf_name(name: &str) -> &str {
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
         "rust" => kind == NodeKind::MODULE,
-        "javascript" | "typescript" | "tsx" | "python" => {
+        "java" | "kotlin" | "javascript" | "typescript" | "tsx" | "python" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
         _ => false,

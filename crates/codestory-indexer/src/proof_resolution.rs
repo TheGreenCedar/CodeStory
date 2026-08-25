@@ -91,10 +91,14 @@ const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
 const RUST_ADAPTER_VERSION: &str = "reference-v19";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 16;
+const JAVA_ADAPTER_VERSION: &str = "reference-v1";
+const KOTLIN_ADAPTER_VERSION: &str = "reference-v1";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 17;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
+    ("java", JAVA_ADAPTER_VERSION),
+    ("kotlin", KOTLIN_ADAPTER_VERSION),
     ("python", PYTHON_ADAPTER_VERSION),
     ("rust", RUST_ADAPTER_VERSION),
     ("tsx", TYPESCRIPT_ADAPTER_VERSION),
@@ -152,6 +156,8 @@ pub(crate) fn collect_call_resolution_inputs(
         (language == "go").then(|| GoResolutionIndex::build(tree, source, file_id, nodes));
     let python_index =
         (language == "python").then(|| PythonResolutionIndex::build(tree, source, file_id, nodes));
+    let java_kotlin_index = is_java_kotlin_language(language)
+        .then(|| JavaKotlinResolutionIndex::build(tree, source, language, file_id, nodes));
     let (direct_exports, export_poison_all, poisoned_export_names) =
         if let Some(index) = &javascript_index {
             index.collect_direct_exports(source)
@@ -174,6 +180,8 @@ pub(crate) fn collect_call_resolution_inputs(
     } else if let Some(index) = &go_index {
         index.declarations.clone()
     } else if let Some(index) = &python_index {
+        index.declarations.clone()
+    } else if let Some(index) = &java_kotlin_index {
         index.declarations.clone()
     } else {
         Vec::new()
@@ -203,6 +211,8 @@ pub(crate) fn collect_call_resolution_inputs(
             } else if let Some(index) = &python_index {
                 index.resolve_syntax_claim(source, callee, form, &raw_target)
             } else if let Some(index) = &javascript_index {
+                index.resolve_syntax_claim(source, callee, form, &raw_target)
+            } else if let Some(index) = &java_kotlin_index {
                 index.resolve_syntax_claim(source, callee, form, &raw_target)
             } else {
                 (None, CachedResolutionBinding::Unsupported)
@@ -259,6 +269,10 @@ pub(crate) fn collect_call_resolution_inputs(
         for call in &index.calls {
             emit_call(call.callee, call.form, call.raw_target.clone(), None);
         }
+    } else if let Some(index) = &java_kotlin_index {
+        for call in &index.calls {
+            emit_call(call.callee, call.form, call.raw_target.clone(), None);
+        }
     } else {
         collect_calls(tree.root_node(), source, &mut |callee, form, raw_target| {
             emit_call(callee, form, raw_target, None);
@@ -280,9 +294,14 @@ pub(crate) fn collect_call_resolution_inputs(
             inherent_methods,
             classes: javascript_index.as_ref().map_or_else(
                 || {
-                    python_index
-                        .as_ref()
-                        .map_or_else(Vec::new, |index| index.classes.clone())
+                    python_index.as_ref().map_or_else(
+                        || {
+                            java_kotlin_index
+                                .as_ref()
+                                .map_or_else(Vec::new, |index| index.classes.clone())
+                        },
+                        |index| index.classes.clone(),
+                    )
                 },
                 |index| index.cached_classes(),
             ),
@@ -299,6 +318,9 @@ pub(crate) fn collect_call_resolution_inputs(
                 .as_ref()
                 .map_or_else(Vec::new, |index| index.uses.clone()),
             go_package: go_index.as_ref().map(GoResolutionIndex::cached_package),
+            java_kotlin_package: java_kotlin_index
+                .as_ref()
+                .and_then(|index| index.package_name.clone()),
         }),
     }
 }
@@ -311,6 +333,10 @@ fn is_installed_language(language: &str) -> bool {
 
 fn is_javascript_language(language: &str) -> bool {
     matches!(language, "javascript" | "typescript" | "tsx")
+}
+
+fn is_java_kotlin_language(language: &str) -> bool {
+    matches!(language, "java" | "kotlin")
 }
 
 fn expected_parser_fingerprint(path: &Path, language: &str) -> Option<String> {
@@ -401,6 +427,720 @@ fn classify_callee<'tree>(
             ))
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct IndexedJavaKotlinCall<'tree> {
+    callee: TsNode<'tree>,
+    form: CalleeForm,
+    raw_target: String,
+}
+
+struct JavaKotlinResolutionIndex<'tree> {
+    language: &'tree str,
+    calls: Vec<IndexedJavaKotlinCall<'tree>>,
+    declarations: Vec<CachedTopLevelDeclaration>,
+    declaration_indices_by_name: HashMap<String, Vec<usize>>,
+    classes: Vec<CachedClassDeclaration>,
+    class_indices_by_name: HashMap<String, Vec<usize>>,
+    class_method_indices_by_name: HashMap<(usize, String), Vec<usize>>,
+    class_names: HashSet<String>,
+    callable_nodes: HashMap<(u32, String), Vec<NodeId>>,
+    class_nodes: HashMap<(u32, String), Vec<NodeId>>,
+    import_nodes: HashMap<u32, Vec<NodeId>>,
+    package_name: Option<String>,
+    generated_or_annotation: bool,
+}
+
+impl<'tree> JavaKotlinResolutionIndex<'tree> {
+    fn build(
+        tree: &'tree Tree,
+        source: &str,
+        language: &'tree str,
+        file_id: NodeId,
+        nodes: &[Node],
+    ) -> Self {
+        let mut callable_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        let mut class_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        let mut import_nodes = HashMap::<u32, Vec<NodeId>>::new();
+        for node in nodes
+            .iter()
+            .filter(|node| node.file_node_id == Some(file_id))
+        {
+            let Some(line) = node.start_line else {
+                continue;
+            };
+            let name = graph_leaf_name(&node.serialized_name).to_string();
+            match node.kind {
+                NodeKind::FUNCTION | NodeKind::METHOD => {
+                    callable_nodes
+                        .entry((line, name))
+                        .or_default()
+                        .push(node.id);
+                }
+                NodeKind::CLASS => {
+                    class_nodes.entry((line, name)).or_default().push(node.id);
+                }
+                NodeKind::MODULE | NodeKind::UNKNOWN => {
+                    import_nodes.entry(line).or_default().push(node.id);
+                }
+                _ => {}
+            }
+        }
+        let root = tree.root_node();
+        let mut result = Self {
+            language,
+            calls: Vec::new(),
+            declarations: Vec::new(),
+            declaration_indices_by_name: HashMap::new(),
+            classes: Vec::new(),
+            class_indices_by_name: HashMap::new(),
+            class_method_indices_by_name: HashMap::new(),
+            class_names: HashSet::new(),
+            callable_nodes,
+            class_nodes,
+            import_nodes,
+            package_name: java_kotlin_package_name(root, source, language),
+            generated_or_annotation: java_kotlin_source_is_generated_or_annotated(root, source),
+        };
+        walk_nodes(root, &mut |node| {
+            if java_kotlin_same_file_declaration(language, node, root, source) {
+                let Some(name) = declaration_name(node, source).map(str::to_string) else {
+                    return;
+                };
+                if let Some(declaration) = result.map_callable_declaration(node, source) {
+                    result.declarations.push(CachedTopLevelDeclaration {
+                        name,
+                        declaration,
+                        module_path: Vec::new(),
+                        cross_module_visible: false,
+                    });
+                }
+            }
+            if java_kotlin_class_kind(language, node.kind())
+                && let Some(owner) = result.map_class_declaration(node, source)
+                && let Some(name) = declaration_name(node, source)
+            {
+                result.classes.push(CachedClassDeclaration {
+                    name: name.to_string(),
+                    declaration: owner,
+                    methods: java_kotlin_class_methods(
+                        node,
+                        language,
+                        source,
+                        &result.callable_nodes,
+                    ),
+                });
+            }
+            let call = if language == "java" {
+                java_call(node, source)
+            } else {
+                kotlin_call(node, source)
+            };
+            if let Some((callee, form, raw_target)) = call {
+                result.calls.push(IndexedJavaKotlinCall {
+                    callee,
+                    form,
+                    raw_target,
+                });
+            }
+        });
+        result
+            .calls
+            .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        result.declarations.sort_by(|left, right| {
+            left.name
+                .cmp(&right.name)
+                .then(left.declaration.cmp(&right.declaration))
+        });
+        result
+            .classes
+            .sort_by(|left, right| left.declaration.cmp(&right.declaration));
+        for (index, declaration) in result.declarations.iter().enumerate() {
+            result
+                .declaration_indices_by_name
+                .entry(declaration.name.clone())
+                .or_default()
+                .push(index);
+        }
+        for (index, class) in result.classes.iter().enumerate() {
+            result
+                .class_indices_by_name
+                .entry(class.name.clone())
+                .or_default()
+                .push(index);
+            result.class_names.insert(class.name.clone());
+            for (method_index, method) in class.methods.iter().enumerate() {
+                result
+                    .class_method_indices_by_name
+                    .entry((index, method.name.clone()))
+                    .or_default()
+                    .push(method_index);
+            }
+        }
+        result
+    }
+
+    fn map_callable_declaration(&self, node: TsNode<'_>, source: &str) -> Option<NodeId> {
+        let name = declaration_name(node, source)?;
+        let matches = self
+            .callable_nodes
+            .get(&(node.start_position().row as u32 + 1, name.to_string()))?;
+        matches.first().copied().filter(|_| matches.len() == 1)
+    }
+
+    fn map_class_declaration(&self, node: TsNode<'_>, source: &str) -> Option<NodeId> {
+        let name = declaration_name(node, source)?;
+        let matches = self
+            .class_nodes
+            .get(&(node.start_position().row as u32 + 1, name.to_string()))?;
+        matches.first().copied().filter(|_| matches.len() == 1)
+    }
+
+    fn resolve_syntax_claim(
+        &self,
+        source: &str,
+        callee: TsNode<'tree>,
+        form: CalleeForm,
+        raw_target: &str,
+    ) -> (Option<NodeId>, CachedResolutionBinding) {
+        let Some(callable) = java_kotlin_enclosing_callable(callee, self.language) else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        let Some(caller) = self.map_callable_declaration(callable, source) else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        let unsupported =
+            java_kotlin_call_is_unsupported(callee, raw_target, source, self.language);
+        if self.generated_or_annotation || unsupported {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if form == CalleeForm::Identifier {
+            if java_kotlin_overload_present(source, self.language, raw_target) {
+                return (Some(caller), CachedResolutionBinding::Ambiguous);
+            }
+            let candidates = self
+                .declaration_indices_by_name
+                .get(raw_target)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            return match candidates {
+                [declaration] => (
+                    Some(caller),
+                    CachedResolutionBinding::SameFile {
+                        declaration: self.declarations[*declaration].declaration,
+                        rust_glob_local_module: None,
+                    },
+                ),
+                [] => (Some(caller), CachedResolutionBinding::MissingBinding),
+                _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+            };
+        }
+        if java_kotlin_receiver_is_rebound(callee, source, self.language)
+            || self.language == "kotlin"
+                && source.contains("var ")
+                && source.matches(" = ").count() > 1
+        {
+            return (Some(caller), CachedResolutionBinding::Ambiguous);
+        }
+        let Some((owner_name, constructor)) =
+            self.receiver_owner(callee, source, raw_target, form, callable)
+        else {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        };
+        if let Some((package_name, import)) = self.imported_receiver_binding(source, &owner_name) {
+            return (
+                Some(caller),
+                CachedResolutionBinding::JavaKotlinImportedReceiver {
+                    package_name,
+                    owner_name,
+                    method_name: raw_target.to_string(),
+                    import,
+                    constructor,
+                },
+            );
+        }
+        let classes = self
+            .class_indices_by_name
+            .get(&owner_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [class_index] = classes else {
+            return (
+                Some(caller),
+                if classes.is_empty() {
+                    CachedResolutionBinding::MissingBinding
+                } else {
+                    CachedResolutionBinding::Ambiguous
+                },
+            );
+        };
+        let class = &self.classes[*class_index];
+        let matching_methods = self
+            .class_method_indices_by_name
+            .get(&(*class_index, raw_target.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [method_index] = matching_methods else {
+            return (
+                Some(caller),
+                if matching_methods.is_empty() {
+                    CachedResolutionBinding::MissingBinding
+                } else {
+                    CachedResolutionBinding::Ambiguous
+                },
+            );
+        };
+        if form == CalleeForm::ImplicitReceiver {
+            let declaration = class.methods[*method_index].declaration;
+            return (
+                Some(caller),
+                CachedResolutionBinding::ImplicitReceiver {
+                    owner: class.declaration,
+                    declaration,
+                    owner_name,
+                },
+            );
+        }
+        let class_binding = CachedClassBinding::SameFile {
+            owner: class.declaration,
+            owner_name,
+        };
+        (
+            Some(caller),
+            if constructor {
+                CachedResolutionBinding::ConstructorBinding {
+                    class_binding,
+                    method_name: raw_target.to_string(),
+                }
+            } else {
+                CachedResolutionBinding::ExplicitReceiverType {
+                    class_binding,
+                    method_name: raw_target.to_string(),
+                }
+            },
+        )
+    }
+
+    fn imported_receiver_binding(
+        &self,
+        source: &str,
+        owner_name: &str,
+    ) -> Option<(String, NodeId)> {
+        let (line, package_name) = java_kotlin_type_import(source, self.language, owner_name)?;
+        let imports = self.import_nodes.get(&line)?;
+        let [import] = imports.as_slice() else {
+            return None;
+        };
+        Some((package_name, *import))
+    }
+
+    fn receiver_owner(
+        &self,
+        callee: TsNode<'tree>,
+        source: &str,
+        raw_target: &str,
+        form: CalleeForm,
+        callable: TsNode<'tree>,
+    ) -> Option<(String, bool)> {
+        if form == CalleeForm::ImplicitReceiver {
+            let mut node = callable;
+            while let Some(parent) = node.parent() {
+                if java_kotlin_class_kind(self.language, parent.kind()) {
+                    return declaration_name(parent, source).map(|name| (name.to_string(), false));
+                }
+                node = parent;
+            }
+            return None;
+        }
+        let receiver = java_kotlin_member_receiver(callee, self.language)?;
+        let receiver_surface = node_text(receiver, source)?.trim();
+        let receiver_call_surface = &source[receiver.start_byte()..callee.start_byte()];
+        let direct_constructor = if self.language == "java" {
+            receiver.kind() == "object_creation_expression"
+        } else {
+            matches!(
+                receiver.kind(),
+                "call_expression" | "constructor_invocation"
+            ) && receiver_surface
+                .chars()
+                .next()
+                .is_some_and(char::is_uppercase)
+                || receiver_surface
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_uppercase)
+                    && receiver_call_surface.starts_with(&format!("{receiver_surface}()"))
+        };
+        if direct_constructor {
+            let owner = if self.language == "java" {
+                receiver
+                    .child_by_field_name("type")
+                    .and_then(|ty| node_text(ty, source))?
+                    .trim()
+                    .split('<')
+                    .next()?
+            } else {
+                receiver_surface.split('(').next()?.trim()
+            };
+            return Some((owner.to_string(), true));
+        }
+        let receiver_name = receiver_surface.trim_end_matches('?');
+        if self.language == "java" && self.class_names.contains(receiver_name) {
+            return Some((receiver_name.to_string(), false));
+        }
+        if receiver_name.contains(['.', '(', ')', '[', ']']) {
+            return None;
+        }
+        let before_call = &source[..callee.start_byte()];
+        if before_call.matches(&format!("{receiver_name} =")).count() > 1 {
+            return None;
+        }
+        if let Some(imported_owner) = java_kotlin_visible_imported_receiver_type(
+            source,
+            self.language,
+            receiver_name,
+            before_call,
+        ) {
+            return Some((imported_owner, false));
+        }
+        if self.language == "kotlin"
+            && let Some(owner) = java_kotlin_constructor_receiver_type(before_call, receiver_name)
+            && self.class_names.contains(&owner)
+        {
+            return Some((owner, true));
+        }
+        java_kotlin_declared_receiver_type(before_call, self.language, receiver_name)
+            .filter(|owner| self.class_names.contains(owner))
+            .map(|owner| (owner, false))
+            .filter(|_| !raw_target.is_empty())
+    }
+}
+
+fn java_kotlin_callable_kind(language: &str, kind: &str) -> bool {
+    matches!(
+        (language, kind),
+        ("java", "method_declaration") | ("kotlin", "function_declaration")
+    )
+}
+
+fn java_kotlin_class_kind(language: &str, kind: &str) -> bool {
+    matches!(
+        (language, kind),
+        ("java", "class_declaration") | ("kotlin", "class_declaration")
+    )
+}
+
+fn java_kotlin_same_file_declaration(
+    language: &str,
+    node: TsNode<'_>,
+    root: TsNode<'_>,
+    source: &str,
+) -> bool {
+    if !java_kotlin_callable_kind(language, node.kind()) {
+        return false;
+    }
+    if language == "kotlin" {
+        return node.parent().is_some_and(|parent| parent.id() == root.id());
+    }
+    source[node.start_byte()..node.end_byte()]
+        .split('{')
+        .next()
+        .is_some_and(|signature| signature.split_whitespace().any(|word| word == "static"))
+}
+
+fn java_kotlin_class_methods(
+    class: TsNode<'_>,
+    language: &str,
+    source: &str,
+    callable_nodes: &HashMap<(u32, String), Vec<NodeId>>,
+) -> Vec<CachedClassMethod> {
+    let mut methods = Vec::new();
+    walk_nodes(class, &mut |node| {
+        if node.id() == class.id() || !java_kotlin_callable_kind(language, node.kind()) {
+            return;
+        }
+        let Some(name) = declaration_name(node, source) else {
+            return;
+        };
+        let Some(matches) =
+            callable_nodes.get(&(node.start_position().row as u32 + 1, name.to_string()))
+        else {
+            return;
+        };
+        if let [declaration] = matches.as_slice() {
+            methods.push(CachedClassMethod {
+                name: name.to_string(),
+                declaration: *declaration,
+            });
+        }
+    });
+    methods.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.declaration.cmp(&right.declaration))
+    });
+    methods
+}
+
+fn java_kotlin_package_name(root: TsNode<'_>, source: &str, language: &str) -> Option<String> {
+    let kind = if language == "java" {
+        "package_declaration"
+    } else {
+        "package_header"
+    };
+    let mut cursor = root.walk();
+    root.named_children(&mut cursor)
+        .find(|node| node.kind() == kind)
+        .and_then(|node| node_text(node, source))
+        .and_then(|surface| {
+            surface
+                .trim()
+                .strip_prefix("package")
+                .map(str::trim)
+                .map(|name| name.trim_end_matches(';').trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+}
+
+fn java_kotlin_source_is_generated_or_annotated(root: TsNode<'_>, source: &str) -> bool {
+    source.contains("@Generated")
+        || source.contains("annotation class Generated")
+        || contains_node_kind(root, "annotation")
+}
+
+fn java_call<'tree>(
+    node: TsNode<'tree>,
+    source: &str,
+) -> Option<(TsNode<'tree>, CalleeForm, String)> {
+    (node.kind() == "method_invocation").then_some(())?;
+    let name = node.child_by_field_name("name")?;
+    let object = node.child_by_field_name("object");
+    let form = match object {
+        None => CalleeForm::Identifier,
+        Some(object) if object.kind() == "this" => CalleeForm::ImplicitReceiver,
+        Some(_) => CalleeForm::ExplicitReceiver,
+    };
+    Some((name, form, node_text(name, source)?.to_string()))
+}
+
+fn kotlin_call<'tree>(
+    node: TsNode<'tree>,
+    source: &str,
+) -> Option<(TsNode<'tree>, CalleeForm, String)> {
+    (node.kind() == "call_expression").then_some(())?;
+    let mut cursor = node.walk();
+    let callee = node.named_children(&mut cursor).next()?;
+    if callee.kind() == "identifier" {
+        return Some((
+            callee,
+            CalleeForm::Identifier,
+            node_text(callee, source)?.to_string(),
+        ));
+    }
+    if callee.kind() != "navigation_expression" {
+        return None;
+    }
+    let mut children = callee.walk();
+    let parts = callee.named_children(&mut children).collect::<Vec<_>>();
+    let (receiver, member) = (parts.first()?, parts.last()?);
+    let form = if receiver.kind() == "this_expression" {
+        CalleeForm::ImplicitReceiver
+    } else {
+        CalleeForm::ExplicitReceiver
+    };
+    Some((
+        *member,
+        form,
+        node_text(*member, source)?
+            .trim_start_matches('?')
+            .to_string(),
+    ))
+}
+
+fn java_kotlin_member_receiver<'tree>(
+    callee: TsNode<'tree>,
+    language: &str,
+) -> Option<TsNode<'tree>> {
+    let invocation = callee.parent()?;
+    if language == "java" {
+        return invocation.child_by_field_name("object");
+    }
+    let navigation = invocation;
+    let mut cursor = navigation.walk();
+    navigation.named_children(&mut cursor).next()
+}
+
+fn java_kotlin_enclosing_callable<'tree>(
+    mut node: TsNode<'tree>,
+    language: &str,
+) -> Option<TsNode<'tree>> {
+    while let Some(parent) = node.parent() {
+        if java_kotlin_callable_kind(language, parent.kind()) {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn java_kotlin_type_import(
+    source: &str,
+    language: &str,
+    owner_name: &str,
+) -> Option<(u32, String)> {
+    for (index, line) in source.lines().enumerate() {
+        let surface = line.trim().trim_end_matches(';').trim();
+        let path = if language == "java" {
+            let Some(path) = surface.strip_prefix("import ") else {
+                continue;
+            };
+            if path.starts_with("static ") {
+                continue;
+            }
+            path
+        } else {
+            let Some(path) = surface.strip_prefix("import ") else {
+                continue;
+            };
+            path
+        };
+        if path.ends_with(".*") || path.rsplit('.').next()? != owner_name {
+            continue;
+        }
+        let parts = path.split('.').collect::<Vec<_>>();
+        if parts.len() >= 2 {
+            return Some((index as u32 + 1, parts[..parts.len() - 1].join(".")));
+        }
+    }
+    None
+}
+
+fn java_kotlin_visible_imported_receiver_type(
+    source: &str,
+    language: &str,
+    receiver_name: &str,
+    before_call: &str,
+) -> Option<String> {
+    for line in source.lines() {
+        let surface = line.trim().trim_end_matches(';').trim();
+        let path = if language == "java" {
+            let Some(path) = surface.strip_prefix("import ") else {
+                continue;
+            };
+            if path.starts_with("static ") {
+                continue;
+            }
+            path
+        } else {
+            let Some(path) = surface.strip_prefix("import ") else {
+                continue;
+            };
+            path
+        };
+        let owner = path.rsplit('.').next()?.trim();
+        let typed = if language == "java" {
+            format!("{owner} {receiver_name}")
+        } else {
+            format!("{receiver_name}: {owner}")
+        };
+        if before_call.contains(&typed) {
+            return Some(owner.to_string());
+        }
+    }
+    None
+}
+
+fn java_kotlin_declared_receiver_type(
+    before_call: &str,
+    language: &str,
+    receiver_name: &str,
+) -> Option<String> {
+    if language == "kotlin" {
+        let type_marker = format!("{receiver_name}:");
+        let type_name = before_call.rsplit_once(&type_marker)?.1.trim_start();
+        let type_name = type_name
+            .chars()
+            .take_while(|character| character == &'_' || character.is_alphanumeric())
+            .collect::<String>();
+        return (!type_name.is_empty()).then_some(type_name);
+    }
+    let header = &before_call[..before_call.rfind('{')?];
+    let declaration = header.rsplit_once(&format!(" {receiver_name}"))?.0;
+    declaration
+        .trim_end()
+        .rsplit(|character: char| character != '_' && !character.is_alphanumeric())
+        .next()
+        .filter(|type_name| !type_name.is_empty())
+        .map(str::to_string)
+}
+
+fn java_kotlin_constructor_receiver_type(before_call: &str, receiver_name: &str) -> Option<String> {
+    let constructor = before_call
+        .rsplit_once(&format!("{receiver_name} = "))?
+        .1
+        .trim_start()
+        .split('(')
+        .next()?
+        .trim();
+    (!constructor.is_empty()
+        && constructor
+            .chars()
+            .all(|character| character == '_' || character.is_alphanumeric()))
+    .then(|| constructor.to_string())
+}
+
+fn java_kotlin_call_is_unsupported(
+    callee: TsNode<'_>,
+    raw_target: &str,
+    source: &str,
+    language: &str,
+) -> bool {
+    let prefix = &source[..callee.start_byte()];
+    raw_target == "forName"
+        || prefix.contains("import ") && prefix.contains(".*")
+        || prefix.contains("interface ") && !prefix.contains("class ")
+        || prefix.contains(" extends ")
+        || prefix.contains("fun <")
+        || prefix.contains("<T>")
+        || prefix.contains(" is ")
+        || prefix.contains(" by ")
+        || language == "kotlin"
+            && source.lines().any(|line| {
+                line.trim()
+                    .strip_prefix("fun ")
+                    .and_then(|declaration| declaration.split_once('.'))
+                    .is_some_and(|(receiver, member)| {
+                        receiver.chars().next().is_some_and(char::is_uppercase)
+                            && receiver
+                                .chars()
+                                .all(|character| character == '_' || character.is_alphanumeric())
+                            && member.starts_with(&format!("{raw_target}("))
+                    })
+            })
+        || language == "java" && prefix.contains("((")
+}
+
+fn java_kotlin_overload_present(source: &str, language: &str, name: &str) -> bool {
+    let declaration = if language == "java" {
+        format!("void {name}(")
+    } else {
+        format!("fun {name}(")
+    };
+    source.matches(&declaration).count() > 1
+}
+
+fn java_kotlin_receiver_is_rebound(callee: TsNode<'_>, source: &str, language: &str) -> bool {
+    java_kotlin_member_receiver(callee, language)
+        .and_then(|receiver| node_text(receiver, source))
+        .map(str::trim)
+        .filter(|receiver| !receiver.contains(['.', '(', ')', '[', ']']))
+        .is_some_and(|receiver| {
+            source[..callee.start_byte()]
+                .matches(&format!("{receiver} ="))
+                .count()
+                > 1
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -7528,6 +8268,7 @@ pub fn rematerialize_proof_resolution_projection(
         .collect::<HashMap<_, _>>();
     let rust_projection_index = RustProjectionIndex::prepare(&records)?;
     let go_projection_index = GoProjectionIndex::prepare(&records)?;
+    let java_kotlin_projection_index = JavaKotlinProjectionIndex::prepare(&records);
     let python_projection_index = PythonProjectionIndex::prepare(&records, &record_by_path)?;
     let mut claims = inputs
         .into_iter()
@@ -7537,6 +8278,7 @@ pub fn rematerialize_proof_resolution_projection(
                 &record_by_path,
                 &rust_projection_index,
                 &go_projection_index,
+                &java_kotlin_projection_index,
                 &python_projection_index,
                 source_record,
                 input,
@@ -9033,6 +9775,32 @@ impl ExactEvidenceValidationIndex {
             (
                 CalleeForm::ExplicitReceiver,
                 [
+                    ResolutionEvidence::StaticImportBinding {
+                        import,
+                        declaration: owner,
+                    },
+                    ResolutionEvidence::ConstructorBinding { constructor },
+                    ResolutionEvidence::ExplicitReceiverType { receiver_type },
+                    ResolutionEvidence::QualifiedPath { components },
+                ],
+            ) if matches!(claim.input.language.as_str(), "java" | "kotlin")
+                && *owner == *constructor
+                && *owner == *receiver_type =>
+            {
+                self.imported_receiver_is_correlated(
+                    &claim.input.language,
+                    source_file,
+                    *import,
+                    *owner,
+                    target,
+                    target_node,
+                    components,
+                    nodes,
+                )
+            }
+            (
+                CalleeForm::ExplicitReceiver,
+                [
                     ResolutionEvidence::ConstructorBinding { constructor },
                     ResolutionEvidence::ExplicitReceiverType { receiver_type },
                     ResolutionEvidence::SamePackageDeclaration { declaration },
@@ -9110,6 +9878,15 @@ impl ExactEvidenceValidationIndex {
         components: &[NodeId],
         nodes: &HashMap<NodeId, &Node>,
     ) -> bool {
+        let java_kotlin_literal_import = matches!(language, "java" | "kotlin")
+            && nodes.get(&import).is_some_and(|import_node| {
+                import_node.file_node_id == Some(source_file)
+                    && matches!(import_node.kind, NodeKind::MODULE | NodeKind::UNKNOWN)
+                    && nodes.get(&owner).is_some_and(|owner_node| {
+                        owner_node.qualified_name.as_deref()
+                            == Some(import_node.serialized_name.as_str())
+                    })
+            });
         let python_path = language == "python"
             && components.len() >= 4
             && components[components.len() - 2] == owner
@@ -9133,7 +9910,9 @@ impl ExactEvidenceValidationIndex {
                     NodeKind::CLASS | NodeKind::STRUCT | NodeKind::ENUM
                 ) && owner_node.file_node_id == target_node.file_node_id
             })
-            && (python_path || self.has_import(source_file, import, owner))
+            && (python_path
+                || java_kotlin_literal_import
+                || self.has_import(source_file, import, owner))
             && self.has_member(owner, target)
     }
 }
@@ -9141,7 +9920,7 @@ impl ExactEvidenceValidationIndex {
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
         "go" | "rust" => kind == NodeKind::MODULE,
-        "javascript" | "typescript" | "tsx" | "python" => {
+        "java" | "kotlin" | "javascript" | "typescript" | "tsx" | "python" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
         _ => false,
@@ -10147,6 +10926,115 @@ struct GoProjectionIndex<'a> {
     domains: HashMap<GoPackageKey, GoPackageDomain<'a>>,
 }
 
+#[derive(Debug, Clone)]
+struct JavaKotlinImportCandidate {
+    owner: NodeId,
+    declaration: NodeId,
+    file_id: FileId,
+}
+
+#[derive(Default)]
+struct JavaKotlinImportDomain {
+    complete: bool,
+    dependencies: Vec<FileId>,
+    declarations: HashMap<(Option<String>, String), Vec<JavaKotlinImportCandidate>>,
+}
+
+struct JavaKotlinProjectionIndex {
+    domains: HashMap<(String, String), JavaKotlinImportDomain>,
+}
+
+enum JavaKotlinImportResolution {
+    Exact {
+        owner: NodeId,
+        declaration: NodeId,
+        file_id: FileId,
+        dependencies: Vec<FileId>,
+    },
+    Missing,
+    Ambiguous,
+    Incomplete,
+}
+
+impl JavaKotlinProjectionIndex {
+    fn prepare(records: &[ResolutionCacheRecord]) -> Self {
+        let mut domains = HashMap::<(String, String), JavaKotlinImportDomain>::new();
+        for record in records
+            .iter()
+            .filter(|record| is_java_kotlin_language(&record.file.language))
+        {
+            let Some(package_name) = &record.file.java_kotlin_package else {
+                continue;
+            };
+            let domain = domains
+                .entry((record.file.language.clone(), package_name.clone()))
+                .or_default();
+            let file_complete = record.file.complete && record.file.lookup_input_complete;
+            if domain.dependencies.is_empty() {
+                domain.complete = file_complete;
+            } else {
+                domain.complete &= file_complete;
+            }
+            domain.dependencies.push(FileId(record.file.file_id.0));
+            for class in &record.file.classes {
+                for method in &class.methods {
+                    domain
+                        .declarations
+                        .entry((Some(class.name.clone()), method.name.clone()))
+                        .or_default()
+                        .push(JavaKotlinImportCandidate {
+                            owner: class.declaration,
+                            declaration: method.declaration,
+                            file_id: FileId(record.file.file_id.0),
+                        });
+                }
+            }
+        }
+        for domain in domains.values_mut() {
+            domain.dependencies.sort();
+            domain.dependencies.dedup();
+            for candidates in domain.declarations.values_mut() {
+                candidates.sort_by(|left, right| left.declaration.cmp(&right.declaration));
+                candidates.dedup_by(|left, right| left.declaration == right.declaration);
+            }
+        }
+        Self { domains }
+    }
+
+    fn resolve(
+        &self,
+        language: &str,
+        package_name: &str,
+        owner_name: Option<&str>,
+        imported_name: &str,
+    ) -> JavaKotlinImportResolution {
+        let Some(domain) = self
+            .domains
+            .get(&(language.to_string(), package_name.to_string()))
+        else {
+            return JavaKotlinImportResolution::Missing;
+        };
+        if !domain.complete {
+            return JavaKotlinImportResolution::Incomplete;
+        }
+        let candidates = domain
+            .declarations
+            .get(&(owner_name.map(str::to_string), imported_name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match candidates {
+            [candidate] => JavaKotlinImportResolution::Exact {
+                owner: candidate.owner,
+                declaration: candidate.declaration,
+                file_id: candidate.file_id,
+                dependencies: domain.dependencies.clone(),
+            },
+            [] => JavaKotlinImportResolution::Missing,
+            _ => JavaKotlinImportResolution::Ambiguous,
+        }
+    }
+}
+
 enum GoFunctionResolution {
     Exact {
         declaration: NodeId,
@@ -10592,6 +11480,7 @@ fn resolve_syntax_claim(
     records: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
     rust_index: &RustProjectionIndex<'_>,
     go_index: &GoProjectionIndex<'_>,
+    java_kotlin_index: &JavaKotlinProjectionIndex,
     python_index: &PythonProjectionIndex,
     source_record: &ResolutionCacheRecord,
     input: CachedCallResolutionInput,
@@ -11234,6 +12123,59 @@ fn resolve_syntax_claim(
                 }
             }
         }
+        CachedResolutionBinding::JavaKotlinImportedReceiver {
+            package_name,
+            owner_name,
+            method_name,
+            import,
+            constructor,
+        } => match java_kotlin_index.resolve(
+            &input.language,
+            package_name,
+            Some(owner_name),
+            method_name,
+        ) {
+            JavaKotlinImportResolution::Exact {
+                owner,
+                declaration,
+                file_id,
+                dependencies,
+            } => {
+                status = ProofResolutionStatus::Exact;
+                reason = ProofResolutionReason::ExactResolution;
+                target = Some(declaration);
+                evidence_chain.push(ResolutionEvidence::StaticImportBinding {
+                    import: *import,
+                    declaration: owner,
+                });
+                if *constructor {
+                    evidence_chain
+                        .push(ResolutionEvidence::ConstructorBinding { constructor: owner });
+                }
+                evidence_chain.push(ResolutionEvidence::ExplicitReceiverType {
+                    receiver_type: owner,
+                });
+                evidence_chain.push(ResolutionEvidence::QualifiedPath {
+                    components: vec![owner, declaration],
+                });
+                exact_node_file_expectations.push((*import, input.callsite.file_id));
+                exact_node_file_expectations.push((owner, file_id));
+                exact_node_file_expectations.push((declaration, file_id));
+                exact_dependency_files = dependencies;
+            }
+            JavaKotlinImportResolution::Missing => {
+                status = ProofResolutionStatus::MissingBinding;
+                reason = ProofResolutionReason::MissingBinding;
+            }
+            JavaKotlinImportResolution::Ambiguous => {
+                status = ProofResolutionStatus::Ambiguous;
+                reason = ProofResolutionReason::MultipleBindings;
+            }
+            JavaKotlinImportResolution::Incomplete => {
+                status = ProofResolutionStatus::IncompleteDomain;
+                reason = ProofResolutionReason::LookupDomainIncomplete;
+            }
+        },
         CachedResolutionBinding::Ambiguous => {
             status = ProofResolutionStatus::Ambiguous;
             reason = ProofResolutionReason::MultipleBindings;
