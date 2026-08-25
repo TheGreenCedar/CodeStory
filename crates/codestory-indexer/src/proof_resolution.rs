@@ -89,9 +89,9 @@ fn python_resolution_work() -> usize {
 const ADAPTER_VERSION: &str = "reference-v15";
 const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
-const RUST_ADAPTER_VERSION: &str = "reference-v18";
+const RUST_ADAPTER_VERSION: &str = "reference-v19";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 15;
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 16;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
@@ -5001,6 +5001,7 @@ struct RustResolutionIndex<'tree> {
     callable_module_paths: HashMap<usize, Vec<String>>,
     callable_start_bytes: HashMap<usize, usize>,
     attributed_items: HashSet<usize>,
+    documented_free_function_targets: HashSet<usize>,
     bounded_outer_attribute_ids: HashSet<usize>,
     bounded_attributed_callers: HashSet<usize>,
     bounded_attributed_callsites: HashSet<usize>,
@@ -5011,6 +5012,7 @@ impl<'tree> RustResolutionIndex<'tree> {
         let graph_nodes = RustGraphNodeIndex::prepare(file_id, nodes);
         let (
             attributed_items,
+            documented_free_function_targets,
             bounded_outer_attribute_ids,
             bounded_attributed_callers,
             bounded_attributed_callsites,
@@ -5044,6 +5046,7 @@ impl<'tree> RustResolutionIndex<'tree> {
             callable_module_paths: HashMap::new(),
             callable_start_bytes: HashMap::new(),
             attributed_items,
+            documented_free_function_targets,
             bounded_outer_attribute_ids,
             bounded_attributed_callers,
             bounded_attributed_callsites,
@@ -5151,7 +5154,9 @@ impl<'tree> RustResolutionIndex<'tree> {
             match item.kind() {
                 "function_item" => {
                     let name = declaration_name(*item, source).map(str::to_string);
-                    if self.attributed_items.contains(&item.id()) {
+                    if self.attributed_items.contains(&item.id())
+                        && !self.documented_free_function_targets.contains(&item.id())
+                    {
                         if let Some(name) = name {
                             incomplete_value_names.insert(name);
                         } else {
@@ -5998,6 +6003,7 @@ fn rust_struct_constructor_capabilities(item: TsNode<'_>) -> (bool, bool) {
     (!record && !tuple, record)
 }
 
+#[allow(clippy::type_complexity)]
 fn rust_prepare_attribute_index(
     root: TsNode<'_>,
     source: &str,
@@ -6006,11 +6012,14 @@ fn rust_prepare_attribute_index(
     HashSet<usize>,
     HashSet<usize>,
     HashSet<usize>,
+    HashSet<usize>,
 ) {
+    #[allow(clippy::too_many_arguments)]
     fn collect(
         node: TsNode<'_>,
         source: &str,
         attributed_items: &mut HashSet<usize>,
+        documented_free_function_targets: &mut HashSet<usize>,
         bounded_outer_attribute_ids: &mut HashSet<usize>,
         bounded_attributed_callers: &mut HashSet<usize>,
         bounded_attributed_callsites: &mut HashSet<usize>,
@@ -6022,11 +6031,28 @@ fn rust_prepare_attribute_index(
         let direct_method_owner = node
             .parent()
             .filter(|parent| matches!(parent.kind(), "impl_item" | "trait_item"));
+        let free_function_container = node.kind() == "source_file"
+            || node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "mod_item");
         let mut attributes = Vec::new();
+        let mut attribute_group_tainted = false;
         for child in children {
             count_rust_resolution_work(1);
             if child.kind() == "attribute_item" || rust_is_outer_doc_comment(child, source) {
                 attributes.push(child);
+                continue;
+            }
+            if rust_is_ordinary_non_doc_comment(child, source) {
+                continue;
+            }
+            if !attributes.is_empty()
+                && (matches!(
+                    child.kind(),
+                    "line_comment" | "block_comment" | "inner_attribute_item"
+                ) || child.is_error())
+            {
+                attribute_group_tainted = true;
                 continue;
             }
             let direct_method = child.kind() == "function_item" && direct_method_owner.is_some();
@@ -6039,27 +6065,44 @@ fn rust_prepare_attribute_index(
             }
             if !attributes.is_empty() {
                 attributed_items.insert(child.id());
-                if rust_attribute_group_is_bounded(&attributes, child, source) {
+                if free_function_container
+                    && child.kind() == "function_item"
+                    && !attribute_group_tainted
+                    && !child.has_error()
+                    && attributes
+                        .iter()
+                        .all(|attribute| rust_is_outer_doc_comment(*attribute, source))
+                {
+                    count_rust_resolution_work(attributes.len());
+                    documented_free_function_targets.insert(child.id());
+                }
+                if !attribute_group_tainted
+                    && rust_attribute_group_is_bounded(&attributes, child, source)
+                {
                     bounded_outer_attribute_ids
                         .extend(attributes.iter().map(|attribute| attribute.id()));
                 }
-                if child.kind() == "function_item"
+                if !attribute_group_tainted
+                    && child.kind() == "function_item"
                     && !direct_method_ids.contains(&child.id())
                     && rust_attribute_group_preserves_caller(&attributes, source)
                 {
                     bounded_attributed_callers.insert(child.id());
                 }
-                if rust_bounded_callsite_category(child)
+                if !attribute_group_tainted
+                    && rust_bounded_callsite_category(child)
                     && rust_attribute_group_preserves_callsite(&attributes, source)
                 {
                     bounded_attributed_callsites.insert(child.id());
                 }
                 attributes.clear();
+                attribute_group_tainted = false;
             }
             collect(
                 child,
                 source,
                 attributed_items,
+                documented_free_function_targets,
                 bounded_outer_attribute_ids,
                 bounded_attributed_callers,
                 bounded_attributed_callsites,
@@ -6069,6 +6112,7 @@ fn rust_prepare_attribute_index(
     }
 
     let mut attributed_items = HashSet::new();
+    let mut documented_free_function_targets = HashSet::new();
     let mut bounded_outer_attribute_ids = HashSet::new();
     let mut bounded_attributed_callers = HashSet::new();
     let mut bounded_attributed_callsites = HashSet::new();
@@ -6077,6 +6121,7 @@ fn rust_prepare_attribute_index(
         root,
         source,
         &mut attributed_items,
+        &mut documented_free_function_targets,
         &mut bounded_outer_attribute_ids,
         &mut bounded_attributed_callers,
         &mut bounded_attributed_callsites,
@@ -6084,6 +6129,7 @@ fn rust_prepare_attribute_index(
     );
     (
         attributed_items,
+        documented_free_function_targets,
         bounded_outer_attribute_ids,
         bounded_attributed_callers,
         bounded_attributed_callsites,
@@ -6114,6 +6160,17 @@ fn rust_is_outer_doc_comment(node: TsNode<'_>, source: &str) -> bool {
     match node.kind() {
         "line_comment" => surface.starts_with("///") && !surface.starts_with("////"),
         "block_comment" => surface.starts_with("/**") && !surface.starts_with("/***"),
+        _ => false,
+    }
+}
+
+fn rust_is_ordinary_non_doc_comment(node: TsNode<'_>, source: &str) -> bool {
+    let Some(surface) = node_text(node, source).map(str::trim_start) else {
+        return false;
+    };
+    match node.kind() {
+        "line_comment" => !surface.starts_with("//!"),
+        "block_comment" => surface.ends_with("*/") && !surface.starts_with("/*!"),
         _ => false,
     }
 }
@@ -11932,6 +11989,26 @@ mod rust_complexity_tests {
         source
     }
 
+    fn documented_declaration_source(count: usize) -> String {
+        let mut source = String::new();
+        for index in 0..count {
+            source.push_str(&format!(
+                "/// documented target {index}\n/** bounded documentation {index} */\nfn target_{index}() {{}}\nfn caller_{index}() {{ target_{index}(); }}\n"
+            ));
+        }
+        source
+    }
+
+    fn interleaved_documented_group_source(count: usize) -> String {
+        let mut source = String::new();
+        for index in 0..count {
+            source.push_str(&format!(
+                "/// documented target {index}\n// ordinary {index}\n/** bounded documentation {index} */\n/* ordinary block {index} */\nfn target_{index}() {{}}\n#[cfg(any())]\n//// ordinary {index}\n/// documented but attributed {index}\nfn attributed_{index}() {{}}\nfn caller_{index}() {{ target_{index}(); attributed_{index}(); }}\n"
+            ));
+        }
+        source
+    }
+
     fn measured_projection_work(count: usize) -> usize {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("lib.rs");
@@ -12076,6 +12153,28 @@ mod rust_complexity_tests {
         assert!(
             large_modules <= small_modules * 2 + 128,
             "nested-module attribute preparation grew superlinearly: {small_modules} -> {large_modules}"
+        );
+
+        let small_documented = measured_source_work(&documented_declaration_source(64));
+        let large_documented = measured_source_work(&documented_declaration_source(128));
+        assert!(
+            small_documented >= 64 * 8,
+            "documented-declaration preparation and lookup work was not fully counted: {small_documented}"
+        );
+        assert!(
+            large_documented <= small_documented * 2 + 128,
+            "documented-declaration preparation and lookup work grew superlinearly: {small_documented} -> {large_documented}"
+        );
+
+        let small_interleaved = measured_source_work(&interleaved_documented_group_source(64));
+        let large_interleaved = measured_source_work(&interleaved_documented_group_source(128));
+        assert!(
+            small_interleaved >= 64 * 12,
+            "interleaved documented-group work was not fully counted: {small_interleaved}"
+        );
+        assert!(
+            large_interleaved <= small_interleaved * 2 + 128,
+            "interleaved documented-group work grew superlinearly: {small_interleaved} -> {large_interleaved}"
         );
     }
 

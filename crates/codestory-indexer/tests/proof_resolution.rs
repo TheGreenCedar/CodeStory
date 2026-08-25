@@ -7368,7 +7368,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v15", "adapter", "language"]
+            ["stale", "schema-v16", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -7696,7 +7696,7 @@ fn rust_glob_local_calls_preserve_repeated_source_coordinates_and_provenance() -
     );
     assert!(facts.iter().all(|fact| {
         fact.provenance.language_adapter == "rust"
-            && fact.provenance.language_adapter_version == "reference-v18"
+            && fact.provenance.language_adapter_version == "reference-v19"
             && fact.provenance.dependency_file_hashes.len() == 1
             && matches!(
                 fact.evidence_chain.as_slice(),
@@ -7728,12 +7728,12 @@ fn stale_rust_glob_local_adapter_inputs_reject_rematerialization() -> anyhow::Re
         |row| row.get::<_, Vec<u8>>(0),
     )?;
     let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
-    artifact["resolution_file"]["adapter_version"] = "reference-v17".into();
+    artifact["resolution_file"]["adapter_version"] = "reference-v18".into();
     for call in artifact["call_resolution_inputs"]
         .as_array_mut()
         .expect("call inputs")
     {
-        call["adapter_version"] = "reference-v17".into();
+        call["adapter_version"] = "reference-v18".into();
     }
     store.get_connection().execute(
         "UPDATE index_artifact_cache SET artifact_blob = ?1",
@@ -7770,7 +7770,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "rust")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v18")
+        Some("reference-v19")
     );
     assert_eq!(
         receipt
@@ -7866,7 +7866,7 @@ fn rust_bounded_callsite_regions_preserve_coordinates_order_and_provenance() -> 
             (start as usize - line_start + 1) as u32
         );
         assert_eq!(fact.provenance.language_adapter, "rust");
-        assert_eq!(fact.provenance.language_adapter_version, "reference-v18");
+        assert_eq!(fact.provenance.language_adapter_version, "reference-v19");
         assert_eq!(fact.provenance.dependency_file_hashes.len(), 1);
         assert!(matches!(
             fact.evidence_chain.as_slice(),
@@ -7920,8 +7920,6 @@ fn rust_bounded_attributes_do_not_authorize_attributed_targets_or_competing_bind
         "#[allow(dead_code)]",
         "#[doc = \"attributed target\"]",
         "#[inline]",
-        "/// attributed target",
-        "/** attributed target */",
     ] {
         let source = format!(
             "{target_attributes}\nfn target() {{}}\n#[allow(dead_code)]\nfn caller() {{ target(); }}\n"
@@ -8086,6 +8084,231 @@ fn rust_prepared_incompleteness_propagates_through_traits_and_nested_callables()
     assert_ne!(poisoned[0].status, ProofResolutionStatus::Exact);
     assert_eq!(safe.len(), 1, "{safe:#?}");
     assert_eq!(safe[0].status, ProofResolutionStatus::Exact, "{safe:#?}");
+    Ok(())
+}
+
+#[test]
+fn rust_documented_free_function_target_matrix_is_exact() -> anyhow::Result<()> {
+    for documentation in [
+        "/// one line",
+        "/// first line\n/// second line",
+        "/** one block */",
+        "/**\n * multiple block lines\n */",
+        "/// line\n/** block */\n/// line again",
+    ] {
+        let source = format!("{documentation}\nfn target() {{}}\nfn caller() {{ target(); }}\n");
+        assert_only_call_is_exact(&[("src/lib.rs", source.as_str())])?;
+    }
+
+    for ordinary_prefix in [
+        "//// ordinary line comment",
+        "/*** ordinary block comment */",
+        "// ordinary line comment",
+        "/* ordinary block comment */",
+        "// unrelated comment\n\n/* separated ordinary comment */",
+    ] {
+        let source = format!("{ordinary_prefix}\nfn target() {{}}\nfn caller() {{ target(); }}\n");
+        assert_only_call_is_exact(&[("src/lib.rs", source.as_str())])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_documented_targets_with_any_real_attribute_remain_incomplete() -> anyhow::Result<()> {
+    for actual_attribute in [
+        "#[doc = \"semantic doc attribute\"]",
+        "#[doc = include_str!(\"missing.md\")]",
+        "#[doc]",
+        "#[cfg(any())]",
+        "#[cfg_attr(any(), allow(dead_code))]",
+        "#[allow(dead_code)]",
+        "#[inline]",
+        "#[test]",
+        "#[tokio::test]",
+        "#[tool::instrument]",
+        "#[unresolved_attribute_macro]",
+    ] {
+        let source = format!(
+            "/// inert documentation\n{actual_attribute}\nfn target() {{}}\nfn caller() {{ target(); }}\n"
+        );
+        let facts = rust_call_facts(&source, "target")?;
+        assert_eq!(facts.len(), 1, "{actual_attribute}: {facts:#?}");
+        assert_eq!(
+            facts[0].status,
+            ProofResolutionStatus::IncompleteDomain,
+            "an actual Rust attribute must keep the documented target non-exact: {actual_attribute}: {facts:#?}"
+        );
+        assert!(facts[0].target.is_none(), "{actual_attribute}: {facts:#?}");
+        assert!(facts[0].edge_id.is_none(), "{actual_attribute}: {facts:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_documented_target_groups_survive_interposed_ordinary_comments() -> anyhow::Result<()> {
+    for ordinary_comment in [
+        "// ordinary line comment",
+        "/* ordinary block comment */",
+        "//// non-doc line comment",
+        "/*** non-doc block comment */",
+    ] {
+        for prefix in [
+            format!("#[cfg(any())]\n{ordinary_comment}\n/// docs"),
+            format!("/// docs\n#[cfg(any())]\n{ordinary_comment}"),
+            format!("#[cfg(any())]\n{ordinary_comment}"),
+        ] {
+            let source = format!("{prefix}\nfn target() {{}}\nfn caller() {{ target(); }}\n");
+            let facts = rust_call_facts(&source, "target")?;
+            assert_eq!(facts.len(), 1, "{prefix}: {facts:#?}");
+            assert_eq!(
+                facts[0].status,
+                ProofResolutionStatus::IncompleteDomain,
+                "ordinary comments must not discard a pending actual attribute: {prefix}: {facts:#?}"
+            );
+            assert!(facts[0].target.is_none(), "{prefix}: {facts:#?}");
+            assert!(facts[0].edge_id.is_none(), "{prefix}: {facts:#?}");
+        }
+
+        let docs_only = format!(
+            "/// first docs\n{ordinary_comment}\n/** second docs */\nfn target() {{}}\nfn caller() {{ target(); }}\n"
+        );
+        assert_only_call_is_exact(&[("src/lib.rs", docs_only.as_str())])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_documented_target_inner_dangling_and_recovery_barriers_stay_non_authoritative()
+-> anyhow::Result<()> {
+    for source in [
+        "#[cfg(any())]\n//! inner docs\n/// outer docs\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg(any())]\n/*! inner docs */\n/** outer docs */\nfn target() {}\nfn caller() { target(); }\n",
+        "/// dangling docs\nstruct Marker;\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "/// docs\n<\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg(any())]\n// ordinary\n<\n/// docs\nfn target() {}\nfn caller() { target(); }\n",
+        "/// docs\n/* unterminated\nfn target() {}\nfn caller() { target(); }\n",
+    ] {
+        assert_no_exact_target_calls(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_tainted_attribute_groups_never_reach_bounded_caller_or_callsite_classification()
+-> anyhow::Result<()> {
+    let caller_source = "#[cfg(any())]\n//! inner docs\n/// outer docs\nfn caller() { target(); }\nfn target() {}\n";
+    let caller_facts = rust_call_facts(caller_source, "target")?;
+    assert_eq!(caller_facts.len(), 1, "{caller_facts:#?}");
+    assert_ne!(
+        caller_facts[0].status,
+        ProofResolutionStatus::Exact,
+        "an inner-doc barrier must prevent bounded-caller classification: {caller_facts:#?}"
+    );
+
+    for callsite_source in [
+        "fn target() {}\nfn caller() {\n#[cfg(any())]\n//! inner docs\n/// outer docs\n{ target(); }\n}\n",
+        "fn target() {}\nfn caller() {\n#[cfg(any())]\n<\n/// outer docs\n{ target(); }\n}\n",
+    ] {
+        let callsite_facts = rust_call_facts(callsite_source, "target")?;
+        assert_eq!(
+            callsite_facts.len(),
+            1,
+            "{callsite_source}: {callsite_facts:#?}"
+        );
+        assert_ne!(
+            callsite_facts[0].status,
+            ProofResolutionStatus::Exact,
+            "an inner or recovery barrier must prevent bounded-callsite classification: {callsite_source}: {callsite_facts:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_documented_target_rule_stays_free_function_and_domain_specific() -> anyhow::Result<()> {
+    for source in [
+        "struct Worker;\nimpl Worker { /// docs\nfn target(&self) {} fn caller(&self) { self.target(); } }\n",
+        "struct Worker;\nimpl Worker { /// docs\nfn target() {} }\nfn caller() { Worker::target(); }\n",
+        "fn outer() { /// docs\nfn target() {} target(); }\n",
+        "trait Worker { /// docs\nfn target(&self); fn caller(&self) { self.target(); } }\n",
+        "/// docs\nstruct target;\nfn caller() { target(); }\n",
+        "/// docs\nmod target {}\nfn caller() { target(); }\n",
+        "/// docs for a different item\nstruct Marker;\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "//! inner module documentation\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "/*! inner module documentation */\n#[cfg(any())]\nfn target() {}\nfn caller() { target(); }\n",
+        "/// docs\nfn target() {}\nmacro_rules! tokens { ($value:expr) => {}; }\nfn caller() { tokens!(target()); }\n",
+    ] {
+        assert_no_exact_target_calls(&[("src/lib.rs", source)])?;
+    }
+
+    for source in [
+        "/// docs\nfn target() {}\nfn target() {}\nfn caller() { target(); }\n",
+        "mod other { pub fn target() {} }\nuse crate::other::target;\n/// docs\nfn target() {}\nfn caller() { target(); }\n",
+        "#[cfg(any())]\nfn target() {}\n/// docs\nfn target() {}\nfn caller() { target(); }\n",
+        "const target: fn() = || {};\n/// docs\nfn target() {}\nfn caller() { target(); }\n",
+        "/// docs\nfn target() {}\nfn caller(target: fn()) { target(); }\n",
+        "/// docs\nfn target() {}\nfn caller() { let target: fn() = || {}; target(); }\n",
+        "macro_rules! duplicate { () => { fn target() {} }; }\nduplicate!();\n/// docs\nfn target() {}\nfn caller() { target(); }\n",
+        "include!(\"generated.rs\");\n/// docs\nfn target() {}\nfn caller() { target(); }\n",
+        "/// docs\nfn target() {}\nfn caller() { target(); }\n<",
+    ] {
+        assert_only_call_is_not_exact(&[("src/lib.rs", source)])?;
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_documented_targets_preserve_order_repetition_and_native_coordinates() -> anyhow::Result<()>
+{
+    let source = "fn before() { target(); }\r\n// é\r\n/// documented target é\r\n/** second document */\r\nfn target() {}\r\nfn after() { target(); target(); }";
+    let facts = rust_call_facts(source, "target")?;
+    let starts = source
+        .match_indices("target();")
+        .map(|(start, _)| start as u64)
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 3, "{facts:#?}");
+    assert_eq!(
+        facts
+            .iter()
+            .map(|fact| fact.callsite.start_byte)
+            .collect::<Vec<_>>(),
+        starts
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter_map(|fact| fact.edge_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        facts.len(),
+        "repeated documented-target calls require edge-distinct receipts"
+    );
+    for (fact, start) in facts.iter().zip(starts) {
+        let start = start as usize;
+        let line_start = source[..start].rfind('\n').map_or(0, |line| line + 1);
+        let line = source[..start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count() as u32
+            + 1;
+        assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+        assert_eq!(fact.callsite.line, line, "{fact:#?}");
+        assert_eq!(
+            fact.callsite.column,
+            (start - line_start + 1) as u32,
+            "{fact:#?}"
+        );
+        assert_eq!(
+            fact.callsite.end_byte_exclusive,
+            fact.callsite.start_byte + "target".len() as u64,
+            "{fact:#?}"
+        );
+        assert!(matches!(
+            fact.evidence_chain.as_slice(),
+            [ResolutionEvidence::SameFileDeclaration { declaration }]
+                if Some(*declaration) == fact.target
+        ));
+    }
     Ok(())
 }
 
