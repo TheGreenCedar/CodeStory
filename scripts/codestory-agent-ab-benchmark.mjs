@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { createReadStream, existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -659,7 +659,48 @@ function exactCandidateArmEnv(opts, arm) {
   };
 }
 
+const EXACT_BASELINE_ENV_ALLOWLIST = Object.freeze([
+  "ALL_PROXY", "COMSPEC", "HTTPS_PROXY", "HTTP_PROXY", "LANG", "LC_ALL", "LC_CTYPE",
+  "LOGNAME", "NODE_EXTRA_CA_CERTS", "NO_PROXY", "PATH", "PATHEXT", "SHELL",
+  "SSL_CERT_DIR", "SSL_CERT_FILE", "SYSTEMROOT", "TERM", "TZ", "USER", "WINDIR",
+]);
+
+function pathEntryExposesCodeStory(entry) {
+  const normalized = normalizePathLike(entry).toLowerCase();
+  if (normalized.includes("codestory")) return true;
+  return ["codestory", "codestory-cli", "codestory.exe", "codestory-cli.exe", "codestory.cmd"]
+    .some((name) => existsSync(path.join(entry, name)));
+}
+
+function exactCandidateBaselineEnv(opts, baseEnv = process.env) {
+  const root = opts.exactCandidateBaselineStateRoot;
+  if (!opts.exactCandidate || !root) throw new Error("exact baseline environment requires its disjoint private state root");
+  const env = {};
+  for (const key of EXACT_BASELINE_ENV_ALLOWLIST) {
+    if (baseEnv[key] != null) env[key] = baseEnv[key];
+  }
+  env.PATH = String(env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .filter((entry) => !pathEntryExposesCodeStory(entry))
+    .join(path.delimiter);
+  const home = path.join(root, "home");
+  const temporary = path.join(root, "tmp");
+  env.HOME = home;
+  env.USERPROFILE = home;
+  env.XDG_CACHE_HOME = path.join(root, "xdg-cache");
+  env.XDG_CONFIG_HOME = path.join(root, "xdg-config");
+  env.XDG_DATA_HOME = path.join(root, "xdg-data");
+  env.TMPDIR = temporary;
+  env.TMP = temporary;
+  env.TEMP = temporary;
+  return env;
+}
+
 function selectedBenchmarkChildEnv(opts = {}, arm = null) {
+  if (opts.exactCandidate && arm === "without_codestory") {
+    return exactCandidateBaselineEnv(opts);
+  }
   return {
     ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)),
     ...exactCandidateArmEnv(opts, arm),
@@ -717,9 +758,15 @@ function runnerCommand(opts, repoPath, prompt, arm = null) {
   return { command, args, stdin: prompt, killProcessTree: process.platform === "win32" };
 }
 
-function agentRunnerEnv(baseEnv = process.env, codexHome = null) {
-  const env = benchmarkChildEnv(baseEnv);
-  delete env.CODESTORY_CLI;
+function agentRunnerEnv(baseEnv = process.env, codexHome = null, allowCodeStory = true) {
+  const env = allowCodeStory ? benchmarkChildEnv(baseEnv) : { ...baseEnv };
+  if (allowCodeStory) {
+    delete env.CODESTORY_CLI;
+  } else {
+    for (const key of Object.keys(env)) {
+      if (key.startsWith("CODESTORY_")) delete env[key];
+    }
+  }
   if (codexHome) {
     env.CODEX_HOME = codexHome;
   }
@@ -749,9 +796,18 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
   if (opts.exactCandidate) {
     homes = {};
     for (const arm of EXACT_CANDIDATE_ARMS) {
-      const armRoot = path.join(opts.exactCandidateStateRoot, arm);
+      const armRoot = arm === "without_codestory"
+        ? opts.exactCandidateBaselineStateRoot
+        : path.join(opts.exactCandidateStateRoot, arm);
       const codexHome = path.join(armRoot, "host");
       await mkdir(codexHome, { recursive: true });
+      if (arm === "without_codestory") {
+        for (const directory of [
+          "home", "tmp", "xdg-cache", "xdg-config", "xdg-data",
+        ]) {
+          await mkdir(path.join(armRoot, directory), { recursive: true });
+        }
+      }
       await copyFile(authPath, path.join(codexHome, "auth.json"));
       homes[arm] = codexHome;
       for (const value of Object.values(exactCandidateArmEnv(opts, arm))) {
@@ -875,28 +931,95 @@ function normalizeExternalSha256(value, label) {
 }
 
 async function sha256FileBounded(filePath, maxBytes, label) {
-  const size = statSync(filePath).size;
-  if (!Number.isSafeInteger(size) || size < 0 || size > maxBytes) {
-    throw new Error(`${label} exceeds the ${maxBytes}-byte bound`);
+  const handle = await open(filePath, "r");
+  try {
+    return await streamOpenedFileBounded(handle, maxBytes, label);
+  } finally {
+    await handle.close();
   }
-  const hash = createHash("sha256");
-  let observed = 0;
-  for await (const chunk of createReadStream(filePath)) {
-    observed += chunk.length;
-    if (observed > maxBytes) throw new Error(`${label} exceeded its bound while hashing`);
-    hash.update(chunk);
-  }
-  if (observed !== size) throw new Error(`${label} changed while hashing`);
-  return { sha256: hash.digest("hex"), byte_length: observed };
 }
 
 async function readBoundedFile(filePath, maxBytes, label) {
-  const identity = await sha256FileBounded(filePath, maxBytes, label);
-  const bytes = await readFile(filePath);
-  if (bytes.length !== identity.byte_length || sha256Bytes(bytes) !== identity.sha256) {
-    throw new Error(`${label} changed between authentication and read`);
+  const handle = await open(filePath, "r");
+  try {
+    return await streamOpenedFileBounded(handle, maxBytes, label, { capture: true });
+  } finally {
+    await handle.close();
   }
-  return { bytes, ...identity };
+}
+
+async function writeAll(handle, bytes) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset);
+    if (bytesWritten <= 0) throw new Error("immutable input staging stopped before all bytes were written");
+    offset += bytesWritten;
+  }
+}
+
+async function streamOpenedFileBounded(handle, maxBytes, label, options = {}) {
+  const before = await handle.stat();
+  if (!before.isFile() || !Number.isSafeInteger(before.size) || before.size < 0 || before.size > maxBytes) {
+    throw new Error(`${label} exceeds the ${maxBytes}-byte bound or is not a regular file`);
+  }
+  const hash = createHash("sha256");
+  const chunks = options.capture ? [] : null;
+  const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1));
+  let observed = 0;
+  while (true) {
+    const remaining = maxBytes + 1 - observed;
+    const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, remaining), null);
+    if (bytesRead === 0) break;
+    observed += bytesRead;
+    if (observed > maxBytes) throw new Error(`${label} exceeds the ${maxBytes}-byte bound`);
+    const chunk = buffer.subarray(0, bytesRead);
+    hash.update(chunk);
+    if (options.destination) await writeAll(options.destination, chunk);
+    if (chunks) chunks.push(Buffer.from(chunk));
+  }
+  const after = await handle.stat();
+  if (after.size !== observed) throw new Error(`${label} changed while it was being ingested`);
+  return {
+    sha256: hash.digest("hex"),
+    byte_length: observed,
+    ...(chunks ? { bytes: Buffer.concat(chunks, observed) } : {}),
+  };
+}
+
+async function ingestExactInput(opts, kind, sourcePath, maxBytes) {
+  const source = path.resolve(sourcePath);
+  const stagingRoot = path.join(opts.exactCandidateStateRoot, "authenticated-inputs");
+  await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+  const stagedPath = path.join(stagingRoot, `${kind}.bin`);
+  const sourceHandle = await open(source, "r");
+  let destinationHandle = null;
+  try {
+    destinationHandle = await open(stagedPath, "wx", 0o600);
+    const identity = await streamOpenedFileBounded(
+      sourceHandle,
+      maxBytes,
+      kind.replaceAll("_", " "),
+      { destination: destinationHandle },
+    );
+    await destinationHandle.sync();
+    await destinationHandle.chmod(0o400);
+    await destinationHandle.close();
+    destinationHandle = null;
+    await sourceHandle.close();
+    await opts.exactCandidateAfterInputIngest?.({
+      kind,
+      source_path: source,
+      staged_path: stagedPath,
+      sha256: identity.sha256,
+      byte_length: identity.byte_length,
+    });
+    return { ...identity, source_path: source, staged_path: stagedPath };
+  } catch (error) {
+    await destinationHandle?.close().catch(() => {});
+    await sourceHandle.close().catch(() => {});
+    await rm(stagedPath, { force: true });
+    throw error;
+  }
 }
 
 function exactArchiveEntryIsSafe(entry) {
@@ -974,12 +1097,7 @@ async function probeExactPackageRuntime(cliPath, expected, env) {
   }
 }
 
-async function authenticateExactArchive({ arm, archivePath, archiveSha256, expected, trustRoot }, root, env) {
-  const archiveIdentity = await sha256FileBounded(
-    archivePath,
-    MAX_EXACT_ARCHIVE_BYTES,
-    `${arm} archive`,
-  );
+async function authenticateExactArchive({ arm, archivePath, archiveSha256, archiveIdentity, expected, trustRoot }, root, env) {
   if (archiveIdentity.sha256 !== archiveSha256) throw new Error(`${arm} archive checksum mismatch`);
   const unpackRoot = path.join(root, "packages", arm);
   await mkdir(unpackRoot, { recursive: true });
@@ -1039,11 +1157,16 @@ async function authenticateExactArchive({ arm, archivePath, archiveSha256, expec
 
 async function authenticateExactCandidatePackages(opts) {
   const started = performance.now();
-  const publishedManifestPath = path.resolve(opts.publishedChecksumManifest);
-  const publishedManifest = await readBoundedFile(
-    publishedManifestPath,
+  const publishedManifestInput = await ingestExactInput(
+    opts,
+    "published_checksum_manifest",
+    opts.publishedChecksumManifest,
     MAX_EXACT_CHECKSUM_MANIFEST_BYTES,
-    "published checksum manifest",
+  );
+  const publishedManifest = await readBoundedFile(
+    publishedManifestInput.staged_path,
+    MAX_EXACT_CHECKSUM_MANIFEST_BYTES,
+    "staged published checksum manifest",
   );
   if (
     publishedManifest.sha256 !== normalizeExternalSha256(
@@ -1062,10 +1185,16 @@ async function authenticateExactCandidatePackages(opts) {
   if (publishedMatches.length !== 1) throw new Error("official checksum data must name the published archive exactly once");
 
   const candidateReceiptPath = path.resolve(opts.candidatePackageReceipt);
-  const candidateReceiptRead = await readBoundedFile(
+  const candidateReceiptInput = await ingestExactInput(
+    opts,
+    "candidate_receipt",
     candidateReceiptPath,
     MAX_EXACT_RECEIPT_BYTES,
-    "candidate receipt",
+  );
+  const candidateReceiptRead = await readBoundedFile(
+    candidateReceiptInput.staged_path,
+    MAX_EXACT_RECEIPT_BYTES,
+    "staged candidate receipt",
   );
   if (
     candidateReceiptRead.sha256 !== normalizeExternalSha256(
@@ -1112,14 +1241,14 @@ async function authenticateExactCandidatePackages(opts) {
   const definitions = {
     published_0_17_4: {
       arm: "published_0_17_4",
-      archivePath: publishedArchive,
+      sourceArchivePath: publishedArchive,
       archiveSha256: normalizeExternalSha256(publishedMatches[0], "official published archive sha256"),
       expected: { package_version: "0.17.4", schema_version: 2, protocol_revision: "2025-11-25" },
       trustRoot: { kind: "official_published_checksum", sha256: publishedManifest.sha256 },
     },
     candidate_0_18: {
       arm: "candidate_0_18",
-      archivePath: path.resolve(path.dirname(candidateReceiptPath), candidate.archive_path),
+      sourceArchivePath: path.resolve(path.dirname(candidateReceiptPath), candidate.archive_path),
       archiveSha256: normalizeExternalSha256(candidate.archive_sha256, "candidate archive sha256"),
       expected: candidateExpected,
       trustRoot: { kind: "immutable_candidate_receipt", sha256: candidateReceiptRead.sha256 },
@@ -1130,8 +1259,18 @@ async function authenticateExactCandidatePackages(opts) {
   for (const arm of order) {
     if (!definitions[arm] || packages.has(arm)) throw new Error("package authentication order must contain each exact CodeStory arm once");
     const armStarted = performance.now();
+    const archiveInput = await ingestExactInput(
+      opts,
+      `${arm}_archive`,
+      definitions[arm].sourceArchivePath,
+      MAX_EXACT_ARCHIVE_BYTES,
+    );
     packages.set(arm, await authenticateExactArchive(
-      definitions[arm],
+      {
+        ...definitions[arm],
+        archivePath: archiveInput.staged_path,
+        archiveIdentity: archiveInput,
+      },
       packageRoot,
       selectedBenchmarkChildEnv(opts, arm),
     ));
@@ -4007,7 +4146,9 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
   ];
   const command = displayCommand("rg", args);
   const started = performance.now();
-  const env = { ...process.env };
+  const env = opts.exactCandidate
+    ? selectedBenchmarkChildEnv(opts, "without_codestory")
+    : { ...process.env };
   delete env.CODESTORY_CLI;
   const result = await runProcess("rg", args, {
     cwd: repoConfig.path,
@@ -4609,6 +4750,7 @@ async function runOne(opts, run, outDir) {
   const env = agentRunnerEnv(
     selectedBenchmarkChildEnv(opts, run.arm),
     opts.agentCodexHomes?.[run.arm] ?? null,
+    !opts.exactCandidate || isCodeStoryArm(run.arm),
   );
   const baselinePrelude =
     run.arm === "without_codestory"
@@ -9834,6 +9976,38 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     ) {
       reasons.push(`CodeStory visibility accounting is incomplete for ${row.task_id}/${row.arm}/${row.repeat}`);
     }
+    const eventTypeValues = Object.values(row.event_types ?? {});
+    if (
+      row.malformed_stdout_lines !== 0 ||
+      !finiteNonnegativeInteger(row.json_events) ||
+      !finiteNonnegativeInteger(row.analysis_events) ||
+      row.analysis_events < row.json_events ||
+      eventTypeValues.some((value) => !finiteNonnegativeInteger(value)) ||
+      eventTypeValues.reduce((total, value) => total + value, 0) !== row.analysis_events
+    ) {
+      reasons.push(`malformed or unreconciled JSONL parser telemetry for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    const provenanceReasons = repoProvenanceBlockers(row);
+    const repoMetadata = row.task_manifest_snapshot?.repo_metadata;
+    if (
+      row.task_manifest_snapshot?.repo !== row.repo ||
+      repoMetadata?.name !== row.repo ||
+      repoMetadata?.url !== row.repo_provenance?.configured?.url ||
+      repoMetadata?.url !== row.repo_provenance?.manifest?.url ||
+      repoMetadata?.ref !== row.repo_provenance?.configured?.ref ||
+      repoMetadata?.ref !== row.repo_provenance?.manifest?.ref
+    ) {
+      provenanceReasons.push("task manifest repository identity does not match the observed checkout");
+    }
+    if (provenanceReasons.length) {
+      reasons.push(`owning repo provenance is invalid for ${row.task_id}/${row.arm}/${row.repeat}: ${provenanceReasons.join("; ")}`);
+    }
+    if (
+      !finiteNonnegativeInteger(row.transcript_analysis?.external_context_tool_calls) ||
+      row.transcript_analysis.external_context_tool_calls !== 0
+    ) {
+      reasons.push(`external web/search context is forbidden for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
     if (row.arm === "without_codestory") {
       if (
         row.package_identity != null ||
@@ -9850,8 +10024,17 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       ) {
         reasons.push(`baseline has CodeStory visibility or use in ${row.task_id}/${row.repeat}`);
       }
+      if (
+        row.packet_first_required !== false || row.packet_first_pass !== true ||
+        row.transcript_analysis.command_count <= 0
+      ) {
+        reasons.push(`baseline local inspection telemetry is incomplete for ${row.task_id}/${row.repeat}`);
+      }
     }
     if (isCodeStoryArm(row.arm)) {
+      if (row.packet_first_required !== true || row.packet_first_pass !== true) {
+        reasons.push(`packet-first contract failed for ${row.task_id}/${row.arm}/${row.repeat}`);
+      }
       if (
         row.codestory_prelude_cli_sha256 !== row.package_identity?.cli_sha256 ||
         row.codestory_binary_identity?.prelude_cli_sha256 !== row.package_identity?.cli_sha256 ||
@@ -11436,12 +11619,21 @@ async function main() {
     opts.exactCandidateStateRoot = await mkdtemp(
       path.join(os.tmpdir(), "codestory-agent-exact-candidate-"),
     );
+    opts.exactCandidateBaselineContainerRoot = await mkdtemp(
+      path.join(os.tmpdir(), "agent-exact-baseline-"),
+    );
+    opts.exactCandidateBaselineStateRoot = path.join(
+      opts.exactCandidateBaselineContainerRoot,
+      "private-state",
+    );
+    await mkdir(opts.exactCandidateBaselineStateRoot, { recursive: true, mode: 0o700 });
     try {
       const authenticated = await authenticateExactCandidatePackages(opts);
       opts.exactCandidatePackageByArm = authenticated.packages;
       opts.exactCandidateLifecycle = authenticated.lifecycle;
     } catch (error) {
       await rm(opts.exactCandidateStateRoot, { recursive: true, force: true });
+      await rm(opts.exactCandidateBaselineContainerRoot, { recursive: true, force: true });
       throw error;
     }
   }
@@ -11506,9 +11698,11 @@ async function main() {
   } finally {
     await ledger.close();
     await preparationLedger.close();
-    const isolationRoot = agentCodexIsolation?.root ?? opts.exactCandidateStateRoot;
-    if (isolationRoot) {
-      await rm(isolationRoot, { recursive: true, force: true });
+    if (opts.exactCandidateStateRoot) {
+      await rm(opts.exactCandidateStateRoot, { recursive: true, force: true });
+    }
+    if (opts.exactCandidateBaselineContainerRoot) {
+      await rm(opts.exactCandidateBaselineContainerRoot, { recursive: true, force: true });
     }
   }
 
@@ -11715,6 +11909,7 @@ export {
   planAgentRuns,
   exactCandidateAcceptance,
   authenticateExactCandidatePackages,
+  exactCandidateBaselineEnv,
   exactCandidatePreparationArmOrder,
   withExactSourceMutation,
   validateExactCandidateShape,

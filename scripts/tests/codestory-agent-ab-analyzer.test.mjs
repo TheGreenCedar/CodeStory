@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -242,6 +242,7 @@ function exactCandidateRows() {
             codestory_mcp_tool_calls_observed: 0,
             codestory_mcp_completed_calls_observed: 0,
             codestory_mcp_runtime_identities: [],
+            external_context_tool_calls: 0,
             direct_source_reads: codestory
               ? [{ path: "src/named.rs", authorization: { status: "authorized", reason: "user_named_file" } }]
               : [{ path: "src/read.rs", authorization: { status: "baseline_local_exploration", reason: "without_codestory" } }],
@@ -256,6 +257,21 @@ function exactCandidateRows() {
               }
             : { cold_ms: 0, warm_ms: 100, incremental_ms: 0, all_in_ms: 100 },
           wall_ms: codestory ? 50 : 100,
+          malformed_stdout_lines: 0,
+          json_events: 1,
+          analysis_events: 1,
+          event_types: { fixture: 1 },
+          packet_first_required: codestory,
+          packet_first_pass: true,
+          repo_provenance: pinnedRepoProvenance(),
+          task_manifest_snapshot: {
+            repo,
+            repo_metadata: {
+              name: repo,
+              url: "https://github.com/example/fixture.git",
+              ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+            },
+          },
           package_identity: codestory
             ? {
                 contract: "codestory.agent-benchmark-package/v2",
@@ -447,7 +463,7 @@ test("exact-candidate planning balances deterministic arm position across 162 fr
   }
 });
 
-async function makeExactArchive(root, name, { version, schema, source, tree, discovery }) {
+async function makeExactArchive(root, name, { version, schema, source, tree, discovery, executionMarker = null }) {
   const packageRoot = path.join(root, `${name}-root`);
   await mkdir(packageRoot, { recursive: true });
   const cliPath = path.join(packageRoot, "codestory-cli");
@@ -455,10 +471,12 @@ async function makeExactArchive(root, name, { version, schema, source, tree, dis
     cliPath,
     `#!/usr/bin/env node
 const readline = require("node:readline");
+const fs = require("node:fs");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.method !== "initialize") return;
+  ${executionMarker ? `fs.writeFileSync(${JSON.stringify(executionMarker)}, "executed");` : ""}
   const response = {
     jsonrpc: "2.0",
     id: request.id,
@@ -552,9 +570,8 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
     for (const [label, receipt, overrides, expected] of hostile) {
       await assert.rejects(run(receipt, overrides), expected, label);
     }
-    const oversized = Buffer.alloc(65 * 1024, 0x20);
-    await writeFile(receiptPath, oversized);
-    const oversizedSha = createHash("sha256").update(oversized).digest("hex");
+    await writeFile(receiptPath, "");
+    await truncate(receiptPath, 64 * 1024 + 1);
     await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
       exactCandidate: true,
       exactCandidateStateRoot: await mkdtemp(path.join(root, "state-")),
@@ -562,18 +579,18 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
       publishedChecksumManifest: checksumPath,
       publishedChecksumSha256: checksumSha,
       candidatePackageReceipt: receiptPath,
-      candidateReceiptSha256: oversizedSha,
+      candidateReceiptSha256: "7".repeat(64),
     }), /bound/i);
 
-    const oversizedManifest = Buffer.alloc(1024 * 1024 + 1, 0x20);
-    await writeFile(checksumPath, oversizedManifest);
+    await writeFile(checksumPath, "");
+    await truncate(checksumPath, 1024 * 1024 + 1);
     await writeFile(receiptPath, JSON.stringify(baseReceipt));
     await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
       exactCandidate: true,
       exactCandidateStateRoot: await mkdtemp(path.join(root, "state-")),
       publishedArchive: published.archivePath,
       publishedChecksumManifest: checksumPath,
-      publishedChecksumSha256: createHash("sha256").update(oversizedManifest).digest("hex"),
+      publishedChecksumSha256: "8".repeat(64),
       candidatePackageReceipt: receiptPath,
       candidateReceiptSha256: createHash("sha256").update(await readFile(receiptPath)).digest("hex"),
     }), /bound/i);
@@ -593,6 +610,84 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
     }), /bound/i);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact input ingestion makes every caller path irrelevant before parsing extraction or execution", async () => {
+  for (const kind of [
+    "published_checksum_manifest",
+    "published_0_17_4_archive",
+    "candidate_receipt",
+    "candidate_0_18_archive",
+  ]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), `codestory-exact-race-${kind}-`));
+    try {
+      const marker = path.join(root, "substituted-cli-executed");
+      const published = await makeExactArchive(root, "published-original", {
+        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
+      });
+      const candidate = await makeExactArchive(root, "candidate-original", {
+        version: "0.18.0", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+      });
+      const publishedSubstitute = await makeExactArchive(root, "published-substitute", {
+        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
+        executionMarker: marker,
+      });
+      const candidateSubstitute = await makeExactArchive(root, "candidate-substitute", {
+        version: "0.18.0", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+        executionMarker: marker,
+      });
+      const publishedInput = path.join(root, "published-input.tar.gz");
+      const candidateInput = path.join(root, "candidate-input.tar.gz");
+      await copyFile(published.archivePath, publishedInput);
+      await copyFile(candidate.archivePath, candidateInput);
+      const checksumPath = path.join(root, "SHA256SUMS.txt");
+      await writeFile(checksumPath, `${published.sha256}  ${path.basename(publishedInput)}\n`);
+      const receiptPath = path.join(root, "candidate-receipt.json");
+      await writeFile(receiptPath, JSON.stringify({
+        contract: "codestory.agent-benchmark-package/v2",
+        arm: "candidate_0_18",
+        package_version: "0.18.0",
+        archive_path: candidateInput,
+        archive_sha256: candidate.sha256,
+        source_commit: "d".repeat(40),
+        source_tree: "e".repeat(40),
+        schema_version: 3,
+        protocol_revision: "2025-11-25",
+        discovery_contract_sha256: "f".repeat(64),
+      }));
+      const state = await mkdtemp(path.join(root, "state-"));
+      const result = await benchmarkHarness.authenticateExactCandidatePackages({
+        exactCandidate: true,
+        exactCandidateStateRoot: state,
+        publishedArchive: publishedInput,
+        publishedChecksumManifest: checksumPath,
+        publishedChecksumSha256: createHash("sha256").update(await readFile(checksumPath)).digest("hex"),
+        candidatePackageReceipt: receiptPath,
+        candidateReceiptSha256: createHash("sha256").update(await readFile(receiptPath)).digest("hex"),
+        exactCandidateAfterInputIngest: async (event) => {
+          if (event.kind !== kind) return;
+          if (kind === "published_checksum_manifest" || kind === "candidate_receipt") {
+            await writeFile(event.source_path, "substituted after ingest");
+          } else if (kind === "published_0_17_4_archive") {
+            await copyFile(publishedSubstitute.archivePath, event.source_path);
+          } else {
+            await copyFile(candidateSubstitute.archivePath, event.source_path);
+          }
+        },
+      });
+      assert.equal(result.packages.get("published_0_17_4").package_sha256, published.sha256, kind);
+      assert.equal(result.packages.get("candidate_0_18").package_sha256, candidate.sha256, kind);
+      assert.equal(existsSync(marker), false, `${kind} executed the substituted CLI`);
+      for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+        assert.ok(
+          isPathInside(path.join(state, "authenticated-inputs"), result.packages.get(arm).package_path),
+          `${kind} did not consume its private staged archive`,
+        );
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -723,6 +818,26 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     ["zero trust root", (rows) => {
       rows.find((row) => row.arm === "published_0_17_4").package_identity.trust_root_sha256 = "0".repeat(64);
     }, /published package identity mismatch/i],
+    ["malformed JSONL", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").malformed_stdout_lines = 1;
+    }, /malformed or unreconciled JSONL parser telemetry/i],
+    ["external web context", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").transcript_analysis.external_context_tool_calls = 1;
+    }, /external web\/search context is forbidden/i],
+    ["zero baseline local commands", (rows) => {
+      const row = rows.find((entry) => entry.arm === "without_codestory");
+      row.transcript_analysis.command_count = 0;
+      row.transcript_analysis.command_categories = {};
+    }, /baseline local inspection telemetry is incomplete/i],
+    ["packet-first failure", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").packet_first_pass = false;
+    }, /packet-first contract failed/i],
+    ["dirty repo provenance", (rows) => {
+      rows[0].repo_provenance.git_dirty = true;
+    }, /owning repo provenance.*dirty/i],
+    ["moving repo provenance", (rows) => {
+      rows[0].repo_provenance.configured.ref = "main";
+    }, /owning repo provenance.*not pinned/i],
   ];
   for (const [label, mutate, expected] of mutations) {
     const rows = exactCandidateRows();
@@ -794,6 +909,72 @@ test("exact lifecycle alternates preparation and restores the selected source by
     assert.deepEqual(await readFile(sourcePath), original);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact baseline child gets an allowlisted disjoint environment with no CodeStory surface", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-exact-baseline-env-"));
+  const codeStoryRoot = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-arm-env-"));
+  try {
+    const baselineContainer = path.join(root, "baseline-container");
+    const baselineRoot = path.join(baselineContainer, "private-state");
+    const exposedBin = path.join(root, "exposed-bin");
+    await mkdir(baselineRoot, { recursive: true });
+    await mkdir(codeStoryRoot, { recursive: true });
+    await mkdir(exposedBin, { recursive: true });
+    await writeFile(path.join(exposedBin, "codestory-cli"), "not executable");
+    const baselineEnv = benchmarkHarness.exactCandidateBaselineEnv({
+      exactCandidate: true,
+      exactCandidateBaselineStateRoot: baselineRoot,
+      exactCandidateStateRoot: codeStoryRoot,
+    }, {
+      ...process.env,
+      PATH: `${exposedBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      CODESTORY_CLI: path.join(exposedBin, "codestory-cli"),
+      CODESTORY_CACHE_ROOT: path.join(codeStoryRoot, "cache"),
+      CODESTORY_PLUGIN_DATA: path.join(codeStoryRoot, "plugin"),
+    });
+    for (const directory of [
+      baselineEnv.HOME, baselineEnv.TMPDIR, baselineEnv.XDG_CACHE_HOME,
+      baselineEnv.XDG_CONFIG_HOME, baselineEnv.XDG_DATA_HOME,
+    ]) {
+      await mkdir(directory, { recursive: true });
+    }
+    const childEnv = agentRunnerEnv(baselineEnv, path.join(baselineRoot, "host"), false);
+    await mkdir(childEnv.CODEX_HOME, { recursive: true });
+    const child = await runProcess(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const entries = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+      const executableHits = entries.filter((entry) =>
+        ["codestory", "codestory-cli", "codestory.exe", "codestory-cli.exe", "codestory.cmd"]
+          .some((name) => fs.existsSync(path.join(entry, name)))
+      );
+      const readableParent = path.dirname(path.dirname(process.env.HOME));
+      process.stdout.write(JSON.stringify({
+        env: process.env,
+        executableHits,
+        readableParent,
+        parentEntries: fs.readdirSync(readableParent),
+      }));
+    `], { env: childEnv, timeoutMs: 10_000 });
+    assert.equal(child.status, "pass", child.stderr);
+    const observed = JSON.parse(child.stdout);
+    assert.deepEqual(observed.executableHits, []);
+    assert.equal(Object.keys(observed.env).some((key) => key.startsWith("CODESTORY_")), false);
+    assert.equal(
+      Object.values(observed.env).some((value) => String(value).includes(codeStoryRoot)),
+      false,
+    );
+    assert.equal(
+      Object.values(observed.env).some((value) => /codestory/i.test(String(value))),
+      false,
+    );
+    assert.deepEqual(observed.parentEntries, ["private-state"]);
+    assert.equal(observed.env.PATH.includes(exposedBin), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(codeStoryRoot, { recursive: true, force: true });
   }
 });
 
@@ -4196,6 +4377,28 @@ test("transcript analysis authorizes source reads only from user-named files or 
     task: { prompt: "Explain the flow." },
   });
   assert.equal(baseline.direct_source_reads[0].authorization.status, "baseline_local_exploration");
+});
+
+test("exact telemetry sees malformed JSONL web context and an empty local transcript through the real parser", () => {
+  const jsonl = [
+    JSON.stringify({ type: "item.started", item: { id: "web", type: "web_search", query: "upstream source" } }),
+    "{malformed-jsonl",
+  ].join("\n");
+  const { parsed, malformed } = parseJsonLines(jsonl);
+  assert.equal(parsed.length, 1);
+  assert.equal(malformed.length, 1);
+  const web = analyzeTranscript(parsed, "/tmp/exact-parser", {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the local repository." },
+  });
+  assert.equal(web.external_context_tool_calls, 1);
+  assert.equal(web.tool_categories.web_search, 1);
+  const empty = analyzeTranscript([], "/tmp/exact-parser", {
+    arm: "without_codestory",
+    task: { prompt: "Explain the local repository." },
+  });
+  assert.equal(empty.command_count, 0);
+  assert.equal(empty.direct_source_reads_total, 0);
 });
 
 test("counts PowerShell LiteralPath source reads after a CodeStory packet", () => {
