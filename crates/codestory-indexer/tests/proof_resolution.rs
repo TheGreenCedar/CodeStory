@@ -2999,6 +2999,747 @@ fn go_repeated_callsites_and_utf8_crlf_coordinates_are_source_bound_and_distinct
 }
 
 #[test]
+fn go_returned_closure_h1_authorizes_only_direct_non_nested_return_ownership() -> anyhow::Result<()>
+{
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "main.go",
+                concat!(
+                    "package proof\n",
+                    "type Handler func()\n",
+                    "type Factory struct{}\n",
+                    "func shouldRecord() {}\n",
+                    "func captureFrames() {}\n",
+                    "func buildLocal() Handler { return func() { shouldRecord(); captureFrames() } }\n",
+                    "func (Factory) buildRemote() Handler { return func() { remoteLeaf() } }\n",
+                ),
+            ),
+            ("remote.go", "package proof\nfunc remoteLeaf() {}\n"),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let should_record = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "shouldRecord")
+        .expect("first same-file returned-closure call");
+    let capture_frames = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "captureFrames")
+        .expect("second same-file returned-closure call");
+    let remote = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "remoteLeaf")
+        .expect("same-package returned-closure call");
+    assert_eq!(
+        should_record.status,
+        ProofResolutionStatus::Exact,
+        "{should_record:#?}"
+    );
+    assert_eq!(
+        capture_frames.status,
+        ProofResolutionStatus::Exact,
+        "{capture_frames:#?}"
+    );
+    assert_eq!(remote.status, ProofResolutionStatus::Exact, "{remote:#?}");
+    assert!(matches!(
+        should_record.evidence_chain.as_slice(),
+        [ResolutionEvidence::SameFileDeclaration { .. }]
+    ));
+    assert!(matches!(
+        capture_frames.evidence_chain.as_slice(),
+        [ResolutionEvidence::SameFileDeclaration { .. }]
+    ));
+    assert!(matches!(
+        remote.evidence_chain.as_slice(),
+        [ResolutionEvidence::SamePackageDeclaration { .. }]
+    ));
+    let nodes = store.get_nodes()?;
+    let build_local = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "buildLocal")
+        .expect("named outer function");
+    let build_remote = nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::METHOD && node.serialized_name.ends_with("buildRemote"))
+        .expect("named outer method");
+    assert_eq!(should_record.caller, build_local.id);
+    assert_eq!(capture_frames.caller, build_local.id);
+    assert_eq!(remote.caller, build_remote.id);
+
+    let unsupported = [
+        (
+            "assigned.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { closure := func() { target() }; return closure }\n",
+        ),
+        (
+            "passed.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc consume(Handler) {}\nfunc outer() { consume(func() { target() }) }\n",
+        ),
+        (
+            "immediate.go",
+            "package proof\nfunc target() {}\nfunc outer() { func() { target() }() }\n",
+        ),
+        (
+            "go.go",
+            "package proof\nfunc target() {}\nfunc outer() { go func() { target() }() }\n",
+        ),
+        (
+            "defer.go",
+            "package proof\nfunc target() {}\nfunc outer() { defer func() { target() }() }\n",
+        ),
+        (
+            "wrapped.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return Handler(func() { target() }) }\n",
+        ),
+        (
+            "conditional.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer(enabled bool) Handler { if enabled { return func() { target() } }; return nil }\n",
+        ),
+        (
+            "nested.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { func() { target() }() } }\n",
+        ),
+        (
+            "initializer.go",
+            "package proof\nfunc target() {}\nvar handler = func() { target() }\n",
+        ),
+    ];
+    for (path, source) in unsupported {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let matching = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.callsite.raw_target == "target")
+            .collect::<Vec<_>>();
+        assert!(!matching.is_empty(), "missing unsupported fact for {path}");
+        assert!(
+            matching
+                .iter()
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "unsupported returned-closure owner became Exact for {path}: {matching:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn go_returned_closure_h2_closes_closure_and_outer_lexical_capture_domains() -> anyhow::Result<()> {
+    let blocked = [
+        (
+            "closure_parameter.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func(target func()) { target() } }\n",
+        ),
+        (
+            "closure_named_result.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() (target func()) { target(); return } }\n",
+        ),
+        (
+            "closure_local.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { var target func(); target() } }\n",
+        ),
+        (
+            "closure_const.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { const target = 1; target() } }\n",
+        ),
+        (
+            "closure_type.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { type target int; target() } }\n",
+        ),
+        (
+            "closure_short.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target := func() {}; target() } }\n",
+        ),
+        (
+            "closure_assignment.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target = func() {}; target() } }\n",
+        ),
+        (
+            "closure_range.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { for target := range []int{} { target() } } }\n",
+        ),
+        (
+            "closure_type_switch.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { switch target := any(1).(type) { case int: target() } } }\n",
+        ),
+        (
+            "closure_binding_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target(); target := func() {}; _ = target } }\n",
+        ),
+        (
+            "closure_const_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target(); const target = 1; _ = target } }\n",
+        ),
+        (
+            "closure_type_after_call.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target(); type target int; var _ target } }\n",
+        ),
+        (
+            "outer_parameter.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer(target func()) Handler { return func() { target() } }\n",
+        ),
+        (
+            "outer_receiver.go",
+            "package proof\ntype Handler func()\ntype Factory struct{}\nfunc target() {}\nfunc (target Factory) outer() Handler { return func() { target() } }\n",
+        ),
+        (
+            "outer_named_result.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() (target Handler) { return func() { target() } }\n",
+        ),
+        (
+            "outer_local.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { target := func() {}; return func() { target() } }\n",
+        ),
+        (
+            "outer_const.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { const target = 1; return func() { target() } }\n",
+        ),
+        (
+            "outer_type.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { type target int; return func() { target() } }\n",
+        ),
+        (
+            "outer_assignment.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer(target func()) Handler { target = func() {}; return func() { target() } }\n",
+        ),
+        (
+            "outer_var_after_return.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() }; var target func(); _ = target }\n",
+        ),
+        (
+            "outer_const_after_return.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() }; const target = 1; _ = target }\n",
+        ),
+        (
+            "outer_type_after_return.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() }; type target int; var _ target }\n",
+        ),
+        (
+            "outer_short_after_return.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() }; target := func() {}; _ = target }\n",
+        ),
+        (
+            "outer_assignment_after_return.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() }; target = func() {} }\n",
+        ),
+    ];
+    for (path, source) in blocked {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let matching = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.callsite.raw_target == "target")
+            .collect::<Vec<_>>();
+        assert!(!matching.is_empty(), "missing blocker fact for {path}");
+        assert!(
+            matching
+                .iter()
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "closed lexical/capture domain became Exact for {path}: {matching:#?}"
+        );
+    }
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "visible.go",
+            concat!(
+                "package proof\n",
+                "type Handler func()\n",
+                "func target() {}\n",
+                "func disjoint() Handler {\n",
+                "  { target := func() {}; target() }\n",
+                "  return func() { target() }\n",
+                "}\n",
+                "func unrelated(other func()) Handler { return func() { other(); target() } }\n",
+                "func lateUnrelated() Handler { return func() { target() }; var other func(); _ = other }\n",
+                "func lateDisjoint() Handler { return func() { target() }; { var target func(); _ = target } }\n",
+            ),
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let target_facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        target_facts
+            .iter()
+            .filter(|fact| fact.status == ProofResolutionStatus::Exact)
+            .count(),
+        4,
+        "a disjoint binding and an unrelated capture must preserve both package calls: {target_facts:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn go_returned_closure_requires_the_outer_to_be_the_sole_containing_graph_callable()
+-> anyhow::Result<()> {
+    for mutate_after_seal in [false, true] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[(
+                "main.go",
+                "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+            )],
+        )?;
+        if mutate_after_seal {
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+            store.validate_proof_resolution_publication(&publication(1))?;
+        }
+        let nodes = store.get_nodes()?;
+        let outer = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "outer")
+            .expect("named outer graph callable");
+        let call = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.kind == EdgeKind::CALL)
+            .expect("returned-closure raw CALL");
+        assert_eq!(
+            call.source, outer.id,
+            "raw CALL must continue to name outer"
+        );
+        let call_line = call.line.expect("raw CALL line");
+        let mut overlapping = outer.clone();
+        overlapping.id = NodeId(if mutate_after_seal {
+            8_205_400_000_000_002
+        } else {
+            8_205_400_000_000_001
+        });
+        overlapping.serialized_name = "overlappingCallable".to_string();
+        overlapping.qualified_name = Some("overlappingCallable".to_string());
+        overlapping.canonical_id = None;
+        overlapping.start_line = Some(call_line);
+        overlapping.start_col = Some(1);
+        overlapping.end_line = Some(call_line);
+        overlapping.end_col = Some(u32::MAX);
+        store.insert_node(&overlapping)?;
+
+        let generation = if mutate_after_seal { 2 } else { 1 };
+        rematerialize_proof_resolution_projection(&mut store, &publication(generation))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("returned-closure fact");
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "a distinct overlapping graph callable retained Exact after_seal={mutate_after_seal}: {fact:#?}"
+        );
+        let stored_call = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.id == call.id)
+            .expect("stored raw CALL");
+        assert_eq!(stored_call.source, outer.id, "graph repair is forbidden");
+    }
+    Ok(())
+}
+
+#[test]
+fn go_returned_closure_h3_reuses_the_closed_native_package_domain() -> anyhow::Result<()> {
+    let blocked = [
+        (
+            "duplicate_same_file",
+            vec![(
+                "main.go",
+                "package proof\ntype Handler func()\nfunc target() {}\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+            )],
+        ),
+        (
+            "duplicate_same_package",
+            vec![
+                (
+                    "main.go",
+                    "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+                ),
+                ("duplicate.go", "package proof\nfunc target() {}\n"),
+            ],
+        ),
+        (
+            "package_var_blocker",
+            vec![(
+                "main.go",
+                "package proof\ntype Handler func()\nvar target func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+            )],
+        ),
+        (
+            "conditional_competitor",
+            vec![
+                (
+                    "main.go",
+                    "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+                ),
+                (
+                    "conditional.go",
+                    "//go:build linux\n\npackage proof\nfunc target() {}\n",
+                ),
+            ],
+        ),
+        (
+            "generated_target",
+            vec![
+                (
+                    "main.go",
+                    "package proof\ntype Handler func()\nfunc outer() Handler { return func() { target() } }\n",
+                ),
+                (
+                    "generated.go",
+                    "// Code generated by fixture. DO NOT EDIT.\npackage proof\nfunc target() {}\n",
+                ),
+            ],
+        ),
+        (
+            "parser_error_sibling",
+            vec![
+                (
+                    "main.go",
+                    "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+                ),
+                ("broken.go", "package proof\nfunc broken( {\n"),
+            ],
+        ),
+        (
+            "package_mismatch",
+            vec![
+                (
+                    "main.go",
+                    "package proof\ntype Handler func()\nfunc outer() Handler { return func() { target() } }\n",
+                ),
+                ("target.go", "package other\nfunc target() {}\n"),
+            ],
+        ),
+    ];
+    for (label, files) in blocked {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let matching = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.callsite.raw_target == "target")
+            .collect::<Vec<_>>();
+        assert!(
+            !matching.is_empty(),
+            "missing package-domain fact for {label}"
+        );
+        assert!(
+            matching
+                .iter()
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "open or competing package domain became Exact for {label}: {matching:#?}"
+        );
+    }
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "main.go",
+                "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+            ),
+            ("other/other.go", "package proof\nfunc target() {}\n"),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let target = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("same-directory target fact");
+    assert_eq!(target.status, ProofResolutionStatus::Exact, "{target:#?}");
+    Ok(())
+}
+
+#[test]
+fn go_returned_closure_h4_requires_one_matching_raw_call_edge_and_one_syntax_fact()
+-> anyhow::Result<()> {
+    for mutation in 0..6 {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[(
+                "main.go",
+                concat!(
+                    "package proof\n",
+                    "type Handler func()\n",
+                    "func target() {}\n",
+                    "func sibling() {}\n",
+                    "func outer() Handler { return func() { target() } }\n",
+                ),
+            )],
+        )?;
+        let nodes = store.get_nodes()?;
+        let outer = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "outer")
+            .expect("outer function")
+            .id;
+        let sibling = nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::FUNCTION && node.serialized_name == "sibling")
+            .expect("sibling function")
+            .id;
+        let edge = store
+            .get_edges()?
+            .into_iter()
+            .find(|edge| edge.kind == EdgeKind::CALL)
+            .expect("returned-closure raw CALL edge");
+        assert_eq!(edge.source, outer, "raw graph must claim the named outer");
+        match mutation {
+            0 => {
+                store
+                    .get_connection()
+                    .execute("DELETE FROM edge WHERE id = ?1", [edge.id.0])?;
+            }
+            1 => {
+                store.get_connection().execute(
+                    "UPDATE edge SET source_node_id = ?1, resolved_source_node_id = NULL WHERE id = ?2",
+                    [sibling.0, edge.id.0],
+                )?;
+            }
+            2 => {
+                store.get_connection().execute(
+                    "UPDATE edge SET target_node_id = ?1, resolved_target_node_id = NULL WHERE id = ?2",
+                    [sibling.0, edge.id.0],
+                )?;
+            }
+            3 => {
+                store
+                    .get_connection()
+                    .execute("UPDATE edge SET line = line + 1 WHERE id = ?1", [edge.id.0])?;
+            }
+            4 => {
+                store.get_connection().execute(
+                    "UPDATE edge SET callsite_identity = 'opaque' WHERE id = ?1",
+                    [edge.id.0],
+                )?;
+            }
+            5 => {
+                let mut duplicate = edge.clone();
+                duplicate.id = EdgeId(8_205_400_000_000_000_000);
+                store.insert_edge(&duplicate)?;
+            }
+            _ => unreachable!(),
+        }
+        match rematerialize_proof_resolution_projection(&mut store, &publication(1)) {
+            Ok(_) => {
+                let matching = store
+                    .get_proof_resolution_facts()?
+                    .into_iter()
+                    .filter(|fact| fact.callsite.raw_target == "target")
+                    .collect::<Vec<_>>();
+                assert!(
+                    matching
+                        .iter()
+                        .all(|fact| fact.status != ProofResolutionStatus::Exact),
+                    "graph/fact mutation {mutation} retained Exact: {matching:#?}"
+                );
+            }
+            Err(_) => {}
+        }
+    }
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+        )],
+    )?;
+    store.get_connection().execute(
+        "UPDATE edge SET confidence = 0.01, certainty = 'uncertain' WHERE kind = ?1",
+        [EdgeKind::CALL as i32],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let exact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("confidence-independent fact");
+    assert_eq!(exact.status, ProofResolutionStatus::Exact, "{exact:#?}");
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "main.go",
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc outer() Handler { return func() { target() } }\n",
+        )],
+    )?;
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    artifact["call_resolution_inputs"] = serde_json::Value::Array(Vec::new());
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    assert!(
+        store
+            .get_proof_resolution_facts()?
+            .iter()
+            .all(|fact| fact.callsite.raw_target != "target"),
+        "an ordinary edge without its cached syntax fact must not become authoritative"
+    );
+    Ok(())
+}
+
+#[test]
+fn go_returned_closure_h5_preserves_repeated_native_source_coordinates() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let source = concat!(
+        "package proof\r\n",
+        "type Handler func()\r\n",
+        "func target() {}\r\n",
+        "func outer() Handler { return func() {\r\n",
+        "\t// λλ\r\n",
+        "\ttarget(); target(); target()\r\n",
+        "\ttarget()\r\n",
+        "} }\r\n",
+    );
+    index_files(project.path(), &mut store, &[("main.go", source)])?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let mut facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    facts.sort_by_key(|fact| fact.callsite.start_byte);
+    assert_eq!(facts.len(), 4, "{facts:#?}");
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.status == ProofResolutionStatus::Exact),
+        "{facts:#?}"
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter_map(|fact| fact.edge_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .filter_map(|fact| fact.raw_callsite_identity.as_ref())
+            .collect::<BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert_eq!(
+        facts
+            .iter()
+            .map(|fact| fact.callsite.line)
+            .collect::<Vec<_>>(),
+        [6, 6, 6, 7]
+    );
+    for fact in &facts {
+        assert_eq!(
+            &source.as_bytes()
+                [fact.callsite.start_byte as usize..fact.callsite.end_byte_exclusive as usize],
+            b"target"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn go_returned_closure_h6_seals_current_go_cache_and_fact_provenance() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "main.go",
+                "package proof\ntype Handler func()\nfunc outer() Handler { return func() { target() } }\n",
+            ),
+            ("target.go", "package proof\nfunc target() {}\n"),
+        ],
+    )?;
+    let receipt = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("sealed returned-closure fact");
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert_eq!(fact.provenance.language_adapter, "go");
+    assert_eq!(fact.provenance.language_adapter_version, "reference-v16");
+    assert_eq!(fact.provenance.parser_fingerprint.len(), 64);
+    assert_eq!(fact.provenance.dependency_file_hashes.len(), 2);
+    assert_eq!(fact.provenance.evidence_sha256.len(), 64);
+    assert_eq!(fact.fact_id.len(), 64);
+    assert_eq!(receipt.fact_digest.len(), 64);
+
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache WHERE file_path LIKE '%main.go'",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    artifact["resolution_file"]["adapter_version"] = "stale-go-adapter".into();
+    for call in artifact["call_resolution_inputs"]
+        .as_array_mut()
+        .expect("Go call inputs")
+    {
+        call["adapter_version"] = "stale-go-adapter".into();
+    }
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE file_path LIKE '%main.go'",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("stale Go adapter cache must fail closed");
+    assert!(error.to_string().contains("stale"), "{error}");
+    Ok(())
+}
+
+#[test]
 fn go_authenticated_receiver_replaces_wrong_certain_navigation_target() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;

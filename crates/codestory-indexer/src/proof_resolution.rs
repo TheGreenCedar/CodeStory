@@ -87,11 +87,12 @@ fn python_resolution_work() -> usize {
 }
 
 const ADAPTER_VERSION: &str = "reference-v15";
+const GO_ADAPTER_VERSION: &str = "reference-v16";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 14;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
-    ("go", ADAPTER_VERSION),
+    ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
     ("python", PYTHON_ADAPTER_VERSION),
     ("rust", ADAPTER_VERSION),
@@ -429,6 +430,8 @@ struct GoResolutionIndex<'tree> {
     import_names: HashSet<String>,
     import_domain_complete: bool,
     callable_nodes: HashMap<usize, NodeId>,
+    returned_closure_calls: HashSet<usize>,
+    returned_closure_outer_blockers: HashSet<(usize, String)>,
     binding_decisions: HashMap<(usize, usize, String), GoBindingDecision>,
     build_constrained: bool,
     generated: bool,
@@ -456,6 +459,7 @@ impl<'tree> GoResolutionIndex<'tree> {
         let package_name = go_package_name(root, source);
         let graph_nodes = GoGraphNodeIndex::prepare(file_id, nodes);
         let import_domain = go_import_domain(root, source);
+        let returned_closures = GoReturnedClosureIndex::prepare(root);
         let mut result = Self {
             calls: Vec::new(),
             package_name,
@@ -466,6 +470,8 @@ impl<'tree> GoResolutionIndex<'tree> {
             import_names: import_domain.names,
             import_domain_complete: import_domain.complete,
             callable_nodes: HashMap::new(),
+            returned_closure_calls: HashSet::new(),
+            returned_closure_outer_blockers: HashSet::new(),
             binding_decisions: HashMap::new(),
             build_constrained: go_source_has_build_constraint(source),
             generated: go_source_is_generated(root, source),
@@ -565,10 +571,15 @@ impl<'tree> GoResolutionIndex<'tree> {
                     let Some(function) = node.child_by_field_name("function") else {
                         return;
                     };
-                    let callable_id = go_enclosing_callable(node).map(|callable| callable.id());
+                    let returned_closure = returned_closures.contains(node);
+                    let callable_id = go_enclosing_callable(node, &returned_closures)
+                        .map(|callable| callable.id());
                     match function.kind() {
                         "identifier" => {
                             if let Some(raw_target) = node_text(function, source) {
+                                if returned_closure {
+                                    result.returned_closure_calls.insert(function.start_byte());
+                                }
                                 result.calls.push(IndexedGoCall {
                                     callee: function,
                                     form: CalleeForm::Identifier,
@@ -584,6 +595,9 @@ impl<'tree> GoResolutionIndex<'tree> {
                             let Some(raw_target) = node_text(field, source) else {
                                 return;
                             };
+                            if returned_closure {
+                                result.returned_closure_calls.insert(field.start_byte());
+                            }
                             result.calls.push(IndexedGoCall {
                                 callee: field,
                                 form: CalleeForm::ExplicitReceiver,
@@ -597,6 +611,9 @@ impl<'tree> GoResolutionIndex<'tree> {
                                 .named_children(&mut cursor)
                                 .last()
                                 .unwrap_or(function);
+                            if returned_closure {
+                                result.returned_closure_calls.insert(leaf.start_byte());
+                            }
                             result.calls.push(IndexedGoCall {
                                 callee: leaf,
                                 form: CalleeForm::DynamicAccess,
@@ -633,8 +650,16 @@ impl<'tree> GoResolutionIndex<'tree> {
         result
             .calls
             .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
-        result.binding_decisions =
-            go_prepare_binding_decisions(root, source, &result.calls, &result.import_names);
+        (
+            result.binding_decisions,
+            result.returned_closure_outer_blockers,
+        ) = go_prepare_binding_decisions(
+            root,
+            source,
+            &result.calls,
+            &result.import_names,
+            &returned_closures,
+        );
         result
     }
 
@@ -675,9 +700,18 @@ impl<'tree> GoResolutionIndex<'tree> {
         if !self.import_domain_complete {
             return (Some(caller), CachedResolutionBinding::IncompleteDomain);
         }
+        if form != CalleeForm::Identifier
+            && self.returned_closure_calls.contains(&callee.start_byte())
+        {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
         match form {
             CalleeForm::Identifier => {
-                if self.import_names.contains(raw_target)
+                if (self.returned_closure_calls.contains(&callee.start_byte())
+                    && self
+                        .returned_closure_outer_blockers
+                        .contains(&(callable_id, raw_target.to_string())))
+                    || self.import_names.contains(raw_target)
                     || self.binding_decisions.contains_key(&(
                         callable_id,
                         callee.start_byte(),
@@ -807,7 +841,77 @@ fn go_spec_is_package_level(node: TsNode<'_>, root: TsNode<'_>) -> bool {
         .is_some_and(|parent| parent.id() == root.id())
 }
 
-fn go_enclosing_callable(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+struct GoReturnedClosureIndex<'tree> {
+    member_owners: HashMap<usize, TsNode<'tree>>,
+    outer_body_owners: HashMap<usize, TsNode<'tree>>,
+}
+
+impl<'tree> GoReturnedClosureIndex<'tree> {
+    fn prepare(root: TsNode<'tree>) -> Self {
+        let mut literals = Vec::new();
+        let mut outer_body_owners = HashMap::new();
+        walk_nodes(root, &mut |node| {
+            count_go_resolution_work(1);
+            if node.kind() == "func_literal"
+                && let Some(owner) = go_direct_returned_closure_owner(node)
+            {
+                let body = owner
+                    .child_by_field_name("body")
+                    .expect("direct returned closure owner has a body");
+                outer_body_owners.insert(body.id(), owner);
+                literals.push((node, owner));
+            }
+        });
+        let mut member_owners = HashMap::new();
+        for (literal, owner) in literals {
+            go_record_returned_closure_members(literal, literal.id(), owner, &mut member_owners);
+        }
+        Self {
+            member_owners,
+            outer_body_owners,
+        }
+    }
+
+    fn contains(&self, node: TsNode<'_>) -> bool {
+        count_go_resolution_work(1);
+        self.member_owners.contains_key(&node.id())
+    }
+
+    fn member_owner(&self, node: TsNode<'tree>) -> Option<TsNode<'tree>> {
+        count_go_resolution_work(1);
+        self.member_owners.get(&node.id()).copied()
+    }
+
+    fn outer_body_owner(&self, scope_id: usize) -> Option<TsNode<'tree>> {
+        count_go_resolution_work(1);
+        self.outer_body_owners.get(&scope_id).copied()
+    }
+}
+
+fn go_record_returned_closure_members<'tree>(
+    node: TsNode<'tree>,
+    literal_id: usize,
+    owner: TsNode<'tree>,
+    members: &mut HashMap<usize, TsNode<'tree>>,
+) {
+    count_go_resolution_work(1);
+    if node.id() != literal_id && node.kind() == "func_literal" {
+        return;
+    }
+    members.insert(node.id(), owner);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        go_record_returned_closure_members(child, literal_id, owner, members);
+    }
+}
+
+fn go_enclosing_callable<'tree>(
+    mut node: TsNode<'tree>,
+    returned_closures: &GoReturnedClosureIndex<'tree>,
+) -> Option<TsNode<'tree>> {
+    if let Some(owner) = returned_closures.member_owner(node) {
+        return Some(owner);
+    }
     loop {
         if matches!(node.kind(), "function_declaration" | "method_declaration") {
             return Some(node);
@@ -817,6 +921,53 @@ fn go_enclosing_callable(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
         }
         node = node.parent()?;
     }
+}
+
+fn go_direct_returned_closure_owner<'tree>(literal: TsNode<'tree>) -> Option<TsNode<'tree>> {
+    if literal.kind() != "func_literal" {
+        return None;
+    }
+    let returned = literal.parent()?;
+    if returned.kind() != "expression_list" {
+        return None;
+    }
+    let mut cursor = returned.walk();
+    let expressions = returned.named_children(&mut cursor).collect::<Vec<_>>();
+    let [expression] = expressions.as_slice() else {
+        return None;
+    };
+    if expression.id() != literal.id() {
+        return None;
+    }
+    let returned = returned.parent()?;
+    if returned.kind() != "return_statement" {
+        return None;
+    }
+    let mut cursor = returned.walk();
+    let return_values = returned.named_children(&mut cursor).collect::<Vec<_>>();
+    let [return_value] = return_values.as_slice() else {
+        return None;
+    };
+    if return_value.kind() != "expression_list" || return_value.id() != literal.parent()?.id() {
+        return None;
+    }
+    let statements = returned.parent()?;
+    if statements.kind() != "statement_list" {
+        return None;
+    }
+    let body = statements.parent()?;
+    if body.kind() != "block" {
+        return None;
+    }
+    let owner = body.parent()?;
+    if !matches!(owner.kind(), "function_declaration" | "method_declaration")
+        || owner
+            .child_by_field_name("body")
+            .is_none_or(|owner_body| owner_body.id() != body.id())
+    {
+        return None;
+    }
+    Some(owner)
 }
 
 fn go_receiver_declaration(receiver: TsNode<'_>, source: &str) -> Option<(String, bool, String)> {
@@ -1004,12 +1155,17 @@ fn go_prepare_binding_decisions(
     source: &str,
     calls: &[IndexedGoCall<'_>],
     import_names: &HashSet<String>,
-) -> HashMap<(usize, usize, String), GoBindingDecision> {
-    let shadowed_new = go_callables_declaring_name(root, source, "new");
+    returned_closures: &GoReturnedClosureIndex<'_>,
+) -> (
+    HashMap<(usize, usize, String), GoBindingDecision>,
+    HashSet<(usize, String)>,
+) {
+    let shadowed_new = go_callables_declaring_name(root, source, "new", returned_closures);
     let mut intervals = Vec::<GoBindingInterval>::new();
+    let mut outer_blockers = HashSet::new();
     walk_nodes(root, &mut |node| {
         count_go_resolution_work(1);
-        let Some(callable) = go_enclosing_callable(node) else {
+        let Some(callable) = go_enclosing_callable(node, returned_closures) else {
             return;
         };
         if node.id() == callable.id() {
@@ -1037,9 +1193,36 @@ fn go_prepare_binding_decisions(
             }
             return;
         }
-        let Some((scope_start, scope_end, depth)) = go_binding_scope(node, callable) else {
+        let Some((scope_id, scope_start, scope_end, depth)) = go_binding_scope(node, callable)
+        else {
             return;
         };
+        let returned_closure_binding = returned_closures.contains(node);
+        let complete_outer_scope = returned_closures
+            .outer_body_owner(scope_id)
+            .is_some_and(|owner| owner.id() == callable.id());
+        if complete_outer_scope {
+            let names = match node.kind() {
+                "short_var_declaration" | "assignment_statement" => node
+                    .child_by_field_name("left")
+                    .map(|left| go_expression_names(left, source))
+                    .unwrap_or_default(),
+                "var_spec" | "const_spec" | "type_spec" => {
+                    let mut names = Vec::new();
+                    go_declared_names(node, source, &mut names);
+                    if node.kind() == "type_spec"
+                        && let Some(name) = node
+                            .child_by_field_name("name")
+                            .and_then(|name| node_text(name, source))
+                    {
+                        names.push(name.to_string());
+                    }
+                    names
+                }
+                _ => Vec::new(),
+            };
+            outer_blockers.extend(names.into_iter().map(|name| (callable.id(), name)));
+        }
         match node.kind() {
             "parameter_declaration" | "variadic_parameter_declaration" => {
                 if callable.kind() == "method_declaration"
@@ -1100,7 +1283,11 @@ fn go_prepare_binding_decisions(
                     intervals.push(GoBindingInterval {
                         name,
                         callable_id: callable.id(),
-                        start_byte: node.end_byte().max(scope_start),
+                        start_byte: if returned_closure_binding {
+                            scope_start
+                        } else {
+                            node.end_byte().max(scope_start)
+                        },
                         end_byte: if assignment {
                             callable.end_byte()
                         } else {
@@ -1112,19 +1299,22 @@ fn go_prepare_binding_decisions(
                 }
             }
             "var_spec" => {
-                let Some(type_node) = node.child_by_field_name("type") else {
-                    return;
-                };
-                let receiver = (!go_binding_uses_control_flow(node, callable))
-                    .then(|| go_typed_receiver_binding(type_node, source, import_names))
-                    .flatten();
+                let receiver = node.child_by_field_name("type").and_then(|type_node| {
+                    (!go_binding_uses_control_flow(node, callable))
+                        .then(|| go_typed_receiver_binding(type_node, source, import_names))
+                        .flatten()
+                });
                 let mut names = Vec::new();
                 go_declared_names(node, source, &mut names);
                 for name in names {
                     intervals.push(GoBindingInterval {
                         name,
                         callable_id: callable.id(),
-                        start_byte: node.end_byte().max(scope_start),
+                        start_byte: if returned_closure_binding {
+                            scope_start
+                        } else {
+                            node.end_byte().max(scope_start)
+                        },
                         end_byte: scope_end,
                         scope_depth: depth,
                         receiver: receiver.clone(),
@@ -1145,7 +1335,11 @@ fn go_prepare_binding_decisions(
                     intervals.push(GoBindingInterval {
                         name,
                         callable_id: callable.id(),
-                        start_byte: node.end_byte().max(scope_start),
+                        start_byte: if returned_closure_binding {
+                            scope_start
+                        } else {
+                            node.end_byte().max(scope_start)
+                        },
                         end_byte: scope_end,
                         scope_depth: depth,
                         receiver: None,
@@ -1207,7 +1401,7 @@ fn go_prepare_binding_decisions(
         if node.kind() != "identifier" {
             return;
         }
-        let Some(callable) = go_outer_callable_for_captured_node(node) else {
+        let Some(callable) = go_outer_callable_for_captured_node(node, returned_closures) else {
             return;
         };
         let Some(name) = node_text(node, source).filter(|name| go_identifier(name)) else {
@@ -1305,13 +1499,18 @@ fn go_prepare_binding_decisions(
             }
         }
     }
-    decisions
+    (decisions, outer_blockers)
 }
 
-fn go_callables_declaring_name(root: TsNode<'_>, source: &str, wanted: &str) -> HashSet<usize> {
+fn go_callables_declaring_name(
+    root: TsNode<'_>,
+    source: &str,
+    wanted: &str,
+    returned_closures: &GoReturnedClosureIndex<'_>,
+) -> HashSet<usize> {
     let mut result = HashSet::new();
     walk_nodes(root, &mut |node| {
-        let Some(callable) = go_enclosing_callable(node) else {
+        let Some(callable) = go_enclosing_callable(node, returned_closures) else {
             return;
         };
         let declared = match node.kind() {
@@ -1455,16 +1654,24 @@ fn go_scope_depth(mut node: TsNode<'_>, callable: TsNode<'_>) -> usize {
     depth
 }
 
-fn go_binding_scope(node: TsNode<'_>, callable: TsNode<'_>) -> Option<(usize, usize, usize)> {
+fn go_binding_scope(
+    node: TsNode<'_>,
+    callable: TsNode<'_>,
+) -> Option<(usize, usize, usize, usize)> {
     let mut current = node;
     let mut depth = 0;
     loop {
         if current.kind() == "block" {
             depth += 1;
-            return Some((current.start_byte(), current.end_byte(), depth));
+            return Some((
+                current.id(),
+                current.start_byte(),
+                current.end_byte(),
+                depth,
+            ));
         }
         if current.id() == callable.id() {
-            return Some((callable.start_byte(), callable.end_byte(), 0));
+            return Some((callable.id(), callable.start_byte(), callable.end_byte(), 0));
         }
         current = current.parent()?;
     }
@@ -1490,10 +1697,18 @@ fn go_binding_uses_control_flow(mut node: TsNode<'_>, callable: TsNode<'_>) -> b
     false
 }
 
-fn go_outer_callable_for_captured_node(mut node: TsNode<'_>) -> Option<TsNode<'_>> {
+fn go_outer_callable_for_captured_node<'tree>(
+    mut node: TsNode<'tree>,
+    returned_closures: &GoReturnedClosureIndex<'tree>,
+) -> Option<TsNode<'tree>> {
+    if returned_closures.contains(node) {
+        return None;
+    }
     let mut crossed_closure = false;
     loop {
-        crossed_closure |= node.kind() == "func_literal";
+        if node.kind() == "func_literal" {
+            crossed_closure = true;
+        }
         if crossed_closure && matches!(node.kind(), "function_declaration" | "method_declaration") {
             return Some(node);
         }
@@ -6996,6 +7211,7 @@ pub fn rematerialize_proof_resolution_projection(
             )
         })
         .collect::<Result<Vec<_>>>()?;
+    enforce_go_exact_callable_ownership(&mut claims, &nodes);
     enforce_exact_dependency_eligibility(
         &mut claims,
         &file_by_id,
@@ -7774,6 +7990,96 @@ struct ResolvedSyntaxClaim {
     evidence_chain: Vec<ResolutionEvidence>,
     exact_node_file_expectations: Vec<(NodeId, FileId)>,
     exact_dependency_files: Vec<FileId>,
+}
+
+enum GoCallableContainmentSubject {
+    Callable(NodeId),
+    Claim(usize),
+}
+
+struct GoCallableContainmentEvent {
+    file_id: NodeId,
+    line: u32,
+    column: u32,
+    order: u8,
+    subject: GoCallableContainmentSubject,
+}
+
+fn enforce_go_exact_callable_ownership(claims: &mut [ResolvedSyntaxClaim], nodes: &[Node]) {
+    let mut events = Vec::new();
+    for node in nodes
+        .iter()
+        .filter(|node| matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD))
+    {
+        let (Some(file_id), Some(start_line), Some(end_line)) =
+            (node.file_node_id, node.start_line, node.end_line)
+        else {
+            continue;
+        };
+        let start_column = node.start_col.unwrap_or(0);
+        let end_column = node.end_col.unwrap_or(u32::MAX);
+        if (end_line, end_column) < (start_line, start_column) {
+            continue;
+        }
+        events.push(GoCallableContainmentEvent {
+            file_id,
+            line: start_line,
+            column: start_column,
+            order: 0,
+            subject: GoCallableContainmentSubject::Callable(node.id),
+        });
+        events.push(GoCallableContainmentEvent {
+            file_id,
+            line: end_line,
+            column: end_column,
+            order: 2,
+            subject: GoCallableContainmentSubject::Callable(node.id),
+        });
+    }
+    for (index, claim) in claims.iter().enumerate().filter(|(_, claim)| {
+        claim.status == ProofResolutionStatus::Exact && claim.input.language == "go"
+    }) {
+        events.push(GoCallableContainmentEvent {
+            file_id: NodeId(claim.input.callsite.file_id.0),
+            line: claim.input.callsite.line,
+            column: claim.input.callsite.column,
+            order: 1,
+            subject: GoCallableContainmentSubject::Claim(index),
+        });
+    }
+    events.sort_by(|left, right| {
+        (left.file_id, left.line, left.column, left.order).cmp(&(
+            right.file_id,
+            right.line,
+            right.column,
+            right.order,
+        ))
+    });
+    let mut active_file = None;
+    let mut active = HashSet::new();
+    for event in events {
+        if active_file != Some(event.file_id) {
+            active.clear();
+            active_file = Some(event.file_id);
+        }
+        match event.subject {
+            GoCallableContainmentSubject::Callable(callable) if event.order == 0 => {
+                active.insert(callable);
+            }
+            GoCallableContainmentSubject::Callable(callable) => {
+                active.remove(&callable);
+            }
+            GoCallableContainmentSubject::Claim(index) => {
+                let claim = &mut claims[index];
+                if active.len() != 1 || !active.contains(&claim.caller) {
+                    claim.status = ProofResolutionStatus::Ambiguous;
+                    claim.reason = ProofResolutionReason::MultipleBindings;
+                    claim.target = None;
+                    claim.evidence_chain.clear();
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -11422,13 +11728,51 @@ mod go_complexity_tests {
 
     fn measured_source_work(count: usize) -> usize {
         let source = go_source(count);
+        measured_source(&source)
+    }
+
+    fn returned_closure_source(count: usize) -> String {
+        let mut source = String::from(
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc caller() Handler { return func() {\n",
+        );
+        for _ in 0..count {
+            source.push_str("  target()\n");
+        }
+        source.push_str("} }\n");
+        source
+    }
+
+    fn measured_returned_closure_work(count: usize) -> usize {
+        measured_source(&returned_closure_source(count))
+    }
+
+    fn nested_returned_closure_source(depth: usize) -> String {
+        let mut source = String::from(
+            "package proof\ntype Handler func()\nfunc target() {}\nfunc caller() Handler { return func() {\n",
+        );
+        for _ in 0..depth {
+            source.push_str("{\n");
+        }
+        source.push_str("target()\n");
+        for _ in 0..depth {
+            source.push_str("}\n");
+        }
+        source.push_str("} }\n");
+        source
+    }
+
+    fn measured_nested_returned_closure_work(depth: usize) -> usize {
+        measured_source(&nested_returned_closure_source(depth))
+    }
+
+    fn measured_source(source: &str) -> usize {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_go::LANGUAGE.into())
             .expect("Go grammar must load");
-        let tree = parser.parse(&source, None).expect("source must parse");
+        let tree = parser.parse(source, None).expect("source must parse");
         reset_go_resolution_work();
-        let _ = GoResolutionIndex::build(&tree, &source, NodeId(1), &[]);
+        let _ = GoResolutionIndex::build(&tree, source, NodeId(1), &[]);
         go_resolution_work()
     }
 
@@ -11444,7 +11788,7 @@ mod go_complexity_tests {
                     file_id: NodeId(index as i64 + 1),
                     source_sha256: "0".repeat(64),
                     language: "go".to_string(),
-                    adapter_version: ADAPTER_VERSION.to_string(),
+                    adapter_version: GO_ADAPTER_VERSION.to_string(),
                     parser_fingerprint: "parser".to_string(),
                     complete: true,
                     lookup_input_complete: true,
@@ -11491,6 +11835,28 @@ mod go_complexity_tests {
         assert!(
             large <= small * 2 + 128,
             "Go source work grew superlinearly: {small} -> {large}"
+        );
+
+        let small_closure = measured_returned_closure_work(64);
+        let large_closure = measured_returned_closure_work(128);
+        assert!(
+            small_closure > 0,
+            "Go returned-closure work was not instrumented"
+        );
+        assert!(
+            large_closure <= small_closure * 2 + 128,
+            "Go returned-closure work grew superlinearly: {small_closure} -> {large_closure}"
+        );
+
+        let shallow_nested = measured_nested_returned_closure_work(32);
+        let deep_nested = measured_nested_returned_closure_work(64);
+        assert!(
+            shallow_nested > 32,
+            "Go returned-closure membership work was not counted: {shallow_nested}"
+        );
+        assert!(
+            deep_nested <= shallow_nested * 2 + 128,
+            "Go nested returned-closure membership work grew superlinearly: {shallow_nested} -> {deep_nested}"
         );
     }
 
