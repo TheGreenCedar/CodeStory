@@ -40,6 +40,7 @@ use tree_sitter_graph::{ExecutionConfig, NoCancellation, Variables};
 #[cfg(test)]
 thread_local! {
     static MANUAL_RECEIVER_LOOKUP_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GO_METHOD_IDENTITY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -58,6 +59,24 @@ fn reset_manual_receiver_lookup_work() {
 #[cfg(test)]
 fn manual_receiver_lookup_work() -> usize {
     MANUAL_RECEIVER_LOOKUP_WORK.with(std::cell::Cell::get)
+}
+
+#[inline]
+fn count_go_method_identity_work(amount: usize) {
+    #[cfg(test)]
+    GO_METHOD_IDENTITY_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_go_method_identity_work() {
+    GO_METHOD_IDENTITY_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn go_method_identity_work() -> usize {
+    GO_METHOD_IDENTITY_WORK.with(std::cell::Cell::get)
 }
 
 mod cache;
@@ -8380,9 +8399,7 @@ fn language_member_specs(
 }
 
 struct ManualMemberEdgeContext<'a> {
-    language_name: &'a str,
-    tree: &'a Tree,
-    source: &'a str,
+    specs: &'a [ManualMemberEdgeSpec],
     unique_nodes: &'a HashMap<NodeId, Node>,
     file_id: NodeId,
     flags: IndexFeatureFlags,
@@ -8392,8 +8409,9 @@ fn append_manual_member_edges(
     context: ManualMemberEdgeContext<'_>,
     result_edges: &mut Vec<Edge>,
     edge_keys: &mut HashSet<EdgeDedupKey>,
-) {
-    for spec in language_member_specs(context.language_name, context.tree, context.source) {
+) -> HashSet<NodeId> {
+    let mut target_ids = HashSet::new();
+    for spec in context.specs {
         let Some(source_id) = node_id_by_name_and_span(
             context.unique_nodes,
             &spec.source_name,
@@ -8411,6 +8429,7 @@ fn append_manual_member_edges(
             continue;
         };
 
+        target_ids.insert(target_id);
         let mut edge = Edge {
             id: EdgeId(0),
             source: source_id,
@@ -8426,6 +8445,74 @@ fn append_manual_member_edges(
         }
         edge.id = EdgeId(generate_edge_id_for_edge(&edge, context.flags));
         result_edges.push(edge);
+    }
+    target_ids
+}
+
+fn apply_go_receiver_method_identities(
+    language_name: &str,
+    nodes: &mut HashMap<NodeId, Node>,
+    specs: &[ManualMemberEdgeSpec],
+    local_member_targets: &HashSet<NodeId>,
+    canonical_roles: &HashMap<NodeId, CanonicalNodeRole>,
+) {
+    if language_name != "go" || specs.is_empty() {
+        return;
+    }
+
+    let mut methods_by_span = HashMap::<(u32, u32, u32, u32, String), Vec<NodeId>>::new();
+    for node in nodes.values() {
+        count_go_method_identity_work(1);
+        if node.kind != NodeKind::METHOD
+            || !matches!(
+                canonical_roles.get(&node.id),
+                Some(
+                    CanonicalNodeRole::Definition
+                        | CanonicalNodeRole::Declaration
+                        | CanonicalNodeRole::ForwardDeclaration
+                )
+            )
+        {
+            continue;
+        }
+        let (Some(start_line), Some(start_col), Some(end_line), Some(end_col)) =
+            (node.start_line, node.start_col, node.end_line, node.end_col)
+        else {
+            continue;
+        };
+        methods_by_span
+            .entry((
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+                short_member_name(&node.serialized_name).to_string(),
+            ))
+            .or_default()
+            .push(node.id);
+    }
+
+    for spec in specs {
+        count_go_method_identity_work(1);
+        let key = (
+            spec.target_span.start_line,
+            spec.target_span.start_col,
+            spec.target_span.end_line,
+            spec.target_span.end_col,
+            spec.target_name.clone(),
+        );
+        let Some([method_id]) = methods_by_span.get(&key).map(Vec::as_slice) else {
+            continue;
+        };
+        if local_member_targets.contains(method_id) {
+            continue;
+        }
+        let Some(method) = nodes.get_mut(method_id) else {
+            continue;
+        };
+        let receiver_qualified = format!("{}.{}", spec.source_name, spec.target_name);
+        method.serialized_name = receiver_qualified.clone();
+        method.qualified_name = Some(receiver_qualified);
     }
 }
 
@@ -15945,11 +16032,10 @@ fn index_file_with_resolution_inputs(
         &mut edge_keys,
         flags,
     );
-    append_manual_member_edges(
+    let manual_member_specs = language_member_specs(language_config.language_name, &tree, source);
+    let local_member_targets = append_manual_member_edges(
         ManualMemberEdgeContext {
-            language_name: language_config.language_name,
-            tree: &tree,
-            source,
+            specs: &manual_member_specs,
             unique_nodes: &unique_nodes,
             file_id,
             flags,
@@ -16065,6 +16151,14 @@ fn index_file_with_resolution_inputs(
     if language_config.language_name == "rust" {
         apply_rust_receiver_call_hints(&tree, source, &mut unique_nodes);
     }
+
+    apply_go_receiver_method_identities(
+        language_config.language_name,
+        &mut unique_nodes,
+        &manual_member_specs,
+        &local_member_targets,
+        &canonical_role_by_node_id,
+    );
 
     if !unique_nodes.is_empty() {
         result_nodes.extend(unique_nodes.values().cloned());

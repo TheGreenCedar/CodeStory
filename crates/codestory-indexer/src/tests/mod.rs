@@ -16,6 +16,200 @@ use rusqlite::types::Value;
 use std::collections::HashSet;
 use tempfile::tempdir;
 
+fn measured_go_method_identity_qualification_work(method_count: usize) -> usize {
+    let mut nodes = HashMap::new();
+    let mut roles = HashMap::new();
+    let mut specs = Vec::new();
+    for index in 0..method_count {
+        let id = NodeId(i64::try_from(index + 1).expect("method id"));
+        let line = u32::try_from(index + 1).expect("method line");
+        nodes.insert(
+            id,
+            Node {
+                id,
+                kind: NodeKind::METHOD,
+                serialized_name: format!("Method{index}"),
+                start_line: Some(line),
+                start_col: Some(1),
+                end_line: Some(line),
+                end_col: Some(20),
+                ..Default::default()
+            },
+        );
+        roles.insert(id, CanonicalNodeRole::Definition);
+        specs.push(ManualMemberEdgeSpec {
+            source_name: format!("Owner{index}"),
+            target_name: format!("Method{index}"),
+            source_span: GraphNodeSpan {
+                start_line: line,
+                start_col: 1,
+                end_line: line,
+                end_col: 5,
+            },
+            target_span: GraphNodeSpan {
+                start_line: line,
+                start_col: 1,
+                end_line: line,
+                end_col: 20,
+            },
+            line: Some(line),
+        });
+    }
+
+    reset_go_method_identity_work();
+    apply_go_receiver_method_identities("go", &mut nodes, &specs, &HashSet::new(), &roles);
+    assert!(
+        nodes
+            .values()
+            .all(|node| node.serialized_name.starts_with("Owner"))
+    );
+    go_method_identity_work()
+}
+
+#[test]
+fn go_method_identity_qualification_work_is_linear() {
+    let baseline = measured_go_method_identity_qualification_work(128);
+    let doubled = measured_go_method_identity_qualification_work(256);
+    assert!(baseline >= 256, "Go identity work was not fully counted");
+    assert!(
+        doubled <= baseline * 2 + 16,
+        "Go identity qualification grew superlinearly: {baseline} -> {doubled}"
+    );
+}
+
+#[test]
+fn go_builtin_new_package_and_local_shadowing_matrix_is_closed() -> Result<()> {
+    struct Case {
+        name: &'static str,
+        declarations: &'static str,
+        expect_receiver_resolution: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "direct package var",
+            declarations: "var new func(int)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package var",
+            declarations: "var (\n  new func(int)\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "direct package const",
+            declarations: "const new = 1\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package const",
+            declarations: "const (\n  new = 1\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "direct package type",
+            declarations: "type new int\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package type",
+            declarations: "type (\n  new int\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "unrelated package names",
+            declarations: "var otherVar func(int)\nconst otherConst = 1\ntype otherType int\n",
+            expect_receiver_resolution: true,
+        },
+        Case {
+            name: "local new in unrelated callable",
+            declarations: r#"
+func unrelated() {
+  { var new func(int); _ = new }
+  { const new = 1; _ = new }
+  { type new int; var _ new }
+}
+"#,
+            expect_receiver_resolution: true,
+        },
+        Case {
+            name: "local new in caller",
+            declarations: "",
+            expect_receiver_resolution: false,
+        },
+    ];
+
+    for case in cases {
+        let caller_shadow = if case.name == "local new in caller" {
+            "  var new func(int)\n"
+        } else {
+            ""
+        };
+        let source = format!(
+            r#"package proof
+
+type node struct{{}}
+func (*node) addRoute() {{}}
+
+{}
+func build() {{
+{}  root := new(node)
+  root.addRoute()
+}}
+"#,
+            case.declarations, caller_shadow
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go parser language");
+        let tree = parser.parse(&source, None).expect("Go syntax tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "case `{}` must be syntactically valid",
+            case.name
+        );
+
+        let has_receiver_spec = languages::go::receiver_call_specs(&tree, &source)
+            .iter()
+            .any(|spec| {
+                spec.source_name == "build"
+                    && spec.owner_name == "node"
+                    && spec.method_name == "addRoute"
+            });
+        assert_eq!(
+            has_receiver_spec, case.expect_receiver_resolution,
+            "case `{}` receiver-spec decision",
+            case.name
+        );
+
+        let language_config = get_language_for_ext("go").expect("Go language config");
+        let result = index_file(Path::new("main.go"), &source, &language_config, None, None)?;
+        let nodes_by_id = result
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let has_resolved_method_edge = result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge
+                    .resolved_target
+                    .and_then(|target| nodes_by_id.get(&target))
+                    .is_some_and(|target| {
+                        target.serialized_name == "node.addRoute"
+                            || target.serialized_name.ends_with(".node.addRoute")
+                    })
+        });
+        assert_eq!(
+            has_resolved_method_edge, case.expect_receiver_resolution,
+            "case `{}` resolved-edge decision",
+            case.name
+        );
+    }
+
+    Ok(())
+}
+
 fn measured_manual_receiver_index_work(owner_count: usize, lookup_count: usize) -> usize {
     let file_id = NodeId(1);
     let mut nodes = HashMap::new();
