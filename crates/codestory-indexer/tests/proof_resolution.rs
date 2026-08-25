@@ -628,6 +628,313 @@ fn python_closed_exact_subset_authorizes_s1_through_s4() -> anyhow::Result<()> {
 }
 
 #[test]
+fn python_classic_relative_imports_resolve_direct_and_multi_dot_paths() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/scaffold.py", "def find_package():\n    pass\n"),
+            ("pkg/helpers.py", "def root_value():\n    pass\n"),
+            (
+                "pkg/main.py",
+                "from .scaffold import find_package\ndef direct():\n    find_package()\n",
+            ),
+            ("pkg/sub/__init__.py", ""),
+            ("pkg/sub/near.py", "def near_value():\n    pass\n"),
+            ("pkg/sub/deep/__init__.py", ""),
+            (
+                "pkg/sub/deep/main.py",
+                concat!(
+                    "from ...helpers import root_value\n",
+                    "from ..near import near_value\n\n",
+                    "from ..near import near_value as aliased_near\n\n",
+                    "def caller():\n",
+                    "    root_value()\n",
+                    "    near_value()\n",
+                    "    aliased_near()\n",
+                ),
+            ),
+        ],
+    )?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "python")
+        .collect::<Vec<_>>();
+    for target in ["find_package", "root_value", "near_value", "aliased_near"] {
+        let fact = facts
+            .iter()
+            .find(|fact| fact.callsite.raw_target == target)
+            .unwrap_or_else(|| panic!("missing Python fact for {target}: {facts:#?}"));
+        assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+        assert!(fact.edge_id.is_some(), "{fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn python_multi_dot_relative_imports_fail_closed_outside_classic_package_paths()
+-> anyhow::Result<()> {
+    for files in [
+        vec![
+            ("pkg/__init__.py", ""),
+            ("pkg/helper.py", "def target():\n    pass\n"),
+            ("pkg/sub/__init__.py", ""),
+            (
+                "pkg/sub/main.py",
+                "from ...helper import target\ndef caller():\n    target()\n",
+            ),
+        ],
+        vec![
+            ("pkg/__init__.py", ""),
+            ("pkg/helper.py", "def target():\n    pass\n"),
+            (
+                "pkg/sub/main.py",
+                "from ..helper import target\ndef caller():\n    target()\n",
+            ),
+        ],
+        vec![
+            ("pkg/__init__.py", ""),
+            ("pkg/helper.py", "def target():\n    pass\n"),
+            ("pkg/helper/__init__.py", "def target():\n    pass\n"),
+            ("pkg/sub/__init__.py", ""),
+            (
+                "pkg/sub/main.py",
+                "from ..helper import target\ndef caller():\n    target()\n",
+            ),
+        ],
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == "python" && fact.callsite.raw_target == "target"
+            })
+            .expect("closed multi-dot Python fact");
+        assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn python_relative_imports_reject_live_unindexed_package_collisions_and_replay_them()
+-> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/target.py", "def target():\n    pass\n"),
+            ("pkg/sub/__init__.py", ""),
+            (
+                "pkg/sub/main.py",
+                "from ..target import target\ndef caller():\n    target()\n",
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+
+    let unindexed_marker = project.path().join("pkg/target/__init__.py");
+    fs::create_dir_all(unindexed_marker.parent().expect("package parent"))?;
+    fs::write(&unindexed_marker, "def target():\n    pass\n")?;
+    let error = store
+        .validate_proof_resolution_publication(&publication(1))
+        .expect_err("live package collision must reject the sealed fact");
+    assert!(error.to_string().contains("candidate"), "{error}");
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(2))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("relative-import fact");
+    assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn python_relative_imports_reject_symlinked_source_package_ancestry() -> anyhow::Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir()?;
+    let outside = tempfile::tempdir()?;
+    symlink(outside.path(), project.path().join("pkg"))?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/target.py", "def target():\n    pass\n"),
+            (
+                "pkg/main.py",
+                "from .target import target\ndef caller():\n    target()\n",
+            ),
+            ("pkg/sub/__init__.py", ""),
+            ("pkg/sub/target.py", "def target():\n    pass\n"),
+            (
+                "pkg/sub/main.py",
+                "from .target import target\ndef caller():\n    target()\n",
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.callsite.raw_target == "target")
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 2, "{facts:#?}");
+    assert!(
+        facts
+            .iter()
+            .all(|fact| fact.status != ProofResolutionStatus::Exact),
+        "{facts:#?}"
+    );
+
+    let replay_project = tempfile::tempdir()?;
+    let replay_outside = tempfile::tempdir()?;
+    let mut replay_store = Store::new_in_memory()?;
+    index_files(
+        replay_project.path(),
+        &mut replay_store,
+        &[
+            ("pkg/__init__.py", ""),
+            ("pkg/sub/__init__.py", ""),
+            ("pkg/sub/target.py", "def target():\n    pass\n"),
+            (
+                "pkg/sub/main.py",
+                "from .target import target\ndef caller():\n    target()\n",
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut replay_store, &publication(1))?;
+    replay_store.validate_proof_resolution_publication(&publication(1))?;
+    fs::rename(
+        replay_project.path().join("pkg"),
+        replay_outside.path().join("pkg"),
+    )?;
+    symlink(
+        replay_outside.path().join("pkg"),
+        replay_project.path().join("pkg"),
+    )?;
+    replay_store
+        .validate_proof_resolution_publication(&publication(1))
+        .expect_err("symlinked source package ancestry must reject replay");
+    Ok(())
+}
+
+#[test]
+fn python_relative_imports_reject_parenthesized_one_name_forms() -> anyhow::Result<()> {
+    for statement in [
+        "from ..target import (target)",
+        "from ..target import (\n    target\n)",
+        "from ..target import (target,)",
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        let source = format!("{statement}\ndef caller():\n    target()\n");
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/target.py", "def target():\n    pass\n"),
+                ("pkg/sub/__init__.py", ""),
+                ("pkg/sub/main.py", source.as_str()),
+            ],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .expect("parenthesized import fact");
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "{statement}: {fact:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn python_relative_imports_reject_duplicate_raw_import_hops_before_and_after_replay()
+-> anyhow::Result<()> {
+    for replay in [false, true] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                ("pkg/__init__.py", ""),
+                ("pkg/target.py", "def target():\n    pass\n"),
+                ("pkg/sub/__init__.py", ""),
+                (
+                    "pkg/sub/main.py",
+                    "from ..target import target\ndef caller():\n    target()\n",
+                ),
+            ],
+        )?;
+        if replay {
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+            store.validate_proof_resolution_publication(&publication(1))?;
+        }
+        let mut hops = store
+            .get_edges()?
+            .into_iter()
+            .filter(|edge| edge.kind == EdgeKind::IMPORT)
+            .filter(|edge| {
+                store
+                    .get_node(edge.target)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|node| node.kind == NodeKind::MODULE)
+            })
+            .collect::<Vec<_>>();
+        hops.sort_by_key(|edge| edge.id);
+        for (offset, hop) in hops.into_iter().enumerate() {
+            let mut duplicate = hop.clone();
+            duplicate.id = EdgeId(8_700_000_000_000_000_000 + offset as i64);
+            store.insert_edge(&duplicate)?;
+            if replay {
+                store
+                    .validate_proof_resolution_publication(&publication(1))
+                    .expect_err("duplicate raw import hop must reject replay");
+            } else {
+                rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+                let fact = store
+                    .get_proof_resolution_facts()?
+                    .into_iter()
+                    .find(|fact| fact.callsite.raw_target == "target")
+                    .expect("relative-import fact");
+                assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+            }
+            store
+                .get_connection()
+                .execute("DELETE FROM edge WHERE id = ?1", [duplicate.id.0])?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn python_read_only_getattr_does_not_poison_closed_static_neighbors() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
@@ -686,7 +993,7 @@ fn python_read_only_getattr_does_not_poison_closed_static_neighbors() -> anyhow:
             static_facts.iter().all(|fact| {
                 fact.status == ProofResolutionStatus::Exact
                     && fact.edge_id.is_some()
-                    && fact.provenance.language_adapter_version == "reference-v16"
+                    && fact.provenance.language_adapter_version == "reference-v17"
             }),
             "read-only getter poisoned {target}: {static_facts:#?}"
         );
@@ -6218,7 +6525,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .iter()
             .find(|adapter| adapter.language == "python")
             .map(|adapter| adapter.adapter_version.as_str()),
-        Some("reference-v16")
+        Some("reference-v17")
     );
     for fact in store.get_proof_resolution_facts()? {
         assert!(receipt.adapter_roster.iter().any(|adapter| {
