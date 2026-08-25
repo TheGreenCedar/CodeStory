@@ -262,6 +262,7 @@ struct ProofResolutionValidationContext {
     typescript_directory_import_relations:
         HashMap<(NodeId, NodeId), TypescriptDirectoryImportState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
+    member_by_owner_and_name: HashMap<(NodeId, String), Option<NodeId>>,
     python_import_paths: HashMap<(NodeId, NodeId), Vec<Vec<NodeId>>>,
     python_file_ids_by_path: HashMap<PathBuf, Vec<FileId>>,
     python_attestation_error_by_file: HashMap<i64, String>,
@@ -1241,6 +1242,7 @@ mod go_replay_complexity_tests {
             import_relations: HashMap::new(),
             typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
+            member_by_owner_and_name: HashMap::new(),
             python_import_paths: HashMap::new(),
             python_file_ids_by_path: HashMap::new(),
             python_attestation_error_by_file: HashMap::new(),
@@ -1407,6 +1409,7 @@ mod python_replay_complexity_tests {
             import_relations: HashMap::new(),
             typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
+            member_by_owner_and_name: HashMap::new(),
             python_import_paths: HashMap::new(),
             python_file_ids_by_path,
             python_attestation_error_by_file,
@@ -1697,6 +1700,23 @@ impl ProofResolutionValidationContext {
                 current = *next;
             }
         }
+        let mut member_by_owner_and_name = HashMap::new();
+        for (&(owner, member), state) in &member_relations {
+            if !state.is_unique() {
+                continue;
+            }
+            let Some(member_node) = node_by_id.get(&member) else {
+                continue;
+            };
+            let key = (
+                owner,
+                graph_leaf_name(&member_node.serialized_name).to_string(),
+            );
+            member_by_owner_and_name
+                .entry(key)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(member));
+        }
         Ok(Self {
             file_by_id,
             file_content_hash_by_id,
@@ -1710,6 +1730,7 @@ impl ProofResolutionValidationContext {
             import_relations,
             typescript_directory_import_relations,
             member_relations,
+            member_by_owner_and_name,
             python_import_paths,
             python_file_ids_by_path,
             python_attestation_error_by_file,
@@ -1744,6 +1765,44 @@ impl ProofResolutionValidationContext {
         self.member_relations
             .get(&(owner, member))
             .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn has_cpp_member_definition(&self, owner: NodeId, member: NodeId) -> bool {
+        if self.has_member(owner, member) {
+            return true;
+        }
+        let (Some(owner_node), Some(member_node)) =
+            (self.node_by_id.get(&owner), self.node_by_id.get(&member))
+        else {
+            return false;
+        };
+        if !matches!(owner_node.kind, NodeKind::CLASS | NodeKind::STRUCT)
+            || member_node.kind != NodeKind::FUNCTION
+            || owner_node.file_node_id.is_none()
+            || owner_node.file_node_id != member_node.file_node_id
+        {
+            return false;
+        }
+        let member_name = graph_leaf_name(&member_node.serialized_name);
+        let owner_name = owner_node
+            .qualified_name
+            .as_deref()
+            .unwrap_or(&owner_node.serialized_name);
+        let member_identity = member_node
+            .qualified_name
+            .as_deref()
+            .unwrap_or(&member_node.serialized_name);
+        if member_identity != format!("{owner_name}::{member_name}") {
+            return false;
+        }
+        self.member_by_owner_and_name
+            .get(&(owner, member_name.to_string()))
+            .is_some_and(Option::is_some)
+    }
+
+    fn has_member_for_language(&self, language: &str, owner: NodeId, member: NodeId) -> bool {
+        self.has_member(owner, member)
+            || (language == "cpp" && self.has_cpp_member_definition(owner, member))
     }
 
     fn has_python_import_path(&self, file: NodeId, components: &[NodeId]) -> bool {
@@ -2278,6 +2337,8 @@ impl Storage {
             CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver
         ) && if fact.provenance.language_adapter == "python" {
             target_node.kind != NodeKind::FUNCTION
+        } else if fact.provenance.language_adapter == "cpp" {
+            !matches!(target_node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
         } else {
             target_node.kind != NodeKind::METHOD
         } {
@@ -2423,9 +2484,15 @@ impl Storage {
                 } else {
                     owner_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                         || target_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                } || !context.has_member(*owner, fact.caller)
-                    || !context.has_member(*owner, target)
-                {
+                } || !context.has_member_for_language(
+                    &fact.provenance.language_adapter,
+                    *owner,
+                    fact.caller,
+                ) || !context.has_member_for_language(
+                    &fact.provenance.language_adapter,
+                    *owner,
+                    target,
+                ) {
                     return Err(proof_error(
                         "ImplicitReceiver does not own caller and target through inherent membership",
                     ));

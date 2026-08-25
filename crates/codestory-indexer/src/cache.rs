@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 // Versioned with proof-input semantics so older parser artifacts fail closed.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 19;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 22;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -126,6 +126,9 @@ pub(crate) enum CachedResolutionBinding {
         method_name: String,
         constructor: bool,
     },
+    CCppQualified {
+        components: Vec<NodeId>,
+    },
     Ambiguous,
     MissingBinding,
     Unsupported,
@@ -176,6 +179,28 @@ pub(crate) struct CachedResolutionFile {
     pub go_package: Option<CachedGoPackage>,
     #[serde(default)]
     pub java_kotlin_package: Option<String>,
+    #[serde(default)]
+    pub c_cpp_file: Option<CachedCCppFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCCppFile {
+    pub source_path: PathBuf,
+    pub source_role: CachedCCppSourceRole,
+    pub namespaces: Vec<CachedCCppNamespace>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CachedCCppSourceRole {
+    Source,
+    Header,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCCppNamespace {
+    pub path: Vec<String>,
+    pub declaration: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,7 +338,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 18,
+            resolution_input_schema_version: 21,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

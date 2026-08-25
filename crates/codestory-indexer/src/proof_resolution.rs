@@ -1,9 +1,9 @@
 use crate::cache::{
-    CachedCallResolutionInput, CachedClassBinding, CachedClassDeclaration, CachedClassMethod,
-    CachedDeclarationKind, CachedDirectExport, CachedGoMethod, CachedGoPackage, CachedGoType,
-    CachedIndexArtifact, CachedInherentMethod, CachedResolutionBinding, CachedResolutionFile,
-    CachedRustFileModule, CachedRustModule, CachedRustType, CachedRustUseBinding,
-    CachedTopLevelDeclaration,
+    CachedCCppFile, CachedCCppNamespace, CachedCCppSourceRole, CachedCallResolutionInput,
+    CachedClassBinding, CachedClassDeclaration, CachedClassMethod, CachedDeclarationKind,
+    CachedDirectExport, CachedGoMethod, CachedGoPackage, CachedGoType, CachedIndexArtifact,
+    CachedInherentMethod, CachedResolutionBinding, CachedResolutionFile, CachedRustFileModule,
+    CachedRustModule, CachedRustType, CachedRustUseBinding, CachedTopLevelDeclaration,
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
@@ -31,6 +31,7 @@ thread_local! {
     static GO_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PYTHON_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static JAVA_KOTLIN_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static C_CPP_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -105,6 +106,24 @@ fn java_kotlin_resolution_work() -> usize {
     JAVA_KOTLIN_RESOLUTION_WORK.with(std::cell::Cell::get)
 }
 
+#[inline]
+fn count_c_cpp_resolution_work(amount: usize) {
+    #[cfg(test)]
+    C_CPP_RESOLUTION_WORK.with(|work| work.set(work.get().saturating_add(amount)));
+    #[cfg(not(test))]
+    let _ = amount;
+}
+
+#[cfg(test)]
+fn reset_c_cpp_resolution_work() {
+    C_CPP_RESOLUTION_WORK.with(|work| work.set(0));
+}
+
+#[cfg(test)]
+fn c_cpp_resolution_work() -> usize {
+    C_CPP_RESOLUTION_WORK.with(std::cell::Cell::get)
+}
+
 const ADAPTER_VERSION: &str = "reference-v15";
 const GO_ADAPTER_VERSION: &str = "reference-v19";
 const PYTHON_ADAPTER_VERSION: &str = "reference-v17";
@@ -112,10 +131,14 @@ const RUST_ADAPTER_VERSION: &str = "reference-v19";
 const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const JAVA_ADAPTER_VERSION: &str = "reference-v2";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 18;
+const C_ADAPTER_VERSION: &str = "reference-v2";
+const CPP_ADAPTER_VERSION: &str = "reference-v3";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 21;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
+    ("c", C_ADAPTER_VERSION),
+    ("cpp", CPP_ADAPTER_VERSION),
     ("java", JAVA_ADAPTER_VERSION),
     ("kotlin", KOTLIN_ADAPTER_VERSION),
     ("python", PYTHON_ADAPTER_VERSION),
@@ -177,6 +200,8 @@ pub(crate) fn collect_call_resolution_inputs(
         (language == "python").then(|| PythonResolutionIndex::build(tree, source, file_id, nodes));
     let java_kotlin_index = is_java_kotlin_language(language)
         .then(|| JavaKotlinResolutionIndex::build(tree, source, language, file_id, nodes));
+    let c_cpp_index = is_c_cpp_language(language)
+        .then(|| CCppResolutionIndex::build(tree, source, source_path, language, file_id, nodes));
     let (direct_exports, export_poison_all, poisoned_export_names) =
         if let Some(index) = &javascript_index {
             index.collect_direct_exports(source)
@@ -203,6 +228,8 @@ pub(crate) fn collect_call_resolution_inputs(
     } else if let Some(index) = &python_index {
         index.declarations.clone()
     } else if let Some(index) = &java_kotlin_index {
+        index.declarations.clone()
+    } else if let Some(index) = &c_cpp_index {
         index.declarations.clone()
     } else {
         Vec::new()
@@ -235,13 +262,19 @@ pub(crate) fn collect_call_resolution_inputs(
                 index.resolve_syntax_claim(source, callee, form, &raw_target)
             } else if let Some(index) = &java_kotlin_index {
                 index.resolve_syntax_claim(source, callee, form, &raw_target)
+            } else if let Some(index) = &c_cpp_index {
+                index.resolve_syntax_claim(callee, form, &raw_target)
             } else {
                 (None, CachedResolutionBinding::Unsupported)
             };
             if !lookup_input_complete {
                 binding = CachedResolutionBinding::IncompleteDomain;
             }
-            if matches!(binding, CachedResolutionBinding::GoImplicitReceiver { .. }) {
+            if matches!(
+                binding,
+                CachedResolutionBinding::GoImplicitReceiver { .. }
+                    | CachedResolutionBinding::ImplicitReceiver { .. }
+            ) {
                 callsite.callee_form = CalleeForm::ImplicitReceiver;
             }
             if matches!(binding, CachedResolutionBinding::StaticImport { .. })
@@ -298,12 +331,28 @@ pub(crate) fn collect_call_resolution_inputs(
         for call in &index.calls {
             emit_call(call.callee, call.form, call.raw_target.clone(), None);
         }
+    } else if let Some(index) = &c_cpp_index {
+        for call in &index.calls {
+            emit_call(call.callee, call.form, call.raw_target.clone(), None);
+        }
     } else {
         collect_calls(tree.root_node(), source, &mut |callee, form, raw_target| {
             emit_call(callee, form, raw_target, None);
         });
     }
-    calls.sort_by_key(|input| (input.callsite.start_byte, input.callsite.end_byte_exclusive));
+    if c_cpp_index.is_none() {
+        calls.sort_by_key(|input| (input.callsite.start_byte, input.callsite.end_byte_exclusive));
+    } else {
+        debug_assert!(calls.windows(2).all(|pair| {
+            (
+                pair[0].callsite.start_byte,
+                pair[0].callsite.end_byte_exclusive,
+            ) <= (
+                pair[1].callsite.start_byte,
+                pair[1].callsite.end_byte_exclusive,
+            )
+        }));
+    }
     CollectedResolutionInputs {
         calls,
         file: Some(CachedResolutionFile {
@@ -321,9 +370,14 @@ pub(crate) fn collect_call_resolution_inputs(
                 || {
                     python_index.as_ref().map_or_else(
                         || {
-                            java_kotlin_index
-                                .as_ref()
-                                .map_or_else(Vec::new, |index| index.classes.clone())
+                            java_kotlin_index.as_ref().map_or_else(
+                                || {
+                                    c_cpp_index
+                                        .as_ref()
+                                        .map_or_else(Vec::new, |index| index.classes.clone())
+                                },
+                                |index| index.classes.clone(),
+                            )
                         },
                         |index| index.classes.clone(),
                     )
@@ -346,6 +400,11 @@ pub(crate) fn collect_call_resolution_inputs(
             java_kotlin_package: java_kotlin_index
                 .as_ref()
                 .and_then(|index| index.package_name.clone()),
+            c_cpp_file: c_cpp_index.as_ref().map(|index| CachedCCppFile {
+                source_path: source_path.to_path_buf(),
+                source_role: index.source_role,
+                namespaces: index.namespaces.clone(),
+            }),
         }),
     }
 }
@@ -362,6 +421,1444 @@ fn is_javascript_language(language: &str) -> bool {
 
 fn is_java_kotlin_language(language: &str) -> bool {
     matches!(language, "java" | "kotlin")
+}
+
+fn is_c_cpp_language(language: &str) -> bool {
+    matches!(language, "c" | "cpp")
+}
+
+#[derive(Clone)]
+struct IndexedCCppCall<'tree> {
+    callee: TsNode<'tree>,
+    form: CalleeForm,
+    raw_target: String,
+    caller: Option<NodeId>,
+    callable_id: Option<usize>,
+    namespace_path: Vec<String>,
+    owner_index: Option<usize>,
+    unsupported: bool,
+    identifier_shadowed: bool,
+    receiver: CCppCallReceiver,
+}
+
+#[derive(Clone)]
+enum CCppCallReceiver {
+    None,
+    Implicit,
+    ExactType {
+        owner_name: String,
+        constructor: bool,
+        receiver_name: Option<String>,
+    },
+    Qualified(Vec<String>),
+    Blocked,
+}
+
+#[derive(Clone)]
+enum CCppLexicalBinding {
+    Other,
+    Receiver { owner_name: String },
+}
+
+struct CCppScope {
+    names: HashSet<String>,
+    insertions: Vec<String>,
+}
+
+struct CCppCallableRecord {
+    namespace_path: Vec<String>,
+    owner_index: Option<usize>,
+    name: String,
+    signature: Option<String>,
+    declaration: Option<NodeId>,
+    defined: bool,
+    is_virtual: bool,
+    is_static: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CCppWalkContext {
+    callable_id: Option<usize>,
+    caller: Option<NodeId>,
+    owner_index: Option<usize>,
+    unsupported: bool,
+}
+
+struct CCppResolutionIndex<'tree> {
+    language: &'tree str,
+    source_role: CachedCCppSourceRole,
+    calls: Vec<IndexedCCppCall<'tree>>,
+    call_indices_by_span: HashMap<(usize, usize), usize>,
+    declarations: Vec<CachedTopLevelDeclaration>,
+    declaration_indices_by_key: HashMap<(Vec<String>, String), Vec<usize>>,
+    classes: Vec<CachedClassDeclaration>,
+    class_namespace_paths: Vec<Vec<String>>,
+    class_indices_by_name: HashMap<String, Vec<usize>>,
+    class_method_indices_by_name: HashMap<(usize, String), Vec<usize>>,
+    namespaces: Vec<CachedCCppNamespace>,
+    namespace_nodes_by_path: HashMap<Vec<String>, Vec<NodeId>>,
+    callable_nodes: HashMap<(u32, String), Vec<NodeId>>,
+    class_nodes: HashMap<(u32, String), Vec<NodeId>>,
+    namespace_nodes: HashMap<(u32, String), Vec<NodeId>>,
+    owner_bindings: HashMap<(usize, String), Vec<CCppLexicalBinding>>,
+    callable_records: Vec<CCppCallableRecord>,
+    callable_namespace_paths: HashMap<usize, Vec<String>>,
+    rebound_receivers: HashSet<(usize, String)>,
+    declaration_signatures: HashMap<(Vec<String>, Option<String>, String), HashSet<String>>,
+    unsupported_declarations: HashSet<(Vec<String>, Option<String>, String)>,
+    global_shadow_names: HashSet<(Vec<String>, String)>,
+    poisoned_callables: HashSet<usize>,
+    poisoned_owners: HashSet<usize>,
+    poisoned_namespaces: HashSet<Vec<String>>,
+    virtual_methods: HashSet<(usize, String)>,
+    static_methods: HashSet<(usize, String)>,
+    macro_names: HashSet<String>,
+    generated: bool,
+}
+
+impl<'tree> CCppResolutionIndex<'tree> {
+    fn build(
+        tree: &'tree Tree,
+        source: &str,
+        source_path: &Path,
+        language: &'tree str,
+        file_id: NodeId,
+        nodes: &[Node],
+    ) -> Self {
+        let mut callable_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        let mut class_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        let mut namespace_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
+        for graph in nodes
+            .iter()
+            .filter(|node| node.file_node_id == Some(file_id))
+        {
+            count_c_cpp_resolution_work(1);
+            let Some(line) = graph.start_line else {
+                continue;
+            };
+            let name = graph_leaf_name(&graph.serialized_name).to_string();
+            match graph.kind {
+                NodeKind::FUNCTION | NodeKind::METHOD => {
+                    count_c_cpp_resolution_work(1);
+                    callable_nodes
+                        .entry((line, name))
+                        .or_default()
+                        .push(graph.id);
+                }
+                NodeKind::CLASS | NodeKind::STRUCT => {
+                    count_c_cpp_resolution_work(1);
+                    class_nodes.entry((line, name)).or_default().push(graph.id);
+                }
+                NodeKind::MODULE => {
+                    count_c_cpp_resolution_work(1);
+                    namespace_nodes
+                        .entry((line, name))
+                        .or_default()
+                        .push(graph.id);
+                }
+                _ => {}
+            }
+        }
+        let mut result = Self {
+            language,
+            source_role: c_cpp_source_role(source_path),
+            calls: Vec::new(),
+            call_indices_by_span: HashMap::new(),
+            declarations: Vec::new(),
+            declaration_indices_by_key: HashMap::new(),
+            classes: Vec::new(),
+            class_namespace_paths: Vec::new(),
+            class_indices_by_name: HashMap::new(),
+            class_method_indices_by_name: HashMap::new(),
+            namespaces: Vec::new(),
+            namespace_nodes_by_path: HashMap::new(),
+            callable_nodes,
+            class_nodes,
+            namespace_nodes,
+            owner_bindings: HashMap::new(),
+            callable_records: Vec::new(),
+            callable_namespace_paths: HashMap::new(),
+            rebound_receivers: HashSet::new(),
+            declaration_signatures: HashMap::new(),
+            unsupported_declarations: HashSet::new(),
+            global_shadow_names: HashSet::new(),
+            poisoned_callables: HashSet::new(),
+            poisoned_owners: HashSet::new(),
+            poisoned_namespaces: HashSet::new(),
+            virtual_methods: HashSet::new(),
+            static_methods: HashSet::new(),
+            macro_names: HashSet::new(),
+            generated: c_cpp_generated_source(source),
+        };
+        CCppProducer::new(&mut result, source).visit(
+            tree.root_node(),
+            CCppWalkContext {
+                callable_id: None,
+                caller: None,
+                owner_index: None,
+                unsupported: false,
+            },
+        );
+
+        result.finalize_callable_domain();
+        c_cpp_sort_calls_by_span(&mut result.calls);
+        for (index, call) in result.calls.iter().enumerate() {
+            count_c_cpp_resolution_work(1);
+            result
+                .call_indices_by_span
+                .insert((call.callee.start_byte(), call.callee.end_byte()), index);
+        }
+        for (index, declaration) in result.declarations.iter().enumerate() {
+            count_c_cpp_resolution_work(1);
+            result
+                .declaration_indices_by_key
+                .entry((declaration.module_path.clone(), declaration.name.clone()))
+                .or_default()
+                .push(index);
+        }
+        for (class_index, class) in result.classes.iter().enumerate() {
+            count_c_cpp_resolution_work(2);
+            for (method_index, method) in class.methods.iter().enumerate() {
+                count_c_cpp_resolution_work(1);
+                result
+                    .class_method_indices_by_name
+                    .entry((class_index, method.name.clone()))
+                    .or_default()
+                    .push(method_index);
+            }
+        }
+        result
+    }
+
+    fn finalize_callable_domain(&mut self) {
+        let mut records_by_signature =
+            HashMap::<(Vec<String>, Option<usize>, String, String), Vec<usize>>::new();
+        for (record_index, record) in self.callable_records.iter().enumerate() {
+            let owner_name = record
+                .owner_index
+                .map(|owner| self.classes[owner].name.clone());
+            let lookup_key = (
+                record.namespace_path.clone(),
+                owner_name,
+                record.name.clone(),
+            );
+            let Some(signature) = &record.signature else {
+                count_c_cpp_resolution_work(1);
+                self.unsupported_declarations.insert(lookup_key);
+                continue;
+            };
+            count_c_cpp_resolution_work(2);
+            self.declaration_signatures
+                .entry(lookup_key)
+                .or_default()
+                .insert(signature.clone());
+            records_by_signature
+                .entry((
+                    record.namespace_path.clone(),
+                    record.owner_index,
+                    record.name.clone(),
+                    signature.clone(),
+                ))
+                .or_default()
+                .push(record_index);
+        }
+
+        for ((namespace_path, owner_index, name, _signature), record_indices) in
+            records_by_signature
+        {
+            let records = record_indices
+                .iter()
+                .map(|index| &self.callable_records[*index])
+                .collect::<Vec<_>>();
+            let mut defined = records
+                .iter()
+                .filter(|record| record.defined)
+                .filter_map(|record| record.declaration)
+                .collect::<Vec<_>>();
+            defined.sort_unstable();
+            defined.dedup();
+            let mut declared = records
+                .iter()
+                .filter(|record| !record.defined)
+                .filter_map(|record| record.declaration)
+                .collect::<Vec<_>>();
+            declared.sort_unstable();
+            declared.dedup();
+            let target = match (defined.as_slice(), declared.as_slice(), self.language) {
+                ([definition], [], _) => Some(*definition),
+                ([_definition], [declaration], _) => Some(*declaration),
+                ([], [declaration], "c") => Some(*declaration),
+                _ => None,
+            };
+            let owner_name = owner_index.map(|owner| self.classes[owner].name.clone());
+            let lookup_key = (namespace_path.clone(), owner_name, name.clone());
+            if records.iter().any(|record| record.is_virtual) {
+                if let Some(owner) = owner_index {
+                    count_c_cpp_resolution_work(1);
+                    self.virtual_methods.insert((owner, name.clone()));
+                } else {
+                    self.unsupported_declarations.insert(lookup_key.clone());
+                }
+            }
+            if records.iter().any(|record| record.is_static)
+                && let Some(owner) = owner_index
+            {
+                count_c_cpp_resolution_work(1);
+                self.static_methods.insert((owner, name.clone()));
+            }
+            let Some(target) = target else {
+                self.unsupported_declarations.insert(lookup_key);
+                continue;
+            };
+            count_c_cpp_resolution_work(1);
+            if let Some(owner) = owner_index {
+                self.classes[owner].methods.push(CachedClassMethod {
+                    name,
+                    declaration: target,
+                });
+            } else {
+                self.declarations.push(CachedTopLevelDeclaration {
+                    name,
+                    declaration: target,
+                    module_path: namespace_path,
+                    cross_module_visible: false,
+                });
+            }
+        }
+    }
+
+    fn resolve_syntax_claim(
+        &self,
+        callee: TsNode<'_>,
+        form: CalleeForm,
+        target: &str,
+    ) -> (Option<NodeId>, CachedResolutionBinding) {
+        count_c_cpp_resolution_work(1);
+        let Some(call_index) = self
+            .call_indices_by_span
+            .get(&(callee.start_byte(), callee.end_byte()))
+        else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        let call = &self.calls[*call_index];
+        let Some(caller) = call.caller else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        if call.form != form
+            || call.raw_target != target
+            || call.unsupported
+            || self.generated
+            || self.source_role == CachedCCppSourceRole::Header
+            || call
+                .callable_id
+                .is_some_and(|callable| self.poisoned_callables.contains(&callable))
+            || call
+                .owner_index
+                .is_some_and(|owner| self.poisoned_owners.contains(&owner))
+            || self.poisoned_namespaces.contains(&call.namespace_path)
+        {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if self.language == "c" && form != CalleeForm::Identifier {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        count_c_cpp_resolution_work(4);
+        match &call.receiver {
+            CCppCallReceiver::Qualified(scope) => {
+                return (Some(caller), self.resolve_qualified(scope, target));
+            }
+            CCppCallReceiver::ExactType {
+                owner_name,
+                constructor,
+                receiver_name,
+            } => {
+                if let (Some(callable_id), Some(receiver_name)) = (call.callable_id, receiver_name)
+                    && self
+                        .rebound_receivers
+                        .contains(&(callable_id, receiver_name.clone()))
+                {
+                    return (Some(caller), CachedResolutionBinding::Ambiguous);
+                }
+                return (
+                    Some(caller),
+                    self.resolve_explicit_receiver(owner_name, target, *constructor),
+                );
+            }
+            CCppCallReceiver::Implicit => {
+                return (
+                    Some(caller),
+                    self.resolve_implicit_receiver(call.owner_index, target),
+                );
+            }
+            CCppCallReceiver::Blocked => {
+                return (Some(caller), CachedResolutionBinding::Unsupported);
+            }
+            CCppCallReceiver::None => {}
+        }
+        if form != CalleeForm::Identifier || call.identifier_shadowed {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if self.macro_names.contains(target) {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if self
+            .global_shadow_names
+            .contains(&(call.namespace_path.clone(), target.to_string()))
+        {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if let Some(owner_index) = call.owner_index {
+            let method = self.resolve_implicit_receiver(Some(owner_index), target);
+            if !matches!(method, CachedResolutionBinding::Unsupported) {
+                return (Some(caller), method);
+            }
+        }
+        let count_key = (call.namespace_path.clone(), None, target.to_string());
+        if self
+            .declaration_signatures
+            .get(&count_key)
+            .is_some_and(|signatures| signatures.len() > 1)
+        {
+            return (Some(caller), CachedResolutionBinding::Ambiguous);
+        }
+        if self.unsupported_declarations.contains(&count_key) {
+            return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        count_c_cpp_resolution_work(1);
+        let declarations = self
+            .declaration_indices_by_key
+            .get(&(call.namespace_path.clone(), target.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match declarations {
+            [declaration] => (
+                Some(caller),
+                CachedResolutionBinding::SameFile {
+                    declaration: self.declarations[*declaration].declaration,
+                    rust_glob_local_module: None,
+                },
+            ),
+            [] => (Some(caller), CachedResolutionBinding::Unsupported),
+            _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+        }
+    }
+
+    fn resolve_implicit_receiver(
+        &self,
+        owner_index: Option<usize>,
+        target: &str,
+    ) -> CachedResolutionBinding {
+        let Some(owner_index) = owner_index else {
+            return CachedResolutionBinding::Unsupported;
+        };
+        let class = &self.classes[owner_index];
+        let count_key = (
+            self.class_namespace_paths[owner_index].clone(),
+            Some(class.name.clone()),
+            target.to_string(),
+        );
+        if self
+            .declaration_signatures
+            .get(&count_key)
+            .is_some_and(|signatures| signatures.len() > 1)
+        {
+            return CachedResolutionBinding::Ambiguous;
+        }
+        if self.unsupported_declarations.contains(&count_key) {
+            return CachedResolutionBinding::Unsupported;
+        }
+        if self
+            .virtual_methods
+            .contains(&(owner_index, target.to_string()))
+        {
+            return CachedResolutionBinding::Unsupported;
+        }
+        count_c_cpp_resolution_work(1);
+        let methods = self
+            .class_method_indices_by_name
+            .get(&(owner_index, target.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match methods {
+            [method] => CachedResolutionBinding::ImplicitReceiver {
+                owner: class.declaration,
+                declaration: class.methods[*method].declaration,
+                owner_name: class.name.clone(),
+            },
+            [] => CachedResolutionBinding::Unsupported,
+            _ => CachedResolutionBinding::Ambiguous,
+        }
+    }
+
+    fn resolve_explicit_receiver(
+        &self,
+        owner_name: &str,
+        target: &str,
+        constructor: bool,
+    ) -> CachedResolutionBinding {
+        count_c_cpp_resolution_work(2);
+        let classes = self
+            .class_indices_by_name
+            .get(owner_name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [class_index] = classes else {
+            return if classes.is_empty() {
+                CachedResolutionBinding::Unsupported
+            } else {
+                CachedResolutionBinding::Ambiguous
+            };
+        };
+        let class = &self.classes[*class_index];
+        let declaration_key = (
+            self.class_namespace_paths[*class_index].clone(),
+            Some(class.name.clone()),
+            target.to_string(),
+        );
+        if self.unsupported_declarations.contains(&declaration_key) {
+            return CachedResolutionBinding::Unsupported;
+        }
+        if self
+            .virtual_methods
+            .contains(&(*class_index, target.to_string()))
+        {
+            return CachedResolutionBinding::Unsupported;
+        }
+        let methods = self
+            .class_method_indices_by_name
+            .get(&(*class_index, target.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [_method] = methods else {
+            return if methods.is_empty() {
+                CachedResolutionBinding::Unsupported
+            } else {
+                CachedResolutionBinding::Ambiguous
+            };
+        };
+        let class_binding = CachedClassBinding::SameFile {
+            owner: class.declaration,
+            owner_name: class.name.clone(),
+        };
+        if constructor {
+            CachedResolutionBinding::ConstructorBinding {
+                class_binding,
+                method_name: target.to_string(),
+            }
+        } else {
+            CachedResolutionBinding::ExplicitReceiverType {
+                class_binding,
+                method_name: target.to_string(),
+            }
+        }
+    }
+
+    fn resolve_qualified(&self, scope: &[String], target: &str) -> CachedResolutionBinding {
+        if scope.len() == 1 {
+            count_c_cpp_resolution_work(1);
+            if let Some(classes) = self.class_indices_by_name.get(&scope[0]) {
+                let [class_index] = classes.as_slice() else {
+                    return CachedResolutionBinding::Ambiguous;
+                };
+                let declaration_key = (
+                    self.class_namespace_paths[*class_index].clone(),
+                    Some(self.classes[*class_index].name.clone()),
+                    target.to_string(),
+                );
+                if self.unsupported_declarations.contains(&declaration_key)
+                    || !self
+                        .static_methods
+                        .contains(&(*class_index, target.to_string()))
+                {
+                    return CachedResolutionBinding::Unsupported;
+                }
+                let methods = self
+                    .class_method_indices_by_name
+                    .get(&(*class_index, target.to_string()))
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                return match methods {
+                    [method] => CachedResolutionBinding::CCppQualified {
+                        components: vec![
+                            self.classes[*class_index].declaration,
+                            self.classes[*class_index].methods[*method].declaration,
+                        ],
+                    },
+                    [] => CachedResolutionBinding::Unsupported,
+                    _ => CachedResolutionBinding::Ambiguous,
+                };
+            }
+        }
+        count_c_cpp_resolution_work(2);
+        let namespaces = self
+            .namespace_nodes_by_path
+            .get(scope)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let declarations = self
+            .declaration_indices_by_key
+            .get(&(scope.to_vec(), target.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match (namespaces, declarations) {
+            ([namespace], [declaration]) => CachedResolutionBinding::CCppQualified {
+                components: vec![*namespace, self.declarations[*declaration].declaration],
+            },
+            ([], _) | (_, []) => CachedResolutionBinding::Unsupported,
+            _ => CachedResolutionBinding::Ambiguous,
+        }
+    }
+}
+
+struct CCppProducer<'index, 'tree> {
+    index: &'index mut CCppResolutionIndex<'tree>,
+    source: &'index str,
+    namespace_path: Vec<String>,
+    active_bindings: HashMap<String, Vec<CCppLexicalBinding>>,
+    scopes: Vec<CCppScope>,
+}
+
+impl<'index, 'tree> CCppProducer<'index, 'tree> {
+    fn new(index: &'index mut CCppResolutionIndex<'tree>, source: &'index str) -> Self {
+        Self {
+            index,
+            source,
+            namespace_path: Vec::new(),
+            active_bindings: HashMap::new(),
+            scopes: vec![CCppScope {
+                names: HashSet::new(),
+                insertions: Vec::new(),
+            }],
+        }
+    }
+
+    fn visit(&mut self, node: TsNode<'tree>, context: CCppWalkContext) {
+        count_c_cpp_resolution_work(1);
+        let namespace_name = (node.kind() == "namespace_definition")
+            .then(|| node.child_by_field_name("name"))
+            .flatten()
+            .and_then(|name| node_text(name, self.source))
+            .map(str::to_string);
+        if let Some(name) = &namespace_name {
+            self.namespace_path.push(name.clone());
+            self.collect_namespace(node, name);
+        }
+
+        let is_callable = node.kind() == "function_definition";
+        let is_scope = is_callable || node.kind() == "compound_statement";
+        if is_scope {
+            count_c_cpp_resolution_work(1);
+            self.scopes.push(CCppScope {
+                names: HashSet::new(),
+                insertions: Vec::new(),
+            });
+        }
+        let mut context = context;
+        if matches!(
+            node.kind(),
+            "template_declaration"
+                | "preproc_if"
+                | "preproc_ifdef"
+                | "preproc_elif"
+                | "preproc_else"
+                | "lambda_expression"
+        ) {
+            context.unsupported = true;
+        }
+        if matches!(node.kind(), "class_specifier" | "struct_specifier") {
+            context = self.enter_class(node, context);
+        }
+        if is_callable {
+            context = self.enter_callable(node, context);
+        }
+        self.collect_declaration(node, context);
+        self.collect_parameter(node, context);
+        self.collect_write(node, context);
+        self.collect_macro(node);
+        self.collect_call(node, context);
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.visit(child, context);
+        }
+        if is_scope {
+            self.leave_scope();
+        }
+        if namespace_name.is_some() {
+            self.namespace_path.pop();
+        }
+    }
+
+    fn collect_namespace(&mut self, node: TsNode<'tree>, name: &str) {
+        count_c_cpp_resolution_work(1);
+        let candidates = self
+            .index
+            .namespace_nodes
+            .get(&(node.start_position().row as u32 + 1, name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if let [declaration] = candidates {
+            count_c_cpp_resolution_work(2);
+            self.index.namespaces.push(CachedCCppNamespace {
+                path: self.namespace_path.clone(),
+                declaration: *declaration,
+            });
+            self.index
+                .namespace_nodes_by_path
+                .entry(self.namespace_path.clone())
+                .or_default()
+                .push(*declaration);
+        }
+    }
+
+    fn enter_class(
+        &mut self,
+        node: TsNode<'tree>,
+        mut context: CCppWalkContext,
+    ) -> CCppWalkContext {
+        context.owner_index = None;
+        context.unsupported |= node.child_by_field_name("name").is_none()
+            || c_cpp_has_direct_kind(node, "base_class_clause")
+            || c_cpp_has_direct_kind(node, "template_type");
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_text(name, self.source))
+            .map(str::to_string)
+        else {
+            return context;
+        };
+        count_c_cpp_resolution_work(1);
+        let candidates = self
+            .index
+            .class_nodes
+            .get(&(node.start_position().row as u32 + 1, name.clone()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [declaration] = candidates else {
+            return context;
+        };
+        count_c_cpp_resolution_work(2);
+        self.index.classes.push(CachedClassDeclaration {
+            name,
+            declaration: *declaration,
+            methods: Vec::new(),
+        });
+        self.index
+            .class_namespace_paths
+            .push(self.namespace_path.clone());
+        let owner_index = self.index.classes.len() - 1;
+        count_c_cpp_resolution_work(1);
+        self.index
+            .class_indices_by_name
+            .entry(self.index.classes[owner_index].name.clone())
+            .or_default()
+            .push(owner_index);
+        context.owner_index = Some(owner_index);
+        context
+    }
+
+    fn enter_callable(
+        &mut self,
+        node: TsNode<'tree>,
+        mut context: CCppWalkContext,
+    ) -> CCppWalkContext {
+        let Some(declarator) = node.child_by_field_name("declarator") else {
+            context.callable_id = Some(node.id());
+            context.caller = None;
+            context.unsupported = true;
+            return context;
+        };
+        let Some((name, qualifier, signature)) =
+            c_cpp_callable_shape(declarator, self.source, self.index.language)
+        else {
+            context.callable_id = Some(node.id());
+            context.caller = None;
+            context.unsupported = true;
+            return context;
+        };
+        let (namespace_path, owner_index, qualified_supported) =
+            self.resolve_declaration_owner(qualifier.as_deref(), context.owner_index);
+        context.owner_index = owner_index;
+        context.unsupported |= !qualified_supported;
+        let caller = self.map_callable(node, &name);
+        let is_virtual = c_cpp_function_is_virtual(node, self.source);
+        if is_virtual {
+            context.unsupported = true;
+        }
+        let domain_supported = !context.unsupported && qualified_supported;
+        self.record_callable(CCppCallableRecord {
+            namespace_path: namespace_path.clone(),
+            owner_index,
+            name,
+            signature: domain_supported.then_some(signature),
+            declaration: caller,
+            defined: true,
+            is_virtual,
+            is_static: c_cpp_function_is_static(node, self.source),
+        });
+        count_c_cpp_resolution_work(1);
+        self.index
+            .callable_namespace_paths
+            .insert(node.id(), namespace_path);
+        context.callable_id = Some(node.id());
+        context.caller = caller;
+        context
+    }
+
+    fn map_callable(&self, node: TsNode<'tree>, name: &str) -> Option<NodeId> {
+        count_c_cpp_resolution_work(1);
+        let candidates = self
+            .index
+            .callable_nodes
+            .get(&(node.start_position().row as u32 + 1, name.to_string()))?;
+        candidates
+            .first()
+            .copied()
+            .filter(|_| candidates.len() == 1)
+    }
+
+    fn collect_parameter(&mut self, node: TsNode<'tree>, context: CCppWalkContext) {
+        if node.kind() != "parameter_declaration" || context.callable_id.is_none() {
+            return;
+        }
+        if node.child_by_field_name("declarator").is_none()
+            && node
+                .child_by_field_name("type")
+                .and_then(|ty| node_text(ty, self.source))
+                .is_some_and(|ty| ty.trim() == "void")
+        {
+            return;
+        }
+        let Some((name, binding)) = c_cpp_typed_binding(node, self.source) else {
+            self.poison_scope(context);
+            return;
+        };
+        self.insert_active(name, binding);
+    }
+
+    fn collect_declaration(&mut self, node: TsNode<'tree>, context: CCppWalkContext) {
+        if node.kind() == "expression_statement"
+            && context.callable_id.is_some()
+            && c_cpp_untrusted_declaration_expression(node)
+        {
+            self.poison_scope(context);
+            return;
+        }
+        if !matches!(node.kind(), "declaration" | "field_declaration") {
+            return;
+        }
+        let Some(ty) = node.child_by_field_name("type") else {
+            self.poison_scope(context);
+            return;
+        };
+        let mut cursor = node.walk();
+        let declarators = node
+            .children_by_field_name("declarator", &mut cursor)
+            .collect::<Vec<_>>();
+        if declarators.is_empty() {
+            self.poison_scope(context);
+            return;
+        }
+        for declarator in declarators {
+            count_c_cpp_resolution_work(1);
+            let Some(bound_names) = c_cpp_declarator_bound_names(declarator, self.source) else {
+                self.poison_scope(context);
+                continue;
+            };
+            if bound_names.is_empty() {
+                self.poison_scope(context);
+                continue;
+            }
+            if context.callable_id.is_some() {
+                let binding = c_cpp_binding_for_declarator(ty, declarator, self.source);
+                for name in bound_names {
+                    self.insert_active(name, binding.clone());
+                }
+                continue;
+            }
+            if let Some((name, qualifier, signature)) =
+                c_cpp_callable_shape(declarator, self.source, self.index.language)
+            {
+                let (namespace_path, owner_index, qualified_supported) =
+                    self.resolve_declaration_owner(qualifier.as_deref(), context.owner_index);
+                let declaration = self.map_callable(node, &name);
+                self.record_callable(CCppCallableRecord {
+                    namespace_path,
+                    owner_index,
+                    name,
+                    signature: (qualified_supported && !context.unsupported).then_some(signature),
+                    declaration,
+                    defined: false,
+                    is_virtual: c_cpp_function_is_virtual(node, self.source),
+                    is_static: c_cpp_function_is_static(node, self.source),
+                });
+                continue;
+            }
+            let binding = c_cpp_binding_for_declarator(ty, declarator, self.source);
+            for name in bound_names {
+                if let Some(owner_index) = context.owner_index {
+                    count_c_cpp_resolution_work(1);
+                    self.index
+                        .owner_bindings
+                        .entry((owner_index, name))
+                        .or_default()
+                        .push(binding.clone());
+                } else {
+                    count_c_cpp_resolution_work(1);
+                    self.index
+                        .global_shadow_names
+                        .insert((self.namespace_path.clone(), name));
+                }
+            }
+        }
+    }
+
+    fn record_callable(&mut self, record: CCppCallableRecord) {
+        count_c_cpp_resolution_work(1);
+        self.index.callable_records.push(record);
+    }
+
+    fn resolve_declaration_owner(
+        &self,
+        qualifier: Option<&[String]>,
+        lexical_owner: Option<usize>,
+    ) -> (Vec<String>, Option<usize>, bool) {
+        let Some(qualifier) = qualifier else {
+            return (self.namespace_path.clone(), lexical_owner, true);
+        };
+        count_c_cpp_resolution_work(1);
+        if let [owner_name] = qualifier
+            && let Some(owners) = self.index.class_indices_by_name.get(owner_name)
+            && let [owner] = owners.as_slice()
+        {
+            return (
+                self.index.class_namespace_paths[*owner].clone(),
+                Some(*owner),
+                true,
+            );
+        }
+        let namespace = qualifier.to_vec();
+        let supported = self
+            .index
+            .namespace_nodes_by_path
+            .get(&namespace)
+            .is_some_and(|nodes| nodes.len() == 1);
+        (namespace, None, supported)
+    }
+
+    fn poison_scope(&mut self, context: CCppWalkContext) {
+        count_c_cpp_resolution_work(1);
+        if let Some(callable) = context.callable_id {
+            self.index.poisoned_callables.insert(callable);
+        } else if let Some(owner) = context.owner_index {
+            self.index.poisoned_owners.insert(owner);
+        } else {
+            self.index
+                .poisoned_namespaces
+                .insert(self.namespace_path.clone());
+        }
+    }
+
+    fn collect_write(&mut self, node: TsNode<'tree>, context: CCppWalkContext) {
+        if node.kind() != "assignment_expression" {
+            return;
+        }
+        let Some(callable_id) = context.callable_id else {
+            return;
+        };
+        let Some(name) = node
+            .child_by_field_name("left")
+            .filter(|left| left.kind() == "identifier")
+            .and_then(|left| node_text(left, self.source))
+        else {
+            return;
+        };
+        count_c_cpp_resolution_work(1);
+        self.index
+            .rebound_receivers
+            .insert((callable_id, name.to_string()));
+    }
+
+    fn collect_macro(&mut self, node: TsNode<'tree>) {
+        if !matches!(node.kind(), "preproc_def" | "preproc_function_def") {
+            return;
+        }
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_text(name, self.source))
+        else {
+            return;
+        };
+        count_c_cpp_resolution_work(1);
+        self.index.macro_names.insert(name.to_string());
+    }
+
+    fn collect_call(&mut self, node: TsNode<'tree>, context: CCppWalkContext) {
+        if node.kind() != "call_expression" {
+            return;
+        }
+        let Some(function) = node.child_by_field_name("function") else {
+            return;
+        };
+        let Some((callee, form, raw_target, receiver)) = self.classify_call(function, context)
+        else {
+            return;
+        };
+        let identifier_shadowed =
+            form == CalleeForm::Identifier && self.active_bindings.contains_key(&raw_target);
+        let namespace_path = context
+            .callable_id
+            .and_then(|callable| self.index.callable_namespace_paths.get(&callable))
+            .cloned()
+            .unwrap_or_else(|| self.namespace_path.clone());
+        count_c_cpp_resolution_work(2);
+        self.index.calls.push(IndexedCCppCall {
+            callee,
+            form,
+            raw_target,
+            caller: context.caller,
+            callable_id: context.callable_id,
+            namespace_path,
+            owner_index: context.owner_index,
+            unsupported: context.unsupported,
+            identifier_shadowed,
+            receiver,
+        });
+    }
+
+    fn classify_call(
+        &self,
+        function: TsNode<'tree>,
+        context: CCppWalkContext,
+    ) -> Option<(TsNode<'tree>, CalleeForm, String, CCppCallReceiver)> {
+        match function.kind() {
+            "identifier" | "type_identifier" => {
+                let target = node_text(function, self.source)?.to_string();
+                Some((
+                    function,
+                    CalleeForm::Identifier,
+                    target,
+                    CCppCallReceiver::None,
+                ))
+            }
+            "qualified_identifier" => {
+                let name = function.child_by_field_name("name")?;
+                let target = node_text(name, self.source)?.to_string();
+                let surface = node_text(function, self.source)?;
+                let mut components = surface
+                    .split("::")
+                    .map(str::trim)
+                    .filter(|component| !component.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
+                components.pop();
+                (!components.is_empty()).then_some((
+                    name,
+                    CalleeForm::QualifiedPath,
+                    target,
+                    CCppCallReceiver::Qualified(components),
+                ))
+            }
+            "field_expression" => {
+                let receiver = function.child_by_field_name("argument")?;
+                let field = function.child_by_field_name("field")?;
+                let target = node_text(field, self.source)?.to_string();
+                let operator = function
+                    .child_by_field_name("operator")
+                    .and_then(|operator| node_text(operator, self.source))
+                    .unwrap_or_default();
+                if receiver.kind() == "this" {
+                    return Some((
+                        field,
+                        CalleeForm::ImplicitReceiver,
+                        target,
+                        CCppCallReceiver::Implicit,
+                    ));
+                }
+                if operator != "." {
+                    return Some((
+                        field,
+                        CalleeForm::ExplicitReceiver,
+                        target,
+                        CCppCallReceiver::Blocked,
+                    ));
+                }
+                if let Some(owner_name) = c_cpp_direct_constructor_type(receiver, self.source) {
+                    return Some((
+                        field,
+                        CalleeForm::ExplicitReceiver,
+                        target,
+                        CCppCallReceiver::ExactType {
+                            owner_name,
+                            constructor: true,
+                            receiver_name: None,
+                        },
+                    ));
+                }
+                let receiver_name = node_text(receiver, self.source)?.trim();
+                if !c_cpp_simple_identifier(receiver_name) {
+                    return Some((
+                        field,
+                        CalleeForm::ExplicitReceiver,
+                        target,
+                        CCppCallReceiver::Blocked,
+                    ));
+                }
+                let binding = self
+                    .active_bindings
+                    .get(receiver_name)
+                    .and_then(|bindings| bindings.last())
+                    .or_else(|| {
+                        context.owner_index.and_then(|owner| {
+                            self.index
+                                .owner_bindings
+                                .get(&(owner, receiver_name.to_string()))
+                                .and_then(|bindings| {
+                                    let [binding] = bindings.as_slice() else {
+                                        return None;
+                                    };
+                                    Some(binding)
+                                })
+                        })
+                    });
+                let receiver = match binding {
+                    Some(CCppLexicalBinding::Receiver { owner_name }) => {
+                        CCppCallReceiver::ExactType {
+                            owner_name: owner_name.clone(),
+                            constructor: false,
+                            receiver_name: Some(receiver_name.to_string()),
+                        }
+                    }
+                    _ => CCppCallReceiver::Blocked,
+                };
+                Some((field, CalleeForm::ExplicitReceiver, target, receiver))
+            }
+            _ => {
+                let mut cursor = function.walk();
+                let leaf = function
+                    .named_children(&mut cursor)
+                    .last()
+                    .unwrap_or(function);
+                Some((
+                    leaf,
+                    CalleeForm::DynamicAccess,
+                    node_text(leaf, self.source)?.to_string(),
+                    CCppCallReceiver::Blocked,
+                ))
+            }
+        }
+    }
+
+    fn insert_active(&mut self, name: String, binding: CCppLexicalBinding) {
+        count_c_cpp_resolution_work(1);
+        let scope = self
+            .scopes
+            .last_mut()
+            .expect("C/C++ producer always has one lexical scope");
+        let duplicate_in_scope = scope.names.contains(&name);
+        count_c_cpp_resolution_work(1);
+        scope.names.insert(name.clone());
+        count_c_cpp_resolution_work(1);
+        scope.insertions.push(name.clone());
+        count_c_cpp_resolution_work(1);
+        self.active_bindings
+            .entry(name.clone())
+            .or_default()
+            .push(if duplicate_in_scope {
+                CCppLexicalBinding::Other
+            } else {
+                binding
+            });
+    }
+
+    fn leave_scope(&mut self) {
+        let scope = self
+            .scopes
+            .pop()
+            .expect("C/C++ producer scope stack is balanced");
+        for name in scope.insertions {
+            count_c_cpp_resolution_work(1);
+            if let Some(bindings) = self.active_bindings.get_mut(&name) {
+                bindings.pop();
+                if bindings.is_empty() {
+                    self.active_bindings.remove(&name);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn c_cpp_function_name<'a>(node: TsNode<'a>, source: &'a str) -> Option<&'a str> {
+    c_cpp_declarator_identifier(node.child_by_field_name("declarator")?, source)
+}
+
+fn c_cpp_callable_shape(
+    declarator: TsNode<'_>,
+    source: &str,
+    language: &str,
+) -> Option<(String, Option<Vec<String>>, String)> {
+    let function = c_cpp_function_declarator(declarator)?;
+    let name_declarator = function.child_by_field_name("declarator")?;
+    if c_cpp_declarator_contains_kind(name_declarator, "pointer_declarator") {
+        return None;
+    }
+    let name = c_cpp_declarator_identifier(name_declarator, source)?.to_string();
+    let name_surface = node_text(name_declarator, source)?.trim();
+    let qualifier = name_surface.rsplit_once("::").and_then(|(qualifier, _)| {
+        let components = qualifier
+            .split("::")
+            .map(str::trim)
+            .filter(|component| c_cpp_simple_identifier(component))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        (!components.is_empty()).then_some(components)
+    });
+    let parameters = function.child_by_field_name("parameters")?;
+    let suffix = source.get(parameters.end_byte()..function.end_byte())?;
+    let signature = format!(
+        "{language}:{}:{}",
+        c_cpp_normalize_signature_text(node_text(parameters, source)?),
+        c_cpp_normalize_signature_text(suffix)
+    );
+    Some((name, qualifier, signature))
+}
+
+fn c_cpp_function_declarator(mut declarator: TsNode<'_>) -> Option<TsNode<'_>> {
+    loop {
+        if declarator.kind() == "function_declarator" {
+            return Some(declarator);
+        }
+        declarator = declarator.child_by_field_name("declarator").or_else(|| {
+            let mut cursor = declarator.walk();
+            declarator.named_children(&mut cursor).last()
+        })?;
+        count_c_cpp_resolution_work(1);
+    }
+}
+
+fn c_cpp_normalize_signature_text(surface: &str) -> String {
+    surface
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn c_cpp_declarator_bound_names(node: TsNode<'_>, source: &str) -> Option<Vec<String>> {
+    fn collect(node: TsNode<'_>, source: &str, names: &mut Vec<String>) -> Option<()> {
+        count_c_cpp_resolution_work(1);
+        match node.kind() {
+            "identifier" | "field_identifier" | "type_identifier" => {
+                names.push(node_text(node, source)?.to_string());
+                Some(())
+            }
+            "qualified_identifier" => collect(node.child_by_field_name("name")?, source, names),
+            "structured_binding_declarator" => {
+                let mut cursor = node.walk();
+                let bindings = node.named_children(&mut cursor).collect::<Vec<_>>();
+                if bindings.is_empty()
+                    || bindings
+                        .iter()
+                        .any(|binding| binding.kind() != "identifier")
+                {
+                    return None;
+                }
+                for binding in bindings {
+                    collect(binding, source, names)?;
+                }
+                Some(())
+            }
+            "init_declarator"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "array_declarator"
+            | "function_declarator"
+            | "parenthesized_declarator"
+            | "attributed_declarator"
+            | "variadic_declarator" => {
+                let declarator = node.child_by_field_name("declarator").or_else(|| {
+                    let mut cursor = node.walk();
+                    let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+                    let [declarator] = children.as_slice() else {
+                        return None;
+                    };
+                    Some(*declarator)
+                })?;
+                collect(declarator, source, names)
+            }
+            _ => None,
+        }
+    }
+
+    let mut names = Vec::new();
+    collect(node, source, &mut names)?;
+    names.sort();
+    names.dedup();
+    (!names.is_empty()).then_some(names)
+}
+
+fn c_cpp_untrusted_declaration_expression(root: TsNode<'_>) -> bool {
+    let mut stack = vec![root];
+    let mut has_type_callee = false;
+    let mut has_pointer = false;
+    while let Some(node) = stack.pop() {
+        count_c_cpp_resolution_work(1);
+        if node.kind() == "pointer_expression" {
+            has_pointer = true;
+        }
+        if node.kind() == "call_expression"
+            && node
+                .child_by_field_name("function")
+                .is_some_and(|function| {
+                    matches!(function.kind(), "primitive_type" | "type_identifier")
+                })
+        {
+            has_type_callee = true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    has_type_callee && has_pointer
+}
+
+fn c_cpp_declarator_identifier<'a>(mut node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    loop {
+        if matches!(
+            node.kind(),
+            "identifier" | "field_identifier" | "type_identifier"
+        ) {
+            return node_text(node, source);
+        }
+        if matches!(node.kind(), "operator_name" | "operator_cast") {
+            return None;
+        }
+        let next = node
+            .child_by_field_name("declarator")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor).last()
+            })?;
+        count_c_cpp_resolution_work(1);
+        node = next;
+    }
+}
+
+fn c_cpp_typed_binding(node: TsNode<'_>, source: &str) -> Option<(String, CCppLexicalBinding)> {
+    count_c_cpp_resolution_work(2);
+    let ty = node.child_by_field_name("type")?;
+    let declarator = node.child_by_field_name("declarator")?;
+    let names = c_cpp_declarator_bound_names(declarator, source)?;
+    let [name] = names.as_slice() else {
+        return None;
+    };
+    Some((
+        name.clone(),
+        c_cpp_binding_for_declarator(ty, declarator, source),
+    ))
+}
+
+fn c_cpp_binding_for_declarator(
+    ty: TsNode<'_>,
+    declarator: TsNode<'_>,
+    source: &str,
+) -> CCppLexicalBinding {
+    let type_name = c_cpp_simple_type_name(ty, source);
+    let pointer = c_cpp_declarator_contains_kind(declarator, "pointer_declarator");
+    type_name
+        .filter(|_| !pointer)
+        .map_or(CCppLexicalBinding::Other, |owner_name| {
+            CCppLexicalBinding::Receiver { owner_name }
+        })
+}
+
+fn c_cpp_simple_type_name(node: TsNode<'_>, source: &str) -> Option<String> {
+    let surface = node_text(node, source)?.trim();
+    c_cpp_simple_identifier(surface).then(|| surface.to_string())
+}
+
+fn c_cpp_simple_identifier(surface: &str) -> bool {
+    let mut chars = surface.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn c_cpp_declarator_contains_kind(root: TsNode<'_>, kind: &str) -> bool {
+    let mut node = Some(root);
+    while let Some(current) = node {
+        count_c_cpp_resolution_work(1);
+        if current.kind() == kind {
+            return true;
+        }
+        node = current.child_by_field_name("declarator").or_else(|| {
+            let mut cursor = current.walk();
+            current.named_children(&mut cursor).last()
+        });
+    }
+    false
+}
+
+fn c_cpp_direct_constructor_type(node: TsNode<'_>, source: &str) -> Option<String> {
+    (node.kind() == "call_expression").then_some(())?;
+    let function = node.child_by_field_name("function")?;
+    matches!(function.kind(), "identifier" | "type_identifier")
+        .then(|| node_text(function, source))
+        .flatten()
+        .filter(|name| c_cpp_simple_identifier(name))
+        .map(str::to_string)
+}
+
+fn c_cpp_function_is_virtual(node: TsNode<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| {
+        child.kind() == "virtual" || node_text(child, source).is_some_and(|text| text == "virtual")
+    })
+}
+
+fn c_cpp_function_is_static(node: TsNode<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| {
+        child.kind() == "static" || node_text(child, source).is_some_and(|text| text == "static")
+    })
+}
+
+fn c_cpp_has_direct_kind(node: TsNode<'_>, kind: &str) -> bool {
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| child.kind() == kind)
+}
+
+fn c_cpp_generated_source(source: &str) -> bool {
+    source
+        .lines()
+        .take(8)
+        .any(|line| line.to_ascii_lowercase().contains("generated"))
+}
+
+fn c_cpp_source_role(path: &Path) -> CachedCCppSourceRole {
+    match crate::normalized_path_extension(path).as_deref() {
+        Some("h" | "hpp" | "hh" | "hxx") => CachedCCppSourceRole::Header,
+        _ => CachedCCppSourceRole::Source,
+    }
+}
+
+fn c_cpp_sort_calls_by_span(calls: &mut Vec<IndexedCCppCall<'_>>) {
+    for shift in (0..usize::BITS).step_by(8) {
+        let mut buckets = (0..=u8::MAX)
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<IndexedCCppCall<'_>>>>();
+        for call in std::mem::take(calls) {
+            count_c_cpp_resolution_work(1);
+            let bucket = (call.callee.start_byte() >> shift) & usize::from(u8::MAX);
+            buckets[bucket].push(call);
+        }
+        for bucket in buckets {
+            count_c_cpp_resolution_work(bucket.len());
+            calls.extend(bucket);
+        }
+    }
 }
 
 fn expected_parser_fingerprint(path: &Path, language: &str) -> Option<String> {
@@ -8634,11 +10131,20 @@ pub fn rematerialize_proof_resolution_projection(
                 indexed_file.path.display()
             ));
         }
+        let c_cpp_source_identity_matches = if is_c_cpp_language(&indexed_file.language) {
+            record.file.c_cpp_file.as_ref().is_some_and(|file| {
+                file.source_path == indexed_file.path
+                    && file.source_role == c_cpp_source_role(&indexed_file.path)
+            })
+        } else {
+            record.file.c_cpp_file.is_none()
+        };
         if record.file.file_id != NodeId(indexed_file.id)
             || record.file.source_sha256 != *stored_hash
             || record.file.language != indexed_file.language
             || record.file.complete != indexed_file.complete
             || record.file.adapter_version != adapter_version(&indexed_file.language)
+            || !c_cpp_source_identity_matches
             || record.calls.iter().any(|call| {
                 call.callsite.file_id != FileId(indexed_file.id)
                     || call.callsite.source_sha256 != *stored_hash
@@ -9635,6 +11141,7 @@ struct ExactEvidenceValidationIndex {
     typescript_directory_import_relations:
         HashMap<(NodeId, NodeId), TypescriptDirectoryImportState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
+    member_by_owner_and_name: HashMap<(NodeId, String), Option<NodeId>>,
     python_import_paths: HashMap<(NodeId, NodeId, String), Vec<Vec<NodeId>>>,
     python_import_path_counts: HashMap<(NodeId, NodeId, Vec<NodeId>), usize>,
 }
@@ -9804,10 +11311,28 @@ impl ExactEvidenceValidationIndex {
                 current = *next;
             }
         }
+        let mut member_by_owner_and_name = HashMap::new();
+        for (&(owner, member), state) in &member_relations {
+            if !state.is_unique() {
+                continue;
+            }
+            let Some(member_node) = nodes.get(&member) else {
+                continue;
+            };
+            let key = (
+                owner,
+                graph_leaf_name(&member_node.serialized_name).to_string(),
+            );
+            member_by_owner_and_name
+                .entry(key)
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(member));
+        }
         Self {
             import_relations,
             typescript_directory_import_relations,
             member_relations,
+            member_by_owner_and_name,
             python_import_paths,
             python_import_path_counts,
         }
@@ -9835,6 +11360,53 @@ impl ExactEvidenceValidationIndex {
         self.member_relations
             .get(&(owner, member))
             .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn has_cpp_member_definition(
+        &self,
+        owner: NodeId,
+        member: NodeId,
+        nodes: &HashMap<NodeId, &Node>,
+    ) -> bool {
+        if self.has_member(owner, member) {
+            return true;
+        }
+        let (Some(owner_node), Some(member_node)) = (nodes.get(&owner), nodes.get(&member)) else {
+            return false;
+        };
+        if !matches!(owner_node.kind, NodeKind::CLASS | NodeKind::STRUCT)
+            || member_node.kind != NodeKind::FUNCTION
+            || owner_node.file_node_id.is_none()
+            || owner_node.file_node_id != member_node.file_node_id
+        {
+            return false;
+        }
+        let member_name = graph_leaf_name(&member_node.serialized_name);
+        let owner_name = owner_node
+            .qualified_name
+            .as_deref()
+            .unwrap_or(&owner_node.serialized_name);
+        let member_identity = member_node
+            .qualified_name
+            .as_deref()
+            .unwrap_or(&member_node.serialized_name);
+        if member_identity != format!("{owner_name}::{member_name}") {
+            return false;
+        }
+        self.member_by_owner_and_name
+            .get(&(owner, member_name.to_string()))
+            .is_some_and(Option::is_some)
+    }
+
+    fn has_member_for_language(
+        &self,
+        language: &str,
+        owner: NodeId,
+        member: NodeId,
+        nodes: &HashMap<NodeId, &Node>,
+    ) -> bool {
+        self.has_member(owner, member)
+            || (language == "cpp" && self.has_cpp_member_definition(owner, member, nodes))
     }
 
     fn python_import_path(
@@ -9995,6 +11567,8 @@ impl ExactEvidenceValidationIndex {
                 let local_shape = *declaration == target
                     && if claim.input.language == "python" {
                         target_node.kind == NodeKind::FUNCTION
+                    } else if claim.input.language == "cpp" {
+                        matches!(target_node.kind, NodeKind::METHOD | NodeKind::FUNCTION)
                     } else {
                         target_node.kind == NodeKind::METHOD
                     }
@@ -10010,8 +11584,13 @@ impl ExactEvidenceValidationIndex {
                         }
                     });
                 local_shape
-                    && self.has_member(*owner, claim.caller)
-                    && self.has_member(*owner, target)
+                    && self.has_member_for_language(
+                        &claim.input.language,
+                        *owner,
+                        claim.caller,
+                        nodes,
+                    )
+                    && self.has_member_for_language(&claim.input.language, *owner, target, nodes)
             }
             (
                 CalleeForm::ImplicitReceiver,
@@ -10345,7 +11924,7 @@ impl ExactEvidenceValidationIndex {
                 && owner_node.file_node_id == target_node.file_node_id
         };
         declaration == target
-            && if language == "python" {
+            && if matches!(language, "python" | "cpp") {
                 target_node.kind == NodeKind::FUNCTION
             } else {
                 target_node.kind == NodeKind::METHOD
@@ -11988,7 +13567,6 @@ struct SyntaxClaimIndexes<'a, 'records> {
     java_kotlin: &'a JavaKotlinProjectionIndex,
     python: &'a PythonProjectionIndex,
 }
-
 fn resolve_syntax_claim(
     indexes: &SyntaxClaimIndexes<'_, '_>,
     source_record: &ResolutionCacheRecord,
@@ -12814,6 +14392,50 @@ fn resolve_syntax_claim(
                 reason = ProofResolutionReason::LookupDomainIncomplete;
             }
         },
+        CachedResolutionBinding::CCppQualified { components } => {
+            let recorded = input.language == "cpp"
+                && components.len() == 2
+                && source_record.file.c_cpp_file.as_ref().is_some_and(|file| {
+                    file.namespaces
+                        .iter()
+                        .any(|namespace| namespace.declaration == components[0])
+                        || source_record.file.classes.iter().any(|class| {
+                            class.declaration == components[0]
+                                && class
+                                    .methods
+                                    .iter()
+                                    .any(|method| method.declaration == components[1])
+                        })
+                })
+                && (source_record
+                    .file
+                    .top_level_declarations
+                    .iter()
+                    .any(|declaration| declaration.declaration == components[1])
+                    || source_record.file.classes.iter().any(|class| {
+                        class
+                            .methods
+                            .iter()
+                            .any(|method| method.declaration == components[1])
+                    }));
+            if recorded {
+                status = ProofResolutionStatus::Exact;
+                reason = ProofResolutionReason::ExactResolution;
+                target = components.last().copied();
+                evidence_chain.push(ResolutionEvidence::QualifiedPath {
+                    components: components.clone(),
+                });
+                exact_node_file_expectations.extend(
+                    components
+                        .iter()
+                        .copied()
+                        .map(|component| (component, input.callsite.file_id)),
+                );
+            } else {
+                status = ProofResolutionStatus::Ambiguous;
+                reason = ProofResolutionReason::MultipleBindings;
+            }
+        }
         CachedResolutionBinding::Ambiguous => {
             status = ProofResolutionStatus::Ambiguous;
             reason = ProofResolutionReason::MultipleBindings;
@@ -13665,6 +15287,7 @@ mod rust_complexity_tests {
                 rust_uses: imports,
                 go_package: None,
                 java_kotlin_package: None,
+                c_cpp_file: None,
             },
             calls: Vec::new(),
         };
@@ -13770,6 +15393,89 @@ mod rust_complexity_tests {
         assert!(
             large <= small * 2 + 128,
             "projection work grew superlinearly: {small} -> {large}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod c_cpp_complexity_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn measured_work(source: &str) -> usize {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar must load");
+        let tree = parser.parse(source, None).expect("C++ source must parse");
+        let file_id = NodeId(1);
+        let mut nodes = Vec::new();
+        let mut next_id = 2_i64;
+        walk_nodes(tree.root_node(), &mut |node| {
+            let (kind, name) = match node.kind() {
+                "class_specifier" | "struct_specifier" => (
+                    NodeKind::CLASS,
+                    node.child_by_field_name("name")
+                        .and_then(|name| node_text(name, source)),
+                ),
+                "function_definition" => (NodeKind::FUNCTION, c_cpp_function_name(node, source)),
+                _ => return,
+            };
+            let Some(name) = name else {
+                return;
+            };
+            nodes.push(Node {
+                id: NodeId(next_id),
+                kind,
+                serialized_name: name.to_string(),
+                file_node_id: Some(file_id),
+                start_line: Some(node.start_position().row as u32 + 1),
+                ..Node::default()
+            });
+            next_id += 1;
+        });
+        reset_c_cpp_resolution_work();
+        let index = CCppResolutionIndex::build(
+            &tree,
+            source,
+            Path::new("fixture.cpp"),
+            "cpp",
+            file_id,
+            &nodes,
+        );
+        for call in &index.calls {
+            let _ = index.resolve_syntax_claim(call.callee, call.form, &call.raw_target);
+        }
+        c_cpp_resolution_work()
+    }
+
+    fn source(count: usize) -> String {
+        let mut source = String::from("class Worker { public: void run() {} };\n");
+        for index in 0..count {
+            source.push_str(&format!("class Owner{index} {{ public:\n"));
+        }
+        source.push_str("void caller() {\n");
+        for index in 0..count {
+            source.push_str(&format!("Worker receiver{index}; receiver{index}.run();\n"));
+        }
+        source.push_str("}\n");
+        for _ in 0..count {
+            source.push_str("};\n");
+        }
+        source
+    }
+
+    #[test]
+    fn c_cpp_parser_index_work_is_linear_for_doubled_receivers_and_nested_owners() {
+        let small = measured_work(&source(64));
+        let large = measured_work(&source(128));
+        assert!(
+            small >= 64 * 8,
+            "C++ parser work was not fully counted: {small}"
+        );
+        assert!(
+            large <= small * 2 + 256,
+            "C++ parser/index work grew superlinearly: {small} -> {large}"
         );
     }
 }
@@ -13992,6 +15698,7 @@ mod go_complexity_tests {
                         methods: Vec::new(),
                     }),
                     java_kotlin_package: None,
+                    c_cpp_file: None,
                 },
                 calls: Vec::new(),
             });
@@ -14124,6 +15831,7 @@ mod python_complexity_tests {
                 rust_uses: Vec::new(),
                 go_package: None,
                 java_kotlin_package: None,
+                c_cpp_file: None,
             },
             calls: Vec::new(),
         }

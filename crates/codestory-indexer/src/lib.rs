@@ -16,6 +16,7 @@ use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, EdgeId, EdgeKind, FileCoverageReason, Node, NodeId,
     NodeKind, Occurrence, OccurrenceKind, ResolutionCertainty, SourceLocation,
 };
+use codestory_contracts::language_support::normalize_extension;
 use codestory_contracts::workspace::{OversizedSourceExclusionCandidate, SourceIndexPolicy};
 use codestory_store::{
     IndexArtifactCacheReader, IndexArtifactCacheWrite, StorageError, Store as Storage,
@@ -636,9 +637,13 @@ fn cpp_language_config() -> LanguageConfig {
 }
 
 fn path_is_c_header(path: &Path) -> bool {
+    normalized_path_extension(path).as_deref() == Some("h")
+}
+
+pub(crate) fn normalized_path_extension(path: &Path) -> Option<String> {
     path.extension()
-        .and_then(|s| s.to_str())
-        .is_some_and(|ext| ext.trim().trim_start_matches('.').eq_ignore_ascii_case("h"))
+        .and_then(|extension| extension.to_str())
+        .map(normalize_extension)
 }
 
 fn header_source_has_cpp_signals(source: &str) -> bool {
@@ -685,11 +690,11 @@ fn get_language_config_for_path(
     path: &Path,
     compilation_info: Option<&compilation_database::CompilationInfo>,
 ) -> Option<LanguageConfig> {
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    if ext.trim().trim_start_matches('.').eq_ignore_ascii_case("h") {
+    let ext = normalized_path_extension(path).unwrap_or_default();
+    if ext == "h" {
         return Some(infer_header_language_config(compilation_info));
     }
-    get_language_for_ext(ext)
+    get_language_for_ext(&ext)
 }
 
 /// Batch sizes used while flushing incremental indexing output.
@@ -4456,6 +4461,14 @@ fn rebase_cached_index_artifact(
                 constructor_record,
                 constructor_method,
             },
+            CachedResolutionBinding::CCppQualified { components } => {
+                CachedResolutionBinding::CCppQualified {
+                    components: components
+                        .into_iter()
+                        .map(|component| id_remap.get(&component).copied().unwrap_or(component))
+                        .collect(),
+                }
+            }
             other => other,
         };
     }
@@ -4515,6 +4528,15 @@ fn rebase_cached_index_artifact(
                     .get(&method.declaration)
                     .copied()
                     .unwrap_or(method.declaration);
+            }
+        }
+        if let Some(c_cpp_file) = &mut resolution_file.c_cpp_file {
+            c_cpp_file.source_path = full_path.to_path_buf();
+            for namespace in &mut c_cpp_file.namespaces {
+                namespace.declaration = id_remap
+                    .get(&namespace.declaration)
+                    .copied()
+                    .unwrap_or(namespace.declaration);
             }
         }
     }
@@ -16699,6 +16721,7 @@ mod proof_resolution_cache_tests {
                 rust_uses: Vec::new(),
                 go_package: None,
                 java_kotlin_package: None,
+                c_cpp_file: None,
             }),
         };
 

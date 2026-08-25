@@ -1,7 +1,7 @@
 use codestory_contracts::events::EventBus;
 use codestory_contracts::graph::{EdgeId, EdgeKind, Node, NodeId, NodeKind, ResolutionCertainty};
 use codestory_contracts::proof_resolution::{
-    DependencyFileHash, FileId, ProofResolutionProjection, ProofResolutionReason,
+    CalleeForm, DependencyFileHash, FileId, ProofResolutionProjection, ProofResolutionReason,
     ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
 };
 use codestory_indexer::{
@@ -1080,6 +1080,442 @@ fn kotlin_parameter_shadow_never_proves_package_or_import_target() -> anyhow::Re
         .expect("shadowed Kotlin call fact");
     assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
     assert!(fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty());
+    Ok(())
+}
+
+#[test]
+fn c_cpp_closed_direct_identifier_matrix() -> anyhow::Result<()> {
+    for (language, path, source, expected) in [
+        (
+            "c",
+            "fixture.c",
+            "void target(void) {} void caller(void) { target(); }\n",
+            ProofResolutionStatus::Exact,
+        ),
+        (
+            "cpp",
+            "fixture.cpp",
+            "void target() {} void caller() { target(); }\n",
+            ProofResolutionStatus::Exact,
+        ),
+        (
+            "c",
+            "hostile.c",
+            "void target(void) {} void caller(void) { void (*p)(void) = target; p(); }\n",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "cpp",
+            "hostile.cpp",
+            "void target() {} void caller() { auto p = target; p(); }\n",
+            ProofResolutionStatus::Unsupported,
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| fact.provenance.language_adapter == language)
+            .expect("C/C++ source call fact");
+        assert_eq!(fact.status, expected, "{language}: {fact:#?}");
+        if expected != ProofResolutionStatus::Exact {
+            assert!(
+                fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cpp_closed_exact_subset_emits_replay_valid_authenticated_facts() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "fixture.cpp",
+            concat!(
+                "namespace exact { void namespaced_target() {} }\n",
+                "class Worker {\n",
+                "public:\n",
+                "  static void static_target() {}\n",
+                "  void member_target() {}\n",
+                "  void implicit_caller() { member_target(); }\n",
+                "  void this_caller() { this->member_target(); }\n",
+                "};\n",
+                "class Holder {\n",
+                "  Worker field;\n",
+                "  void field_caller() { field.member_target(); }\n",
+                "};\n",
+                "void free_target() {}\n",
+                "void free_caller() { free_target(); }\n",
+                "void namespace_caller() { exact::namespaced_target(); }\n",
+                "void static_caller() { Worker::static_target(); }\n",
+                "void parameter_caller(Worker& value) { value.member_target(); }\n",
+                "void local_caller() { Worker value; value.member_target(); }\n",
+                "void constructor_caller() { Worker().member_target(); }\n",
+            ),
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "cpp")
+        .collect::<Vec<_>>();
+    for (target, expected) in [
+        ("free_target", 1),
+        ("namespaced_target", 1),
+        ("static_target", 1),
+        ("member_target", 6),
+    ] {
+        let exact = facts
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == target)
+            .filter(|fact| fact.status == ProofResolutionStatus::Exact)
+            .collect::<Vec<_>>();
+        assert_eq!(exact.len(), expected, "{target}: {facts:#?}");
+        assert!(exact.iter().all(|fact| {
+            fact.edge_id.is_some()
+                && fact.target.is_some()
+                && !fact.evidence_chain.is_empty()
+                && fact.lookup_domain_complete
+                && fact.provenance.dependency_file_hashes.len() == 1
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn cpp_closed_hostile_matrix_never_proves() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "overload",
+            "void target(int) {} void target(double) {} void caller() { target(1); }\n",
+            "target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "template",
+            "template <typename T> void target(T) {} void caller() { target(1); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "virtual",
+            "class Worker { public: virtual void target() {} void caller() { target(); } };\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "operator",
+            "struct Worker { void operator()() {} }; void caller() { Worker value; value(); }\n",
+            "value",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "macro",
+            "#define INVOKE target\nvoid target() {} void caller() { INVOKE(); }\n",
+            "INVOKE",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "conditional",
+            "void target() {}\n#if ENABLED\nvoid caller() { target(); }\n#endif\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "rebinding",
+            "class Worker { public: void target() {} }; void caller() { Worker value; value = Worker(); value.target(); }\n",
+            "target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "pointer_receiver",
+            "class Worker { public: void target() {} }; void caller(Worker* value) { value->target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "declaration_only",
+            "void target(); void caller() { target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+    ];
+    for (name, source, target, expected) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[("hostile.cpp", source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == "cpp" && fact.callsite.raw_target == target
+            })
+            .unwrap_or_else(|| panic!("{name} did not emit a canonical closed fact: {facts:#?}"));
+        assert_eq!(fact.status, expected, "{name}: {fact:#?}");
+        assert!(fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn c_cpp_complete_declaration_domain_replays_or_fails_closed() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "cpp_out_of_class_definition",
+            "fixture.cpp",
+            concat!(
+                "class Worker { public: void target(); void caller(); };\n",
+                "void Worker::target() {}\n",
+                "void Worker::caller() { target(); }\n",
+            ),
+            ProofResolutionStatus::Exact,
+        ),
+        (
+            "c_prototype",
+            "fixture.c",
+            "void target(void); void caller(void) { target(); }\n",
+            ProofResolutionStatus::Exact,
+        ),
+        (
+            "c_function_pointer_shadow",
+            "fixture.c",
+            "void target(void); void caller(void) { void (*target)(void); target(); }\n",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "c_local_shadow",
+            "fixture.c",
+            "void target(void); void caller(void) { int target = 0; target(); }\n",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "cpp_prototype_overload",
+            "fixture.cpp",
+            "void target(int); void target(double); void caller() { target(1); }\n",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "cpp_virtual_prototype",
+            "fixture.cpp",
+            "class Worker { public: virtual void target(); void caller() { target(); } };\n",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "cpp_unknown_local_declarator",
+            "fixture.cpp",
+            "void target(); void caller() { void (*target)(), (*other)(); target(); }\n",
+            ProofResolutionStatus::Unsupported,
+        ),
+    ];
+    for (name, path, source, expected) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .unwrap_or_else(|| panic!("{name} emitted no canonical target fact: {facts:#?}"));
+        assert_eq!(fact.status, expected, "{name}: {fact:#?}");
+        if expected == ProofResolutionStatus::Exact {
+            assert!(
+                fact.edge_id.is_some() && fact.target.is_some() && !fact.evidence_chain.is_empty(),
+                "{name}: {fact:#?}"
+            );
+            if name == "cpp_out_of_class_definition" {
+                assert_eq!(fact.callsite.callee_form, CalleeForm::ImplicitReceiver);
+                assert!(matches!(
+                    fact.evidence_chain.as_slice(),
+                    [
+                        ResolutionEvidence::ImplicitReceiver { .. },
+                        ResolutionEvidence::SameFileDeclaration { .. }
+                    ]
+                ));
+            }
+            if name == "c_prototype" {
+                assert!(matches!(
+                    fact.evidence_chain.as_slice(),
+                    [ResolutionEvidence::SameFileDeclaration { .. }]
+                ));
+                let target = fact.target.expect("exact C prototype target");
+                assert!(store.get_nodes()?.iter().any(|node| {
+                    node.id == target
+                        && node.kind == NodeKind::FUNCTION
+                        && node.start_line == Some(1)
+                }));
+            }
+        } else {
+            assert!(
+                fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty(),
+                "{name}: {fact:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn cpp_local_declarator_domain_shadows_free_and_implicit_member_calls() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "free_parser_multi_pointer",
+            concat!(
+                "void target() {}\n",
+                "void caller() { int *other, *target; target(); }\n",
+            ),
+        ),
+        (
+            "free_function_pointer_alias",
+            concat!(
+                "using Callback = void (*)(); void target() {}\n",
+                "void caller() { Callback other, target; target(); }\n",
+            ),
+        ),
+        (
+            "free_unauthenticated_function_pointer_shape",
+            concat!(
+                "void target() {}\n",
+                "void caller() { void (*other)(), (*target)(); target(); }\n",
+            ),
+        ),
+        (
+            "free_array_pointer",
+            concat!(
+                "void target() {}\n",
+                "void caller() { void (*other[2])(), (*target[2])(); target(); }\n",
+            ),
+        ),
+        (
+            "free_structured_binding",
+            concat!(
+                "void target() {}\n",
+                "void caller() { auto [target, other] = pair; target(); }\n",
+            ),
+        ),
+        (
+            "implicit_parser_multi_pointer",
+            concat!(
+                "class Worker { public: void target() {} ",
+                "void caller() { int *other, *target; target(); } };\n",
+            ),
+        ),
+        (
+            "implicit_function_pointer_alias",
+            concat!(
+                "using Callback = void (*)(); ",
+                "class Worker { public: void target() {} ",
+                "void caller() { Callback other, target; target(); } };\n",
+            ),
+        ),
+        (
+            "implicit_unauthenticated_function_pointer_shape",
+            concat!(
+                "class Worker { public: void target() {} ",
+                "void caller() { void (*other)(), (*target)(); target(); } };\n",
+            ),
+        ),
+        (
+            "implicit_array_pointer",
+            concat!(
+                "class Worker { public: void target() {} ",
+                "void caller() { void (*other[2])(), (*target[2])(); target(); } };\n",
+            ),
+        ),
+        (
+            "implicit_structured_binding",
+            concat!(
+                "class Worker { public: void target() {} ",
+                "void caller() { auto [target, other] = pair; target(); } };\n",
+            ),
+        ),
+    ];
+    for (name, source) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[("fixture.cpp", source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let target_facts = facts
+            .iter()
+            .filter(|fact| fact.callsite.raw_target == "target")
+            .collect::<Vec<_>>();
+        assert!(
+            !target_facts.is_empty(),
+            "{name} emitted no canonical target fact: {facts:#?}"
+        );
+        for fact in target_facts {
+            assert_eq!(
+                fact.status,
+                ProofResolutionStatus::Unsupported,
+                "{name}: {fact:#?}"
+            );
+            assert!(
+                fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn c_cpp_header_extensions_are_always_canonical_nonexact() -> anyhow::Result<()> {
+    for (extension, expected) in [
+        ("h", ProofResolutionStatus::Unsupported),
+        ("H", ProofResolutionStatus::Unsupported),
+        ("hh", ProofResolutionStatus::Unsupported),
+        ("HH", ProofResolutionStatus::Unsupported),
+        ("hH", ProofResolutionStatus::Unsupported),
+        ("hpp", ProofResolutionStatus::Unsupported),
+        ("HPP", ProofResolutionStatus::Unsupported),
+        ("hPp", ProofResolutionStatus::Unsupported),
+        ("hxx", ProofResolutionStatus::Unsupported),
+        ("HXX", ProofResolutionStatus::Unsupported),
+        ("hXx", ProofResolutionStatus::Unsupported),
+        ("c", ProofResolutionStatus::Exact),
+        ("C", ProofResolutionStatus::Exact),
+        ("cc", ProofResolutionStatus::Exact),
+        ("CC", ProofResolutionStatus::Exact),
+        ("cC", ProofResolutionStatus::Exact),
+        ("cpp", ProofResolutionStatus::Exact),
+        ("CPP", ProofResolutionStatus::Exact),
+        ("cPp", ProofResolutionStatus::Exact),
+        ("cxx", ProofResolutionStatus::Exact),
+        ("CXX", ProofResolutionStatus::Exact),
+        ("cXx", ProofResolutionStatus::Exact),
+    ] {
+        let source = "void target() {} void caller() { target(); }\n";
+        let path = format!("fixture.{extension}");
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(&path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter()
+            .find(|fact| fact.callsite.raw_target == "target")
+            .unwrap_or_else(|| panic!("{path} emitted no canonical target fact: {facts:#?}"));
+        assert_eq!(fact.status, expected, "{path}: {fact:#?}");
+        if expected != ProofResolutionStatus::Exact {
+            assert!(
+                fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty(),
+                "{path}: {fact:#?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -7646,7 +8082,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let mut empty = Store::new_in_memory()?;
     let empty_receipt = rematerialize_proof_resolution_projection(&mut empty, &publication(1))?;
     assert_eq!(empty_receipt.fact_count, 0);
-    assert_eq!(empty_receipt.adapter_roster.len(), 8);
+    assert_eq!(empty_receipt.adapter_roster.len(), 10);
 
     let project = tempfile::tempdir()?;
     let mut unsupported = Store::new_in_memory()?;
@@ -7661,7 +8097,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let unsupported_receipt =
         rematerialize_proof_resolution_projection(&mut unsupported, &publication(1))?;
     assert_eq!(unsupported_receipt.fact_count, 0);
-    assert_eq!(unsupported_receipt.adapter_roster.len(), 8);
+    assert_eq!(unsupported_receipt.adapter_roster.len(), 10);
 
     let governed_project = tempfile::tempdir()?;
     let mut governed = Store::new_in_memory()?;
@@ -7889,7 +8325,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v18", "adapter", "language"]
+            ["stale", "schema-v21", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -8318,6 +8754,17 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
                 .map(|adapter| adapter.adapter_version.as_str()),
             Some("reference-v2"),
             "{language} must invalidate parser inputs through its explicit adapter identity"
+        );
+    }
+    for (language, version) in [("c", "reference-v2"), ("cpp", "reference-v3")] {
+        assert_eq!(
+            receipt
+                .adapter_roster
+                .iter()
+                .find(|adapter| adapter.language == language)
+                .map(|adapter| adapter.adapter_version.as_str()),
+            Some(version),
+            "C and C++ must invalidate their complete declaration inputs"
         );
     }
     for fact in store.get_proof_resolution_facts()? {
