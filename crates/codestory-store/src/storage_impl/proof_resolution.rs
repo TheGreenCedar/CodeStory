@@ -257,6 +257,8 @@ struct ProofResolutionValidationContext {
     ordinary_call_edge_indices: Vec<usize>,
     parsed_callsite_identity_by_edge: HashMap<EdgeId, CanonicalCallsiteIdentity>,
     import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
+    typescript_directory_import_relations:
+        HashMap<(NodeId, NodeId), TypescriptDirectoryImportState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
     python_import_paths: HashMap<(NodeId, NodeId), Vec<Vec<NodeId>>>,
     python_file_ids_by_path: HashMap<PathBuf, Vec<FileId>>,
@@ -858,6 +860,7 @@ mod go_replay_complexity_tests {
             ordinary_call_edge_indices: Vec::new(),
             parsed_callsite_identity_by_edge: HashMap::new(),
             import_relations: HashMap::new(),
+            typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
             python_import_paths: HashMap::new(),
             python_file_ids_by_path: HashMap::new(),
@@ -1019,6 +1022,7 @@ mod python_replay_complexity_tests {
             ordinary_call_edge_indices: Vec::new(),
             parsed_callsite_identity_by_edge: HashMap::new(),
             import_relations: HashMap::new(),
+            typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
             python_import_paths: HashMap::new(),
             python_file_ids_by_path,
@@ -1071,6 +1075,41 @@ struct ProofRelationState {
 impl ProofRelationState {
     fn is_unique(&self) -> bool {
         self.admissible == 1 && self.conflicting == 0
+    }
+}
+
+#[derive(Default)]
+struct TypescriptDirectoryImportState {
+    marker: Option<&'static str>,
+    marker_seen: bool,
+    admissible: usize,
+    conflicting: usize,
+}
+
+impl TypescriptDirectoryImportState {
+    fn record(&mut self, marker: Option<&'static str>, admissible: bool) {
+        self.marker_seen |= marker.is_some();
+        if admissible {
+            let marker = marker.expect("directory marker admission requires a marker");
+            self.marker.get_or_insert(marker);
+            self.admissible += 1;
+        } else {
+            self.conflicting += 1;
+        }
+    }
+
+    fn unique_marker(&self) -> Option<&'static str> {
+        (self.admissible == 1 && self.conflicting == 0)
+            .then_some(self.marker)
+            .flatten()
+    }
+}
+
+fn typescript_directory_specifier(literal: &str) -> Option<&'static str> {
+    match literal {
+        "'.'" | "\".\"" => Some("."),
+        "'..'" | "\"..\"" => Some(".."),
+        _ => None,
     }
 }
 
@@ -1138,6 +1177,8 @@ impl ProofResolutionValidationContext {
             prepare_call_edge_correlation_index(&edges, &node_by_id);
         let mut edge_index_by_id = HashMap::with_capacity(edges.len());
         let mut import_relations = HashMap::<_, ProofRelationState>::new();
+        let mut typescript_directory_import_relations =
+            HashMap::<_, TypescriptDirectoryImportState>::new();
         let mut member_relations = HashMap::<_, ProofRelationState>::new();
         let mut python_import_edges = HashMap::<NodeId, Vec<NodeId>>::new();
         for (index, edge) in edges.iter().enumerate() {
@@ -1170,6 +1211,27 @@ impl ProofResolutionValidationContext {
                 } else {
                     state.conflicting += 1;
                 }
+            }
+            if edge.kind == EdgeKind::IMPORT
+                && let Some(import) = node_by_id.get(&edge.source)
+                && import.kind == NodeKind::UNKNOWN
+                && let Some(source_file) = import.file_node_id
+            {
+                let target = node_by_id.get(&edge.target);
+                let marker = target
+                    .filter(|target| target.kind == NodeKind::MODULE)
+                    .and_then(|target| typescript_directory_specifier(&target.serialized_name));
+                let admissible = marker.is_some()
+                    && edge.file_node_id == Some(source_file)
+                    && target.is_some_and(|target| target.file_node_id == Some(source_file))
+                    && edge.effective_source() == edge.source
+                    && edge.effective_target() == edge.target
+                    && edge.resolved_target.is_none()
+                    && edge.candidate_targets.is_empty();
+                typescript_directory_import_relations
+                    .entry((source_file, edge.source))
+                    .or_default()
+                    .record(marker, admissible);
             }
             if python_raw_import_marker_is_admissible(edge, &node_by_id) {
                 python_import_edges
@@ -1259,6 +1321,7 @@ impl ProofResolutionValidationContext {
             ordinary_call_edge_indices,
             parsed_callsite_identity_by_edge,
             import_relations,
+            typescript_directory_import_relations,
             member_relations,
             python_import_paths,
             python_file_ids_by_path,
@@ -1274,6 +1337,18 @@ impl ProofResolutionValidationContext {
         self.import_relations
             .get(&(file, import, target))
             .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn typescript_directory_import(&self, file: NodeId, import: NodeId) -> Option<&'static str> {
+        self.typescript_directory_import_relations
+            .get(&(file, import))
+            .and_then(TypescriptDirectoryImportState::unique_marker)
+    }
+
+    fn typescript_directory_marker_seen(&self, file: NodeId, import: NodeId) -> bool {
+        self.typescript_directory_import_relations
+            .get(&(file, import))
+            .is_some_and(|state| state.marker_seen)
     }
 
     fn has_member(&self, owner: NodeId, member: NodeId) -> bool {
@@ -1844,7 +1919,15 @@ impl Storage {
                     .ok_or_else(|| proof_error("static import binding is missing"))?;
                 if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                     || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
-                    || !context.has_import(NodeId(fact.callsite.file_id.0), *import, target)
+                    || !(if context
+                        .typescript_directory_marker_seen(NodeId(fact.callsite.file_id.0), *import)
+                    {
+                        typescript_directory_import_target_is_authenticated(
+                            context, fact, *import, target,
+                        )
+                    } else {
+                        context.has_import(NodeId(fact.callsite.file_id.0), *import, target)
+                    })
                 {
                     return Err(proof_error(
                         "StaticImportBinding is not the unique source import bound to target",
@@ -2632,6 +2715,142 @@ fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
         }
         _ => false,
     }
+}
+
+fn normalize_stored_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::Normal(name) => normalized.push(name),
+        }
+    }
+    Some(normalized)
+}
+
+fn stored_paths_match(left: &Path, right: &Path) -> bool {
+    let native_match = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (
+                std::fs::symlink_metadata(left),
+                std::fs::symlink_metadata(right),
+            ) {
+                (Ok(left), Ok(right)) => {
+                    Some((left.dev(), left.ino()) == (right.dev(), right.ino()))
+                }
+                (Err(left), _) if left.kind() == std::io::ErrorKind::NotFound => None,
+                (_, Err(right)) if right.kind() == std::io::ErrorKind::NotFound => None,
+                _ => Some(false),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+                (Ok(left), Ok(right)) => Some(
+                    left.to_string_lossy()
+                        .eq_ignore_ascii_case(&right.to_string_lossy()),
+                ),
+                (Err(left), _) if left.kind() == std::io::ErrorKind::NotFound => None,
+                (_, Err(right)) if right.kind() == std::io::ErrorKind::NotFound => None,
+                _ => Some(false),
+            }
+        }
+    };
+    native_match.unwrap_or_else(|| {
+        let (Some(left), Some(right)) = (normalize_stored_path(left), normalize_stored_path(right))
+        else {
+            return false;
+        };
+        #[cfg(windows)]
+        {
+            left.to_string_lossy()
+                .eq_ignore_ascii_case(&right.to_string_lossy())
+        }
+        #[cfg(not(windows))]
+        {
+            left == right
+        }
+    })
+}
+
+fn typescript_source_extension_is_supported(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| matches!(extension, "ts" | "tsx"))
+}
+
+fn typescript_directory_import_target_is_authenticated(
+    context: &ProofResolutionValidationContext,
+    fact: &CallResolutionFact,
+    import: NodeId,
+    target: NodeId,
+) -> bool {
+    if !matches!(
+        fact.provenance.language_adapter.as_str(),
+        "typescript" | "tsx"
+    ) {
+        return false;
+    }
+    let source_file_id = NodeId(fact.callsite.file_id.0);
+    let Some(import_node) = context.node_by_id.get(&import) else {
+        return false;
+    };
+    if import_node.file_node_id != Some(source_file_id)
+        || import_node.kind != NodeKind::UNKNOWN
+        || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
+    {
+        return false;
+    }
+    let Some(module_specifier) = context.typescript_directory_import(source_file_id, import) else {
+        return false;
+    };
+    let Some(source_file) = context.file_by_id.get(&fact.callsite.file_id.0) else {
+        return false;
+    };
+    if !matches!(source_file.language.as_str(), "typescript" | "tsx")
+        || !typescript_source_extension_is_supported(&source_file.path)
+    {
+        return false;
+    }
+    let Some(target_file_id) = context
+        .node_by_id
+        .get(&target)
+        .filter(|node| {
+            matches!(node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                && graph_leaf_name(&node.serialized_name) == fact.callsite.raw_target
+        })
+        .and_then(|node| node.file_node_id)
+    else {
+        return false;
+    };
+    if !dependency_file_ids(fact).contains(&FileId(target_file_id.0)) {
+        return false;
+    }
+    let Some(target_file) = context.file_by_id.get(&target_file_id.0) else {
+        return false;
+    };
+    if !matches!(target_file.language.as_str(), "typescript" | "tsx") {
+        return false;
+    }
+    let Some(parent) = source_file.path.parent() else {
+        return false;
+    };
+    let Some(directory) = normalize_stored_path(&parent.join(module_specifier)) else {
+        return false;
+    };
+    [directory.join("index.ts"), directory.join("index.tsx")]
+        .into_iter()
+        .filter_map(|path| normalize_stored_path(&path))
+        .any(|path| stored_paths_match(&target_file.path, &path))
 }
 
 fn publication_integrity_digest(

@@ -16130,6 +16130,7 @@ fn index_file_with_resolution_inputs(
     let resolution_inputs = proof_resolution::collect_call_resolution_inputs(
         &tree,
         source,
+        path,
         language_config.language_name,
         &resolution_parser_fingerprint(language_config),
         file_id,
