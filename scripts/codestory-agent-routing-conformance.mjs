@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { createHash } from "node:crypto";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -22,12 +23,17 @@ const ROUTING_ACTIONS = Object.freeze([
 ]);
 
 export const INSTALLED_IDENTITY_FIELDS = Object.freeze([
+  "installation.root",
+  "receipt.relative_path",
+  "receipt.sha256",
   "package.name",
   "package.version",
+  "package.archive_relative_path",
   "package.sha256",
   "launcher.relative_path",
   "launcher.sha256",
   "cli.version",
+  "cli.relative_path",
   "cli.sha256",
   "cli.source",
   "publication.schema_version",
@@ -59,17 +65,32 @@ function scenario({
   typedContract = "none",
 }) {
   const allowed = new Set([first, ...followups].filter((item) => item !== "none"));
+  const finalConstraints = {
+    named_file_direct_read: { authority: "source", outcome: "supported" },
+    exact_symbol_search: { authority: "search_lead", outcome: "discovery_only" },
+    ambiguous_symbol_then_context: { authority: "context_evidence", outcome: "supported" },
+    selected_target_context: { authority: "context_evidence", outcome: "supported" },
+    broad_packet: { authority: "packet_evidence", outcome: "supported" },
+    packet_single_continuation: { authority: "packet_evidence", outcome: "supported" },
+    packet_gap_to_focused_source: { authority: "source", outcome: "supported" },
+    packet_unavailable_to_source: { authority: "source", outcome: "unavailable" },
+    typed_proof_contract_proven: { authority: "typed_proof", outcome: "supported", proof_disposition: "contract_proven" },
+    typed_proof_contract_refuted: { authority: "typed_proof", outcome: "refuted", proof_disposition: "contract_refuted" },
+    typed_proof_unknown: { authority: "typed_proof", outcome: "unknown", proof_disposition: "unknown" },
+    typed_proof_unavailable: { authority: "typed_proof", outcome: "unavailable", proof_disposition: "unavailable" },
+    malformed_proof_contract: { authority: "none", outcome: "invalid_contract" },
+    refuse_free_english_proof: { authority: "none", outcome: "refused" },
+    proof_observational: { authority: "typed_proof", outcome: "unknown", proof_disposition: "unknown" },
+    hidden_proof_tool_discovery: { authority: "typed_proof", outcome: "supported", proof_disposition: "contract_proven" },
+  }[id];
   return {
     id,
     expected_first_tool: first,
+    required_action_sequence: first === "none" ? [] : [first, ...followups],
     permitted_followups: followups,
     forbidden_tools: ROUTING_ACTIONS.filter((item) => !allowed.has(item)),
     source_read_authorization: { kind: source },
-    final_claim_constraints: {
-      required_terms: required,
-      forbidden_terms: forbidden,
-      proof_disposition: disposition,
-    },
+    final_claim_constraints: finalConstraints,
     typed_contract: typedContract,
     identity_requirements: IDENTITY_REQUIREMENTS,
   };
@@ -210,6 +231,19 @@ export const STATIC_PARITY_HOSTS = deepFreeze({
     rule: "skills/codestory-grounding/SKILL.md",
   },
 });
+
+const STATIC_ROSTER_PATHS = Object.freeze([
+  "plugin.json",
+  "cli-version.json",
+  "generated-mcp-catalog.json",
+  "mcp.json",
+  "scripts/codestory-mcp.cjs",
+  ".claude-plugin/plugin.json",
+  ".github/plugin/plugin.json",
+  "hooks/claude-codex-hooks.json",
+  "hooks/copilot-hooks.json",
+  "skills/codestory-grounding/SKILL.md",
+]);
 
 class ConformanceError extends Error {
   constructor(message) {
@@ -367,42 +401,132 @@ function parseCodex(events) {
   return finishParsedState("Codex", state);
 }
 
-function cursorBlocks(event) {
-  return Array.isArray(event?.message?.content) ? event.message.content : null;
+function cursorText(event, role) {
+  if (event?.message?.role !== role || !Array.isArray(event?.message?.content)) {
+    fail(`Cursor ${role} event has invalid message content`);
+  }
+  let text = "";
+  for (const block of event.message.content) {
+    if (!plainObject(block) || block.type !== "text" || typeof block.text !== "string") {
+      fail(`Cursor ${role} event contains a non-text block`);
+    }
+    text += block.text;
+  }
+  return text;
+}
+
+function unwrapCursorToolCall(event) {
+  if (!plainObject(event.tool_call)) fail("Cursor tool_call event is missing tool_call");
+  const keys = Object.keys(event.tool_call);
+  if (keys.length !== 1 || !/^[A-Za-z][A-Za-z0-9]*ToolCall$/u.test(keys[0])) {
+    fail("Cursor tool_call must contain exactly one *ToolCall payload");
+  }
+  const wrapper = event.tool_call[keys[0]];
+  if (!plainObject(wrapper) || !plainObject(wrapper.args)) fail("Cursor tool_call payload is missing args");
+  return { key: keys[0], wrapper };
+}
+
+function cursorStartedAction(callId, key, args) {
+  if (key === "readToolCall") {
+    return { kind: "source_read", tool: "source_read", path: normalizePath(args.path), args, cursor_key: key };
+  }
+  if (key === "mcpToolCall") {
+    if (args.toolCallId !== callId || typeof args.providerIdentifier !== "string"
+        || typeof args.toolName !== "string" || !plainObject(args.args)) {
+      fail("Cursor mcpToolCall args are incomplete or do not match call_id");
+    }
+    const tool = normalizeToolName(args.toolName, args.providerIdentifier);
+    return {
+      kind: tool ?? "external_tool",
+      tool: tool ?? args.toolName,
+      args: args.args,
+      server: args.providerIdentifier,
+      cursor_key: key,
+      cursor_args: args,
+    };
+  }
+  if (key === "toolSearchToolCall") {
+    if (typeof args.query !== "string" || !args.query) fail("Cursor toolSearchToolCall is missing query");
+    return { kind: "tool_search", tool: "tool_search", args, cursor_key: key, cursor_args: args };
+  }
+  return { kind: "external_tool", tool: key, args, cursor_key: key, cursor_args: args };
 }
 
 function parseCursor(events) {
   const state = { actions: [], open: new Map(), completed: new Set(), final: "" };
-  for (const event of events) {
-    if (event.type === "system" && event.subtype === "init") continue;
-    const blocks = cursorBlocks(event);
-    if (!blocks || !["assistant", "user"].includes(event.type)) {
-      fail(`unsupported Cursor event ${JSON.stringify(event.type ?? null)}`);
+  let initSeen = false;
+  let userSeen = false;
+  let terminalSeen = false;
+  let sessionId = null;
+  let assistantDeltas = "";
+  let userText = "";
+  events.forEach((event, index) => {
+    if (terminalSeen) fail("Cursor terminal result must be the final stream event");
+    if (typeof event.session_id !== "string" || !event.session_id) fail("Cursor event is missing session_id");
+    if (sessionId === null) sessionId = event.session_id;
+    if (event.session_id !== sessionId) fail("Cursor session_id changed within one transcript");
+
+    if (event.type === "system") {
+      if (index !== 0 || initSeen || event.subtype !== "init") fail("Cursor stream must begin with one system init event");
+      initSeen = true;
+      return;
     }
-    for (const block of blocks) {
-      if (!plainObject(block)) fail("Cursor content block must be an object");
-      if (event.type === "assistant" && block.type === "text") {
-        if (typeof block.text !== "string") fail("Cursor text block is missing text");
-        state.final = block.text;
-      } else if (event.type === "assistant" && block.type === "tool_use") {
-        const tool = normalizeToolName(block.name);
-        const shell = ["shell", "bash", "exec_command"].includes(String(block.name ?? "").toLowerCase());
-        const path = shell ? sourceReadPath(block.input?.command) : null;
-        beginAction(state, String(block.id ?? ""), {
-          kind: path ? "source_read" : tool ?? (shell ? "shell" : "external_tool"),
-          tool: path ? "source_read" : tool ?? String(block.name ?? "unknown"),
-          args: block.input ?? {},
-          path,
-          command: shell ? String(block.input?.command ?? "") : null,
-        });
-      } else if (event.type === "user" && block.type === "tool_result") {
-        completeAction(state, String(block.tool_use_id ?? ""), block.content ?? null, block.is_error === true);
-      } else {
-        fail(`unsupported Cursor content block ${JSON.stringify(block.type ?? null)}`);
+    if (!initSeen) fail("Cursor stream is missing system init");
+    if (event.type === "user") {
+      if (userSeen || state.actions.length > 0) fail("Cursor stream has duplicate or late user input");
+      userText = cursorText(event, "user");
+      if (!userText) fail("Cursor user input is empty");
+      userSeen = true;
+      return;
+    }
+    if (!userSeen) fail("Cursor stream is missing user input before agent activity");
+    if (event.type === "assistant") {
+      assistantDeltas += cursorText(event, "assistant");
+      return;
+    }
+    if (event.type === "tool_call") {
+      const callId = String(event.call_id ?? "");
+      const { key, wrapper } = unwrapCursorToolCall(event);
+      if (event.subtype === "started") {
+        if (Object.hasOwn(wrapper, "result")) fail("Cursor started tool call must not contain a result");
+        beginAction(state, callId, cursorStartedAction(callId, key, wrapper.args));
+        return;
       }
+      if (event.subtype !== "completed") fail(`unsupported Cursor tool_call subtype ${JSON.stringify(event.subtype)}`);
+      const action = state.open.get(callId);
+      if (!action) fail(`unmatched tool call result ${JSON.stringify(callId)}`);
+      if (action.cursor_key !== key || !equalJson(action.cursor_args ?? action.args, wrapper.args)) {
+        fail(`Cursor completed tool call ${JSON.stringify(callId)} does not match its start`);
+      }
+      if (!plainObject(wrapper.result) || Object.keys(wrapper.result).length !== 1
+          || !Object.hasOwn(wrapper.result, "success")) {
+        fail(`Cursor completed tool call ${JSON.stringify(callId)} must contain exactly one success result`);
+      }
+      if (event.truncated != null || wrapper.result.truncated != null) {
+        fail(`Cursor completed tool call ${JSON.stringify(callId)} is partial`);
+      }
+      const success = wrapper.result.success;
+      if (key === "readToolCall" && (!plainObject(success) || success.exceededLimit !== false)) {
+        fail(`Cursor completed tool call ${JSON.stringify(callId)} contains a partial read`);
+      }
+      completeAction(state, callId, success, false);
+      return;
     }
-  }
-  return finishParsedState("Cursor", state);
+    if (event.type === "result") {
+      terminalSeen = true;
+      if (event.subtype !== "success" || event.is_error !== false || typeof event.result !== "string") {
+        fail("Cursor terminal result must have subtype success and is_error false");
+      }
+      if (state.open.size > 0) fail(`Cursor terminal result has unmatched tool call ${JSON.stringify([...state.open.keys()][0])}`);
+      if (assistantDeltas !== event.result) fail("Cursor assistant deltas do not match terminal result");
+      state.final = event.result;
+      return;
+    }
+    fail(`unsupported Cursor event ${JSON.stringify(event.type ?? null)}`);
+  });
+  if (!terminalSeen) fail("Cursor transcript is missing a terminal result");
+  const parsed = finishParsedState("Cursor", state);
+  return { ...parsed, user_text: userText };
 }
 
 function finishParsedState(host, state) {
@@ -429,7 +553,7 @@ function validateIdentityShape(identity, label) {
     const value = valueAt(identity, field);
     if (value === undefined || value === null || value === "") fail(`${label}.${field} is required`);
   }
-  for (const field of ["package.sha256", "launcher.sha256", "cli.sha256", "protocol.discovery_contract_sha256"]) {
+  for (const field of ["receipt.sha256", "package.sha256", "launcher.sha256", "cli.sha256", "protocol.discovery_contract_sha256"]) {
     const value = valueAt(identity, field);
     if (!SHA256.test(String(value)) || /^0{64}$/u.test(String(value))) fail(`${label}.${field} must be a nonzero lowercase SHA-256`);
   }
@@ -438,6 +562,9 @@ function validateIdentityShape(identity, label) {
     fail(`${label}.launcher.relative_path must be scripts/codestory-mcp.cjs`);
   }
   if (identity.cli.source !== "managed") fail(`${label}.cli.source must be managed`);
+  for (const field of ["receipt.relative_path", "package.archive_relative_path", "launcher.relative_path", "cli.relative_path"]) {
+    normalizePath(valueAt(identity, field));
+  }
   if (!Number.isInteger(identity.publication.schema_version) || identity.publication.schema_version < 1) {
     fail(`${label}.publication.schema_version must be a positive integer`);
   }
@@ -451,6 +578,66 @@ function validateExactIdentity(installed, expected) {
       fail(`installed identity ${field} does not match the exact expected identity`);
     }
   }
+}
+
+function sha256Bytes(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function fileInsideInstalledRoot(root, relativePath, label) {
+  const normalized = normalizePath(relativePath);
+  const lexical = resolve(root, normalized);
+  let actual;
+  try {
+    if (!lstatSync(lexical).isFile()) fail(`${label} must be a regular file`);
+    actual = realpathSync(lexical);
+  } catch (error) {
+    if (error instanceof ConformanceError) throw error;
+    fail(`${label} is not readable: ${error.message}`);
+  }
+  const escaped = relative(root, actual);
+  if (!escaped || escaped === ".." || escaped.startsWith(`..${sep}`) || resolve(root, escaped) !== actual) {
+    fail(`${label} escapes the authenticated installed root`);
+  }
+  return actual;
+}
+
+function authenticateInstalledIdentity(installedRoot, installedReceipt, expected) {
+  validateIdentityShape(expected, "expected identity");
+  let root;
+  try {
+    root = realpathSync(installedRoot);
+  } catch (error) {
+    fail(`installed root is not readable: ${error.message}`);
+  }
+  if (root !== expected.installation.root) fail("installed identity installation.root does not match the authenticated root");
+  const receiptPath = fileInsideInstalledRoot(root, expected.receipt.relative_path, "installed receipt");
+  if (realpathSync(installedReceipt) !== receiptPath) fail("installed receipt path does not match the expected installed receipt");
+  const receiptBytes = readFileSync(receiptPath);
+  if (sha256Bytes(receiptBytes) !== expected.receipt.sha256) fail("installed identity receipt.sha256 does not match receipt bytes");
+  let receipt;
+  try {
+    receipt = JSON.parse(receiptBytes.toString("utf8"));
+  } catch {
+    fail("installed receipt is invalid JSON");
+  }
+  if (!plainObject(receipt) || receipt.schema_version !== 1 || !plainObject(receipt.identity)) {
+    fail("installed receipt must use schema_version 1 and contain identity");
+  }
+  const installed = { ...receipt.identity, receipt: expected.receipt };
+  validateExactIdentity(installed, expected);
+  const artifacts = [
+    ["package", installed.package.archive_relative_path, installed.package.sha256],
+    ["launcher", installed.launcher.relative_path, installed.launcher.sha256],
+    ["cli", installed.cli.relative_path, installed.cli.sha256],
+  ];
+  for (const [label, path, digest] of artifacts) {
+    const bytes = readFileSync(fileInsideInstalledRoot(root, path, `installed ${label}`));
+    if (sha256Bytes(bytes) !== digest || digest !== valueAt(expected, `${label}.sha256`)) {
+      fail(`installed identity ${label}.sha256 does not match authenticated ${label} bytes`);
+    }
+  }
+  return installed;
 }
 
 function parseJsonText(value) {
@@ -522,6 +709,10 @@ function actionName(action) {
 }
 
 function validateActionOrder(scenarioContract, actions) {
+  const observedSequence = actions.map(actionName);
+  if (!equalJson(observedSequence, scenarioContract.required_action_sequence)) {
+    fail(`${scenarioContract.id} required action sequence ${JSON.stringify(scenarioContract.required_action_sequence)} but observed ${JSON.stringify(observedSequence)}`);
+  }
   if (scenarioContract.expected_first_tool === "none") {
     if (actions.length > 0) fail(`${scenarioContract.id} expected no tool but observed ${actionName(actions[0])}`);
     return;
@@ -582,13 +773,491 @@ function stripProject(args) {
   return contract;
 }
 
+function requireExactKeys(value, keys, label) {
+  if (!plainObject(value) || !equalJson(Object.keys(value).sort(), [...keys].sort())) {
+    fail(`${label} does not match its required schema`);
+  }
+}
+
+function nonemptyString(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
+function validateSelector(selector, label) {
+  if (!plainObject(selector) || !nonemptyString(selector.kind)) fail(`${label} is invalid`);
+  if (selector.kind === "canonical_id") {
+    requireExactKeys(selector, ["kind", "canonical_id"], label);
+    if (!nonemptyString(selector.canonical_id)) fail(`${label}.canonical_id is required`);
+    return;
+  }
+  if (selector.kind === "qualified_name") {
+    requireExactKeys(selector, ["kind", "qualified_name", "project_file_components"], label);
+    if (!nonemptyString(selector.qualified_name)
+        || !(selector.project_file_components === null || (Array.isArray(selector.project_file_components)
+          && selector.project_file_components.length > 0))) fail(`${label} is invalid`);
+    return;
+  }
+  if (selector.kind === "pinned_node") {
+    requireExactKeys(selector, ["kind", "project_id", "core_generation_id", "core_run_id", "node_id"], label);
+    if (![selector.project_id, selector.core_generation_id, selector.core_run_id, selector.node_id].every(nonemptyString)) {
+      fail(`${label} is invalid`);
+    }
+    return;
+  }
+  fail(`${label} uses an unsupported selector kind`);
+}
+
+function validateScopeSelectorList(selectors, label) {
+  selectors.forEach((selector, index) => validateSelector(selector, `${label} ${index}`));
+}
+
+function proofContractFieldKey(field, stepCount, prohibitionCount, exclusionCount, label) {
+  if (!plainObject(field) || !nonemptyString(field.kind)) fail(`${label} is invalid`);
+  if (field.kind === "start") {
+    requireExactKeys(field, ["kind"], label);
+    return "start";
+  }
+  if (["step_target", "directness", "ordering", "relation"].includes(field.kind)) {
+    requireExactKeys(field, ["kind", "step"], label);
+    if (!Number.isInteger(field.step) || field.step < 0 || field.step >= stepCount) fail(`${label}.step is invalid`);
+    return `${field.kind}:${field.step}`;
+  }
+  if (["traversal_prohibition", "projection_exclusion"].includes(field.kind)) {
+    requireExactKeys(field, ["kind", "index"], label);
+    const limit = field.kind === "traversal_prohibition" ? prohibitionCount : exclusionCount;
+    if (!Number.isInteger(field.index) || field.index < 0 || field.index >= limit) fail(`${label}.index is invalid`);
+    return `${field.kind}:${field.index}`;
+  }
+  fail(`${label} uses an unsupported proof contract field`);
+}
+
 function validTypedContract(contract) {
-  return plainObject(contract)
-    && typeof contract.source_text === "string"
-    && contract.source_text.length > 0
-    && Array.isArray(contract.clauses)
-    && contract.clauses.length > 0
-    && plainObject(contract.spec);
+  try {
+    requireExactKeys(contract, ["source_text", "clauses", "spec"], "typed proof contract");
+    if (!nonemptyString(contract.source_text) || !Array.isArray(contract.clauses) || contract.clauses.length === 0) {
+      fail("typed proof contract source_text and clauses are required");
+    }
+    requireExactKeys(contract.spec, ["start", "steps", "prohibit_traversal_through", "exclude_from_projection"], "typed proof spec");
+    validateSelector(contract.spec.start, "typed proof start selector");
+    if (!Array.isArray(contract.spec.steps) || contract.spec.steps.length < 1 || contract.spec.steps.length > 6
+        || !Array.isArray(contract.spec.prohibit_traversal_through)
+        || !Array.isArray(contract.spec.exclude_from_projection)) fail("typed proof spec arrays are invalid");
+    contract.spec.steps.forEach((step, index) => {
+      requireExactKeys(step, ["relation", "target"], `typed proof step ${index}`);
+      if (step.relation !== "direct_outgoing_call") fail(`typed proof step ${index} relation is invalid`);
+      validateSelector(step.target, `typed proof step ${index} target`);
+    });
+    validateScopeSelectorList(contract.spec.prohibit_traversal_through, "typed proof traversal prohibition");
+    validateScopeSelectorList(contract.spec.exclude_from_projection, "typed proof projection exclusion");
+
+    const sourceBytes = Buffer.from(contract.source_text);
+    const covered = new Uint8Array(sourceBytes.length);
+    const resolvedFields = new Set();
+    for (const [index, clause] of contract.clauses.entries()) {
+      requireExactKeys(
+        clause,
+        ["start", "end", "clause_id", "quote", "classification", "fields", "reason", "non_material_kind"],
+        `typed proof contract clause ${index}`,
+      );
+      if (!Number.isInteger(clause.start) || !Number.isInteger(clause.end) || clause.start < 0
+          || clause.end <= clause.start || !nonemptyString(clause.clause_id) || typeof clause.quote !== "string"
+          || !["resolved_material", "unresolved_material", "non_material"].includes(clause.classification)
+          || !Array.isArray(clause.fields) || clause.end > sourceBytes.length) fail(`typed proof contract clause ${index} is invalid`);
+      if (sourceBytes.subarray(clause.start, clause.end).toString("utf8") !== clause.quote) {
+        fail(`typed proof contract clause ${index} quote does not match source bytes`);
+      }
+      covered.fill(1, clause.start, clause.end);
+      const fields = clause.fields.map((field, fieldIndex) => proofContractFieldKey(
+        field,
+        contract.spec.steps.length,
+        contract.spec.prohibit_traversal_through.length,
+        contract.spec.exclude_from_projection.length,
+        `typed proof contract clause ${index} field ${fieldIndex}`,
+      ));
+      if (new Set(fields).size !== fields.length) fail(`typed proof contract clause ${index} repeats a field`);
+      if (clause.classification === "resolved_material") {
+        if (fields.length === 0 || clause.reason !== null || clause.non_material_kind !== null) {
+          fail(`typed proof contract clause ${index} resolved classification is invalid`);
+        }
+        fields.forEach((field) => resolvedFields.add(field));
+      } else if (clause.classification === "unresolved_material") {
+        if (fields.length !== 0 || !["missing_selector_resolution", "ambiguous_selector_resolution", "unsupported_interpretation"].includes(clause.reason)
+            || clause.non_material_kind !== null) fail(`typed proof contract clause ${index} unresolved classification is invalid`);
+      } else if (fields.length !== 0 || clause.reason !== null
+          || !["whitespace", "punctuation", "connector", "commentary"].includes(clause.non_material_kind)) {
+        fail(`typed proof contract clause ${index} non-material classification is invalid`);
+      }
+    }
+    let byteOffset = 0;
+    for (const character of contract.source_text) {
+      const width = Buffer.byteLength(character);
+      if (!/^\s$/u.test(character)) {
+        for (let index = byteOffset; index < byteOffset + width; index += 1) {
+          if (covered[index] !== 1) fail("typed proof contract leaves source text unclassified");
+        }
+      }
+      byteOffset += width;
+    }
+    const requiredFields = ["start"];
+    contract.spec.steps.forEach((_, index) => requiredFields.push(
+      `step_target:${index}`, `directness:${index}`, `ordering:${index}`, `relation:${index}`,
+    ));
+    contract.spec.prohibit_traversal_through.forEach((_, index) => requiredFields.push(`traversal_prohibition:${index}`));
+    contract.spec.exclude_from_projection.forEach((_, index) => requiredFields.push(`projection_exclusion:${index}`));
+    if (requiredFields.some((field) => !resolvedFields.has(field))) fail("typed proof contract is missing required resolved fields");
+    return true;
+  } catch (error) {
+    if (error instanceof ConformanceError) return false;
+    throw error;
+  }
+}
+
+function validatePublication(value, label) {
+  requireExactKeys(value, ["core_generation_id", "retrieval_generation_id"], label);
+  if (!nonemptyString(value.core_generation_id) || !nonemptyString(value.retrieval_generation_id)) fail(`${label} is invalid`);
+}
+
+function validateSearchResult(body) {
+  requireExactKeys(body, ["kind", "publication", "leads", "gaps"], "search result");
+  if (body.kind !== "complete" || !Array.isArray(body.leads) || body.leads.length === 0 || !Array.isArray(body.gaps)) {
+    fail("search result is incomplete");
+  }
+  validatePublication(body.publication, "search result publication");
+  body.leads.forEach((lead, index) => {
+    requireExactKeys(lead, ["lead_id", "canonical_id"], `search result lead ${index}`);
+    if (!nonemptyString(lead.lead_id) || !nonemptyString(lead.canonical_id)) fail(`search result lead ${index} is invalid`);
+  });
+  body.gaps.forEach((gap, index) => {
+    requireExactKeys(gap, ["code"], `search result gap ${index}`);
+    if (!nonemptyString(gap.code)) fail(`search result gap ${index} is invalid`);
+  });
+}
+
+function validateContextResult(body) {
+  requireExactKeys(body, ["kind", "publication", "target", "evidence", "gaps"], "context result");
+  if (body.kind !== "complete" || !plainObject(body.target) || !nonemptyString(body.target.canonical_id)
+      || !Array.isArray(body.evidence) || body.evidence.length === 0 || !Array.isArray(body.gaps)) {
+    fail("context result is incomplete");
+  }
+  validatePublication(body.publication, "context result publication");
+  requireExactKeys(body.target, ["canonical_id"], "context result target");
+  body.evidence.forEach((entry, index) => {
+    requireExactKeys(entry, ["evidence_id", "path"], `context result evidence ${index}`);
+    if (!nonemptyString(entry.evidence_id) || !nonemptyString(entry.path)) fail(`context result evidence ${index} is invalid`);
+  });
+  body.gaps.forEach((gap, index) => {
+    requireExactKeys(gap, ["code"], `context result gap ${index}`);
+    if (!nonemptyString(gap.code)) fail(`context result gap ${index} is invalid`);
+  });
+}
+
+function validatePacketResult(body) {
+  const keys = ["kind", "packet_id", "status", "publication", "evidence", "gaps"];
+  if (body?.status === "continuation_available") keys.push("continuation");
+  if (body?.status === "unavailable") keys.splice(1, 1, "reason");
+  requireExactKeys(body, keys, "packet result");
+  if (!["complete", "budget_exceeded"].includes(body.kind)
+      || !["complete", "continuation_available", "no_useful_evidence", "unavailable"].includes(body.status)
+      || !Array.isArray(body.evidence) || !Array.isArray(body.gaps)) fail("packet result is incomplete");
+  validatePublication(body.publication, "packet result publication");
+  if (body.status !== "unavailable" && !nonemptyString(body.packet_id)) fail("packet result packet_id is required");
+  if (body.status === "unavailable" && !nonemptyString(body.reason)) fail("packet result reason is required");
+  body.evidence.forEach((entry, index) => {
+    requireExactKeys(entry, ["evidence_id", "path"], `packet result evidence ${index}`);
+    if (!nonemptyString(entry.evidence_id) || !nonemptyString(entry.path)) fail(`packet result evidence ${index} is invalid`);
+  });
+  body.gaps.forEach((gap, index) => {
+    const gapKeys = Array.isArray(gap?.authorized_source_paths) ? ["gap_id", "authorized_source_paths"] : ["gap_id"];
+    requireExactKeys(gap, gapKeys, `packet result gap ${index}`);
+    if (!nonemptyString(gap.gap_id)
+        || (gapKeys.length === 2 && (!gap.authorized_source_paths.every(nonemptyString)
+          || gap.authorized_source_paths.length === 0))) fail(`packet result gap ${index} is invalid`);
+  });
+  if (body.status === "continuation_available") {
+    requireExactKeys(body.continuation, ["continuation_id", "gap_ids"], "packet result continuation");
+    if (!nonemptyString(body.continuation.continuation_id) || !Array.isArray(body.continuation.gap_ids)
+        || body.continuation.gap_ids.length === 0) fail("packet result continuation is invalid");
+  }
+}
+
+function proofIndex(value, length, label) {
+  if (!Number.isInteger(value) || value < 0 || value >= length) fail(`${label} is out of range`);
+  return value;
+}
+
+function validateProjectedProofSelector(selector, identities, label) {
+  if (!plainObject(selector) || !nonemptyString(selector.kind)) fail(`${label} is invalid`);
+  if (["pinned_node", "canonical_id", "qualified_name"].includes(selector.kind)) {
+    validateSelector(selector, label);
+    return;
+  }
+  if (["pinned_node_ref", "canonical_id_ref"].includes(selector.kind)) {
+    requireExactKeys(selector, ["kind", "symbol"], label);
+  } else if (selector.kind === "qualified_name_ref") {
+    requireExactKeys(selector, ["kind", "symbol", "path_binding"], label);
+    if (!["none", "exact_file"].includes(selector.path_binding)) fail(`${label}.path_binding is invalid`);
+  } else {
+    fail(`${label} uses an unsupported projected selector kind`);
+  }
+  proofIndex(selector.symbol, identities.symbols.length, `${label}.symbol`);
+}
+
+function validateProofClauseSchema(clause, index) {
+  requireExactKeys(
+    clause,
+    ["start", "end", "clause_id", "quote", "classification", "fields", "reason", "non_material_kind"],
+    `proof result clause ${index}`,
+  );
+  if (!Number.isInteger(clause.start) || clause.start < 0 || !Number.isInteger(clause.end) || clause.end <= clause.start
+      || !nonemptyString(clause.clause_id) || typeof clause.quote !== "string" || !Array.isArray(clause.fields)
+      || !["resolved_material", "unresolved_material", "non_material"].includes(clause.classification)) {
+    fail(`proof result clause ${index} is invalid`);
+  }
+  clause.fields.forEach((field, fieldIndex) => proofContractFieldKey(
+    field, 6, 256, 256, `proof result clause ${index} field ${fieldIndex}`,
+  ));
+}
+
+function validateProofGap(gap, index) {
+  const selectorKinds = ["selector_missing", "selector_ambiguous", "non_callable_selector"];
+  const stepKinds = [
+    "direct_call_missing", "recursive_call_not_representable", "source_window_too_large", "invalid_utf8",
+    "source_line_out_of_range", "edge_containment_unproven", "missing_direct_call_receipt",
+    "receipt_or_edge_already_used", "projection_exclusion_conflicts_with_required_receipt",
+  ];
+  if (selectorKinds.includes(gap?.kind)) {
+    requireExactKeys(gap, ["kind", "selector_index"], `proof result gap ${index}`);
+    if (!Number.isInteger(gap.selector_index) || gap.selector_index < 0 || gap.selector_index > 6) fail(`proof result gap ${index} is invalid`);
+    return;
+  }
+  if (stepKinds.includes(gap?.kind)) {
+    requireExactKeys(gap, ["kind", "step_index"], `proof result gap ${index}`);
+    if (!Number.isInteger(gap.step_index) || gap.step_index < 0 || gap.step_index > 5) fail(`proof result gap ${index} is invalid`);
+    return;
+  }
+  fail(`proof result gap ${index} has an unsupported kind`);
+}
+
+function validateProofReceipt(receipt, index, identities) {
+  requireExactKeys(receipt, [
+    "receipt_id", "edge_id", "source", "target", "evidence", "exact_callsite_start_byte",
+    "callsite_identity", "column_or_ordinal", "containment", "line_window",
+  ], `proof result receipt ${index}`);
+  if (!nonemptyString(receipt.receipt_id) || !nonemptyString(receipt.edge_id)
+      || !Number.isInteger(receipt.exact_callsite_start_byte) || receipt.exact_callsite_start_byte < 0
+      || !nonemptyString(receipt.callsite_identity) || !Number.isInteger(receipt.column_or_ordinal)
+      || receipt.column_or_ordinal < 0) {
+    fail(`proof result receipt ${index} is invalid`);
+  }
+  proofIndex(receipt.source, identities.symbols.length, `proof result receipt ${index} source`);
+  proofIndex(receipt.target, identities.symbols.length, `proof result receipt ${index} target`);
+  proofIndex(receipt.evidence, identities.evidence.length, `proof result receipt ${index} evidence`);
+  requireExactKeys(receipt.containment, ["file", "owner", "start_line", "end_line"], `proof result receipt ${index} containment`);
+  requireExactKeys(receipt.line_window, ["kind", "file", "anchor_line", "byte_start", "byte_end", "text"], `proof result receipt ${index} line_window`);
+  proofIndex(receipt.containment.file, identities.files.length, `proof result receipt ${index} containment.file`);
+  proofIndex(receipt.containment.owner, identities.symbols.length, `proof result receipt ${index} containment.owner`);
+  proofIndex(receipt.line_window.file, identities.files.length, `proof result receipt ${index} line_window.file`);
+  if (receipt.line_window.kind !== "indexed_line_v1" || !Number.isInteger(receipt.line_window.anchor_line)
+      || receipt.line_window.anchor_line < 1 || !Number.isInteger(receipt.line_window.byte_start)
+      || receipt.line_window.byte_start < 0 || !Number.isInteger(receipt.line_window.byte_end)
+      || receipt.line_window.byte_end < receipt.line_window.byte_start || typeof receipt.line_window.text !== "string") {
+    fail(`proof result receipt ${index} line_window is invalid`);
+  }
+  if (receipt.line_window.byte_end - receipt.line_window.byte_start !== Buffer.byteLength(receipt.line_window.text)
+      || receipt.containment.file !== receipt.line_window.file || receipt.containment.owner !== receipt.source
+      || !Number.isInteger(receipt.containment.start_line) || receipt.containment.start_line < 1
+      || !Number.isInteger(receipt.containment.end_line) || receipt.containment.end_line < receipt.containment.start_line) {
+    fail(`proof result receipt ${index} containment or source window is inconsistent`);
+  }
+  const evidence = identities.evidence[receipt.evidence];
+  if (evidence.caller !== receipt.source || evidence.target !== receipt.target || evidence.edge_id !== receipt.edge_id
+      || evidence.callsite_identity !== receipt.callsite_identity) fail(`proof result receipt ${index} does not match exact-resolution evidence`);
+}
+
+function validateProofResult(body) {
+  requireExactKeys(body, [
+    "kind", "schema_version", "domain", "contract_interpretation", "guard_version",
+    "source_text_sha256", "contract_digest", "core_publication", "identities", "spec",
+    "clauses", "disposition", "steps", "receipts",
+  ], "proof result");
+  if (body.kind !== "complete" || body.schema_version !== 1 || body.domain !== "indexed_source_call_path_v1"
+      || body.contract_interpretation !== "host_supplied" || body.guard_version !== "clause_guard_v1"
+      || !SHA256.test(body.source_text_sha256) || !SHA256.test(body.contract_digest)
+      || !plainObject(body.core_publication) || !plainObject(body.identities) || !plainObject(body.spec)
+      || !Array.isArray(body.clauses) || body.clauses.length === 0 || !Array.isArray(body.steps) || !Array.isArray(body.receipts)
+      || !plainObject(body.disposition)) fail("proof result is incomplete");
+  requireExactKeys(body.core_publication, ["project_id", "generation_id", "run_id"], "proof result core_publication");
+  if (![body.core_publication.project_id, body.core_publication.generation_id, body.core_publication.run_id].every(nonemptyString)) {
+    fail("proof result core_publication is invalid");
+  }
+  requireExactKeys(body.identities, ["files", "symbols", "provenance_profiles", "evidence"], "proof result identities");
+  if (![body.identities.files, body.identities.symbols, body.identities.provenance_profiles, body.identities.evidence].every(Array.isArray)) {
+    fail("proof result identities are invalid");
+  }
+  body.identities.files.forEach((file, index) => {
+    requireExactKeys(file, ["file_node_id", "project_file_components", "indexed_sha256", "observed_sha256"], `proof result file ${index}`);
+    if (!(file.file_node_id === null || nonemptyString(file.file_node_id))
+        || !(file.project_file_components === null || (Array.isArray(file.project_file_components)
+          && file.project_file_components.every(nonemptyString)))
+        || !(file.indexed_sha256 === null || SHA256.test(file.indexed_sha256))
+        || !(file.observed_sha256 === null || SHA256.test(file.observed_sha256))) fail(`proof result file ${index} is invalid`);
+  });
+  body.identities.symbols.forEach((symbol, index) => {
+    requireExactKeys(symbol, ["node_id", "canonical_id", "qualified_name", "file"], `proof result symbol ${index}`);
+    if (!nonemptyString(symbol.node_id) || !(symbol.canonical_id === null || nonemptyString(symbol.canonical_id))
+        || !(symbol.qualified_name === null || nonemptyString(symbol.qualified_name))) fail(`proof result symbol ${index} is invalid`);
+    if (symbol.file !== null) proofIndex(symbol.file, body.identities.files.length, `proof result symbol ${index}.file`);
+  });
+  body.identities.provenance_profiles.forEach((profile, index) => {
+    requireExactKeys(profile, ["producer", "fact_schema_version", "algorithm", "language_adapter", "language_adapter_version", "parser_fingerprint"], `proof result provenance profile ${index}`);
+    if (profile.producer !== "codestory-internal" || profile.fact_schema_version !== 1
+        || profile.algorithm !== "exact-call-resolution-v1" || !nonemptyString(profile.language_adapter)
+        || !nonemptyString(profile.language_adapter_version) || !SHA256.test(profile.parser_fingerprint)) {
+      fail(`proof result provenance profile ${index} is invalid`);
+    }
+  });
+  body.identities.evidence.forEach((evidence, index) => {
+    requireExactKeys(evidence, ["fact_id", "caller", "target", "edge_id", "callsite_identity", "chain", "provenance"], `proof result evidence ${index}`);
+    if (!SHA256.test(evidence.fact_id) || !nonemptyString(evidence.edge_id) || !nonemptyString(evidence.callsite_identity)
+        || !Array.isArray(evidence.chain) || !plainObject(evidence.provenance)) fail(`proof result evidence ${index} is invalid`);
+    proofIndex(evidence.caller, body.identities.symbols.length, `proof result evidence ${index}.caller`);
+    proofIndex(evidence.target, body.identities.symbols.length, `proof result evidence ${index}.target`);
+    evidence.chain.forEach((entry, chainIndex) => {
+      requireExactKeys(entry, ["kind", "symbols"], `proof result evidence ${index} chain ${chainIndex}`);
+      if (!nonemptyString(entry.kind) || !Array.isArray(entry.symbols)) fail(`proof result evidence ${index} chain ${chainIndex} is invalid`);
+      entry.symbols.forEach((symbol) => proofIndex(symbol, body.identities.symbols.length, `proof result evidence ${index} chain ${chainIndex} symbol`));
+    });
+    requireExactKeys(evidence.provenance, ["profile", "dependency_files", "evidence_sha256"], `proof result evidence ${index} provenance`);
+    proofIndex(evidence.provenance.profile, body.identities.provenance_profiles.length, `proof result evidence ${index} provenance.profile`);
+    if (!Array.isArray(evidence.provenance.dependency_files) || !SHA256.test(evidence.provenance.evidence_sha256)) {
+      fail(`proof result evidence ${index} provenance is invalid`);
+    }
+    evidence.provenance.dependency_files.forEach((file) => proofIndex(file, body.identities.files.length, `proof result evidence ${index} dependency file`));
+  });
+  requireExactKeys(body.spec, ["start", "steps", "prohibit_traversal_through", "exclude_from_projection"], "proof result spec");
+  validateProjectedProofSelector(body.spec.start, body.identities, "proof result start selector");
+  if (!Array.isArray(body.spec.steps) || body.spec.steps.length < 1 || body.spec.steps.length > 6
+      || !Array.isArray(body.spec.prohibit_traversal_through) || !Array.isArray(body.spec.exclude_from_projection)) {
+    fail("proof result spec is invalid");
+  }
+  body.spec.steps.forEach((step, index) => {
+    requireExactKeys(step, ["relation", "target"], `proof result spec step ${index}`);
+    if (step.relation !== "direct_outgoing_call") fail(`proof result spec step ${index} is invalid`);
+    validateProjectedProofSelector(step.target, body.identities, `proof result spec step ${index} target`);
+  });
+  validateScopeSelectorList(body.spec.prohibit_traversal_through, "proof result traversal prohibition");
+  validateScopeSelectorList(body.spec.exclude_from_projection, "proof result projection exclusion");
+  body.clauses.forEach(validateProofClauseSchema);
+  if (body.disposition.contract_digest !== body.contract_digest || !PROOF_DISPOSITIONS.has(body.disposition.kind)) {
+    fail("proof result disposition is invalid");
+  }
+  const disposition = body.disposition;
+  if (disposition.kind === "contract_proven") {
+    requireExactKeys(disposition, ["kind", "contract_digest", "receipts"], "proof result ContractProven disposition");
+    if (!Array.isArray(disposition.receipts) || disposition.receipts.length === 0 || new Set(disposition.receipts).size !== disposition.receipts.length) {
+      fail("proof result ContractProven receipts are missing");
+    }
+  } else if (disposition.kind === "contract_refuted") {
+    requireExactKeys(disposition, ["kind", "contract_digest", "refutation"], "proof result ContractRefuted disposition");
+    const refutation = disposition.refutation;
+    if (refutation?.kind === "prohibited_scope_traversal") {
+      requireExactKeys(refutation, ["kind", "step_index", "prohibition_index", "connected_receipts"], "proof result refutation basis");
+      if (!Number.isInteger(refutation.prohibition_index) || refutation.prohibition_index < 0
+          || refutation.prohibition_index >= body.spec.prohibit_traversal_through.length) fail("proof result refutation basis is invalid");
+    } else if (refutation?.kind === "certified_absence") {
+      requireExactKeys(refutation, ["kind", "step_index", "extractor_capability_receipt_id", "untruncated_enumeration_receipt_id", "connected_receipts"], "proof result refutation basis");
+      if (!nonemptyString(refutation.extractor_capability_receipt_id)
+          || !nonemptyString(refutation.untruncated_enumeration_receipt_id)) fail("proof result refutation basis is invalid");
+    } else {
+      fail("proof result refutation basis is missing");
+    }
+    if (!Number.isInteger(refutation.step_index) || refutation.step_index < 0 || refutation.step_index >= body.spec.steps.length
+        || !Array.isArray(refutation.connected_receipts)) fail("proof result refutation basis is invalid");
+  } else if (disposition.kind === "unknown") {
+    requireExactKeys(disposition, ["kind", "contract_digest", "gaps", "connected_receipts"], "proof result Unknown disposition");
+    if (!Array.isArray(disposition.gaps) || disposition.gaps.length === 0 || !Array.isArray(disposition.connected_receipts)) {
+      fail("proof result Unknown gaps are missing");
+    }
+    disposition.gaps.forEach(validateProofGap);
+  } else {
+    requireExactKeys(disposition, ["kind", "contract_digest", "reasons"], "proof result Unavailable disposition");
+    if (!Array.isArray(disposition.reasons) || disposition.reasons.length === 0 || !disposition.reasons.every(nonemptyString)) {
+      fail("proof result Unavailable reasons are missing");
+    }
+  }
+  body.receipts.forEach((receipt, index) => validateProofReceipt(receipt, index, body.identities));
+  const receiptReferences = disposition.kind === "contract_proven"
+    ? disposition.receipts
+    : disposition.kind === "contract_refuted" ? disposition.refutation.connected_receipts
+      : disposition.kind === "unknown" ? disposition.connected_receipts : [];
+  receiptReferences.forEach((receipt) => proofIndex(receipt, body.receipts.length, "proof result disposition receipt"));
+  if (body.steps.length !== body.spec.steps?.length) fail("proof result steps do not match spec");
+  body.steps.forEach((step, index) => {
+    requireExactKeys(step, ["step_index", "status", "receipt"], `proof result step ${index}`);
+    if (step.step_index !== index || !["proven", "positive_contradiction", "certified_absence", "unavailable", "unknown"].includes(step.status)
+        || !(step.receipt === null || Number.isInteger(step.receipt))) fail(`proof result step ${index} is invalid`);
+    if (step.receipt !== null) proofIndex(step.receipt, body.receipts.length, `proof result step ${index}.receipt`);
+  });
+}
+
+function validateToolResultSchema(action, projection) {
+  if (!plainObject(projection.body)) fail(`${action.tool} result is not a JSON object`);
+  if (action.kind === "search") validateSearchResult(projection.body);
+  if (action.kind === "context") validateContextResult(projection.body);
+  if (action.kind === "packet") validatePacketResult(projection.body);
+  if (action.kind === "prove_call_path" && !projection.isError) validateProofResult(projection.body);
+}
+
+function projectedSelectorValue(selector, result, label) {
+  if (["pinned_node", "canonical_id", "qualified_name"].includes(selector.kind)) return selector;
+  const symbol = result.identities.symbols[selector.symbol];
+  if (selector.kind === "canonical_id_ref") {
+    if (!nonemptyString(symbol.canonical_id)) fail(`${label} canonical identity is unavailable`);
+    return { kind: "canonical_id", canonical_id: symbol.canonical_id };
+  }
+  if (selector.kind === "pinned_node_ref") {
+    return {
+      kind: "pinned_node",
+      project_id: result.core_publication.project_id,
+      core_generation_id: result.core_publication.generation_id,
+      core_run_id: result.core_publication.run_id,
+      node_id: symbol.node_id,
+    };
+  }
+  if (!nonemptyString(symbol.qualified_name)) fail(`${label} qualified identity is unavailable`);
+  let projectFileComponents = null;
+  if (selector.path_binding === "exact_file") {
+    if (symbol.file === null) fail(`${label} exact file binding is unavailable`);
+    projectFileComponents = result.identities.files[symbol.file].project_file_components;
+    if (!Array.isArray(projectFileComponents)) fail(`${label} exact file binding is invalid`);
+  }
+  return {
+    kind: "qualified_name",
+    qualified_name: symbol.qualified_name,
+    project_file_components: projectFileComponents,
+  };
+}
+
+function validateProofResultAgainstRequest(result, contract) {
+  if (result.source_text_sha256 !== sha256Bytes(Buffer.from(contract.source_text))) {
+    fail("proof result source_text_sha256 does not match the host-supplied contract");
+  }
+  if (!equalJson(result.clauses, contract.clauses)) fail("proof result clauses do not match the host-supplied contract");
+  if (!equalJson(projectedSelectorValue(result.spec.start, result, "proof result start selector"), contract.spec.start)) {
+    fail("proof result start selector does not match the host-supplied contract");
+  }
+  if (result.spec.steps.length !== contract.spec.steps.length) fail("proof result steps do not match the host-supplied contract");
+  result.spec.steps.forEach((step, index) => {
+    const projected = {
+      relation: step.relation,
+      target: projectedSelectorValue(step.target, result, `proof result step ${index} target`),
+    };
+    if (!equalJson(projected, contract.spec.steps[index])) fail(`proof result step ${index} does not match the host-supplied contract`);
+  });
+  if (!equalJson(result.spec.prohibit_traversal_through, contract.spec.prohibit_traversal_through)
+      || !equalJson(result.spec.exclude_from_projection, contract.spec.exclude_from_projection)) {
+    fail("proof result scope selectors do not match the host-supplied contract");
+  }
 }
 
 function validateProofCalls(scenarioContract, request, actions, results) {
@@ -620,6 +1289,7 @@ function validateProofCalls(scenarioContract, request, actions, results) {
     return;
   }
   if (projection?.isError) fail(`${scenarioContract.id} typed proof unexpectedly returned a tool error`);
+  validateProofResultAgainstRequest(projection.body, request.proof_contract);
 }
 
 function validatePacketContinuation(scenarioContract, actions, results) {
@@ -639,7 +1309,7 @@ function validatePacketContinuation(scenarioContract, actions, results) {
   if (!equalJson(packets[1].args, expected)) fail(`${scenarioContract.id} packet continuation arguments do not match the pinned offer`);
 }
 
-function validateSelectedContext(scenarioContract, request, actions) {
+function validateSelectedContext(scenarioContract, request, actions, results) {
   const contexts = actions.filter((action) => action.kind === "context");
   if (contexts.length === 0) return;
   if (typeof request.selected_target !== "string" || !request.selected_target) {
@@ -648,6 +1318,9 @@ function validateSelectedContext(scenarioContract, request, actions) {
   for (const action of contexts) {
     if (action.args?.selector?.canonical_id !== request.selected_target) {
       fail(`${scenarioContract.id} context selector does not match the selected target`);
+    }
+    if (results.get(action)?.body?.target?.canonical_id !== request.selected_target) {
+      fail(`${scenarioContract.id} context result does not match the selected target`);
     }
   }
 }
@@ -677,64 +1350,138 @@ function proofDisposition(actions, results) {
   return typeof kind === "string" ? kind : null;
 }
 
-function materialGaps(actions, results) {
-  const gaps = [];
-  for (const action of actions) {
-    if (!["search", "context", "packet", "prove_call_path"].includes(action.kind)) continue;
-    const body = results.get(action)?.body;
-    const collections = [body?.gaps, body?.disposition?.gaps];
-    for (const entries of collections) {
-      if (!Array.isArray(entries)) continue;
-      for (const gap of entries) {
-        const id = gap?.gap_id ?? gap?.code;
-        if (typeof id === "string" && id) gaps.push(id);
-      }
+const FINAL_CLAIM_KEYS = Object.freeze([
+  "authority",
+  "outcome",
+  "target_id",
+  "evidence_ids",
+  "gap_ids",
+  "reason_codes",
+  "proof_disposition",
+  "refutation_basis",
+  "runtime_execution_claim",
+  "absence_claim",
+  "material_omissions",
+]);
+
+function uniqueStrings(values, label) {
+  if (!Array.isArray(values) || !values.every(nonemptyString) || new Set(values).size !== values.length) {
+    fail(`${label} must be unique nonempty strings`);
+  }
+  return values;
+}
+
+function parseFinalClaim(final, scenarioId) {
+  const claim = parseJsonText(final);
+  requireExactKeys(claim, FINAL_CLAIM_KEYS, `${scenarioId} final claim`);
+  if (!nonemptyString(claim.authority) || !nonemptyString(claim.outcome)
+      || !(claim.target_id === null || nonemptyString(claim.target_id))
+      || !(claim.proof_disposition === null || PROOF_DISPOSITIONS.has(claim.proof_disposition))
+      || !(claim.refutation_basis === null || nonemptyString(claim.refutation_basis))
+      || typeof claim.runtime_execution_claim !== "boolean" || typeof claim.absence_claim !== "boolean") {
+    fail(`${scenarioId} final claim has invalid typed fields`);
+  }
+  uniqueStrings(claim.evidence_ids, `${scenarioId} final claim evidence_ids`);
+  uniqueStrings(claim.gap_ids, `${scenarioId} final claim gap_ids`);
+  uniqueStrings(claim.reason_codes, `${scenarioId} final claim reason_codes`);
+  if (!Array.isArray(claim.material_omissions)) fail(`${scenarioId} final claim material_omissions must be an array`);
+  return claim;
+}
+
+function expectedFinalClaim(scenarioContract, actions, results) {
+  const expected = {
+    ...scenarioContract.final_claim_constraints,
+    target_id: null,
+    evidence_ids: [],
+    gap_ids: [],
+    reason_codes: [],
+    proof_disposition: scenarioContract.final_claim_constraints.proof_disposition ?? null,
+    refutation_basis: null,
+    runtime_execution_claim: false,
+    absence_claim: false,
+    material_omissions: [],
+  };
+  const contexts = actions.filter((action) => action.kind === "context");
+  const packets = actions.filter((action) => action.kind === "packet");
+  const searches = actions.filter((action) => action.kind === "search");
+  const proof = actions.find((action) => action.kind === "prove_call_path");
+  const reads = actions.filter((action) => action.kind === "source_read");
+
+  if (contexts.length > 0) {
+    const body = results.get(contexts.at(-1)).body;
+    expected.target_id = body.target.canonical_id;
+    expected.evidence_ids = body.evidence.map(({ evidence_id }) => evidence_id);
+  } else if (searches.length > 0) {
+    const body = results.get(searches.at(-1)).body;
+    if (body.leads.length === 1) expected.target_id = body.leads[0].canonical_id;
+    expected.evidence_ids = body.leads.map(({ lead_id }) => lead_id);
+  } else if (packets.length > 0) {
+    expected.evidence_ids = packets.flatMap((action) => results.get(action).body.evidence.map(({ evidence_id }) => evidence_id));
+  }
+  if (reads.length > 0) expected.evidence_ids = reads.map(({ path }) => `source:${path}`);
+  if (proof) {
+    const disposition = results.get(proof).body?.disposition;
+    if (disposition?.kind === "contract_proven") {
+      const receipts = results.get(proof).body.receipts;
+      expected.evidence_ids = disposition.receipts.map((index) => receipts[index]?.receipt_id);
+    } else {
+      expected.evidence_ids = [];
+    }
+    if (disposition?.kind === "contract_refuted") expected.refutation_basis = disposition.refutation.kind;
+  }
+
+  for (const action of [...searches, ...packets]) {
+    expected.gap_ids.push(...results.get(action).body.gaps.map((gap) => gap.gap_id ?? gap.code));
+  }
+  if (proof) {
+    const disposition = results.get(proof).body?.disposition;
+    if (Array.isArray(disposition?.gaps)) expected.gap_ids.push(...disposition.gaps.map(({ kind }) => kind));
+    if (Array.isArray(disposition?.reasons)) expected.reason_codes.push(...disposition.reasons);
+    if (results.get(proof).isError && nonemptyString(results.get(proof).body?.code)) {
+      expected.reason_codes.push(results.get(proof).body.code);
     }
   }
-  return [...new Set(gaps)];
+  for (const action of packets) {
+    const reason = results.get(action).body.reason;
+    if (nonemptyString(reason)) expected.reason_codes.push(reason);
+  }
+  if (scenarioContract.id === "refuse_free_english_proof") expected.reason_codes.push("typed_contract_required");
+  expected.evidence_ids = [...new Set(expected.evidence_ids)];
+  expected.gap_ids = [...new Set(expected.gap_ids.filter(nonemptyString))];
+  expected.reason_codes = [...new Set(expected.reason_codes)];
+  return expected;
 }
 
 function validateFinalClaims(scenarioContract, final, actions, results) {
-  const lower = final.toLowerCase();
-  for (const term of scenarioContract.final_claim_constraints.required_terms) {
-    if (!lower.includes(term.toLowerCase())) fail(`${scenarioContract.id} missing required final claim ${term}`);
+  const claim = parseFinalClaim(final, scenarioContract.id);
+  const expected = expectedFinalClaim(scenarioContract, actions, results);
+  for (const key of FINAL_CLAIM_KEYS) {
+    if (!equalJson(claim[key], expected[key])) {
+      fail(`${scenarioContract.id} final claim ${key} does not match result-bound evidence`);
+    }
   }
-  for (const term of scenarioContract.final_claim_constraints.forbidden_terms) {
-    if (lower.includes(term.toLowerCase())) fail(`${scenarioContract.id} final claim violates forbidden term ${term}`);
-  }
-  if (/execut(?:e|ed|es|ion) at runtime|runtime reach(?:es|able)|will execute/iu.test(final)) {
-    fail(`${scenarioContract.id} final claim violates the no-runtime-claim boundary`);
-  }
-  for (const gap of materialGaps(actions, results)) {
-    if (!lower.includes(gap.toLowerCase())) fail(`${scenarioContract.id} missing required final claim for material gap ${gap}`);
-  }
-  const observed = proofDisposition(actions, results);
-  const expected = scenarioContract.final_claim_constraints.proof_disposition;
-  if (observed === null && /\b(?:verified|certified|definitively|proven|refuted)\b/iu.test(final)) {
-    fail(`${scenarioContract.id} final claim violates retrieval/proof authority separation`);
-  }
-  if (expected !== null && observed !== expected) {
-    fail(`${scenarioContract.id} expected proof disposition ${expected} but observed ${observed ?? "none"}`);
-  }
-  if (observed !== null && !PROOF_DISPOSITIONS.has(observed)) fail(`${scenarioContract.id} observed unknown proof disposition ${observed}`);
-  if (observed === "unknown" && /\b(absent|does not exist|never happens|cannot call)\b/iu.test(final)) {
-    if (!lower.includes("does not establish absence")) fail(`${scenarioContract.id} Unknown must not become absence`);
-  }
+  if (claim.runtime_execution_claim) fail(`${scenarioContract.id} final claim makes a runtime execution claim`);
+  if (claim.absence_claim) fail(`${scenarioContract.id} final claim absence_claim contradicts Unknown or retrieval authority`);
+  if (claim.material_omissions.length > 0) fail(`${scenarioContract.id} final claim contains material omissions`);
 }
 
 export function validateInstalledSession({
   host,
   scenarioId,
   request,
-  installedIdentity,
+  installedRoot,
+  installedReceipt,
   expectedIdentity,
   transcript,
 }) {
   const scenarioContract = SCENARIOS_BY_ID.get(scenarioId);
   if (!scenarioContract) fail(`unknown routing scenario ${JSON.stringify(scenarioId)}`);
   if (!plainObject(request)) fail(`${scenarioId} request must be an object`);
-  validateExactIdentity(installedIdentity, expectedIdentity);
+  authenticateInstalledIdentity(installedRoot, installedReceipt, expectedIdentity);
   const parsed = parseInstalledTranscript(host, transcript);
+  if (String(host).toLowerCase() === "cursor" && parsed.user_text !== request.text) {
+    fail(`${scenarioId} Cursor user text does not match the declared request`);
+  }
   validateActionOrder(scenarioContract, parsed.actions);
 
   const results = new Map();
@@ -750,12 +1497,15 @@ export function validateInstalledSession({
     if (results.get(action).isError && !expectedSemanticError) {
       fail(`${scenarioId} has an unexpected failed ${action.tool} action`);
     }
+    if (!expectedSemanticError && ["search", "context", "packet", "prove_call_path"].includes(action.kind)) {
+      validateToolResultSchema(action, results.get(action));
+    }
   }
 
   validateSourceReads(scenarioContract, request, parsed.actions, results);
   validateProofCalls(scenarioContract, request, parsed.actions, results);
   validatePacketContinuation(scenarioContract, parsed.actions, results);
-  validateSelectedContext(scenarioContract, request, parsed.actions);
+  validateSelectedContext(scenarioContract, request, parsed.actions, results);
   validateHiddenDiscovery(scenarioContract, parsed.actions, results);
   validateFinalClaims(scenarioContract, parsed.final, parsed.actions, results);
 
@@ -788,6 +1538,12 @@ async function readJson(path, label) {
 export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   validateIdentityShape(expectedIdentity, "expected identity");
   const root = resolve(pluginRoot);
+  requireExactKeys(expectedIdentity.static_roster, STATIC_ROSTER_PATHS, "expected static digest roster");
+  for (const path of STATIC_ROSTER_PATHS) {
+    const digest = expectedIdentity.static_roster[path];
+    if (!SHA256.test(digest) || /^0{64}$/u.test(digest)) fail(`expected static digest roster ${path} is invalid`);
+    if (await fileSha256(resolve(root, path)) !== digest) fail(`static digest roster ${path} does not match package bytes`);
+  }
   const portable = await readJson(resolve(root, "plugin.json"), "portable plugin manifest");
   const pin = await readJson(resolve(root, "cli-version.json"), "CLI version pin");
   const catalog = await readJson(resolve(root, "generated-mcp-catalog.json"), "generated MCP catalog");
@@ -824,6 +1580,7 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
     const hookPath = resolve(root, inputs.hook);
     const rulePath = resolve(root, inputs.rule);
     const metadata = await readJson(metadataPath, `${host} metadata`);
+    const hook = await readJson(hookPath, `${host} hook`);
     const hookText = await readFile(hookPath, "utf8");
     const ruleText = await readFile(rulePath, "utf8");
     if (metadata.name !== "codestory" || metadata.version !== portable.version) {
@@ -834,8 +1591,38 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
     if (host.startsWith("copilot") && metadata.skills !== "skills/") {
       fail(`${host} metadata does not bind the canonical rule/skill directory`);
     }
-    if (!hookText.includes("codestory-activate.cjs")) fail(`${host} hook does not bind the canonical activation hook`);
-    if (!ruleText.includes("# CodeStory Grounding")) fail(`${host} rule input is not the canonical grounding skill`);
+    if (host === "claude_code") {
+      const sessionStart = hook.hooks?.SessionStart;
+      if (!Array.isArray(sessionStart) || sessionStart.length !== 1
+          || sessionStart[0].matcher !== "startup|resume|clear|compact"
+          || !Array.isArray(sessionStart[0].hooks) || sessionStart[0].hooks.length !== 1) {
+        fail("claude_code hook structure is invalid");
+      }
+      const command = sessionStart[0].hooks[0];
+      requireExactKeys(command, ["type", "command", "commandWindows", "timeout", "statusMessage"], "claude_code hook command");
+      if (command.type !== "command"
+          || command.command !== "command -v node >/dev/null 2>&1 && node \"${CLAUDE_PLUGIN_ROOT}/hooks/codestory-activate.cjs\" || exit 0"
+          || command.commandWindows !== "if (Get-Command node -ErrorAction SilentlyContinue) { node \"$env:CLAUDE_PLUGIN_ROOT\\hooks\\codestory-activate.cjs\" }"
+          || command.timeout !== 300) fail("claude_code hook command is not the canonical launcher");
+    } else {
+      if (hook.version !== 1 || !Array.isArray(hook.hooks?.sessionStart) || hook.hooks.sessionStart.length !== 1) {
+        fail(`${host} hook structure is invalid`);
+      }
+      const command = hook.hooks.sessionStart[0];
+      requireExactKeys(command, ["type", "bash", "powershell", "timeoutSec"], `${host} hook command`);
+      if (command.type !== "command"
+          || command.bash !== "node \"${PLUGIN_ROOT}/hooks/codestory-activate.cjs\""
+          || command.powershell !== "node \"${PLUGIN_ROOT}\\hooks\\codestory-activate.cjs\""
+          || command.timeoutSec !== 300) fail(`${host} hook command is not the canonical launcher`);
+    }
+    if (!/^---\nname: codestory-grounding\n/iu.test(ruleText)
+        || !ruleText.includes("## Direct Tool Loop")
+        || !ruleText.includes("## Task Router")
+        || !ruleText.includes("## Evidence Rules")
+        || !ruleText.includes("`packet`")
+        || !ruleText.includes("`context`")) {
+      fail(`${host} rule input is not the complete canonical grounding contract`);
+    }
     hosts.push({
       host,
       package_version: portable.version,
@@ -856,7 +1643,8 @@ function parseOptions(argv) {
     "--scenario",
     "--request",
     "--transcript",
-    "--installed-identity",
+    "--installed-root",
+    "--installed-receipt",
     "--expected-identity",
     "--plugin-root",
     "--static-parity",
@@ -890,7 +1678,7 @@ async function main(argv) {
     if (!options.plugin_root) fail("--plugin-root is required with --static-parity");
     report = await validateStaticHostParity(options.plugin_root, expectedIdentity);
   } else {
-    for (const required of ["host", "scenario", "request", "transcript", "installed_identity"]) {
+    for (const required of ["host", "scenario", "request", "transcript", "installed_root", "installed_receipt"]) {
       if (!options[required]) fail(`--${required.replaceAll("_", "-")} is required`);
     }
     report = validateInstalledSession({
@@ -898,7 +1686,8 @@ async function main(argv) {
       scenarioId: options.scenario,
       request: await readInputJson(options.request, "request"),
       transcript: await readFile(resolve(options.transcript), "utf8"),
-      installedIdentity: await readInputJson(options.installed_identity, "installed identity"),
+      installedRoot: resolve(options.installed_root),
+      installedReceipt: resolve(options.installed_receipt),
       expectedIdentity,
     });
   }
