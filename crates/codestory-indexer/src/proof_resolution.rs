@@ -628,9 +628,7 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 .cmp(&right.name)
                 .then(left.declaration.cmp(&right.declaration))
         });
-        result
-            .classes
-            .sort_by(|left, right| left.declaration.cmp(&right.declaration));
+        result.classes.sort_by_key(|class| class.declaration);
         for (index, declaration) in result.declarations.iter().enumerate() {
             count_java_kotlin_resolution_work(1);
             result
@@ -8702,20 +8700,17 @@ pub fn rematerialize_proof_resolution_projection(
     let go_projection_index = GoProjectionIndex::prepare(&records)?;
     let java_kotlin_projection_index = JavaKotlinProjectionIndex::prepare(&records);
     let python_projection_index = PythonProjectionIndex::prepare(&records, &record_by_path)?;
+    let claim_indexes = SyntaxClaimIndexes {
+        files: &file_by_id,
+        records: &record_by_path,
+        rust: &rust_projection_index,
+        go: &go_projection_index,
+        java_kotlin: &java_kotlin_projection_index,
+        python: &python_projection_index,
+    };
     let mut claims = inputs
         .into_iter()
-        .map(|(source_record, input)| {
-            resolve_syntax_claim(
-                &file_by_id,
-                &record_by_path,
-                &rust_projection_index,
-                &go_projection_index,
-                &java_kotlin_projection_index,
-                &python_projection_index,
-                source_record,
-                input,
-            )
-        })
+        .map(|(source_record, input)| resolve_syntax_claim(&claim_indexes, source_record, input))
         .collect::<Result<Vec<_>>>()?;
     enforce_go_exact_callable_ownership(&mut claims, &nodes);
     enforce_exact_dependency_eligibility(
@@ -11504,7 +11499,7 @@ impl JavaKotlinProjectionIndex {
             domain.dependencies.sort();
             domain.dependencies.dedup();
             for candidates in domain.declarations.values_mut() {
-                candidates.sort_by(|left, right| left.declaration.cmp(&right.declaration));
+                candidates.sort_by_key(|candidate| candidate.declaration);
                 candidates.dedup_by(|left, right| left.declaration == right.declaration);
             }
         }
@@ -11985,16 +11980,26 @@ fn go_domain_dependencies(domain: &GoPackageDomain<'_>) -> Vec<FileId> {
     domain.dependencies.clone()
 }
 
+struct SyntaxClaimIndexes<'a, 'records> {
+    files: &'a HashMap<i64, &'records codestory_store::FileInfo>,
+    records: &'a HashMap<WorkspacePathIdentity, &'records ResolutionCacheRecord>,
+    rust: &'a RustProjectionIndex<'records>,
+    go: &'a GoProjectionIndex<'records>,
+    java_kotlin: &'a JavaKotlinProjectionIndex,
+    python: &'a PythonProjectionIndex,
+}
+
 fn resolve_syntax_claim(
-    files: &HashMap<i64, &codestory_store::FileInfo>,
-    records: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
-    rust_index: &RustProjectionIndex<'_>,
-    go_index: &GoProjectionIndex<'_>,
-    java_kotlin_index: &JavaKotlinProjectionIndex,
-    python_index: &PythonProjectionIndex,
+    indexes: &SyntaxClaimIndexes<'_, '_>,
     source_record: &ResolutionCacheRecord,
     input: CachedCallResolutionInput,
 ) -> Result<ResolvedSyntaxClaim> {
+    let files = indexes.files;
+    let records = indexes.records;
+    let rust_index = indexes.rust;
+    let go_index = indexes.go;
+    let java_kotlin_index = indexes.java_kotlin;
+    let python_index = indexes.python;
     let source_file = files
         .get(&input.callsite.file_id.0)
         .ok_or_else(|| anyhow!("proof callsite file is missing"))?;
