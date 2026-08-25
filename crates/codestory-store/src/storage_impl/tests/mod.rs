@@ -751,6 +751,32 @@ fn observational_wal_snapshot_pins_frames_during_concurrent_checkpoint() {
 }
 
 #[test]
+fn proof_validation_observer_refuses_a_sealed_database_without_sidecars() {
+    let path = unique_temp_db_path("proof-validation-observer");
+    let bootstrap = Storage::open(&path).expect("create proof validation fixture");
+    drop(bootstrap);
+    let database_before = fs::read(&path).expect("read sealed proof validation fixture");
+    assert_no_sqlite_sidecars(&path);
+
+    let error = Storage::open_proof_validation_observer(&path)
+        .err()
+        .expect("a sealed database cannot supply a proof validation observer");
+    assert!(
+        error
+            .to_string()
+            .contains("existing complete WAL sidecar pair"),
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(&path).expect("read sealed proof validation fixture after refusal"),
+        database_before,
+        "refusing the proof observer must not change database bytes"
+    );
+    assert_no_sqlite_sidecars(&path);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn observational_open_reports_incomplete_wal_pair_without_materializing_shm() {
     let path = unique_temp_db_path("observational-incomplete-wal");
     create_versioned_observation_fixture(&path, SCHEMA_VERSION);

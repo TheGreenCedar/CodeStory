@@ -4488,6 +4488,7 @@ pub struct SymbolSummaryRecord {
 enum NonmutatingOpenPolicy {
     StrictCurrentSchema,
     FreshnessFence,
+    ProofValidation,
     SchemaVersion,
 }
 
@@ -4545,6 +4546,17 @@ impl Storage {
         Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::StrictCurrentSchema)
     }
 
+    /// Open the current database for one persistent proof-validation observer.
+    ///
+    /// This keeps the same nonmutating promotion and sidecar fences as ordinary
+    /// observation, and requires an already-complete WAL/SHM pair. The
+    /// persistent non-immutable reader observes later in-place commits via
+    /// `PRAGMA data_version`; refusing a standalone database prevents this
+    /// observer from materializing SQLite sidecars itself.
+    pub fn open_proof_validation_observer<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::ProofValidation)
+    }
+
     /// Open storage only to inspect index freshness without repairing,
     /// migrating, or exposing a fenced database as a readable publication.
     ///
@@ -4592,17 +4604,35 @@ impl Storage {
                 path.display()
             )));
         }
+        if policy == NonmutatingOpenPolicy::ProofValidation && !wal_exists {
+            return Err(StorageError::Other(format!(
+                "Proof validation requires an existing complete WAL sidecar pair: {}",
+                path.display()
+            )));
+        }
         // `immutable=1` guarantees that a standalone database cannot acquire
         // locks or sidecars, but it intentionally ignores committed WAL state.
         // When a complete WAL/SHM pair already exists, a normal read-only
         // connection observes it without materializing either sidecar. SQLite
         // may update transient reader marks inside the existing SHM wal-index;
         // durable database and WAL bytes remain observationally unchanged.
-        let uri = sqlite_path::observational_uri(path, !wal_exists);
-        let conn = Connection::open_with_flags(
-            uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )?;
+        let conn = if policy == NonmutatingOpenPolicy::ProofValidation {
+            // A plain read-only filename stays non-immutable, so this
+            // persistent connection can observe later commits through
+            // `data_version`. The complete pair above was established by the
+            // active read path, rather than this observer.
+            Connection::open_with_flags(
+                sqlite_path::open_path(path),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?
+        } else {
+            let immutable = !wal_exists;
+            let uri = sqlite_path::observational_uri(path, immutable);
+            Connection::open_with_flags(
+                uri,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )?
+        };
         if policy == NonmutatingOpenPolicy::FreshnessFence {
             // The freshness decision combines the schema sentinel, durable
             // fence, stored inventory, and workspace comparison. Pin one
@@ -4632,6 +4662,11 @@ impl Storage {
             NonmutatingOpenPolicy::FreshnessFence if version != SCHEMA_VERSION => {
                 return Err(StorageError::Other(format!(
                     "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"
+                )));
+            }
+            NonmutatingOpenPolicy::ProofValidation if version != SCHEMA_VERSION => {
+                return Err(StorageError::Other(format!(
+                    "Proof validation requires schema version {SCHEMA_VERSION}, found {version}"
                 )));
             }
             NonmutatingOpenPolicy::SchemaVersion => {}
@@ -4885,6 +4920,18 @@ impl Storage {
     /// schema invariants and derived snapshot freshness manually.
     pub fn get_connection(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Return SQLite's connection-local commit observation counter.
+    ///
+    /// A persistent read-only observer compares this value before reusing a
+    /// previously validated publication. SQLite changes it when another
+    /// connection commits, so it detects in-place mutations without treating
+    /// file metadata as publication authority.
+    pub fn sqlite_data_version(&self) -> Result<i64, StorageError> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(StorageError::from)
     }
 
     /// Open a query-only artifact-cache reader for this file-backed store.

@@ -43,10 +43,12 @@ use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
 use codestory_indexer::current_proof_resolution_adapter_roster;
-use codestory_store::{FileInfo, IndexPublicationRecord, Store};
+use codestory_store::{
+    FileInfo, IndexPublicationRecord, ProofResolutionPublication, Store, seal_call_resolution_fact,
+};
 use codestory_workspace::{
     ProjectRelativePathResolution, WorkspacePathIdentity, project_identity_v3,
-    resolve_project_relative_path, workspace_relative_path,
+    resolve_project_relative_path, workspace_path_identity_token, workspace_relative_path,
 };
 use sha2::{Digest, Sha256};
 
@@ -61,6 +63,413 @@ pub const MAX_QUALIFICATION_OBSERVED_RECEIPTS_PER_CASE: usize =
     MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize * 6;
 const RECEIPT_DOMAIN: &[u8] = b"codestory.indexed-call-edge-receipt.v1\0";
 const CALLABLE_KINDS: [NodeKind; 3] = [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
+
+#[cfg(test)]
+thread_local! {
+    static FULL_PROOF_PUBLICATION_VALIDATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[inline]
+fn count_full_proof_publication_validation() {
+    #[cfg(test)]
+    FULL_PROOF_PUBLICATION_VALIDATIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_proof_publication_validations() {
+    FULL_PROOF_PUBLICATION_VALIDATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_proof_publication_validation_count() -> usize {
+    FULL_PROOF_PUBLICATION_VALIDATIONS.with(std::cell::Cell::get)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProofPublicationValidationToken {
+    project_root: PathBuf,
+    project_id: String,
+    storage_path: PathBuf,
+    native_storage_identity: String,
+    core_publication: IndexPublicationRecord,
+    manifest: ProofResolutionPublication,
+    data_version: i64,
+}
+
+struct ProofPublicationValidationCacheEntry {
+    token: ProofPublicationValidationToken,
+    observer: Store,
+}
+
+enum PreparedProofPublicationValidation {
+    Unavailable,
+    Warm(ProofPublicationValidationToken),
+    Cold {
+        project_root: PathBuf,
+        project_id: String,
+        storage_path: PathBuf,
+        native_storage_identity: String,
+        observed: ObservedProofPublicationIdentity,
+        observer: Store,
+    },
+}
+
+pub(crate) enum ProofPublicationValidationUse {
+    Direct {
+        proof_projection_available: bool,
+    },
+    Unavailable,
+    Warm(ProofPublicationValidationToken),
+    Cold {
+        token: ProofPublicationValidationToken,
+        observer: Store,
+    },
+}
+
+impl ProofPublicationValidationUse {
+    fn proof_projection_available(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+            && match self {
+                Self::Direct {
+                    proof_projection_available,
+                } => *proof_projection_available,
+                Self::Unavailable => false,
+                Self::Warm(_) | Self::Cold { .. } => true,
+            }
+    }
+}
+
+/// One controller-local proof-only validation receipt.
+///
+/// The observer is deliberately a persistent, nonmutating SQLite connection:
+/// `data_version` is meaningful only when the same connection observes both
+/// the full validation and a later warm proof.
+struct ProofPublicationValidationCache {
+    entry: Option<ProofPublicationValidationCacheEntry>,
+    prepared: Option<PreparedProofPublicationValidation>,
+    armed: bool,
+}
+
+impl Default for ProofPublicationValidationCache {
+    fn default() -> Self {
+        Self {
+            entry: None,
+            prepared: None,
+            armed: false,
+        }
+    }
+}
+
+fn proof_validation_cache(
+    slot: &mut Option<Box<dyn std::any::Any + Send>>,
+) -> &mut ProofPublicationValidationCache {
+    slot.get_or_insert_with(|| Box::new(ProofPublicationValidationCache::default()))
+        .downcast_mut::<ProofPublicationValidationCache>()
+        .expect("the dark proof cache slot only stores proof validation state")
+}
+
+#[derive(PartialEq, Eq)]
+struct ObservedProofPublicationIdentity {
+    data_version: i64,
+    core_publication: Option<IndexPublicationRecord>,
+    manifest: Option<ProofResolutionPublication>,
+}
+
+fn count_and_validate_complete_proof_publication(
+    store: &Store,
+    publication: &IndexPublicationRecord,
+) -> Result<ProofResolutionPublication, codestory_store::StorageError> {
+    count_full_proof_publication_validation();
+    store.validate_proof_resolution_publication(publication)
+}
+
+fn observe_proof_publication_identity(
+    observer: &Store,
+) -> Result<ObservedProofPublicationIdentity, codestory_store::StorageError> {
+    let snapshot = observer.read_snapshot()?;
+    let storage = snapshot.storage();
+    let observed = ObservedProofPublicationIdentity {
+        data_version: storage.sqlite_data_version()?,
+        core_publication: storage.get_complete_index_publication()?,
+        manifest: storage.get_proof_resolution_publication()?,
+    };
+    snapshot.finish()?;
+    Ok(observed)
+}
+
+fn storage_native_identity(storage_path: &Path) -> Result<String, ApiError> {
+    workspace_path_identity_token(storage_path)
+        .map_err(|error| {
+            ApiError::new(
+                "project_unavailable",
+                format!(
+                    "failed to observe native proof storage identity for {}: {error}",
+                    storage_path.display()
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                "project_unavailable",
+                format!(
+                    "proof storage disappeared while observing {}",
+                    storage_path.display()
+                ),
+            )
+        })
+}
+
+fn publication_changed(message: impl Into<String>) -> ApiError {
+    ApiError::new("publication_changed", message.into())
+}
+
+fn proof_validation_fence_matches(
+    token: &ProofPublicationValidationToken,
+    project_root: &Path,
+    project_id: &str,
+    storage_path: &Path,
+    native_storage_identity: &str,
+    active_publication: &IndexPublicationRecord,
+    observer: &Store,
+) -> bool {
+    token.project_root == project_root
+        && token.project_id == project_id
+        && token.storage_path == storage_path
+        && token.native_storage_identity == native_storage_identity
+        && token.core_publication == *active_publication
+        && observe_proof_publication_identity(observer)
+            .ok()
+            .is_some_and(|observed| {
+                observed.data_version == token.data_version
+                    && observed.core_publication.as_ref() == Some(active_publication)
+                    && observed.manifest.as_ref() == Some(&token.manifest)
+            })
+}
+
+impl ProofPublicationValidationCache {
+    fn clear(&mut self) {
+        self.entry = None;
+        self.prepared = None;
+    }
+
+    fn finish_operation(&mut self) {
+        self.prepared = None;
+        self.armed = false;
+    }
+}
+
+impl AppController {
+    pub(crate) fn clear_proof_publication_validation_cache(&self) {
+        proof_validation_cache(&mut self.proof_validation_cache.lock()).clear();
+    }
+
+    pub(crate) fn arm_proof_publication_validation(&self) {
+        let mut cache_slot = self.proof_validation_cache.lock();
+        let cache = proof_validation_cache(&mut cache_slot);
+        cache.prepared = None;
+        cache.armed = true;
+    }
+
+    pub(crate) fn prepare_armed_proof_publication_validation(&self) -> Result<(), ApiError> {
+        let mut cache_slot = self.proof_validation_cache.lock();
+        let cache = proof_validation_cache(&mut cache_slot);
+        if !cache.armed {
+            return Ok(());
+        }
+        cache.prepared = None;
+        let project_root = self.require_project_root()?;
+        let project_id = project_identity_v3(&project_root).project_id;
+        let storage_path = self.require_storage_path()?;
+        let native_storage_identity = storage_native_identity(&storage_path)?;
+
+        if let Some(entry) = cache.entry.as_ref() {
+            let scope_matches = entry.token.project_root == project_root
+                && entry.token.project_id == project_id
+                && entry.token.storage_path == storage_path
+                && entry.token.native_storage_identity == native_storage_identity;
+            let observer_matches = observe_proof_publication_identity(&entry.observer)
+                .ok()
+                .is_some_and(|observed| {
+                    observed.data_version == entry.token.data_version
+                        && observed.core_publication.as_ref() == Some(&entry.token.core_publication)
+                        && observed.manifest.as_ref() == Some(&entry.token.manifest)
+                });
+            if scope_matches && observer_matches {
+                cache.prepared = Some(PreparedProofPublicationValidation::Warm(
+                    entry.token.clone(),
+                ));
+                return Ok(());
+            }
+            cache.clear();
+        }
+
+        let observer = match Store::open_proof_validation_observer(&storage_path) {
+            Ok(observer) => observer,
+            Err(_) => {
+                cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
+                return Ok(());
+            }
+        };
+        let observed = match observe_proof_publication_identity(&observer) {
+            Ok(observed) => observed,
+            Err(_) => {
+                cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
+                return Ok(());
+            }
+        };
+        let native_after = storage_native_identity(&storage_path)?;
+        if native_after != native_storage_identity {
+            cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
+            return Ok(());
+        }
+        cache.prepared = Some(PreparedProofPublicationValidation::Cold {
+            project_root,
+            project_id,
+            storage_path,
+            native_storage_identity,
+            observed,
+            observer,
+        });
+        Ok(())
+    }
+
+    fn validate_proof_publication_for_active_snapshot(
+        &self,
+        active_publication: &IndexPublicationRecord,
+        active_storage: &Store,
+    ) -> Result<ProofPublicationValidationUse, ApiError> {
+        let mut cache_slot = self.proof_validation_cache.lock();
+        let cache = proof_validation_cache(&mut cache_slot);
+        let Some(prepared) = cache.prepared.take() else {
+            let proof_projection_available = matches!(
+                count_and_validate_complete_proof_publication(active_storage, active_publication),
+                Ok(manifest) if manifest.adapter_roster == current_proof_resolution_adapter_roster()
+            );
+            return Ok(ProofPublicationValidationUse::Direct {
+                proof_projection_available,
+            });
+        };
+        match prepared {
+            PreparedProofPublicationValidation::Unavailable => {
+                Ok(ProofPublicationValidationUse::Unavailable)
+            }
+            PreparedProofPublicationValidation::Warm(token) => {
+                let manifest = active_storage
+                    .get_proof_resolution_publication()
+                    .map_err(store_error)?;
+                if token.core_publication != *active_publication
+                    || manifest.as_ref() != Some(&token.manifest)
+                {
+                    cache.clear();
+                    return Err(publication_changed(
+                        "the active proof snapshot differs from the warm validation receipt",
+                    ));
+                }
+                Ok(ProofPublicationValidationUse::Warm(token))
+            }
+            PreparedProofPublicationValidation::Cold {
+                project_root,
+                project_id,
+                storage_path,
+                native_storage_identity,
+                observed,
+                observer,
+            } => {
+                let manifest = match count_and_validate_complete_proof_publication(
+                    active_storage,
+                    active_publication,
+                ) {
+                    Ok(manifest)
+                        if manifest.adapter_roster == current_proof_resolution_adapter_roster() =>
+                    {
+                        manifest
+                    }
+                    Ok(_) | Err(_) => return Ok(ProofPublicationValidationUse::Unavailable),
+                };
+                if observed.core_publication.as_ref() != Some(active_publication)
+                    || observed.manifest.as_ref() != Some(&manifest)
+                {
+                    return Err(publication_changed(
+                        "the observer differs from the active proof-validation snapshot",
+                    ));
+                }
+                Ok(ProofPublicationValidationUse::Cold {
+                    token: ProofPublicationValidationToken {
+                        project_root,
+                        project_id,
+                        storage_path,
+                        native_storage_identity,
+                        core_publication: active_publication.clone(),
+                        manifest,
+                        data_version: observed.data_version,
+                    },
+                    observer,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn finish_proof_publication_validation(
+        &self,
+        validation: ProofPublicationValidationUse,
+    ) -> Result<(), ApiError> {
+        let active_publication = self.active_core_publication().ok_or_else(|| {
+            publication_changed("the active core publication disappeared during proof execution")
+        })?;
+        let project_root = self.require_project_root()?;
+        let project_id = project_identity_v3(&project_root).project_id;
+        let storage_path = self.require_storage_path()?;
+        let native_storage_identity = storage_native_identity(&storage_path)?;
+        let mut cache_slot = self.proof_validation_cache.lock();
+        let cache = proof_validation_cache(&mut cache_slot);
+        let matches = match validation {
+            ProofPublicationValidationUse::Direct { .. }
+            | ProofPublicationValidationUse::Unavailable => return Ok(()),
+            ProofPublicationValidationUse::Warm(token) => {
+                cache.entry.as_ref().is_some_and(|entry| {
+                    entry.token == token
+                        && proof_validation_fence_matches(
+                            &token,
+                            &project_root,
+                            &project_id,
+                            &storage_path,
+                            &native_storage_identity,
+                            &active_publication,
+                            &entry.observer,
+                        )
+                })
+            }
+            ProofPublicationValidationUse::Cold { token, observer } => {
+                if proof_validation_fence_matches(
+                    &token,
+                    &project_root,
+                    &project_id,
+                    &storage_path,
+                    &native_storage_identity,
+                    &active_publication,
+                    &observer,
+                ) {
+                    cache.entry = Some(ProofPublicationValidationCacheEntry { token, observer });
+                    return Ok(());
+                }
+                false
+            }
+        };
+        if matches {
+            return Ok(());
+        }
+        cache.clear();
+        Err(publication_changed(
+            "the proof validation publication changed during proof execution",
+        ))
+    }
+
+    pub(crate) fn finish_proof_publication_validation_operation(&self) {
+        proof_validation_cache(&mut self.proof_validation_cache.lock()).finish_operation();
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SelectorFailure {
@@ -344,6 +753,60 @@ pub(crate) fn build_observed_indexed_source_call_path_facts(
     )
 }
 
+pub(crate) fn build_observed_indexed_source_call_path_facts_with_prepared_validation(
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+) -> Result<(ObservedBuiltCallPathFacts, ProofPublicationValidationUse), ApiError> {
+    let publication = controller.active_core_publication().ok_or_else(|| {
+        ApiError::internal("indexed call-path proof requires an active core publication")
+    })?;
+    let project_root = controller.require_project_root()?;
+    let project_id = project_identity_v3(&project_root).project_id;
+    let storage = controller.open_storage_read_only()?;
+    let validation =
+        controller.validate_proof_publication_for_active_snapshot(&publication, &storage)?;
+    let observed = build_from_store_observed_with_validation(
+        &storage,
+        &project_root,
+        &project_id,
+        &publication,
+        contract,
+        validation.proof_projection_available(),
+        |path| fs::read(path),
+    )?;
+    Ok((observed, validation))
+}
+
+fn build_indexed_source_call_path_facts_after_validation(
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+) -> Result<BuiltCallPathFacts, ApiError> {
+    build_indexed_source_call_path_facts_with_validation_outcome(controller, contract, true)
+}
+
+fn build_indexed_source_call_path_facts_with_validation_outcome(
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+    proof_projection_available: bool,
+) -> Result<BuiltCallPathFacts, ApiError> {
+    let publication = controller.active_core_publication().ok_or_else(|| {
+        ApiError::internal("indexed call-path proof requires an active core publication")
+    })?;
+    let project_root = controller.require_project_root()?;
+    let project_id = project_identity_v3(&project_root).project_id;
+    let storage = controller.open_storage_read_only()?;
+    Ok(build_from_store_observed_with_validation(
+        &storage,
+        &project_root,
+        &project_id,
+        &publication,
+        contract,
+        proof_projection_available,
+        |path| fs::read(path),
+    )?
+    .built)
+}
+
 fn build_from_store<R>(
     store: &Store,
     project_root: &Path,
@@ -372,6 +835,33 @@ fn build_from_store_observed<R>(
     project_id: &str,
     publication: &IndexPublicationRecord,
     contract: &ValidatedCallPathContract,
+    read_source: R,
+) -> Result<ObservedBuiltCallPathFacts, ApiError>
+where
+    R: FnMut(&Path) -> io::Result<Vec<u8>>,
+{
+    let proof_projection_available = matches!(
+        count_and_validate_complete_proof_publication(store, publication),
+        Ok(manifest) if manifest.adapter_roster == current_proof_resolution_adapter_roster()
+    );
+    build_from_store_observed_with_validation(
+        store,
+        project_root,
+        project_id,
+        publication,
+        contract,
+        proof_projection_available,
+        read_source,
+    )
+}
+
+fn build_from_store_observed_with_validation<R>(
+    store: &Store,
+    project_root: &Path,
+    project_id: &str,
+    publication: &IndexPublicationRecord,
+    contract: &ValidatedCallPathContract,
+    proof_projection_available: bool,
     mut read_source: R,
 ) -> Result<ObservedBuiltCallPathFacts, ApiError>
 where
@@ -382,10 +872,6 @@ where
         generation_id: publication.generation_id.clone(),
         run_id: publication.run_id.clone(),
     };
-    let proof_projection_available = matches!(
-        store.validate_proof_resolution_publication(publication),
-        Ok(manifest) if manifest.adapter_roster == current_proof_resolution_adapter_roster()
-    );
     if !proof_projection_available {
         return Ok(ObservedBuiltCallPathFacts {
             built: BuiltCallPathFacts {
@@ -644,7 +1130,16 @@ where
                 step_trace.reject_resolution_fact(edge.id, ResolutionFactFailure::Missing);
                 continue;
             };
-            if !resolution_fact_matches_raw_edge(&resolution_fact, &admitted, source_id, target_id)
+            if seal_call_resolution_fact(resolution_fact.clone())
+                .ok()
+                .as_ref()
+                != Some(&resolution_fact)
+                || !resolution_fact_matches_raw_edge(
+                    &resolution_fact,
+                    &admitted,
+                    source_id,
+                    target_id,
+                )
             {
                 step_unavailable.push(UnavailableReason::ProofSemanticProjectionUnavailable);
                 step_trace.reject_resolution_fact(edge.id, ResolutionFactFailure::Inconsistent);
@@ -901,8 +1396,13 @@ pub(crate) fn run_integrated_projected_public_operation(
     rendering: &ValidatedContractRendering,
     cancelled: Arc<AtomicBool>,
 ) -> Result<PublicOperation<IntegratedProjectedCallPathResult>, ApiError> {
-    service.run_with_cancel(PROOF_DOMAIN, cancelled, || {
-        let built = build_indexed_source_call_path_facts(controller, contract)?;
+    controller.arm_proof_publication_validation();
+    let result = service.run_with_cancel(PROOF_DOMAIN, cancelled, || {
+        let (observed, validation) =
+            build_observed_indexed_source_call_path_facts_with_prepared_validation(
+                controller, contract,
+            )?;
+        let built = observed.built;
         let integration = check_built_call_path_integration(contract, hashes, rendering, built)
             .map_err(|error| {
                 ApiError::internal(format!(
@@ -914,11 +1414,15 @@ pub(crate) fn run_integrated_projected_public_operation(
                 "indexed call-path projection construction failed: {error:?}"
             ))
         })?;
-        Ok(IntegratedProjectedCallPathResult {
+        let result = IntegratedProjectedCallPathResult {
             integration,
             projection,
-        })
-    })
+        };
+        controller.finish_proof_publication_validation(validation)?;
+        Ok(result)
+    });
+    controller.finish_proof_publication_validation_operation();
+    result
 }
 
 struct CheckedIntegrationInputs<'a> {
@@ -3439,6 +3943,12 @@ mod tests {
         let (contract, hashes, rendering) =
             validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
         drop(store);
+        let wal_path = PathBuf::from(format!("{}-wal", storage_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", storage_path.display()));
+        assert!(
+            !wal_path.exists() && !shm_path.exists(),
+            "the sealed fixture must force the public operation to establish its normal reader pair"
+        );
 
         let retrieval_pin_calls = Rc::new(Cell::new(0));
         let observed_retrieval_pin_calls = Rc::clone(&retrieval_pin_calls);
@@ -3446,6 +3956,7 @@ mod tests {
             observed_retrieval_pin_calls.set(observed_retrieval_pin_calls.get() + 1);
         });
         let service = crate::services::PublicOperationService::new(controller.clone());
+        reset_full_proof_publication_validations();
         let operation = run_integrated_projected_public_operation(
             &service,
             &controller,
@@ -3468,12 +3979,74 @@ mod tests {
             operation.value.projection,
             InternalProjection::Complete { .. }
         ));
+        assert!(
+            wal_path.is_file() && shm_path.is_file(),
+            "the active public-operation snapshot must establish the reader pair before the proof observer opens"
+        );
         assert_eq!(
             Store::open(&storage_path)
                 .unwrap()
                 .get_retrieval_index_publication(&project_identity_v3(project.path()).project_id)
                 .unwrap(),
             None
+        );
+
+        let warm_operation = run_integrated_projected_public_operation(
+            &service,
+            &controller,
+            &contract,
+            &hashes,
+            &rendering,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(matches!(
+            warm_operation.value.integration.disposition(),
+            ProofDisposition::ContractProven { .. }
+        ));
+        assert_eq!(
+            full_proof_publication_validation_count(),
+            1,
+            "an unchanged publication validates once before warm proof execution"
+        );
+
+        let mutating_store = Store::open(&storage_path).unwrap();
+        let fact_id = mutating_store
+            .get_proof_resolution_facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.status == ProofResolutionStatus::Exact)
+            .expect("indexed proof has one exact fact")
+            .fact_id;
+        mutating_store
+            .get_connection()
+            .execute(
+                "DELETE FROM proof_resolution_fact WHERE fact_id = ?1",
+                [&fact_id],
+            )
+            .unwrap();
+        drop(mutating_store);
+
+        let mutated_operation = run_integrated_projected_public_operation(
+            &service,
+            &controller,
+            &contract,
+            &hashes,
+            &rendering,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(
+            !matches!(
+                mutated_operation.value.integration.disposition(),
+                ProofDisposition::ContractProven { .. }
+            ),
+            "an in-place proof fact mutation must discard the warm validation receipt"
+        );
+        assert_eq!(
+            full_proof_publication_validation_count(),
+            2,
+            "the changed data_version forces one fresh complete validation"
         );
 
         let builds = Cell::new(0_usize);
@@ -3490,6 +4063,139 @@ mod tests {
             .expect_err("post-build source drift must consume the one bounded retry and refuse");
         assert_eq!(refusal.code, "project_unavailable");
         assert_eq!(builds.get(), 1);
+    }
+
+    #[test]
+    fn active_snapshot_poison_restored_before_current_observation_cannot_prove() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("src/lib.rs");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(
+            &source_path,
+            "pub fn callee() -> i32 { 1 }\npub fn caller() -> i32 { callee(); 1 }\n",
+        )
+        .unwrap();
+        let storage_path = project.path().join(".codestory-test/codestory.db");
+        let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let store = Store::open(&storage_path).unwrap();
+        let caller = source_callable(&store, "caller");
+        let callee = source_callable(&store, "callee");
+        let publication = store.get_complete_index_publication().unwrap().unwrap();
+        let original = store
+            .get_proof_resolution_facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.status == ProofResolutionStatus::Exact)
+            .expect("indexed proof has one exact fact");
+        drop(store);
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
+
+        controller.arm_proof_publication_validation();
+        let normal_reader = controller.open_storage_read_only().unwrap();
+        controller
+            .prepare_armed_proof_publication_validation()
+            .unwrap();
+
+        let mut poisoned = original.clone();
+        poisoned.provenance.parser_fingerprint = "f".repeat(64);
+        let poisoned = seal_call_resolution_fact(poisoned).unwrap();
+        let writer = Store::open(&storage_path).unwrap();
+        writer
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_fact
+                 SET fact_id = ?1, parser_fingerprint = ?2, evidence_digest = ?3
+                 WHERE fact_id = ?4",
+                (
+                    &poisoned.fact_id,
+                    &poisoned.provenance.parser_fingerprint,
+                    &poisoned.provenance.evidence_sha256,
+                    &original.fact_id,
+                ),
+            )
+            .unwrap();
+        drop(writer);
+
+        let active = Store::open_read_only(&storage_path).unwrap();
+        let active_snapshot = active.read_snapshot().unwrap();
+        assert_eq!(
+            active_snapshot
+                .storage()
+                .get_proof_resolution_facts()
+                .unwrap()
+                .into_iter()
+                .find(|fact| fact.status == ProofResolutionStatus::Exact)
+                .expect("active snapshot exact fact")
+                .provenance
+                .parser_fingerprint,
+            poisoned.provenance.parser_fingerprint,
+            "the active snapshot must retain the poisoned but resealed fact"
+        );
+        drop(normal_reader);
+
+        let restored = Store::open(&storage_path).unwrap();
+        restored
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_fact
+                 SET fact_id = ?1, parser_fingerprint = ?2, evidence_digest = ?3
+                 WHERE fact_id = ?4",
+                (
+                    &original.fact_id,
+                    &original.provenance.parser_fingerprint,
+                    &original.provenance.evidence_sha256,
+                    &poisoned.fact_id,
+                ),
+            )
+            .unwrap();
+        assert!(
+            restored
+                .validate_proof_resolution_publication(&publication)
+                .is_ok(),
+            "the current database is restored and would authorize an observer-only validation"
+        );
+        drop(restored);
+
+        reset_full_proof_publication_validations();
+        let validation = controller
+            .validate_proof_publication_for_active_snapshot(&publication, active_snapshot.storage())
+            .unwrap();
+        assert!(matches!(
+            &validation,
+            &ProofPublicationValidationUse::Unavailable
+        ));
+        assert_eq!(full_proof_publication_validation_count(), 1);
+        let observed = build_from_store_observed_with_validation(
+            active_snapshot.storage(),
+            project.path(),
+            &project_identity_v3(project.path()).project_id,
+            &publication,
+            &contract,
+            validation.proof_projection_available(),
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let selector_early_return = observed.trace.selector_early_return;
+        let integration =
+            check_built_call_path_integration(&contract, &hashes, &rendering, observed.built)
+                .unwrap();
+        assert!(!matches!(
+            integration.disposition(),
+            ProofDisposition::ContractProven { .. }
+        ));
+        assert!(selector_early_return);
+        controller.finish_proof_publication_validation_operation();
+        active_snapshot.finish().unwrap();
     }
 
     #[test]

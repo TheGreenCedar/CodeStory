@@ -36,20 +36,28 @@ pub fn run_observed_call_path_public_operation(
     rendering: &codestory_agent::proof_qualification_support::ValidatedContractRendering,
     cancelled: Arc<AtomicBool>,
 ) -> Result<crate::PublicOperation<ObservedIntegratedProjectedCallPathResult>, ApiError> {
-    runtime
-        .public_operation_service()
-        .run_with_cancel(proof_domain(), cancelled, || {
-            let observed =
-                crate::indexed_source_call_path_v1::build_observed_indexed_source_call_path_facts(
+    runtime.controller.arm_proof_publication_validation();
+    let result =
+        runtime
+            .public_operation_service()
+            .run_with_cancel(proof_domain(), cancelled, || {
+                let (observed, validation) = crate::indexed_source_call_path_v1::
+                build_observed_indexed_source_call_path_facts_with_prepared_validation(
                     &runtime.controller,
                     contract,
                 )?;
-            Ok(
-                crate::indexed_source_call_path_v1::finalize_observed_call_path(
+                let result = crate::indexed_source_call_path_v1::finalize_observed_call_path(
                     contract, hashes, rendering, observed,
-                ),
-            )
-        })
+                );
+                runtime
+                    .controller
+                    .finish_proof_publication_validation(validation)?;
+                Ok(result)
+            });
+    runtime
+        .controller
+        .finish_proof_publication_validation_operation();
+    result
 }
 
 /// Identifies the request domain observed by proof qualification.
@@ -82,6 +90,10 @@ mod tests {
     use codestory_contracts::api::IndexMode;
     use codestory_contracts::graph::{Node, NodeKind};
     use codestory_store::Store;
+
+    use crate::indexed_source_call_path_v1::{
+        full_proof_publication_validation_count, reset_full_proof_publication_validations,
+    };
 
     fn callable(store: &Store, terminal_name: &str) -> Node {
         let mut matches = store
@@ -219,6 +231,7 @@ mod tests {
         crate::set_before_retrieval_pin_test_hook(move || {
             observed_calls.set(observed_calls.get() + 1);
         });
+        reset_full_proof_publication_validations();
         let positive_operation = run_observed_call_path_public_operation(
             &runtime,
             &positive.0,
@@ -244,6 +257,11 @@ mod tests {
         assert!(unknown_operation.core_publication.is_some());
         assert_eq!(unknown_operation.retrieval_publication, None);
         assert_eq!(disposition_kind(&unknown_operation), "unknown");
+        assert_eq!(
+            full_proof_publication_validation_count(),
+            1,
+            "the real sealed facade must reuse its one validation receipt on the second call"
+        );
         assert_eq!(retrieval_pin_calls.get(), 0);
         assert_eq!(
             Store::open(&storage_path)
