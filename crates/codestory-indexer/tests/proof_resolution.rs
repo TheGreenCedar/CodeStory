@@ -563,6 +563,527 @@ fn go_closed_exact_subset_authorizes_package_functions_and_concrete_receivers() 
 }
 
 #[test]
+fn java_and_kotlin_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow::Result<()> {
+    for (language, files, targets) in [
+        (
+            "java",
+            vec![
+                (
+                    "example/Imported.java",
+                    "package example; public class Imported { public void importedTarget() {} }\n",
+                ),
+                (
+                    "example/JavaExact.java",
+                    concat!(
+                        "package example;\n",
+                        "import example.Imported;\n",
+                        "public class JavaExact {\n",
+                        "  static void sameFileTarget() {}\n",
+                        "  static void packageTarget() {}\n",
+                        "  void memberTarget() {}\n",
+                        "  void sameFileCaller() { sameFileTarget(); }\n",
+                        "  void packageCaller() { JavaExact.packageTarget(); }\n",
+                        "  void importedCaller() { new Imported().importedTarget(); }\n",
+                        "  void thisCaller() { this.memberTarget(); }\n",
+                        "  void typedCaller(JavaExact receiver) { receiver.memberTarget(); }\n",
+                        "  void constructorCaller() { new JavaExact().memberTarget(); }\n",
+                        "}\n",
+                    ),
+                ),
+            ],
+            vec![
+                ("sameFileTarget", 1),
+                ("packageTarget", 1),
+                ("importedTarget", 1),
+                ("memberTarget", 3),
+            ],
+        ),
+        (
+            "kotlin",
+            vec![
+                (
+                    "example/imported.kt",
+                    "package example\nclass Imported {\n  fun importedTarget() {}\n}\n",
+                ),
+                (
+                    "example/KotlinExact.kt",
+                    concat!(
+                        "package example\n",
+                        "import example.Imported\n",
+                        "fun sameFileTarget() {}\n",
+                        "class KotlinExact {\n",
+                        "  fun memberTarget() {}\n",
+                        "  fun thisCaller() { this.memberTarget() }\n",
+                        "  fun typedCaller(receiver: KotlinExact) { receiver.memberTarget() }\n",
+                        "  fun constructorCaller() { val constructed = KotlinExact(); constructed.memberTarget() }\n",
+                        "}\n",
+                        "fun sameFileCaller() { sameFileTarget() }\n",
+                        "fun importedCaller(receiver: Imported) { receiver.importedTarget() }\n",
+                    ),
+                ),
+            ],
+            vec![
+                ("sameFileTarget", 1),
+                ("importedTarget", 1),
+                ("memberTarget", 3),
+            ],
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.provenance.language_adapter == language)
+            .collect::<Vec<_>>();
+
+        for (target, expected_count) in targets {
+            let exact = facts
+                .iter()
+                .filter(|fact| fact.callsite.raw_target == target)
+                .filter(|fact| fact.status == ProofResolutionStatus::Exact)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                exact.len(),
+                expected_count,
+                "{language} {target} did not receive the expected source-built exact facts: {facts:#?}"
+            );
+            assert!(exact.iter().all(|fact| {
+                fact.edge_id.is_some()
+                    && fact.raw_edge_target.is_some()
+                    && fact.raw_callsite_identity.is_some()
+                    && fact.target.is_some()
+                    && !fact.evidence_chain.is_empty()
+                    && fact.provenance.evidence_sha256.len() == 64
+                    && !fact.provenance.dependency_file_hashes.is_empty()
+            }));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn java_and_kotlin_closed_nonexact_matrix_never_proves() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "java",
+            "overload",
+            "class Hostile { static void overload(int n) {} static void overload(String s) {} void caller() { overload(null); } }\n",
+            "overload",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "java",
+            "interface",
+            "interface Worker { void interfaceRun(); } class Hostile { void caller(Worker worker) { worker.interfaceRun(); } }\n",
+            "interfaceRun",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "java",
+            "virtual",
+            "class Base { void virtualRun() {} } class Child extends Base { void virtualRun() {} } class Hostile { void caller(Base value) { value.virtualRun(); } }\n",
+            "virtualRun",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "java",
+            "implicit_instance",
+            "class Hostile { void instanceTarget() {} void caller() { instanceTarget(); } }\n",
+            "instanceTarget",
+            ProofResolutionStatus::MissingBinding,
+        ),
+        (
+            "java",
+            "wildcard_import",
+            "package hostile; import example.*; class Hostile { void caller() { Imported.importedTarget(); } }\n",
+            "importedTarget",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "java",
+            "reflection",
+            "class Hostile { void caller() throws Exception { Class.forName(\"missing.Target\"); } }\n",
+            "forName",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "java",
+            "annotation",
+            "@interface Generated {} @Generated class Hostile { static void generatedTarget() {} void caller() { generatedTarget(); } }\n",
+            "generatedTarget",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "java",
+            "generic",
+            "class Hostile { <T> void caller(T value) { value.toString(); } }\n",
+            "toString",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "java",
+            "smart_cast",
+            "class Worker { void smartRun() {} } class Hostile { void caller(Object value) { if (value instanceof Worker) { ((Worker) value).smartRun(); } } }\n",
+            "smartRun",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "java",
+            "rebinding",
+            "class Worker { void reboundRun() {} } class Hostile { void caller() { Worker worker = new Worker(); worker = new Worker(); worker.reboundRun(); } }\n",
+            "reboundRun",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "java",
+            "missing",
+            "class Hostile { void caller() { missingTarget(); } }\n",
+            "missingTarget",
+            ProofResolutionStatus::MissingBinding,
+        ),
+        (
+            "java",
+            "incomplete",
+            "class Hostile { static void incompleteTarget() {} void caller() { incompleteTarget();\n",
+            "incompleteTarget",
+            ProofResolutionStatus::IncompleteDomain,
+        ),
+        (
+            "kotlin",
+            "overload",
+            "fun overload(value: Int) {}\nfun overload(value: String) {}\nfun caller() { overload(todo()) }\nfun todo(): Nothing = throw Exception()\n",
+            "overload",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "kotlin",
+            "interface",
+            "interface Worker {\n  fun interfaceRun()\n}\nfun caller(worker: Worker) { worker.interfaceRun() }\n",
+            "interfaceRun",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "kotlin",
+            "cross_class_member",
+            "class Target {\n  fun memberTarget() {}\n}\nclass Hostile {\n  fun caller() { memberTarget() }\n}\n",
+            "memberTarget",
+            ProofResolutionStatus::MissingBinding,
+        ),
+        (
+            "kotlin",
+            "extension",
+            "class Worker {}\nfun Worker.extensionRun() {}\nfun caller(worker: Worker) { worker.extensionRun() }\n",
+            "extensionRun",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "kotlin",
+            "wildcard_import",
+            "package hostile\nimport example.*\nfun caller() { importedTarget() }\n",
+            "importedTarget",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "kotlin",
+            "reflection",
+            "fun caller() { Class.forName(\"missing.Target\") }\n",
+            "forName",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "kotlin",
+            "annotation",
+            "annotation class Generated\n@Generated\nclass Hostile {\n  fun generatedTarget() {}\n  fun caller() { generatedTarget() }\n}\n",
+            "generatedTarget",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "kotlin",
+            "generic",
+            "fun <T> caller(value: T) { value.toString() }\n",
+            "toString",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "kotlin",
+            "smart_cast",
+            "class Worker {\n  fun smartRun() {}\n}\nfun caller(value: Any) { if (value is Worker) value.smartRun() }\n",
+            "smartRun",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "kotlin",
+            "delegation",
+            "interface Worker {\n  fun delegatedRun()\n}\nclass Delegating(worker: Worker) : Worker by worker\nfun caller(value: Delegating) { value.delegatedRun() }\n",
+            "delegatedRun",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "kotlin",
+            "rebinding",
+            "class Worker {\n  fun reboundRun() {}\n}\nfun caller() { var worker = Worker(); worker = Worker(); worker.reboundRun() }\n",
+            "reboundRun",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "kotlin",
+            "missing",
+            "fun caller() { missingTarget() }\n",
+            "missingTarget",
+            ProofResolutionStatus::MissingBinding,
+        ),
+        (
+            "kotlin",
+            "incomplete",
+            "fun incompleteTarget() {}\nfun caller() { incompleteTarget()\n",
+            "incompleteTarget",
+            ProofResolutionStatus::IncompleteDomain,
+        ),
+    ];
+
+    for (language, name, source, target, expected) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[(
+                if language == "java" {
+                    "Hostile.java"
+                } else {
+                    "Hostile.kt"
+                },
+                source,
+            )],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+            })
+            .unwrap_or_else(|| {
+                panic!("{language} {name} did not produce a closed fact: {facts:#?}")
+            });
+        assert_eq!(fact.status, expected, "{language} {name}: {fact:#?}");
+        assert!(fact.reason.matches_status(fact.status), "{fact:#?}");
+        assert!(fact.evidence_chain.is_empty(), "{fact:#?}");
+        assert!(fact.edge_id.is_none() && fact.target.is_none(), "{fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn java_and_kotlin_exact_facts_reject_resealed_raw_call_mutation() -> anyhow::Result<()> {
+    for (language, path, source) in [
+        (
+            "java",
+            "Fixture.java",
+            "class Fixture {\n  static void target() {}\n  static void caller() { target(); }\n}\n",
+        ),
+        (
+            "kotlin",
+            "Fixture.kt",
+            "fun target() {}\nfun caller() { target() }\n",
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language
+                    && fact.callsite.raw_target == "target"
+                    && fact.status == ProofResolutionStatus::Exact
+            })
+            .unwrap_or_else(|| panic!("{language} exact mutation fixture"));
+        let edge_id = fact
+            .edge_id
+            .expect("exact fact carries its raw CALL edge")
+            .0;
+        store.get_connection().execute(
+            "UPDATE edge SET resolved_target_node_id = source_node_id WHERE id = ?1",
+            [edge_id],
+        )?;
+        let error = store
+            .validate_proof_resolution_publication(&publication(1))
+            .expect_err("resealed {language} raw CALL mutation must reject the proof");
+        assert!(!error.to_string().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn java_and_kotlin_cross_file_package_and_import_receipts_are_exact() -> anyhow::Result<()> {
+    for (language, files, target) in [
+        (
+            "java",
+            vec![
+                (
+                    "api/Lib.java",
+                    "package api; public class Lib { public static void target() {} }\n",
+                ),
+                (
+                    "app/Caller.java",
+                    "package app;\nimport static api.Lib.target;\nclass Caller {\n  void caller() { target(); }\n}\n",
+                ),
+            ],
+            "target",
+        ),
+        (
+            "kotlin",
+            vec![
+                ("api/target.kt", "package api\nfun target() {}\n"),
+                (
+                    "client/caller.kt",
+                    "package client\nimport api.target\nfun caller() { target() }\n",
+                ),
+            ],
+            "target",
+        ),
+    ] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let exact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+            })
+            .expect("cross-file fact");
+        assert_eq!(exact.status, ProofResolutionStatus::Exact, "{exact:#?}");
+        assert!(
+            exact.provenance.dependency_file_hashes.len() >= 2,
+            "{exact:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn java_same_package_receiver_receipt_replays_and_rejects_domain_mutations() -> anyhow::Result<()> {
+    for mutation in ["none", "package", "member", "source"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    "p/Lib.java",
+                    "package p; public class Lib { public static void target() {} }\n",
+                ),
+                (
+                    "p/Caller.java",
+                    "package p; class Caller { void caller() { Lib.target(); } }\n",
+                ),
+            ],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == "java" && fact.callsite.raw_target == "target"
+            })
+            .expect("two-file Java same-package receiver fact");
+        assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+        assert_eq!(
+            fact.provenance.dependency_file_hashes.len(),
+            2,
+            "the complete package domain must be bound: {fact:#?}"
+        );
+
+        let owner = fact
+            .evidence_chain
+            .iter()
+            .find_map(|evidence| match evidence {
+                ResolutionEvidence::ExplicitReceiverType { receiver_type } => Some(*receiver_type),
+                _ => None,
+            })
+            .expect("same-package receiver owner");
+        let target = fact.target.expect("same-package target");
+        match mutation {
+            "none" => {
+                store.validate_proof_resolution_publication(&publication(1))?;
+                continue;
+            }
+            "package" => {
+                store.get_connection().execute(
+                    "UPDATE node SET qualified_name = CASE id WHEN ?1 THEN 'q.Lib' ELSE 'q.Lib.target' END WHERE id IN (?1, ?2)",
+                    [owner.0, target.0],
+                )?;
+            }
+            "member" => {
+                let member = store
+                    .get_edges()?
+                    .into_iter()
+                    .find(|edge| {
+                        edge.kind == EdgeKind::MEMBER
+                            && edge.effective_source() == owner
+                            && edge.effective_target() == target
+                    })
+                    .expect("unique Lib.target MEMBER relation");
+                store
+                    .get_connection()
+                    .execute("DELETE FROM edge WHERE id = ?1", [member.id.0])?;
+            }
+            "source" => {
+                store.get_connection().execute(
+                    "UPDATE file SET complete = 0 WHERE id = ?1",
+                    [fact.callsite.file_id.0],
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        let error = store
+            .validate_proof_resolution_publication(&publication(1))
+            .expect_err("mutated Java same-package evidence must fail replay");
+        assert!(!error.to_string().is_empty(), "{mutation}");
+    }
+    Ok(())
+}
+
+#[test]
+fn kotlin_parameter_shadow_never_proves_package_or_import_target() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            ("api/target.kt", "package api\nfun target() {}\n"),
+            (
+                "client/caller.kt",
+                "package client\nimport api.target\nfun caller(target: () -> Unit) { target() }\n",
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "kotlin" && fact.callsite.raw_target == "target"
+        })
+        .expect("shadowed Kotlin call fact");
+    assert_ne!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty());
+    Ok(())
+}
+
+#[test]
 fn python_closed_exact_subset_authorizes_s1_through_s4() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;
@@ -7125,7 +7646,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let mut empty = Store::new_in_memory()?;
     let empty_receipt = rematerialize_proof_resolution_projection(&mut empty, &publication(1))?;
     assert_eq!(empty_receipt.fact_count, 0);
-    assert_eq!(empty_receipt.adapter_roster.len(), 6);
+    assert_eq!(empty_receipt.adapter_roster.len(), 8);
 
     let project = tempfile::tempdir()?;
     let mut unsupported = Store::new_in_memory()?;
@@ -7140,7 +7661,7 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let unsupported_receipt =
         rematerialize_proof_resolution_projection(&mut unsupported, &publication(1))?;
     assert_eq!(unsupported_receipt.fact_count, 0);
-    assert_eq!(unsupported_receipt.adapter_roster.len(), 6);
+    assert_eq!(unsupported_receipt.adapter_roster.len(), 8);
 
     let governed_project = tempfile::tempdir()?;
     let mut governed = Store::new_in_memory()?;
@@ -7368,7 +7889,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v16", "adapter", "language"]
+            ["stale", "schema-v18", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -7761,6 +8282,14 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
                 "src/main.py",
                 "def target():\n    pass\ndef caller():\n    target()\n",
             ),
+            (
+                "src/Fixture.java",
+                "class Fixture {\n  static void target() {}\n  static void caller() { target(); }\n}\n",
+            ),
+            (
+                "src/Fixture.kt",
+                "fun target() {}\nfun caller() { target() }\n",
+            ),
         ],
     )?;
     let receipt = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
@@ -7780,6 +8309,17 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .map(|adapter| adapter.adapter_version.as_str()),
         Some("reference-v17")
     );
+    for language in ["java", "kotlin"] {
+        assert_eq!(
+            receipt
+                .adapter_roster
+                .iter()
+                .find(|adapter| adapter.language == language)
+                .map(|adapter| adapter.adapter_version.as_str()),
+            Some("reference-v2"),
+            "{language} must invalidate parser inputs through its explicit adapter identity"
+        );
+    }
     for fact in store.get_proof_resolution_facts()? {
         assert!(receipt.adapter_roster.iter().any(|adapter| {
             adapter.language == fact.provenance.language_adapter

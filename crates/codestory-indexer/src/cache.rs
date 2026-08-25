@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 // Versioned with proof-input semantics so older parser artifacts fail closed.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 17;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 19;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -103,6 +103,29 @@ pub(crate) enum CachedResolutionBinding {
         constructor: bool,
         constructor_uses_builtin_new: bool,
     },
+    JavaKotlinImportedReceiver {
+        package_name: String,
+        owner_name: String,
+        method_name: String,
+        import: NodeId,
+        constructor: bool,
+    },
+    JavaKotlinPackageFunction {
+        package_name: String,
+        name: String,
+    },
+    JavaKotlinImportedFunction {
+        package_name: String,
+        owner_name: Option<String>,
+        name: String,
+        import: NodeId,
+    },
+    JavaKotlinPackageReceiver {
+        package_name: String,
+        owner_name: String,
+        method_name: String,
+        constructor: bool,
+    },
     Ambiguous,
     MissingBinding,
     Unsupported,
@@ -151,6 +174,8 @@ pub(crate) struct CachedResolutionFile {
     pub rust_uses: Vec<CachedRustUseBinding>,
     #[serde(default)]
     pub go_package: Option<CachedGoPackage>,
+    #[serde(default)]
+    pub java_kotlin_package: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,7 +313,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 16,
+            resolution_input_schema_version: 18,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

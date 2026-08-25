@@ -16698,6 +16698,7 @@ mod proof_resolution_cache_tests {
                 rust_types: Vec::new(),
                 rust_uses: Vec::new(),
                 go_package: None,
+                java_kotlin_package: None,
             }),
         };
 
