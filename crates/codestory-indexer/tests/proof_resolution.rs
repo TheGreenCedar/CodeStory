@@ -1052,6 +1052,43 @@ fn csharp_swift_and_dart_closed_exact_subset_emits_authenticated_exact_facts() -
 }
 
 #[test]
+fn nonexact_narrow_graph_caller_span_does_not_block_publication() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "dart_tictactoe.dart",
+            include_str!("fixtures/tictactoe/dart_tictactoe.dart"),
+        )],
+    )?;
+    let navigation_edges = store.get_edges()?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "dart")
+        .filter(|fact| fact.callsite.raw_target == "print")
+        .filter(|fact| fact.callsite.line == 8)
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 1, "one parser callsite must own one fact");
+    let fact = &facts[0];
+    assert_eq!(fact.status, ProofResolutionStatus::Unsupported);
+    assert_eq!(fact.reason, ProofResolutionReason::UnsupportedConstruct);
+    assert!(fact.target.is_none());
+    assert!(fact.edge_id.is_none());
+    assert!(fact.raw_edge_target.is_none());
+    assert!(fact.raw_callsite_identity.is_none());
+    assert!(fact.evidence_chain.is_empty());
+    assert_eq!(store.get_edges()?, navigation_edges);
+    Ok(())
+}
+
+#[test]
 fn csharp_swift_and_dart_closed_hostile_matrix_never_proves() -> anyhow::Result<()> {
     let cases = [
         (

@@ -2947,13 +2947,18 @@ impl Storage {
             .node_by_id
             .get(&fact.caller)
             .ok_or_else(|| proof_error("caller node is missing"))?;
-        if caller.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-            || caller
+        if caller.file_node_id != Some(NodeId(fact.callsite.file_id.0)) {
+            return Err(proof_error(
+                "caller node does not belong to the callsite file",
+            ));
+        }
+        if fact.status == ProofResolutionStatus::Exact
+            && (caller
                 .start_line
                 .is_some_and(|line| line > fact.callsite.line)
-            || caller
-                .end_line
-                .is_some_and(|line| line < fact.callsite.line)
+                || caller
+                    .end_line
+                    .is_some_and(|line| line < fact.callsite.line))
         {
             return Err(proof_error(
                 "caller containment does not match the exact callsite",
