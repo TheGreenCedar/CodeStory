@@ -155,18 +155,24 @@ const C_ADAPTER_VERSION: &str = "reference-v2";
 const CPP_ADAPTER_VERSION: &str = "reference-v3";
 const RUBY_ADAPTER_VERSION: &str = "reference-v3";
 const PHP_ADAPTER_VERSION: &str = "reference-v2";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 23;
+const CSHARP_ADAPTER_VERSION: &str = "reference-v1";
+const SWIFT_ADAPTER_VERSION: &str = "reference-v1";
+const DART_ADAPTER_VERSION: &str = "reference-v1";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 24;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
     ("c", C_ADAPTER_VERSION),
     ("cpp", CPP_ADAPTER_VERSION),
+    ("csharp", CSHARP_ADAPTER_VERSION),
+    ("dart", DART_ADAPTER_VERSION),
     ("java", JAVA_ADAPTER_VERSION),
     ("kotlin", KOTLIN_ADAPTER_VERSION),
     ("python", PYTHON_ADAPTER_VERSION),
     ("php", PHP_ADAPTER_VERSION),
     ("ruby", RUBY_ADAPTER_VERSION),
     ("rust", RUST_ADAPTER_VERSION),
+    ("swift", SWIFT_ADAPTER_VERSION),
     ("tsx", TYPESCRIPT_ADAPTER_VERSION),
     ("typescript", TYPESCRIPT_ADAPTER_VERSION),
 ];
@@ -222,8 +228,9 @@ pub(crate) fn collect_call_resolution_inputs(
         (language == "go").then(|| GoResolutionIndex::build(tree, source, file_id, nodes));
     let python_index =
         (language == "python").then(|| PythonResolutionIndex::build(tree, source, file_id, nodes));
-    let java_kotlin_index = is_java_kotlin_language(language)
-        .then(|| JavaKotlinResolutionIndex::build(tree, source, language, file_id, nodes));
+    let java_kotlin_index = is_nominal_language(language).then(|| {
+        JavaKotlinResolutionIndex::build(tree, source, source_path, language, file_id, nodes)
+    });
     let c_cpp_index = is_c_cpp_language(language)
         .then(|| CCppResolutionIndex::build(tree, source, source_path, language, file_id, nodes));
     let ruby_index =
@@ -240,7 +247,11 @@ pub(crate) fn collect_call_resolution_inputs(
                 index.poisoned_export_names(),
             )
         } else if let Some(index) = &java_kotlin_index {
-            (Vec::new(), index.has_annotated_declaration, Vec::new())
+            (
+                Vec::new(),
+                index.has_annotated_declaration || index.domain_poisoned,
+                Vec::new(),
+            )
         } else if let Some(index) = &ruby_index {
             (index.direct_exports.clone(), index.poisoned, Vec::new())
         } else if let Some(index) = &php_index {
@@ -388,7 +399,11 @@ pub(crate) fn collect_call_resolution_inputs(
             emit_call(callee, form, raw_target, None);
         });
     }
-    if c_cpp_index.is_none() && ruby_index.is_none() && php_index.is_none() {
+    if c_cpp_index.is_none()
+        && ruby_index.is_none()
+        && php_index.is_none()
+        && !is_csharp_swift_dart_language(language)
+    {
         calls.sort_by_key(|input| (input.callsite.start_byte, input.callsite.end_byte_exclusive));
     } else {
         debug_assert!(calls.windows(2).all(|pair| {
@@ -484,6 +499,157 @@ fn is_javascript_language(language: &str) -> bool {
 
 fn is_java_kotlin_language(language: &str) -> bool {
     matches!(language, "java" | "kotlin")
+}
+
+fn is_csharp_swift_dart_language(language: &str) -> bool {
+    matches!(language, "csharp" | "swift" | "dart")
+}
+
+fn is_nominal_language(language: &str) -> bool {
+    is_java_kotlin_language(language) || is_csharp_swift_dart_language(language)
+}
+
+fn csd_source_domain(language: &str, source_path: &Path) -> Option<String> {
+    match language {
+        "csharp" => Some("csharp:global".to_string()),
+        "swift" => {
+            let components = source_path
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(value) => value.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            components
+                .windows(2)
+                .find_map(|pair| (pair[0] == "Sources").then(|| pair[1].to_string()))
+                .or_else(|| Some("swift:root".to_string()))
+        }
+        "dart" => {
+            let mut current = source_path.parent();
+            while let Some(directory) = current {
+                if directory.file_name().and_then(|name| name.to_str()) == Some("lib") {
+                    return Some("dart:lib".to_string());
+                }
+                current = directory.parent();
+            }
+            Some("dart:root".to_string())
+        }
+        _ => None,
+    }
+}
+
+fn swift_project_module(path: &Path) -> Option<&str> {
+    let mut components = path.components().filter_map(|component| match component {
+        Component::Normal(value) => value.to_str(),
+        _ => None,
+    });
+    while let Some(component) = components.next() {
+        if component == "Sources" {
+            return components
+                .next()
+                .filter(|module| java_kotlin_simple_identifier(module));
+        }
+    }
+    None
+}
+
+fn dart_literal_import_target_is_authenticated(
+    source_file: NodeId,
+    import: NodeId,
+    target_file: NodeId,
+    dependencies: &[FileId],
+    nodes: &HashMap<NodeId, &Node>,
+    files: &HashMap<i64, &codestory_store::FileInfo>,
+) -> bool {
+    let (Some(source), Some(target), Some(import_node)) = (
+        files.get(&source_file.0),
+        files.get(&target_file.0),
+        nodes.get(&import),
+    ) else {
+        return false;
+    };
+    let Some(uri) = quoted_literal(&import_node.serialized_name) else {
+        return false;
+    };
+    let relative = Path::new(uri);
+    let Some(source_directory) = source.path.parent() else {
+        return false;
+    };
+    let expected_path = source_directory.join(relative);
+    let exact_native_target = std::fs::symlink_metadata(&expected_path)
+        .ok()
+        .is_some_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+        && workspace_path_identity(&expected_path).ok()
+            == workspace_path_identity(&target.path).ok();
+    let same_library = dart_library_root(&source.path)
+        .zip(dart_library_root(&target.path))
+        .is_some_and(|(source_root, target_root)| {
+            workspace_path_identity(source_root).ok() == workspace_path_identity(target_root).ok()
+        });
+    let source_library_identity =
+        dart_library_root(&source.path).and_then(|root| workspace_path_identity(root).ok());
+    let expected_dependencies = files
+        .values()
+        .filter(|file| {
+            file.indexed
+                && file.language == "dart"
+                && dart_library_root(&file.path).and_then(|root| workspace_path_identity(root).ok())
+                    == source_library_identity
+        })
+        .map(|file| FileId(file.id))
+        .collect::<HashSet<_>>();
+    import_node.kind == NodeKind::MODULE
+        && import_node.file_node_id == Some(source_file)
+        && relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("dart")
+        && relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        && source_file != target_file
+        && target.language == "dart"
+        && target.indexed
+        && exact_native_target
+        && same_library
+        && source_library_identity.is_some()
+        && dependencies.iter().copied().collect::<HashSet<_>>() == expected_dependencies
+}
+
+fn generated_source_marker(source: &str) -> bool {
+    let prefix = source.get(..source.len().min(512)).unwrap_or(source);
+    let lowercase = prefix.to_ascii_lowercase();
+    lowercase.contains("generated code")
+        || lowercase.contains("@generated")
+        || lowercase.contains("<auto-generated")
+        || lowercase.contains("generatedcode(")
+}
+
+fn quoted_literal(surface: &str) -> Option<&str> {
+    let start = surface.find(['\'', '"'])?;
+    let quote = surface.as_bytes()[start] as char;
+    let rest = &surface[start + quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(&rest[..end])
+}
+
+fn import_alias(surface: &str) -> Option<String> {
+    let tail = surface.trim_end_matches(';').trim();
+    let (_, alias) = tail.rsplit_once(" as ")?;
+    java_kotlin_simple_identifier(alias.trim()).then(|| alias.trim().to_string())
+}
+
+fn import_show_names(surface: &str) -> Option<Vec<String>> {
+    let (_, shown) = surface.split_once(" show ")?;
+    let names = shown
+        .trim_end_matches(';')
+        .split(',')
+        .map(str::trim)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!names.is_empty() && names.iter().all(|name| java_kotlin_simple_identifier(name)))
+        .then_some(names)
 }
 
 fn is_c_cpp_language(language: &str) -> bool {
@@ -3490,6 +3656,7 @@ enum JavaKotlinCallReceiver {
         owner_name: String,
         constructor: bool,
         receiver_name: Option<String>,
+        import_prefix: Option<String>,
     },
     Named {
         receiver_name: String,
@@ -3528,8 +3695,11 @@ struct JavaKotlinResolutionIndex<'tree> {
     callable_nodes: HashMap<(u32, String), Vec<NodeId>>,
     class_nodes: HashMap<(u32, String), Vec<NodeId>>,
     import_nodes: HashMap<u32, Vec<NodeId>>,
+    import_names: HashMap<NodeId, String>,
     imports_by_name: HashMap<String, Vec<JavaKotlinImportBinding>>,
     type_imports_by_name: HashMap<String, Vec<JavaKotlinImportBinding>>,
+    whole_module_imports: Vec<JavaKotlinImportBinding>,
+    prefixed_imports: HashMap<String, Vec<JavaKotlinImportBinding>>,
     owner_bindings: HashMap<(String, String), Vec<JavaKotlinLexicalBinding>>,
     rebound_receivers: HashSet<(usize, String)>,
     unsupported_type_names: HashSet<String>,
@@ -3540,12 +3710,14 @@ struct JavaKotlinResolutionIndex<'tree> {
     extension_methods: HashSet<String>,
     has_annotated_declaration: bool,
     has_delegation: bool,
+    domain_poisoned: bool,
 }
 
 impl<'tree> JavaKotlinResolutionIndex<'tree> {
     fn build(
         tree: &'tree Tree,
         source: &str,
+        source_path: &Path,
         language: &'tree str,
         file_id: NodeId,
         nodes: &[Node],
@@ -3553,6 +3725,7 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
         let mut callable_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
         let mut class_nodes = HashMap::<(u32, String), Vec<NodeId>>::new();
         let mut import_nodes = HashMap::<u32, Vec<NodeId>>::new();
+        let mut import_names = HashMap::<NodeId, String>::new();
         for node in nodes
             .iter()
             .filter(|node| node.file_node_id == Some(file_id))
@@ -3570,18 +3743,25 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                         .or_default()
                         .push(node.id);
                 }
-                NodeKind::CLASS => {
+                NodeKind::CLASS | NodeKind::STRUCT => {
                     count_java_kotlin_resolution_work(1);
                     class_nodes.entry((line, name)).or_default().push(node.id);
                 }
                 NodeKind::MODULE | NodeKind::UNKNOWN => {
                     count_java_kotlin_resolution_work(1);
                     import_nodes.entry(line).or_default().push(node.id);
+                    import_names.insert(node.id, node.serialized_name.clone());
                 }
                 _ => {}
             }
         }
 
+        let nominal_source_poison = is_csharp_swift_dart_language(language)
+            && (generated_source_marker(source)
+                || language == "swift"
+                    && source
+                        .lines()
+                        .any(|line| line.trim_start().starts_with("extension ")));
         let mut result = Self {
             language,
             calls: Vec::new(),
@@ -3595,18 +3775,22 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             callable_nodes,
             class_nodes,
             import_nodes,
+            import_names,
             imports_by_name: HashMap::new(),
             type_imports_by_name: HashMap::new(),
+            whole_module_imports: Vec::new(),
+            prefixed_imports: HashMap::new(),
             owner_bindings: HashMap::new(),
             rebound_receivers: HashSet::new(),
             unsupported_type_names: HashSet::new(),
-            package_name: None,
+            package_name: csd_source_domain(language, source_path),
             wildcard_import: false,
             overloads: HashSet::new(),
             virtual_methods: HashSet::new(),
             extension_methods: HashSet::new(),
-            has_annotated_declaration: false,
+            has_annotated_declaration: nominal_source_poison,
             has_delegation: false,
+            domain_poisoned: nominal_source_poison,
         };
         let root = tree.root_node();
         JavaKotlinProducer::new(&mut result, source, root.id()).visit(
@@ -3620,21 +3804,25 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             },
         );
 
-        result
-            .calls
-            .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        if is_java_kotlin_language(language) {
+            result
+                .calls
+                .sort_by_key(|call| (call.callee.start_byte(), call.callee.end_byte()));
+        }
         for (index, call) in result.calls.iter().enumerate() {
             count_java_kotlin_resolution_work(1);
             result
                 .call_indices_by_span
                 .insert((call.callee.start_byte(), call.callee.end_byte()), index);
         }
-        result.declarations.sort_by(|left, right| {
-            left.name
-                .cmp(&right.name)
-                .then(left.declaration.cmp(&right.declaration))
-        });
-        result.classes.sort_by_key(|class| class.declaration);
+        if is_java_kotlin_language(language) {
+            result.declarations.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then(left.declaration.cmp(&right.declaration))
+            });
+            result.classes.sort_by_key(|class| class.declaration);
+        }
         for (index, declaration) in result.declarations.iter().enumerate() {
             count_java_kotlin_resolution_work(1);
             result
@@ -3644,11 +3832,13 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 .push(index);
         }
         for (index, class) in result.classes.iter_mut().enumerate() {
-            class.methods.sort_by(|left, right| {
-                left.name
-                    .cmp(&right.name)
-                    .then(left.declaration.cmp(&right.declaration))
-            });
+            if is_java_kotlin_language(language) {
+                class.methods.sort_by(|left, right| {
+                    left.name
+                        .cmp(&right.name)
+                        .then(left.declaration.cmp(&right.declaration))
+                });
+            }
             count_java_kotlin_resolution_work(2);
             result
                 .class_indices_by_name
@@ -3714,20 +3904,30 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             || self.extension_methods.contains(raw_target)
             || self.has_delegation
             || self.has_annotated_declaration
+            || self.domain_poisoned
         {
             return (Some(caller), CachedResolutionBinding::Unsupported);
         }
 
         if form == CalleeForm::Identifier {
             if call.identifier_shadowed {
-                return (Some(caller), CachedResolutionBinding::MissingBinding);
+                return (
+                    Some(caller),
+                    if is_csharp_swift_dart_language(self.language) {
+                        CachedResolutionBinding::Unsupported
+                    } else {
+                        CachedResolutionBinding::MissingBinding
+                    },
+                );
             }
             count_java_kotlin_resolution_work(1);
             if self.overloads.contains(&format!("overload:{raw_target}")) {
                 return (Some(caller), CachedResolutionBinding::Ambiguous);
             }
             count_java_kotlin_resolution_work(1);
-            if let Some(imports) = self.imports_by_name.get(raw_target) {
+            if !is_csharp_swift_dart_language(self.language)
+                && let Some(imports) = self.imports_by_name.get(raw_target)
+            {
                 return match imports.as_slice() {
                     [import] => (
                         Some(caller),
@@ -3747,6 +3947,59 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 .get(raw_target)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
+            if is_csharp_swift_dart_language(self.language) {
+                return match candidates {
+                    [_declaration] => (
+                        Some(caller),
+                        CachedResolutionBinding::JavaKotlinPackageFunction {
+                            package_name: self.package_name.clone().unwrap_or_default(),
+                            name: raw_target.to_string(),
+                        },
+                    ),
+                    [] if self.imports_by_name.contains_key(raw_target) => {
+                        match self.imports_by_name[raw_target].as_slice() {
+                            [import] => (
+                                Some(caller),
+                                CachedResolutionBinding::JavaKotlinImportedFunction {
+                                    package_name: import.package_name.clone(),
+                                    owner_name: None,
+                                    name: import.imported_name.clone(),
+                                    import: import.node,
+                                },
+                            ),
+                            _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+                        }
+                    }
+                    [] if matches!(self.whole_module_imports.as_slice(), [_]) => {
+                        let import = &self.whole_module_imports[0];
+                        (
+                            Some(caller),
+                            CachedResolutionBinding::JavaKotlinImportedFunction {
+                                package_name: import.package_name.clone(),
+                                owner_name: None,
+                                name: raw_target.to_string(),
+                                import: import.node,
+                            },
+                        )
+                    }
+                    [] if !self.whole_module_imports.is_empty() => {
+                        (Some(caller), CachedResolutionBinding::Ambiguous)
+                    }
+                    [] if matches!(self.language, "csharp" | "swift")
+                        && self.package_name.is_some() =>
+                    {
+                        (
+                            Some(caller),
+                            CachedResolutionBinding::JavaKotlinPackageFunction {
+                                package_name: self.package_name.clone().unwrap_or_default(),
+                                name: raw_target.to_string(),
+                            },
+                        )
+                    }
+                    [] => (Some(caller), CachedResolutionBinding::MissingBinding),
+                    _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+                };
+            }
             return match candidates {
                 [declaration] => (
                     Some(caller),
@@ -3755,13 +4008,17 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                         rust_glob_local_module: None,
                     },
                 ),
-                [] if self.language == "kotlin" && self.package_name.is_some() => (
-                    Some(caller),
-                    CachedResolutionBinding::JavaKotlinPackageFunction {
-                        package_name: self.package_name.clone().unwrap_or_default(),
-                        name: raw_target.to_string(),
-                    },
-                ),
+                [] if matches!(self.language, "kotlin" | "csharp" | "swift" | "dart")
+                    && self.package_name.is_some() =>
+                {
+                    (
+                        Some(caller),
+                        CachedResolutionBinding::JavaKotlinPackageFunction {
+                            package_name: self.package_name.clone().unwrap_or_default(),
+                            name: raw_target.to_string(),
+                        },
+                    )
+                }
                 [] => (Some(caller), CachedResolutionBinding::MissingBinding),
                 _ => (Some(caller), CachedResolutionBinding::Ambiguous),
             };
@@ -3784,12 +4041,51 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
             }
         }
 
+        if self.language == "dart"
+            && let JavaKotlinCallReceiver::Named { receiver_name } = &call.receiver
+            && let Some(imports) = self.prefixed_imports.get(receiver_name)
+        {
+            count_java_kotlin_resolution_work(1);
+            return match imports.as_slice() {
+                [import] => (
+                    Some(caller),
+                    CachedResolutionBinding::JavaKotlinImportedFunction {
+                        package_name: import.package_name.clone(),
+                        owner_name: None,
+                        name: raw_target.to_string(),
+                        import: import.node,
+                    },
+                ),
+                _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+            };
+        }
+
         let Some((owner_name, constructor)) = self.call_receiver_owner(call) else {
             return (Some(caller), CachedResolutionBinding::Unsupported);
         };
         count_java_kotlin_resolution_work(1);
         if self.unsupported_type_names.contains(&owner_name) {
             return (Some(caller), CachedResolutionBinding::Unsupported);
+        }
+        if let JavaKotlinCallReceiver::ExactType {
+            import_prefix: Some(prefix),
+            ..
+        } = &call.receiver
+        {
+            count_java_kotlin_resolution_work(1);
+            return match self.prefixed_imports.get(prefix).map(Vec::as_slice) {
+                Some([import]) => (
+                    Some(caller),
+                    CachedResolutionBinding::JavaKotlinImportedReceiver {
+                        package_name: import.package_name.clone(),
+                        owner_name,
+                        method_name: raw_target.to_string(),
+                        import: import.node,
+                        constructor,
+                    },
+                ),
+                _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+            };
         }
         count_java_kotlin_resolution_work(1);
         if let Some(imports) = self.type_imports_by_name.get(&owner_name) {
@@ -3807,8 +4103,25 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 _ => (Some(caller), CachedResolutionBinding::Ambiguous),
             };
         }
+        if matches!(self.language, "swift" | "dart") && !self.class_names.contains(&owner_name) {
+            count_java_kotlin_resolution_work(1);
+            return match self.whole_module_imports.as_slice() {
+                [import] => (
+                    Some(caller),
+                    CachedResolutionBinding::JavaKotlinImportedReceiver {
+                        package_name: import.package_name.clone(),
+                        owner_name,
+                        method_name: raw_target.to_string(),
+                        import: import.node,
+                        constructor,
+                    },
+                ),
+                [] => (Some(caller), CachedResolutionBinding::MissingBinding),
+                _ => (Some(caller), CachedResolutionBinding::Ambiguous),
+            };
+        }
         count_java_kotlin_resolution_work(1);
-        if self.language == "java"
+        if matches!(self.language, "java" | "csharp" | "swift" | "dart")
             && !self.class_names.contains(&owner_name)
             && let Some(package_name) = &self.package_name
         {
@@ -3859,6 +4172,17 @@ impl<'tree> JavaKotlinResolutionIndex<'tree> {
                 },
             );
         };
+        if is_csharp_swift_dart_language(self.language) {
+            return (
+                Some(caller),
+                CachedResolutionBinding::JavaKotlinPackageReceiver {
+                    package_name: self.package_name.clone().unwrap_or_default(),
+                    owner_name,
+                    method_name: raw_target.to_string(),
+                    constructor,
+                },
+            );
+        }
         if form == CalleeForm::ImplicitReceiver {
             return (
                 Some(caller),
@@ -3950,13 +4274,27 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
         }
 
         let mut context = context;
-        if matches!(node.kind(), "interface_declaration" | "when_expression")
-            || self.index.language == "java" && node.kind() == "cast_expression"
+        if matches!(
+            node.kind(),
+            "interface_declaration"
+                | "protocol_declaration"
+                | "mixin_declaration"
+                | "extension_declaration"
+                | "when_expression"
+        ) || self.index.language == "java" && node.kind() == "cast_expression"
+            || self.index.language == "swift"
+                && matches!(node.kind(), "statements" | "directive")
+                && node_text(node, self.source).is_some_and(|surface| surface.contains("#if"))
         {
             context.unsupported = true;
+            if is_csharp_swift_dart_language(self.index.language) {
+                self.index.domain_poisoned = true;
+            }
         }
-        if node.kind() == "interface_declaration"
-            && let Some(name) = declaration_name(node, self.source)
+        if matches!(
+            node.kind(),
+            "interface_declaration" | "protocol_declaration" | "mixin_declaration"
+        ) && let Some(name) = declaration_name(node, self.source)
         {
             count_java_kotlin_resolution_work(1);
             self.index.unsupported_type_names.insert(name.to_string());
@@ -3993,12 +4331,16 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
         let annotated = java_kotlin_declaration_has_annotation(node, self.source);
         let delegated = self.index.language == "kotlin"
             && java_kotlin_has_direct_child_kind(node, "delegation_specifiers");
-        let virtual_owner =
-            self.index.language == "java" && node.child_by_field_name("superclass").is_some();
+        let nominal_poison = csd_owner_is_unsupported(node, self.source, self.index.language);
+        let virtual_owner = self.index.language == "java"
+            && node.child_by_field_name("superclass").is_some()
+            || matches!(self.index.language, "swift" | "dart") && nominal_poison;
         self.index.has_annotated_declaration |= annotated;
         self.index.has_delegation |= delegated;
+        self.index.domain_poisoned |= nominal_poison;
         context.unsupported |= annotated
             || delegated
+            || nominal_poison
             || virtual_owner
             || node.child_by_field_name("type_parameters").is_some()
             || java_kotlin_has_direct_child_kind(node, "type_parameters");
@@ -4027,13 +4369,20 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
         node: TsNode<'tree>,
         mut context: JavaKotlinWalkContext,
     ) -> JavaKotlinWalkContext {
-        let annotated = java_kotlin_declaration_has_annotation(node, self.source);
+        let declaration_node = nominal_callable_declaration(node, self.index.language);
+        let annotated = java_kotlin_declaration_has_annotation(declaration_node, self.source);
+        let unsupported_callable =
+            csd_callable_is_unsupported(declaration_node, self.source, self.index.language);
         self.index.has_annotated_declaration |= annotated;
+        self.index.domain_poisoned |= unsupported_callable;
         context.unsupported |= annotated
-            || node.child_by_field_name("type_parameters").is_some()
-            || java_kotlin_has_direct_child_kind(node, "type_parameters");
+            || unsupported_callable
+            || declaration_node
+                .child_by_field_name("type_parameters")
+                .is_some()
+            || java_kotlin_has_direct_child_kind(declaration_node, "type_parameters");
 
-        let Some(name) = declaration_name(node, self.source).map(str::to_string) else {
+        let Some(name) = declaration_name(declaration_node, self.source).map(str::to_string) else {
             context.caller = None;
             context.callable_id = Some(node.id());
             return context;
@@ -4054,7 +4403,9 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
             self.index.extension_methods.insert(name.clone());
         }
 
-        let caller = self.index.map_callable_declaration(node, self.source);
+        let caller = self
+            .index
+            .map_callable_declaration(declaration_node, self.source);
         if let (Some(owner_index), Some(declaration)) = (context.owner_index, caller) {
             count_java_kotlin_resolution_work(1);
             self.index.classes[owner_index]
@@ -4065,11 +4416,16 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
                 });
         }
         if let Some(declaration) = caller {
-            let same_file = if self.index.language == "kotlin" {
-                node.parent()
+            let same_file = if matches!(self.index.language, "kotlin" | "swift") {
+                declaration_node
+                    .parent()
                     .is_some_and(|parent| parent.id() == self.root_id)
+            } else if self.index.language == "dart" {
+                declaration_node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "program")
             } else {
-                java_kotlin_java_method_is_static(node, self.source)
+                java_kotlin_java_method_is_static(declaration_node, self.source)
             };
             if same_file {
                 count_java_kotlin_resolution_work(1);
@@ -4083,29 +4439,75 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
         }
         context.callable_id = Some(node.id());
         context.caller = caller;
+        if self.index.language == "dart" {
+            for (binding_name, binding) in dart_callable_bindings(declaration_node, self.source) {
+                self.insert_active(binding_name, binding);
+            }
+        }
         context
     }
 
     fn collect_package(&mut self, node: TsNode<'tree>) {
-        let expected = if self.index.language == "java" {
-            "package_declaration"
-        } else {
-            "package_header"
+        let expected = match self.index.language {
+            "java" => "package_declaration",
+            "kotlin" => "package_header",
+            "csharp" if node.kind() == "namespace_declaration" => "namespace_declaration",
+            "csharp" => "file_scoped_namespace_declaration",
+            _ => return,
         };
-        if node.kind() != expected || self.index.package_name.is_some() {
+        if node.kind() != expected {
             return;
         }
-        self.index.package_name = node_text(node, self.source)
-            .and_then(|surface| surface.trim().strip_prefix("package"))
-            .map(str::trim)
-            .map(|name| name.trim_end_matches(';').trim().to_string())
-            .filter(|name| !name.is_empty());
-        if self.index.package_name.is_some() {
-            count_java_kotlin_resolution_work(1);
+        let prefix = if self.index.language == "csharp" {
+            "namespace"
+        } else {
+            "package"
+        };
+        let parsed = if self.index.language == "csharp" {
+            node.child_by_field_name("name")
+                .and_then(|name| node_text(name, self.source))
+                .map(str::trim)
+                .map(str::to_string)
+                .filter(|name| !name.is_empty())
+        } else {
+            node_text(node, self.source)
+                .and_then(|surface| surface.trim().strip_prefix(prefix))
+                .map(str::trim)
+                .map(|name| name.trim_end_matches(';').trim().to_string())
+                .filter(|name| !name.is_empty())
+        };
+        count_java_kotlin_resolution_work(1);
+        if self.index.language == "csharp" {
+            match (&self.index.package_name, parsed) {
+                (Some(existing), Some(parsed)) if existing == &parsed => {}
+                (Some(existing), Some(parsed))
+                    if existing.starts_with("csharp:path:") || existing == "csharp:global" =>
+                {
+                    self.index.package_name = Some(parsed);
+                }
+                (_, Some(_)) => self.index.domain_poisoned = true,
+                _ => self.index.domain_poisoned = true,
+            }
+        } else if self.index.package_name.is_some() {
+            self.index.domain_poisoned = true;
+        } else {
+            self.index.package_name = parsed;
         }
     }
 
     fn collect_import(&mut self, node: TsNode<'tree>) {
+        if is_csharp_swift_dart_language(self.index.language) {
+            let expected = match self.index.language {
+                "csharp" => "using_directive",
+                "swift" => "import_declaration",
+                "dart" => "import_or_export",
+                _ => unreachable!("nominal import collector language"),
+            };
+            if node.kind() == expected {
+                self.collect_csd_import(node);
+            }
+            return;
+        }
         if !node.kind().contains("import") {
             return;
         }
@@ -4136,6 +4538,156 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
                 .or_default()
                 .push(import);
         }
+    }
+
+    fn collect_csd_import(&mut self, node: TsNode<'tree>) {
+        let Some(surface) = node_text(node, self.source).map(str::trim) else {
+            self.index.domain_poisoned = true;
+            return;
+        };
+        let line = node.start_position().row as u32 + 1;
+        count_java_kotlin_resolution_work(1);
+        let Some(import_nodes) = self.index.import_nodes.get(&line).map(Vec::as_slice) else {
+            self.index.domain_poisoned = true;
+            return;
+        };
+        match self.index.language {
+            "csharp" => {
+                let Some(rest) = surface.trim_end_matches(';').trim().strip_prefix("using ") else {
+                    self.index.domain_poisoned = true;
+                    return;
+                };
+                let Some((alias, qualified)) = rest.split_once('=') else {
+                    self.index.domain_poisoned = true;
+                    return;
+                };
+                let alias = alias.trim();
+                let qualified = qualified.trim();
+                let Some((package_name, imported_name)) = qualified.rsplit_once('.') else {
+                    self.index.domain_poisoned = true;
+                    return;
+                };
+                if !java_kotlin_simple_identifier(alias)
+                    || !java_kotlin_simple_identifier(imported_name)
+                    || package_name.is_empty()
+                {
+                    self.index.domain_poisoned = true;
+                    return;
+                }
+                let matching_imports = import_nodes
+                    .iter()
+                    .filter(|candidate| {
+                        self.index
+                            .import_names
+                            .get(candidate)
+                            .is_some_and(|name| name == qualified)
+                    })
+                    .copied()
+                    .collect::<Vec<_>>();
+                let [import_node] = matching_imports.as_slice() else {
+                    self.index.domain_poisoned = true;
+                    return;
+                };
+                let binding = JavaKotlinImportBinding {
+                    package_name: package_name.to_string(),
+                    owner_name: None,
+                    imported_name: imported_name.to_string(),
+                    local_name: alias.to_string(),
+                    node: *import_node,
+                };
+                self.index
+                    .type_imports_by_name
+                    .entry(alias.to_string())
+                    .or_default()
+                    .push(binding);
+            }
+            "swift" => {
+                let [import_node] = import_nodes else {
+                    self.index.domain_poisoned = true;
+                    return;
+                };
+                if surface.contains(['.', ':']) {
+                    self.index.domain_poisoned = true;
+                    return;
+                }
+                let Some(module) = surface.strip_prefix("import ").map(str::trim) else {
+                    self.index.domain_poisoned = true;
+                    return;
+                };
+                if !java_kotlin_simple_identifier(module) {
+                    self.index.domain_poisoned = true;
+                    return;
+                }
+                self.index
+                    .whole_module_imports
+                    .push(JavaKotlinImportBinding {
+                        package_name: module.to_string(),
+                        owner_name: None,
+                        imported_name: "*".to_string(),
+                        local_name: "*".to_string(),
+                        node: *import_node,
+                    });
+            }
+            "dart" => {
+                let [import_node] = import_nodes else {
+                    self.index.domain_poisoned = true;
+                    return;
+                };
+                if surface.contains(" if ")
+                    || surface.contains(" deferred ")
+                    || surface.contains("dart:mirrors")
+                {
+                    self.index.wildcard_import = true;
+                    self.index.domain_poisoned = true;
+                    return;
+                }
+                let Some(uri) = quoted_literal(surface) else {
+                    self.index.domain_poisoned = true;
+                    return;
+                };
+                if uri.starts_with('/')
+                    || uri.contains(':')
+                    || uri.split('/').any(|component| component == "..")
+                {
+                    self.index.domain_poisoned = true;
+                    return;
+                }
+                let binding = JavaKotlinImportBinding {
+                    package_name: format!("dart:uri:{uri}"),
+                    owner_name: None,
+                    imported_name: "*".to_string(),
+                    local_name: "*".to_string(),
+                    node: *import_node,
+                };
+                if let Some(prefix) = import_alias(surface) {
+                    self.index
+                        .prefixed_imports
+                        .entry(prefix)
+                        .or_default()
+                        .push(binding);
+                } else if let Some(shown) = import_show_names(surface) {
+                    for name in shown {
+                        let mut named = binding.clone();
+                        named.imported_name = name.clone();
+                        named.local_name = name.clone();
+                        self.index
+                            .imports_by_name
+                            .entry(name.clone())
+                            .or_default()
+                            .push(named.clone());
+                        self.index
+                            .type_imports_by_name
+                            .entry(name)
+                            .or_default()
+                            .push(named);
+                    }
+                } else {
+                    self.index.whole_module_imports.push(binding);
+                }
+            }
+            _ => unreachable!("C#/Swift/Dart import collector language"),
+        }
+        count_java_kotlin_resolution_work(1);
     }
 
     fn parse_import(&self, node: TsNode<'tree>, surface: &str) -> Option<JavaKotlinImportBinding> {
@@ -4185,9 +4737,12 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
     }
 
     fn collect_binding(&mut self, node: TsNode<'tree>, context: JavaKotlinWalkContext) {
-        let Some((name, binding)) =
+        let binding = if is_csharp_swift_dart_language(self.index.language) {
+            csd_lexical_binding(node, self.source, self.index.language)
+        } else {
             java_kotlin_lexical_binding(node, self.source, self.index.language)
-        else {
+        };
+        let Some((name, binding)) = binding else {
             return;
         };
         if context.callable_id.is_some() {
@@ -4210,7 +4765,10 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
         let Some(callable_id) = context.callable_id else {
             return;
         };
-        let Some(left) = node.child_by_field_name("left") else {
+        let Some(left) = node
+            .child_by_field_name("left")
+            .or_else(|| node.named_child(0))
+        else {
             return;
         };
         let Some(name) = node_text(left, self.source)
@@ -4226,14 +4784,23 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
     }
 
     fn collect_call(&mut self, node: TsNode<'tree>, context: JavaKotlinWalkContext) {
-        let call = if self.index.language == "java" {
-            java_call(node, self.source)
-        } else {
-            kotlin_call(node, self.source)
+        let call = match self.index.language {
+            "java" => java_call(node, self.source),
+            "kotlin" => kotlin_call(node, self.source),
+            "csharp" => csharp_call(node, self.source),
+            "swift" => swift_call(node, self.source),
+            "dart" => dart_call(node, self.source),
+            _ => None,
         };
         let Some((callee, form, raw_target)) = call else {
             return;
         };
+        if matches!(self.index.language, "swift" | "dart")
+            && form == CalleeForm::Identifier
+            && raw_target.chars().next().is_some_and(char::is_uppercase)
+        {
+            return;
+        }
         let owner_name = context
             .owner_index
             .map(|owner_index| self.index.classes[owner_index].name.clone());
@@ -4269,16 +4836,59 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
         if form == CalleeForm::ImplicitReceiver {
             return JavaKotlinCallReceiver::Implicit;
         }
+        if self.index.language == "dart" {
+            let Some(receiver_surface) = dart_member_receiver_surface(callee, self.source) else {
+                return JavaKotlinCallReceiver::Blocked;
+            };
+            if let Some((owner_name, import_prefix)) = constructor_surface_owner(&receiver_surface)
+            {
+                return JavaKotlinCallReceiver::ExactType {
+                    owner_name,
+                    constructor: true,
+                    receiver_name: None,
+                    import_prefix,
+                };
+            }
+            let receiver_name = receiver_surface.trim_end_matches('?').trim();
+            if !java_kotlin_simple_identifier(receiver_name) {
+                return JavaKotlinCallReceiver::Blocked;
+            }
+            count_java_kotlin_resolution_work(1);
+            return match self
+                .active_bindings
+                .get(receiver_name)
+                .and_then(|bindings| bindings.last())
+            {
+                Some(JavaKotlinLexicalBinding::Receiver {
+                    owner_name,
+                    constructor,
+                }) => JavaKotlinCallReceiver::ExactType {
+                    owner_name: owner_name.clone(),
+                    constructor: *constructor,
+                    receiver_name: Some(receiver_name.to_string()),
+                    import_prefix: None,
+                },
+                Some(JavaKotlinLexicalBinding::Other) => JavaKotlinCallReceiver::Blocked,
+                None => JavaKotlinCallReceiver::Named {
+                    receiver_name: receiver_name.to_string(),
+                },
+            };
+        }
         let Some(receiver) = java_kotlin_member_receiver(callee, self.index.language) else {
             return JavaKotlinCallReceiver::Blocked;
         };
-        if let Some(owner_name) =
+        let direct_constructor = if is_csharp_swift_dart_language(self.index.language) {
+            csd_direct_constructor_type(receiver, self.source, self.index.language)
+        } else {
             java_kotlin_direct_constructor_type(receiver, self.source, self.index.language)
-        {
+                .map(|owner| (owner, None))
+        };
+        if let Some((owner_name, import_prefix)) = direct_constructor {
             return JavaKotlinCallReceiver::ExactType {
                 owner_name,
                 constructor: true,
                 receiver_name: None,
+                import_prefix,
             };
         }
         let Some(receiver_name) = node_text(receiver, self.source)
@@ -4301,6 +4911,7 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
                 owner_name: owner_name.clone(),
                 constructor: *constructor,
                 receiver_name: Some(receiver_name.to_string()),
+                import_prefix: None,
             },
             Some(JavaKotlinLexicalBinding::Other) => JavaKotlinCallReceiver::Blocked,
             None if self.index.language == "java"
@@ -4310,6 +4921,7 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
                     owner_name: receiver_name.to_string(),
                     constructor: false,
                     receiver_name: None,
+                    import_prefix: None,
                 }
             }
             None => JavaKotlinCallReceiver::Named {
@@ -4351,15 +4963,94 @@ impl<'index, 'tree> JavaKotlinProducer<'index, 'tree> {
 fn java_kotlin_callable_kind(language: &str, kind: &str) -> bool {
     matches!(
         (language, kind),
-        ("java", "method_declaration") | ("kotlin", "function_declaration")
+        ("java", "method_declaration")
+            | ("kotlin", "function_declaration")
+            | ("csharp", "method_declaration")
+            | ("swift", "function_declaration")
+            | ("dart", "function_body")
     )
 }
 
 fn java_kotlin_class_kind(language: &str, kind: &str) -> bool {
     matches!(
         (language, kind),
-        ("java", "class_declaration") | ("kotlin", "class_declaration")
+        ("java", "class_declaration")
+            | ("kotlin", "class_declaration")
+            | ("csharp", "class_declaration" | "struct_declaration")
+            | ("swift", "class_declaration")
+            | ("dart", "class_definition")
     )
+}
+
+fn nominal_callable_declaration<'tree>(node: TsNode<'tree>, language: &str) -> TsNode<'tree> {
+    if language != "dart" || node.kind() != "function_body" {
+        return node;
+    }
+    let Some(signature) = node.prev_named_sibling() else {
+        return node;
+    };
+    if signature.kind() == "function_signature" {
+        return signature;
+    }
+    if signature.kind() == "method_signature" {
+        let mut cursor = signature.walk();
+        if let Some(function) = signature
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "function_signature")
+        {
+            return function;
+        }
+    }
+    node
+}
+
+fn csd_owner_is_unsupported(node: TsNode<'_>, source: &str, language: &str) -> bool {
+    let header = node
+        .child_by_field_name("body")
+        .and_then(|body| source.get(node.start_byte()..body.start_byte()))
+        .or_else(|| node_text(node, source))
+        .unwrap_or_default();
+    match language {
+        "csharp" => header.split_whitespace().any(|word| word == "partial"),
+        "swift" => {
+            let header = header.trim_start();
+            header.starts_with("class ") || header.contains("@objc") || header.contains(" dynamic ")
+        }
+        "dart" => {
+            let header = header.trim_start();
+            !(header.starts_with("final class ") || header.starts_with("sealed class "))
+                || header.contains(" with ")
+                || header.contains(" implements ")
+        }
+        _ => false,
+    }
+}
+
+fn csd_callable_is_unsupported(node: TsNode<'_>, source: &str, language: &str) -> bool {
+    let Some(name) = node.child_by_field_name("name") else {
+        return is_csharp_swift_dart_language(language);
+    };
+    let header = source
+        .get(node.start_byte()..name.start_byte())
+        .unwrap_or_default();
+    match language {
+        "csharp" => {
+            header.split_whitespace().any(|word| {
+                matches!(
+                    word,
+                    "virtual" | "abstract" | "override" | "extern" | "partial"
+                )
+            }) || node_text(node, source).is_some_and(|surface| surface.contains("(this "))
+        }
+        "swift" => {
+            header.contains("@objc")
+                || header
+                    .split_whitespace()
+                    .any(|word| matches!(word, "dynamic" | "override" | "class" | "@objc"))
+        }
+        "dart" => header.contains('<') || header.contains("external"),
+        _ => false,
+    }
 }
 
 fn java_kotlin_simple_identifier(value: &str) -> bool {
@@ -4517,6 +5208,167 @@ fn java_kotlin_lexical_binding(
     Some((name, binding))
 }
 
+fn typed_binding_from_surface(surface: &str, language: &str) -> Option<(String, String, bool)> {
+    let before_initializer = surface.split('=').next()?.trim();
+    let constructor_type = surface.split_once('=').and_then(|(_, initializer)| {
+        let initializer = initializer.trim().trim_start_matches("new ").trim();
+        let (name, arguments) = initializer.split_once('(')?;
+        (arguments.contains(')')
+            && java_kotlin_simple_identifier(name)
+            && name.chars().next().is_some_and(char::is_uppercase))
+        .then(|| name.to_string())
+    });
+    let constructor = constructor_type.is_some();
+    if language == "swift" {
+        let (name, owner) = if let Some((left, right)) = before_initializer.split_once(':') {
+            (
+                left.split_whitespace().last()?.trim(),
+                right.trim().trim_end_matches('?').to_string(),
+            )
+        } else {
+            (
+                before_initializer.split_whitespace().last()?.trim(),
+                constructor_type?,
+            )
+        };
+        return (java_kotlin_simple_identifier(name) && java_kotlin_simple_identifier(&owner))
+            .then(|| (name.to_string(), owner, constructor));
+    }
+    let tokens = before_initializer
+        .split_whitespace()
+        .filter(|token| {
+            !matches!(
+                *token,
+                "final"
+                    | "const"
+                    | "var"
+                    | "required"
+                    | "readonly"
+                    | "private"
+                    | "public"
+                    | "protected"
+                    | "internal"
+                    | "static"
+            )
+        })
+        .collect::<Vec<_>>();
+    let name = tokens
+        .last()?
+        .trim_matches(|character: char| !character.is_alphanumeric() && character != '_');
+    let owner = tokens
+        .get(tokens.len().checked_sub(2).unwrap_or_default())
+        .filter(|_| tokens.len() >= 2)
+        .map(|owner| owner.trim_end_matches('?').to_string())
+        .or(constructor_type)?;
+    (java_kotlin_simple_identifier(name) && java_kotlin_simple_identifier(&owner))
+        .then(|| (name.to_string(), owner, constructor))
+}
+
+fn csd_lexical_binding(
+    node: TsNode<'_>,
+    source: &str,
+    language: &str,
+) -> Option<(String, JavaKotlinLexicalBinding)> {
+    let surface = match (language, node.kind()) {
+        ("csharp", "parameter") => node_text(node, source)?,
+        ("csharp", "variable_declarator") => {
+            node.parent().and_then(|parent| node_text(parent, source))?
+        }
+        ("swift", "parameter" | "property_declaration") => node_text(node, source)?,
+        ("dart", "declaration" | "local_variable_declaration") => node_text(node, source)?,
+        _ => return None,
+    };
+    let declared_name = match language {
+        "swift" => surface
+            .split([':', '='])
+            .next()
+            .and_then(|left| left.split_whitespace().last()),
+        "csharp" | "dart" => surface
+            .split('=')
+            .next()
+            .and_then(|left| left.split_whitespace().last())
+            .map(|name| {
+                name.trim_matches(|character: char| {
+                    !character.is_alphanumeric() && character != '_'
+                })
+            }),
+        _ => None,
+    }
+    .filter(|name| java_kotlin_simple_identifier(name))?
+    .to_string();
+    let Some((name, owner_name, constructor)) = typed_binding_from_surface(surface, language)
+    else {
+        count_java_kotlin_resolution_work(1);
+        return Some((declared_name, JavaKotlinLexicalBinding::Other));
+    };
+    if name != declared_name {
+        return Some((declared_name, JavaKotlinLexicalBinding::Other));
+    }
+    count_java_kotlin_resolution_work(2);
+    Some((
+        name,
+        if owner_name == "dynamic"
+            || owner_name == "var"
+            || owner_name.contains(['<', '>', '(', ')'])
+        {
+            JavaKotlinLexicalBinding::Other
+        } else {
+            JavaKotlinLexicalBinding::Receiver {
+                owner_name,
+                constructor,
+            }
+        },
+    ))
+}
+
+fn dart_callable_bindings(
+    signature: TsNode<'_>,
+    source: &str,
+) -> Vec<(String, JavaKotlinLexicalBinding)> {
+    let mut bindings = Vec::new();
+    let mut stack = vec![signature];
+    while let Some(node) = stack.pop() {
+        count_java_kotlin_resolution_work(1);
+        if node.kind() == "formal_parameter"
+            && let Some(surface) = node_text(node, source)
+        {
+            if let Some((name, owner_name, constructor)) =
+                typed_binding_from_surface(surface, "dart")
+            {
+                bindings.push((
+                    name,
+                    if owner_name == "dynamic" || owner_name == "Function" {
+                        JavaKotlinLexicalBinding::Other
+                    } else {
+                        JavaKotlinLexicalBinding::Receiver {
+                            owner_name,
+                            constructor,
+                        }
+                    },
+                ));
+            } else if let Some(name) = surface
+                .split('=')
+                .next()
+                .and_then(|left| left.split_whitespace().last())
+                .map(|name| {
+                    name.trim_matches(|character: char| {
+                        !character.is_alphanumeric() && character != '_'
+                    })
+                })
+                .filter(|name| java_kotlin_simple_identifier(name))
+            {
+                bindings.push((name.to_string(), JavaKotlinLexicalBinding::Other));
+            }
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        for child in children.into_iter().rev() {
+            stack.push(child);
+        }
+    }
+    bindings
+}
+
 fn java_call<'tree>(
     node: TsNode<'tree>,
     source: &str,
@@ -4530,6 +5382,179 @@ fn java_call<'tree>(
         Some(_) => CalleeForm::ExplicitReceiver,
     };
     Some((name, form, node_text(name, source)?.to_string()))
+}
+
+fn csharp_call<'tree>(
+    node: TsNode<'tree>,
+    source: &str,
+) -> Option<(TsNode<'tree>, CalleeForm, String)> {
+    (node.kind() == "invocation_expression").then_some(())?;
+    let function = node.child_by_field_name("function")?;
+    if function.kind() == "identifier" {
+        return Some((
+            function,
+            CalleeForm::Identifier,
+            node_text(function, source)?.to_string(),
+        ));
+    }
+    (function.kind() == "member_access_expression").then_some(())?;
+    let name = function.child_by_field_name("name")?;
+    let receiver = function.child_by_field_name("expression")?;
+    let form = if receiver.kind() == "this_expression" || node_text(receiver, source)? == "this" {
+        CalleeForm::ImplicitReceiver
+    } else {
+        CalleeForm::ExplicitReceiver
+    };
+    Some((name, form, node_text(name, source)?.to_string()))
+}
+
+fn swift_call<'tree>(
+    node: TsNode<'tree>,
+    source: &str,
+) -> Option<(TsNode<'tree>, CalleeForm, String)> {
+    (node.kind() == "call_expression").then_some(())?;
+    let function = node.named_child(0)?;
+    if function.kind() == "simple_identifier" {
+        return Some((
+            function,
+            CalleeForm::Identifier,
+            node_text(function, source)?.to_string(),
+        ));
+    }
+    (function.kind() == "navigation_expression").then_some(())?;
+    let receiver = function.named_child(0)?;
+    let suffix_index = u32::try_from(function.named_child_count().checked_sub(1)?).ok()?;
+    let suffix = function.named_child(suffix_index)?;
+    let member = first_descendant_named_kind(suffix, "simple_identifier")?;
+    let form = if receiver.kind() == "self_expression" {
+        CalleeForm::ImplicitReceiver
+    } else {
+        CalleeForm::ExplicitReceiver
+    };
+    Some((member, form, node_text(member, source)?.to_string()))
+}
+
+fn dart_call<'tree>(
+    node: TsNode<'tree>,
+    source: &str,
+) -> Option<(TsNode<'tree>, CalleeForm, String)> {
+    if node.kind() == "method_invocation" {
+        let function = node.child_by_field_name("function")?;
+        return (function.kind() == "identifier").then(|| {
+            (
+                function,
+                CalleeForm::Identifier,
+                node_text(function, source).unwrap_or_default().to_string(),
+            )
+        });
+    }
+    let mut cursor = node.walk();
+    let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+    let mut found = None;
+    for pair in children.windows(2) {
+        if pair[0].kind() != "selector"
+            || pair[1].kind() != "selector"
+            || !node_contains_kind(pair[1], "argument_part")
+        {
+            continue;
+        }
+        let callee = first_descendant_named_kind(pair[0], "identifier")?;
+        let receiver = source.get(node.start_byte()..pair[0].start_byte())?.trim();
+        let form = if receiver == "this" {
+            CalleeForm::ImplicitReceiver
+        } else {
+            CalleeForm::ExplicitReceiver
+        };
+        found = Some((callee, form, node_text(callee, source)?.to_string()));
+    }
+    found
+}
+
+fn node_contains_kind(node: TsNode<'_>, kind: &str) -> bool {
+    if node.kind() == kind {
+        return true;
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        count_java_kotlin_resolution_work(1);
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == kind {
+                return true;
+            }
+            stack.push(child);
+        }
+    }
+    false
+}
+
+fn first_descendant_named_kind<'tree>(node: TsNode<'tree>, kind: &str) -> Option<TsNode<'tree>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        count_java_kotlin_resolution_work(1);
+        let mut cursor = current.walk();
+        for child in current.named_children(&mut cursor) {
+            if child.kind() == kind {
+                return Some(child);
+            }
+            stack.push(child);
+        }
+    }
+    None
+}
+
+fn dart_member_receiver_surface(callee: TsNode<'_>, source: &str) -> Option<String> {
+    let selector = callee.parent()?.parent()?;
+    let expression = selector.parent()?;
+    source
+        .get(expression.start_byte()..selector.start_byte())
+        .map(str::trim)
+        .filter(|surface| !surface.is_empty())
+        .map(str::to_string)
+}
+
+fn constructor_surface_owner(surface: &str) -> Option<(String, Option<String>)> {
+    let surface = surface.trim().trim_end_matches('?').trim();
+    let callee = surface.strip_suffix("()")?.trim();
+    let (prefix, owner) = callee
+        .rsplit_once('.')
+        .map_or((None, callee), |(prefix, owner)| (Some(prefix), owner));
+    (java_kotlin_simple_identifier(owner)
+        && prefix.is_none_or(java_kotlin_simple_identifier)
+        && owner.chars().next().is_some_and(char::is_uppercase))
+    .then(|| (owner.to_string(), prefix.map(str::to_string)))
+}
+
+fn csd_direct_constructor_type(
+    node: TsNode<'_>,
+    source: &str,
+    language: &str,
+) -> Option<(String, Option<String>)> {
+    match language {
+        "csharp" => {
+            (node.kind() == "object_creation_expression").then_some(())?;
+            let owner = node
+                .child_by_field_name("type")
+                .and_then(|ty| java_kotlin_simple_type_name(ty, source))?;
+            Some((owner, None))
+        }
+        "swift" => {
+            (node.kind() == "call_expression").then_some(())?;
+            let callee = node.named_child(0)?;
+            let surface = node_text(callee, source)?;
+            let (prefix, owner) = surface
+                .rsplit_once('.')
+                .map_or((None, surface), |(prefix, owner)| (Some(prefix), owner));
+            (java_kotlin_simple_identifier(owner)
+                && prefix.is_none_or(java_kotlin_simple_identifier)
+                && owner.chars().next().is_some_and(char::is_uppercase))
+            .then(|| (owner.to_string(), prefix.map(str::to_string)))
+        }
+        _ => None,
+    }
 }
 
 fn kotlin_call<'tree>(
@@ -4571,12 +5596,16 @@ fn java_kotlin_member_receiver<'tree>(
     callee: TsNode<'tree>,
     language: &str,
 ) -> Option<TsNode<'tree>> {
-    let invocation = callee.parent()?;
-    if language == "java" {
-        return invocation.child_by_field_name("object");
+    let parent = callee.parent()?;
+    match language {
+        "java" => return parent.child_by_field_name("object"),
+        "csharp" => return parent.child_by_field_name("expression"),
+        "swift" => return parent.parent()?.named_child(0),
+        "dart" => return None,
+        _ => {}
     }
     count_java_kotlin_resolution_work(1);
-    invocation.named_child(0)
+    parent.named_child(0)
 }
 
 #[derive(Debug, Clone)]
@@ -11702,7 +12731,10 @@ pub fn rematerialize_proof_resolution_projection(
     let mut records = records
         .into_iter()
         .filter_map(|record| {
-            if matches!(record.file.language.as_str(), "ruby" | "php") {
+            if matches!(
+                record.file.language.as_str(),
+                "ruby" | "php" | "csharp" | "swift" | "dart"
+            ) {
                 count_ruby_php_resolution_work(1);
                 linear_records.push(record);
                 None
@@ -11730,7 +12762,10 @@ pub fn rematerialize_proof_resolution_projection(
         .iter()
         .flat_map(|record| record.calls.iter().cloned().map(move |call| (record, call)))
         .filter_map(|(record, call)| {
-            if matches!(record.file.language.as_str(), "ruby" | "php") {
+            if matches!(
+                record.file.language.as_str(),
+                "ruby" | "php" | "csharp" | "swift" | "dart"
+            ) {
                 count_ruby_php_resolution_work(1);
                 linear_inputs.push((record, call));
                 None
@@ -11755,7 +12790,10 @@ pub fn rematerialize_proof_resolution_projection(
     inputs.extend(linear_inputs);
     let mut callsite_members = HashSet::new();
     if inputs.iter().any(|(_, input)| {
-        if matches!(input.language.as_str(), "ruby" | "php") {
+        if matches!(
+            input.language.as_str(),
+            "ruby" | "php" | "csharp" | "swift" | "dart"
+        ) {
             count_ruby_php_resolution_work(1);
         }
         !callsite_members.insert((
@@ -11797,7 +12835,12 @@ pub fn rematerialize_proof_resolution_projection(
         &governed_by_id,
         &record_by_file_id,
     )?;
-    enforce_exact_evidence_corroboration(&mut claims, &node_by_id, &exact_evidence_validation);
+    enforce_exact_evidence_corroboration(
+        &mut claims,
+        &node_by_id,
+        &file_by_id,
+        &exact_evidence_validation,
+    );
     let exact_claim_indices = claims
         .iter()
         .enumerate()
@@ -12725,6 +13768,7 @@ fn typescript_directory_specifier(literal: &str) -> Option<&'static str> {
 
 struct ExactEvidenceValidationIndex {
     import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
+    swift_module_import_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
     typescript_directory_import_relations:
         HashMap<(NodeId, NodeId), TypescriptDirectoryImportState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
@@ -12764,11 +13808,32 @@ fn python_raw_import_marker_is_admissible(edge: &Edge, nodes: &HashMap<NodeId, &
 impl ExactEvidenceValidationIndex {
     fn prepare(edges: &[Edge], nodes: &HashMap<NodeId, &Node>) -> Self {
         let mut import_relations = HashMap::<_, ProofRelationState>::new();
+        let mut swift_module_import_relations = HashMap::<_, ProofRelationState>::new();
         let mut typescript_directory_import_relations =
             HashMap::<_, TypescriptDirectoryImportState>::new();
         let mut member_relations = HashMap::<_, ProofRelationState>::new();
         let mut python_import_edges = HashMap::<NodeId, Vec<NodeId>>::new();
         for edge in edges {
+            if edge.kind == EdgeKind::IMPORT
+                && edge.source == edge.target
+                && let Some(file_id) = edge.file_node_id
+                && let Some(import) = nodes.get(&edge.source)
+                && import.kind == NodeKind::MODULE
+                && import.file_node_id == Some(file_id)
+            {
+                let state = swift_module_import_relations
+                    .entry((file_id, edge.source))
+                    .or_default();
+                if edge.effective_source() == edge.source
+                    && edge.effective_target() == edge.target
+                    && edge.resolved_target.is_none()
+                    && edge.candidate_targets.is_empty()
+                {
+                    state.admissible += 1;
+                } else {
+                    state.conflicting += 1;
+                }
+            }
             if edge.kind == EdgeKind::IMPORT
                 && let (Some(file_id), Some(target)) = (edge.file_node_id, edge.resolved_target)
             {
@@ -12917,6 +13982,7 @@ impl ExactEvidenceValidationIndex {
         }
         Self {
             import_relations,
+            swift_module_import_relations,
             typescript_directory_import_relations,
             member_relations,
             member_by_owner_and_name,
@@ -12928,6 +13994,12 @@ impl ExactEvidenceValidationIndex {
     fn has_import(&self, file: NodeId, import: NodeId, target: NodeId) -> bool {
         self.import_relations
             .get(&(file, import, target))
+            .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn has_swift_module_import(&self, file: NodeId, import: NodeId) -> bool {
+        self.swift_module_import_relations
+            .get(&(file, import))
             .is_some_and(ProofRelationState::is_unique)
     }
 
@@ -13021,6 +14093,7 @@ impl ExactEvidenceValidationIndex {
         &self,
         claim: &ResolvedSyntaxClaim,
         nodes: &HashMap<NodeId, &Node>,
+        files: &HashMap<i64, &codestory_store::FileInfo>,
     ) -> bool {
         let Some(target) = claim.target else {
             return false;
@@ -13073,8 +14146,10 @@ impl ExactEvidenceValidationIndex {
                 CalleeForm::Identifier,
                 [ResolutionEvidence::SamePackageDeclaration { declaration }],
             ) => {
-                matches!(claim.input.language.as_str(), "go" | "kotlin")
-                    && *declaration == target
+                matches!(
+                    claim.input.language.as_str(),
+                    "go" | "kotlin" | "csharp" | "swift" | "dart"
+                ) && *declaration == target
                     && target_node.file_node_id.is_some()
                     && target_node.file_node_id != Some(source_file)
             }
@@ -13094,6 +14169,14 @@ impl ExactEvidenceValidationIndex {
                             || matches!(
                                 &claim.input.binding,
                                 CachedResolutionBinding::JavaKotlinImportedFunction {
+                                    import: binding_import,
+                                    ..
+                                } if is_csharp_swift_dart_language(&claim.input.language)
+                                    && binding_import == import
+                            )
+                            || matches!(
+                                &claim.input.binding,
+                                CachedResolutionBinding::JavaKotlinImportedFunction {
                                     package_name,
                                     name,
                                     import: binding_import,
@@ -13109,6 +14192,17 @@ impl ExactEvidenceValidationIndex {
                             && target_node.qualified_name.as_deref().is_some_and(|name| {
                                 name.ends_with(&claim.input.callsite.raw_target)
                             })
+                    } else if claim.input.language == "dart" {
+                        target_node.file_node_id.is_some_and(|target_file| {
+                            dart_literal_import_target_is_authenticated(
+                                source_file,
+                                *import,
+                                target_file,
+                                &claim.exact_dependency_files,
+                                nodes,
+                                files,
+                            )
+                        })
                     } else if typescript_directory_import {
                         typescript_directory_import_is_correlated
                     } else if self.typescript_directory_marker_seen(source_file, *import) {
@@ -13197,8 +14291,10 @@ impl ExactEvidenceValidationIndex {
                     ResolutionEvidence::SamePackageDeclaration { declaration },
                 ],
             ) => {
-                claim.input.language == "go"
-                    && *declaration == target
+                matches!(
+                    claim.input.language.as_str(),
+                    "go" | "csharp" | "swift" | "dart"
+                ) && *declaration == target
                     && target_node.kind == NodeKind::METHOD
                     && target_node.file_node_id.is_some()
                     && nodes.get(owner).is_some_and(|owner_node| {
@@ -13321,7 +14417,9 @@ impl ExactEvidenceValidationIndex {
                     target,
                     target_node,
                     components,
+                    &claim.exact_dependency_files,
                     nodes,
+                    files,
                 ),
             (
                 CalleeForm::ExplicitReceiver,
@@ -13341,7 +14439,9 @@ impl ExactEvidenceValidationIndex {
                 target,
                 target_node,
                 components,
+                &claim.exact_dependency_files,
                 nodes,
+                files,
             ),
             (
                 CalleeForm::ExplicitReceiver,
@@ -13363,7 +14463,9 @@ impl ExactEvidenceValidationIndex {
                     target,
                     target_node,
                     &[],
+                    &claim.exact_dependency_files,
                     nodes,
+                    files,
                 )
             }
             (
@@ -13385,7 +14487,9 @@ impl ExactEvidenceValidationIndex {
                     target,
                     target_node,
                     &[],
+                    &claim.exact_dependency_files,
                     nodes,
+                    files,
                 ),
             (
                 CalleeForm::ExplicitReceiver,
@@ -13410,7 +14514,9 @@ impl ExactEvidenceValidationIndex {
                     target,
                     target_node,
                     components,
+                    &claim.exact_dependency_files,
                     nodes,
+                    files,
                 )
             }
             (
@@ -13512,9 +14618,25 @@ impl ExactEvidenceValidationIndex {
                     .iter()
                     .any(|dependency| dependency.0 == owner_file.0)
         } else if same_package {
-            language == "go"
-                && owner_node.file_node_id.is_some()
-                && target_node.file_node_id.is_some()
+            if is_csharp_swift_dart_language(language) {
+                nodes.get(&caller).is_some_and(|caller_node| {
+                    caller_node.file_node_id == Some(source_file)
+                        && matches!(caller_node.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+                }) && owner_node.file_node_id.is_some()
+                    && owner_node.file_node_id == target_node.file_node_id
+                    && domain_dependencies
+                        .iter()
+                        .any(|dependency| dependency.0 == source_file.0)
+                    && owner_node.file_node_id.is_some_and(|owner_file| {
+                        domain_dependencies
+                            .iter()
+                            .any(|dependency| dependency.0 == owner_file.0)
+                    })
+            } else {
+                language == "go"
+                    && owner_node.file_node_id.is_some()
+                    && target_node.file_node_id.is_some()
+            }
         } else if language == "go" {
             owner_node.file_node_id.is_some() && target_node.file_node_id.is_some()
         } else {
@@ -13545,7 +14667,9 @@ impl ExactEvidenceValidationIndex {
         target: NodeId,
         target_node: &Node,
         components: &[NodeId],
+        domain_dependencies: &[FileId],
         nodes: &HashMap<NodeId, &Node>,
+        files: &HashMap<i64, &codestory_store::FileInfo>,
     ) -> bool {
         let java_kotlin_literal_import = matches!(language, "java" | "kotlin")
             && nodes.get(&import).is_some_and(|import_node| {
@@ -13565,6 +14689,49 @@ impl ExactEvidenceValidationIndex {
                 import,
                 &components[..components.len() - 2],
             );
+        let swift_module_import = language == "swift"
+            && components == [owner, target]
+            && nodes.get(&import).is_some_and(|import_node| {
+                import_node.kind == NodeKind::MODULE
+                    && import_node.file_node_id == Some(source_file)
+                    && self.has_swift_module_import(source_file, import)
+                    && nodes
+                        .get(&owner)
+                        .and_then(|owner_node| owner_node.file_node_id)
+                        .and_then(|file_id| files.get(&file_id.0))
+                        .and_then(|file| swift_project_module(&file.path))
+                        == Some(import_node.serialized_name.as_str())
+            })
+            && {
+                let dependency_set = domain_dependencies.iter().copied().collect::<HashSet<_>>();
+                let module = nodes
+                    .get(&import)
+                    .map(|import_node| import_node.serialized_name.as_str());
+                module.is_some_and(|module| {
+                    let expected = files
+                        .values()
+                        .filter(|file| {
+                            file.indexed
+                                && file.language == "swift"
+                                && swift_project_module(&file.path) == Some(module)
+                        })
+                        .map(|file| FileId(file.id))
+                        .collect::<HashSet<_>>();
+                    !expected.is_empty() && dependency_set == expected
+                })
+            };
+        let dart_literal_import = language == "dart"
+            && components == [owner, target]
+            && target_node.file_node_id.is_some_and(|target_file| {
+                dart_literal_import_target_is_authenticated(
+                    source_file,
+                    import,
+                    target_file,
+                    domain_dependencies,
+                    nodes,
+                    files,
+                )
+            });
         (if language == "python" {
             target_node.kind == NodeKind::FUNCTION && python_path
         } else {
@@ -13581,6 +14748,8 @@ impl ExactEvidenceValidationIndex {
             })
             && (python_path
                 || java_kotlin_literal_import
+                || swift_module_import
+                || dart_literal_import
                 || self.has_import(source_file, import, owner))
             && self.has_member(owner, target)
     }
@@ -13589,7 +14758,8 @@ impl ExactEvidenceValidationIndex {
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
         "go" | "rust" => kind == NodeKind::MODULE,
-        "java" | "kotlin" | "javascript" | "typescript" | "tsx" | "python" | "php" | "ruby" => {
+        "java" | "kotlin" | "csharp" | "swift" | "dart" | "javascript" | "typescript" | "tsx"
+        | "python" | "php" | "ruby" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
         _ => false,
@@ -13599,6 +14769,7 @@ fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
 fn enforce_exact_evidence_corroboration(
     claims: &mut [ResolvedSyntaxClaim],
     nodes: &HashMap<NodeId, &Node>,
+    files: &HashMap<i64, &codestory_store::FileInfo>,
     validation: &ExactEvidenceValidationIndex,
 ) {
     for claim in claims
@@ -13670,7 +14841,7 @@ fn enforce_exact_evidence_corroboration(
                 *evidence_components = components;
             }
         }
-        if !validation.claim_has_literal_corroboration(claim, nodes) {
+        if !validation.claim_has_literal_corroboration(claim, nodes, files) {
             claim.status = ProofResolutionStatus::IncompleteDomain;
             claim.reason = ProofResolutionReason::LookupDomainIncomplete;
             claim.target = None;
@@ -14635,6 +15806,122 @@ enum JavaKotlinImportResolution {
     Incomplete,
 }
 
+fn dart_library_root(path: &Path) -> Option<&Path> {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        if directory.file_name().and_then(|name| name.to_str()) == Some("lib") {
+            return Some(directory);
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+fn resolve_dart_literal_import(
+    projection: &JavaKotlinProjectionIndex,
+    records: &HashMap<WorkspacePathIdentity, &ResolutionCacheRecord>,
+    source_record: &ResolutionCacheRecord,
+    encoded_uri: &str,
+    owner_name: Option<&str>,
+    imported_name: &str,
+) -> JavaKotlinImportResolution {
+    let Some(uri) = encoded_uri.strip_prefix("dart:uri:") else {
+        return JavaKotlinImportResolution::Incomplete;
+    };
+    let relative = Path::new(uri);
+    if relative
+        .extension()
+        .and_then(|extension| extension.to_str())
+        != Some("dart")
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return JavaKotlinImportResolution::Incomplete;
+    }
+    let Some(source_directory) = source_record.path.parent() else {
+        return JavaKotlinImportResolution::Incomplete;
+    };
+    let target_path = source_directory.join(relative);
+    if !matches!(
+        std::fs::symlink_metadata(&target_path),
+        Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file()
+    ) {
+        return JavaKotlinImportResolution::Incomplete;
+    }
+    let (Some(source_library), Some(target_library)) = (
+        dart_library_root(&source_record.path),
+        dart_library_root(&target_path),
+    ) else {
+        return JavaKotlinImportResolution::Incomplete;
+    };
+    if workspace_path_identity(source_library).ok() != workspace_path_identity(target_library).ok()
+    {
+        return JavaKotlinImportResolution::Incomplete;
+    }
+    let Ok(target_identity) = workspace_path_identity(&target_path) else {
+        return JavaKotlinImportResolution::Incomplete;
+    };
+    let Some(target_record) = records.get(&target_identity).copied() else {
+        return JavaKotlinImportResolution::Incomplete;
+    };
+    if target_record.file.language != "dart"
+        || !target_record.file.complete
+        || !target_record.file.lookup_input_complete
+        || target_record.file.export_poison_all
+        || target_record.file.file_id == source_record.file.file_id
+    {
+        return JavaKotlinImportResolution::Incomplete;
+    }
+    let Some(domain) = projection
+        .domains
+        .get(&("dart".to_string(), "dart:lib".to_string()))
+        .filter(|domain| domain.complete && !domain.poisoned)
+    else {
+        return JavaKotlinImportResolution::Incomplete;
+    };
+    let file_id = FileId(target_record.file.file_id.0);
+    let candidates = if let Some(owner_name) = owner_name {
+        let owners = target_record
+            .file
+            .classes
+            .iter()
+            .filter(|class| class.name == owner_name)
+            .collect::<Vec<_>>();
+        let [owner] = owners.as_slice() else {
+            return if owners.is_empty() {
+                JavaKotlinImportResolution::Missing
+            } else {
+                JavaKotlinImportResolution::Ambiguous
+            };
+        };
+        owner
+            .methods
+            .iter()
+            .filter(|method| method.name == imported_name)
+            .map(|method| (owner.declaration, method.declaration))
+            .collect::<Vec<_>>()
+    } else {
+        target_record
+            .file
+            .top_level_declarations
+            .iter()
+            .filter(|declaration| declaration.name == imported_name)
+            .map(|declaration| (declaration.declaration, declaration.declaration))
+            .collect::<Vec<_>>()
+    };
+    match candidates.as_slice() {
+        [(owner, declaration)] => JavaKotlinImportResolution::Exact {
+            owner: *owner,
+            declaration: *declaration,
+            file_id,
+            dependencies: domain.dependencies.clone(),
+        },
+        [] => JavaKotlinImportResolution::Missing,
+        _ => JavaKotlinImportResolution::Ambiguous,
+    }
+}
+
 impl JavaKotlinProjectionIndex {
     fn prepare(records: &[ResolutionCacheRecord]) -> Self {
         let mut domains = HashMap::<(String, String), JavaKotlinImportDomain>::new();
@@ -14760,7 +16047,7 @@ impl JavaKotlinProjectionIndex {
         }
         for record in records
             .iter()
-            .filter(|record| is_java_kotlin_language(&record.file.language))
+            .filter(|record| is_nominal_language(&record.file.language))
         {
             let Some(package_name) = record.file.java_kotlin_package.as_ref() else {
                 continue;
@@ -14791,6 +16078,13 @@ impl JavaKotlinProjectionIndex {
                     });
             }
             for class in &record.file.classes {
+                domain.classes.entry(class.name.clone()).or_default().push(
+                    JavaKotlinImportCandidate {
+                        owner: class.declaration,
+                        declaration: class.declaration,
+                        file_id,
+                    },
+                );
                 for method in &class.methods {
                     domain
                         .declarations
@@ -14804,12 +16098,14 @@ impl JavaKotlinProjectionIndex {
                 }
             }
         }
-        for domain in domains.values_mut() {
-            domain.dependencies.sort();
-            domain.dependencies.dedup();
-            for candidates in domain.declarations.values_mut() {
-                candidates.sort_by_key(|candidate| candidate.declaration);
-                candidates.dedup_by(|left, right| left.declaration == right.declaration);
+        for ((language, _), domain) in &mut domains {
+            if is_java_kotlin_language(language) {
+                domain.dependencies.sort();
+                domain.dependencies.dedup();
+                for candidates in domain.declarations.values_mut() {
+                    candidates.sort_by_key(|candidate| candidate.declaration);
+                    candidates.dedup_by(|left, right| left.declaration == right.declaration);
+                }
             }
         }
         Self {
@@ -14837,7 +16133,20 @@ impl JavaKotlinProjectionIndex {
         else {
             return JavaKotlinImportResolution::Missing;
         };
-        Self::resolve_domain(domain, owner_name, imported_name)
+        let resolution = Self::resolve_domain(domain, owner_name, imported_name);
+        let (Some(owner_name), JavaKotlinImportResolution::Exact { owner, .. }) =
+            (owner_name, &resolution)
+        else {
+            return resolution;
+        };
+        if matches!(
+            domain.classes.get(owner_name).map(Vec::as_slice),
+            Some([candidate]) if candidate.owner == *owner
+        ) {
+            resolution
+        } else {
+            JavaKotlinImportResolution::Ambiguous
+        }
     }
 
     fn resolve_php(
@@ -16176,6 +17485,15 @@ fn resolve_syntax_claim(
             import,
         } => match if input.language == "php" {
             java_kotlin_index.resolve_php_named(package_name, owner_name.as_deref(), name)
+        } else if input.language == "dart" {
+            resolve_dart_literal_import(
+                java_kotlin_index,
+                records,
+                source_record,
+                package_name,
+                owner_name.as_deref(),
+                name,
+            )
         } else {
             java_kotlin_index.resolve(&input.language, package_name, owner_name.as_deref(), name)
         } {
@@ -16231,14 +17549,22 @@ fn resolve_syntax_claim(
                 status = ProofResolutionStatus::Exact;
                 reason = ProofResolutionReason::ExactResolution;
                 target = Some(declaration);
-                if *constructor {
-                    evidence_chain
-                        .push(ResolutionEvidence::ConstructorBinding { constructor: owner });
+                if input.callsite.callee_form == CalleeForm::ImplicitReceiver {
+                    evidence_chain.push(ResolutionEvidence::ImplicitReceiver { owner });
+                } else {
+                    if *constructor {
+                        evidence_chain
+                            .push(ResolutionEvidence::ConstructorBinding { constructor: owner });
+                    }
+                    evidence_chain.push(ResolutionEvidence::ExplicitReceiverType {
+                        receiver_type: owner,
+                    });
                 }
-                evidence_chain.push(ResolutionEvidence::ExplicitReceiverType {
-                    receiver_type: owner,
+                evidence_chain.push(if file_id == input.callsite.file_id {
+                    ResolutionEvidence::SameFileDeclaration { declaration }
+                } else {
+                    ResolutionEvidence::SamePackageDeclaration { declaration }
                 });
-                evidence_chain.push(ResolutionEvidence::SamePackageDeclaration { declaration });
                 exact_node_file_expectations.push((owner, file_id));
                 exact_node_file_expectations.push((declaration, file_id));
                 dependencies.push(input.callsite.file_id);
@@ -16265,6 +17591,15 @@ fn resolve_syntax_claim(
             constructor,
         } => match if input.language == "php" {
             java_kotlin_index.resolve_php_named(package_name, Some(owner_name), method_name)
+        } else if input.language == "dart" {
+            resolve_dart_literal_import(
+                java_kotlin_index,
+                records,
+                source_record,
+                package_name,
+                Some(owner_name),
+                method_name,
+            )
         } else {
             java_kotlin_index.resolve(&input.language, package_name, Some(owner_name), method_name)
         } {
@@ -16808,7 +18143,10 @@ fn seal_resolved_claim(
         None
     };
     let input = &claim.input;
-    let linear_dependency_order = matches!(input.language.as_str(), "ruby" | "php");
+    let linear_dependency_order = matches!(
+        input.language.as_str(),
+        "ruby" | "php" | "csharp" | "swift" | "dart"
+    );
     let mut dependency_ids = Vec::new();
     let mut dependency_members = HashSet::new();
     let mut push_dependency = |file_id: NodeId| {
@@ -16892,8 +18230,15 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
             Some(fact.callsite.callee_form),
             evidence_kind,
         );
-        let counts = if matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php") {
-            count_ruby_php_resolution_work(1);
+        let counts = if matches!(
+            fact.provenance.language_adapter.as_str(),
+            "ruby" | "php" | "csharp" | "swift" | "dart"
+        ) {
+            if is_csharp_swift_dart_language(&fact.provenance.language_adapter) {
+                count_java_kotlin_resolution_work(1);
+            } else {
+                count_ruby_php_resolution_work(1);
+            }
             linear_rows.entry(key).or_default()
         } else {
             rows.entry(key).or_default()
@@ -16933,7 +18278,7 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
                 right.evidence_kind.map(|kind| kind.as_str()),
             ))
     });
-    for language in ["php", "ruby"] {
+    for language in ["csharp", "dart", "php", "ruby", "swift"] {
         for callee_form in [
             CalleeForm::Constructor,
             CalleeForm::DynamicAccess,
@@ -16954,7 +18299,11 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
                 Some(ResolutionEvidenceKind::StaticImportBinding),
             ] {
                 let key = (language.to_owned(), Some(callee_form), evidence_kind);
-                count_ruby_php_resolution_work(1);
+                if is_csharp_swift_dart_language(language) {
+                    count_java_kotlin_resolution_work(1);
+                } else {
+                    count_ruby_php_resolution_work(1);
+                }
                 if let Some(counts) = linear_rows.remove(&key) {
                     result.push(ProofResolutionFunnelRow {
                         language: language.to_owned(),
@@ -17732,10 +19081,22 @@ mod java_kotlin_complexity_tests {
 
     fn measured_work(language: &str, source: &str) -> usize {
         let mut parser = Parser::new();
-        let grammar = if language == "java" {
-            tree_sitter_java::LANGUAGE.into()
-        } else {
-            tree_sitter_kotlin_ng::LANGUAGE.into()
+        let (grammar, path) = match language {
+            "java" => (tree_sitter_java::LANGUAGE.into(), Path::new("Exact.java")),
+            "kotlin" => (
+                tree_sitter_kotlin_ng::LANGUAGE.into(),
+                Path::new("Exact.kt"),
+            ),
+            "csharp" => (tree_sitter_c_sharp::LANGUAGE.into(), Path::new("Exact.cs")),
+            "swift" => (
+                tree_sitter_swift::LANGUAGE.into(),
+                Path::new("Sources/App/Exact.swift"),
+            ),
+            "dart" => (
+                tree_sitter_dart_orchard::LANGUAGE.into(),
+                Path::new("lib/exact.dart"),
+            ),
+            _ => panic!("unsupported nominal test language {language}"),
         };
         parser.set_language(&grammar).expect("grammar must load");
         let tree = parser.parse(source, None).expect("source must parse");
@@ -17764,11 +19125,41 @@ mod java_kotlin_complexity_tests {
             next_id += 1;
         });
         reset_java_kotlin_resolution_work();
-        let index = JavaKotlinResolutionIndex::build(&tree, source, language, file_id, &nodes);
+        let index =
+            JavaKotlinResolutionIndex::build(&tree, source, path, language, file_id, &nodes);
         for call in &index.calls {
             let _ = index.resolve_syntax_claim(source, call.callee, call.form, &call.raw_target);
         }
         java_kotlin_resolution_work()
+    }
+
+    fn csd_source(language: &str, count: usize) -> String {
+        let mut source = match language {
+            "csharp" => String::from(
+                "public sealed class Worker { public void Run() {} }\npublic static class Calls {\n",
+            ),
+            "swift" => String::from("struct Worker { func run() {} }\n"),
+            "dart" => String::from("final class Worker { void run() {} }\n"),
+            _ => panic!("unsupported nominal test language {language}"),
+        };
+        for index in 0..count {
+            match language {
+                "csharp" => source.push_str(&format!(
+                    "public static void Caller{index}() {{ Worker receiver{index} = new Worker(); receiver{index}.Run(); }}\n"
+                )),
+                "swift" => source.push_str(&format!(
+                    "func caller{index}() {{ let receiver{index}: Worker = Worker(); receiver{index}.run() }}\n"
+                )),
+                "dart" => source.push_str(&format!(
+                    "void caller{index}() {{ Worker receiver{index} = Worker(); receiver{index}.run(); }}\n"
+                )),
+                _ => unreachable!(),
+            }
+        }
+        if language == "csharp" {
+            source.push_str("}\n");
+        }
+        source
     }
 
     fn source(language: &str, count: usize) -> String {
@@ -17808,6 +19199,22 @@ mod java_kotlin_complexity_tests {
         for language in ["java", "kotlin"] {
             let small = measured_work(language, &source(language, 64));
             let large = measured_work(language, &source(language, 128));
+            assert!(
+                small >= 64 * 8,
+                "{language} parser work was not fully counted: {small}"
+            );
+            assert!(
+                large <= small * 2 + 256,
+                "{language} parser/index work grew superlinearly: {small} -> {large}"
+            );
+        }
+    }
+
+    #[test]
+    fn csharp_swift_dart_parser_index_work_is_linear_for_doubled_receivers_and_callers() {
+        for language in ["csharp", "swift", "dart"] {
+            let small = measured_work(language, &csd_source(language, 64));
+            let large = measured_work(language, &csd_source(language, 128));
             assert!(
                 small >= 64 * 8,
                 "{language} parser work was not fully counted: {small}"

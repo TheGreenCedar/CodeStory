@@ -52,8 +52,10 @@ pub struct ProofResolutionPublication {
 pub fn seal_call_resolution_fact(
     mut fact: CallResolutionFact,
 ) -> Result<CallResolutionFact, StorageError> {
-    let linear_dependency_order =
-        matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php");
+    let linear_dependency_order = matches!(
+        fact.provenance.language_adapter.as_str(),
+        "ruby" | "php" | "csharp" | "swift" | "dart"
+    );
     if !linear_dependency_order {
         fact.provenance.dependency_file_hashes.sort();
     }
@@ -128,8 +130,10 @@ where
 }
 
 fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<(), StorageError> {
-    let linear_dependency_order =
-        matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php");
+    let linear_dependency_order = matches!(
+        fact.provenance.language_adapter.as_str(),
+        "ruby" | "php" | "csharp" | "swift" | "dart"
+    );
     let dependencies_are_canonical = if linear_dependency_order {
         let mut members = HashSet::new();
         fact.provenance
@@ -288,6 +292,7 @@ struct ProofResolutionValidationContext {
     ordinary_call_edge_indices: Vec<usize>,
     parsed_callsite_identity_by_edge: HashMap<EdgeId, CanonicalCallsiteIdentity>,
     import_relations: HashMap<(NodeId, NodeId, NodeId), ProofRelationState>,
+    swift_module_import_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
     typescript_directory_import_relations:
         HashMap<(NodeId, NodeId), TypescriptDirectoryImportState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
@@ -297,6 +302,8 @@ struct ProofResolutionValidationContext {
     python_attestation_error_by_file: HashMap<i64, String>,
     java_package_identity_by_file: HashMap<i64, String>,
     java_dependency_ids_by_package: HashMap<String, BTreeSet<FileId>>,
+    csd_domain_identity_by_file: HashMap<i64, String>,
+    csd_dependency_ids_by_domain: HashMap<String, Vec<FileId>>,
     ruby_dependency_file_ids: Vec<FileId>,
     php_namespace_identity_by_file: HashMap<i64, PhpNamespaceIdentity>,
     php_dependency_ids_by_namespace: HashMap<PhpNamespaceIdentity, Vec<FileId>>,
@@ -766,6 +773,103 @@ fn prepare_java_package_closure(
             .insert(FileId(file_id));
     }
     (package_identity_by_file, dependency_ids_by_package)
+}
+
+fn prepare_csd_domain_closure(
+    files: &[FileInfo],
+    node_by_id: &HashMap<NodeId, Node>,
+) -> (HashMap<i64, String>, HashMap<String, Vec<FileId>>) {
+    let file_language_by_id = files
+        .iter()
+        .map(|file| (file.id, file.language.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut csharp_names = HashMap::<i64, Vec<String>>::new();
+    let mut csharp_members = HashMap::<i64, HashSet<String>>::new();
+    for node in node_by_id
+        .values()
+        .filter(|node| node.kind == NodeKind::NAMESPACE)
+    {
+        let Some(file_id) = node.file_node_id else {
+            continue;
+        };
+        if file_language_by_id.get(&file_id.0).copied() != Some("csharp")
+            || node.serialized_name.is_empty()
+        {
+            continue;
+        }
+        let members = csharp_members.entry(file_id.0).or_default();
+        if members.insert(node.serialized_name.clone()) {
+            csharp_names
+                .entry(file_id.0)
+                .or_default()
+                .push(node.serialized_name.clone());
+        }
+    }
+    let mut identity_by_file = HashMap::new();
+    let mut dependency_ids_by_domain = HashMap::<String, Vec<FileId>>::new();
+    for file in files
+        .iter()
+        .filter(|file| matches!(file.language.as_str(), "csharp" | "swift" | "dart"))
+    {
+        count_store_replay_work(1);
+        let identity = match file.language.as_str() {
+            "csharp" => match csharp_names.get(&file.id).map(Vec::as_slice) {
+                None | Some([]) => Some("csharp:global".to_string()),
+                Some([name]) => Some(format!("csharp:{name}")),
+                Some(_) => None,
+            },
+            "swift" => swift_project_module(&file.path).map(|module| format!("swift:{module}")),
+            "dart" => dart_library_root(&file.path)
+                .and_then(|root| std::fs::canonicalize(root).ok())
+                .map(|root| format!("dart:{}", root.display())),
+            _ => None,
+        };
+        let Some(identity) = identity else {
+            continue;
+        };
+        identity_by_file.insert(file.id, identity.clone());
+        dependency_ids_by_domain
+            .entry(identity)
+            .or_default()
+            .push(FileId(file.id));
+    }
+    (identity_by_file, dependency_ids_by_domain)
+}
+
+fn csd_dependency_ids(
+    fact: &CallResolutionFact,
+    context: &ProofResolutionValidationContext,
+) -> Result<Vec<FileId>, StorageError> {
+    let imported = fact
+        .evidence_chain
+        .iter()
+        .any(|evidence| matches!(evidence, ResolutionEvidence::StaticImportBinding { .. }));
+    let domain_file = if imported {
+        fact.target
+            .and_then(|target| context.node_by_id.get(&target))
+            .and_then(|target| target.file_node_id)
+            .map(|file| file.0)
+            .ok_or_else(|| proof_error("nominal import target has no governed domain file"))?
+    } else {
+        fact.callsite.file_id.0
+    };
+    let identity = context
+        .csd_domain_identity_by_file
+        .get(&domain_file)
+        .ok_or_else(|| proof_error("nominal exact fact has no authenticated domain identity"))?;
+    let domain = context
+        .csd_dependency_ids_by_domain
+        .get(identity)
+        .ok_or_else(|| proof_error("nominal exact fact has no complete dependency domain"))?;
+    let mut dependencies = Vec::with_capacity(domain.len().saturating_add(1));
+    let mut members = HashSet::new();
+    for file_id in std::iter::once(fact.callsite.file_id).chain(domain.iter().copied()) {
+        count_store_replay_work(1);
+        if members.insert(file_id) {
+            dependencies.push(file_id);
+        }
+    }
+    Ok(dependencies)
 }
 
 fn java_same_package_dependency_ids(
@@ -1430,6 +1534,7 @@ mod go_replay_complexity_tests {
             ordinary_call_edge_indices: Vec::new(),
             parsed_callsite_identity_by_edge: HashMap::new(),
             import_relations: HashMap::new(),
+            swift_module_import_relations: HashMap::new(),
             typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
             member_by_owner_and_name: HashMap::new(),
@@ -1438,6 +1543,8 @@ mod go_replay_complexity_tests {
             python_attestation_error_by_file: HashMap::new(),
             java_package_identity_by_file: HashMap::new(),
             java_dependency_ids_by_package: HashMap::new(),
+            csd_domain_identity_by_file: HashMap::new(),
+            csd_dependency_ids_by_domain: HashMap::new(),
             ruby_dependency_file_ids: Vec::new(),
             php_namespace_identity_by_file: HashMap::new(),
             php_dependency_ids_by_namespace: HashMap::new(),
@@ -1601,6 +1708,7 @@ mod python_replay_complexity_tests {
             ordinary_call_edge_indices: Vec::new(),
             parsed_callsite_identity_by_edge: HashMap::new(),
             import_relations: HashMap::new(),
+            swift_module_import_relations: HashMap::new(),
             typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
             member_by_owner_and_name: HashMap::new(),
@@ -1609,6 +1717,8 @@ mod python_replay_complexity_tests {
             python_attestation_error_by_file,
             java_package_identity_by_file: HashMap::new(),
             java_dependency_ids_by_package: HashMap::new(),
+            csd_domain_identity_by_file: HashMap::new(),
+            csd_dependency_ids_by_domain: HashMap::new(),
             ruby_dependency_file_ids: Vec::new(),
             php_namespace_identity_by_file: HashMap::new(),
             php_dependency_ids_by_namespace: HashMap::new(),
@@ -1723,6 +1833,7 @@ mod ruby_php_replay_complexity_tests {
             ordinary_call_edge_indices: Vec::new(),
             parsed_callsite_identity_by_edge: HashMap::new(),
             import_relations: HashMap::new(),
+            swift_module_import_relations: HashMap::new(),
             typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
             member_by_owner_and_name: HashMap::new(),
@@ -1731,6 +1842,8 @@ mod ruby_php_replay_complexity_tests {
             python_attestation_error_by_file: HashMap::new(),
             java_package_identity_by_file: HashMap::new(),
             java_dependency_ids_by_package: HashMap::new(),
+            csd_domain_identity_by_file: HashMap::new(),
+            csd_dependency_ids_by_domain: HashMap::new(),
             ruby_dependency_file_ids,
             php_namespace_identity_by_file,
             php_dependency_ids_by_namespace,
@@ -1919,6 +2032,8 @@ impl ProofResolutionValidationContext {
             .collect();
         let (java_package_identity_by_file, java_dependency_ids_by_package) =
             prepare_java_package_closure(&file_by_id, &node_by_id);
+        let (csd_domain_identity_by_file, csd_dependency_ids_by_domain) =
+            prepare_csd_domain_closure(&files, &node_by_id);
         let (
             ruby_dependency_file_ids,
             php_namespace_identity_by_file,
@@ -1930,12 +2045,33 @@ impl ProofResolutionValidationContext {
             prepare_call_edge_correlation_index(&edges, &node_by_id);
         let mut edge_index_by_id = HashMap::with_capacity(edges.len());
         let mut import_relations = HashMap::<_, ProofRelationState>::new();
+        let mut swift_module_import_relations = HashMap::<_, ProofRelationState>::new();
         let mut typescript_directory_import_relations =
             HashMap::<_, TypescriptDirectoryImportState>::new();
         let mut member_relations = HashMap::<_, ProofRelationState>::new();
         let mut python_import_edges = HashMap::<NodeId, Vec<NodeId>>::new();
         for (index, edge) in edges.iter().enumerate() {
             edge_index_by_id.insert(edge.id, index);
+            if edge.kind == EdgeKind::IMPORT
+                && edge.source == edge.target
+                && let Some(file_id) = edge.file_node_id
+                && let Some(import) = node_by_id.get(&edge.source)
+                && import.kind == NodeKind::MODULE
+                && import.file_node_id == Some(file_id)
+            {
+                let state = swift_module_import_relations
+                    .entry((file_id, edge.source))
+                    .or_default();
+                if edge.effective_source() == edge.source
+                    && edge.effective_target() == edge.target
+                    && edge.resolved_target.is_none()
+                    && edge.candidate_targets.is_empty()
+                {
+                    state.admissible += 1;
+                } else {
+                    state.conflicting += 1;
+                }
+            }
             if edge.kind == EdgeKind::IMPORT
                 && let (Some(file_id), Some(target)) = (edge.file_node_id, edge.resolved_target)
             {
@@ -2089,6 +2225,7 @@ impl ProofResolutionValidationContext {
             ordinary_call_edge_indices,
             parsed_callsite_identity_by_edge,
             import_relations,
+            swift_module_import_relations,
             typescript_directory_import_relations,
             member_relations,
             member_by_owner_and_name,
@@ -2097,6 +2234,8 @@ impl ProofResolutionValidationContext {
             python_attestation_error_by_file,
             java_package_identity_by_file,
             java_dependency_ids_by_package,
+            csd_domain_identity_by_file,
+            csd_dependency_ids_by_domain,
             ruby_dependency_file_ids,
             php_namespace_identity_by_file,
             php_dependency_ids_by_namespace,
@@ -2111,6 +2250,12 @@ impl ProofResolutionValidationContext {
     fn has_import(&self, file: NodeId, import: NodeId, target: NodeId) -> bool {
         self.import_relations
             .get(&(file, import, target))
+            .is_some_and(ProofRelationState::is_unique)
+    }
+
+    fn has_swift_module_import(&self, file: NodeId, import: NodeId) -> bool {
+        self.swift_module_import_relations
+            .get(&(file, import))
             .is_some_and(ProofRelationState::is_unique)
     }
 
@@ -2513,7 +2658,12 @@ impl Storage {
             ));
         }
 
-        let linear_language = matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php");
+        let csd_language = matches!(
+            fact.provenance.language_adapter.as_str(),
+            "csharp" | "swift" | "dart"
+        );
+        let linear_language =
+            matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php") || csd_language;
         let mut required_dependency_ids = if linear_language {
             BTreeSet::new()
         } else {
@@ -2567,7 +2717,7 @@ impl Storage {
                 )?
             };
         }
-        if linear_language {
+        if linear_language && !csd_language {
             let expected = if fact.status == ProofResolutionStatus::Exact {
                 ruby_php_dependency_ids(fact, context)?
             } else {
@@ -2583,6 +2733,25 @@ impl Storage {
             if observed != expected {
                 return Err(proof_error(format!(
                     "dependency hashes do not exactly cover the Ruby/PHP governed domain: observed={observed:?} required={expected:?}"
+                )));
+            }
+        }
+        if csd_language {
+            let expected = if fact.status == ProofResolutionStatus::Exact {
+                csd_dependency_ids(fact, context)?
+            } else {
+                vec![fact.callsite.file_id]
+            };
+            let observed = fact
+                .provenance
+                .dependency_file_hashes
+                .iter()
+                .map(|dependency| dependency.file_id)
+                .collect::<Vec<_>>();
+            count_store_replay_work(observed.len().saturating_add(expected.len()));
+            if observed != expected {
+                return Err(proof_error(format!(
+                    "dependency hashes do not exactly cover the C#/Swift/Dart governed domain: observed={observed:?} required={expected:?}"
                 )));
             }
         }
@@ -2707,16 +2876,15 @@ impl Storage {
             .node_by_id
             .get(&raw_edge_target)
             .ok_or_else(|| proof_error("raw CALL placeholder node is missing"))?;
-        let direct_member_target = (matches!(
+        let direct_callable_target = (matches!(
             fact.callsite.callee_form,
             CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver | CalleeForm::NamedImport
         ) || matches!(
             fact.provenance.language_adapter.as_str(),
-            "ruby" | "php"
+            "ruby" | "php" | "csharp" | "swift" | "dart"
         )) && raw_edge_target == target
-            && (matches!(raw_placeholder.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-                || raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0)));
-        if !direct_member_target
+            && matches!(raw_placeholder.kind, NodeKind::FUNCTION | NodeKind::METHOD);
+        if !direct_callable_target
             && (raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0))
                 || raw_placeholder.start_line != Some(fact.callsite.line))
             || graph_leaf_name(&raw_placeholder.serialized_name) != fact.callsite.raw_target
@@ -2790,7 +2958,7 @@ impl Storage {
                     .get(import)
                     .ok_or_else(|| proof_error("static import binding is missing"))?;
                 if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || (fact.provenance.language_adapter != "php"
+                    || (!matches!(fact.provenance.language_adapter.as_str(), "php" | "dart")
                         && graph_leaf_name(&import_node.serialized_name)
                             != fact.callsite.raw_target)
                     || !(if context
@@ -2805,6 +2973,15 @@ impl Storage {
                             .qualified_name
                             .as_deref()
                             .is_some_and(|name| name.ends_with(&fact.callsite.raw_target))
+                    } else if fact.provenance.language_adapter == "dart" {
+                        target_node.file_node_id.is_some_and(|target_file| {
+                            dart_literal_import_target_is_authenticated(
+                                context,
+                                fact,
+                                *import,
+                                target_file,
+                            )
+                        })
                     } else {
                         context.has_import(NodeId(fact.callsite.file_id.0), *import, target)
                     })
@@ -3279,6 +3456,35 @@ impl Storage {
                         owner,
                     )
             });
+        let swift_module_import = fact.provenance.language_adapter == "swift"
+            && components.is_some_and(|components| components == [owner, target])
+            && import_node.kind == NodeKind::MODULE
+            && context.has_swift_module_import(source_file, import)
+            && owner_node
+                .file_node_id
+                .and_then(|file_id| context.file_by_id.get(&file_id.0))
+                .and_then(|file| swift_project_module(&file.path))
+                == Some(import_node.serialized_name.as_str())
+            && {
+                let mut expected = context
+                    .file_by_id
+                    .values()
+                    .filter(|file| {
+                        file.indexed
+                            && file.language == "swift"
+                            && swift_project_module(&file.path)
+                                == Some(import_node.serialized_name.as_str())
+                    })
+                    .map(|file| FileId(file.id))
+                    .collect::<BTreeSet<_>>();
+                expected.insert(fact.callsite.file_id);
+                !expected.is_empty() && dependency_file_ids(fact) == expected
+            };
+        let dart_literal_import = fact.provenance.language_adapter == "dart"
+            && components.is_some_and(|components| components == [owner, target])
+            && target_node.file_node_id.is_some_and(|target_file| {
+                dart_literal_import_target_is_authenticated(context, fact, import, target_file)
+            });
         if import_node.file_node_id != Some(source_file)
             || !matches!(
                 owner_node.kind,
@@ -3287,6 +3493,8 @@ impl Storage {
             || owner_node.file_node_id != target_node.file_node_id
             || !(python_relative
                 || java_kotlin_literal_import
+                || swift_module_import
+                || dart_literal_import
                 || context.has_import(source_file, import, owner))
             || !context.has_member(owner, target)
         {
@@ -3416,7 +3624,10 @@ impl Storage {
             .facts
             .iter()
             .filter_map(|fact| {
-                if matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php") {
+                if matches!(
+                    fact.provenance.language_adapter.as_str(),
+                    "ruby" | "php" | "csharp" | "swift" | "dart"
+                ) {
                     count_store_replay_work(1);
                     linear_facts.push(fact.clone());
                     None
@@ -3453,7 +3664,7 @@ impl Storage {
                 "more than one fact owns the same exact callsite",
             ));
         }
-        let mut exact_edges = BTreeSet::new();
+        let mut exact_edges = HashSet::new();
         for edge_id in facts
             .iter()
             .filter(|fact| fact.status == ProofResolutionStatus::Exact)
@@ -3474,7 +3685,10 @@ impl Storage {
             .funnel
             .iter()
             .filter_map(|row| {
-                if matches!(row.language.as_str(), "ruby" | "php") {
+                if matches!(
+                    row.language.as_str(),
+                    "ruby" | "php" | "csharp" | "swift" | "dart"
+                ) {
                     count_store_replay_work(1);
                     linear_funnel.push(row.clone());
                     None
@@ -3712,10 +3926,101 @@ fn graph_leaf_name(name: &str) -> &str {
         .unwrap_or(name)
 }
 
+fn swift_project_module(path: &std::path::Path) -> Option<&str> {
+    let mut components = path.components().filter_map(|component| match component {
+        std::path::Component::Normal(value) => value.to_str(),
+        _ => None,
+    });
+    while let Some(component) = components.next() {
+        if component == "Sources" {
+            return components.next().filter(|module| {
+                !module.is_empty()
+                    && module
+                        .chars()
+                        .all(|character| character == '_' || character.is_alphanumeric())
+            });
+        }
+    }
+    None
+}
+
+fn dart_library_root(path: &std::path::Path) -> Option<&std::path::Path> {
+    let mut current = path.parent();
+    while let Some(directory) = current {
+        if directory.file_name().and_then(|name| name.to_str()) == Some("lib") {
+            return Some(directory);
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+fn quoted_import_literal(surface: &str) -> Option<&str> {
+    let start = surface.find(['\'', '"'])?;
+    let quote = surface.as_bytes()[start] as char;
+    let rest = &surface[start + quote.len_utf8()..];
+    Some(&rest[..rest.find(quote)?])
+}
+
+fn dart_literal_import_target_is_authenticated(
+    context: &ProofResolutionValidationContext,
+    fact: &CallResolutionFact,
+    import: NodeId,
+    target_file: NodeId,
+) -> bool {
+    let (Some(source), Some(target), Some(import_node)) = (
+        context.file_by_id.get(&fact.callsite.file_id.0),
+        context.file_by_id.get(&target_file.0),
+        context.node_by_id.get(&import),
+    ) else {
+        return false;
+    };
+    let Some(uri) = quoted_import_literal(&import_node.serialized_name) else {
+        return false;
+    };
+    let relative = std::path::Path::new(uri);
+    let Some(source_directory) = source.path.parent() else {
+        return false;
+    };
+    let expected_path = source_directory.join(relative);
+    let exact_native_target = std::fs::symlink_metadata(&expected_path)
+        .ok()
+        .is_some_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_file())
+        && std::fs::canonicalize(&expected_path).ok() == std::fs::canonicalize(&target.path).ok();
+    let same_library = dart_library_root(&source.path)
+        .zip(dart_library_root(&target.path))
+        .is_some_and(|(source_root, target_root)| {
+            std::fs::canonicalize(source_root).ok() == std::fs::canonicalize(target_root).ok()
+        });
+    let expected_dependencies = csd_dependency_ids(fact, context).ok();
+    let observed_dependencies = fact
+        .provenance
+        .dependency_file_hashes
+        .iter()
+        .map(|dependency| dependency.file_id)
+        .collect::<Vec<_>>();
+    import_node.kind == NodeKind::MODULE
+        && import_node.file_node_id == Some(NodeId(fact.callsite.file_id.0))
+        && relative
+            .extension()
+            .and_then(|extension| extension.to_str())
+            == Some("dart")
+        && relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && source.id != target.id
+        && target.language == "dart"
+        && target.indexed
+        && exact_native_target
+        && same_library
+        && expected_dependencies.as_deref() == Some(observed_dependencies.as_slice())
+}
+
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
         "rust" => kind == NodeKind::MODULE,
-        "java" | "kotlin" | "javascript" | "typescript" | "tsx" | "python" | "php" | "ruby" => {
+        "java" | "kotlin" | "csharp" | "swift" | "dart" | "javascript" | "typescript" | "tsx"
+        | "python" | "php" | "ruby" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
         _ => false,
@@ -3902,7 +4207,10 @@ fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
             Some(fact.callsite.callee_form),
             evidence_kind,
         );
-        let counts = if matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php") {
+        let counts = if matches!(
+            fact.provenance.language_adapter.as_str(),
+            "ruby" | "php" | "csharp" | "swift" | "dart"
+        ) {
             count_store_replay_work(1);
             linear_rows.entry(key).or_default()
         } else {
@@ -3943,7 +4251,7 @@ fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
                 right.evidence_kind.map(|kind| kind.as_str()),
             ))
     });
-    for language in ["php", "ruby"] {
+    for language in ["csharp", "dart", "php", "ruby", "swift"] {
         for callee_form in [
             CalleeForm::Constructor,
             CalleeForm::DynamicAccess,

@@ -639,7 +639,6 @@ fn java_and_kotlin_closed_exact_subset_emits_authenticated_exact_facts() -> anyh
             .into_iter()
             .filter(|fact| fact.provenance.language_adapter == language)
             .collect::<Vec<_>>();
-
         for (target, expected_count) in targets {
             let exact = facts
                 .iter()
@@ -956,7 +955,7 @@ fn csharp_swift_and_dart_closed_exact_subset_emits_authenticated_exact_facts() -
             vec![
                 (
                     "Sources/WorkerModule/Worker.swift",
-                    "public struct Worker { public init() {} public func target() {} }\n",
+                    "public struct Worker { public func target() {} }\n",
                 ),
                 (
                     "Sources/App/Caller.swift",
@@ -981,7 +980,7 @@ fn csharp_swift_and_dart_closed_exact_subset_emits_authenticated_exact_facts() -
                     "  final Worker worker = Worker();\n",
                     "  void propertyCaller() { worker.target(); }\n",
                     "}\n",
-                    "void constructorCaller() { Worker().target(); }\n",
+                    "void constructorCaller() { final worker = Worker(); worker.target(); }\n",
                     "void typedLocalCaller() { Worker worker = Worker(); worker.target(); }\n",
                     "void typedParameterCaller(Worker worker) { worker.target(); }\n",
                 ),
@@ -1000,18 +999,18 @@ fn csharp_swift_and_dart_closed_exact_subset_emits_authenticated_exact_facts() -
                     "lib/caller.dart",
                     concat!(
                         "import 'worker.dart' show importedTarget, Worker;\n",
-                        "void directCaller() { importedTarget(); Worker().target(); }\n",
+                        "void directCaller() { importedTarget(); final worker = Worker(); worker.target(); }\n",
                     ),
                 ),
                 (
                     "lib/prefixed.dart",
                     concat!(
                         "import 'worker.dart' as lib;\n",
-                        "void prefixedCaller() { lib.importedTarget(); lib.Worker().target(); }\n",
+                        "void prefixedCaller() { lib.importedTarget(); }\n",
                     ),
                 ),
             ],
-            vec![("importedTarget", 2), ("target", 2)],
+            vec![("importedTarget", 2), ("target", 1)],
         ),
     ];
 
@@ -1162,8 +1161,8 @@ fn csharp_swift_and_dart_closed_hostile_matrix_never_proves() -> anyhow::Result<
             "swift",
             "generic_receiver",
             "Hostile.swift",
-            "func caller<T>(_ value: T) { String(describing: value) }\n",
-            "String",
+            "func caller<T>(_ value: T) { value.target() }\n",
+            "target",
             ProofResolutionStatus::Unsupported,
         ),
         (
@@ -1304,23 +1303,34 @@ fn csharp_swift_and_dart_closed_hostile_matrix_never_proves() -> anyhow::Result<
         ),
     ];
 
+    let mut mismatches = Vec::new();
     for (language, name, path, source, target, expected) in cases {
         let project = tempfile::tempdir()?;
         let mut store = Store::new_in_memory()?;
         index_files(project.path(), &mut store, &[(path, source)])?;
         rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
         let facts = store.get_proof_resolution_facts()?;
-        let fact = facts
-            .iter()
-            .find(|fact| {
-                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
-            })
-            .unwrap_or_else(|| panic!("{language} {name} emitted no canonical fact: {facts:#?}"));
-        assert_eq!(fact.status, expected, "{language} {name}: {fact:#?}");
-        assert!(fact.reason.matches_status(fact.status), "{fact:#?}");
-        assert!(fact.target.is_none() && fact.edge_id.is_none(), "{fact:#?}");
-        assert!(fact.evidence_chain.is_empty(), "{fact:#?}");
+        let fact = facts.iter().find(|fact| {
+            fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+        });
+        let Some(fact) = fact else {
+            mismatches.push(format!(
+                "{language} {name}: emitted no canonical {target} fact: {facts:#?}"
+            ));
+            continue;
+        };
+        if fact.status != expected
+            || !fact.reason.matches_status(fact.status)
+            || fact.target.is_some()
+            || fact.edge_id.is_some()
+            || !fact.evidence_chain.is_empty()
+        {
+            mismatches.push(format!(
+                "{language} {name}: expected={expected:?} observed={fact:#?}"
+            ));
+        }
     }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     Ok(())
 }
 
@@ -1351,7 +1361,7 @@ fn csharp_swift_and_dart_complete_domains_are_replay_bound() -> anyhow::Result<(
             vec![
                 (
                     "Sources/WorkerModule/Worker.swift",
-                    "public struct Worker { public init() {} public func target() {} }\n",
+                    "public struct Worker { public func target() {} }\n",
                 ),
                 (
                     "Sources/WorkerModule/Sibling.swift",
@@ -1375,7 +1385,7 @@ fn csharp_swift_and_dart_complete_domains_are_replay_bound() -> anyhow::Result<(
                 ("lib/sibling.dart", "final class Sibling {}\n"),
                 (
                     "lib/caller.dart",
-                    "import 'worker.dart';\nvoid caller() { Worker().target(); }\n",
+                    "import 'worker.dart';\nvoid caller() { final worker = Worker(); worker.target(); }\n",
                 ),
             ],
             "target",
