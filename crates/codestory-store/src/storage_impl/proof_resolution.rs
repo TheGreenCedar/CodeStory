@@ -52,13 +52,28 @@ pub struct ProofResolutionPublication {
 pub fn seal_call_resolution_fact(
     mut fact: CallResolutionFact,
 ) -> Result<CallResolutionFact, StorageError> {
-    fact.provenance.dependency_file_hashes.sort();
-    if fact
-        .provenance
-        .dependency_file_hashes
-        .windows(2)
-        .any(|pair| pair[0].file_id == pair[1].file_id)
-    {
+    let linear_dependency_order =
+        matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php");
+    if !linear_dependency_order {
+        fact.provenance.dependency_file_hashes.sort();
+    }
+    let unique_dependencies = if linear_dependency_order {
+        let mut members = HashSet::new();
+        fact.provenance
+            .dependency_file_hashes
+            .iter()
+            .all(|dependency| {
+                count_store_replay_work(1);
+                members.insert(dependency.file_id)
+            })
+    } else {
+        !fact
+            .provenance
+            .dependency_file_hashes
+            .windows(2)
+            .any(|pair| pair[0].file_id == pair[1].file_id)
+    };
+    if !unique_dependencies {
         return Err(proof_error(
             "dependency file hashes contain a duplicate file",
         ));
@@ -113,6 +128,24 @@ where
 }
 
 fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<(), StorageError> {
+    let linear_dependency_order =
+        matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php");
+    let dependencies_are_canonical = if linear_dependency_order {
+        let mut members = HashSet::new();
+        fact.provenance
+            .dependency_file_hashes
+            .iter()
+            .all(|dependency| {
+                count_store_replay_work(1);
+                members.insert(dependency.file_id)
+            })
+    } else {
+        !fact
+            .provenance
+            .dependency_file_hashes
+            .windows(2)
+            .any(|pair| pair[0].file_id >= pair[1].file_id)
+    };
     if fact.callsite.file_id.0 == 0
         || fact.caller.0 == 0
         || !is_sha256(&fact.callsite.source_sha256)
@@ -143,11 +176,7 @@ fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<
             .dependency_file_hashes
             .iter()
             .any(|dependency| dependency.file_id.0 == 0 || !is_sha256(&dependency.source_sha256))
-        || fact
-            .provenance
-            .dependency_file_hashes
-            .windows(2)
-            .any(|pair| pair[0].file_id >= pair[1].file_id)
+        || !dependencies_are_canonical
     {
         return Err(proof_error(
             "dependency file hashes are empty, invalid, duplicate, or noncanonical",
@@ -268,10 +297,171 @@ struct ProofResolutionValidationContext {
     python_attestation_error_by_file: HashMap<i64, String>,
     java_package_identity_by_file: HashMap<i64, String>,
     java_dependency_ids_by_package: HashMap<String, BTreeSet<FileId>>,
+    ruby_dependency_file_ids: Vec<FileId>,
+    php_namespace_identity_by_file: HashMap<i64, PhpNamespaceIdentity>,
+    php_dependency_ids_by_namespace: HashMap<PhpNamespaceIdentity, Vec<FileId>>,
+    php_namespace_domain_invalid: bool,
     go_package_identity_by_file: HashMap<i64, GoPackageIdentity>,
     go_dependency_ids_by_package: HashMap<GoPackageIdentity, BTreeSet<FileId>>,
     go_attestation_error_by_file: HashMap<i64, String>,
     live_go_sources_authenticated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PhpNamespaceIdentity {
+    Global,
+    Named(String),
+}
+
+fn canonical_php_namespace_identity(name: &str) -> Option<String> {
+    let components = name.split('\\').collect::<Vec<_>>();
+    count_store_replay_work(components.len());
+    (!components.is_empty()
+        && components.iter().all(|component| {
+            let mut chars = component.chars();
+            chars
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        }))
+    .then(|| components.join("."))
+}
+
+#[allow(clippy::type_complexity)]
+fn prepare_ruby_php_domain_closure(
+    files: &[FileInfo],
+    nodes: &HashMap<NodeId, Node>,
+) -> (
+    Vec<FileId>,
+    HashMap<i64, PhpNamespaceIdentity>,
+    HashMap<PhpNamespaceIdentity, Vec<FileId>>,
+    bool,
+) {
+    let ruby_dependency_file_ids = files
+        .iter()
+        .filter(|file| file.indexed && file.language == "ruby")
+        .map(|file| {
+            count_store_replay_work(1);
+            FileId(file.id)
+        })
+        .collect::<Vec<_>>();
+    let php_file_ids = files
+        .iter()
+        .filter(|file| file.indexed && file.language == "php")
+        .map(|file| {
+            count_store_replay_work(1);
+            file.id
+        })
+        .collect::<HashSet<_>>();
+    let mut php_names_by_file = HashMap::<i64, Vec<String>>::new();
+    for node in nodes
+        .values()
+        .filter(|node| node.kind == NodeKind::NAMESPACE)
+    {
+        count_store_replay_work(1);
+        let Some(file_id) = node.file_node_id else {
+            continue;
+        };
+        if !php_file_ids.contains(&file_id.0) {
+            continue;
+        }
+        count_store_replay_work(1);
+        if let Some(name) = canonical_php_namespace_identity(&node.serialized_name) {
+            count_store_replay_work(1);
+            php_names_by_file.entry(file_id.0).or_default().push(name);
+        } else {
+            php_names_by_file
+                .entry(file_id.0)
+                .or_default()
+                .extend([String::new(), String::new()]);
+        }
+    }
+    let mut identity_by_file = HashMap::new();
+    let mut dependencies_by_namespace = HashMap::<PhpNamespaceIdentity, Vec<FileId>>::new();
+    let mut invalid = false;
+    for file in files
+        .iter()
+        .filter(|file| file.indexed && file.language == "php")
+    {
+        count_store_replay_work(1);
+        let names = php_names_by_file
+            .get(&file.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let identity = match names {
+            [] => PhpNamespaceIdentity::Global,
+            [name] if !name.is_empty() => PhpNamespaceIdentity::Named(name.clone()),
+            _ => {
+                invalid = true;
+                continue;
+            }
+        };
+        identity_by_file.insert(file.id, identity.clone());
+        dependencies_by_namespace
+            .entry(identity)
+            .or_default()
+            .push(FileId(file.id));
+        count_store_replay_work(2);
+    }
+    (
+        ruby_dependency_file_ids,
+        identity_by_file,
+        dependencies_by_namespace,
+        invalid,
+    )
+}
+
+fn ruby_php_dependency_ids(
+    fact: &CallResolutionFact,
+    context: &ProofResolutionValidationContext,
+) -> Result<Vec<FileId>, StorageError> {
+    let mut dependencies = Vec::new();
+    let mut members = HashSet::new();
+    let mut append = |file_id: FileId| {
+        count_store_replay_work(1);
+        if members.insert(file_id) {
+            dependencies.push(file_id);
+        }
+    };
+    append(fact.callsite.file_id);
+    if fact.provenance.language_adapter == "ruby" {
+        for file_id in &context.ruby_dependency_file_ids {
+            append(*file_id);
+        }
+        return Ok(dependencies);
+    }
+    if context.php_namespace_domain_invalid {
+        return Err(proof_error(
+            "PHP namespace domain contains an invalid identity",
+        ));
+    }
+    for file_id in std::iter::once(fact.callsite.file_id).chain(
+        fact.evidence_chain
+            .iter()
+            .flat_map(ResolutionEvidence::node_ids)
+            .chain(fact.target)
+            .filter_map(|node_id| {
+                context
+                    .node_by_id
+                    .get(&node_id)
+                    .and_then(|node| node.file_node_id)
+                    .map(|file| FileId(file.0))
+            }),
+    ) {
+        count_store_replay_work(1);
+        let identity = context
+            .php_namespace_identity_by_file
+            .get(&file_id.0)
+            .ok_or_else(|| proof_error("PHP dependency has no canonical namespace identity"))?;
+        let domain = context
+            .php_dependency_ids_by_namespace
+            .get(identity)
+            .ok_or_else(|| proof_error("PHP dependency namespace domain is missing"))?;
+        for dependency in domain {
+            append(*dependency);
+        }
+    }
+    Ok(dependencies)
 }
 
 fn prepare_rust_file_identity(
@@ -1248,6 +1438,10 @@ mod go_replay_complexity_tests {
             python_attestation_error_by_file: HashMap::new(),
             java_package_identity_by_file: HashMap::new(),
             java_dependency_ids_by_package: HashMap::new(),
+            ruby_dependency_file_ids: Vec::new(),
+            php_namespace_identity_by_file: HashMap::new(),
+            php_dependency_ids_by_namespace: HashMap::new(),
+            php_namespace_domain_invalid: false,
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
@@ -1415,6 +1609,10 @@ mod python_replay_complexity_tests {
             python_attestation_error_by_file,
             java_package_identity_by_file: HashMap::new(),
             java_dependency_ids_by_package: HashMap::new(),
+            ruby_dependency_file_ids: Vec::new(),
+            php_namespace_identity_by_file: HashMap::new(),
+            php_dependency_ids_by_namespace: HashMap::new(),
+            php_namespace_domain_invalid: false,
             go_package_identity_by_file: HashMap::new(),
             go_dependency_ids_by_package: HashMap::new(),
             go_attestation_error_by_file: HashMap::new(),
@@ -1451,6 +1649,166 @@ mod python_replay_complexity_tests {
             combined <= baseline * 2 + 128,
             "combined Python store replay grew superlinearly: {baseline} -> {combined}"
         );
+    }
+}
+
+#[cfg(test)]
+mod ruby_php_replay_complexity_tests {
+    use super::*;
+
+    fn measured_domain_replay_work(
+        language: &str,
+        file_count: usize,
+        fact_count: usize,
+        hostile_namespace: bool,
+    ) -> usize {
+        let temp = tempfile::tempdir().expect("Ruby/PHP replay tempdir");
+        let mut files = Vec::new();
+        let mut node_by_id = HashMap::new();
+        for index in 0..file_count {
+            let id = i64::try_from(index + 1).expect("file id");
+            files.push(FileInfo {
+                id,
+                path: temp.path().join(format!(
+                    "file_{index}.{}",
+                    if language == "ruby" { "rb" } else { "php" }
+                )),
+                language: language.to_owned(),
+                modification_time: 0,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: FileRole::Source,
+            });
+            if language == "php" {
+                let namespace = Node {
+                    id: NodeId(10_000 + id),
+                    kind: NodeKind::NAMESPACE,
+                    serialized_name: "App".to_owned(),
+                    file_node_id: Some(NodeId(id)),
+                    ..Default::default()
+                };
+                node_by_id.insert(namespace.id, namespace);
+                if hostile_namespace && index == file_count - 1 {
+                    let duplicate = Node {
+                        id: NodeId(20_000 + id),
+                        kind: NodeKind::NAMESPACE,
+                        serialized_name: "Other".to_owned(),
+                        file_node_id: Some(NodeId(id)),
+                        ..Default::default()
+                    };
+                    node_by_id.insert(duplicate.id, duplicate);
+                }
+            }
+        }
+        reset_store_replay_work();
+        let (
+            ruby_dependency_file_ids,
+            php_namespace_identity_by_file,
+            php_dependency_ids_by_namespace,
+            php_namespace_domain_invalid,
+        ) = prepare_ruby_php_domain_closure(&files, &node_by_id);
+        let file_by_id = files
+            .into_iter()
+            .map(|file| (file.id, file))
+            .collect::<HashMap<_, _>>();
+        let context = ProofResolutionValidationContext {
+            file_by_id,
+            file_content_hash_by_id: HashMap::new(),
+            rust_file_ids_by_path: HashMap::new(),
+            rust_root_count_by_directory: HashMap::new(),
+            node_by_id,
+            edges: Vec::new(),
+            edge_index_by_id: HashMap::new(),
+            ordinary_call_edge_indices: Vec::new(),
+            parsed_callsite_identity_by_edge: HashMap::new(),
+            import_relations: HashMap::new(),
+            typescript_directory_import_relations: HashMap::new(),
+            member_relations: HashMap::new(),
+            member_by_owner_and_name: HashMap::new(),
+            python_import_paths: HashMap::new(),
+            python_file_ids_by_path: HashMap::new(),
+            python_attestation_error_by_file: HashMap::new(),
+            java_package_identity_by_file: HashMap::new(),
+            java_dependency_ids_by_package: HashMap::new(),
+            ruby_dependency_file_ids,
+            php_namespace_identity_by_file,
+            php_dependency_ids_by_namespace,
+            php_namespace_domain_invalid,
+            go_package_identity_by_file: HashMap::new(),
+            go_dependency_ids_by_package: HashMap::new(),
+            go_attestation_error_by_file: HashMap::new(),
+            live_go_sources_authenticated: true,
+        };
+        let fact = CallResolutionFact {
+            fact_id: String::new(),
+            edge_id: Some(EdgeId(1)),
+            raw_edge_target: Some(NodeId(2)),
+            raw_callsite_identity: Some("1:1:1:2".to_owned()),
+            callsite: ExactCallsite {
+                file_id: FileId(1),
+                source_sha256: "0".repeat(64),
+                start_byte: 1,
+                end_byte_exclusive: 2,
+                line: 1,
+                column: 1,
+                callee_form: CalleeForm::Identifier,
+                raw_target: "target".to_owned(),
+            },
+            caller: NodeId(1),
+            target: None,
+            status: ProofResolutionStatus::Exact,
+            reason: ProofResolutionReason::ExactResolution,
+            evidence_chain: Vec::new(),
+            lookup_domain_complete: true,
+            provenance: ResolutionProvenance {
+                producer: INTERNAL_RESOLUTION_PRODUCER.to_owned(),
+                fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+                algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
+                language_adapter: language.to_owned(),
+                language_adapter_version: "reference-v2".to_owned(),
+                parser_fingerprint: "0".repeat(64),
+                dependency_file_hashes: Vec::new(),
+                evidence_sha256: String::new(),
+            },
+        };
+        for _ in 0..fact_count {
+            let result = ruby_php_dependency_ids(&fact, &context);
+            if hostile_namespace && language == "php" {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.expect("closed domain").len(), file_count);
+            }
+        }
+        store_replay_work()
+    }
+
+    #[test]
+    fn ruby_php_file_domain_and_fact_replay_work_is_independently_linear() {
+        for language in ["ruby", "php"] {
+            let baseline = measured_domain_replay_work(language, 32, 32, false);
+            let more_files = measured_domain_replay_work(language, 64, 32, false);
+            let more_facts = measured_domain_replay_work(language, 32, 64, false);
+            let combined = measured_domain_replay_work(language, 64, 32, false);
+            let hostile = measured_domain_replay_work(language, 64, 32, true);
+            assert!(baseline > 0, "{language} replay work was not counted");
+            assert!(
+                more_files <= baseline * 2 + 128,
+                "{language} file preparation grew superlinearly: {baseline} -> {more_files}"
+            );
+            assert!(
+                more_facts <= baseline * 2 + 128,
+                "{language} fact replay grew superlinearly: {baseline} -> {more_facts}"
+            );
+            assert!(
+                combined <= baseline * 2 + 256,
+                "{language} combined replay grew superlinearly: {baseline} -> {combined}"
+            );
+            assert!(
+                hostile <= more_files + 128,
+                "{language} hostile domain work was not linear: {more_files} -> {hostile}"
+            );
+        }
     }
 }
 
@@ -1534,11 +1892,8 @@ impl ProofResolutionValidationContext {
         storage: &Storage,
         authenticate_live_go_sources: bool,
     ) -> Result<Self, StorageError> {
-        let file_by_id = storage
-            .get_files()?
-            .into_iter()
-            .map(|file| (file.id, file))
-            .collect();
+        let files = storage.get_files()?;
+        let file_by_id = files.iter().cloned().map(|file| (file.id, file)).collect();
         let (rust_file_ids_by_path, rust_root_count_by_directory) =
             prepare_rust_file_identity(&file_by_id);
         let python_file_ids_by_path = prepare_python_file_ids_by_path(&file_by_id);
@@ -1564,6 +1919,12 @@ impl ProofResolutionValidationContext {
             .collect();
         let (java_package_identity_by_file, java_dependency_ids_by_package) =
             prepare_java_package_closure(&file_by_id, &node_by_id);
+        let (
+            ruby_dependency_file_ids,
+            php_namespace_identity_by_file,
+            php_dependency_ids_by_namespace,
+            php_namespace_domain_invalid,
+        ) = prepare_ruby_php_domain_closure(&files, &node_by_id);
         let edges = storage.get_edges()?;
         let (ordinary_call_edge_indices, parsed_callsite_identity_by_edge) =
             prepare_call_edge_correlation_index(&edges, &node_by_id);
@@ -1736,6 +2097,10 @@ impl ProofResolutionValidationContext {
             python_attestation_error_by_file,
             java_package_identity_by_file,
             java_dependency_ids_by_package,
+            ruby_dependency_file_ids,
+            php_namespace_identity_by_file,
+            php_dependency_ids_by_namespace,
+            php_namespace_domain_invalid,
             go_package_identity_by_file,
             go_dependency_ids_by_package,
             go_attestation_error_by_file,
@@ -1911,7 +2276,7 @@ impl Storage {
         if edge_id.is_some() {
             sql.push_str(" WHERE edge_id = ?1 AND status = 'exact'");
         }
-        sql.push_str(" ORDER BY file_id, start_byte, end_byte_exclusive, fact_id");
+        sql.push_str(" ORDER BY rowid");
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows = match edge_id {
             Some(edge_id) => stmt.query(params![edge_id.0])?,
@@ -2148,7 +2513,12 @@ impl Storage {
             ));
         }
 
-        let mut required_dependency_ids = BTreeSet::from([fact.callsite.file_id]);
+        let linear_language = matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php");
+        let mut required_dependency_ids = if linear_language {
+            BTreeSet::new()
+        } else {
+            BTreeSet::from([fact.callsite.file_id])
+        };
         let mut evidence_node_ids = fact
             .evidence_chain
             .iter()
@@ -2157,14 +2527,22 @@ impl Storage {
         if let Some(target) = fact.target {
             evidence_node_ids.push(target);
         }
-        evidence_node_ids.sort_unstable();
-        evidence_node_ids.dedup();
+        if linear_language {
+            let mut members = HashSet::new();
+            evidence_node_ids.retain(|node_id| {
+                count_store_replay_work(1);
+                members.insert(*node_id)
+            });
+        } else {
+            evidence_node_ids.sort_unstable();
+            evidence_node_ids.dedup();
+        }
         for node_id in evidence_node_ids {
             let node = context
                 .node_by_id
                 .get(&node_id)
                 .ok_or_else(|| proof_error("typed evidence references a missing graph node"))?;
-            if let Some(file_id) = node.file_node_id {
+            if !linear_language && let Some(file_id) = node.file_node_id {
                 required_dependency_ids.insert(FileId(file_id.0));
             }
         }
@@ -2189,7 +2567,30 @@ impl Storage {
                 )?
             };
         }
-        let observed_dependency_ids = dependency_file_ids(fact);
+        if linear_language {
+            let expected = if fact.status == ProofResolutionStatus::Exact {
+                ruby_php_dependency_ids(fact, context)?
+            } else {
+                vec![fact.callsite.file_id]
+            };
+            let observed = fact
+                .provenance
+                .dependency_file_hashes
+                .iter()
+                .map(|dependency| dependency.file_id)
+                .collect::<Vec<_>>();
+            count_store_replay_work(observed.len().saturating_add(expected.len()));
+            if observed != expected {
+                return Err(proof_error(format!(
+                    "dependency hashes do not exactly cover the Ruby/PHP governed domain: observed={observed:?} required={expected:?}"
+                )));
+            }
+        }
+        let observed_dependency_ids = if !linear_language {
+            dependency_file_ids(fact)
+        } else {
+            BTreeSet::new()
+        };
         if fact.status == ProofResolutionStatus::Exact
             && let Some(java_dependencies) =
                 java_same_package_dependency_ids(fact, &required_dependency_ids, context)?
@@ -2206,15 +2607,17 @@ impl Storage {
                 context,
             )?;
         }
-        if let Some(rust_dependencies) = rust_same_file_dependency_ids(
-            fact,
-            &required_dependency_ids,
-            &observed_dependency_ids,
-            context,
-        ) {
+        if !linear_language
+            && let Some(rust_dependencies) = rust_same_file_dependency_ids(
+                fact,
+                &required_dependency_ids,
+                &observed_dependency_ids,
+                context,
+            )
+        {
             required_dependency_ids = rust_dependencies;
         }
-        if observed_dependency_ids != required_dependency_ids {
+        if !linear_language && observed_dependency_ids != required_dependency_ids {
             return Err(proof_error(format!(
                 "dependency hashes do not exactly cover source, import, package, and target files for {}: observed={observed_dependency_ids:?} required={required_dependency_ids:?}",
                 fact.provenance.language_adapter
@@ -2304,10 +2707,13 @@ impl Storage {
             .node_by_id
             .get(&raw_edge_target)
             .ok_or_else(|| proof_error("raw CALL placeholder node is missing"))?;
-        let direct_member_target = matches!(
+        let direct_member_target = (matches!(
             fact.callsite.callee_form,
             CalleeForm::ImplicitReceiver | CalleeForm::ExplicitReceiver | CalleeForm::NamedImport
-        ) && raw_edge_target == target
+        ) || matches!(
+            fact.provenance.language_adapter.as_str(),
+            "ruby" | "php"
+        )) && raw_edge_target == target
             && (matches!(raw_placeholder.kind, NodeKind::FUNCTION | NodeKind::METHOD)
                 || raw_placeholder.file_node_id != Some(NodeId(fact.callsite.file_id.0)));
         if !direct_member_target
@@ -2384,7 +2790,9 @@ impl Storage {
                     .get(import)
                     .ok_or_else(|| proof_error("static import binding is missing"))?;
                 if import_node.file_node_id != Some(NodeId(fact.callsite.file_id.0))
-                    || graph_leaf_name(&import_node.serialized_name) != fact.callsite.raw_target
+                    || (fact.provenance.language_adapter != "php"
+                        && graph_leaf_name(&import_node.serialized_name)
+                            != fact.callsite.raw_target)
                     || !(if context
                         .typescript_directory_marker_seen(NodeId(fact.callsite.file_id.0), *import)
                     {
@@ -3003,7 +3411,20 @@ impl Storage {
                 "rows are immutable within an already receipted staged publication",
             ));
         }
-        let mut facts = projection.facts.clone();
+        let mut linear_facts = Vec::new();
+        let mut facts = projection
+            .facts
+            .iter()
+            .filter_map(|fact| {
+                if matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php") {
+                    count_store_replay_work(1);
+                    linear_facts.push(fact.clone());
+                    None
+                } else {
+                    Some(fact.clone())
+                }
+            })
+            .collect::<Vec<_>>();
         facts.sort_by(|left, right| {
             (
                 left.callsite.file_id,
@@ -3018,11 +3439,15 @@ impl Storage {
                     right.fact_id.as_str(),
                 ))
         });
+        facts.extend(linear_facts);
         self.validate_facts_against_graph(&facts, true)?;
-        if facts.windows(2).any(|pair| {
-            pair[0].callsite.file_id == pair[1].callsite.file_id
-                && pair[0].callsite.start_byte == pair[1].callsite.start_byte
-                && pair[0].callsite.end_byte_exclusive == pair[1].callsite.end_byte_exclusive
+        let mut exact_callsites = HashSet::new();
+        if facts.iter().any(|fact| {
+            !exact_callsites.insert((
+                fact.callsite.file_id,
+                fact.callsite.start_byte,
+                fact.callsite.end_byte_exclusive,
+            ))
         }) {
             return Err(proof_error(
                 "more than one fact owns the same exact callsite",
@@ -3044,7 +3469,20 @@ impl Storage {
         let mut adapter_roster = projection.adapter_roster.clone();
         adapter_roster.sort();
         validate_adapter_roster(&facts, &adapter_roster)?;
-        let mut funnel = projection.funnel.clone();
+        let mut linear_funnel = Vec::new();
+        let mut funnel = projection
+            .funnel
+            .iter()
+            .filter_map(|row| {
+                if matches!(row.language.as_str(), "ruby" | "php") {
+                    count_store_replay_work(1);
+                    linear_funnel.push(row.clone());
+                    None
+                } else {
+                    Some(row.clone())
+                }
+            })
+            .collect::<Vec<_>>();
         funnel.sort_by(|left, right| {
             (
                 left.language.as_str(),
@@ -3057,6 +3495,7 @@ impl Storage {
                     right.evidence_kind.map(|kind| kind.as_str()),
                 ))
         });
+        funnel.extend(linear_funnel);
         if funnel.iter().any(|row| row.language.trim().is_empty()) {
             return Err(proof_error("funnel contains an empty language"));
         }
@@ -3276,7 +3715,7 @@ fn graph_leaf_name(name: &str) -> &str {
 fn proof_import_node_kind_is_literal(language: &str, kind: NodeKind) -> bool {
     match language {
         "rust" => kind == NodeKind::MODULE,
-        "java" | "kotlin" | "javascript" | "typescript" | "tsx" | "python" => {
+        "java" | "kotlin" | "javascript" | "typescript" | "tsx" | "python" | "php" | "ruby" => {
             matches!(kind, NodeKind::MODULE | NodeKind::UNKNOWN)
         }
         _ => false,
@@ -3452,15 +3891,23 @@ fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
         (String, Option<CalleeForm>, Option<ResolutionEvidenceKind>),
         ProofResolutionFunnelCounts,
     >::new();
+    let mut linear_rows = HashMap::<
+        (String, Option<CalleeForm>, Option<ResolutionEvidenceKind>),
+        ProofResolutionFunnelCounts,
+    >::new();
     for fact in facts {
         let evidence_kind = fact.evidence_chain.first().map(ResolutionEvidence::kind);
-        let counts = rows
-            .entry((
-                fact.provenance.language_adapter.clone(),
-                Some(fact.callsite.callee_form),
-                evidence_kind,
-            ))
-            .or_default();
+        let key = (
+            fact.provenance.language_adapter.clone(),
+            Some(fact.callsite.callee_form),
+            evidence_kind,
+        );
+        let counts = if matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php") {
+            count_store_replay_work(1);
+            linear_rows.entry(key).or_default()
+        } else {
+            rows.entry(key).or_default()
+        };
         counts.syntax_calls += 1;
         counts.adapter_supported += u64::from(fact.status != ProofResolutionStatus::Unsupported);
         match fact.status {
@@ -3496,5 +3943,39 @@ fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
                 right.evidence_kind.map(|kind| kind.as_str()),
             ))
     });
+    for language in ["php", "ruby"] {
+        for callee_form in [
+            CalleeForm::Constructor,
+            CalleeForm::DynamicAccess,
+            CalleeForm::ExplicitReceiver,
+            CalleeForm::Identifier,
+            CalleeForm::ImplicitReceiver,
+            CalleeForm::NamedImport,
+            CalleeForm::QualifiedPath,
+        ] {
+            for evidence_kind in [
+                None,
+                Some(ResolutionEvidenceKind::ConstructorBinding),
+                Some(ResolutionEvidenceKind::ExplicitReceiverType),
+                Some(ResolutionEvidenceKind::ImplicitReceiver),
+                Some(ResolutionEvidenceKind::QualifiedPath),
+                Some(ResolutionEvidenceKind::SameFileDeclaration),
+                Some(ResolutionEvidenceKind::SamePackageDeclaration),
+                Some(ResolutionEvidenceKind::StaticImportBinding),
+            ] {
+                let key = (language.to_owned(), Some(callee_form), evidence_kind);
+                count_store_replay_work(1);
+                if let Some(counts) = linear_rows.remove(&key) {
+                    result.push(ProofResolutionFunnelRow {
+                        language: language.to_owned(),
+                        callee_form: Some(callee_form),
+                        evidence_kind,
+                        counts,
+                    });
+                }
+            }
+        }
+    }
+    debug_assert!(linear_rows.is_empty());
     result
 }

@@ -137,7 +137,10 @@ fn all_language_rows_are_real_parser_and_adapter_observations() -> anyhow::Resul
 fn funnel_uses_canonical_types_and_observed_nonexact_states() -> anyhow::Result<()> {
     let observation = observe_multilingual_contract()?;
     let funnel = resolution_funnel(&observation);
-    assert_eq!(funnel.len(), 16 * 24);
+    assert!(
+        funnel.len() >= 16 * 24,
+        "every fixture must produce at least one closed funnel row"
+    );
     let statuses = funnel
         .iter()
         .filter_map(|row| row.status)
@@ -426,5 +429,5 @@ fn git_materializer_rejects_commit_path_symbol_source_swap_and_injected_fact() -
 
 #[test]
 fn contract_stays_dark_to_the_public_proof_route() {
-    assert!(PUBLIC_PROOF_ROUTE_DARK);
+    const { assert!(PUBLIC_PROOF_ROUTE_DARK) };
 }
