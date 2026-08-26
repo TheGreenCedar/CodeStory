@@ -90,7 +90,23 @@ occurrence element=UNKNOWN:random@66 kind=DEFINITION span=66:13-66:19
 occurrence element=UNKNOWN:run@72 kind=DEFINITION span=72:10-72:13
 occurrence element=UNKNOWN:sameInRow@31 kind=DEFINITION span=31:9-31:18
 occurrence element=UNKNOWN:stringOut@65 kind=DEFINITION span=65:9-65:18
-access node=METHOD:Player.turn@37 kind=Public
+access node=CLASS:ArtificialPlayer@46 kind=Default
+access node=CLASS:Field@19 kind=Default
+access node=CLASS:GameObject@15 kind=Default
+access node=CLASS:HumanPlayer@40 kind=Default
+access node=CLASS:TicTacToe@60 kind=Default
+access node=FUNCTION:main@70 kind=Default
+access node=FUNCTION:numberIn@3 kind=Default
+access node=FUNCTION:numberOut@7 kind=Default
+access node=FUNCTION:stringOut@11 kind=Default
+access node=METHOD:ArtificialPlayer.minMax@47 kind=Default
+access node=METHOD:ArtificialPlayer.turn@54 kind=Default
+access node=METHOD:Field.makeMove@26 kind=Default
+access node=METHOD:Field.sameInRow@22 kind=Default
+access node=METHOD:GameObject.announce@16 kind=Default
+access node=METHOD:HumanPlayer.turn@41 kind=Default
+access node=METHOD:Player.turn@37 kind=Default
+access node=METHOD:TicTacToe.run@63 kind=Default
 callable_state CallableProjectionState { file_id: -9078361163529215938, symbol_key: "13:main", node_id: NodeId(-3423996949260316550), signature_hash: -4671339478033693080, normalized_signature: Some("shape:5773979336569973888"), body_hash: 5859124419576403463, start_line: 70, end_line: 73 }
 callable_state CallableProjectionState { file_id: -9078361163529215938, symbol_key: "13:numberIn", node_id: NodeId(-1267727796621147827), signature_hash: 2477812878330356949, normalized_signature: Some("outline:-1795207361013140379"), body_hash: -2651324468227230200, start_line: 3, end_line: 5 }
 callable_state CallableProjectionState { file_id: -9078361163529215938, symbol_key: "13:numberOut", node_id: NodeId(3517603286906082308), signature_hash: -1579019679195996938, normalized_signature: Some("shape:-3637818959780900931"), body_hash: 6116599310178205983, start_line: 7, end_line: 9 }
