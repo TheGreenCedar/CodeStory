@@ -64,6 +64,7 @@ pub struct DispatchFixture {
 /// A source blob obtained from an exact Git commit and independently projected
 /// through the parser and installed proof adapters. This is the benchmark's
 /// materialization boundary: callers cannot manufacture a row from a string.
+#[cfg_attr(test, allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct MaterializedRepositorySource {
     pub repository: String,
@@ -434,6 +435,7 @@ pub fn materialize_repository_source(
 
 /// Network-capable final-qualification boundary. Ordinary tests call the
 /// checkout materializer above with temporary local repositories instead.
+#[cfg_attr(test, allow(dead_code))]
 pub fn materialize_declared_repositories(
     checkout_root: &Path,
 ) -> Result<Vec<MaterializedRepositorySource>> {
@@ -859,42 +861,69 @@ fn observe_planned_language_cases(
     root: &Path,
     planned: Vec<PlannedLanguageCase>,
 ) -> Result<MultilingualObservation> {
-    write_sources(
-        &planned
-            .iter()
-            .map(|fixture| (fixture.path.clone(), fixture.source.clone()))
-            .collect::<Vec<_>>(),
-    )?;
-    let mut store = Store::new_in_memory()?;
-    index_paths(
-        root,
-        &mut store,
-        planned.iter().map(|fixture| fixture.path.clone()).collect(),
-    )?;
-    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
     let adapter_roster = observed_adapter_roster();
-    let cases = planned
-        .iter()
-        .map(|fixture| {
-            observe_case_from_store(
-                &store,
-                fixture.language,
-                fixture.class,
-                fixture.ordinal,
-                &fixture.path,
-                fixture.pinned_selector,
-                adapter_roster.contains(fixture.language),
-                fixture.materialized_commit.clone(),
-                fixture.materialized_blob_sha256.clone(),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut cases = Vec::with_capacity(planned.len());
+    for dispatch in DISPATCHES {
+        for class in [
+            FixtureClass::Supported,
+            FixtureClass::Unsupported,
+            FixtureClass::Hostile,
+        ] {
+            let fixtures = planned
+                .iter()
+                .filter(|fixture| fixture.language == dispatch.language && fixture.class == class)
+                .collect::<Vec<_>>();
+            let group_root =
+                tempfile::tempdir().context("create language-class fixture workspace")?;
+            let isolated = fixtures
+                .iter()
+                .map(|fixture| {
+                    let relative = fixture
+                        .path
+                        .strip_prefix(root)
+                        .context("fixture escaped multilingual workspace")?;
+                    Ok((
+                        *fixture,
+                        group_root.path().join(relative),
+                        fixture.source.clone(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            write_sources(
+                &isolated
+                    .iter()
+                    .map(|(_, path, source)| (path.clone(), source.clone()))
+                    .collect::<Vec<_>>(),
+            )?;
+            let mut store = Store::new_in_memory()?;
+            index_paths(
+                group_root.path(),
+                &mut store,
+                isolated.iter().map(|(_, path, _)| path.clone()).collect(),
+            )?;
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+            for (fixture, path, _) in isolated {
+                cases.push(observe_case_from_store(
+                    &store,
+                    fixture.language,
+                    fixture.class,
+                    fixture.ordinal,
+                    &path,
+                    fixture.pinned_selector,
+                    adapter_roster.contains(fixture.language),
+                    fixture.materialized_commit.clone(),
+                    fixture.materialized_blob_sha256.clone(),
+                )?);
+            }
+        }
+    }
     Ok(MultilingualObservation {
         cases,
         adapter_roster,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn observe_case_from_store(
     store: &Store,
     language: &'static str,

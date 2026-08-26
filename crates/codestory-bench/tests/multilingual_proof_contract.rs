@@ -429,5 +429,5 @@ fn git_materializer_rejects_commit_path_symbol_source_swap_and_injected_fact() -
 
 #[test]
 fn contract_stays_dark_to_the_public_proof_route() {
-    assert!(PUBLIC_PROOF_ROUTE_DARK);
+    const { assert!(PUBLIC_PROOF_ROUTE_DARK) };
 }

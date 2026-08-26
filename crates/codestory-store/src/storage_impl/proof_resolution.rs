@@ -327,6 +327,7 @@ fn canonical_php_namespace_identity(name: &str) -> Option<String> {
     .then(|| components.join("."))
 }
 
+#[allow(clippy::type_complexity)]
 fn prepare_ruby_php_domain_closure(
     files: &[FileInfo],
     nodes: &HashMap<NodeId, Node>,
@@ -2541,10 +2542,8 @@ impl Storage {
                 .node_by_id
                 .get(&node_id)
                 .ok_or_else(|| proof_error("typed evidence references a missing graph node"))?;
-            if let Some(file_id) = node.file_node_id {
-                if !linear_language {
-                    required_dependency_ids.insert(FileId(file_id.0));
-                }
+            if !linear_language && let Some(file_id) = node.file_node_id {
+                required_dependency_ids.insert(FileId(file_id.0));
             }
         }
         if fact.status == ProofResolutionStatus::Exact && fact.provenance.language_adapter == "go" {
@@ -2587,9 +2586,11 @@ impl Storage {
                 )));
             }
         }
-        let observed_dependency_ids = (!linear_language)
-            .then(|| dependency_file_ids(fact))
-            .unwrap_or_default();
+        let observed_dependency_ids = if !linear_language {
+            dependency_file_ids(fact)
+        } else {
+            BTreeSet::new()
+        };
         if fact.status == ProofResolutionStatus::Exact
             && let Some(java_dependencies) =
                 java_same_package_dependency_ids(fact, &required_dependency_ids, context)?
@@ -2606,15 +2607,15 @@ impl Storage {
                 context,
             )?;
         }
-        if !linear_language {
-            if let Some(rust_dependencies) = rust_same_file_dependency_ids(
+        if !linear_language
+            && let Some(rust_dependencies) = rust_same_file_dependency_ids(
                 fact,
                 &required_dependency_ids,
                 &observed_dependency_ids,
                 context,
-            ) {
-                required_dependency_ids = rust_dependencies;
-            }
+            )
+        {
+            required_dependency_ids = rust_dependencies;
         }
         if !linear_language && observed_dependency_ids != required_dependency_ids {
             return Err(proof_error(format!(

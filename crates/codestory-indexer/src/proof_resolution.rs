@@ -704,13 +704,15 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
         file_scope_entry: bool,
     ) {
         count_ruby_php_resolution_work(1);
+        let supported_declaration = matches!(node.kind(), "method" | "class" | "comment");
+        let supported_file_import = file_scope_entry
+            && node.kind() == "call"
+            && ruby_literal_require_relative(node_text(node, self.source).unwrap_or_default())
+                .is_some();
         if declaration_body_entry
-            && !matches!(node.kind(), "method" | "class" | "comment")
-            && !(file_scope_entry
-                && node.kind() == "call"
-                && ruby_literal_require_relative(node_text(node, self.source).unwrap_or_default())
-                    .is_some())
-            && !ruby_inert_declaration_syntax(node)
+            && !(supported_declaration
+                || supported_file_import
+                || ruby_inert_declaration_syntax(node))
         {
             self.index.poisoned = true;
         }
