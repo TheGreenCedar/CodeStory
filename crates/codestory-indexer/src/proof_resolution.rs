@@ -161,8 +161,10 @@ const PHP_ADAPTER_VERSION: &str = "reference-v2";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v2";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 25;
+const BASH_ADAPTER_VERSION: &str = "reference-v1";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 26;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
+    ("bash", BASH_ADAPTER_VERSION),
     ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
     ("c", C_ADAPTER_VERSION),
@@ -240,6 +242,8 @@ pub(crate) fn collect_call_resolution_inputs(
         (language == "ruby").then(|| RubyResolutionIndex::build(tree, source, file_id, nodes));
     let php_index =
         (language == "php").then(|| PhpResolutionIndex::build(tree, source, file_id, nodes));
+    let bash_index =
+        (language == "bash").then(|| BashResolutionIndex::build(tree, source, file_id, nodes));
     let (direct_exports, export_poison_all, poisoned_export_names) =
         if let Some(index) = &javascript_index {
             index.collect_direct_exports(source)
@@ -281,6 +285,8 @@ pub(crate) fn collect_call_resolution_inputs(
         index.declarations.clone()
     } else if let Some(index) = &php_index {
         index.declarations.clone()
+    } else if let Some(index) = &bash_index {
+        index.declarations.clone()
     } else {
         Vec::new()
     };
@@ -317,6 +323,8 @@ pub(crate) fn collect_call_resolution_inputs(
             } else if let Some(index) = &ruby_index {
                 index.resolve_syntax_claim(callee, form, &raw_target)
             } else if let Some(index) = &php_index {
+                index.resolve_syntax_claim(callee, form, &raw_target)
+            } else if let Some(index) = &bash_index {
                 index.resolve_syntax_claim(callee, form, &raw_target)
             } else {
                 (None, CachedResolutionBinding::Unsupported)
@@ -397,6 +405,10 @@ pub(crate) fn collect_call_resolution_inputs(
         for call in &index.calls {
             emit_call(call.callee, call.form, call.raw_target.clone(), None);
         }
+    } else if let Some(index) = &bash_index {
+        for call in &index.calls {
+            emit_call(call.callee, call.form, call.raw_target.clone(), None);
+        }
     } else {
         collect_calls(tree.root_node(), source, &mut |callee, form, raw_target| {
             emit_call(callee, form, raw_target, None);
@@ -405,6 +417,7 @@ pub(crate) fn collect_call_resolution_inputs(
     if c_cpp_index.is_none()
         && ruby_index.is_none()
         && php_index.is_none()
+        && bash_index.is_none()
         && !is_csharp_swift_dart_language(language)
     {
         calls.sort_by_key(|input| (input.callsite.start_byte, input.callsite.end_byte_exclusive));
@@ -506,6 +519,10 @@ fn is_java_kotlin_language(language: &str) -> bool {
 
 fn is_csharp_swift_dart_language(language: &str) -> bool {
     matches!(language, "csharp" | "swift" | "dart")
+}
+
+fn semantic_cache_requires_source_reauthentication(language: &str) -> bool {
+    is_csharp_swift_dart_language(language) || language == "bash"
 }
 
 fn is_nominal_language(language: &str) -> bool {
@@ -773,6 +790,238 @@ fn unique_import_node(
         }
     }
     None
+}
+
+#[derive(Clone)]
+struct IndexedBashCall<'tree> {
+    callee: TsNode<'tree>,
+    form: CalleeForm,
+    raw_target: String,
+    caller: Option<NodeId>,
+    binding: CachedResolutionBinding,
+}
+
+#[derive(Clone, Copy)]
+struct BashDeclaration {
+    declaration: NodeId,
+    start_byte: usize,
+}
+
+struct BashResolutionIndex<'tree> {
+    calls: Vec<IndexedBashCall<'tree>>,
+    call_indices_by_span: HashMap<(usize, usize), usize>,
+    declarations: Vec<CachedTopLevelDeclaration>,
+}
+
+struct BashResolutionProducer<'a, 'tree> {
+    source: &'a str,
+    graph_functions: HashMap<(u32, String), Vec<NodeId>>,
+    calls: Vec<IndexedBashCall<'tree>>,
+    declarations: Vec<CachedTopLevelDeclaration>,
+    declarations_by_name: HashMap<String, Vec<BashDeclaration>>,
+    poisoned_definition_names: HashSet<String>,
+    source_domain_incomplete: bool,
+    dynamic_domain_unsupported: bool,
+}
+
+impl<'tree> BashResolutionIndex<'tree> {
+    fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
+        let mut graph_functions = HashMap::<(u32, String), Vec<NodeId>>::new();
+        for node in nodes
+            .iter()
+            .filter(|node| node.file_node_id == Some(file_id) && node.kind == NodeKind::FUNCTION)
+        {
+            count_ruby_php_resolution_work(1);
+            if let Some(line) = node.start_line {
+                graph_functions
+                    .entry((line, graph_leaf_name(&node.serialized_name).to_string()))
+                    .or_default()
+                    .push(node.id);
+                count_ruby_php_resolution_work(1);
+            }
+        }
+        let mut producer = BashResolutionProducer {
+            source,
+            graph_functions,
+            calls: Vec::new(),
+            declarations: Vec::new(),
+            declarations_by_name: HashMap::new(),
+            poisoned_definition_names: HashSet::new(),
+            source_domain_incomplete: false,
+            dynamic_domain_unsupported: false,
+        };
+        producer.visit(tree.root_node(), None, true);
+        producer.finish()
+    }
+
+    fn resolve_syntax_claim(
+        &self,
+        callee: TsNode<'tree>,
+        form: CalleeForm,
+        raw_target: &str,
+    ) -> (Option<NodeId>, CachedResolutionBinding) {
+        let Some(call) = self
+            .call_indices_by_span
+            .get(&(callee.start_byte(), callee.end_byte()))
+            .and_then(|index| self.calls.get(*index))
+        else {
+            return (None, CachedResolutionBinding::Unsupported);
+        };
+        if call.form != form || call.raw_target != raw_target {
+            return (call.caller, CachedResolutionBinding::Unsupported);
+        }
+        (call.caller, call.binding.clone())
+    }
+}
+
+impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
+    fn visit(&mut self, node: TsNode<'tree>, caller: Option<NodeId>, file_scope: bool) {
+        count_ruby_php_resolution_work(1);
+        let mut child_caller = caller;
+        if node.kind() == "function_definition" {
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|name| node_text(name, self.source))
+                .map(str::to_string);
+            child_caller = name.as_deref().and_then(|name| {
+                self.unique_graph_function(node.start_position().row as u32 + 1, name)
+            });
+            if let Some(name) = name {
+                if file_scope {
+                    if let Some(declaration) = child_caller {
+                        self.declarations.push(CachedTopLevelDeclaration {
+                            name: name.clone(),
+                            declaration,
+                            module_path: Vec::new(),
+                            cross_module_visible: false,
+                        });
+                        count_ruby_php_resolution_work(1);
+                        self.declarations_by_name
+                            .entry(name)
+                            .or_default()
+                            .push(BashDeclaration {
+                                declaration,
+                                start_byte: node.start_byte(),
+                            });
+                        count_ruby_php_resolution_work(1);
+                    } else {
+                        self.poisoned_definition_names.insert(name);
+                        count_ruby_php_resolution_work(1);
+                    }
+                } else {
+                    self.poisoned_definition_names.insert(name);
+                    count_ruby_php_resolution_work(1);
+                }
+            }
+        } else if node.kind() == "command"
+            && let Some(callee) = bash_command_callee(node)
+            && let Some(raw_target) = node_text(callee, self.source).map(str::to_string)
+        {
+            let literal = bash_literal_command_name(callee, &raw_target);
+            if matches!(literal, Some("source" | ".")) {
+                self.source_domain_incomplete = true;
+            }
+            if matches!(literal, Some("alias" | "eval")) {
+                self.dynamic_domain_unsupported = true;
+            }
+            self.calls.push(IndexedBashCall {
+                callee,
+                form: if literal.is_some() {
+                    CalleeForm::Identifier
+                } else {
+                    CalleeForm::DynamicAccess
+                },
+                raw_target,
+                caller,
+                binding: CachedResolutionBinding::MissingBinding,
+            });
+            count_ruby_php_resolution_work(1);
+        }
+
+        let direct_program_child = node.kind() == "program";
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.visit(child, child_caller, direct_program_child);
+        }
+    }
+
+    fn unique_graph_function(&self, line: u32, name: &str) -> Option<NodeId> {
+        count_ruby_php_resolution_work(1);
+        let candidates = self
+            .graph_functions
+            .get(&(line, name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [declaration] = candidates else {
+            return None;
+        };
+        Some(*declaration)
+    }
+
+    fn finish(mut self) -> BashResolutionIndex<'tree> {
+        for call in &mut self.calls {
+            count_ruby_php_resolution_work(1);
+            call.binding = if call.caller.is_none()
+                || call.form != CalleeForm::Identifier
+                || self.dynamic_domain_unsupported
+            {
+                CachedResolutionBinding::Unsupported
+            } else if self.source_domain_incomplete
+                || self.poisoned_definition_names.contains(&call.raw_target)
+            {
+                CachedResolutionBinding::IncompleteDomain
+            } else {
+                match self
+                    .declarations_by_name
+                    .get(&call.raw_target)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                {
+                    [declaration] if declaration.start_byte < call.callee.start_byte() => {
+                        CachedResolutionBinding::SameFile {
+                            declaration: declaration.declaration,
+                            rust_glob_local_module: None,
+                        }
+                    }
+                    [_] => CachedResolutionBinding::IncompleteDomain,
+                    [] => CachedResolutionBinding::MissingBinding,
+                    _ => CachedResolutionBinding::Ambiguous,
+                }
+            };
+        }
+        debug_assert!(self.calls.windows(2).all(|pair| {
+            (pair[0].callee.start_byte(), pair[0].callee.end_byte())
+                <= (pair[1].callee.start_byte(), pair[1].callee.end_byte())
+        }));
+        let call_indices_by_span = self
+            .calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                count_ruby_php_resolution_work(1);
+                ((call.callee.start_byte(), call.callee.end_byte()), index)
+            })
+            .collect();
+        BashResolutionIndex {
+            calls: self.calls,
+            call_indices_by_span,
+            declarations: self.declarations,
+        }
+    }
+}
+
+fn bash_command_callee(command: TsNode<'_>) -> Option<TsNode<'_>> {
+    let name = command.child_by_field_name("name")?;
+    if name.kind() == "command_name" {
+        name.named_child(0).or(Some(name))
+    } else {
+        Some(name)
+    }
+}
+
+fn bash_literal_command_name<'a>(callee: TsNode<'_>, raw_target: &'a str) -> Option<&'a str> {
+    (callee.kind() == "word" && callee.named_child_count() == 0 && !raw_target.is_empty())
+        .then_some(raw_target)
 }
 
 struct RubyResolutionIndex<'tree> {
@@ -12736,7 +12985,7 @@ pub fn rematerialize_proof_resolution_projection(
         node.file_node_id.is_some_and(|file_id| {
             file_by_id
                 .get(&file_id.0)
-                .is_some_and(|file| is_csharp_swift_dart_language(&file.language))
+                .is_some_and(|file| semantic_cache_requires_source_reauthentication(&file.language))
         })
     }) {
         count_java_kotlin_resolution_work(1);
@@ -12926,7 +13175,7 @@ pub fn rematerialize_proof_resolution_projection(
                 indexed_file.path.display()
             ));
         }
-        if is_csharp_swift_dart_language(&indexed_file.language) {
+        if semantic_cache_requires_source_reauthentication(&indexed_file.language) {
             let source_bytes = std::fs::read(&indexed_file.path).with_context(|| {
                 format!(
                     "proof resolution cannot authenticate semantic cache source {}",
@@ -12997,7 +13246,7 @@ pub fn rematerialize_proof_resolution_projection(
         .filter_map(|record| {
             if matches!(
                 record.file.language.as_str(),
-                "ruby" | "php" | "csharp" | "swift" | "dart"
+                "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
             ) {
                 count_ruby_php_resolution_work(1);
                 linear_records.push(record);
@@ -13028,7 +13277,7 @@ pub fn rematerialize_proof_resolution_projection(
         .filter_map(|(record, call)| {
             if matches!(
                 record.file.language.as_str(),
-                "ruby" | "php" | "csharp" | "swift" | "dart"
+                "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
             ) {
                 count_ruby_php_resolution_work(1);
                 linear_inputs.push((record, call));
@@ -13056,7 +13305,7 @@ pub fn rematerialize_proof_resolution_projection(
     if inputs.iter().any(|(_, input)| {
         if matches!(
             input.language.as_str(),
-            "ruby" | "php" | "csharp" | "swift" | "dart"
+            "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
         ) {
             count_ruby_php_resolution_work(1);
         }
@@ -18586,7 +18835,7 @@ fn seal_resolved_claim(
     let input = &claim.input;
     let linear_dependency_order = matches!(
         input.language.as_str(),
-        "ruby" | "php" | "csharp" | "swift" | "dart"
+        "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
     );
     let mut dependency_ids = Vec::new();
     let mut dependency_members = HashSet::new();
@@ -18673,7 +18922,7 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
         );
         let counts = if matches!(
             fact.provenance.language_adapter.as_str(),
-            "ruby" | "php" | "csharp" | "swift" | "dart"
+            "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
         ) {
             if is_csharp_swift_dart_language(&fact.provenance.language_adapter) {
                 count_java_kotlin_resolution_work(1);
@@ -18719,7 +18968,7 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
                 right.evidence_kind.map(|kind| kind.as_str()),
             ))
     });
-    for language in ["csharp", "dart", "php", "ruby", "swift"] {
+    for language in ["bash", "csharp", "dart", "php", "ruby", "swift"] {
         for callee_form in [
             CalleeForm::Constructor,
             CalleeForm::DynamicAccess,
@@ -18931,6 +19180,71 @@ mod typescript_import_binding_tests {
             "typescript",
             Path::new("source.mts")
         ));
+    }
+}
+
+#[cfg(test)]
+mod bash_complexity_tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    fn source_work(functions: usize) -> usize {
+        let mut source = String::new();
+        let mut nodes = Vec::new();
+        for index in 0..functions {
+            let line = u32::try_from(index + 1).expect("Bash fixture line");
+            let name = format!("target_{index}");
+            source.push_str(&format!("{name}() {{ :; }}\n"));
+            nodes.push(Node {
+                id: NodeId(i64::try_from(index + 2).expect("Bash target id")),
+                kind: NodeKind::FUNCTION,
+                serialized_name: name,
+                file_node_id: Some(NodeId(1)),
+                start_line: Some(line),
+                ..Default::default()
+            });
+        }
+        let caller_line = u32::try_from(functions + 1).expect("Bash caller line");
+        source.push_str("caller() {");
+        for index in 0..functions {
+            source.push_str(&format!(" target_{index};"));
+        }
+        source.push_str(" }\n");
+        nodes.push(Node {
+            id: NodeId(i64::try_from(functions + 2).expect("Bash caller id")),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "caller".to_string(),
+            file_node_id: Some(NodeId(1)),
+            start_line: Some(caller_line),
+            ..Default::default()
+        });
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_bash::LANGUAGE.into())
+            .expect("Bash grammar");
+        let tree = parser.parse(&source, None).expect("Bash source");
+        reset_ruby_php_resolution_work();
+        let index = BashResolutionIndex::build(&tree, &source, NodeId(1), &nodes);
+        assert_eq!(
+            index
+                .calls
+                .iter()
+                .filter(|call| call.raw_target.starts_with("target_"))
+                .count(),
+            functions
+        );
+        ruby_php_resolution_work()
+    }
+
+    #[test]
+    fn bash_parser_index_work_is_linear_for_doubled_declarations_and_calls() {
+        let small = source_work(128);
+        let large = source_work(256);
+        assert!(small > 0, "Bash work was not counted");
+        assert!(
+            large <= small.saturating_mul(2).saturating_add(32),
+            "Bash parser/index work grew superlinearly: {small} -> {large}"
+        );
     }
 }
 

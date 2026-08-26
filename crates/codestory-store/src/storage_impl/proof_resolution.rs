@@ -80,7 +80,7 @@ pub fn seal_call_resolution_fact(
 ) -> Result<CallResolutionFact, StorageError> {
     let linear_dependency_order = matches!(
         fact.provenance.language_adapter.as_str(),
-        "ruby" | "php" | "csharp" | "swift" | "dart"
+        "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
     );
     if !linear_dependency_order {
         fact.provenance.dependency_file_hashes.sort();
@@ -158,7 +158,7 @@ where
 fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<(), StorageError> {
     let linear_dependency_order = matches!(
         fact.provenance.language_adapter.as_str(),
-        "ruby" | "php" | "csharp" | "swift" | "dart"
+        "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
     );
     let dependencies_are_canonical = if linear_dependency_order {
         let mut members = HashSet::new();
@@ -2969,9 +2969,11 @@ impl Storage {
             fact.provenance.language_adapter.as_str(),
             "csharp" | "swift" | "dart"
         );
-        let linear_language =
+        let governed_domain_language =
             matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php") || csd_language;
-        let mut required_dependency_ids = if linear_language {
+        let linear_language =
+            governed_domain_language || fact.provenance.language_adapter == "bash";
+        let mut required_dependency_ids = if governed_domain_language {
             BTreeSet::new()
         } else {
             BTreeSet::from([fact.callsite.file_id])
@@ -2999,7 +3001,7 @@ impl Storage {
                 .node_by_id
                 .get(&node_id)
                 .ok_or_else(|| proof_error("typed evidence references a missing graph node"))?;
-            if !linear_language && let Some(file_id) = node.file_node_id {
+            if !governed_domain_language && let Some(file_id) = node.file_node_id {
                 required_dependency_ids.insert(FileId(file_id.0));
             }
         }
@@ -3024,7 +3026,7 @@ impl Storage {
                 )?
             };
         }
-        if linear_language && !csd_language {
+        if governed_domain_language && !csd_language {
             let expected = if fact.status == ProofResolutionStatus::Exact {
                 ruby_php_dependency_ids(fact, context)?
             } else {
@@ -3062,7 +3064,7 @@ impl Storage {
                 )));
             }
         }
-        let observed_dependency_ids = if !linear_language {
+        let observed_dependency_ids = if !governed_domain_language {
             dependency_file_ids(fact)
         } else {
             BTreeSet::new()
@@ -3083,7 +3085,7 @@ impl Storage {
                 context,
             )?;
         }
-        if !linear_language
+        if !governed_domain_language
             && let Some(rust_dependencies) = rust_same_file_dependency_ids(
                 fact,
                 &required_dependency_ids,
@@ -3093,7 +3095,7 @@ impl Storage {
         {
             required_dependency_ids = rust_dependencies;
         }
-        if !linear_language && observed_dependency_ids != required_dependency_ids {
+        if !governed_domain_language && observed_dependency_ids != required_dependency_ids {
             return Err(proof_error(format!(
                 "dependency hashes do not exactly cover source, import, package, and target files for {}: observed={observed_dependency_ids:?} required={required_dependency_ids:?}",
                 fact.provenance.language_adapter
@@ -3982,7 +3984,7 @@ impl Storage {
             .filter_map(|fact| {
                 if matches!(
                     fact.provenance.language_adapter.as_str(),
-                    "ruby" | "php" | "csharp" | "swift" | "dart"
+                    "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
                 ) {
                     count_store_replay_work(1);
                     linear_facts.push(fact.clone());
@@ -4043,7 +4045,7 @@ impl Storage {
             .filter_map(|row| {
                 if matches!(
                     row.language.as_str(),
-                    "ruby" | "php" | "csharp" | "swift" | "dart"
+                    "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
                 ) {
                     count_store_replay_work(1);
                     linear_funnel.push(row.clone());
@@ -4610,7 +4612,7 @@ fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
         );
         let counts = if matches!(
             fact.provenance.language_adapter.as_str(),
-            "ruby" | "php" | "csharp" | "swift" | "dart"
+            "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
         ) {
             count_store_replay_work(1);
             linear_rows.entry(key).or_default()
@@ -4652,7 +4654,7 @@ fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
                 right.evidence_kind.map(|kind| kind.as_str()),
             ))
     });
-    for language in ["csharp", "dart", "php", "ruby", "swift"] {
+    for language in ["bash", "csharp", "dart", "php", "ruby", "swift"] {
         for callee_form in [
             CalleeForm::Constructor,
             CalleeForm::DynamicAccess,

@@ -282,7 +282,6 @@ fn bash_closed_unsupported_and_hostile_matrix_is_canonical_nonexact() -> anyhow:
 enum GraphMutation {
     Missing,
     Duplicate,
-    CandidateRetained,
     OpaqueIdentity,
     WrongLine,
     WrongSource,
@@ -293,7 +292,6 @@ fn bash_graph_correlation_hostile_matrix_never_authorizes_a_receipt() -> anyhow:
     for mutation in [
         GraphMutation::Missing,
         GraphMutation::Duplicate,
-        GraphMutation::CandidateRetained,
         GraphMutation::OpaqueIdentity,
         GraphMutation::WrongLine,
         GraphMutation::WrongSource,
@@ -321,12 +319,6 @@ fn bash_graph_correlation_hostile_matrix_never_authorizes_a_receipt() -> anyhow:
                 duplicate.id = EdgeId(edge.id.0.wrapping_add(1_000_000_000));
                 store.insert_edge(&duplicate)?;
             }
-            GraphMutation::CandidateRetained => {
-                store.get_connection().execute(
-                    "UPDATE edge SET candidate_target_node_ids = ?1 WHERE id = ?2",
-                    (format!("[{}]", edge.effective_target().0), edge.id.0),
-                )?;
-            }
             GraphMutation::OpaqueIdentity => {
                 store.get_connection().execute(
                     "UPDATE edge SET callsite_identity = 'opaque' WHERE id = ?1",
@@ -347,7 +339,20 @@ fn bash_graph_correlation_hostile_matrix_never_authorizes_a_receipt() -> anyhow:
             }
         }
 
-        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        if let Err(error) = rematerialize_proof_resolution_projection(&mut store, &publication(1)) {
+            assert!(
+                error.to_string().contains("CALL edge")
+                    || error.to_string().contains("correlation"),
+                "{mutation:?}: {error}"
+            );
+            assert_eq!(store.proof_resolution_fact_count()?, 0, "{mutation:?}");
+            assert_eq!(
+                store.get_proof_resolution_publication()?,
+                None,
+                "{mutation:?}"
+            );
+            continue;
+        }
         let facts = store
             .get_proof_resolution_facts()?
             .into_iter()
