@@ -3502,10 +3502,7 @@ fn expand_compact_symbol_selector(
     })
 }
 
-fn expand_inline_selector(
-    selector: &Value,
-    symbol_selector: bool,
-) -> Result<Value, String> {
+fn expand_inline_selector(selector: &Value, symbol_selector: bool) -> Result<Value, String> {
     let selector = compact_object(selector, "compact_selector_invalid")?;
     match compact_string(selector, "kind", "compact_selector_kind_invalid")? {
         "pinned_node" => {
