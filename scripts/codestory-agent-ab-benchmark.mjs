@@ -689,6 +689,57 @@ function exactCandidateArmEnvironmentGroups(opts, arm) {
   };
 }
 
+async function createExactCandidatePrivateStateRoot(prefix) {
+  const created = await mkdtemp(path.join(os.tmpdir(), prefix));
+  try {
+    return realpathSync(created);
+  } catch (error) {
+    await rm(created, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function initializeExactCandidateState(opts, dependencies = {}) {
+  const createPrivateStateRoot = dependencies.createPrivateStateRoot
+    ?? createExactCandidatePrivateStateRoot;
+  const makeDirectory = dependencies.makeDirectory ?? mkdir;
+  const authenticatePackages = dependencies.authenticatePackages
+    ?? authenticateExactCandidatePackages;
+  const remove = dependencies.remove ?? rm;
+  const allocated = [];
+  try {
+    opts.exactCandidateStateRoot = await createPrivateStateRoot(
+      "codestory-agent-exact-candidate-",
+    );
+    allocated.push(opts.exactCandidateStateRoot);
+    opts.exactCandidateBaselineContainerRoot = await createPrivateStateRoot(
+      "agent-exact-baseline-",
+    );
+    allocated.push(opts.exactCandidateBaselineContainerRoot);
+    opts.exactCandidateBaselineStateRoot = path.join(
+      opts.exactCandidateBaselineContainerRoot,
+      "private-state",
+    );
+    await makeDirectory(opts.exactCandidateBaselineStateRoot, {
+      recursive: true,
+      mode: 0o700,
+    });
+    const authenticated = await authenticatePackages(opts);
+    opts.exactCandidatePackageByArm = authenticated.packages;
+    opts.exactCandidateLifecycle = authenticated.lifecycle;
+  } catch (error) {
+    for (const root of allocated.reverse()) {
+      await remove(root, { recursive: true, force: true });
+    }
+    delete opts.exactCandidateStateRoot;
+    delete opts.exactCandidateBaselineContainerRoot;
+    delete opts.exactCandidateBaselineStateRoot;
+    delete opts.exactCandidatePackageByArm;
+    delete opts.exactCandidateLifecycle;
+    throw error;
+  }
+}
+
 const EXACT_BASELINE_ENV_ALLOWLIST = Object.freeze([
   "ALL_PROXY", "COMSPEC", "HTTPS_PROXY", "HTTP_PROXY", "LANG", "LC_ALL", "LC_CTYPE",
   "LOGNAME", "NODE_EXTRA_CA_CERTS", "NO_PROXY", "PATH", "PATHEXT", "SHELL",
@@ -11675,28 +11726,6 @@ async function main() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const outDir = path.resolve(opts.outDir ?? path.join(repoRoot, "target", "agent-benchmark", timestamp));
   await mkdir(outDir, { recursive: true });
-  if (opts.exactCandidate) {
-    opts.exactCandidateStateRoot = await mkdtemp(
-      path.join(os.tmpdir(), "codestory-agent-exact-candidate-"),
-    );
-    opts.exactCandidateBaselineContainerRoot = await mkdtemp(
-      path.join(os.tmpdir(), "agent-exact-baseline-"),
-    );
-    opts.exactCandidateBaselineStateRoot = path.join(
-      opts.exactCandidateBaselineContainerRoot,
-      "private-state",
-    );
-    await mkdir(opts.exactCandidateBaselineStateRoot, { recursive: true, mode: 0o700 });
-    try {
-      const authenticated = await authenticateExactCandidatePackages(opts);
-      opts.exactCandidatePackageByArm = authenticated.packages;
-      opts.exactCandidateLifecycle = authenticated.lifecycle;
-    } catch (error) {
-      await rm(opts.exactCandidateStateRoot, { recursive: true, force: true });
-      await rm(opts.exactCandidateBaselineContainerRoot, { recursive: true, force: true });
-      throw error;
-    }
-  }
   const runsPath = path.join(outDir, "runs.jsonl");
   if (existsSync(runsPath)) {
     throw new Error(`Refusing to append a new benchmark to an existing ledger: ${runsPath}`);
@@ -11710,6 +11739,9 @@ async function main() {
   let agentCodexIsolation = null;
   let pipeline = null;
   try {
+    if (opts.exactCandidate) {
+      await initializeExactCandidateState(opts);
+    }
     pipeline = await runAgentBenchmarkPipeline({
       opts,
       tasks,
@@ -11934,6 +11966,8 @@ export {
   retrievalEngineDiagnosticsSnapshotFromOutput,
   resourceUriMatches,
   createDurableJsonlAppender,
+  createExactCandidatePrivateStateRoot,
+  initializeExactCandidateState,
   benchmarkAgentScopeArgs,
   retrievalIndexCommandArgs,
   retrievalStatusSnapshotFromOutput,

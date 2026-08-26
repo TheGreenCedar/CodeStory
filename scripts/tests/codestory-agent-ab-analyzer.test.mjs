@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -975,6 +975,48 @@ test("exact CodeStory arms use disjoint embedding-server qualification namespace
     published.CODESTORY_EMBED_QUALIFICATION_NONCE,
     candidate.CODESTORY_EMBED_QUALIFICATION_NONCE,
   );
+});
+
+test("exact candidate private state roots use their canonical native path", async () => {
+  const root = await benchmarkHarness.createExactCandidatePrivateStateRoot(
+    "codestory-exact-canonical-state-",
+  );
+  try {
+    assert.equal(root, await realpath(root));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact candidate setup removes every allocated root after a later setup failure", async () => {
+  const parent = await realpath(await mkdtemp(path.join(os.tmpdir(), "codestory-exact-setup-")));
+  const allocated = [];
+  const opts = { exactCandidate: true };
+  try {
+    await assert.rejects(
+      benchmarkHarness.initializeExactCandidateState(opts, {
+        createPrivateStateRoot: async (prefix) => {
+          const root = await mkdtemp(path.join(parent, prefix));
+          allocated.push(root);
+          return root;
+        },
+        makeDirectory: async () => {
+          throw new Error("synthetic later setup failure");
+        },
+        authenticatePackages: async () => {
+          throw new Error("authentication must not run");
+        },
+      }),
+      /synthetic later setup failure/,
+    );
+    assert.equal(allocated.length, 2);
+    for (const root of allocated) assert.equal(existsSync(root), false);
+    assert.equal(opts.exactCandidateStateRoot, undefined);
+    assert.equal(opts.exactCandidateBaselineContainerRoot, undefined);
+    assert.equal(opts.exactCandidateBaselineStateRoot, undefined);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
 });
 
 test("exact Codex isolation keeps scalar namespace credentials out of cache roots and cwd", async () => {
