@@ -5,7 +5,8 @@ use codestory_contracts::proof_resolution::{
     ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
 };
 use codestory_indexer::{
-    WorkspaceIndexer, build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+    WorkspaceIndexer, build_proof_resolution_funnel, current_proof_resolution_adapter_roster,
+    rematerialize_proof_resolution_projection,
 };
 use codestory_store::{
     FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
@@ -9952,7 +9953,10 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let mut empty = Store::new_in_memory()?;
     let empty_receipt = rematerialize_proof_resolution_projection(&mut empty, &publication(1))?;
     assert_eq!(empty_receipt.fact_count, 0);
-    assert_eq!(empty_receipt.adapter_roster.len(), 12);
+    assert_eq!(
+        empty_receipt.adapter_roster,
+        current_proof_resolution_adapter_roster()
+    );
 
     let project = tempfile::tempdir()?;
     let mut unsupported = Store::new_in_memory()?;
@@ -9967,7 +9971,10 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let unsupported_receipt =
         rematerialize_proof_resolution_projection(&mut unsupported, &publication(1))?;
     assert_eq!(unsupported_receipt.fact_count, 0);
-    assert_eq!(unsupported_receipt.adapter_roster.len(), 12);
+    assert_eq!(
+        unsupported_receipt.adapter_roster,
+        current_proof_resolution_adapter_roster()
+    );
 
     let governed_project = tempfile::tempdir()?;
     let mut governed = Store::new_in_memory()?;
@@ -10195,7 +10202,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v23", "adapter", "language"]
+            ["stale", "schema-v25", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -10615,7 +10622,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .map(|adapter| adapter.adapter_version.as_str()),
         Some("reference-v17")
     );
-    for language in ["java", "kotlin"] {
+    for language in ["java", "kotlin", "csharp", "swift", "dart"] {
         assert_eq!(
             receipt
                 .adapter_roster
