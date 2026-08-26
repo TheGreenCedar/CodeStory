@@ -106,6 +106,8 @@ use cache::{
 };
 pub use cancellation::CancellationToken;
 use intermediate_storage::IntermediateStorage;
+#[cfg(debug_assertions)]
+pub use proof_resolution::{BashResolutionWork, bash_resolution_work, reset_bash_resolution_work};
 pub use proof_resolution::{
     build_funnel as build_proof_resolution_funnel, current_proof_resolution_adapter_roster,
     rematerialize_proof_resolution_projection,

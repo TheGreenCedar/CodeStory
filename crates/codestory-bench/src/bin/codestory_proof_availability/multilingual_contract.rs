@@ -27,11 +27,6 @@ use std::process::Command;
 
 pub const PUBLIC_PROOF_ROUTE_DARK: bool = true;
 
-/// Closed, temporary boundary for parser-backed languages without an installed
-/// proof adapter. The observed adapter roster is compared to this list in the
-/// contract test; this is not an expectation of a resolution result.
-pub const MISSING_ADAPTER_ALLOWLIST: &[&str] = &["bash"];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureClass {
     Supported,
