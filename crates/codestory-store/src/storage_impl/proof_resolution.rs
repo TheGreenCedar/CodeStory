@@ -14,24 +14,52 @@ const FACT_ID_DOMAIN: &[u8] = b"codestory-proof-resolution-fact-id-v1\0";
 const PUBLICATION_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-publication-v1\0";
 
 #[cfg(debug_assertions)]
-static STORE_REPLAY_WORK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static STORE_REPLAY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[inline]
 fn count_store_replay_work(amount: usize) {
     #[cfg(debug_assertions)]
-    let _ = STORE_REPLAY_WORK.fetch_add(amount, std::sync::atomic::Ordering::Relaxed);
+    STORE_REPLAY_WORK.with(|work| work.set(work.get().saturating_add(amount)));
     #[cfg(not(debug_assertions))]
     let _ = amount;
 }
 
 #[cfg(debug_assertions)]
 pub fn reset_store_replay_work() {
-    STORE_REPLAY_WORK.store(0, std::sync::atomic::Ordering::Relaxed);
+    STORE_REPLAY_WORK.with(|work| work.set(0));
 }
 
 #[cfg(debug_assertions)]
 pub fn store_replay_work() -> usize {
-    STORE_REPLAY_WORK.load(std::sync::atomic::Ordering::Relaxed)
+    STORE_REPLAY_WORK.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+#[test]
+fn replay_work_is_isolated_across_concurrent_go_ruby_and_csd_measurements() {
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let threads = [("go", 576), ("ruby", 222), ("csd", 901)]
+        .into_iter()
+        .map(|(language, expected)| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                reset_store_replay_work();
+                barrier.wait();
+                count_store_replay_work(expected);
+                barrier.wait();
+                assert_eq!(
+                    store_replay_work(),
+                    expected,
+                    "{language} observed another proof replay invocation's work"
+                );
+            })
+        })
+        .collect::<Vec<_>>();
+    for thread in threads {
+        thread.join().expect("counter isolation worker");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
