@@ -16585,7 +16585,8 @@ mod proof_resolution_cache_tests {
     use crate::cache::{
         CachedCallResolutionInput, CachedClassBinding, CachedClassDeclaration, CachedClassMethod,
         CachedDeclarationKind, CachedDirectExport, CachedIndexArtifact, CachedInherentMethod,
-        CachedResolutionBinding, CachedResolutionFile, CachedTopLevelDeclaration,
+        CachedPhpNamespace, CachedResolutionBinding, CachedResolutionFile,
+        CachedTopLevelDeclaration,
     };
     use codestory_contracts::proof_resolution::{CalleeForm, ExactCallsite, FileId};
     use codestory_store::{FileInfo, FileRole};
@@ -16721,7 +16722,7 @@ mod proof_resolution_cache_tests {
                 rust_uses: Vec::new(),
                 go_package: None,
                 java_kotlin_package: None,
-                php_namespace: None,
+                php_namespace: CachedPhpNamespace::Invalid,
                 c_cpp_file: None,
             }),
         };

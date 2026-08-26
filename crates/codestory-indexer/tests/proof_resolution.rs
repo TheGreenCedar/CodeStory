@@ -1400,6 +1400,74 @@ fn ruby_complete_domain_closes_duplicates_reopening_and_relative_imports() -> an
             );
         }
     }
+
+    for mutation in ["source_drift", "missing_dependency"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    "lib/worker.rb",
+                    "class Worker\n  def imported_target\n  end\nend\n",
+                ),
+                (
+                    "lib/caller.rb",
+                    "require_relative \"worker\"\ndef caller\n  Worker.new.imported_target\nend\n",
+                ),
+                (
+                    "lib/unrelated.rb",
+                    "def unrelated_target\nend\ndef unrelated_caller\n  unrelated_target\nend\n",
+                ),
+            ],
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let unrelated = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path.ends_with("unrelated.rb"))
+            .expect("Ruby governed-domain sibling");
+        if mutation == "source_drift" {
+            store.get_connection().execute(
+                "UPDATE file SET content_hash = ?1 WHERE id = ?2",
+                ("0".repeat(64), unrelated.id),
+            )?;
+            assert!(
+                store
+                    .validate_proof_resolution_publication(&publication(1))
+                    .is_err()
+            );
+        } else {
+            let receipt = store
+                .get_proof_resolution_publication()?
+                .expect("Ruby proof publication");
+            let mut facts = store.get_proof_resolution_facts()?;
+            let fact = facts
+                .iter_mut()
+                .find(|fact| {
+                    fact.provenance.language_adapter == "ruby"
+                        && fact.callsite.raw_target == "imported_target"
+                        && fact.status == ProofResolutionStatus::Exact
+                })
+                .expect("Ruby exact require_relative fact");
+            fact.provenance
+                .dependency_file_hashes
+                .retain(|dependency| dependency.file_id != FileId(unrelated.id));
+            *fact = seal_call_resolution_fact(fact.clone())?;
+            let projection = ProofResolutionProjection {
+                adapter_roster: receipt.adapter_roster,
+                funnel: build_proof_resolution_funnel(&facts),
+                facts,
+            };
+            assert!(
+                store
+                    .replace_proof_resolution_projection(&publication(2), &projection)
+                    .is_err()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1513,6 +1581,42 @@ fn php_global_and_named_namespace_domains_are_complete_and_replay_bound() -> any
         assert!(fact.target.is_none() && fact.edge_id.is_none());
     }
 
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "src/App/Caller.php",
+                concat!(
+                    "<?php\nnamespace App;\n",
+                    "class Worker { public function target() {} public function caller() { $this->target(); } }\n",
+                    "function construct() { (new Worker())->target(); }\n",
+                ),
+            ),
+            (
+                "src/App/Duplicate.php",
+                "<?php\nnamespace App;\nclass Worker { public function unrelated() {} }\n",
+            ),
+        ],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    let duplicate_class_facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| {
+            fact.provenance.language_adapter == "php" && fact.callsite.raw_target == "target"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(duplicate_class_facts.len(), 2, "{duplicate_class_facts:#?}");
+    assert!(duplicate_class_facts.iter().all(|fact| {
+        fact.status != ProofResolutionStatus::Exact
+            && fact.target.is_none()
+            && fact.edge_id.is_none()
+            && fact.evidence_chain.is_empty()
+    }));
+
     for mutation in ["source_drift", "missing_dependency"] {
         let project = tempfile::tempdir()?;
         let mut store = Store::new_in_memory()?;
@@ -1526,11 +1630,12 @@ fn php_global_and_named_namespace_domains_are_complete_and_replay_bound() -> any
                 ),
                 (
                     "src/App/Sibling.php",
-                    "<?php\nnamespace App;\nfunction unrelated() {}\n",
+                    "<?php\nnamespace App;\nfunction unrelated() {}\nfunction unrelated_caller() { unrelated(); }\n",
                 ),
             ],
         )?;
         rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
         let sibling = store
             .get_files()?
             .into_iter()
@@ -9024,7 +9129,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v22", "adapter", "language"]
+            ["stale", "schema-v23", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"

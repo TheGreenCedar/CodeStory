@@ -2,8 +2,9 @@ use crate::cache::{
     CachedCCppFile, CachedCCppNamespace, CachedCCppSourceRole, CachedCallResolutionInput,
     CachedClassBinding, CachedClassDeclaration, CachedClassMethod, CachedDeclarationKind,
     CachedDirectExport, CachedGoMethod, CachedGoPackage, CachedGoType, CachedIndexArtifact,
-    CachedInherentMethod, CachedResolutionBinding, CachedResolutionFile, CachedRustFileModule,
-    CachedRustModule, CachedRustType, CachedRustUseBinding, CachedTopLevelDeclaration,
+    CachedInherentMethod, CachedPhpNamespace, CachedResolutionBinding, CachedResolutionFile,
+    CachedRustFileModule, CachedRustModule, CachedRustType, CachedRustUseBinding,
+    CachedTopLevelDeclaration,
 };
 use crate::source_content_hash;
 use anyhow::{Context, Result, anyhow};
@@ -152,9 +153,9 @@ const JAVA_ADAPTER_VERSION: &str = "reference-v2";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
 const C_ADAPTER_VERSION: &str = "reference-v2";
 const CPP_ADAPTER_VERSION: &str = "reference-v3";
-const RUBY_ADAPTER_VERSION: &str = "reference-v1";
-const PHP_ADAPTER_VERSION: &str = "reference-v1";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 22;
+const RUBY_ADAPTER_VERSION: &str = "reference-v2";
+const PHP_ADAPTER_VERSION: &str = "reference-v2";
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 23;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("go", GO_ADAPTER_VERSION),
     ("javascript", ADAPTER_VERSION),
@@ -387,7 +388,7 @@ pub(crate) fn collect_call_resolution_inputs(
             emit_call(callee, form, raw_target, None);
         });
     }
-    if c_cpp_index.is_none() {
+    if c_cpp_index.is_none() && ruby_index.is_none() && php_index.is_none() {
         calls.sort_by_key(|input| (input.callsite.start_byte, input.callsite.end_byte_exclusive));
     } else {
         debug_assert!(calls.windows(2).all(|pair| {
@@ -459,7 +460,9 @@ pub(crate) fn collect_call_resolution_inputs(
             java_kotlin_package: java_kotlin_index
                 .as_ref()
                 .and_then(|index| index.package_name.clone()),
-            php_namespace: php_index.as_ref().and_then(|index| index.namespace.clone()),
+            php_namespace: php_index
+                .as_ref()
+                .map_or(CachedPhpNamespace::Invalid, |index| index.namespace.clone()),
             c_cpp_file: c_cpp_index.as_ref().map(|index| CachedCCppFile {
                 source_path: source_path.to_path_buf(),
                 source_role: index.source_role,
@@ -617,7 +620,7 @@ impl<'tree> RubyResolutionIndex<'tree> {
             bindings: HashMap::new(),
             require_relative: None,
         };
-        producer.visit(tree.root_node(), None, None);
+        producer.visit(tree.root_node(), None, None, true);
         for class_indices in producer.class_indices.values() {
             if class_indices.len() != 1 {
                 producer.index.poisoned = true;
@@ -696,6 +699,7 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
         node: TsNode<'tree>,
         mut caller: Option<NodeId>,
         mut owner_index: Option<usize>,
+        declarations_static: bool,
     ) {
         count_ruby_php_resolution_work(1);
         if node.kind() == "class" {
@@ -712,33 +716,38 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
                 self.index.poisoned = true;
                 return;
             };
-            owner_index = Some(self.index.classes.len());
-            self.index.classes.push(CachedClassDeclaration {
-                name: name.clone(),
-                declaration,
-                methods: Vec::new(),
-            });
-            self.index.direct_exports.push(CachedDirectExport {
-                exported_name: name.clone(),
-                declaration,
-                is_default: false,
-                declaration_kind: CachedDeclarationKind::Class,
-            });
-            self.class_indices
-                .entry(name)
-                .or_default()
-                .push(owner_index.expect("Ruby class index"));
-            count_ruby_php_resolution_work(1);
-            count_ruby_php_resolution_work(1);
-            self.index
-                .classes_by_name
-                .entry(
-                    self.index.classes[owner_index.expect("Ruby class index")]
-                        .name
-                        .clone(),
-                )
-                .or_default()
-                .push(owner_index.expect("Ruby class index"));
+            if declarations_static {
+                owner_index = Some(self.index.classes.len());
+                self.index.classes.push(CachedClassDeclaration {
+                    name: name.clone(),
+                    declaration,
+                    methods: Vec::new(),
+                });
+                self.index.direct_exports.push(CachedDirectExport {
+                    exported_name: name.clone(),
+                    declaration,
+                    is_default: false,
+                    declaration_kind: CachedDeclarationKind::Class,
+                });
+                self.class_indices
+                    .entry(name)
+                    .or_default()
+                    .push(owner_index.expect("Ruby class index"));
+                count_ruby_php_resolution_work(1);
+                count_ruby_php_resolution_work(1);
+                self.index
+                    .classes_by_name
+                    .entry(
+                        self.index.classes[owner_index.expect("Ruby class index")]
+                            .name
+                            .clone(),
+                    )
+                    .or_default()
+                    .push(owner_index.expect("Ruby class index"));
+            } else {
+                self.index.poisoned = true;
+                owner_index = None;
+            }
         } else if matches!(node.kind(), "module" | "singleton_method") {
             self.index.poisoned = true;
         }
@@ -758,45 +767,50 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
                 return;
             };
             caller = Some(declaration);
-            if let Some(owner_index) = owner_index {
-                self.index.classes[owner_index]
-                    .methods
-                    .push(CachedClassMethod {
+            if name == "method_missing" || !declarations_static {
+                self.index.poisoned = true;
+            }
+            if declarations_static {
+                if let Some(owner_index) = owner_index {
+                    self.index.classes[owner_index]
+                        .methods
+                        .push(CachedClassMethod {
+                            name: name.clone(),
+                            declaration,
+                        });
+                    count_ruby_php_resolution_work(1);
+                    self.index
+                        .methods_by_owner_and_name
+                        .entry((owner_index, name))
+                        .or_default()
+                        .push(declaration);
+                } else {
+                    self.index.declarations.push(CachedTopLevelDeclaration {
                         name: name.clone(),
                         declaration,
+                        module_path: Vec::new(),
+                        cross_module_visible: false,
                     });
-                count_ruby_php_resolution_work(1);
-                self.index
-                    .methods_by_owner_and_name
-                    .entry((owner_index, name))
-                    .or_default()
-                    .push(declaration);
-            } else {
-                self.index.declarations.push(CachedTopLevelDeclaration {
-                    name: name.clone(),
-                    declaration,
-                    module_path: Vec::new(),
-                    cross_module_visible: false,
-                });
-                self.index.direct_exports.push(CachedDirectExport {
-                    exported_name: name,
-                    declaration,
-                    is_default: false,
-                    declaration_kind: CachedDeclarationKind::Callable,
-                });
-                count_ruby_php_resolution_work(1);
-                self.index
-                    .declarations_by_name
-                    .entry(
-                        self.index
-                            .declarations
-                            .last()
-                            .expect("Ruby declaration")
-                            .name
-                            .clone(),
-                    )
-                    .or_default()
-                    .push(declaration);
+                    self.index.direct_exports.push(CachedDirectExport {
+                        exported_name: name,
+                        declaration,
+                        is_default: false,
+                        declaration_kind: CachedDeclarationKind::Callable,
+                    });
+                    count_ruby_php_resolution_work(1);
+                    self.index
+                        .declarations_by_name
+                        .entry(
+                            self.index
+                                .declarations
+                                .last()
+                                .expect("Ruby declaration")
+                                .name
+                                .clone(),
+                        )
+                        .or_default()
+                        .push(declaration);
+                }
             }
         }
 
@@ -816,8 +830,10 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
         }
 
         let mut cursor = node.walk();
+        let child_declarations_static =
+            declarations_static && matches!(node.kind(), "program" | "body_statement" | "class");
         for child in node.named_children(&mut cursor) {
-            self.visit(child, caller, owner_index);
+            self.visit(child, caller, owner_index, child_declarations_static);
         }
     }
 
@@ -1125,19 +1141,13 @@ struct PhpResolutionIndex<'tree> {
     declarations_by_name: HashMap<String, Vec<NodeId>>,
     classes_by_name: HashMap<String, Vec<usize>>,
     methods_by_owner_and_name: HashMap<(usize, String), Vec<NodeId>>,
-    namespace: Option<String>,
+    namespace: CachedPhpNamespace,
     poisoned: bool,
 }
 
 impl<'tree> PhpResolutionIndex<'tree> {
     fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
         let (graph_declarations, graph_imports) = ruby_php_graph_maps(nodes, file_id);
-        let namespace = php_unique_namespace(tree.root_node(), source);
-        let namespace_declarations = tree
-            .root_node()
-            .named_children(&mut tree.root_node().walk())
-            .filter(|node| node.kind() == "namespace_definition")
-            .count();
         let mut index = Self {
             calls: Vec::new(),
             call_indices_by_span: HashMap::new(),
@@ -1146,8 +1156,8 @@ impl<'tree> PhpResolutionIndex<'tree> {
             declarations_by_name: HashMap::new(),
             classes_by_name: HashMap::new(),
             methods_by_owner_and_name: HashMap::new(),
-            namespace,
-            poisoned: namespace_declarations > 1,
+            namespace: CachedPhpNamespace::Invalid,
+            poisoned: false,
         };
         let mut producer = PhpResolutionProducer {
             index: &mut index,
@@ -1157,8 +1167,19 @@ impl<'tree> PhpResolutionIndex<'tree> {
             class_indices: HashMap::new(),
             imports: HashMap::new(),
             bindings: HashMap::new(),
+            namespace: None,
+            namespace_invalid: false,
         };
-        producer.visit(tree.root_node(), None, None);
+        producer.visit(tree.root_node(), None, None, true);
+        producer.index.namespace = if producer.namespace_invalid {
+            producer.index.poisoned = true;
+            CachedPhpNamespace::Invalid
+        } else {
+            producer
+                .namespace
+                .take()
+                .map_or(CachedPhpNamespace::Global, CachedPhpNamespace::Named)
+        };
         if producer
             .class_indices
             .values()
@@ -1231,6 +1252,8 @@ struct PhpResolutionProducer<'index, 'tree> {
     class_indices: HashMap<String, Vec<usize>>,
     imports: HashMap<String, PhpImportBinding>,
     bindings: HashMap<(NodeId, String), PhpReceiverBinding>,
+    namespace: Option<String>,
+    namespace_invalid: bool,
 }
 
 impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
@@ -1239,8 +1262,18 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
         node: TsNode<'tree>,
         mut caller: Option<NodeId>,
         mut owner_index: Option<usize>,
+        declarations_static: bool,
     ) {
         count_ruby_php_resolution_work(1);
+        if node.kind() == "namespace_definition" {
+            let name = declaration_name(node, self.source).and_then(canonical_php_namespace_name);
+            if self.namespace.is_some() || name.is_none() {
+                self.namespace_invalid = true;
+            } else {
+                self.namespace = name;
+            }
+            count_ruby_php_resolution_work(1);
+        }
         if node.kind() == "namespace_use_declaration" {
             self.observe_import(node);
         }
@@ -1261,23 +1294,28 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                 self.index.poisoned = true;
                 return;
             };
-            owner_index = Some(self.index.classes.len());
-            self.index.classes.push(CachedClassDeclaration {
-                name: name.clone(),
-                declaration,
-                methods: Vec::new(),
-            });
-            self.class_indices
-                .entry(name.clone())
-                .or_default()
-                .push(owner_index.expect("PHP class index"));
-            count_ruby_php_resolution_work(1);
-            count_ruby_php_resolution_work(1);
-            self.index
-                .classes_by_name
-                .entry(name)
-                .or_default()
-                .push(owner_index.expect("PHP class index"));
+            if declarations_static {
+                owner_index = Some(self.index.classes.len());
+                self.index.classes.push(CachedClassDeclaration {
+                    name: name.clone(),
+                    declaration,
+                    methods: Vec::new(),
+                });
+                self.class_indices
+                    .entry(name.clone())
+                    .or_default()
+                    .push(owner_index.expect("PHP class index"));
+                count_ruby_php_resolution_work(1);
+                count_ruby_php_resolution_work(1);
+                self.index
+                    .classes_by_name
+                    .entry(name)
+                    .or_default()
+                    .push(owner_index.expect("PHP class index"));
+            } else {
+                self.index.poisoned = true;
+                owner_index = None;
+            }
         }
         if matches!(node.kind(), "function_definition" | "method_declaration") {
             let Some(name) = declaration_name(node, self.source).map(str::to_string) else {
@@ -1294,34 +1332,39 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
                 return;
             };
             caller = Some(declaration);
-            if let Some(owner_index) = owner_index {
-                self.index.classes[owner_index]
-                    .methods
-                    .push(CachedClassMethod {
+            if name.starts_with("__") || !declarations_static {
+                self.index.poisoned = true;
+            }
+            if declarations_static {
+                if let Some(owner_index) = owner_index {
+                    self.index.classes[owner_index]
+                        .methods
+                        .push(CachedClassMethod {
+                            name: name.clone(),
+                            declaration,
+                        });
+                    count_ruby_php_resolution_work(1);
+                    self.index
+                        .methods_by_owner_and_name
+                        .entry((owner_index, name))
+                        .or_default()
+                        .push(declaration);
+                } else {
+                    self.index.declarations.push(CachedTopLevelDeclaration {
                         name: name.clone(),
                         declaration,
+                        module_path: Vec::new(),
+                        cross_module_visible: true,
                     });
-                count_ruby_php_resolution_work(1);
-                self.index
-                    .methods_by_owner_and_name
-                    .entry((owner_index, name))
-                    .or_default()
-                    .push(declaration);
-            } else {
-                self.index.declarations.push(CachedTopLevelDeclaration {
-                    name: name.clone(),
-                    declaration,
-                    module_path: Vec::new(),
-                    cross_module_visible: true,
-                });
-                count_ruby_php_resolution_work(1);
-                self.index
-                    .declarations_by_name
-                    .entry(name)
-                    .or_default()
-                    .push(declaration);
+                    count_ruby_php_resolution_work(1);
+                    self.index
+                        .declarations_by_name
+                        .entry(name)
+                        .or_default()
+                        .push(declaration);
+                }
+                self.observe_parameters(node, declaration);
             }
-            self.observe_parameters(node, declaration);
         }
 
         self.observe_poison(node);
@@ -1350,8 +1393,17 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
         }
 
         let mut cursor = node.walk();
+        let child_declarations_static = declarations_static
+            && matches!(
+                node.kind(),
+                "program"
+                    | "namespace_definition"
+                    | "compound_statement"
+                    | "class_declaration"
+                    | "declaration_list"
+            );
         for child in node.named_children(&mut cursor) {
-            self.visit(child, caller, owner_index);
+            self.visit(child, caller, owner_index, child_declarations_static);
         }
     }
 
@@ -1682,17 +1734,18 @@ impl<'index, 'tree> PhpResolutionProducer<'index, 'tree> {
     }
 }
 
-fn php_unique_namespace(root: TsNode<'_>, source: &str) -> Option<String> {
-    let mut namespaces = Vec::new();
-    let mut cursor = root.walk();
-    for node in root.named_children(&mut cursor) {
-        if node.kind() == "namespace_definition" {
-            namespaces.push(declaration_name(node, source)?.replace('\\', "."));
-        }
-    }
-    namespaces.sort();
-    namespaces.dedup();
-    namespaces.pop().filter(|_| namespaces.is_empty())
+fn canonical_php_namespace_name(name: &str) -> Option<String> {
+    let components = name.split('\\').collect::<Vec<_>>();
+    count_ruby_php_resolution_work(components.len());
+    (!components.is_empty()
+        && components.iter().all(|component| {
+            let mut chars = component.chars();
+            chars
+                .next()
+                .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+                && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+        }))
+    .then(|| components.join("."))
 }
 
 fn php_simple_type(surface: &str) -> Option<String> {
@@ -11349,6 +11402,19 @@ pub fn rematerialize_proof_resolution_projection(
         .iter()
         .map(|node| (node.id, node))
         .collect::<HashMap<_, _>>();
+    let mut php_graph_names_by_file = HashMap::<i64, Vec<String>>::new();
+    for node in nodes.iter().filter(|node| node.kind == NodeKind::NAMESPACE) {
+        count_ruby_php_resolution_work(1);
+        if let (Some(file_id), Some(name)) = (
+            node.file_node_id,
+            canonical_php_namespace_name(&node.serialized_name),
+        ) {
+            php_graph_names_by_file
+                .entry(file_id.0)
+                .or_default()
+                .push(name);
+        }
+    }
     let mut edges = store.get_edges()?;
     let exact_evidence_validation = ExactEvidenceValidationIndex::prepare(&edges, &node_by_id);
     let governed = files
@@ -11482,12 +11548,29 @@ pub fn rematerialize_proof_resolution_projection(
         } else {
             record.file.c_cpp_file.is_none()
         };
+        let php_namespace_identity_matches = if indexed_file.language == "php" {
+            count_ruby_php_resolution_work(1);
+            let graph_names = php_graph_names_by_file
+                .get(&indexed_file.id)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            match &record.file.php_namespace {
+                CachedPhpNamespace::Global => graph_names.is_empty(),
+                CachedPhpNamespace::Named(name) => {
+                    matches!(graph_names, [graph_name] if graph_name == name)
+                }
+                CachedPhpNamespace::Invalid => record.file.export_poison_all,
+            }
+        } else {
+            record.file.php_namespace == CachedPhpNamespace::Invalid
+        };
         if record.file.file_id != NodeId(indexed_file.id)
             || record.file.source_sha256 != *stored_hash
             || record.file.language != indexed_file.language
             || record.file.complete != indexed_file.complete
             || record.file.adapter_version != adapter_version(&indexed_file.language)
             || !c_cpp_source_identity_matches
+            || !php_namespace_identity_matches
             || record.calls.iter().any(|call| {
                 call.callsite.file_id != FileId(indexed_file.id)
                     || call.callsite.source_sha256 != *stored_hash
@@ -11502,7 +11585,21 @@ pub fn rematerialize_proof_resolution_projection(
         }
         records.push(record);
     }
+    let mut linear_records = Vec::new();
+    let mut records = records
+        .into_iter()
+        .filter_map(|record| {
+            if matches!(record.file.language.as_str(), "ruby" | "php") {
+                count_ruby_php_resolution_work(1);
+                linear_records.push(record);
+                None
+            } else {
+                Some(record)
+            }
+        })
+        .collect::<Vec<_>>();
     records.sort_by(|left, right| left.path.cmp(&right.path));
+    records.extend(linear_records);
     let mut record_by_path = HashMap::new();
     for record in &records {
         let identity = governed_identities
@@ -11515,9 +11612,19 @@ pub fn rematerialize_proof_resolution_projection(
             ));
         }
     }
+    let mut linear_inputs = Vec::new();
     let mut inputs = records
         .iter()
         .flat_map(|record| record.calls.iter().cloned().map(move |call| (record, call)))
+        .filter_map(|(record, call)| {
+            if matches!(record.file.language.as_str(), "ruby" | "php") {
+                count_ruby_php_resolution_work(1);
+                linear_inputs.push((record, call));
+                None
+            } else {
+                Some((record, call))
+            }
+        })
         .collect::<Vec<_>>();
     inputs.sort_by(|left, right| {
         left.1
@@ -11532,10 +11639,17 @@ pub fn rematerialize_proof_resolution_projection(
                     .cmp(&right.1.callsite.end_byte_exclusive),
             )
     });
-    if inputs.windows(2).any(|pair| {
-        pair[0].1.callsite.file_id == pair[1].1.callsite.file_id
-            && pair[0].1.callsite.start_byte == pair[1].1.callsite.start_byte
-            && pair[0].1.callsite.end_byte_exclusive == pair[1].1.callsite.end_byte_exclusive
+    inputs.extend(linear_inputs);
+    let mut callsite_members = HashSet::new();
+    if inputs.iter().any(|(_, input)| {
+        if matches!(input.language.as_str(), "ruby" | "php") {
+            count_ruby_php_resolution_work(1);
+        }
+        !callsite_members.insert((
+            input.callsite.file_id,
+            input.callsite.start_byte,
+            input.callsite.end_byte_exclusive,
+        ))
     }) {
         return Err(anyhow!(
             "proof resolution projection has duplicate exact callsites"
@@ -12328,8 +12442,16 @@ fn resolve_relative_import<'a>(
             uncovered = true;
         }
     }
-    matches.sort_by_key(|record| record.file.file_id);
-    matches.dedup_by_key(|record| record.file.file_id);
+    if source_record.file.language == "ruby" {
+        let mut members = HashSet::new();
+        matches.retain(|record| {
+            count_ruby_php_resolution_work(1);
+            members.insert(record.file.file_id)
+        });
+    } else {
+        matches.sort_by_key(|record| record.file.file_id);
+        matches.dedup_by_key(|record| record.file.file_id);
+    }
     Ok(if uncovered || matches.len() > 1 {
         RelativeImportResolution::Incomplete
     } else if let [record] = matches.as_slice() {
@@ -14372,14 +14494,19 @@ struct JavaKotlinImportDomain {
     complete: bool,
     poisoned: bool,
     dependencies: Vec<FileId>,
+    dependency_members: HashSet<FileId>,
     declarations: HashMap<(Option<String>, String), Vec<JavaKotlinImportCandidate>>,
+    classes: HashMap<String, Vec<JavaKotlinImportCandidate>>,
 }
 
 struct JavaKotlinProjectionIndex {
     domains: HashMap<(String, String), JavaKotlinImportDomain>,
+    php_domains: HashMap<CachedPhpNamespace, JavaKotlinImportDomain>,
+    php_identity_by_file: HashMap<i64, CachedPhpNamespace>,
     ruby_complete: bool,
     ruby_dependencies: Vec<FileId>,
     ruby_functions: HashMap<String, Vec<JavaKotlinImportCandidate>>,
+    ruby_classes: HashMap<String, Vec<JavaKotlinImportCandidate>>,
     ruby_methods: HashMap<(String, String), Vec<JavaKotlinImportCandidate>>,
 }
 
@@ -14398,9 +14525,14 @@ enum JavaKotlinImportResolution {
 impl JavaKotlinProjectionIndex {
     fn prepare(records: &[ResolutionCacheRecord]) -> Self {
         let mut domains = HashMap::<(String, String), JavaKotlinImportDomain>::new();
+        let mut php_domains = HashMap::<CachedPhpNamespace, JavaKotlinImportDomain>::new();
+        let mut php_identity_by_file = HashMap::new();
+        let mut php_invalid_namespace = false;
         let mut ruby_complete = true;
         let mut ruby_dependencies = Vec::new();
+        let mut ruby_dependency_members = HashSet::new();
         let mut ruby_functions = HashMap::<String, Vec<JavaKotlinImportCandidate>>::new();
+        let mut ruby_classes = HashMap::<String, Vec<JavaKotlinImportCandidate>>::new();
         let mut ruby_methods = HashMap::<(String, String), Vec<JavaKotlinImportCandidate>>::new();
         for record in records
             .iter()
@@ -14409,8 +14541,13 @@ impl JavaKotlinProjectionIndex {
             ruby_complete &= record.file.complete
                 && record.file.lookup_input_complete
                 && !record.file.export_poison_all;
-            ruby_dependencies.push(FileId(record.file.file_id.0));
+            let file_id = FileId(record.file.file_id.0);
+            count_ruby_php_resolution_work(1);
+            if ruby_dependency_members.insert(file_id) {
+                ruby_dependencies.push(file_id);
+            }
             for declaration in &record.file.top_level_declarations {
+                count_ruby_php_resolution_work(1);
                 ruby_functions
                     .entry(declaration.name.clone())
                     .or_default()
@@ -14421,7 +14558,16 @@ impl JavaKotlinProjectionIndex {
                     });
             }
             for class in &record.file.classes {
+                count_ruby_php_resolution_work(1);
+                ruby_classes.entry(class.name.clone()).or_default().push(
+                    JavaKotlinImportCandidate {
+                        owner: class.declaration,
+                        declaration: class.declaration,
+                        file_id,
+                    },
+                );
                 for method in &class.methods {
+                    count_ruby_php_resolution_work(1);
                     ruby_methods
                         .entry((class.name.clone(), method.name.clone()))
                         .or_default()
@@ -14433,20 +14579,19 @@ impl JavaKotlinProjectionIndex {
                 }
             }
         }
-        for record in records.iter().filter(|record| {
-            is_java_kotlin_language(&record.file.language) || record.file.language == "php"
-        }) {
-            let package_name = if record.file.language == "php" {
-                record.file.php_namespace.as_ref()
-            } else {
-                record.file.java_kotlin_package.as_ref()
-            };
-            let Some(package_name) = package_name else {
+        for record in records
+            .iter()
+            .filter(|record| record.file.language == "php")
+        {
+            count_ruby_php_resolution_work(1);
+            let namespace = record.file.php_namespace.clone();
+            if namespace == CachedPhpNamespace::Invalid {
+                php_invalid_namespace = true;
                 continue;
-            };
-            let domain = domains
-                .entry((record.file.language.clone(), package_name.clone()))
-                .or_default();
+            }
+            php_identity_by_file.insert(record.file.file_id.0, namespace.clone());
+            count_ruby_php_resolution_work(1);
+            let domain = php_domains.entry(namespace).or_default();
             let file_complete = record.file.complete && record.file.lookup_input_complete;
             if domain.dependencies.is_empty() {
                 domain.complete = file_complete;
@@ -14454,8 +14599,13 @@ impl JavaKotlinProjectionIndex {
                 domain.complete &= file_complete;
             }
             domain.poisoned |= record.file.export_poison_all;
-            domain.dependencies.push(FileId(record.file.file_id.0));
+            let file_id = FileId(record.file.file_id.0);
+            count_ruby_php_resolution_work(1);
+            if domain.dependency_members.insert(file_id) {
+                domain.dependencies.push(file_id);
+            }
             for declaration in &record.file.top_level_declarations {
+                count_ruby_php_resolution_work(1);
                 domain
                     .declarations
                     .entry((None, declaration.name.clone()))
@@ -14467,7 +14617,16 @@ impl JavaKotlinProjectionIndex {
                     });
             }
             for class in &record.file.classes {
+                count_ruby_php_resolution_work(1);
+                domain.classes.entry(class.name.clone()).or_default().push(
+                    JavaKotlinImportCandidate {
+                        owner: class.declaration,
+                        declaration: class.declaration,
+                        file_id,
+                    },
+                );
                 for method in &class.methods {
+                    count_ruby_php_resolution_work(1);
                     domain
                         .declarations
                         .entry((Some(class.name.clone()), method.name.clone()))
@@ -14480,6 +14639,58 @@ impl JavaKotlinProjectionIndex {
                 }
             }
         }
+        if php_invalid_namespace {
+            for domain in php_domains.values_mut() {
+                count_ruby_php_resolution_work(1);
+                domain.poisoned = true;
+            }
+        }
+        for record in records
+            .iter()
+            .filter(|record| is_java_kotlin_language(&record.file.language))
+        {
+            let Some(package_name) = record.file.java_kotlin_package.as_ref() else {
+                continue;
+            };
+            let domain = domains
+                .entry((record.file.language.clone(), package_name.clone()))
+                .or_default();
+            let file_complete = record.file.complete && record.file.lookup_input_complete;
+            if domain.dependencies.is_empty() {
+                domain.complete = file_complete;
+            } else {
+                domain.complete &= file_complete;
+            }
+            domain.poisoned |= record.file.export_poison_all;
+            let file_id = FileId(record.file.file_id.0);
+            if domain.dependency_members.insert(file_id) {
+                domain.dependencies.push(file_id);
+            }
+            for declaration in &record.file.top_level_declarations {
+                domain
+                    .declarations
+                    .entry((None, declaration.name.clone()))
+                    .or_default()
+                    .push(JavaKotlinImportCandidate {
+                        owner: declaration.declaration,
+                        declaration: declaration.declaration,
+                        file_id,
+                    });
+            }
+            for class in &record.file.classes {
+                for method in &class.methods {
+                    domain
+                        .declarations
+                        .entry((Some(class.name.clone()), method.name.clone()))
+                        .or_default()
+                        .push(JavaKotlinImportCandidate {
+                            owner: class.declaration,
+                            declaration: method.declaration,
+                            file_id,
+                        });
+                }
+            }
+        }
         for domain in domains.values_mut() {
             domain.dependencies.sort();
             domain.dependencies.dedup();
@@ -14488,13 +14699,14 @@ impl JavaKotlinProjectionIndex {
                 candidates.dedup_by(|left, right| left.declaration == right.declaration);
             }
         }
-        ruby_dependencies.sort();
-        ruby_dependencies.dedup();
         Self {
             domains,
+            php_domains,
+            php_identity_by_file,
             ruby_complete,
             ruby_dependencies,
             ruby_functions,
+            ruby_classes,
             ruby_methods,
         }
     }
@@ -14512,9 +14724,58 @@ impl JavaKotlinProjectionIndex {
         else {
             return JavaKotlinImportResolution::Missing;
         };
+        Self::resolve_domain(domain, owner_name, imported_name)
+    }
+
+    fn resolve_php(
+        &self,
+        namespace: &CachedPhpNamespace,
+        owner_name: Option<&str>,
+        imported_name: &str,
+    ) -> JavaKotlinImportResolution {
+        count_ruby_php_resolution_work(1);
+        let Some(domain) = self.php_domains.get(namespace) else {
+            return JavaKotlinImportResolution::Missing;
+        };
+        let resolution = Self::resolve_domain(domain, owner_name, imported_name);
+        let (Some(owner_name), JavaKotlinImportResolution::Exact { owner, .. }) =
+            (owner_name, &resolution)
+        else {
+            return resolution;
+        };
+        count_ruby_php_resolution_work(1);
+        if matches!(
+            domain.classes.get(owner_name).map(Vec::as_slice),
+            Some([candidate]) if candidate.owner == *owner
+        ) {
+            resolution
+        } else {
+            JavaKotlinImportResolution::Ambiguous
+        }
+    }
+
+    fn resolve_php_named(
+        &self,
+        namespace: &str,
+        owner_name: Option<&str>,
+        imported_name: &str,
+    ) -> JavaKotlinImportResolution {
+        self.resolve_php(
+            &CachedPhpNamespace::Named(namespace.to_owned()),
+            owner_name,
+            imported_name,
+        )
+    }
+
+    fn resolve_domain(
+        domain: &JavaKotlinImportDomain,
+        owner_name: Option<&str>,
+        imported_name: &str,
+    ) -> JavaKotlinImportResolution {
         if !domain.complete || domain.poisoned {
             return JavaKotlinImportResolution::Incomplete;
         }
+        count_ruby_php_resolution_work(1);
         let candidates = domain
             .declarations
             .get(&(owner_name.map(str::to_string), imported_name.to_string()))
@@ -14532,7 +14793,32 @@ impl JavaKotlinProjectionIndex {
         }
     }
 
+    fn php_dependencies(
+        &self,
+        source_file: FileId,
+        evidence_files: impl IntoIterator<Item = FileId>,
+    ) -> Option<Vec<FileId>> {
+        let mut dependencies = Vec::new();
+        let mut members = HashSet::new();
+        for file_id in std::iter::once(source_file).chain(evidence_files) {
+            count_ruby_php_resolution_work(1);
+            let namespace = self.php_identity_by_file.get(&file_id.0)?;
+            let domain = self.php_domains.get(namespace)?;
+            if !domain.complete || domain.poisoned {
+                return None;
+            }
+            for dependency in &domain.dependencies {
+                count_ruby_php_resolution_work(1);
+                if members.insert(*dependency) {
+                    dependencies.push(*dependency);
+                }
+            }
+        }
+        Some(dependencies)
+    }
+
     fn ruby_function(&self, name: &str, declaration: NodeId) -> Option<Vec<FileId>> {
+        count_ruby_php_resolution_work(1);
         self.ruby_complete
             .then_some(())
             .filter(|_| {
@@ -14551,10 +14837,14 @@ impl JavaKotlinProjectionIndex {
         owner: NodeId,
         declaration: NodeId,
     ) -> Option<Vec<FileId>> {
+        count_ruby_php_resolution_work(2);
         self.ruby_complete
             .then_some(())
             .filter(|_| {
                 matches!(
+                    self.ruby_classes.get(owner_name).map(Vec::as_slice),
+                    Some([candidate]) if candidate.owner == owner
+                ) && matches!(
                     self.ruby_methods
                         .get(&(owner_name.to_string(), method_name.to_string()))
                         .map(Vec::as_slice),
@@ -15100,23 +15390,16 @@ fn resolve_syntax_claim(
                         evidence_chain.clear();
                     }
                 } else if source_record.file.language == "php" {
-                    let resolution = source_record
-                        .file
-                        .php_namespace
-                        .as_deref()
-                        .map(|namespace| {
-                            java_kotlin_index.resolve(
-                                "php",
-                                namespace,
-                                None,
-                                &input.callsite.raw_target,
-                            )
-                        });
-                    if let Some(JavaKotlinImportResolution::Exact {
+                    let resolution = java_kotlin_index.resolve_php(
+                        &source_record.file.php_namespace,
+                        None,
+                        &input.callsite.raw_target,
+                    );
+                    if let JavaKotlinImportResolution::Exact {
                         declaration: resolved,
                         dependencies,
                         ..
-                    }) = resolution
+                    } = resolution
                         && resolved == *declaration
                     {
                         exact_dependency_files = dependencies;
@@ -15192,24 +15475,17 @@ fn resolve_syntax_claim(
                         evidence_chain.clear();
                     }
                 } else if source_record.file.language == "php" {
-                    let resolution = source_record
-                        .file
-                        .php_namespace
-                        .as_deref()
-                        .map(|namespace| {
-                            java_kotlin_index.resolve(
-                                "php",
-                                namespace,
-                                Some(owner_name),
-                                &input.callsite.raw_target,
-                            )
-                        });
-                    if let Some(JavaKotlinImportResolution::Exact {
+                    let resolution = java_kotlin_index.resolve_php(
+                        &source_record.file.php_namespace,
+                        Some(owner_name),
+                        &input.callsite.raw_target,
+                    );
+                    if let JavaKotlinImportResolution::Exact {
                         owner: resolved_owner,
                         declaration: resolved,
                         dependencies,
                         ..
-                    }) = resolution
+                    } = resolution
                         && resolved_owner == *owner
                         && resolved == *declaration
                     {
@@ -15785,12 +16061,11 @@ fn resolve_syntax_claim(
             owner_name,
             name,
             import,
-        } => match java_kotlin_index.resolve(
-            &input.language,
-            package_name,
-            owner_name.as_deref(),
-            name,
-        ) {
+        } => match if input.language == "php" {
+            java_kotlin_index.resolve_php_named(package_name, owner_name.as_deref(), name)
+        } else {
+            java_kotlin_index.resolve(&input.language, package_name, owner_name.as_deref(), name)
+        } {
             JavaKotlinImportResolution::Exact {
                 owner,
                 declaration,
@@ -15875,12 +16150,11 @@ fn resolve_syntax_claim(
             method_name,
             import,
             constructor,
-        } => match java_kotlin_index.resolve(
-            &input.language,
-            package_name,
-            Some(owner_name),
-            method_name,
-        ) {
+        } => match if input.language == "php" {
+            java_kotlin_index.resolve_php_named(package_name, Some(owner_name), method_name)
+        } else {
+            java_kotlin_index.resolve(&input.language, package_name, Some(owner_name), method_name)
+        } {
             JavaKotlinImportResolution::Exact {
                 owner,
                 declaration,
@@ -16215,19 +16489,13 @@ fn resolve_syntax_claim(
                         evidence_chain.clear();
                     }
                 } else if source_record.file.language == "php" {
-                    let resolution = target_record
-                        .file
-                        .php_namespace
-                        .as_deref()
-                        .zip(owner_name)
-                        .map(|(namespace, owner_name)| {
-                            java_kotlin_index.resolve(
-                                "php",
-                                namespace,
-                                Some(owner_name),
-                                method_name,
-                            )
-                        });
+                    let resolution = owner_name.map(|owner_name| {
+                        java_kotlin_index.resolve_php(
+                            &target_record.file.php_namespace,
+                            Some(owner_name),
+                            method_name,
+                        )
+                    });
                     if let Some(JavaKotlinImportResolution::Exact {
                         owner: resolved_owner,
                         declaration: resolved,
@@ -16257,6 +16525,22 @@ fn resolve_syntax_claim(
                     ProofResolutionReason::MultipleBindings
                 };
             }
+        }
+    }
+    if status == ProofResolutionStatus::Exact && source_record.file.language == "php" {
+        let evidence_files = exact_node_file_expectations
+            .iter()
+            .map(|(_, file_id)| *file_id);
+        if let Some(dependencies) =
+            java_kotlin_index.php_dependencies(input.callsite.file_id, evidence_files)
+        {
+            exact_dependency_files = dependencies;
+        } else {
+            status = ProofResolutionStatus::IncompleteDomain;
+            reason = ProofResolutionReason::LookupDomainIncomplete;
+            target = None;
+            evidence_chain.clear();
+            exact_dependency_files.clear();
         }
     }
     if !source_file.complete
@@ -16411,14 +16695,22 @@ fn seal_resolved_claim(
         None
     };
     let input = &claim.input;
-    let mut dependency_ids = HashSet::from([NodeId(input.callsite.file_id.0)]);
+    let linear_dependency_order = matches!(input.language.as_str(), "ruby" | "php");
+    let mut dependency_ids = Vec::new();
+    let mut dependency_members = HashSet::new();
+    let mut push_dependency = |file_id: NodeId| {
+        if dependency_members.insert(file_id) {
+            dependency_ids.push(file_id);
+        }
+        if linear_dependency_order {
+            count_ruby_php_resolution_work(1);
+        }
+    };
+    push_dependency(NodeId(input.callsite.file_id.0));
     if status == ProofResolutionStatus::Exact {
-        dependency_ids.extend(
-            claim
-                .exact_dependency_files
-                .iter()
-                .map(|file| NodeId(file.0)),
-        );
+        for file in &claim.exact_dependency_files {
+            push_dependency(NodeId(file.0));
+        }
     }
     for node_id in evidence_chain
         .iter()
@@ -16426,7 +16718,7 @@ fn seal_resolved_claim(
         .chain(target)
     {
         if let Some(file_id) = nodes.get(&node_id).and_then(|node| node.file_node_id) {
-            dependency_ids.insert(file_id);
+            push_dependency(file_id);
         }
     }
     let mut dependency_file_hashes = dependency_ids
@@ -16442,7 +16734,9 @@ fn seal_resolved_claim(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    dependency_file_hashes.sort();
+    if !linear_dependency_order {
+        dependency_file_hashes.sort();
+    }
     codestory_store::seal_call_resolution_fact(CallResolutionFact {
         fact_id: String::new(),
         edge_id: edge.map(|edge| edge.id),
@@ -16474,15 +16768,23 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
         (String, Option<CalleeForm>, Option<ResolutionEvidenceKind>),
         ProofResolutionFunnelCounts,
     >::new();
+    let mut linear_rows = HashMap::<
+        (String, Option<CalleeForm>, Option<ResolutionEvidenceKind>),
+        ProofResolutionFunnelCounts,
+    >::new();
     for fact in facts {
         let evidence_kind = fact.evidence_chain.first().map(ResolutionEvidence::kind);
-        let counts = rows
-            .entry((
-                fact.provenance.language_adapter.clone(),
-                Some(fact.callsite.callee_form),
-                evidence_kind,
-            ))
-            .or_default();
+        let key = (
+            fact.provenance.language_adapter.clone(),
+            Some(fact.callsite.callee_form),
+            evidence_kind,
+        );
+        let counts = if matches!(fact.provenance.language_adapter.as_str(), "ruby" | "php") {
+            count_ruby_php_resolution_work(1);
+            linear_rows.entry(key).or_default()
+        } else {
+            rows.entry(key).or_default()
+        };
         counts.syntax_calls += 1;
         counts.adapter_supported += u64::from(fact.status != ProofResolutionStatus::Unsupported);
         match fact.status {
@@ -16518,6 +16820,40 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
                 right.evidence_kind.map(|kind| kind.as_str()),
             ))
     });
+    for language in ["php", "ruby"] {
+        for callee_form in [
+            CalleeForm::Constructor,
+            CalleeForm::DynamicAccess,
+            CalleeForm::ExplicitReceiver,
+            CalleeForm::Identifier,
+            CalleeForm::ImplicitReceiver,
+            CalleeForm::NamedImport,
+            CalleeForm::QualifiedPath,
+        ] {
+            for evidence_kind in [
+                None,
+                Some(ResolutionEvidenceKind::ConstructorBinding),
+                Some(ResolutionEvidenceKind::ExplicitReceiverType),
+                Some(ResolutionEvidenceKind::ImplicitReceiver),
+                Some(ResolutionEvidenceKind::QualifiedPath),
+                Some(ResolutionEvidenceKind::SameFileDeclaration),
+                Some(ResolutionEvidenceKind::SamePackageDeclaration),
+                Some(ResolutionEvidenceKind::StaticImportBinding),
+            ] {
+                let key = (language.to_owned(), Some(callee_form), evidence_kind);
+                count_ruby_php_resolution_work(1);
+                if let Some(counts) = linear_rows.remove(&key) {
+                    result.push(ProofResolutionFunnelRow {
+                        language: language.to_owned(),
+                        callee_form: Some(callee_form),
+                        evidence_kind,
+                        counts,
+                    });
+                }
+            }
+        }
+    }
+    debug_assert!(linear_rows.is_empty());
     result
 }
 
@@ -16829,7 +17165,11 @@ mod ruby_php_complexity_tests {
                 rust_uses: Vec::new(),
                 go_package: None,
                 java_kotlin_package: None,
-                php_namespace: (language == "php").then(|| "App".to_owned()),
+                php_namespace: if language == "php" {
+                    CachedPhpNamespace::Named("App".to_owned())
+                } else {
+                    CachedPhpNamespace::Invalid
+                },
                 c_cpp_file: None,
             },
             calls: Vec::new(),
@@ -16856,8 +17196,8 @@ mod ruby_php_complexity_tests {
             for declaration in &record.file.top_level_declarations {
                 if record.file.language == "ruby" {
                     let _ = index.ruby_function(&declaration.name, declaration.declaration);
-                } else if let Some(namespace) = record.file.php_namespace.as_deref() {
-                    let _ = index.resolve("php", namespace, None, &declaration.name);
+                } else {
+                    let _ = index.resolve_php(&record.file.php_namespace, None, &declaration.name);
                 }
             }
         }
@@ -17078,7 +17418,7 @@ mod rust_complexity_tests {
                 rust_uses: imports,
                 go_package: None,
                 java_kotlin_package: None,
-                php_namespace: None,
+                php_namespace: CachedPhpNamespace::Invalid,
                 c_cpp_file: None,
             },
             calls: Vec::new(),
@@ -17490,7 +17830,7 @@ mod go_complexity_tests {
                         methods: Vec::new(),
                     }),
                     java_kotlin_package: None,
-                    php_namespace: None,
+                    php_namespace: CachedPhpNamespace::Invalid,
                     c_cpp_file: None,
                 },
                 calls: Vec::new(),
@@ -17624,7 +17964,7 @@ mod python_complexity_tests {
                 rust_uses: Vec::new(),
                 go_package: None,
                 java_kotlin_package: None,
-                php_namespace: None,
+                php_namespace: CachedPhpNamespace::Invalid,
                 c_cpp_file: None,
             },
             calls: Vec::new(),
