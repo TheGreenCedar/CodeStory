@@ -1086,15 +1086,16 @@ async function probeExactPackageRuntime(cliPath, expected, env) {
         throw new Error(`exact package runtime ${field}=${observed[field] ?? "missing"}; expected ${expected[field]}`);
       }
     }
-    observed.discovery_contract_sha256 = normalizeExternalSha256(
-      observed.discovery_contract_sha256,
-      "runtime discovery_contract_sha256",
-    );
-    if (
-      expected.discovery_contract_sha256 &&
-      observed.discovery_contract_sha256 !== expected.discovery_contract_sha256
-    ) {
-      throw new Error("exact package runtime discovery contract does not match its authenticated receipt");
+    if (expected.discovery_contract_sha256) {
+      observed.discovery_contract_sha256 = normalizeExternalSha256(
+        observed.discovery_contract_sha256,
+        "runtime discovery_contract_sha256",
+      );
+      if (observed.discovery_contract_sha256 !== expected.discovery_contract_sha256) {
+        throw new Error("exact package runtime discovery contract does not match its authenticated receipt");
+      }
+    } else if (observed.discovery_contract_sha256 !== null) {
+      throw new Error("legacy exact package unexpectedly declared a discovery contract digest");
     }
     return observed;
   } catch (error) {
@@ -10110,6 +10111,10 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : currentSourcePackageVersion;
     const expectedSchema = arm === "published_0_17_4" ? 2 : 3;
     const expectedProtocol = arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25";
+    const invalidDiscoveryIdentity = arm === "published_0_17_4"
+      ? reference?.discovery_contract_sha256 !== null
+      : !SHA256_PATTERN.test(String(reference?.discovery_contract_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.discovery_contract_sha256 ?? ""));
     const invalidReference =
       reference?.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT ||
       reference?.arm !== arm ||
@@ -10124,8 +10129,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       /^0{40}$/.test(String(reference?.source_tree ?? "")) ||
       reference?.schema_version !== expectedSchema ||
       reference?.protocol_revision !== expectedProtocol ||
-      !SHA256_PATTERN.test(String(reference?.discovery_contract_sha256 ?? "")) ||
-      /^0{64}$/.test(String(reference?.discovery_contract_sha256 ?? "")) ||
+      invalidDiscoveryIdentity ||
       reference?.trust_root_kind !== (arm === "published_0_17_4"
         ? "official_published_checksum"
         : "immutable_candidate_receipt") ||

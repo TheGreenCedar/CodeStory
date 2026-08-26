@@ -283,7 +283,7 @@ function exactCandidateRows() {
                 source_tree: (arm === "published_0_17_4" ? "1" : "2").repeat(40),
                 schema_version: arm === "published_0_17_4" ? 2 : 3,
                 protocol_revision: arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25",
-                discovery_contract_sha256: (arm === "published_0_17_4" ? "3" : "4").repeat(64),
+                discovery_contract_sha256: arm === "published_0_17_4" ? null : "4".repeat(64),
                 trust_root_kind: arm === "published_0_17_4"
                   ? "official_published_checksum"
                   : "immutable_candidate_receipt",
@@ -524,7 +524,7 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-three-arm-receipt-"));
   try {
     const published = await makeExactArchive(root, "published", {
-      version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
+      version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
     });
     const candidate = await makeExactArchive(root, "candidate", {
       version: "0.17.4", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
@@ -563,6 +563,7 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
     const accepted = await run(baseReceipt);
     assert.equal(accepted.packages.get("published_0_17_4").package_sha256, published.sha256);
     assert.equal(accepted.packages.get("published_0_17_4").protocol_revision, "2024-11-05");
+    assert.equal(accepted.packages.get("published_0_17_4").discovery_contract_sha256, null);
     assert.equal(accepted.packages.get("candidate_0_18").package_sha256, candidate.sha256);
     assert.match(accepted.packages.get("candidate_0_18").cli_path, /state-/);
 
@@ -653,13 +654,13 @@ test("exact input ingestion makes every caller path irrelevant before parsing ex
     try {
       const marker = path.join(root, "substituted-cli-executed");
       const published = await makeExactArchive(root, "published-original", {
-        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
+        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
       });
       const candidate = await makeExactArchive(root, "candidate-original", {
         version: "0.17.4", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
       });
       const publishedSubstitute = await makeExactArchive(root, "published-substitute", {
-        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
+        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
         executionMarker: marker,
       });
       const candidateSubstitute = await makeExactArchive(root, "candidate-substitute", {
@@ -794,6 +795,12 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     }, /unauthorized direct source read/i],
     ["identity", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").package_identity.cli_sha256 = "0".repeat(64);
+    }, /candidate package identity mismatch/i],
+    ["fabricated legacy discovery identity", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").package_identity.discovery_contract_sha256 = "9".repeat(64);
+    }, /published package identity mismatch/i],
+    ["missing candidate discovery identity", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").package_identity.discovery_contract_sha256 = null;
     }, /candidate package identity mismatch/i],
     ["accounting", (rows) => {
       delete rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.tool_categories;
