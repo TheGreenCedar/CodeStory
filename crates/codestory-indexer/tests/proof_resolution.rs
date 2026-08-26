@@ -1496,6 +1496,190 @@ fn csharp_swift_and_dart_incomplete_domains_never_emit_exact_facts() -> anyhow::
 }
 
 #[test]
+fn csharp_swift_and_dart_canonical_fixture_layouts_replay_exactly() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "csharp",
+            "src/AutoMapper/Mapper.cs",
+            "namespace AutoMapper; public static class Mapper { public static void Map() {} public static void Caller() { Map(); } }\n",
+            "Map",
+        ),
+        (
+            "swift",
+            "Source/Session.swift",
+            "func request() {}\nfunc caller() { request() }\n",
+            "request",
+        ),
+        (
+            "dart",
+            "pkgs/http/lib/http.dart",
+            "void get() {}\nvoid caller() { get(); }\n",
+            "get",
+        ),
+    ];
+    for (language, path, source, target) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        assert!(
+            facts.iter().any(|fact| {
+                fact.provenance.language_adapter == language
+                    && fact.callsite.raw_target == target
+                    && fact.status == ProofResolutionStatus::Exact
+            }),
+            "{language} canonical fixture layout was not replay-exact: {facts:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn dart_exact_dispatch_requires_a_closed_same_library_override_domain() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "subtype_override",
+            vec![
+                (
+                    "lib/worker.dart",
+                    "final class Worker { void target() {} }\nfinal class Derived extends Worker { @override void target() {} }\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'worker.dart';\nvoid caller(Worker worker) { worker.target(); }\n",
+                ),
+            ],
+            false,
+        ),
+        (
+            "direct_exact_construction",
+            vec![(
+                "lib/caller.dart",
+                "class Worker { void target() {} }\nvoid caller() { final worker = Worker(); worker.target(); }\n",
+            )],
+            true,
+        ),
+        (
+            "externally_extensible_typed_parameter",
+            vec![(
+                "lib/caller.dart",
+                "class Worker { void target() {} }\nvoid caller(Worker worker) { worker.target(); }\n",
+            )],
+            false,
+        ),
+    ];
+    for (name, files, should_be_exact) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let exact = facts.iter().any(|fact| {
+            fact.provenance.language_adapter == "dart"
+                && fact.callsite.raw_target == "target"
+                && fact.status == ProofResolutionStatus::Exact
+        });
+        assert_eq!(exact, should_be_exact, "{name}: {facts:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn dart_combinators_and_swift_visibility_are_replay_authoritative() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "dart_hide",
+            "dart",
+            vec![
+                (
+                    "lib/worker.dart",
+                    "void hiddenTarget() {}\nfinal class Worker {}\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'worker.dart' hide hiddenTarget;\nvoid caller() { hiddenTarget(); }\n",
+                ),
+            ],
+            "hiddenTarget",
+        ),
+        (
+            "swift_internal_member",
+            "swift",
+            vec![
+                (
+                    "Sources/WorkerModule/Worker.swift",
+                    "public struct Worker { func target() {} }\n",
+                ),
+                (
+                    "Sources/App/Caller.swift",
+                    "import WorkerModule\nfunc caller() { Worker().target() }\n",
+                ),
+            ],
+            "target",
+        ),
+    ];
+    for (name, language, files, target) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        assert!(
+            facts.iter().filter(|fact| {
+                fact.provenance.language_adapter == language
+                    && fact.callsite.raw_target == target
+            }).all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "{name} bypassed import/access visibility: {facts:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn csharp_swift_and_dart_cache_blob_semantics_are_not_self_authenticating() -> anyhow::Result<()> {
+    for mutation in ["binding", "poison", "domain", "import"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    "Sources/WorkerModule/Worker.swift",
+                    "public struct Worker { public func target() {} }\n",
+                ),
+                (
+                    "Sources/App/Caller.swift",
+                    "import WorkerModule\nfunc caller() { Worker().target() }\n",
+                ),
+            ],
+        )?;
+        let (path, blob): (String, Vec<u8>) = store.get_connection().query_row(
+            "SELECT file_path, artifact_blob FROM index_artifact_cache WHERE file_path LIKE '%Caller.swift'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut artifact: serde_json::Value = serde_json::from_slice(&blob)?;
+        match mutation {
+            "binding" => artifact["call_resolution_inputs"][0]["binding"]["kind"] = "unsupported".into(),
+            "poison" => artifact["resolution_file"]["export_poison_all"] = true.into(),
+            "domain" => artifact["resolution_file"]["java_kotlin_package"] = "ForgedModule".into(),
+            "import" => artifact["call_resolution_inputs"][0]["binding"]["package_name"] = "ForgedModule".into(),
+            _ => unreachable!(),
+        }
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE file_path = ?2",
+            (serde_json::to_vec(&artifact)?, path),
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))
+            .expect_err("CSD semantic cache BLOB mutation must fail closed");
+    }
+    Ok(())
+}
+
+#[test]
 fn ruby_and_php_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow::Result<()> {
     let cases = [
         (
