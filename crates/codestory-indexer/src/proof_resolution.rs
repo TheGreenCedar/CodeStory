@@ -35,6 +35,63 @@ thread_local! {
     static RUBY_PHP_RESOLUTION_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BashResolutionWork {
+    pub preparation: usize,
+    pub cache_reauthentication: usize,
+    pub projection: usize,
+    pub graph_correlation: usize,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static BASH_RESOLUTION_WORK: std::cell::Cell<BashResolutionWork> = const {
+        std::cell::Cell::new(BashResolutionWork {
+            preparation: 0,
+            cache_reauthentication: 0,
+            projection: 0,
+            graph_correlation: 0,
+        })
+    };
+}
+
+#[derive(Clone, Copy)]
+enum BashResolutionPhase {
+    Preparation,
+    CacheReauthentication,
+    Projection,
+    GraphCorrelation,
+}
+
+#[inline]
+fn count_bash_resolution_work(phase: BashResolutionPhase, amount: usize) {
+    #[cfg(debug_assertions)]
+    BASH_RESOLUTION_WORK.with(|work| {
+        let mut value = work.get();
+        let slot = match phase {
+            BashResolutionPhase::Preparation => &mut value.preparation,
+            BashResolutionPhase::CacheReauthentication => &mut value.cache_reauthentication,
+            BashResolutionPhase::Projection => &mut value.projection,
+            BashResolutionPhase::GraphCorrelation => &mut value.graph_correlation,
+        };
+        *slot = slot.saturating_add(amount);
+        work.set(value);
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = (phase, amount);
+}
+
+#[cfg(debug_assertions)]
+pub fn reset_bash_resolution_work() {
+    BASH_RESOLUTION_WORK.set(BashResolutionWork::default());
+}
+
+#[cfg(debug_assertions)]
+pub fn bash_resolution_work() -> BashResolutionWork {
+    BASH_RESOLUTION_WORK.get()
+}
+
 #[cfg(test)]
 static JAVA_KOTLIN_RESOLUTION_WORK: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -824,6 +881,13 @@ struct BashResolutionProducer<'a, 'tree> {
     dynamic_domain_unsupported: bool,
 }
 
+enum BashCommandEffect {
+    None,
+    IncompleteDomain,
+    Unsupported,
+    InvalidatesFunctions(Vec<String>),
+}
+
 impl<'tree> BashResolutionIndex<'tree> {
     fn build(tree: &'tree Tree, source: &str, file_id: NodeId, nodes: &[Node]) -> Self {
         let mut graph_functions = HashMap::<(u32, String), Vec<NodeId>>::new();
@@ -831,13 +895,13 @@ impl<'tree> BashResolutionIndex<'tree> {
             .iter()
             .filter(|node| node.file_node_id == Some(file_id) && node.kind == NodeKind::FUNCTION)
         {
-            count_ruby_php_resolution_work(1);
+            count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
             if let Some(line) = node.start_line {
                 graph_functions
                     .entry((line, graph_leaf_name(&node.serialized_name).to_string()))
                     .or_default()
                     .push(node.id);
-                count_ruby_php_resolution_work(1);
+                count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
             }
         }
         let mut producer = BashResolutionProducer {
@@ -876,7 +940,7 @@ impl<'tree> BashResolutionIndex<'tree> {
 
 impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
     fn visit(&mut self, node: TsNode<'tree>, caller: Option<NodeId>, file_scope: bool) {
-        count_ruby_php_resolution_work(1);
+        count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
         let mut child_caller = caller;
         if node.kind() == "function_definition" {
             let name = node
@@ -895,7 +959,7 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
                             module_path: Vec::new(),
                             cross_module_visible: false,
                         });
-                        count_ruby_php_resolution_work(1);
+                        count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
                         self.declarations_by_name
                             .entry(name)
                             .or_default()
@@ -903,27 +967,34 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
                                 declaration,
                                 start_byte: node.start_byte(),
                             });
-                        count_ruby_php_resolution_work(1);
+                        count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
                     } else {
                         self.poisoned_definition_names.insert(name);
-                        count_ruby_php_resolution_work(1);
+                        count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
                     }
                 } else {
                     self.poisoned_definition_names.insert(name);
-                    count_ruby_php_resolution_work(1);
+                    count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
                 }
             }
-        } else if node.kind() == "command"
+        } else if matches!(node.kind(), "command" | "unset_command") {
+            match bash_command_effect(node, self.source) {
+                BashCommandEffect::None => {}
+                BashCommandEffect::IncompleteDomain => self.source_domain_incomplete = true,
+                BashCommandEffect::Unsupported => self.dynamic_domain_unsupported = true,
+                BashCommandEffect::InvalidatesFunctions(names) => {
+                    for name in names {
+                        count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
+                        self.poisoned_definition_names.insert(name);
+                    }
+                }
+            }
+        }
+        if node.kind() == "command"
             && let Some(callee) = bash_command_callee(node)
             && let Some(raw_target) = node_text(callee, self.source).map(str::to_string)
         {
             let literal = bash_literal_command_name(callee, &raw_target);
-            if matches!(literal, Some("source" | ".")) {
-                self.source_domain_incomplete = true;
-            }
-            if matches!(literal, Some("alias" | "eval")) {
-                self.dynamic_domain_unsupported = true;
-            }
             self.calls.push(IndexedBashCall {
                 callee,
                 form: if literal.is_some() {
@@ -935,7 +1006,7 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
                 caller,
                 binding: CachedResolutionBinding::MissingBinding,
             });
-            count_ruby_php_resolution_work(1);
+            count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
         }
 
         let direct_program_child = node.kind() == "program";
@@ -946,7 +1017,7 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
     }
 
     fn unique_graph_function(&self, line: u32, name: &str) -> Option<NodeId> {
-        count_ruby_php_resolution_work(1);
+        count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
         let candidates = self
             .graph_functions
             .get(&(line, name.to_string()))
@@ -960,7 +1031,7 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
 
     fn finish(mut self) -> BashResolutionIndex<'tree> {
         for call in &mut self.calls {
-            count_ruby_php_resolution_work(1);
+            count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
             call.binding = if call.caller.is_none()
                 || call.form != CalleeForm::Identifier
                 || self.dynamic_domain_unsupported
@@ -998,7 +1069,7 @@ impl<'a, 'tree> BashResolutionProducer<'a, 'tree> {
             .iter()
             .enumerate()
             .map(|(index, call)| {
-                count_ruby_php_resolution_work(1);
+                count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
                 ((call.callee.start_byte(), call.callee.end_byte()), index)
             })
             .collect();
@@ -1022,6 +1093,120 @@ fn bash_command_callee(command: TsNode<'_>) -> Option<TsNode<'_>> {
 fn bash_literal_command_name<'a>(callee: TsNode<'_>, raw_target: &'a str) -> Option<&'a str> {
     (callee.kind() == "word" && callee.named_child_count() == 0 && !raw_target.is_empty())
         .then_some(raw_target)
+}
+
+fn bash_command_effect(command: TsNode<'_>, source: &str) -> BashCommandEffect {
+    if command.kind() == "unset_command" {
+        let mut cursor = command.walk();
+        let arguments = command.named_children(&mut cursor).collect::<Vec<_>>();
+        return bash_unset_effect(&arguments, source);
+    }
+    if command.kind() != "command" {
+        return BashCommandEffect::None;
+    }
+    let Some(callee) = bash_command_callee(command) else {
+        return BashCommandEffect::None;
+    };
+    let Some(mut effective) = bash_literal_node_text(callee, source) else {
+        return BashCommandEffect::None;
+    };
+    let mut cursor = command.walk();
+    let arguments = command
+        .children_by_field_name("argument", &mut cursor)
+        .collect::<Vec<_>>();
+    let mut argument_index = 0;
+    while matches!(effective, "builtin" | "command") {
+        let Some(argument) = arguments.get(argument_index).copied() else {
+            return BashCommandEffect::Unsupported;
+        };
+        let Some(next) = bash_literal_node_text(argument, source) else {
+            return BashCommandEffect::Unsupported;
+        };
+        argument_index += 1;
+        if next == "--" {
+            let Some(argument) = arguments.get(argument_index).copied() else {
+                return BashCommandEffect::Unsupported;
+            };
+            let Some(next_after_options) = bash_literal_node_text(argument, source) else {
+                return BashCommandEffect::Unsupported;
+            };
+            argument_index += 1;
+            effective = next_after_options;
+        } else if next.starts_with('-') {
+            return BashCommandEffect::Unsupported;
+        } else {
+            effective = next;
+        }
+        count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
+    }
+    match effective {
+        "source" | "." => BashCommandEffect::IncompleteDomain,
+        "eval" | "alias" => BashCommandEffect::Unsupported,
+        "unset" => bash_unset_effect(&arguments[argument_index..], source),
+        _ => BashCommandEffect::None,
+    }
+}
+
+fn bash_unset_effect(arguments: &[TsNode<'_>], source: &str) -> BashCommandEffect {
+    let mut function_mode = false;
+    let mut names_started = false;
+    let mut names = Vec::new();
+    for argument in arguments {
+        count_bash_resolution_work(BashResolutionPhase::Preparation, 1);
+        let literal = bash_literal_node_text(*argument, source);
+        if !names_started {
+            match literal {
+                Some("--") => {
+                    names_started = true;
+                    continue;
+                }
+                Some("--function") => {
+                    function_mode = true;
+                    continue;
+                }
+                Some(option) if option.starts_with('-') && option.len() > 1 => {
+                    if option[1..]
+                        .chars()
+                        .all(|flag| matches!(flag, 'f' | 'v' | 'n'))
+                    {
+                        function_mode |= option[1..].contains('f');
+                        continue;
+                    }
+                    return BashCommandEffect::Unsupported;
+                }
+                _ => names_started = true,
+            }
+        }
+        if !function_mode {
+            continue;
+        }
+        let Some(name) = literal.filter(|name| bash_function_identifier(name)) else {
+            return BashCommandEffect::Unsupported;
+        };
+        names.push(name.to_owned());
+    }
+    if !function_mode {
+        BashCommandEffect::None
+    } else if names.is_empty() {
+        BashCommandEffect::Unsupported
+    } else {
+        BashCommandEffect::InvalidatesFunctions(names)
+    }
+}
+
+fn bash_literal_node_text<'a>(node: TsNode<'_>, source: &'a str) -> Option<&'a str> {
+    matches!(node.kind(), "word" | "variable_name")
+        .then(|| node_text(node, source))
+        .flatten()
+        .filter(|text| !text.is_empty())
+}
+
+fn bash_function_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 struct RubyResolutionIndex<'tree> {
@@ -12988,9 +13173,17 @@ pub fn rematerialize_proof_resolution_projection(
                 .is_some_and(|file| semantic_cache_requires_source_reauthentication(&file.language))
         })
     }) {
-        count_java_kotlin_resolution_work(1);
+        let file_id = node
+            .file_node_id
+            .expect("filtered semantic node has file")
+            .0;
+        if file_by_id[&file_id].language == "bash" {
+            count_bash_resolution_work(BashResolutionPhase::CacheReauthentication, 1);
+        } else {
+            count_java_kotlin_resolution_work(1);
+        }
         csd_nodes_by_file
-            .entry(node.file_node_id.expect("filtered CSD node has file").0)
+            .entry(file_id)
             .or_default()
             .push(node.clone());
     }
@@ -13182,6 +13375,12 @@ pub fn rematerialize_proof_resolution_projection(
                     indexed_file.path.display()
                 )
             })?;
+            if indexed_file.language == "bash" {
+                count_bash_resolution_work(
+                    BashResolutionPhase::CacheReauthentication,
+                    source_bytes.len().saturating_add(1),
+                );
+            }
             if source_content_hash(&source_bytes) != *stored_hash {
                 return Err(anyhow!(
                     "proof resolution semantic cache source drifted for {}",
@@ -13248,7 +13447,11 @@ pub fn rematerialize_proof_resolution_projection(
                 record.file.language.as_str(),
                 "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
             ) {
-                count_ruby_php_resolution_work(1);
+                if record.file.language == "bash" {
+                    count_bash_resolution_work(BashResolutionPhase::Projection, 1);
+                } else {
+                    count_ruby_php_resolution_work(1);
+                }
                 linear_records.push(record);
                 None
             } else {
@@ -13279,7 +13482,11 @@ pub fn rematerialize_proof_resolution_projection(
                 record.file.language.as_str(),
                 "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
             ) {
-                count_ruby_php_resolution_work(1);
+                if record.file.language == "bash" {
+                    count_bash_resolution_work(BashResolutionPhase::Projection, 1);
+                } else {
+                    count_ruby_php_resolution_work(1);
+                }
                 linear_inputs.push((record, call));
                 None
             } else {
@@ -13307,7 +13514,11 @@ pub fn rematerialize_proof_resolution_projection(
             input.language.as_str(),
             "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
         ) {
-            count_ruby_php_resolution_work(1);
+            if input.language == "bash" {
+                count_bash_resolution_work(BashResolutionPhase::Projection, 1);
+            } else {
+                count_ruby_php_resolution_work(1);
+            }
         }
         !callsite_members.insert((
             input.callsite.file_id,
@@ -13339,6 +13550,18 @@ pub fn rematerialize_proof_resolution_projection(
         .into_iter()
         .map(|(source_record, input)| resolve_syntax_claim(&claim_indexes, source_record, input))
         .collect::<Result<Vec<_>>>()?;
+    let bash_claim_count = claims
+        .iter()
+        .filter(|claim| claim.input.language == "bash")
+        .count();
+    if bash_claim_count > 0 {
+        count_bash_resolution_work(
+            BashResolutionPhase::GraphCorrelation,
+            bash_claim_count
+                .saturating_add(edges.len())
+                .saturating_add(1),
+        );
+    }
     enforce_go_exact_callable_ownership(&mut claims, &nodes);
     enforce_exact_dependency_eligibility(
         &mut claims,
@@ -13518,6 +13741,10 @@ pub fn rematerialize_proof_resolution_projection(
     }
     let mut facts = Vec::with_capacity(claims.len());
     for (claim_index, correlation) in claim_correlations.into_iter().enumerate() {
+        if claims[claim_index].input.language == "bash" {
+            count_bash_resolution_work(BashResolutionPhase::Projection, 1);
+            count_bash_resolution_work(BashResolutionPhase::GraphCorrelation, 1);
+        }
         facts.push(seal_resolved_claim(
             &file_content_hash_by_id,
             &node_by_id,
@@ -17388,6 +17615,9 @@ fn resolve_syntax_claim(
     source_record: &ResolutionCacheRecord,
     input: CachedCallResolutionInput,
 ) -> Result<ResolvedSyntaxClaim> {
+    if input.language == "bash" {
+        count_bash_resolution_work(BashResolutionPhase::Projection, 1);
+    }
     let files = indexes.files;
     let records = indexes.records;
     let rust_index = indexes.rust;
@@ -18843,7 +19073,9 @@ fn seal_resolved_claim(
         if dependency_members.insert(file_id) {
             dependency_ids.push(file_id);
         }
-        if linear_dependency_order {
+        if input.language == "bash" {
+            count_bash_resolution_work(BashResolutionPhase::Projection, 1);
+        } else if linear_dependency_order {
             count_ruby_php_resolution_work(1);
         }
     };
@@ -18924,7 +19156,9 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
             fact.provenance.language_adapter.as_str(),
             "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
         ) {
-            if is_csharp_swift_dart_language(&fact.provenance.language_adapter) {
+            if fact.provenance.language_adapter == "bash" {
+                count_bash_resolution_work(BashResolutionPhase::Projection, 1);
+            } else if is_csharp_swift_dart_language(&fact.provenance.language_adapter) {
                 count_java_kotlin_resolution_work(1);
             } else {
                 count_ruby_php_resolution_work(1);
@@ -18989,7 +19223,9 @@ pub fn build_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRo
                 Some(ResolutionEvidenceKind::StaticImportBinding),
             ] {
                 let key = (language.to_owned(), Some(callee_form), evidence_kind);
-                if is_csharp_swift_dart_language(language) {
+                if language == "bash" {
+                    count_bash_resolution_work(BashResolutionPhase::Projection, 1);
+                } else if is_csharp_swift_dart_language(language) {
                     count_java_kotlin_resolution_work(1);
                 } else {
                     count_ruby_php_resolution_work(1);
@@ -19223,6 +19459,7 @@ mod bash_complexity_tests {
             .set_language(&tree_sitter_bash::LANGUAGE.into())
             .expect("Bash grammar");
         let tree = parser.parse(&source, None).expect("Bash source");
+        reset_bash_resolution_work();
         reset_ruby_php_resolution_work();
         let index = BashResolutionIndex::build(&tree, &source, NodeId(1), &nodes);
         assert_eq!(
@@ -19233,7 +19470,12 @@ mod bash_complexity_tests {
                 .count(),
             functions
         );
-        ruby_php_resolution_work()
+        assert_eq!(
+            ruby_php_resolution_work(),
+            0,
+            "Bash work leaked into the Ruby/PHP counter"
+        );
+        bash_resolution_work().preparation
     }
 
     #[test]

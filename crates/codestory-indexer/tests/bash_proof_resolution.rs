@@ -301,6 +301,18 @@ fn bash_command_effect_matrix_closes_wrappers_unset_and_control_flow() -> anyhow
             reason: ProofResolutionReason::LookupDomainIncomplete,
         },
         Case {
+            name: "command_source",
+            source: "command source ./other.sh\ntarget() { :; }\ncaller() { target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
+            name: "builtin_dot",
+            source: "builtin . ./other.sh\ntarget() { :; }\ncaller() { target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
             name: "command_dot",
             source: "command . ./other.sh\ntarget() { :; }\ncaller() { target; }\n",
             expected: ProofResolutionStatus::IncompleteDomain,
@@ -309,6 +321,18 @@ fn bash_command_effect_matrix_closes_wrappers_unset_and_control_flow() -> anyhow
         Case {
             name: "builtin_eval",
             source: "target() { :; }\ncaller() { builtin eval 'target() { false; }'; target; }\n",
+            expected: ProofResolutionStatus::Unsupported,
+            reason: ProofResolutionReason::UnsupportedConstruct,
+        },
+        Case {
+            name: "command_eval",
+            source: "target() { :; }\ncaller() { command eval 'target() { false; }'; target; }\n",
+            expected: ProofResolutionStatus::Unsupported,
+            reason: ProofResolutionReason::UnsupportedConstruct,
+        },
+        Case {
+            name: "builtin_alias",
+            source: "builtin alias target='printf replaced'\ntarget() { :; }\ncaller() { target; }\n",
             expected: ProofResolutionStatus::Unsupported,
             reason: ProofResolutionReason::UnsupportedConstruct,
         },
@@ -343,6 +367,12 @@ fn bash_command_effect_matrix_closes_wrappers_unset_and_control_flow() -> anyhow
             reason: ProofResolutionReason::LookupDomainIncomplete,
         },
         Case {
+            name: "command_wrapped_literal_unset",
+            source: "target() { :; }\ncaller() { command unset --function target; target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
             name: "dynamic_unset_name",
             source: "target() { :; }\ncaller() { name=target; unset -f \"$name\"; target; }\n",
             expected: ProofResolutionStatus::Unsupported,
@@ -351,6 +381,12 @@ fn bash_command_effect_matrix_closes_wrappers_unset_and_control_flow() -> anyhow
         Case {
             name: "wrapped_dynamic_unset_name",
             source: "target() { :; }\ncaller() { name=target; command unset --function \"$name\"; target; }\n",
+            expected: ProofResolutionStatus::Unsupported,
+            reason: ProofResolutionReason::UnsupportedConstruct,
+        },
+        Case {
+            name: "builtin_wrapped_dynamic_unset_name",
+            source: "target() { :; }\ncaller() { name=target; builtin unset -f \"$name\"; target; }\n",
             expected: ProofResolutionStatus::Unsupported,
             reason: ProofResolutionReason::UnsupportedConstruct,
         },
@@ -389,9 +425,9 @@ fn bash_command_effect_matrix_closes_wrappers_unset_and_control_flow() -> anyhow
         let target = store
             .get_proof_resolution_facts()?
             .into_iter()
-            .filter(|fact| fact.provenance.language_adapter == "bash")
-            .filter(|fact| fact.callsite.raw_target == "target")
-            .last()
+            .rfind(|fact| {
+                fact.provenance.language_adapter == "bash" && fact.callsite.raw_target == "target"
+            })
             .unwrap_or_else(|| panic!("{} emitted no target call fact", case.name));
         assert_eq!(target.status, case.expected, "{}: {target:#?}", case.name);
         assert_eq!(target.reason, case.reason, "{}: {target:#?}", case.name);
@@ -412,7 +448,11 @@ fn bash_command_effect_matrix_closes_wrappers_unset_and_control_flow() -> anyhow
         } else {
             assert!(target.target.is_none(), "{}: {target:#?}", case.name);
             assert!(target.edge_id.is_none(), "{}: {target:#?}", case.name);
-            assert!(target.evidence_chain.is_empty(), "{}: {target:#?}", case.name);
+            assert!(
+                target.evidence_chain.is_empty(),
+                "{}: {target:#?}",
+                case.name
+            );
         }
     }
     Ok(())
@@ -572,9 +612,7 @@ fn bash_growth_sources(axis: BashGrowthAxis, size: usize) -> Vec<(String, String
             .map(|index| {
                 (
                     format!("proof_{index}.sh"),
-                    format!(
-                        "target_{index}() {{ :; }}\ncaller_{index}() {{ target_{index}; }}\n"
-                    ),
+                    format!("target_{index}() {{ :; }}\ncaller_{index}() {{ target_{index}; }}\n"),
                 )
             })
             .collect(),
@@ -661,7 +699,8 @@ fn bash_full_pipeline_work(
 }
 
 #[test]
-fn bash_full_proof_pipeline_work_is_phase_complete_and_linear_on_every_axis() -> anyhow::Result<()> {
+fn bash_full_proof_pipeline_work_is_phase_complete_and_linear_on_every_axis() -> anyhow::Result<()>
+{
     for axis in [
         BashGrowthAxis::Files,
         BashGrowthAxis::Declarations,

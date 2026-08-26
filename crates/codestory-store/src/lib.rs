@@ -53,7 +53,10 @@ pub use storage_impl::{
     structural_text_unit_digest,
 };
 #[cfg(debug_assertions)]
-pub use storage_impl::{reset_store_replay_work, store_replay_work};
+pub use storage_impl::{
+    BashStoreResolutionWork, bash_store_resolution_work, reset_bash_store_resolution_work,
+    reset_store_replay_work, store_replay_work,
+};
 
 impl Store {
     /// Access stored file inventory used by workspace refresh planning.

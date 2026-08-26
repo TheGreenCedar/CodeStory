@@ -18,6 +18,63 @@ thread_local! {
     static STORE_REPLAY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BashStoreResolutionWork {
+    pub sealing: usize,
+    pub validation: usize,
+    pub replay: usize,
+    pub publication: usize,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static BASH_STORE_RESOLUTION_WORK: std::cell::Cell<BashStoreResolutionWork> = const {
+        std::cell::Cell::new(BashStoreResolutionWork {
+            sealing: 0,
+            validation: 0,
+            replay: 0,
+            publication: 0,
+        })
+    };
+}
+
+#[derive(Clone, Copy)]
+enum BashStoreResolutionPhase {
+    Sealing,
+    Validation,
+    Replay,
+    Publication,
+}
+
+#[inline]
+fn count_bash_store_resolution_work(phase: BashStoreResolutionPhase, amount: usize) {
+    #[cfg(debug_assertions)]
+    BASH_STORE_RESOLUTION_WORK.with(|work| {
+        let mut value = work.get();
+        let slot = match phase {
+            BashStoreResolutionPhase::Sealing => &mut value.sealing,
+            BashStoreResolutionPhase::Validation => &mut value.validation,
+            BashStoreResolutionPhase::Replay => &mut value.replay,
+            BashStoreResolutionPhase::Publication => &mut value.publication,
+        };
+        *slot = slot.saturating_add(amount);
+        work.set(value);
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = (phase, amount);
+}
+
+#[cfg(debug_assertions)]
+pub fn reset_bash_store_resolution_work() {
+    BASH_STORE_RESOLUTION_WORK.set(BashStoreResolutionWork::default());
+}
+
+#[cfg(debug_assertions)]
+pub fn bash_store_resolution_work() -> BashStoreResolutionWork {
+    BASH_STORE_RESOLUTION_WORK.get()
+}
+
 #[inline]
 fn count_store_replay_work(amount: usize) {
     #[cfg(debug_assertions)]
@@ -78,6 +135,10 @@ pub struct ProofResolutionPublication {
 pub fn seal_call_resolution_fact(
     mut fact: CallResolutionFact,
 ) -> Result<CallResolutionFact, StorageError> {
+    let bash_fact = fact.provenance.language_adapter == "bash";
+    if bash_fact {
+        count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
+    }
     let linear_dependency_order = matches!(
         fact.provenance.language_adapter.as_str(),
         "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
@@ -91,7 +152,11 @@ pub fn seal_call_resolution_fact(
             .dependency_file_hashes
             .iter()
             .all(|dependency| {
-                count_store_replay_work(1);
+                if bash_fact {
+                    count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
+                } else {
+                    count_store_replay_work(1);
+                }
                 members.insert(dependency.file_id)
             })
     } else {
@@ -156,6 +221,10 @@ where
 }
 
 fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<(), StorageError> {
+    let bash_fact = fact.provenance.language_adapter == "bash";
+    if bash_fact {
+        count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
+    }
     let linear_dependency_order = matches!(
         fact.provenance.language_adapter.as_str(),
         "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
@@ -166,7 +235,11 @@ fn validate_fact_shape(fact: &CallResolutionFact, require_seal: bool) -> Result<
             .dependency_file_hashes
             .iter()
             .all(|dependency| {
-                count_store_replay_work(1);
+                if bash_fact {
+                    count_bash_store_resolution_work(BashStoreResolutionPhase::Sealing, 1);
+                } else {
+                    count_store_replay_work(1);
+                }
                 members.insert(dependency.file_id)
             })
     } else {
@@ -2746,7 +2819,7 @@ impl Storage {
                 parse_canonical_json(&evidence_json, "evidence").map_err(proof_error)?;
             let dependency_file_hashes: Vec<DependencyFileHash> =
                 parse_canonical_json(&dependency_json, "dependency").map_err(proof_error)?;
-            facts.push(CallResolutionFact {
+            let fact = CallResolutionFact {
                 fact_id: row.get(0)?,
                 edge_id: row.get::<_, Option<i64>>(1)?.map(EdgeId),
                 raw_edge_target: row.get::<_, Option<i64>>(2)?.map(NodeId),
@@ -2789,7 +2862,17 @@ impl Storage {
                     dependency_file_hashes,
                     evidence_sha256: row.get(25)?,
                 },
-            });
+            };
+            if fact.provenance.language_adapter == "bash" {
+                count_bash_store_resolution_work(
+                    BashStoreResolutionPhase::Replay,
+                    fact.evidence_chain
+                        .len()
+                        .saturating_add(fact.provenance.dependency_file_hashes.len())
+                        .saturating_add(1),
+                );
+            }
+            facts.push(fact);
         }
         Ok(facts)
     }
@@ -2800,6 +2883,15 @@ impl Storage {
         authenticate_live_go_sources: bool,
     ) -> Result<(), StorageError> {
         for fact in facts {
+            if fact.provenance.language_adapter == "bash" {
+                count_bash_store_resolution_work(
+                    BashStoreResolutionPhase::Validation,
+                    fact.evidence_chain
+                        .len()
+                        .saturating_add(fact.provenance.dependency_file_hashes.len())
+                        .saturating_add(1),
+                );
+            }
             validate_fact_seal(fact)?;
         }
         let context =
@@ -3986,7 +4078,11 @@ impl Storage {
                     fact.provenance.language_adapter.as_str(),
                     "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
                 ) {
-                    count_store_replay_work(1);
+                    if fact.provenance.language_adapter == "bash" {
+                        count_bash_store_resolution_work(BashStoreResolutionPhase::Publication, 1);
+                    } else {
+                        count_store_replay_work(1);
+                    }
                     linear_facts.push(fact.clone());
                     None
                 } else {
@@ -4047,7 +4143,11 @@ impl Storage {
                     row.language.as_str(),
                     "bash" | "ruby" | "php" | "csharp" | "swift" | "dart"
                 ) {
-                    count_store_replay_work(1);
+                    if row.language == "bash" {
+                        count_bash_store_resolution_work(BashStoreResolutionPhase::Publication, 1);
+                    } else {
+                        count_store_replay_work(1);
+                    }
                     linear_funnel.push(row.clone());
                     None
                 } else {
@@ -4113,6 +4213,15 @@ impl Storage {
                  )",
             )?;
             for fact in &facts {
+                if fact.provenance.language_adapter == "bash" {
+                    count_bash_store_resolution_work(
+                        BashStoreResolutionPhase::Publication,
+                        fact.evidence_chain
+                            .len()
+                            .saturating_add(fact.provenance.dependency_file_hashes.len())
+                            .saturating_add(1),
+                    );
+                }
                 let evidence_json =
                     serde_json::to_string(&fact.evidence_chain).map_err(|error| {
                         proof_error(format!("failed to serialize typed evidence: {error}"))
@@ -4225,6 +4334,9 @@ impl Storage {
             ));
         }
         for fact in &facts {
+            if fact.provenance.language_adapter == "bash" {
+                count_bash_store_resolution_work(BashStoreResolutionPhase::Replay, 1);
+            }
             validate_fact_seal(fact)?;
         }
         Ok((manifest, facts))
