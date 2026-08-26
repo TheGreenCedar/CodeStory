@@ -15,10 +15,16 @@ const PROOF_DISPOSITIONS = new Set([
   "unknown",
   "unavailable",
 ]);
-const PROVE_CALL_PATH_INPUT_SCHEMA = JSON.parse(readFileSync(
+const GENERATED_MCP_CATALOG = JSON.parse(readFileSync(
   new URL("../plugins/codestory/generated-mcp-catalog.json", import.meta.url),
   "utf8",
-)).tools.find(({ name }) => name === "prove_call_path")?.inputSchema;
+));
+const ROUTING_CORPUS_DOCUMENT = JSON.parse(readFileSync(
+  new URL("./fixtures/codestory-agent-routing-corpus-v1.json", import.meta.url),
+  "utf8",
+));
+const GENERATED_TOOL_SCHEMAS = new Map(GENERATED_MCP_CATALOG.tools.map((tool) => [tool.name, tool]));
+const PROVE_CALL_PATH_INPUT_SCHEMA = GENERATED_TOOL_SCHEMAS.get("prove_call_path")?.inputSchema;
 const ROUTING_ACTIONS = Object.freeze([
   "source_read",
   "search",
@@ -156,7 +162,7 @@ export const ROUTING_SCENARIOS = deepFreeze([
     first: "packet",
     followups: ["source_read"],
     source: "packet_unavailable",
-    required: ["retrieval_unavailable", "source"],
+    required: ["output_budget_exceeded", "source"],
     forbidden: NO_PROOF_CLAIMS,
   }),
   scenario({
@@ -219,6 +225,64 @@ export const ROUTING_SCENARIOS = deepFreeze([
 ]);
 
 const SCENARIOS_BY_ID = new Map(ROUTING_SCENARIOS.map((entry) => [entry.id, entry]));
+
+export function validateRoutingRequestCorpus(document = ROUTING_CORPUS_DOCUMENT) {
+  requireExactKeys(document, ["schema_version", "scenarios"], "routing request corpus");
+  if (document.schema_version !== 1 || !Array.isArray(document.scenarios)) fail("routing request corpus is invalid");
+  const expectedIds = ROUTING_SCENARIOS.map(({ id }) => id);
+  const observedIds = document.scenarios.map(({ id }) => id);
+  if (!equalJson(observedIds, expectedIds) || new Set(observedIds).size !== expectedIds.length) {
+    fail("routing request corpus must contain each frozen scenario exactly once in canonical order");
+  }
+  document.scenarios.forEach((entry, index) => {
+    requireExactKeys(entry, ["id", "prompt", "request"], `routing request corpus scenario ${index}`);
+    if (!nonemptyString(entry.prompt) || !plainObject(entry.request)) fail(`routing request corpus scenario ${index} is invalid`);
+    requireExactKeys(
+      entry.request,
+      ["named_files", "selected_target", "gap_source_paths", "proof_contract"],
+      `routing request corpus scenario ${entry.id} request`,
+    );
+    if (!Array.isArray(entry.request.named_files) || !entry.request.named_files.every(nonemptyString)
+        || !Array.isArray(entry.request.gap_source_paths) || !entry.request.gap_source_paths.every(nonemptyString)
+        || !(entry.request.selected_target === null || nonemptyString(entry.request.selected_target))) {
+      fail(`routing request corpus scenario ${entry.id} request is invalid`);
+    }
+    const scenarioContract = SCENARIOS_BY_ID.get(entry.id);
+    if (scenarioContract.typed_contract === "forbidden" && entry.request.proof_contract !== null) {
+      fail(`${entry.id} must not contain a proof contract`);
+    }
+    if (["valid", "malformed"].includes(scenarioContract.typed_contract)) {
+      validateProofCallInputAgainstCatalog({ project: "/routing-fixture", ...entry.request.proof_contract });
+      const semanticallyValid = validTypedContract(entry.request.proof_contract);
+      if ((scenarioContract.typed_contract === "valid") !== semanticallyValid) {
+        fail(`${entry.id} proof contract does not match its declared semantic boundary`);
+      }
+    } else if (entry.request.proof_contract !== null) {
+      fail(`${entry.id} unexpectedly contains a proof contract`);
+    }
+  });
+  return true;
+}
+
+export const ROUTING_REQUEST_CORPUS = deepFreeze(structuredClone(ROUTING_CORPUS_DOCUMENT));
+
+const FINAL_REPORT_INSTRUCTION = `Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. Use null for absent scalar identities and [] for absent lists. Copy evidence, gap, reason, disposition, and refutation identities only from tool results. Never claim runtime execution or absence and never omit a material gap.`;
+
+export function materializeRoutingRequests(projectRoot) {
+  const project = realpathSync(projectRoot);
+  return ROUTING_REQUEST_CORPUS.scenarios.map((entry) => {
+    const proofInstruction = entry.request.proof_contract === null
+      ? ""
+      : `\nThe unchanged host-supplied proof contract is: ${JSON.stringify(entry.request.proof_contract)}`;
+    return {
+      scenario_id: entry.id,
+      request: {
+        ...structuredClone(entry.request),
+        text: `${entry.prompt}\nThe exact project root for repository work is ${project}.${proofInstruction}\n${FINAL_REPORT_INSTRUCTION}`,
+      },
+    };
+  });
+}
 
 export const STATIC_PARITY_HOSTS = deepFreeze({
   cursor: {
@@ -308,10 +372,15 @@ function equalJson(left, right) {
 }
 
 function matchesJsonSchema(value, schema) {
-  if (!plainObject(schema)) return false;
+  if (schema === true) return true;
+  if (schema === false || !plainObject(schema)) return false;
+  if (Array.isArray(schema.allOf) && !schema.allOf.every((candidate) => matchesJsonSchema(value, candidate))) return false;
+  if (Array.isArray(schema.anyOf) && !schema.anyOf.some((candidate) => matchesJsonSchema(value, candidate))) return false;
   if (Array.isArray(schema.oneOf)) {
     return schema.oneOf.filter((candidate) => matchesJsonSchema(value, candidate)).length === 1;
   }
+  if (plainObject(schema.not) && matchesJsonSchema(value, schema.not)) return false;
+  if (Object.hasOwn(schema, "const") && !equalJson(schema.const, value)) return false;
   if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => equalJson(candidate, value))) return false;
   const types = Array.isArray(schema.type) ? schema.type : [schema.type];
   if (schema.type !== undefined && !types.some((type) => {
@@ -323,6 +392,8 @@ function matchesJsonSchema(value, schema) {
     return typeof value === type;
   })) return false;
   if (typeof value === "string" && Number.isInteger(schema.minLength) && value.length < schema.minLength) return false;
+  if (typeof value === "string" && Number.isInteger(schema.maxLength) && value.length > schema.maxLength) return false;
+  if (typeof value === "string" && typeof schema.pattern === "string" && !new RegExp(schema.pattern, "u").test(value)) return false;
   if (typeof value === "number") {
     if (typeof schema.minimum === "number" && value < schema.minimum) return false;
     if (typeof schema.maximum === "number" && value > schema.maximum) return false;
@@ -330,10 +401,13 @@ function matchesJsonSchema(value, schema) {
   if (Array.isArray(value)) {
     if (Number.isInteger(schema.minItems) && value.length < schema.minItems) return false;
     if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) return false;
+    if (schema.uniqueItems === true && new Set(value.map(canonical)).size !== value.length) return false;
     if (plainObject(schema.items) && !value.every((item) => matchesJsonSchema(item, schema.items))) return false;
   }
   if (plainObject(value)) {
     const properties = plainObject(schema.properties) ? schema.properties : {};
+    if (Number.isInteger(schema.minProperties) && Object.keys(value).length < schema.minProperties) return false;
+    if (Number.isInteger(schema.maxProperties) && Object.keys(value).length > schema.maxProperties) return false;
     if (Array.isArray(schema.required) && schema.required.some((key) => !Object.hasOwn(value, key))) return false;
     if (schema.additionalProperties === false && Object.keys(value).some((key) => !Object.hasOwn(properties, key))) return false;
     for (const [key, child] of Object.entries(value)) {
@@ -820,10 +894,8 @@ function validateSourceReads(scenarioContract, request, actions, results) {
   const packet = actions.find((action) => action.kind === "packet");
   const body = packet ? results.get(packet)?.body : null;
   if (kind === "packet_evidence_gap") {
-    if (body?.status !== "no_useful_evidence") fail(`${scenarioContract.id} source read lacks a terminal packet evidence gap`);
-    const allowed = new Set(
-      (body?.gaps ?? []).flatMap((gap) => gap?.authorized_source_paths ?? []).map(normalizePath),
-    );
+    if (!Array.isArray(body?.gaps) || body.gaps.length === 0) fail(`${scenarioContract.id} source read lacks an explicit packet evidence gap`);
+    const allowed = new Set((request.gap_source_paths ?? []).map(normalizePath));
     for (const read of reads) {
       if (!allowed.has(read.path)) fail(`${scenarioContract.id} source read is not authorized by the packet evidence gap`);
     }
@@ -1159,71 +1231,101 @@ export function canonicalRequestContractDigest(contract) {
   return sha256Bytes(Buffer.concat([PROOF_CONTRACT_DIGEST_DOMAIN, Buffer.from(canonical(document))]));
 }
 
+function validateRequestIdentity(value, label) {
+  requireExactKeys(value, ["packet_id", "request_id", "question_sha256"], label);
+  if (!nonemptyString(value.packet_id) || !nonemptyString(value.request_id) || !SHA256.test(value.question_sha256)) {
+    fail(`${label} is invalid`);
+  }
+}
+
 function validatePublication(value, label) {
-  requireExactKeys(value, ["core_generation_id", "retrieval_generation_id"], label);
-  if (!nonemptyString(value.core_generation_id) || !nonemptyString(value.retrieval_generation_id)) fail(`${label} is invalid`);
+  requireExactKeys(value, ["core", "retrieval"], label);
+  requireExactKeys(value.core, ["project_id", "generation_id", "run_id"], `${label}.core`);
+  if (![value.core.project_id, value.core.generation_id, value.core.run_id].every(nonemptyString)) fail(`${label}.core is invalid`);
+  if (value.retrieval !== null) {
+    requireExactKeys(value.retrieval, [
+      "core_generation_id", "core_run_id", "retrieval_generation",
+      "retrieval_input_sha256", "semantic_generation",
+    ], `${label}.retrieval`);
+    if (![value.retrieval.core_generation_id, value.retrieval.core_run_id,
+      value.retrieval.retrieval_generation, value.retrieval.semantic_generation].every(nonemptyString)
+      || !SHA256.test(value.retrieval.retrieval_input_sha256)) fail(`${label}.retrieval is invalid`);
+  }
+}
+
+function validateProjectionGap(gap, label) {
+  requireExactKeys(gap, ["identity", "kind", "message"], label);
+  requireExactKeys(gap.identity, ["gap_id"], `${label}.identity`);
+  if (!nonemptyString(gap.identity.gap_id)
+      || !["evidence_missing", "retrieval_unavailable", "source_unavailable", "continuation_required", "output_budget_exceeded"].includes(gap.kind)
+      || !(gap.message === null || typeof gap.message === "string")) fail(`${label} is invalid`);
+}
+
+function validateProjectionEnvelope(body, label) {
+  if (body.kind !== "complete" || body.schema_version !== 3
+      || !["available", "continuation_available", "no_useful_evidence", "unavailable"].includes(body.status)) {
+    fail(`${label} is incomplete`);
+  }
+  validateRequestIdentity(body.identity, `${label} identity`);
+  validatePublication(body.publication, `${label} publication`);
+  if (!Array.isArray(body.evidence) || !Array.isArray(body.gaps)) fail(`${label} is incomplete`);
+  body.gaps.forEach((gap, index) => validateProjectionGap(gap, `${label} gap ${index}`));
 }
 
 function validateSearchResult(body) {
-  requireExactKeys(body, ["kind", "publication", "leads", "gaps"], "search result");
-  if (body.kind !== "complete" || !Array.isArray(body.leads) || body.leads.length === 0 || !Array.isArray(body.gaps)) {
-    fail("search result is incomplete");
-  }
-  validatePublication(body.publication, "search result publication");
-  body.leads.forEach((lead, index) => {
-    requireExactKeys(lead, ["lead_id", "canonical_id"], `search result lead ${index}`);
-    if (!nonemptyString(lead.lead_id) || !nonemptyString(lead.canonical_id)) fail(`search result lead ${index} is invalid`);
-  });
-  body.gaps.forEach((gap, index) => {
-    requireExactKeys(gap, ["code"], `search result gap ${index}`);
-    if (!nonemptyString(gap.code)) fail(`search result gap ${index} is invalid`);
+  validateProjectionEnvelope(body, "search result");
+  if (body.evidence.length === 0) fail("search result is incomplete");
+  body.evidence.forEach((entry, index) => {
+    requireExactKeys(entry, ["identity", "path", "symbol_id", "start_line", "end_line", "excerpt"], `search result evidence ${index}`);
+    requireExactKeys(entry.identity, ["evidence_id"], `search result evidence ${index}.identity`);
+    if (!nonemptyString(entry.identity.evidence_id) || !nonemptyString(entry.path)
+        || !(entry.symbol_id === null || nonemptyString(entry.symbol_id))) fail(`search result evidence ${index} is invalid`);
   });
 }
 
 function validateContextResult(body) {
-  requireExactKeys(body, ["kind", "publication", "target", "evidence", "gaps"], "context result");
-  if (body.kind !== "complete" || !plainObject(body.target) || !nonemptyString(body.target.canonical_id)
-      || !Array.isArray(body.evidence) || body.evidence.length === 0 || !Array.isArray(body.gaps)) {
+  validateProjectionEnvelope(body, "context result");
+  requireExactKeys(body.target, ["path", "symbol_id"], "context result target");
+  if ((body.target.path === null && body.target.symbol_id === null) || body.evidence.length === 0) {
     fail("context result is incomplete");
   }
-  validatePublication(body.publication, "context result publication");
-  requireExactKeys(body.target, ["canonical_id"], "context result target");
   body.evidence.forEach((entry, index) => {
-    requireExactKeys(entry, ["evidence_id", "path"], `context result evidence ${index}`);
-    if (!nonemptyString(entry.evidence_id) || !nonemptyString(entry.path)) fail(`context result evidence ${index} is invalid`);
-  });
-  body.gaps.forEach((gap, index) => {
-    requireExactKeys(gap, ["code"], `context result gap ${index}`);
-    if (!nonemptyString(gap.code)) fail(`context result gap ${index} is invalid`);
+    requireExactKeys(entry, ["identity", "path", "symbol_id", "start_line", "end_line", "excerpt"], `context result evidence ${index}`);
+    requireExactKeys(entry.identity, ["evidence_id"], `context result evidence ${index}.identity`);
+    if (!nonemptyString(entry.identity.evidence_id) || !nonemptyString(entry.path)) fail(`context result evidence ${index} is invalid`);
   });
 }
 
 function validatePacketResult(body) {
-  const keys = ["kind", "packet_id", "status", "publication", "evidence", "gaps"];
-  if (body?.status === "continuation_available") keys.push("continuation");
-  if (body?.status === "unavailable") keys.splice(1, 1, "reason");
-  requireExactKeys(body, keys, "packet result");
-  if (!["complete", "budget_exceeded"].includes(body.kind)
-      || !["complete", "continuation_available", "no_useful_evidence", "unavailable"].includes(body.status)
-      || !Array.isArray(body.evidence) || !Array.isArray(body.gaps)) fail("packet result is incomplete");
-  validatePublication(body.publication, "packet result publication");
-  if (body.status !== "unavailable" && !nonemptyString(body.packet_id)) fail("packet result packet_id is required");
-  if (body.status === "unavailable" && !nonemptyString(body.reason)) fail("packet result reason is required");
+  if (body.kind === "budget_exceeded") {
+    if (body.schema_version !== 3 || body.status !== "unavailable" || !Array.isArray(body.gaps)
+        || body.gaps.length === 0 || !Number.isSafeInteger(body.maximum_bytes)
+        || !Number.isSafeInteger(body.required_complete_bytes)) fail("packet result budget fallback is invalid");
+    validateRequestIdentity(body.identity, "packet result identity");
+    validatePublication(body.publication, "packet result publication");
+    body.gaps.forEach((gap, index) => validateProjectionGap(gap, `packet result gap ${index}`));
+    return;
+  }
+  validateProjectionEnvelope(body, "packet result");
   body.evidence.forEach((entry, index) => {
-    requireExactKeys(entry, ["evidence_id", "path"], `packet result evidence ${index}`);
-    if (!nonemptyString(entry.evidence_id) || !nonemptyString(entry.path)) fail(`packet result evidence ${index} is invalid`);
-  });
-  body.gaps.forEach((gap, index) => {
-    const gapKeys = Array.isArray(gap?.authorized_source_paths) ? ["gap_id", "authorized_source_paths"] : ["gap_id"];
-    requireExactKeys(gap, gapKeys, `packet result gap ${index}`);
-    if (!nonemptyString(gap.gap_id)
-        || (gapKeys.length === 2 && (!gap.authorized_source_paths.every(nonemptyString)
-          || gap.authorized_source_paths.length === 0))) fail(`packet result gap ${index} is invalid`);
+    requireExactKeys(entry, ["identity", "kind", "path", "symbol_id", "start_line", "end_line", "summary"], `packet result evidence ${index}`);
+    requireExactKeys(entry.identity, ["evidence_id"], `packet result evidence ${index}.identity`);
+    if (!nonemptyString(entry.identity.evidence_id)
+        || !["exact_source", "structural_source", "graph_relation", "retrieval_excerpt"].includes(entry.kind)) {
+      fail(`packet result evidence ${index} is invalid`);
+    }
   });
   if (body.status === "continuation_available") {
-    requireExactKeys(body.continuation, ["continuation_id", "gap_ids"], "packet result continuation");
-    if (!nonemptyString(body.continuation.continuation_id) || !Array.isArray(body.continuation.gap_ids)
+    requireExactKeys(body.continuation, ["continuation_id", "remaining_rounds", "gap_ids"], "packet result continuation");
+    if (!nonemptyString(body.continuation.continuation_id) || !Number.isInteger(body.continuation.remaining_rounds)
+        || body.continuation.remaining_rounds < 1 || !Array.isArray(body.continuation.gap_ids)
         || body.continuation.gap_ids.length === 0) fail("packet result continuation is invalid");
+    body.continuation.gap_ids.forEach((gap, index) => {
+      requireExactKeys(gap, ["gap_id"], `packet result continuation gap ${index}`);
+      if (!nonemptyString(gap.gap_id)) fail(`packet result continuation gap ${index} is invalid`);
+    });
+  } else if (body.continuation !== null) {
+    fail("packet result has a continuation outside continuation_available");
   }
 }
 
@@ -1459,9 +1561,22 @@ function validateProofResult(body) {
 
 function validateToolResultSchema(action, projection) {
   if (!plainObject(projection.body)) fail(`${action.tool} result is not a JSON object`);
+  if (["search", "context", "packet"].includes(action.kind)) {
+    const outputSchema = GENERATED_TOOL_SCHEMAS.get(action.kind)?.outputSchema;
+    if (!plainObject(outputSchema) || !matchesJsonSchema(projection.body, outputSchema)) {
+      fail(`${action.tool} result does not match the generated catalog output schema`);
+    }
+  }
   if (action.kind === "search") validateSearchResult(projection.body);
   if (action.kind === "context") validateContextResult(projection.body);
   if (action.kind === "packet") validatePacketResult(projection.body);
+}
+
+function validateToolInputSchema(action) {
+  const inputSchema = GENERATED_TOOL_SCHEMAS.get(action.kind)?.inputSchema;
+  if (!plainObject(inputSchema) || !matchesJsonSchema(action.args, inputSchema)) {
+    fail(`${action.tool} request does not match the generated catalog input schema`);
+  }
 }
 
 function projectedSelectorValue(selector, result, label) {
@@ -1821,9 +1936,9 @@ function validatePacketContinuation(scenarioContract, actions, results) {
     project: packets[0].args.project,
     question: packets[0].args.question,
     parent_packet_id: first?.continuation?.continuation_id,
-    option_ids: first?.continuation?.gap_ids,
-    core_generation_id: first?.publication?.core_generation_id,
-    retrieval_generation_id: first?.publication?.retrieval_generation_id,
+    option_ids: first?.continuation?.gap_ids?.map(({ gap_id: gapId }) => gapId),
+    core_generation_id: first?.publication?.core?.generation_id,
+    retrieval_generation: first?.publication?.retrieval?.retrieval_generation,
   };
   if (!equalJson(packets[1].args, expected)) fail(`${scenarioContract.id} packet continuation arguments do not match the pinned offer`);
 }
@@ -1834,12 +1949,29 @@ function validateSelectedContext(scenarioContract, request, actions, results) {
   if (typeof request.selected_target !== "string" || !request.selected_target) {
     fail(`${scenarioContract.id} context requires one host-selected target`);
   }
+  const search = actions.find((action) => action.kind === "search");
+  if (search) {
+    const selected = results.get(search).body.evidence.filter((entry) =>
+      entry.symbol_id === request.selected_target || entry.path === request.selected_target);
+    if (selected.length !== 1 || !nonemptyString(selected[0].symbol_id)) {
+      fail(`${scenarioContract.id} selected target does not identify exactly one search evidence row`);
+    }
+    for (const action of contexts) {
+      if (action.args?.id !== selected[0].symbol_id
+          || results.get(action)?.body?.target?.symbol_id !== selected[0].symbol_id) {
+        fail(`${scenarioContract.id} context result does not match the selected search target`);
+      }
+    }
+    return;
+  }
   for (const action of contexts) {
-    if (action.args?.selector?.canonical_id !== request.selected_target) {
+    if (!(action.args?.id === request.selected_target || action.args?.query === request.selected_target)) {
       fail(`${scenarioContract.id} context selector does not match the selected target`);
     }
-    if (results.get(action)?.body?.target?.canonical_id !== request.selected_target) {
-      fail(`${scenarioContract.id} context result does not match the selected target`);
+    const target = results.get(action)?.body?.target;
+    if (!nonemptyString(target?.symbol_id)
+        || !results.get(action).body.evidence.some((entry) => entry.symbol_id === target.symbol_id)) {
+      fail(`${scenarioContract.id} context result does not bind its returned target to evidence`);
     }
   }
 }
@@ -1928,14 +2060,14 @@ function expectedFinalClaim(scenarioContract, actions, results) {
 
   if (contexts.length > 0) {
     const body = results.get(contexts.at(-1)).body;
-    expected.target_id = body.target.canonical_id;
-    expected.evidence_ids = body.evidence.map(({ evidence_id }) => evidence_id);
+    expected.target_id = body.target.symbol_id;
+    expected.evidence_ids = body.evidence.map(({ identity }) => identity.evidence_id);
   } else if (searches.length > 0) {
     const body = results.get(searches.at(-1)).body;
-    if (body.leads.length === 1) expected.target_id = body.leads[0].canonical_id;
-    expected.evidence_ids = body.leads.map(({ lead_id }) => lead_id);
+    if (body.evidence.length === 1) expected.target_id = body.evidence[0].symbol_id;
+    expected.evidence_ids = body.evidence.map(({ identity }) => identity.evidence_id);
   } else if (packets.length > 0) {
-    expected.evidence_ids = packets.flatMap((action) => results.get(action).body.evidence.map(({ evidence_id }) => evidence_id));
+    expected.evidence_ids = packets.flatMap((action) => (results.get(action).body.evidence ?? []).map(({ identity }) => identity.evidence_id));
   }
   if (reads.length > 0) expected.evidence_ids = reads.map(({ path }) => `source:${path}`);
   if (proof) {
@@ -1953,7 +2085,7 @@ function expectedFinalClaim(scenarioContract, actions, results) {
   }
 
   for (const action of [...searches, ...packets]) {
-    expected.gap_ids.push(...results.get(action).body.gaps.map((gap) => gap.gap_id ?? gap.code));
+    expected.gap_ids.push(...results.get(action).body.gaps.map((gap) => gap.identity.gap_id));
   }
   if (proof) {
     const disposition = results.get(proof).body?.disposition;
@@ -1964,8 +2096,10 @@ function expectedFinalClaim(scenarioContract, actions, results) {
     }
   }
   for (const action of packets) {
-    const reason = results.get(action).body.reason;
-    if (nonemptyString(reason)) expected.reason_codes.push(reason);
+    const body = results.get(action).body;
+    if (body.status === "unavailable") {
+      expected.reason_codes.push(...body.gaps.map(({ kind }) => kind));
+    }
   }
   if (scenarioContract.id === "refuse_free_english_proof") expected.reason_codes.push("typed_contract_required");
   expected.evidence_ids = [...new Set(expected.evidence_ids)];
@@ -2010,6 +2144,7 @@ export function validateInstalledSession({
   for (const action of parsed.actions) {
     if (!action.completed) fail(`${scenarioId} has an incomplete ${action.tool} action`);
     if (["search", "context", "packet", "prove_call_path"].includes(action.kind)) {
+      validateToolInputSchema(action);
       results.set(action, validateResultIdentity(action, expectedIdentity));
     } else {
       results.set(action, normalizedResult(action));

@@ -3409,11 +3409,11 @@ fn expand_compact_spec(
         .collect::<Result<Vec<_>, String>>()?;
     let prohibitions = prohibitions
         .iter()
-        .map(|selector| expand_inline_selector(selector, publication, false))
+        .map(|selector| expand_inline_selector(selector, false))
         .collect::<Result<Vec<_>, _>>()?;
     let exclusions = exclusions
         .iter()
-        .map(|selector| expand_inline_selector(selector, publication, false))
+        .map(|selector| expand_inline_selector(selector, false))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(json!({
         "start":start,
@@ -3440,7 +3440,7 @@ fn expand_compact_symbol_selector(
         if expected_symbol.is_some() {
             return Err("compact_selector_reference_required".to_owned());
         }
-        return expand_inline_selector(selector, publication, true);
+        return expand_inline_selector(selector, true);
     }
     let expected_symbol =
         expected_symbol.ok_or_else(|| "compact_selector_reference_disconnected".to_owned())?;
@@ -3504,7 +3504,6 @@ fn expand_compact_symbol_selector(
 
 fn expand_inline_selector(
     selector: &Value,
-    publication: &serde_json::Map<String, Value>,
     symbol_selector: bool,
 ) -> Result<Value, String> {
     let selector = compact_object(selector, "compact_selector_invalid")?;
@@ -3537,15 +3536,6 @@ fn expand_inline_selector(
             };
             validate_pinned_identity(&identity)
                 .map_err(|_| "compact_selector_invalid".to_owned())?;
-            if identity.project_id
-                != compact_string(publication, "project_id", "compact_publication_invalid")?
-                || identity.core_generation_id
-                    != compact_string(publication, "generation_id", "compact_publication_invalid")?
-                || identity.core_run_id
-                    != compact_string(publication, "run_id", "compact_publication_invalid")?
-            {
-                return Err("compact_selector_publication_mismatch".to_owned());
-            }
             Ok(Value::Object(selector.clone()))
         }
         "canonical_id" => {
@@ -6141,6 +6131,48 @@ mod tests {
             panic!("focused fixture remains complete")
         };
         root
+    }
+
+    #[test]
+    fn compact_unavailable_projection_preserves_a_stale_pinned_request() {
+        let stale = |node_id: &str| {
+            UnvalidatedExactSymbolSelector::PinnedNode(PinnedNodeIdentity {
+                project_id: "stale-project".to_owned(),
+                core_generation_id: "stale-generation".to_owned(),
+                core_run_id: "stale-run".to_owned(),
+                node_id: node_id.to_owned(),
+            })
+        };
+        let mut input = valid_input(&["B"]);
+        input.spec.start = stale("10");
+        input.spec.steps[0].target = stale("20");
+        let ValidationOutcome::Validated {
+            contract,
+            hashes,
+            rendering,
+        } = validate_contract(input).unwrap()
+        else {
+            panic!("stale pinned selectors remain a valid typed interpretation")
+        };
+        let root = projected_root(
+            &contract,
+            &hashes,
+            &rendering,
+            BuiltCallPathFacts {
+                publication: publication(),
+                facts: vec![VerifiedProofFact::Unavailable(UnavailableProofFact {
+                    reason: UnavailableReason::PublicationPinMismatch,
+                })],
+                receipts: Vec::new(),
+                gaps: Vec::new(),
+                unavailable: vec![UnavailableReason::PublicationPinMismatch],
+            },
+        );
+
+        assert_eq!(root["spec"]["start"]["project_id"], "stale-project");
+        assert_eq!(root["core_publication"]["project_id"], "project");
+        assert_eq!(root["disposition"]["kind"], "unavailable");
+        assert_eq!(validate_compact_projection(&root), Ok(()));
     }
 
     #[test]
