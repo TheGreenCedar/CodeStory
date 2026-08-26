@@ -15832,16 +15832,45 @@ fn index_file_with_resolution_inputs(
             };
             let nid = NodeId(generate_id(&canonical_seed));
             graph_to_node_id.insert(node_id, nid);
-            let effective_access = access_kind.or_else(|| {
-                infer_access_from_source(
-                    language_config.language_name,
-                    &tree,
-                    source,
-                    &line_offsets,
-                    start_line,
+            let effective_access = if language_config.language_name == "swift"
+                && matches!(
                     kind,
+                    NodeKind::STRUCT
+                        | NodeKind::CLASS
+                        | NodeKind::ENUM
+                        | NodeKind::FUNCTION
+                        | NodeKind::METHOD
                 )
-            });
+                && matches!(
+                    canonical_role,
+                    CanonicalNodeRole::Definition
+                        | CanonicalNodeRole::Declaration
+                        | CanonicalNodeRole::ForwardDeclaration
+                ) {
+                Some(
+                    if proof_resolution::swift_declaration_cross_module_visible_at(
+                        &tree,
+                        source,
+                        start_line,
+                        start_col_1,
+                    ) {
+                        AccessKind::Public
+                    } else {
+                        AccessKind::Default
+                    },
+                )
+            } else {
+                access_kind.or_else(|| {
+                    infer_access_from_source(
+                        language_config.language_name,
+                        &tree,
+                        source,
+                        &line_offsets,
+                        start_line,
+                        kind,
+                    )
+                })
+            };
 
             unique_nodes.insert(
                 nid,

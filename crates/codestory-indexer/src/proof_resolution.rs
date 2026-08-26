@@ -5125,9 +5125,56 @@ fn csd_cross_module_visible(node: TsNode<'_>, source: &str, language: &str) -> b
     if language != "swift" {
         return true;
     }
-    csd_declaration_header(node, source)
-        .split(|character: char| !character.is_alphanumeric() && character != '_')
-        .any(|token| matches!(token, "public" | "open"))
+    swift_declaration_cross_module_visible(node, source)
+}
+
+fn swift_declaration_cross_module_visible(node: TsNode<'_>, source: &str) -> bool {
+    let mut cursor = node.walk();
+    let Some(modifiers) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "modifiers")
+    else {
+        return false;
+    };
+    let mut cursor = modifiers.walk();
+    modifiers.named_children(&mut cursor).any(|modifier| {
+        modifier.kind() == "visibility_modifier"
+            && node_text(modifier, source)
+                .is_some_and(|text| matches!(text.trim(), "public" | "open"))
+    })
+}
+
+pub(crate) fn swift_declaration_cross_module_visible_at(
+    tree: &Tree,
+    source: &str,
+    line: u32,
+    column: u32,
+) -> bool {
+    let point = tree_sitter::Point {
+        row: line.saturating_sub(1) as usize,
+        column: column.saturating_sub(1) as usize,
+    };
+    let Some(mut node) = tree
+        .root_node()
+        .named_descendant_for_point_range(point, point)
+    else {
+        return false;
+    };
+    loop {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "protocol_declaration"
+                | "function_declaration"
+                | "property_declaration"
+        ) {
+            return swift_declaration_cross_module_visible(node, source);
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        node = parent;
+    }
 }
 
 fn csd_runtime_closed(node: TsNode<'_>, source: &str, language: &str) -> bool {
@@ -16002,6 +16049,9 @@ struct JavaKotlinImportDomain {
     cross_module_visible_nodes: HashSet<NodeId>,
     dart_runtime_closed_types: HashSet<String>,
     dart_overridden_methods: HashSet<(String, String)>,
+    dart_parent_candidates: HashMap<String, Vec<Option<String>>>,
+    dart_declared_methods: HashMap<String, Vec<String>>,
+    dart_ancestry_complete: bool,
 }
 
 struct JavaKotlinProjectionIndex {
@@ -16337,6 +16387,13 @@ impl JavaKotlinProjectionIndex {
                 if record.file.language == "dart" && class.runtime_closed {
                     domain.dart_runtime_closed_types.insert(class.name.clone());
                 }
+                if record.file.language == "dart" {
+                    domain
+                        .dart_parent_candidates
+                        .entry(class.name.clone())
+                        .or_default()
+                        .push(class.super_name.clone());
+                }
                 for method in &class.methods {
                     domain
                         .declarations
@@ -16350,12 +16407,12 @@ impl JavaKotlinProjectionIndex {
                     if class.cross_module_visible && method.cross_module_visible {
                         domain.cross_module_visible_nodes.insert(method.declaration);
                     }
-                    if record.file.language == "dart"
-                        && let Some(super_name) = &class.super_name
-                    {
+                    if record.file.language == "dart" {
                         domain
-                            .dart_overridden_methods
-                            .insert((super_name.clone(), method.name.clone()));
+                            .dart_declared_methods
+                            .entry(class.name.clone())
+                            .or_default()
+                            .push(method.name.clone());
                     }
                 }
             }
@@ -16367,6 +16424,47 @@ impl JavaKotlinProjectionIndex {
                 for candidates in domain.declarations.values_mut() {
                     candidates.sort_by_key(|candidate| candidate.declaration);
                     candidates.dedup_by(|left, right| left.declaration == right.declaration);
+                }
+            } else if language == "dart" {
+                domain.dart_ancestry_complete = true;
+                domain.dart_runtime_closed_types.retain(|name| {
+                    matches!(
+                        domain.dart_parent_candidates.get(name).map(Vec::as_slice),
+                        Some([_])
+                    )
+                });
+                for (subclass, methods) in &domain.dart_declared_methods {
+                    let mut current = subclass.as_str();
+                    let mut visited = HashSet::new();
+                    loop {
+                        if !visited.insert(current.to_string()) {
+                            domain.dart_ancestry_complete = false;
+                            break;
+                        }
+                        let Some([parent]) = domain
+                            .dart_parent_candidates
+                            .get(current)
+                            .map(Vec::as_slice)
+                        else {
+                            domain.dart_ancestry_complete = false;
+                            break;
+                        };
+                        let Some(parent) = parent.as_deref() else {
+                            break;
+                        };
+                        let Some([_]) =
+                            domain.dart_parent_candidates.get(parent).map(Vec::as_slice)
+                        else {
+                            domain.dart_ancestry_complete = false;
+                            break;
+                        };
+                        for method in methods {
+                            domain
+                                .dart_overridden_methods
+                                .insert((parent.to_string(), method.clone()));
+                        }
+                        current = parent;
+                    }
                 }
             }
         }
@@ -16448,16 +16546,15 @@ impl JavaKotlinProjectionIndex {
         method_name: &str,
         direct_construction: bool,
     ) -> bool {
-        if direct_construction {
-            return true;
-        }
         self.domains
             .get(&("dart".to_string(), package_name.to_string()))
             .is_some_and(|domain| {
-                domain.dart_runtime_closed_types.contains(owner_name)
-                    && !domain
-                        .dart_overridden_methods
-                        .contains(&(owner_name.to_string(), method_name.to_string()))
+                domain.dart_ancestry_complete
+                    && (direct_construction
+                        || (domain.dart_runtime_closed_types.contains(owner_name)
+                            && !domain
+                                .dart_overridden_methods
+                                .contains(&(owner_name.to_string(), method_name.to_string()))))
             })
     }
 

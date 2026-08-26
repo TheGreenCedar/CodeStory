@@ -295,6 +295,7 @@ struct ProofResolutionValidationContext {
     dart_import_visibility_by_node: HashMap<NodeId, DartImportVisibility>,
     dart_runtime_closed_nodes: HashSet<NodeId>,
     dart_overridden_owner_methods: HashSet<(NodeId, String)>,
+    dart_ancestry_invalid_domains: HashSet<String>,
     typescript_directory_import_relations:
         HashMap<(NodeId, NodeId), TypescriptDirectoryImportState>,
     member_relations: HashMap<(NodeId, NodeId), ProofRelationState>,
@@ -843,42 +844,42 @@ fn prepare_csd_domain_closure(
 }
 
 fn prepare_swift_public_nodes(
+    storage: &Storage,
     files: &[FileInfo],
-    hashes: &HashMap<i64, String>,
     nodes: &HashMap<NodeId, Node>,
-) -> HashSet<NodeId> {
-    let mut lines_by_file = HashMap::<i64, Vec<String>>::new();
-    for file in files.iter().filter(|file| file.language == "swift") {
-        count_store_replay_work(1);
-        let Ok(bytes) = std::fs::read(&file.path) else {
-            continue;
-        };
-        if hashes.get(&file.id) != Some(&format!("{:x}", Sha256::digest(&bytes))) {
-            continue;
-        }
-        let Ok(source) = String::from_utf8(bytes) else {
-            continue;
-        };
-        lines_by_file.insert(file.id, source.lines().map(str::to_string).collect());
-    }
+) -> Result<HashSet<NodeId>, StorageError> {
+    let swift_file_ids = files
+        .iter()
+        .filter_map(|file| (file.language == "swift").then_some(file.id))
+        .collect::<HashSet<_>>();
+    let swift_node_ids = nodes
+        .values()
+        .filter_map(|node| {
+            count_store_replay_work(1);
+            node.file_node_id
+                .filter(|file| swift_file_ids.contains(&file.0))
+                .filter(|_| {
+                    matches!(
+                        node.kind,
+                        NodeKind::STRUCT
+                            | NodeKind::CLASS
+                            | NodeKind::ENUM
+                            | NodeKind::FUNCTION
+                            | NodeKind::METHOD
+                    )
+                })
+                .map(|_| node.id)
+        })
+        .collect::<Vec<_>>();
+    let access = storage.get_component_access_map_for_nodes(&swift_node_ids)?;
     let mut public = HashSet::new();
-    for node in nodes.values() {
+    for node_id in swift_node_ids {
         count_store_replay_work(1);
-        let Some((file, line)) = node.file_node_id.zip(node.start_line) else {
-            continue;
-        };
-        if lines_by_file
-            .get(&file.0)
-            .and_then(|lines| lines.get(line.saturating_sub(1) as usize))
-            .is_some_and(|line| {
-                line.split(|character: char| !character.is_alphanumeric() && character != '_')
-                    .any(|token| matches!(token, "public" | "open"))
-            })
-        {
-            public.insert(node.id);
+        if access.get(&node_id) == Some(&AccessKind::Public) {
+            public.insert(node_id);
         }
     }
-    public
+    Ok(public)
 }
 
 fn prepare_dart_dispatch_closure(
@@ -887,7 +888,7 @@ fn prepare_dart_dispatch_closure(
     nodes: &HashMap<NodeId, Node>,
     domain_by_file: &HashMap<i64, String>,
     member_by_owner_and_name: &HashMap<(NodeId, String), Option<NodeId>>,
-) -> (HashSet<NodeId>, HashSet<(NodeId, String)>) {
+) -> (HashSet<NodeId>, HashSet<(NodeId, String)>, HashSet<String>) {
     let mut lines_by_file = HashMap::<i64, Vec<String>>::new();
     for file in files.iter().filter(|file| file.language == "dart") {
         count_store_replay_work(1);
@@ -903,6 +904,8 @@ fn prepare_dart_dispatch_closure(
         lines_by_file.insert(file.id, source.lines().map(str::to_string).collect());
     }
     let mut class_by_domain_and_name = HashMap::<(String, String), Option<NodeId>>::new();
+    let mut class_identity_by_node = HashMap::<NodeId, (String, String)>::new();
+    let mut parent_by_class = HashMap::<NodeId, Option<String>>::new();
     let mut closed = HashSet::new();
     let mut super_by_class = Vec::<(NodeId, String, String)>::new();
     for node in nodes.values().filter(|node| node.kind == NodeKind::CLASS) {
@@ -920,7 +923,12 @@ fn prepare_dart_dispatch_closure(
         }) else {
             continue;
         };
+        let declaration_column = line.len().saturating_sub(line.trim_start().len()) as u32 + 1;
+        if node.start_col != Some(declaration_column) {
+            continue;
+        }
         let name = graph_leaf_name(&node.serialized_name).to_string();
+        class_identity_by_node.insert(node.id, (domain.clone(), name.clone()));
         class_by_domain_and_name
             .entry((domain.clone(), name))
             .and_modify(|entry| *entry = None)
@@ -934,10 +942,14 @@ fn prepare_dart_dispatch_closure(
                 character.is_whitespace() || matches!(character, '{' | '(' | ')' | '<' | '>' | ',')
             })
             .collect::<Vec<_>>();
-        if let Some(index) = tokens.iter().position(|token| *token == "extends")
-            && let Some(super_name) = tokens[index + 1..].iter().find(|token| !token.is_empty())
-        {
-            super_by_class.push((node.id, domain, (*super_name).to_string()));
+        let super_name = tokens
+            .iter()
+            .position(|token| *token == "extends")
+            .and_then(|index| tokens[index + 1..].iter().find(|token| !token.is_empty()))
+            .map(|name| (*name).to_string());
+        parent_by_class.insert(node.id, super_name.clone());
+        if let Some(super_name) = super_name {
+            super_by_class.push((node.id, domain, super_name));
         }
     }
     let unique_nodes = class_by_domain_and_name
@@ -956,19 +968,51 @@ fn prepare_dart_dispatch_closure(
         }
     }
     let mut overridden = HashSet::new();
-    for (subclass, domain, super_name) in super_by_class {
+    let mut invalid_domains = HashSet::new();
+    for (class, (domain, _)) in &class_identity_by_node {
+        let mut current = *class;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current) {
+                invalid_domains.insert(domain.clone());
+                break;
+            }
+            let Some(parent_name) = parent_by_class.get(&current).and_then(Option::as_deref) else {
+                break;
+            };
+            let Some(Some(parent)) =
+                class_by_domain_and_name.get(&(domain.clone(), parent_name.to_string()))
+            else {
+                invalid_domains.insert(domain.clone());
+                break;
+            };
+            current = *parent;
+        }
+    }
+    for (subclass, domain, _) in super_by_class {
         count_store_replay_work(1);
-        let Some(Some(owner)) = class_by_domain_and_name.get(&(domain, super_name)) else {
-            continue;
-        };
         if let Some(names) = member_names_by_owner.get(&subclass) {
-            for name in names {
-                count_store_replay_work(1);
-                overridden.insert((*owner, name.clone()));
+            let mut current = subclass;
+            let mut visited = HashSet::new();
+            while visited.insert(current) {
+                let Some(parent_name) = parent_by_class.get(&current).and_then(Option::as_deref)
+                else {
+                    break;
+                };
+                let Some(Some(owner)) =
+                    class_by_domain_and_name.get(&(domain.clone(), parent_name.to_string()))
+                else {
+                    break;
+                };
+                for name in names {
+                    count_store_replay_work(1);
+                    overridden.insert((*owner, name.clone()));
+                }
+                current = *owner;
             }
         }
     }
-    (closed, overridden)
+    (closed, overridden, invalid_domains)
 }
 
 fn path_normal_components(path: &Path) -> Vec<&str> {
@@ -1719,6 +1763,7 @@ mod go_replay_complexity_tests {
             dart_import_visibility_by_node: HashMap::new(),
             dart_runtime_closed_nodes: HashSet::new(),
             dart_overridden_owner_methods: HashSet::new(),
+            dart_ancestry_invalid_domains: HashSet::new(),
             typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
             member_by_owner_and_name: HashMap::new(),
@@ -1897,6 +1942,7 @@ mod python_replay_complexity_tests {
             dart_import_visibility_by_node: HashMap::new(),
             dart_runtime_closed_nodes: HashSet::new(),
             dart_overridden_owner_methods: HashSet::new(),
+            dart_ancestry_invalid_domains: HashSet::new(),
             typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
             member_by_owner_and_name: HashMap::new(),
@@ -2026,6 +2072,7 @@ mod ruby_php_replay_complexity_tests {
             dart_import_visibility_by_node: HashMap::new(),
             dart_runtime_closed_nodes: HashSet::new(),
             dart_overridden_owner_methods: HashSet::new(),
+            dart_ancestry_invalid_domains: HashSet::new(),
             typescript_directory_import_relations: HashMap::new(),
             member_relations: HashMap::new(),
             member_by_owner_and_name: HashMap::new(),
@@ -2226,8 +2273,7 @@ impl ProofResolutionValidationContext {
             prepare_java_package_closure(&file_by_id, &node_by_id);
         let (csd_domain_identity_by_file, csd_dependency_ids_by_domain) =
             prepare_csd_domain_closure(&files, &node_by_id);
-        let swift_public_node_ids =
-            prepare_swift_public_nodes(&files, &file_content_hash_by_id, &node_by_id);
+        let swift_public_node_ids = prepare_swift_public_nodes(storage, &files, &node_by_id)?;
         let mut dart_import_visibility_by_node = HashMap::new();
         for node in node_by_id.values().filter(|node| {
             node.file_node_id.is_some_and(|file| {
@@ -2427,14 +2473,17 @@ impl ProofResolutionValidationContext {
                 .and_modify(|candidate| *candidate = None)
                 .or_insert(Some(member));
         }
-        let (dart_runtime_closed_nodes, dart_overridden_owner_methods) =
-            prepare_dart_dispatch_closure(
-                &files,
-                &file_content_hash_by_id,
-                &node_by_id,
-                &csd_domain_identity_by_file,
-                &member_by_owner_and_name,
-            );
+        let (
+            dart_runtime_closed_nodes,
+            dart_overridden_owner_methods,
+            dart_ancestry_invalid_domains,
+        ) = prepare_dart_dispatch_closure(
+            &files,
+            &file_content_hash_by_id,
+            &node_by_id,
+            &csd_domain_identity_by_file,
+            &member_by_owner_and_name,
+        );
         Ok(Self {
             file_by_id,
             file_content_hash_by_id,
@@ -2451,6 +2500,7 @@ impl ProofResolutionValidationContext {
             dart_import_visibility_by_node,
             dart_runtime_closed_nodes,
             dart_overridden_owner_methods,
+            dart_ancestry_invalid_domains,
             typescript_directory_import_relations,
             member_relations,
             member_by_owner_and_name,
@@ -3079,16 +3129,24 @@ impl Storage {
                     ResolutionEvidence::ImplicitReceiver { owner } => Some(*owner),
                     _ => None,
                 });
-            if let Some(owner) = receiver_owner
-                && !direct_construction
-                && (!context.dart_runtime_closed_nodes.contains(&owner)
-                    || context
-                        .dart_overridden_owner_methods
-                        .contains(&(owner, fact.callsite.raw_target.clone())))
-            {
-                return Err(proof_error(
-                    "Dart receiver dispatch is not closed by its complete library domain",
-                ));
+            if let Some(owner) = receiver_owner {
+                let ancestry_invalid = context
+                    .node_by_id
+                    .get(&owner)
+                    .and_then(|node| node.file_node_id)
+                    .and_then(|file| context.csd_domain_identity_by_file.get(&file.0))
+                    .is_none_or(|domain| context.dart_ancestry_invalid_domains.contains(domain));
+                if ancestry_invalid
+                    || (!direct_construction
+                        && (!context.dart_runtime_closed_nodes.contains(&owner)
+                            || context
+                                .dart_overridden_owner_methods
+                                .contains(&(owner, fact.callsite.raw_target.clone()))))
+                {
+                    return Err(proof_error(
+                        "Dart receiver dispatch is not closed by its complete library domain",
+                    ));
+                }
             }
         }
         if fact.provenance.language_adapter == "go"

@@ -1674,7 +1674,8 @@ fn dart_exact_dispatch_requires_a_closed_same_library_override_domain() -> anyho
             let project = tempfile::tempdir()?;
             let mut store = Store::new_in_memory()?;
             index_files(project.path(), &mut store, &files)?;
-            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))
+                .map_err(|error| anyhow::anyhow!("{name} reordered={reordered}: {error}"))?;
             let facts = store.get_proof_resolution_facts()?;
             let exact = facts.iter().any(|fact| {
                 fact.provenance.language_adapter == "dart"
