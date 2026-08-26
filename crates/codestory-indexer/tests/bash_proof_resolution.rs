@@ -3,8 +3,14 @@ use codestory_contracts::graph::{Edge, EdgeId, EdgeKind};
 use codestory_contracts::proof_resolution::{
     ProofResolutionReason, ProofResolutionStatus, ResolutionEvidence,
 };
-use codestory_indexer::{WorkspaceIndexer, rematerialize_proof_resolution_projection};
-use codestory_store::{IndexPublicationMode, IndexPublicationRecord, Store};
+use codestory_indexer::{
+    WorkspaceIndexer, bash_resolution_work, rematerialize_proof_resolution_projection,
+    reset_bash_resolution_work,
+};
+use codestory_store::{
+    IndexPublicationMode, IndexPublicationRecord, Store, bash_store_resolution_work,
+    reset_bash_store_resolution_work,
+};
 use codestory_workspace::{BuildMode, RefreshInfo};
 use std::collections::HashMap;
 use std::fs;
@@ -278,6 +284,140 @@ fn bash_closed_unsupported_and_hostile_matrix_is_canonical_nonexact() -> anyhow:
     Ok(())
 }
 
+#[test]
+fn bash_command_effect_matrix_closes_wrappers_unset_and_control_flow() -> anyhow::Result<()> {
+    struct Case {
+        name: &'static str,
+        source: &'static str,
+        expected: ProofResolutionStatus,
+        reason: ProofResolutionReason,
+    }
+
+    let cases = [
+        Case {
+            name: "builtin_source",
+            source: "builtin source ./other.sh\ntarget() { :; }\ncaller() { target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
+            name: "command_dot",
+            source: "command . ./other.sh\ntarget() { :; }\ncaller() { target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
+            name: "builtin_eval",
+            source: "target() { :; }\ncaller() { builtin eval 'target() { false; }'; target; }\n",
+            expected: ProofResolutionStatus::Unsupported,
+            reason: ProofResolutionReason::UnsupportedConstruct,
+        },
+        Case {
+            name: "command_alias",
+            source: "command alias target='printf replaced'\ntarget() { :; }\ncaller() { target; }\n",
+            expected: ProofResolutionStatus::Unsupported,
+            reason: ProofResolutionReason::UnsupportedConstruct,
+        },
+        Case {
+            name: "literal_unset_short_option",
+            source: "target() { :; }\ncaller() { unset -f target; target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
+            name: "literal_unset_long_option",
+            source: "target() { :; }\ncaller() { unset --function target; target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
+            name: "literal_unset_combined_option",
+            source: "target() { :; }\ncaller() { unset -fv -- target; target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
+            name: "wrapped_literal_unset",
+            source: "target() { :; }\ncaller() { builtin unset -f -- target; target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
+            name: "dynamic_unset_name",
+            source: "target() { :; }\ncaller() { name=target; unset -f \"$name\"; target; }\n",
+            expected: ProofResolutionStatus::Unsupported,
+            reason: ProofResolutionReason::UnsupportedConstruct,
+        },
+        Case {
+            name: "wrapped_dynamic_unset_name",
+            source: "target() { :; }\ncaller() { name=target; command unset --function \"$name\"; target; }\n",
+            expected: ProofResolutionStatus::Unsupported,
+            reason: ProofResolutionReason::UnsupportedConstruct,
+        },
+        Case {
+            name: "malformed_function_unset",
+            source: "target() { :; }\ncaller() { unset -f --; target; }\n",
+            expected: ProofResolutionStatus::Unsupported,
+            reason: ProofResolutionReason::UnsupportedConstruct,
+        },
+        Case {
+            name: "conditional_literal_unset",
+            source: "target() { :; }\ncaller() { if test -n \"$FLAG\"; then unset -f target; fi; target; }\n",
+            expected: ProofResolutionStatus::IncompleteDomain,
+            reason: ProofResolutionReason::LookupDomainIncomplete,
+        },
+        Case {
+            name: "literal_unset_other_function_control",
+            source: "target() { :; }\nunrelated() { :; }\ncaller() { unset -f unrelated; target; }\n",
+            expected: ProofResolutionStatus::Exact,
+            reason: ProofResolutionReason::ExactResolution,
+        },
+        Case {
+            name: "ordinary_variable_unset_control",
+            source: "target() { :; }\ncaller() { unset target_variable; target; }\n",
+            expected: ProofResolutionStatus::Exact,
+            reason: ProofResolutionReason::ExactResolution,
+        },
+    ];
+
+    for case in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[("proof.sh", case.source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let target = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.provenance.language_adapter == "bash")
+            .filter(|fact| fact.callsite.raw_target == "target")
+            .last()
+            .unwrap_or_else(|| panic!("{} emitted no target call fact", case.name));
+        assert_eq!(target.status, case.expected, "{}: {target:#?}", case.name);
+        assert_eq!(target.reason, case.reason, "{}: {target:#?}", case.name);
+        if case.expected == ProofResolutionStatus::Exact {
+            assert!(target.target.is_some(), "{}: {target:#?}", case.name);
+            assert!(target.edge_id.is_some(), "{}: {target:#?}", case.name);
+            assert!(
+                !target.evidence_chain.is_empty(),
+                "{}: {target:#?}",
+                case.name
+            );
+            assert_eq!(
+                store.get_exact_proof_resolution_fact_by_edge(target.edge_id.unwrap())?,
+                Some(target.clone()),
+                "{}: Exact effect-control receipt must replay",
+                case.name
+            );
+        } else {
+            assert!(target.target.is_none(), "{}: {target:#?}", case.name);
+            assert!(target.edge_id.is_none(), "{}: {target:#?}", case.name);
+            assert!(target.evidence_chain.is_empty(), "{}: {target:#?}", case.name);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 enum GraphMutation {
     Missing,
@@ -413,5 +553,137 @@ fn bash_semantic_cache_is_reauthenticated_from_source_before_replay() -> anyhow:
     );
     assert_eq!(store.proof_resolution_fact_count()?, 0);
     assert_eq!(store.get_proof_resolution_publication()?, None);
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BashGrowthAxis {
+    Files,
+    Declarations,
+    Calls,
+    RepeatedCallsites,
+    HostileEffects,
+    SourceTrivia,
+}
+
+fn bash_growth_sources(axis: BashGrowthAxis, size: usize) -> Vec<(String, String)> {
+    match axis {
+        BashGrowthAxis::Files => (0..size)
+            .map(|index| {
+                (
+                    format!("proof_{index}.sh"),
+                    format!(
+                        "target_{index}() {{ :; }}\ncaller_{index}() {{ target_{index}; }}\n"
+                    ),
+                )
+            })
+            .collect(),
+        BashGrowthAxis::Declarations => {
+            let mut source = String::new();
+            for index in 0..size {
+                source.push_str(&format!("target_{index}() {{ :; }}\n"));
+            }
+            source.push_str("caller() { target_0; }\n");
+            vec![("proof.sh".to_owned(), source)]
+        }
+        BashGrowthAxis::Calls => {
+            let mut source = String::new();
+            for index in 0..size {
+                source.push_str(&format!("target_{index}() {{ :; }}\n"));
+            }
+            source.push_str("caller() {");
+            for index in 0..size {
+                source.push_str(&format!(" target_{index};"));
+            }
+            source.push_str(" }\n");
+            vec![("proof.sh".to_owned(), source)]
+        }
+        BashGrowthAxis::RepeatedCallsites => {
+            let mut source = String::from("target() { :; }\ncaller() {");
+            for _ in 0..size {
+                source.push_str(" target;");
+            }
+            source.push_str(" }\n");
+            vec![("proof.sh".to_owned(), source)]
+        }
+        BashGrowthAxis::HostileEffects => {
+            let mut source = String::from("target() { :; }\ncaller() {\n");
+            for index in 0..size {
+                source.push_str(&format!("  unset -f missing_{index};\n"));
+            }
+            source.push_str("  target;\n}\n");
+            vec![("proof.sh".to_owned(), source)]
+        }
+        BashGrowthAxis::SourceTrivia => {
+            let mut source = String::from("target() { :; }\n");
+            for index in 0..size {
+                source.push_str(&format!("# inert parser-visible trivia {index}\n"));
+            }
+            source.push_str("caller() { target; }\n");
+            vec![("proof.sh".to_owned(), source)]
+        }
+    }
+}
+
+fn bash_full_pipeline_work(
+    axis: BashGrowthAxis,
+    size: usize,
+) -> anyhow::Result<([usize; 4], [usize; 4])> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    let sources = bash_growth_sources(axis, size);
+    let borrowed = sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+
+    reset_bash_resolution_work();
+    reset_bash_store_resolution_work();
+    index_files(project.path(), &mut store, &borrowed)?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let indexer = bash_resolution_work();
+    let store = bash_store_resolution_work();
+    Ok((
+        [
+            indexer.preparation,
+            indexer.cache_reauthentication,
+            indexer.projection,
+            indexer.graph_correlation,
+        ],
+        [
+            store.sealing,
+            store.validation,
+            store.replay,
+            store.publication,
+        ],
+    ))
+}
+
+#[test]
+fn bash_full_proof_pipeline_work_is_phase_complete_and_linear_on_every_axis() -> anyhow::Result<()> {
+    for axis in [
+        BashGrowthAxis::Files,
+        BashGrowthAxis::Declarations,
+        BashGrowthAxis::Calls,
+        BashGrowthAxis::RepeatedCallsites,
+        BashGrowthAxis::HostileEffects,
+        BashGrowthAxis::SourceTrivia,
+    ] {
+        let (small_indexer, small_store) = bash_full_pipeline_work(axis, 8)?;
+        let (large_indexer, large_store) = bash_full_pipeline_work(axis, 16)?;
+        for (phase, (small, large)) in small_indexer
+            .into_iter()
+            .zip(large_indexer)
+            .chain(small_store.into_iter().zip(large_store))
+            .enumerate()
+        {
+            assert!(small > 0, "{axis:?} phase {phase} was not counted");
+            assert!(
+                large <= small.saturating_mul(2).saturating_add(64),
+                "{axis:?} phase {phase} grew superlinearly: {small} -> {large}"
+            );
+        }
+    }
     Ok(())
 }
