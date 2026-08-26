@@ -662,6 +662,30 @@ function exactCandidateArmEnv(opts, arm) {
     CODESTORY_CACHE_ROOT: path.join(armRoot, "cache"),
     CODESTORY_STDIO_CACHE_ROOT: path.join(armRoot, "stdio-cache"),
     CODESTORY_PLUGIN_DATA: path.join(armRoot, "plugin-data"),
+    CODESTORY_EMBED_QUALIFICATION_DIR: path.join(armRoot, "embedding-qualification"),
+    CODESTORY_EMBED_QUALIFICATION_NONCE: `agent-benchmark-${arm}`,
+  };
+}
+
+const EXACT_CANDIDATE_ARM_DIRECTORY_ENV_KEYS = Object.freeze([
+  "CODESTORY_CACHE_ROOT",
+  "CODESTORY_STDIO_CACHE_ROOT",
+  "CODESTORY_PLUGIN_DATA",
+  "CODESTORY_EMBED_QUALIFICATION_DIR",
+]);
+
+const EXACT_CANDIDATE_ARM_SCALAR_ENV_KEYS = Object.freeze([
+  "CODESTORY_EMBED_QUALIFICATION_NONCE",
+]);
+
+function exactCandidateArmEnvironmentGroups(opts, arm) {
+  const env = exactCandidateArmEnv(opts, arm);
+  const select = (keys) => Object.fromEntries(
+    keys.filter((key) => Object.hasOwn(env, key)).map((key) => [key, env[key]]),
+  );
+  return {
+    directories: select(EXACT_CANDIDATE_ARM_DIRECTORY_ENV_KEYS),
+    scalars: select(EXACT_CANDIDATE_ARM_SCALAR_ENV_KEYS),
   };
 }
 
@@ -816,8 +840,10 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
       }
       await copyFile(authPath, path.join(codexHome, "auth.json"));
       homes[arm] = codexHome;
-      for (const value of Object.values(exactCandidateArmEnv(opts, arm))) {
-        await mkdir(value, { recursive: true });
+      for (const value of Object.values(
+        exactCandidateArmEnvironmentGroups(opts, arm).directories,
+      )) {
+        await mkdir(value, { recursive: true, mode: 0o700 });
       }
       if (isCodeStoryArm(arm)) {
         const cli = resolveCodeStoryCliForArm(opts, arm);
@@ -836,11 +862,25 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
     receipt.cache_roots = Object.fromEntries(
       EXACT_CANDIDATE_ARMS.map((arm) => [
         arm,
-        Object.fromEntries(Object.entries(exactCandidateArmEnv(opts, arm)).map(([key, value]) => [
+        Object.fromEntries(Object.entries(
+          exactCandidateArmEnvironmentGroups(opts, arm).directories,
+        ).map(([key, value]) => [
           key,
           path.relative(outDir, value),
         ])),
       ]),
+    );
+    receipt.embedding_server_namespaces = Object.fromEntries(
+      EXACT_CANDIDATE_ARMS.filter(isCodeStoryArm).map((arm) => {
+        const groups = exactCandidateArmEnvironmentGroups(opts, arm);
+        return [arm, {
+          qualification_directory: path.relative(
+            outDir,
+            groups.directories.CODESTORY_EMBED_QUALIFICATION_DIR,
+          ),
+          nonce: groups.scalars.CODESTORY_EMBED_QUALIFICATION_NONCE,
+        }];
+      }),
     );
   }
   await writeFile(
@@ -3714,6 +3754,8 @@ function retrievalIndexCommandArgs(project) {
     ...benchmarkAgentScopeArgs(),
     "--refresh",
     "auto",
+    "--format",
+    "json",
   ];
 }
 
@@ -5948,10 +5990,12 @@ async function prepareCodeStoryCaches(opts, tasks) {
     opts.exactCandidateLifecycle.preparation_order.push({ repo: task.repo, arms: armOrder });
     const preparedByArm = new Map();
     for (const arm of armOrder) {
-      const childEnv = selectedBenchmarkChildEnv(opts, arm);
-      for (const value of Object.values(exactCandidateArmEnv(opts, arm))) {
-        await mkdir(value, { recursive: true });
+      for (const value of Object.values(
+        exactCandidateArmEnvironmentGroups(opts, arm).directories,
+      )) {
+        await mkdir(value, { recursive: true, mode: 0o700 });
       }
+      const childEnv = selectedBenchmarkChildEnv(opts, arm);
       const rows = await prepareCodeStoryCaches(
         {
           ...opts,
@@ -11925,6 +11969,7 @@ export {
   planAgentRuns,
   exactCandidateAcceptance,
   authenticateExactCandidatePackages,
+  exactCandidateArmEnv,
   exactCandidateBaselineEnv,
   exactCandidatePreparationArmOrder,
   withExactSourceMutation,

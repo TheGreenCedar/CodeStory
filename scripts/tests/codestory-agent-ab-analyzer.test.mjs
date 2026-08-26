@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -943,6 +943,91 @@ test("exact lifecycle alternates preparation and restores the selected source by
     assert.deepEqual(spy, ["incremental", "restore"]);
     assert.equal(receipt.result.status, "pass");
     assert.deepEqual(await readFile(sourcePath), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact CodeStory arms use disjoint embedding-server qualification namespaces", () => {
+  const stateRoot = path.join(os.tmpdir(), "codestory-exact-state");
+  const opts = {
+    exactCandidate: true,
+    exactCandidateStateRoot: stateRoot,
+  };
+  const published = benchmarkHarness.exactCandidateArmEnv(opts, "published_0_17_4");
+  const candidate = benchmarkHarness.exactCandidateArmEnv(opts, "candidate_0_18");
+
+  for (const [arm, env] of [
+    ["published_0_17_4", published],
+    ["candidate_0_18", candidate],
+  ]) {
+    assert.equal(
+      env.CODESTORY_EMBED_QUALIFICATION_DIR,
+      path.join(stateRoot, arm, "embedding-qualification"),
+    );
+    assert.match(env.CODESTORY_EMBED_QUALIFICATION_NONCE, /^[A-Za-z0-9_-]+$/);
+  }
+  assert.notEqual(
+    published.CODESTORY_EMBED_QUALIFICATION_DIR,
+    candidate.CODESTORY_EMBED_QUALIFICATION_DIR,
+  );
+  assert.notEqual(
+    published.CODESTORY_EMBED_QUALIFICATION_NONCE,
+    candidate.CODESTORY_EMBED_QUALIFICATION_NONCE,
+  );
+});
+
+test("exact Codex isolation keeps scalar namespace credentials out of cache roots and cwd", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-isolation-"));
+  const sourceCodexHome = path.join(root, "source-codex-home");
+  const stateRoot = path.join(root, "state");
+  const baselineRoot = path.join(root, "baseline", "private-state");
+  const outDir = path.join(root, "out");
+  await mkdir(sourceCodexHome, { recursive: true });
+  await mkdir(baselineRoot, { recursive: true });
+  await mkdir(outDir, { recursive: true });
+  await writeFile(path.join(sourceCodexHome, "auth.json"), "{}\n");
+  const harnessUrl = new URL("../codestory-agent-ab-benchmark.mjs", import.meta.url).href;
+  const script = `
+    const benchmark = await import(${JSON.stringify(harnessUrl)});
+    const opts = {
+      exactCandidate: true,
+      exactCandidateStateRoot: ${JSON.stringify(stateRoot)},
+      exactCandidateBaselineStateRoot: ${JSON.stringify(baselineRoot)},
+      exactCandidatePackageByArm: new Map([
+        ["published_0_17_4", { cli_path: process.execPath }],
+        ["candidate_0_18", { cli_path: process.execPath }],
+      ]),
+      model: "gpt-5.6-sol",
+    };
+    const result = await benchmark.prepareAgentCodexIsolation(${JSON.stringify(outDir)}, opts);
+    process.stdout.write(JSON.stringify(result.receipt));
+  `;
+  try {
+    const child = await runProcess(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: root,
+      env: { ...process.env, CODEX_HOME: sourceCodexHome },
+      timeoutMs: 10_000,
+    });
+    assert.equal(child.status, "pass", child.stderr);
+    const receipt = JSON.parse(child.stdout);
+    const rootEntries = await readdir(root);
+    assert.equal(rootEntries.includes("agent-benchmark-published_0_17_4"), false);
+    assert.equal(rootEntries.includes("agent-benchmark-candidate_0_18"), false);
+    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      assert.equal(
+        Object.hasOwn(receipt.cache_roots[arm], "CODESTORY_EMBED_QUALIFICATION_NONCE"),
+        false,
+      );
+      assert.equal(
+        receipt.embedding_server_namespaces[arm].nonce,
+        `agent-benchmark-${arm}`,
+      );
+      assert.match(
+        receipt.embedding_server_namespaces[arm].qualification_directory,
+        /embedding-qualification$/,
+      );
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -3998,6 +4083,8 @@ test("packet and cache preparation share one explicit agent retrieval namespace"
     "shared-agent",
     "--refresh",
     "auto",
+    "--format",
+    "json",
   ]);
   assert.deepEqual(retrievalStatusCommandArgs("C:\\repo"), [
     "retrieval",
