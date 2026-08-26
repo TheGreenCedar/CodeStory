@@ -130,6 +130,29 @@ fn all_language_rows_are_real_parser_and_adapter_observations() -> anyhow::Resul
         observed_missing,
         MISSING_ADAPTER_ALLOWLIST.iter().copied().collect()
     );
+    assert_eq!(MISSING_ADAPTER_ALLOWLIST, &["bash"]);
+    for case in &observation.cases {
+        let components = case
+            .path
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect::<Vec<_>>();
+        match case.language {
+            "swift" => assert!(
+                components
+                    .iter()
+                    .any(|component| matches!(*component, "Source" | "Sources")),
+                "Swift benchmark cohort escaped its authenticated source layout: {}",
+                case.path.display()
+            ),
+            "dart" => assert!(
+                components.contains(&"lib"),
+                "Dart benchmark cohort escaped lib: {}",
+                case.path.display()
+            ),
+            _ => {}
+        }
+    }
     Ok(())
 }
 

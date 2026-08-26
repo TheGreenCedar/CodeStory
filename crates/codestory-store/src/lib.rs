@@ -52,6 +52,8 @@ pub use storage_impl::{
     UnownedProjectionRemovalSummary, seal_call_resolution_fact, stored_vector_encoding,
     structural_text_unit_digest,
 };
+#[cfg(debug_assertions)]
+pub use storage_impl::{reset_store_replay_work, store_replay_work};
 
 impl Store {
     /// Access stored file inventory used by workspace refresh planning.

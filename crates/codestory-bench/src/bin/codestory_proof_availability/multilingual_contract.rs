@@ -30,7 +30,7 @@ pub const PUBLIC_PROOF_ROUTE_DARK: bool = true;
 /// Closed, temporary boundary for parser-backed languages without an installed
 /// proof adapter. The observed adapter roster is compared to this list in the
 /// contract test; this is not an expectation of a resolution result.
-pub const MISSING_ADAPTER_ALLOWLIST: &[&str] = &["csharp", "swift", "dart", "bash"];
+pub const MISSING_ADAPTER_ALLOWLIST: &[&str] = &["bash"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureClass {
@@ -561,11 +561,7 @@ pub fn observe_multilingual_contract() -> Result<MultilingualObservation> {
     for dispatch in DISPATCHES {
         for ordinal in 0..24_u8 {
             let class = fixture_class(ordinal);
-            let relative = format!(
-                "languages/{}/{class:?}-{ordinal}.{}",
-                dispatch.language, dispatch.extension
-            )
-            .to_lowercase();
+            let relative = fixture_relative_path(dispatch, class, ordinal);
             planned.push(PlannedLanguageCase {
                 language: dispatch.language,
                 class,
@@ -846,7 +842,12 @@ fn initialize_fixture_repository(checkout: &Path) -> Result<()> {
 }
 
 fn fixture_relative_path(dispatch: &DispatchFixture, class: FixtureClass, ordinal: u8) -> PathBuf {
-    PathBuf::from(format!("fixtures/{class:?}-{ordinal}.{}", dispatch.extension).to_lowercase())
+    let cohort = format!("{class:?}_{ordinal}").to_lowercase();
+    match dispatch.language {
+        "swift" => PathBuf::from(format!("Sources/{cohort}/fixture.swift")),
+        "dart" => PathBuf::from(format!("lib/{cohort}.dart")),
+        _ => PathBuf::from(format!("fixtures/{cohort}.{}", dispatch.extension)),
+    }
 }
 
 fn fixture_symbol(language: &str, ordinal: u8) -> String {
@@ -873,47 +874,57 @@ fn observe_planned_language_cases(
                 .iter()
                 .filter(|fixture| fixture.language == dispatch.language && fixture.class == class)
                 .collect::<Vec<_>>();
-            let group_root =
-                tempfile::tempdir().context("create language-class fixture workspace")?;
-            let isolated = fixtures
-                .iter()
-                .map(|fixture| {
-                    let relative = fixture
-                        .path
-                        .strip_prefix(root)
-                        .context("fixture escaped multilingual workspace")?;
-                    Ok((
-                        *fixture,
-                        group_root.path().join(relative),
-                        fixture.source.clone(),
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            write_sources(
-                &isolated
+            let groups = if matches!(dispatch.language, "swift" | "dart") {
+                fixtures
+                    .into_iter()
+                    .map(|fixture| vec![fixture])
+                    .collect::<Vec<_>>()
+            } else {
+                vec![fixtures]
+            };
+            for fixtures in groups {
+                let group_root =
+                    tempfile::tempdir().context("create language-class fixture workspace")?;
+                let isolated = fixtures
                     .iter()
-                    .map(|(_, path, source)| (path.clone(), source.clone()))
-                    .collect::<Vec<_>>(),
-            )?;
-            let mut store = Store::new_in_memory()?;
-            index_paths(
-                group_root.path(),
-                &mut store,
-                isolated.iter().map(|(_, path, _)| path.clone()).collect(),
-            )?;
-            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
-            for (fixture, path, _) in isolated {
-                cases.push(observe_case_from_store(
-                    &store,
-                    fixture.language,
-                    fixture.class,
-                    fixture.ordinal,
-                    &path,
-                    fixture.pinned_selector,
-                    adapter_roster.contains(fixture.language),
-                    fixture.materialized_commit.clone(),
-                    fixture.materialized_blob_sha256.clone(),
-                )?);
+                    .map(|fixture| {
+                        let relative = fixture
+                            .path
+                            .strip_prefix(root)
+                            .context("fixture escaped multilingual workspace")?;
+                        Ok((
+                            *fixture,
+                            group_root.path().join(relative),
+                            fixture.source.clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                write_sources(
+                    &isolated
+                        .iter()
+                        .map(|(_, path, source)| (path.clone(), source.clone()))
+                        .collect::<Vec<_>>(),
+                )?;
+                let mut store = Store::new_in_memory()?;
+                index_paths(
+                    group_root.path(),
+                    &mut store,
+                    isolated.iter().map(|(_, path, _)| path.clone()).collect(),
+                )?;
+                rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+                for (fixture, path, _) in isolated {
+                    cases.push(observe_case_from_store(
+                        &store,
+                        fixture.language,
+                        fixture.class,
+                        fixture.ordinal,
+                        &path,
+                        fixture.pinned_selector,
+                        adapter_roster.contains(fixture.language),
+                        fixture.materialized_commit.clone(),
+                        fixture.materialized_blob_sha256.clone(),
+                    )?);
+                }
             }
         }
     }

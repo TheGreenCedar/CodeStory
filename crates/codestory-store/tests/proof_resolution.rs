@@ -1342,6 +1342,20 @@ fn exact_projection_rejects_digest_and_graph_mismatches_without_partial_rows() {
     assert!(error.to_string().contains("callsite identity"), "{error}");
     assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
 
+    store
+        .get_connection()
+        .execute("UPDATE node SET end_line = 1 WHERE id = 2", [])
+        .unwrap();
+    let caller_containment_mismatch = exact_fact(EdgeId(7));
+    let error = store
+        .replace_proof_resolution_projection(
+            &publication,
+            &projection(vec![caller_containment_mismatch]),
+        )
+        .expect_err("Exact caller containment mismatch must fail");
+    assert!(error.to_string().contains("caller containment"), "{error}");
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
+
     let mut hash_mismatch = exact_fact(EdgeId(7));
     hash_mismatch.callsite.source_sha256 = "b".repeat(64);
     hash_mismatch.provenance.dependency_file_hashes[0].source_sha256 = "b".repeat(64);

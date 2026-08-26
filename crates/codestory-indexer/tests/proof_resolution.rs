@@ -5,7 +5,8 @@ use codestory_contracts::proof_resolution::{
     ProofResolutionStatus, ResolutionEvidence, ResolutionEvidenceKind,
 };
 use codestory_indexer::{
-    WorkspaceIndexer, build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+    WorkspaceIndexer, build_proof_resolution_funnel, current_proof_resolution_adapter_roster,
+    rematerialize_proof_resolution_projection,
 };
 use codestory_store::{
     FileInfo, FileRole, IndexPublicationMode, IndexPublicationRecord, Store,
@@ -639,7 +640,6 @@ fn java_and_kotlin_closed_exact_subset_emits_authenticated_exact_facts() -> anyh
             .into_iter()
             .filter(|fact| fact.provenance.language_adapter == language)
             .collect::<Vec<_>>();
-
         for (target, expected_count) in targets {
             let exact = facts
                 .iter()
@@ -874,6 +874,1004 @@ fn java_and_kotlin_closed_nonexact_matrix_never_proves() -> anyhow::Result<()> {
         assert!(fact.reason.matches_status(fact.status), "{fact:#?}");
         assert!(fact.evidence_chain.is_empty(), "{fact:#?}");
         assert!(fact.edge_id.is_none() && fact.target.is_none(), "{fact:#?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn csharp_swift_and_dart_closed_exact_subset_emits_authenticated_exact_facts() -> anyhow::Result<()>
+{
+    let cases = [
+        (
+            "csharp_same_file",
+            "csharp",
+            vec![(
+                "src/Exact.cs",
+                concat!(
+                    "namespace App;\n",
+                    "sealed class Worker {\n",
+                    "  public void Target() {}\n",
+                    "  public void ThisCaller() { this.Target(); }\n",
+                    "}\n",
+                    "sealed class Holder {\n",
+                    "  private readonly Worker worker = new Worker();\n",
+                    "  public void FieldCaller() { worker.Target(); }\n",
+                    "}\n",
+                    "static class Calls {\n",
+                    "  public static void SameFileTarget() {}\n",
+                    "  public static void SameFileCaller() { SameFileTarget(); SameFileTarget(); }\n",
+                    "  public static void ConstructorCaller() { new Worker().Target(); }\n",
+                    "  public static void TypedLocalCaller() { Worker worker = new Worker(); worker.Target(); }\n",
+                    "  public static void TypedParameterCaller(Worker worker) { worker.Target(); }\n",
+                    "}\n",
+                ),
+            )],
+            vec![("SameFileTarget", 2), ("Target", 5)],
+        ),
+        (
+            "csharp_using_alias",
+            "csharp",
+            vec![
+                (
+                    "src/Lib/Worker.cs",
+                    "namespace Lib; public sealed class Worker { public void Target() {} }\n",
+                ),
+                (
+                    "src/App/Caller.cs",
+                    concat!(
+                        "using WorkerAlias = Lib.Worker;\n",
+                        "namespace App;\n",
+                        "static class Calls { public static void Caller(WorkerAlias worker) { worker.Target(); } }\n",
+                    ),
+                ),
+            ],
+            vec![("Target", 1)],
+        ),
+        (
+            "swift_same_file",
+            "swift",
+            vec![(
+                "Sources/App/Exact.swift",
+                concat!(
+                    "func sameFileTarget() {}\n",
+                    "func sameFileCaller() { sameFileTarget(); sameFileTarget() }\n",
+                    "struct Worker {\n",
+                    "  func target() {}\n",
+                    "  func selfCaller() { self.target() }\n",
+                    "}\n",
+                    "struct Holder {\n",
+                    "  let worker: Worker = Worker()\n",
+                    "  func propertyCaller() { worker.target() }\n",
+                    "}\n",
+                    "func constructorCaller() { Worker().target() }\n",
+                    "func typedLocalCaller() { let worker: Worker = Worker(); worker.target() }\n",
+                    "func typedParameterCaller(_ worker: Worker) { worker.target() }\n",
+                ),
+            )],
+            vec![("sameFileTarget", 2), ("target", 5)],
+        ),
+        (
+            "swift_project_module",
+            "swift",
+            vec![
+                (
+                    "Sources/WorkerModule/Worker.swift",
+                    "public struct Worker { public func target() {} }\n",
+                ),
+                (
+                    "Sources/App/Caller.swift",
+                    "import WorkerModule\nfunc caller() { Worker().target() }\n",
+                ),
+            ],
+            vec![("target", 1)],
+        ),
+        (
+            "dart_same_library",
+            "dart",
+            vec![(
+                "lib/exact.dart",
+                concat!(
+                    "void sameFileTarget() {}\n",
+                    "void sameFileCaller() { sameFileTarget(); sameFileTarget(); }\n",
+                    "final class Worker {\n",
+                    "  void target() {}\n",
+                    "  void thisCaller() { this.target(); }\n",
+                    "}\n",
+                    "final class Holder {\n",
+                    "  final Worker worker = Worker();\n",
+                    "  void propertyCaller() { worker.target(); }\n",
+                    "}\n",
+                    "void constructorCaller() { final worker = Worker(); worker.target(); }\n",
+                    "void typedLocalCaller() { Worker worker = Worker(); worker.target(); }\n",
+                    "void typedParameterCaller(Worker worker) { worker.target(); }\n",
+                ),
+            )],
+            vec![("sameFileTarget", 2), ("target", 5)],
+        ),
+        (
+            "dart_exact_imports",
+            "dart",
+            vec![
+                (
+                    "lib/worker.dart",
+                    "void importedTarget() {}\nfinal class Worker { void target() {} }\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    concat!(
+                        "import 'worker.dart' show importedTarget, Worker;\n",
+                        "void directCaller() { importedTarget(); final worker = Worker(); worker.target(); }\n",
+                    ),
+                ),
+                (
+                    "lib/prefixed.dart",
+                    concat!(
+                        "import 'worker.dart' as lib;\n",
+                        "void prefixedCaller() { lib.importedTarget(); }\n",
+                    ),
+                ),
+            ],
+            vec![("importedTarget", 2), ("target", 1)],
+        ),
+    ];
+
+    for (name, language, files, expected_targets) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .filter(|fact| fact.provenance.language_adapter == language)
+            .collect::<Vec<_>>();
+        for (target, expected_count) in expected_targets {
+            let exact = facts
+                .iter()
+                .filter(|fact| fact.callsite.raw_target == target)
+                .filter(|fact| fact.status == ProofResolutionStatus::Exact)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                exact.len(),
+                expected_count,
+                "{name} {target} did not emit the expected exact facts: {facts:#?}"
+            );
+            assert!(exact.iter().all(|fact| {
+                fact.edge_id.is_some()
+                    && fact.raw_edge_target.is_some()
+                    && fact.raw_callsite_identity.is_some()
+                    && fact.target.is_some()
+                    && !fact.evidence_chain.is_empty()
+                    && fact.provenance.evidence_sha256.len() == 64
+                    && !fact.provenance.dependency_file_hashes.is_empty()
+            }));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn nonexact_narrow_graph_caller_span_does_not_block_publication() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "dart_tictactoe.dart",
+            include_str!("fixtures/tictactoe/dart_tictactoe.dart"),
+        )],
+    )?;
+    let navigation_edges = store.get_edges()?;
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+
+    let facts = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .filter(|fact| fact.provenance.language_adapter == "dart")
+        .filter(|fact| fact.callsite.raw_target == "print")
+        .filter(|fact| fact.callsite.line == 8)
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 1, "one parser callsite must own one fact");
+    let fact = &facts[0];
+    assert_eq!(fact.status, ProofResolutionStatus::Unsupported);
+    assert_eq!(fact.reason, ProofResolutionReason::UnsupportedConstruct);
+    assert!(fact.target.is_none());
+    assert!(fact.edge_id.is_none());
+    assert!(fact.raw_edge_target.is_none());
+    assert!(fact.raw_callsite_identity.is_none());
+    assert!(fact.evidence_chain.is_empty());
+    assert_eq!(store.get_edges()?, navigation_edges);
+    Ok(())
+}
+
+#[test]
+fn csharp_swift_and_dart_closed_hostile_matrix_never_proves() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "csharp",
+            "dynamic_receiver",
+            "Hostile.cs",
+            "class Hostile { void Caller(dynamic value) { value.Target(); } }\n",
+            "Target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "csharp",
+            "interface_dispatch",
+            "Hostile.cs",
+            "interface IWorker { void Target(); } class Hostile { void Caller(IWorker value) { value.Target(); } }\n",
+            "Target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "csharp",
+            "virtual_dispatch",
+            "Hostile.cs",
+            "class Base { public virtual void Target() {} } sealed class Hostile { void Caller(Base value) { value.Target(); } }\n",
+            "Target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "csharp",
+            "extension_method",
+            "Hostile.cs",
+            "sealed class Worker {} static class Extensions { public static void Target(this Worker value) {} } class Hostile { void Caller(Worker value) { value.Target(); } }\n",
+            "Target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "csharp",
+            "generic_receiver",
+            "Hostile.cs",
+            "class Hostile { void Caller<T>(T value) { value.ToString(); } }\n",
+            "ToString",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "csharp",
+            "overload_ambiguity",
+            "Hostile.cs",
+            "class Hostile { static void Target(string value) {} static void Target(object value) {} void Caller() { Target(null); } }\n",
+            "Target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "csharp",
+            "partial_type",
+            "Hostile.cs",
+            "partial class Hostile { void Target() {} void Caller() { this.Target(); } }\n",
+            "Target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "csharp",
+            "generated_type",
+            "Hostile.cs",
+            "[System.CodeDom.Compiler.GeneratedCode(\"tool\", \"1\")] sealed class Hostile { void Target() {} void Caller() { this.Target(); } }\n",
+            "Target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "csharp",
+            "callable_indirection",
+            "Hostile.cs",
+            "class Hostile { void Caller(System.Action call) { call(); } }\n",
+            "call",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "csharp",
+            "receiver_rebinding",
+            "Hostile.cs",
+            "sealed class Worker { public void Target() {} } class Hostile { void Caller() { Worker value = new Worker(); value = new Worker(); value.Target(); } }\n",
+            "Target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "swift",
+            "protocol_dispatch",
+            "Hostile.swift",
+            "protocol Worker { func target() }\nfunc caller(_ value: any Worker) { value.target() }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "swift",
+            "class_dispatch",
+            "Hostile.swift",
+            "class Worker { func target() {} }\nfunc caller(_ value: Worker) { value.target() }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "swift",
+            "extension_method",
+            "Hostile.swift",
+            "struct Worker {}\nextension Worker { func target() {} }\nfunc caller(_ value: Worker) { value.target() }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "swift",
+            "generic_receiver",
+            "Hostile.swift",
+            "func caller<T>(_ value: T) { value.target() }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "swift",
+            "overload_ambiguity",
+            "Hostile.swift",
+            "func target(_ value: Int) {}\nfunc target(_ value: String) {}\nfunc caller() { target(fatalError()) }\n",
+            "target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "swift",
+            "objc_dispatch",
+            "Hostile.swift",
+            "@objc class Worker: NSObject { @objc dynamic func target() {} }\nfunc caller(_ value: Worker) { value.target() }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "swift",
+            "callable_indirection",
+            "Hostile.swift",
+            "func caller(_ call: () -> Void) { call() }\n",
+            "call",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "swift",
+            "receiver_rebinding",
+            "Hostile.swift",
+            "struct Worker { func target() {} }\nfunc caller() { var value = Worker(); value = Worker(); value.target() }\n",
+            "target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "swift",
+            "conditional_compilation",
+            "Hostile.swift",
+            "#if FEATURE\nfunc target() {}\n#endif\nfunc caller() { target() }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "swift",
+            "generated_type",
+            "Hostile.swift",
+            "// @generated\nstruct Worker { func target() {} }\nfunc caller() { Worker().target() }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "dynamic_receiver",
+            "hostile.dart",
+            "void caller(dynamic value) { value.target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "interface_dispatch",
+            "hostile.dart",
+            "abstract interface class Worker { void target(); }\nvoid caller(Worker value) { value.target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "mixin_dispatch",
+            "hostile.dart",
+            "mixin WorkerMixin { void target() {} }\nclass Worker with WorkerMixin {}\nvoid caller(Worker value) { value.target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "extension_method",
+            "hostile.dart",
+            "final class Worker {}\nextension WorkerExtension on Worker { void target() {} }\nvoid caller(Worker value) { value.target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "generic_receiver",
+            "hostile.dart",
+            "void caller<T>(T value) { value.toString(); }\n",
+            "toString",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "mirrors",
+            "hostile.dart",
+            "import 'dart:mirrors';\nfinal class Worker { void target() {} }\nvoid caller(Worker value) { value.target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "callable_indirection",
+            "hostile.dart",
+            "void caller(void Function() call) { call(); }\n",
+            "call",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "receiver_rebinding",
+            "hostile.dart",
+            "final class Worker { void target() {} }\nvoid caller() { Worker value = Worker(); value = Worker(); value.target(); }\n",
+            "target",
+            ProofResolutionStatus::Ambiguous,
+        ),
+        (
+            "dart",
+            "conditional_import",
+            "hostile.dart",
+            "import 'worker.dart' if (dart.library.io) 'io_worker.dart';\nvoid caller(Worker value) { value.target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "deferred_import",
+            "hostile.dart",
+            "import 'worker.dart' deferred as lib;\nvoid caller() { lib.Worker().target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+        (
+            "dart",
+            "generated_type",
+            "hostile.dart",
+            "// GENERATED CODE - DO NOT MODIFY BY HAND\nfinal class Worker { void target() {} }\nvoid caller() { Worker().target(); }\n",
+            "target",
+            ProofResolutionStatus::Unsupported,
+        ),
+    ];
+
+    let mut mismatches = Vec::new();
+    for (language, name, path, source, target, expected) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts.iter().find(|fact| {
+            fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+        });
+        let Some(fact) = fact else {
+            mismatches.push(format!(
+                "{language} {name}: emitted no canonical {target} fact: {facts:#?}"
+            ));
+            continue;
+        };
+        if fact.status != expected
+            || !fact.reason.matches_status(fact.status)
+            || fact.target.is_some()
+            || fact.edge_id.is_some()
+            || !fact.evidence_chain.is_empty()
+        {
+            mismatches.push(format!(
+                "{language} {name}: expected={expected:?} observed={fact:#?}"
+            ));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn csharp_swift_and_dart_complete_domains_are_replay_bound() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "csharp",
+            vec![
+                (
+                    "src/Lib/Worker.cs",
+                    "namespace Lib; public sealed class Worker { public void Target() {} }\n",
+                ),
+                (
+                    "src/App/Caller.cs",
+                    "using WorkerAlias = Lib.Worker; namespace App; static class Calls { static void Caller(WorkerAlias worker) { worker.Target(); } }\n",
+                ),
+                (
+                    "src/Lib/Sibling.cs",
+                    "namespace Lib; public sealed class Sibling {}\n",
+                ),
+            ],
+            "Target",
+            "Sibling.cs",
+        ),
+        (
+            "swift",
+            vec![
+                (
+                    "Sources/WorkerModule/Worker.swift",
+                    "public struct Worker { public func target() {} }\n",
+                ),
+                (
+                    "Sources/WorkerModule/Sibling.swift",
+                    "public struct Sibling {}\n",
+                ),
+                (
+                    "Sources/App/Caller.swift",
+                    "import WorkerModule\nfunc caller() { Worker().target() }\n",
+                ),
+            ],
+            "target",
+            "Sibling.swift",
+        ),
+        (
+            "dart",
+            vec![
+                (
+                    "lib/worker.dart",
+                    "final class Worker { void target() {} }\n",
+                ),
+                ("lib/sibling.dart", "final class Sibling {}\n"),
+                (
+                    "lib/caller.dart",
+                    "import 'worker.dart';\nvoid caller() { final worker = Worker(); worker.target(); }\n",
+                ),
+            ],
+            "target",
+            "sibling.dart",
+        ),
+    ];
+
+    for (language, files, target, sibling_name) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let fact = store
+            .get_proof_resolution_facts()?
+            .into_iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == language
+                    && fact.callsite.raw_target == target
+                    && fact.status == ProofResolutionStatus::Exact
+            })
+            .unwrap_or_else(|| panic!("missing {language} cross-file exact fact"));
+        let sibling = store
+            .get_files()?
+            .into_iter()
+            .find(|file| file.path.ends_with(sibling_name))
+            .expect("governed-domain sibling");
+        assert!(
+            fact.provenance
+                .dependency_file_hashes
+                .iter()
+                .any(|dependency| dependency.file_id == FileId(sibling.id)),
+            "{language} exact fact omitted its complete domain: {fact:#?}"
+        );
+        store.get_connection().execute(
+            "UPDATE file SET content_hash = ?1 WHERE id = ?2",
+            ("0".repeat(64), sibling.id),
+        )?;
+        store
+            .validate_proof_resolution_publication(&publication(1))
+            .expect_err("governed-domain source drift must reject replay");
+    }
+    Ok(())
+}
+
+#[test]
+fn csharp_swift_and_dart_incomplete_domains_never_emit_exact_facts() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "csharp",
+            vec![
+                (
+                    "src/App/Caller.cs",
+                    "namespace App; static class Calls { static void Target() {} static void Caller() { Target(); } }\n",
+                ),
+                ("src/App/Broken.cs", "namespace App; class Broken {\n"),
+            ],
+            "Target",
+        ),
+        (
+            "swift",
+            vec![
+                (
+                    "Sources/App/Caller.swift",
+                    "func target() {}\nfunc caller() { target() }\n",
+                ),
+                ("Sources/App/Broken.swift", "struct Broken {\n"),
+            ],
+            "target",
+        ),
+        (
+            "dart",
+            vec![
+                (
+                    "lib/caller.dart",
+                    "void target() {}\nvoid caller() { target(); }\n",
+                ),
+                ("lib/broken.dart", "final class Broken {\n"),
+            ],
+            "target",
+        ),
+    ];
+
+    for (language, files, target) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let matching = facts
+            .iter()
+            .filter(|fact| {
+                fact.provenance.language_adapter == language && fact.callsite.raw_target == target
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !matching.is_empty(),
+            "missing {language} domain fact: {facts:#?}"
+        );
+        assert!(matching.iter().all(|fact| {
+            fact.status == ProofResolutionStatus::IncompleteDomain
+                && fact.target.is_none()
+                && fact.edge_id.is_none()
+                && fact.evidence_chain.is_empty()
+        }));
+    }
+    Ok(())
+}
+
+#[test]
+fn csharp_swift_and_dart_canonical_fixture_layouts_replay_exactly() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "csharp",
+            "src/AutoMapper/Mapper.cs",
+            "namespace AutoMapper; public static class Mapper { public static void Map() {} public static void Caller() { Map(); } }\n",
+            "Map",
+        ),
+        (
+            "swift",
+            "Source/Session.swift",
+            "func request() {}\nfunc caller() { request() }\n",
+            "request",
+        ),
+        (
+            "dart",
+            "pkgs/http/lib/http.dart",
+            "void get() {}\nvoid caller() { get(); }\n",
+            "get",
+        ),
+    ];
+    for (language, path, source, target) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[(path, source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        assert!(
+            facts.iter().any(|fact| {
+                fact.provenance.language_adapter == language
+                    && fact.callsite.raw_target == target
+                    && fact.status == ProofResolutionStatus::Exact
+            }),
+            "{language} canonical fixture layout was not replay-exact: {facts:#?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn dart_exact_dispatch_requires_a_closed_same_library_override_domain() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "subtype_override",
+            vec![
+                (
+                    "lib/worker.dart",
+                    "final class Worker { void target() {} }\nfinal class Derived extends Worker { @override void target() {} }\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'worker.dart';\nvoid caller(Worker worker) { worker.target(); }\n",
+                ),
+            ],
+            false,
+        ),
+        (
+            "direct_exact_construction",
+            vec![(
+                "lib/caller.dart",
+                "class Worker { void target() {} }\nvoid caller() { final worker = Worker(); worker.target(); }\n",
+            )],
+            true,
+        ),
+        (
+            "externally_extensible_typed_parameter",
+            vec![(
+                "lib/caller.dart",
+                "class Worker { void target() {} }\nvoid caller(Worker worker) { worker.target(); }\n",
+            )],
+            false,
+        ),
+    ];
+    for (name, files, should_be_exact) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let exact = facts.iter().any(|fact| {
+            fact.provenance.language_adapter == "dart"
+                && fact.callsite.raw_target == "target"
+                && fact.status == ProofResolutionStatus::Exact
+        });
+        assert_eq!(exact, should_be_exact, "{name}: {facts:#?}");
+    }
+
+    let ancestry_cases = [
+        (
+            "closed_without_override",
+            vec![
+                ("lib/a.dart", "final class A { void target() {} }\n"),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nfinal class B extends A {}\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'b.dart';\nfinal class C extends B {}\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'a.dart';\nvoid caller(A receiver) { receiver.target(); }\n",
+                ),
+            ],
+            true,
+        ),
+        (
+            "transitive_override",
+            vec![
+                ("lib/a.dart", "final class A { void target() {} }\n"),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nfinal class B extends A {}\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'b.dart';\nfinal class C extends B { @override void target() {} }\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'a.dart';\nvoid caller(A receiver) { receiver.target(); }\n",
+                ),
+            ],
+            false,
+        ),
+        (
+            "cyclic_ancestry",
+            vec![
+                (
+                    "lib/a.dart",
+                    "import 'c.dart';\nfinal class A extends C { void target() {} }\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'a.dart';\nfinal class C extends A {}\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'a.dart';\nvoid caller(A receiver) { receiver.target(); }\n",
+                ),
+            ],
+            false,
+        ),
+        (
+            "ambiguous_parent",
+            vec![
+                ("lib/a.dart", "final class A { void target() {} }\n"),
+                (
+                    "lib/b_one.dart",
+                    "import 'a.dart';\nfinal class B extends A {}\n",
+                ),
+                (
+                    "lib/b_two.dart",
+                    "import 'a.dart';\nfinal class B extends A {}\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'b_one.dart';\nfinal class C extends B { @override void target() {} }\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'a.dart';\nvoid caller(A receiver) { receiver.target(); }\n",
+                ),
+            ],
+            false,
+        ),
+    ];
+    for (name, files, should_be_exact) in ancestry_cases {
+        for reordered in [false, true] {
+            let mut files = files.clone();
+            if reordered {
+                files.reverse();
+            }
+            let project = tempfile::tempdir()?;
+            let mut store = Store::new_in_memory()?;
+            index_files(project.path(), &mut store, &files)?;
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))
+                .map_err(|error| anyhow::anyhow!("{name} reordered={reordered}: {error}"))?;
+            let facts = store.get_proof_resolution_facts()?;
+            let exact = facts.iter().any(|fact| {
+                fact.provenance.language_adapter == "dart"
+                    && fact.callsite.raw_target == "target"
+                    && fact.status == ProofResolutionStatus::Exact
+            });
+            assert_eq!(
+                exact, should_be_exact,
+                "{name} reordered={reordered} violated ancestry closure: {facts:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn dart_combinators_and_swift_visibility_are_replay_authoritative() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "dart_hide",
+            "dart",
+            vec![
+                (
+                    "lib/worker.dart",
+                    "void hiddenTarget() {}\nfinal class Worker {}\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'worker.dart' hide hiddenTarget;\nvoid caller() { hiddenTarget(); }\n",
+                ),
+            ],
+            "hiddenTarget",
+        ),
+        (
+            "swift_internal_member",
+            "swift",
+            vec![
+                (
+                    "Sources/WorkerModule/Worker.swift",
+                    "public struct Worker { func target() {} }\n",
+                ),
+                (
+                    "Sources/App/Caller.swift",
+                    "import WorkerModule\nfunc caller() { Worker().target() }\n",
+                ),
+            ],
+            "target",
+        ),
+    ];
+    for (name, language, files, target) in cases {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &files)?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        assert!(
+            facts
+                .iter()
+                .filter(|fact| {
+                    fact.provenance.language_adapter == language
+                        && fact.callsite.raw_target == target
+                })
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
+            "{name} bypassed import/access visibility: {facts:#?}"
+        );
+    }
+
+    for visibility in ["public", "open"] {
+        let comment_cases = [
+            (
+                "type",
+                format!("struct /* {visibility} */ Worker {{ public func target() {{}} }}\n"),
+                "func caller() { Worker().target() }\n",
+                "target",
+            ),
+            (
+                "member",
+                format!("public struct Worker {{ func /* {visibility} */ target() {{}} }}\n"),
+                "func caller() { Worker().target() }\n",
+                "target",
+            ),
+            (
+                "top_level",
+                format!("func /* {visibility} */ target() {{}}\n"),
+                "func caller() { target() }\n",
+                "target",
+            ),
+        ];
+        for (surface, declaration, caller, target) in comment_cases {
+            let project = tempfile::tempdir()?;
+            let mut store = Store::new_in_memory()?;
+            let caller = format!("import WorkerModule\n{caller}");
+            index_files(
+                project.path(),
+                &mut store,
+                &[
+                    ("Sources/WorkerModule/Worker.swift", declaration.as_str()),
+                    ("Sources/App/Caller.swift", caller.as_str()),
+                ],
+            )?;
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+            let facts = store.get_proof_resolution_facts()?;
+            assert!(
+                facts.iter().all(|fact| {
+                    fact.provenance.language_adapter != "swift"
+                        || fact.callsite.raw_target != target
+                        || fact.status != ProofResolutionStatus::Exact
+                }),
+                "Swift {visibility} comment forged {surface} visibility: {facts:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn csharp_swift_and_dart_cache_blob_semantics_are_not_self_authenticating() -> anyhow::Result<()> {
+    for mutation in ["binding", "poison", "domain", "import"] {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(
+            project.path(),
+            &mut store,
+            &[
+                (
+                    "Sources/WorkerModule/Worker.swift",
+                    "public struct Worker { public func target() {} }\n",
+                ),
+                (
+                    "Sources/App/Caller.swift",
+                    "import WorkerModule\nfunc caller() { Worker().target() }\n",
+                ),
+            ],
+        )?;
+        let (path, blob): (String, Vec<u8>) = store.get_connection().query_row(
+            "SELECT file_path, artifact_blob FROM index_artifact_cache WHERE file_path LIKE '%Caller.swift'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut artifact: serde_json::Value = serde_json::from_slice(&blob)?;
+        match mutation {
+            "binding" => {
+                artifact["call_resolution_inputs"][0]["binding"]["kind"] = "unsupported".into()
+            }
+            "poison" => artifact["resolution_file"]["export_poison_all"] = true.into(),
+            "domain" => artifact["resolution_file"]["java_kotlin_package"] = "ForgedModule".into(),
+            "import" => {
+                artifact["call_resolution_inputs"][0]["binding"]["package_name"] =
+                    "ForgedModule".into()
+            }
+            _ => unreachable!(),
+        }
+        store.get_connection().execute(
+            "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE file_path = ?2",
+            (serde_json::to_vec(&artifact)?, path),
+        )?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))
+            .expect_err("CSD semantic cache BLOB mutation must fail closed");
     }
     Ok(())
 }
@@ -8992,7 +9990,10 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let mut empty = Store::new_in_memory()?;
     let empty_receipt = rematerialize_proof_resolution_projection(&mut empty, &publication(1))?;
     assert_eq!(empty_receipt.fact_count, 0);
-    assert_eq!(empty_receipt.adapter_roster.len(), 12);
+    assert_eq!(
+        empty_receipt.adapter_roster,
+        current_proof_resolution_adapter_roster()
+    );
 
     let project = tempfile::tempdir()?;
     let mut unsupported = Store::new_in_memory()?;
@@ -9007,7 +10008,10 @@ fn complete_projection_requires_cache_coverage_but_empty_and_unsupported_reposit
     let unsupported_receipt =
         rematerialize_proof_resolution_projection(&mut unsupported, &publication(1))?;
     assert_eq!(unsupported_receipt.fact_count, 0);
-    assert_eq!(unsupported_receipt.adapter_roster.len(), 12);
+    assert_eq!(
+        unsupported_receipt.adapter_roster,
+        current_proof_resolution_adapter_roster()
+    );
 
     let governed_project = tempfile::tempdir()?;
     let mut governed = Store::new_in_memory()?;
@@ -9235,7 +10239,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v23", "adapter", "language"]
+            ["stale", "schema-v25", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -9655,7 +10659,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             .map(|adapter| adapter.adapter_version.as_str()),
         Some("reference-v17")
     );
-    for language in ["java", "kotlin"] {
+    for language in ["java", "kotlin", "csharp", "swift", "dart"] {
         assert_eq!(
             receipt
                 .adapter_roster
