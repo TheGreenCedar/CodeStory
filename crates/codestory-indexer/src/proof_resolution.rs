@@ -153,7 +153,7 @@ const JAVA_ADAPTER_VERSION: &str = "reference-v2";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
 const C_ADAPTER_VERSION: &str = "reference-v2";
 const CPP_ADAPTER_VERSION: &str = "reference-v3";
-const RUBY_ADAPTER_VERSION: &str = "reference-v2";
+const RUBY_ADAPTER_VERSION: &str = "reference-v3";
 const PHP_ADAPTER_VERSION: &str = "reference-v2";
 const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 23;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
@@ -620,7 +620,7 @@ impl<'tree> RubyResolutionIndex<'tree> {
             bindings: HashMap::new(),
             require_relative: None,
         };
-        producer.visit(tree.root_node(), None, None, true);
+        producer.visit(tree.root_node(), None, None, true, false, false);
         for class_indices in producer.class_indices.values() {
             if class_indices.len() != 1 {
                 producer.index.poisoned = true;
@@ -700,8 +700,20 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
         mut caller: Option<NodeId>,
         mut owner_index: Option<usize>,
         declarations_static: bool,
+        declaration_body_entry: bool,
+        file_scope_entry: bool,
     ) {
         count_ruby_php_resolution_work(1);
+        if declaration_body_entry
+            && !matches!(node.kind(), "method" | "class" | "comment")
+            && !(file_scope_entry
+                && node.kind() == "call"
+                && ruby_literal_require_relative(node_text(node, self.source).unwrap_or_default())
+                    .is_some())
+            && !ruby_inert_declaration_syntax(node)
+        {
+            self.index.poisoned = true;
+        }
         if node.kind() == "class" {
             let Some(name) = declaration_name(node, self.source).map(str::to_string) else {
                 self.index.poisoned = true;
@@ -767,7 +779,7 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
                 return;
             };
             caller = Some(declaration);
-            if name == "method_missing" || !declarations_static {
+            if ruby_magic_method_declaration(&name) || !declarations_static {
                 self.index.poisoned = true;
             }
             if declarations_static {
@@ -814,13 +826,11 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
             }
         }
 
-        self.observe_poison(node);
+        self.observe_poison(node, file_scope_entry);
         if node.kind() == "assignment" {
             self.observe_assignment(node, caller);
         }
-        if node.kind() == "call" {
-            self.observe_call(node, caller, owner_index);
-        } else if matches!(node.kind(), "identifier" | "constant")
+        if matches!(node.kind(), "identifier" | "constant")
             && crate::is_ruby_bare_call_site(node)
             && caller.is_some()
         {
@@ -830,14 +840,33 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
         }
 
         let mut cursor = node.walk();
+        let call_method = (node.kind() == "call")
+            .then(|| node.child_by_field_name("method"))
+            .flatten()
+            .map(|method| method.id());
         let child_declarations_static =
             declarations_static && matches!(node.kind(), "program" | "body_statement" | "class");
         for child in node.named_children(&mut cursor) {
-            self.visit(child, caller, owner_index, child_declarations_static);
+            if call_method == Some(child.id()) {
+                self.observe_call(node, caller, owner_index);
+            }
+            let child_declaration_body_entry = declarations_static
+                && caller.is_none()
+                && matches!(node.kind(), "program" | "body_statement");
+            let child_file_scope_entry =
+                child_declaration_body_entry && owner_index.is_none() && node.kind() == "program";
+            self.visit(
+                child,
+                caller,
+                owner_index,
+                child_declarations_static,
+                child_declaration_body_entry,
+                child_file_scope_entry,
+            );
         }
     }
 
-    fn observe_poison(&mut self, node: TsNode<'_>) {
+    fn observe_poison(&mut self, node: TsNode<'_>, file_scope_entry: bool) {
         if node.kind() == "comment"
             && node_text(node, self.source).is_some_and(|comment| {
                 let comment = comment.to_ascii_lowercase();
@@ -856,18 +885,7 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
             .child_by_field_name("method")
             .and_then(|method| node_text(method, self.source))
             .unwrap_or_default();
-        if matches!(
-            method,
-            "define_method"
-                | "include"
-                | "extend"
-                | "prepend"
-                | "send"
-                | "public_send"
-                | "class_eval"
-                | "module_eval"
-                | "method_missing"
-        ) {
+        if ruby_method_table_mutator(method) {
             self.index.poisoned = true;
         }
         if method == "require_relative" {
@@ -875,7 +893,11 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
             let literal =
                 ruby_literal_require_relative(node_text(node, self.source).unwrap_or_default());
             let import = unique_import_node(&self.graph_imports, line);
-            match (literal, import, self.require_relative.is_none()) {
+            match (
+                literal,
+                import,
+                self.require_relative.is_none() && file_scope_entry,
+            ) {
                 (Some(module), Some(import), true) => {
                     self.require_relative = Some((module, import))
                 }
@@ -1073,6 +1095,95 @@ impl<'index, 'tree> RubyResolutionProducer<'index, 'tree> {
         });
         count_ruby_php_resolution_work(1);
     }
+}
+
+fn ruby_magic_method_declaration(name: &str) -> bool {
+    matches!(
+        name,
+        "method_missing"
+            | "respond_to_missing?"
+            | "method_added"
+            | "singleton_method_added"
+            | "inherited"
+            | "included"
+            | "extended"
+            | "prepended"
+            | "append_features"
+            | "extend_object"
+            | "prepend_features"
+            | "const_missing"
+    )
+}
+
+fn ruby_method_table_mutator(name: &str) -> bool {
+    matches!(
+        name,
+        "remove_method"
+            | "undef_method"
+            | "alias_method"
+            | "define_method"
+            | "define_singleton_method"
+            | "attr"
+            | "attr_reader"
+            | "attr_writer"
+            | "attr_accessor"
+            | "include"
+            | "prepend"
+            | "extend"
+            | "eval"
+            | "class_eval"
+            | "module_eval"
+            | "instance_eval"
+            | "class_exec"
+            | "module_exec"
+            | "instance_exec"
+            | "send"
+            | "public_send"
+            | "__send__"
+            | "method"
+            | "public_method"
+            | "singleton_method"
+            | "instance_method"
+            | "const_set"
+            | "remove_const"
+            | "autoload"
+            | "method_missing"
+            | "respond_to_missing?"
+    )
+}
+
+fn ruby_inert_declaration_syntax(node: TsNode<'_>) -> bool {
+    count_ruby_php_resolution_work(1);
+    if matches!(
+        node.kind(),
+        "comment"
+            | "integer"
+            | "float"
+            | "nil"
+            | "true"
+            | "false"
+            | "string_content"
+            | "escape_sequence"
+    ) {
+        return true;
+    }
+    if !matches!(
+        node.kind(),
+        "string"
+            | "symbol"
+            | "simple_symbol"
+            | "bare_symbol"
+            | "array"
+            | "hash"
+            | "pair"
+            | "parenthesized_statements"
+            | "unary"
+    ) {
+        return false;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .all(ruby_inert_declaration_syntax)
 }
 
 fn ruby_literal_require_relative(surface: &str) -> Option<String> {

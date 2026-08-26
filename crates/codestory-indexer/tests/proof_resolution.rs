@@ -1332,6 +1332,112 @@ fn ruby_and_php_dynamic_declaration_domains_never_authorize_a_fact() -> anyhow::
 }
 
 #[test]
+fn ruby_method_table_domain_is_closed_over_all_parser_observed_mutation_forms() -> anyhow::Result<()>
+{
+    let hostile = [
+        (
+            "remove_method_call",
+            "class Worker\n  def target\n  end\n  remove_method :unrelated\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "undef_method_call",
+            "class Worker\n  def target\n  end\n  undef_method :unrelated\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "alias_method_call",
+            "class Worker\n  def target\n  end\n  alias_method :other, :target\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "define_method_call",
+            "class Worker\n  def target\n  end\n  define_method(:other) {}\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "include_call",
+            "class Worker\n  def target\n  end\n  include External\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "prepend_call",
+            "class Worker\n  def target\n  end\n  prepend External\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "extend_call",
+            "class Worker\n  def target\n  end\n  extend External\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "eval_call",
+            "class Worker\n  def target\n  end\n  class_eval('def other; end')\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "reflective_send_inside_method",
+            "class Worker\n  def target\n  end\n  def mutate\n    self.class.__send__(:remove_method, :unrelated)\n  end\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "syntax_undef",
+            "class Worker\n  def target\n  end\n  undef target\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "syntax_alias",
+            "class Worker\n  def target\n  end\n  alias other target\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "singleton_class",
+            "class Worker\n  def target\n  end\n  class << self\n    def other\n    end\n  end\n  def caller\n    self.target\n  end\nend\n",
+        ),
+        (
+            "class_reopening",
+            "class Worker\n  def target\n  end\nend\nclass Worker\n  def other\n  end\nend\ndef caller\n  Worker.new.target\nend\n",
+        ),
+    ];
+    for (name, source) in hostile {
+        let project = tempfile::tempdir()?;
+        let mut store = Store::new_in_memory()?;
+        index_files(project.path(), &mut store, &[("fixture.rb", source)])?;
+        rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+        store.validate_proof_resolution_publication(&publication(1))?;
+        let facts = store.get_proof_resolution_facts()?;
+        let fact = facts
+            .iter()
+            .find(|fact| {
+                fact.provenance.language_adapter == "ruby" && fact.callsite.raw_target == "target"
+            })
+            .unwrap_or_else(|| panic!("{name} emitted no canonical target fact: {facts:#?}"));
+        assert_ne!(
+            fact.status,
+            ProofResolutionStatus::Exact,
+            "{name}: {fact:#?}"
+        );
+        assert!(
+            fact.target.is_none() && fact.edge_id.is_none() && fact.evidence_chain.is_empty(),
+            "{name}: {fact:#?}"
+        );
+    }
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "control.rb",
+            "\"inert documentation\"\n42\nclass Worker\n  \"inert class documentation\"\n  def target\n  end\n  def caller\n    ordinary_runtime_call\n    self.target\n  end\nend\n",
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let fact = facts
+        .iter()
+        .find(|fact| {
+            fact.provenance.language_adapter == "ruby" && fact.callsite.raw_target == "target"
+        })
+        .unwrap_or_else(|| panic!("supported control emitted no target fact: {facts:#?}"));
+    assert_eq!(fact.status, ProofResolutionStatus::Exact, "{fact:#?}");
+    assert!(fact.target.is_some() && fact.edge_id.is_some());
+    assert!(!fact.evidence_chain.is_empty());
+    Ok(())
+}
+
+#[test]
 fn ruby_complete_domain_closes_duplicates_reopening_and_relative_imports() -> anyhow::Result<()> {
     let cases = [
         (
