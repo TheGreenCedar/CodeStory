@@ -6,8 +6,8 @@ use codestory_contracts::proof_resolution::{
     CalleeForm, ProofResolutionStatus, ResolutionEvidenceKind,
 };
 use multilingual_contract::{
-    FixtureClass, MISSING_ADAPTER_ALLOWLIST, ObservedDisposition, PUBLIC_PROOF_ROUTE_DARK,
-    dispatches, materialize_repository_source, materialized_projection_rejects_injected_fact,
+    FixtureClass, ObservedDisposition, PUBLIC_PROOF_ROUTE_DARK, dispatches,
+    materialize_repository_source, materialized_projection_rejects_injected_fact,
     observe_language_source, observe_language_source_after_call_edge_removal,
     observe_multilingual_contract, observe_structural_continuity, observe_structural_source,
     resolution_funnel, valid_callee_form,
@@ -105,19 +105,16 @@ fn all_language_rows_are_real_parser_and_adapter_observations() -> anyhow::Resul
             assert_eq!(selector, dispatch.pinned_selector);
             assert_eq!(selector.commit.len(), 40);
             assert!(!selector.path.is_empty() && !selector.selector.is_empty());
-            if positive.adapter_available {
-                assert!(
-                    positive.facts.iter().any(|fact| fact.proof_admitted),
-                    "{} positive fixture was not proven by its installed adapter",
-                    positive.path.display()
-                );
-            } else {
-                assert!(
-                    positive.facts.is_empty(),
-                    "{} is missing an adapter and must not fabricate proof facts",
-                    dispatch.language
-                );
-            }
+            assert!(
+                positive.adapter_available,
+                "{} has no installed exact-resolution adapter",
+                dispatch.language
+            );
+            assert!(
+                positive.facts.iter().any(|fact| fact.proof_admitted),
+                "{} positive fixture was not proven by its installed adapter",
+                positive.path.display()
+            );
         }
     }
 
@@ -126,11 +123,10 @@ fn all_language_rows_are_real_parser_and_adapter_observations() -> anyhow::Resul
         .filter(|dispatch| !observation.adapter_roster.contains(dispatch.language))
         .map(|dispatch| dispatch.language)
         .collect::<BTreeSet<_>>();
-    assert_eq!(
-        observed_missing,
-        MISSING_ADAPTER_ALLOWLIST.iter().copied().collect()
+    assert!(
+        observed_missing.is_empty(),
+        "every parser dispatch must have an installed exact-resolution adapter: {observed_missing:?}"
     );
-    assert_eq!(MISSING_ADAPTER_ALLOWLIST, &["bash"]);
     for case in &observation.cases {
         let components = case
             .path
