@@ -141,6 +141,13 @@ function exactLifecycle() {
     package_authentication_ms: { published_0_17_4: 10, candidate_0_18: 10 },
     total_package_authentication_ms: 20,
     model_initialization_ms: { published_0_17_4: 5, candidate_0_18: 5 },
+    cost_rates: {
+      currency: "USD",
+      model: "gpt-5.6-sol",
+      input_per_mtok: 4,
+      output_per_mtok: 20,
+      source: "configured_environment",
+    },
     preparation_order: EXACT_TASKS.map(([_, repo], index) => ({
       repo,
       arms: index % 2 === 0
@@ -150,8 +157,8 @@ function exactLifecycle() {
   };
 }
 
-function passingCacheProvenance() {
-  return {
+function passingCacheProvenance(schemaVersion = 2) {
+  const provenance = {
     doctor_status: "pass",
     storage_path: "/isolated/cache.db",
     cache_policy: "prepared-retrieval-cache-read-only",
@@ -190,6 +197,9 @@ function passingCacheProvenance() {
       preparation_wall_ms: 100,
       incremental_status: "pass",
       incremental_wall_ms: 20,
+      coherence_refresh_status: "pass",
+      coherence_refresh_exit_code: 0,
+      coherence_semantic_generation: "semantic-1",
       incremental_source_mutation: {
         path: "src/named.rs",
         original_sha256: "b".repeat(64),
@@ -198,6 +208,34 @@ function passingCacheProvenance() {
       },
     },
   };
+  if (schemaVersion === 3) {
+    provenance.packet_embedding_execution = {
+      source: "packet.v3_public_projection",
+      schema_version: 3,
+      transport_mode: "agent_harness_prelude",
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      embedding_policy: "accelerated",
+      retrieval_mode: "full",
+      packet_kind: "complete",
+      evidence_status: "available",
+      evidence_count: 1,
+      gap_count: 0,
+      core_generation: "core-1",
+      core_run_id: "run-1",
+      retrieval_core_generation: "core-1",
+      retrieval_core_run_id: "run-1",
+      retrieval_generation: "retrieval-1",
+      retrieval_state_generation: "retrieval-1",
+      semantic_generation: "semantic-1",
+      prepared_semantic_generation: "semantic-1",
+      diagnostics_availability: "available",
+      diagnostics_artifact_id: "diagnostic-1",
+      diagnostics_sha256: "7".repeat(64),
+      diagnostics_byte_length: 512,
+    };
+  }
+  return provenance;
 }
 
 function exactCandidateRows() {
@@ -300,27 +338,44 @@ function exactCandidateRows() {
                 prelude_cli_sha256: (arm === "published_0_17_4" ? "c" : "d").repeat(64),
               }
             : null,
-          codestory_cache_provenance: codestory ? passingCacheProvenance() : null,
+          codestory_cache_provenance: codestory
+            ? passingCacheProvenance(arm === "candidate_0_18" ? 3 : 2)
+            : null,
           codestory_harness_prelude: codestory
             ? {
                 status: "pass",
+                packet_schema_version: arm === "candidate_0_18" ? 3 : 2,
                 packet_extra_probe_strategy: null,
                 packet_contract_runtime: {
-                  plugin_version: packageVersion,
-                  plugin_cli_version: packageVersion,
                   cli_version: packageVersion,
-                  pinned_pair_matches: true,
-                  cli_source: "managed",
+                  cli_source: "direct_cli_launch",
                   known_override_skew_channel: false,
                 },
-                packet_sufficiency: {
+                ...(arm === "candidate_0_18"
+                  ? {
+                      packet_evidence_gap_accounting: {
+                        contract: "codestory.packet-v3-evidence-gap-accounting/v1",
+                        kind: "complete",
+                        status: "available",
+                        evidence_count: 1,
+                        unique_evidence_id_count: 1,
+                        evidence_kind_counts: { exact_source: 1 },
+                        gap_count: 0,
+                        unique_gap_id_count: 0,
+                        gap_kind_counts: {},
+                        continuation_gap_count: 0,
+                        unique_continuation_gap_id_count: 0,
+                        continuation_gap_ids_bound: true,
+                      },
+                    }
+                  : { packet_sufficiency: {
                   obligation_accounting: {
                     total: 0,
                     material: 0,
                     nonmaterial: 0,
                     material_status_buckets: {},
                   },
-                },
+                } }),
               }
             : null,
         });
@@ -360,6 +415,26 @@ test("exact-candidate mode freezes the 18x3x3 shape and rejects baseline reuse",
       opts,
       Array.from({ length: 18 }, (_, index) => ({ id: `t-${index}` })),
     )
+  );
+});
+
+test("exact-candidate cost rates fail before package or repository work", () => {
+  assert.throws(
+    () => benchmarkHarness.exactCandidateCostRates({}),
+    /requires positive CODESTORY_BENCH_INPUT_COST_PER_MTOK.*before package authentication or repository materialization/i,
+  );
+  assert.deepEqual(
+    benchmarkHarness.exactCandidateCostRates({
+      CODESTORY_BENCH_INPUT_COST_PER_MTOK: "4",
+      CODESTORY_BENCH_OUTPUT_COST_PER_MTOK: "20",
+    }),
+    {
+      currency: "USD",
+      model: "gpt-5.6-sol",
+      input_per_mtok: 4,
+      output_per_mtok: 20,
+      source: "configured_environment",
+    },
   );
 });
 
@@ -832,13 +907,16 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     }, /baseline has CodeStory visibility/i],
     ["published runtime proof", (rows) => {
       rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_contract_runtime = null;
-    }, /missing per-arm managed runtime proof/i],
+    }, /missing per-arm exact-package runtime proof/i],
     ["candidate cache proof", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance = null;
     }, /missing per-arm cache proof/i],
     ["published obligation proof", (rows) => {
       rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_sufficiency = null;
     }, /missing per-arm obligation proof/i],
+    ["candidate v3 evidence gap proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_harness_prelude.packet_evidence_gap_accounting = null;
+    }, /missing per-arm v3 evidence\/gap proof/i],
     ["candidate source mutation proof", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_source_mutation = null;
     }, /missing verified source mutation/i],
@@ -848,6 +926,9 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     ["cache timing mismatch", (rows) => {
       rows.find((row) => row.arm === "published_0_17_4").codestory_cache_provenance.cache_preparation.incremental_wall_ms = 19;
     }, /cache lifecycle timings do not reconcile/i],
+    ["cross-arm coherence", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.coherence_semantic_generation = "stale";
+    }, /cross-arm cache coherence/i],
     ["executed CLI substitution", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").codestory_prelude_cli_sha256 = "9".repeat(64);
     }, /executed CLI is not bound/i],
@@ -899,6 +980,10 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
       lifecycle.package_authentication_ms.candidate_0_18 = 1000;
       return lifecycle;
     }, /all-in timing exceeds 110%/i],
+    ["missing cost rates", (lifecycle) => {
+      delete lifecycle.cost_rates;
+      return lifecycle;
+    }, /cost rates are missing/i],
   ]) {
     const lifecycle = mutate(exactLifecycle());
     const result = benchmarkHarness.exactCandidateAcceptance(exactCandidateRows(), lifecycle);
@@ -946,6 +1031,56 @@ test("exact lifecycle alternates preparation and restores the selected source by
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("final exact-candidate coherence refresh overwrites stale cross-arm publication state", async () => {
+  const task = { repo: "psf-requests", project: "/repo" };
+  const opts = {
+    exactCandidate: true,
+    exactCandidateStateRoot: "/tmp/exact-state",
+    exactCandidatePackageByArm: new Map([
+      ["candidate_0_18", { cli_path: "/authenticated/candidate-cli" }],
+    ]),
+    prepareCodestoryTimeoutMs: 60_000,
+    signal: null,
+    packetRuntimeChildEnv: {},
+  };
+  const row = {
+    project: "/repo",
+    retrieval_status: { semantic_generation: "stale-generation" },
+  };
+  const calls = [];
+  await benchmarkHarness.refreshExactCandidatePreparation(
+    opts,
+    task,
+    "candidate_0_18",
+    row,
+    {
+      run: async (command, args) => {
+        calls.push([command, ...args]);
+        return { status: "pass", exitCode: 0, stdout: "", stderr: "" };
+      },
+      statusSnapshot: async () => ({
+        status: "pass",
+        retrieval_mode: "full",
+        degraded_reason: null,
+        semantic_generation: "fresh-generation",
+      }),
+      engineSnapshot: async () => ({
+        status: "pass",
+        retrieval_mode: "full",
+        degraded_reason: null,
+        engine: {},
+        server: null,
+      }),
+      doctorSnapshot: async () => ({ freshness_status: "fresh" }),
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "/authenticated/candidate-cli");
+  assert.equal(row.retrieval_status.semantic_generation, "fresh-generation");
+  assert.equal(row.coherence_refresh_status, "pass");
+  assert.equal(row.coherence_semantic_generation, "fresh-generation");
 });
 
 test("exact CodeStory arms use disjoint embedding-server qualification namespaces", () => {
@@ -1515,6 +1650,193 @@ function exactPacketStdout(packet) {
     packet.budget.used.output_bytes = bytes;
   }
 }
+
+function packetV3Fixture() {
+  return {
+    schema_version: 3,
+    kind: "complete",
+    status: "available",
+    identity: {
+      packet_id: "packet-v3",
+      request_id: "request-v3",
+      question_sha256: "1".repeat(64),
+    },
+    publication: {
+      core: {
+        project_id: "project-v3",
+        generation_id: "core-v3",
+        run_id: "run-v3",
+      },
+      retrieval: {
+        core_generation_id: "core-v3",
+        core_run_id: "run-v3",
+        retrieval_generation: "retrieval-v3",
+        retrieval_input_sha256: "2".repeat(64),
+        semantic_generation: "semantic-v3",
+      },
+    },
+    retrieval: { state: "full", generation_id: "retrieval-v3" },
+    evidence: [{
+      identity: { evidence_id: "evidence-v3" },
+      kind: "exact_source",
+      path: "src/lib.rs",
+      symbol_id: "crate::run",
+      start_line: 4,
+      end_line: 7,
+      summary: "run calls dispatch",
+    }],
+    gaps: [],
+    continuation: null,
+    diagnostics: {
+      availability: "available",
+      reference: {
+        artifact_id: "diagnostic-v3",
+        sha256: "3".repeat(64),
+        byte_length: 512,
+      },
+    },
+    _meta: {
+      codestory_publication: {
+        contract_runtime: {
+          cli_source: "direct_cli_launch",
+          cli_version: "0.17.4",
+          known_override_skew_channel: false,
+        },
+      },
+    },
+  };
+}
+
+test("v3 packet validation keeps evidence authority version-native and closed", () => {
+  const packet = packetV3Fixture();
+  assert.deepEqual(packetPreludeContractBlockers(packet, JSON.stringify(packet), {
+    requireSupported: true,
+    requireManagedRuntime: false,
+  }), []);
+  assert.match(
+    packetPreludeContractBlockers(packet, JSON.stringify(packet), {
+      expectedQuestion: "different question",
+    }).join("\n"),
+    /question digest does not match/,
+  );
+  assert.equal(publicPacketPreludeContractPasses(packet, JSON.stringify(packet)), true);
+  const prompt = packetForAgentPrompt(packet);
+  assert.equal(prompt.schema_version, 3);
+  assert.equal(prompt.status, "available");
+  assert.equal(prompt.evidence.length, 1);
+  assert.equal(Object.hasOwn(prompt, "support"), false);
+  assert.equal(Object.hasOwn(prompt, "disposition"), false);
+  assert.deepEqual(benchmarkHarness.packetV3EvidenceGapAccounting(packet), {
+    contract: "codestory.packet-v3-evidence-gap-accounting/v1",
+    kind: "complete",
+    status: "available",
+    evidence_count: 1,
+    unique_evidence_id_count: 1,
+    evidence_kind_counts: { exact_source: 1 },
+    gap_count: 0,
+    unique_gap_id_count: 0,
+    gap_kind_counts: {},
+    continuation_gap_count: 0,
+    unique_continuation_gap_id_count: 0,
+    continuation_gap_ids_bound: true,
+  });
+
+  const mutations = [
+    ["missing identity", (value) => { value.evidence[0].identity.evidence_id = ""; }, /evidence identity is missing/],
+    ["duplicate evidence", (value) => { value.evidence.push(structuredClone(value.evidence[0])); }, /evidence identity=.*duplicated/],
+    ["duplicate gap", (value) => {
+      value.status = "continuation_available";
+      value.gaps = [
+        { identity: { gap_id: "gap-v3" }, kind: "continuation_required", message: null },
+        { identity: { gap_id: "gap-v3" }, kind: "evidence_missing", message: null },
+      ];
+      value.continuation = {
+        continuation_id: "continuation-v3",
+        remaining_rounds: 1,
+        gap_ids: [{ gap_id: "gap-v3" }],
+      };
+    }, /gap identity=.*duplicated/],
+    ["unbound continuation", (value) => {
+      value.status = "continuation_available";
+      value.gaps = [{ identity: { gap_id: "gap-v3" }, kind: "continuation_required", message: null }];
+      value.continuation = {
+        continuation_id: "continuation-v3",
+        remaining_rounds: 1,
+        gap_ids: [{ gap_id: "other-gap" }],
+      };
+    }, /continuation gap identities.*unbound/],
+    ["wrong retrieval binding", (value) => {
+      value.publication.retrieval.core_generation_id = "other-core";
+    }, /retrieval publication is not bound/],
+    ["over cap", (value) => { value.padding = "x".repeat(17_000); }, /compact bytes=.*exceeds public cap/],
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const hostile = structuredClone(packet);
+    mutate(hostile);
+    assert.match(
+      packetPreludeContractBlockers(hostile, JSON.stringify(hostile)).join("\n"),
+      expected,
+      label,
+    );
+  }
+});
+
+test("v3 packet continuation and budget fallback remain bounded and non-partial", () => {
+  const continuation = packetV3Fixture();
+  continuation.status = "continuation_available";
+  continuation.gaps = [{
+    identity: { gap_id: "gap-v3" },
+    kind: "continuation_required",
+    message: "one more bounded lookup",
+  }];
+  continuation.continuation = {
+    continuation_id: "continuation-v3",
+    remaining_rounds: 1,
+    gap_ids: [{ gap_id: "gap-v3" }],
+  };
+  assert.deepEqual(
+    drillPacketCommandArgs(
+      { path: "/repo", prompt: "question" },
+      { prompt: "question", task_class: "architecture_explanation" },
+      {},
+      continuation,
+    ).slice(-8),
+    [
+      "--parent-packet-id", "continuation-v3",
+      "--option-id", "gap-v3",
+      "--core-generation-id", "core-v3",
+      "--retrieval-generation", "retrieval-v3",
+    ],
+  );
+
+  const fallback = packetV3Fixture();
+  fallback.kind = "budget_exceeded";
+  fallback.status = "unavailable";
+  delete fallback.evidence;
+  delete fallback.continuation;
+  fallback.gaps = [{
+    identity: { gap_id: "packet-output-budget-exceeded" },
+    kind: "output_budget_exceeded",
+    message: null,
+  }];
+  fallback.maximum_bytes = 16 * 1024;
+  fallback.required_complete_bytes = 16 * 1024 + 1;
+  assert.deepEqual(
+    packetPreludeContractBlockers(fallback, JSON.stringify(fallback)),
+    [],
+  );
+  fallback.evidence = [];
+  assert.match(
+    packetPreludeContractBlockers(fallback, JSON.stringify(fallback)).join("\n"),
+    /contains partial evidence or continuation/,
+  );
+  delete fallback.evidence;
+  fallback.required_complete_bytes = 16 * 1024;
+  assert.match(
+    packetPreludeContractBlockers(fallback, JSON.stringify(fallback)).join("\n"),
+    /required_complete_bytes is invalid/,
+  );
+});
 
 function managedRuntimeIdentity(overrides = {}) {
   return {
@@ -3918,6 +4240,52 @@ test("cold packet embedding execution binds full retrieval to the prepared seman
   );
 });
 
+test("v3 public packet projection binds full retrieval to the prepared publication", () => {
+  const preparation = {
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "accelerated",
+    },
+    retrieval_status: { semantic_generation: "semantic-v3" },
+  };
+  const packet = packetV3Fixture();
+  const proof = packetEmbeddingExecutionProof(
+    packet,
+    preparation,
+    "agent_harness_prelude",
+  );
+  const provenance = localCacheProvenance({
+    semantic_generation: "semantic-v3",
+    transport_mode: "agent_harness_prelude",
+    packet_embedding_execution: proof,
+  });
+  assert.equal(proof.source, "packet.v3_public_projection");
+  assert.equal(proof.semantic_generation, "semantic-v3");
+  assert.deepEqual(
+    cacheProvenanceBlockers({ codestory_cache_provenance: provenance }),
+    [],
+  );
+
+  for (const [field, value, expected] of [
+    ["retrieval_mode", "degraded", /retrieval mode=degraded/],
+    ["retrieval_state_generation", "other", /state generation does not match/],
+    ["semantic_generation", "other", /does not match the prepared generation/],
+    ["diagnostics_sha256", null, /no valid diagnostics reference/],
+    ["evidence_count", -1, /invalid evidence accounting/],
+  ]) {
+    const hostileProof = structuredClone(proof);
+    hostileProof[field] = value;
+    const blockers = cacheProvenanceBlockers({
+      codestory_cache_provenance: {
+        ...provenance,
+        packet_embedding_execution: hostileProof,
+      },
+    });
+    assert.match(blockers.join("\n"), expected, field);
+  }
+});
+
 test("packet latency telemetry preserves retrieval shadow cache diagnostics", () => {
   const packet = {
     answer: {
@@ -4843,6 +5211,28 @@ test("transcript analysis authorizes source reads only from user-named files or 
   });
   assert.equal(gap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
   assert.equal(gap.direct_source_reads[0].authorization.evidence_command_id, "packet");
+
+  const v3GapEvents = [
+    commandEvent("packet-v3", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet-v3",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      JSON.stringify({
+        schema_version: 3,
+        status: "continuation_available",
+        gaps: [{ kind: "evidence_missing" }],
+      }),
+    ),
+    commandEvent("v3-gap-read", "item.started", "Get-Content src/v3-gap.ts"),
+    commandEvent("v3-gap-read", "item.completed", "Get-Content src/v3-gap.ts", "source"),
+  ];
+  const v3Gap = analyzeTranscript(v3GapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(v3Gap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
+  assert.equal(v3Gap.direct_source_reads[0].authorization.evidence_command_id, "packet-v3");
 
   const unauthorized = analyzeTranscript(namedEvents, project, {
     arm: "candidate_0_18",

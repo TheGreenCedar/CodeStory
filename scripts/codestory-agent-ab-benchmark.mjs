@@ -51,6 +51,7 @@ const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
 const PUBLIC_PACKET_MAX_ANCHORS = 16;
 const PUBLIC_PACKET_MAX_TRAIL_EDGES = 60;
 const PUBLIC_PACKET_MAX_OUTPUT_BYTES = 128 * 1024;
+const PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES = 16 * 1024;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
 const EXACT_CANDIDATE_ARMS = Object.freeze([
@@ -211,6 +212,9 @@ const ALL_REPOS = { ...PUBLIC_REPOS, ...LOCAL_REPOS };
 const CODESTORY_ARM_INSTRUCTION =
   "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.";
 
+const CODESTORY_V3_ARM_INSTRUCTION =
+  "Use the CodeStory packet supplied by the harness as repository evidence, not as proof or an answer-authority verdict. Answer only from its evidence rows and state every material gap. Follow at most one declared continuation using the packet's continuation and publication identities. Inspect a source file only when the user named it or the packet explicitly reports an evidence gap, Unknown, or Unavailable boundary; do not broaden into unconstrained repository exploration. Do not turn missing evidence into absence or runtime behavior. Do not repeat the initial packet call or use web search, browser tools, remote URLs, or upstream mirrors.";
+
 const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
@@ -222,6 +226,16 @@ const ARMS = {
 
 function isCodeStoryArm(arm) {
   return arm === "with_codestory" || arm === "published_0_17_4" || arm === "candidate_0_18";
+}
+
+function isPacketProjectionV3(packet) {
+  return packet?.schema_version === 3;
+}
+
+function codeStoryArmInstruction(packet) {
+  return isPacketProjectionV3(packet)
+    ? CODESTORY_V3_ARM_INSTRUCTION
+    : CODESTORY_ARM_INSTRUCTION;
 }
 
 function usage() {
@@ -2477,7 +2491,10 @@ Run that answer packet before any repository search, direct source read, git com
     : "";
   const stopContractBlock =
     isCodeStoryArm(armName)
-      ? `
+      ? isPacketProjectionV3(context.codestoryPrelude?.packet)
+        ? `
+The packet is an evidence-only projection. Use its evidence rows directly, name every gap, and do not infer proof, completeness, runtime behavior, or absence from availability. If status is \`continuation_available\`, execute exactly the declared one-shot continuation and then stop. A source read is allowed only for a user-named file or an explicit packet gap, \`Unknown\`, or \`Unavailable\` boundary.`
+        : `
 The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. A \`not_established\` packet can still contain directly useful support: answer those established parts, identify the material gaps, and do not infer the missing links. On \`drill_once\`, execute exactly the declared one-shot packet continuation, apply the same terminal answer rule, and then stop regardless of its result.`
       : "";
   const harnessPacketBlock = packetPreludePromptBlock(context.codestoryPrelude);
@@ -2489,7 +2506,9 @@ ${taskHeader}
 Task: ${taskPrompt}
 
 Arm: ${armName}
-Instruction: ${ARMS[armName]}
+Instruction: ${isCodeStoryArm(armName)
+    ? codeStoryArmInstruction(context.codestoryPrelude?.packet)
+    : ARMS[armName]}
 ${packetFirstBlock}
 ${stopContractBlock}
 ${harnessPacketBlock}
@@ -2519,6 +2538,22 @@ function packetPreludePromptBlock(prelude) {
   if (!prelude?.packet) {
     return "";
   }
+  if (isPacketProjectionV3(prelude.packet)) {
+    return `
+The benchmark harness already ran the required first repository-context command before starting you:
+\`\`\`${packetFirstCommandFenceLanguage()}
+${prelude.public.command}
+\`\`\`
+
+Use the evidence rows as bounded repository evidence and preserve every gap and
+availability boundary. This packet does not prove claims. Do not repeat the
+initial packet call or synthesize legacy support/disposition semantics.
+
+CodeStory packet JSON excerpt:
+\`\`\`json
+${JSON.stringify(packetForAgentPrompt(prelude.packet), null, 2)}
+\`\`\``;
+  }
   return `
 The benchmark harness already ran the required first repository-context command before starting you:
 \`\`\`${packetFirstCommandFenceLanguage()}
@@ -2540,6 +2575,42 @@ function packetForAgentPrompt(packet) {
   if (!packet || typeof packet !== "object") {
     return packet;
   }
+  if (isPacketProjectionV3(packet)) {
+    return {
+      schema_version: 3,
+      kind: packet.kind ?? null,
+      status: packet.status ?? null,
+      identity: packet.identity ?? null,
+      publication: packet.publication ?? null,
+      retrieval: packet.retrieval ?? null,
+      evidence: (packet.evidence ?? []).map((row) => ({
+        identity: row?.identity ?? null,
+        kind: row?.kind ?? null,
+        path: row?.path ?? null,
+        symbol_id: row?.symbol_id ?? null,
+        start_line: row?.start_line ?? null,
+        end_line: row?.end_line ?? null,
+        summary: row?.summary == null
+          ? null
+          : truncatePacketPromptText(row.summary, 1_200),
+      })),
+      gaps: (packet.gaps ?? []).map((row) => ({
+        identity: row?.identity ?? null,
+        kind: row?.kind ?? null,
+        message: row?.message == null
+          ? null
+          : truncatePacketPromptText(row.message, 800),
+      })),
+      continuation: packet.continuation ?? null,
+      diagnostics: packet.diagnostics ?? null,
+      ...(packet.kind === "budget_exceeded"
+        ? {
+            maximum_bytes: packet.maximum_bytes ?? null,
+            required_complete_bytes: packet.required_complete_bytes ?? null,
+          }
+        : {}),
+    };
+  }
   return {
     packet_id: packet.packet_id ?? null,
     question: packet.question ?? null,
@@ -2559,6 +2630,13 @@ function packetPreludeManifestComplete(publicPrelude) {
   const quality = publicPrelude?.packet_manifest_quality;
   if (!quality?.pass) {
     return false;
+  }
+  if (publicPrelude?.packet_schema_version === 3) {
+    return (
+      publicPrelude?.packet_projection_kind === "complete" &&
+      publicPrelude?.packet_evidence_availability?.status === "available" &&
+      (presentFiniteNumber(publicPrelude?.packet_evidence_count) ?? 0) > 0
+    );
   }
   if (publicPrelude?.packet_disposition_kind !== "supported") {
     return false;
@@ -2591,15 +2669,32 @@ function packetManifestQualitySummary(packet, task) {
     )
     .filter(Boolean)
     .join("\n");
-  const claimText = (packet.support ?? [])
+  const claimText = isPacketProjectionV3(packet)
+    ? (packet.evidence ?? [])
+      .map((row) => [
+        row?.path,
+        row?.symbol_id,
+        row?.start_line == null ? null : `line ${row.start_line}`,
+        row?.summary,
+      ].filter(Boolean).join(" "))
+      .filter(Boolean)
+      .join("\n")
+    : (packet.support ?? [])
     .map((support) => String(support?.summary ?? "").trim())
     .filter(Boolean)
     .join("\n");
+  const gapText = isPacketProjectionV3(packet)
+    ? (packet.gaps ?? [])
+      .map((gap) => [gap?.kind, gap?.message].filter(Boolean).join(" "))
+      .filter(Boolean)
+      .join("\n")
+    : "";
   const text = [
     packet.answer?.summary ?? "",
     packetAnswerText(packet),
     citationText,
     claimText,
+    gapText,
   ]
     .filter(Boolean)
     .join("\n");
@@ -3066,7 +3161,7 @@ function directSourceReadAuthorization(read, commands, events, projectRoot, cont
   if (relativePath && prompt.includes(relativePath)) {
     return { status: "authorized", reason: "user_named_file" };
   }
-  const gapPattern = /\b(?:unknown|unavailable|not_established|evidence gap|material gap|missing evidence)\b/i;
+  const gapPattern = /\b(?:unknown|unavailable|not_established|evidence gap|material gap|missing evidence|evidence_missing|retrieval_unavailable|source_unavailable|continuation_required|output_budget_exceeded)\b/i;
   const priorCommand = [...commands].reverse().find((command) =>
     command.category === "codestory_cli" &&
     (command.completed_event_index ?? -1) < (read.event_index ?? -1) &&
@@ -3869,6 +3964,28 @@ function estimateCost(usage) {
   return (usage.input_tokens / 1_000_000) * inputCost + (usage.output_tokens / 1_000_000) * outputCost;
 }
 
+function exactCandidateCostRates(env = process.env) {
+  const inputPerMtok = Number.parseFloat(env.CODESTORY_BENCH_INPUT_COST_PER_MTOK ?? "");
+  const outputPerMtok = Number.parseFloat(env.CODESTORY_BENCH_OUTPUT_COST_PER_MTOK ?? "");
+  if (
+    !Number.isFinite(inputPerMtok) ||
+    inputPerMtok <= 0 ||
+    !Number.isFinite(outputPerMtok) ||
+    outputPerMtok <= 0
+  ) {
+    throw new Error(
+      "exact-candidate mode requires positive CODESTORY_BENCH_INPUT_COST_PER_MTOK and CODESTORY_BENCH_OUTPUT_COST_PER_MTOK before package authentication or repository materialization",
+    );
+  }
+  return {
+    currency: "USD",
+    model: DEFAULT_BENCHMARK_MODEL,
+    input_per_mtok: inputPerMtok,
+    output_per_mtok: outputPerMtok,
+    source: "configured_environment",
+  };
+}
+
 const BENCHMARK_AGENT_RUN_ID = "shared-agent";
 
 function benchmarkAgentScopeArgs() {
@@ -3925,10 +4042,15 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
 
 function drillPacketCommandArgs(repoConfig, task, opts, packet) {
   const drill = packet?.disposition?.drill;
-  const parentPacketId = String(drill?.parent_packet_id ?? "").trim();
-  const options = Array.isArray(drill?.options) ? drill.options : [];
+  const continuation = isPacketProjectionV3(packet) ? packet.continuation : null;
+  const parentPacketId = String(
+    continuation?.continuation_id ?? drill?.parent_packet_id ?? "",
+  ).trim();
+  const options = continuation
+    ? (Array.isArray(continuation.gap_ids) ? continuation.gap_ids : [])
+    : (Array.isArray(drill?.options) ? drill.options : []);
   const optionIds = options
-    .map((option) => String(option?.id ?? "").trim())
+    .map((option) => String(option?.gap_id ?? option?.id ?? "").trim())
     .filter(Boolean);
   if (!parentPacketId || optionIds.length === 0) {
     return null;
@@ -3938,11 +4060,17 @@ function drillPacketCommandArgs(repoConfig, task, opts, packet) {
   for (const optionId of optionIds) {
     args.push("--option-id", optionId);
   }
-  const coreGenerationId = String(drill.core_generation_id ?? "").trim();
+  const coreGenerationId = String(
+    packet?.publication?.core?.generation_id ?? drill?.core_generation_id ?? "",
+  ).trim();
   if (coreGenerationId) {
     args.push("--core-generation-id", coreGenerationId);
   }
-  const retrievalGeneration = String(drill.retrieval_generation ?? "").trim();
+  const retrievalGeneration = String(
+    packet?.publication?.retrieval?.retrieval_generation ??
+      drill?.retrieval_generation ??
+      "",
+  ).trim();
   if (retrievalGeneration) {
     args.push("--retrieval-generation", retrievalGeneration);
   }
@@ -3980,6 +4108,12 @@ function preludePublicFields(prelude) {
     stdout_bytes: prelude.stdout_bytes,
     stderr_bytes: prelude.stderr_bytes,
     packet_parse_error: prelude.packet_parse_error,
+    packet_schema_version: prelude.packet_schema_version ?? null,
+    packet_projection_kind: prelude.packet_projection_kind ?? null,
+    packet_evidence_availability: prelude.packet_evidence_availability ?? null,
+    packet_evidence_gap_accounting: prelude.packet_evidence_gap_accounting ?? null,
+    packet_evidence_count: prelude.packet_evidence_count ?? null,
+    packet_gap_count: prelude.packet_gap_count ?? null,
     packet_disposition_kind: prelude.packet_disposition_kind ?? null,
     packet_disposition: prelude.packet_disposition ?? null,
     packet_support_count: prelude.packet_support_count ?? null,
@@ -3993,6 +4127,7 @@ function preludePublicFields(prelude) {
     packet_extra_probe_count: prelude.packet_extra_probe_count ?? null,
     packet_extra_probe_strategy: prelude.packet_extra_probe_strategy ?? null,
     packet_drill_continuation: prelude.packet_drill_continuation === true,
+    packet_contract_blockers: prelude.packet_contract_blockers ?? [],
   };
 }
 
@@ -4560,6 +4695,9 @@ function resultRequiresPacketObligationAccounting(result) {
     return false;
   }
   const prelude = result?.codestory_harness_prelude;
+  if (prelude?.packet_schema_version === 3) {
+    return false;
+  }
   if (
     result?.disposition != null ||
     prelude?.packet_disposition != null ||
@@ -4636,9 +4774,365 @@ function publicPacketPreludeContractPasses(packet, stdout) {
   }).length === 0;
 }
 
+function nonemptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function packetV3EvidenceGapAccounting(packet) {
+  if (!isPacketProjectionV3(packet)) {
+    return null;
+  }
+  const evidence = Array.isArray(packet.evidence) ? packet.evidence : [];
+  const gaps = Array.isArray(packet.gaps) ? packet.gaps : [];
+  const evidenceIds = evidence
+    .map((row) => row?.identity?.evidence_id)
+    .filter(nonemptyString);
+  const gapIds = gaps
+    .map((row) => row?.identity?.gap_id)
+    .filter(nonemptyString);
+  const continuationGapIds = Array.isArray(packet.continuation?.gap_ids)
+    ? packet.continuation.gap_ids
+      .map((identity) => identity?.gap_id)
+      .filter(nonemptyString)
+    : [];
+  const kindCounts = (rows) => Object.fromEntries(
+    [...rows.reduce((counts, row) => {
+      const kind = String(row?.kind ?? "unknown");
+      counts.set(kind, (counts.get(kind) ?? 0) + 1);
+      return counts;
+    }, new Map()).entries()].sort(([left], [right]) => left.localeCompare(right)),
+  );
+  return {
+    contract: "codestory.packet-v3-evidence-gap-accounting/v1",
+    kind: packet.kind ?? null,
+    status: packet.status ?? null,
+    evidence_count: evidence.length,
+    unique_evidence_id_count: new Set(evidenceIds).size,
+    evidence_kind_counts: kindCounts(evidence),
+    gap_count: gaps.length,
+    unique_gap_id_count: new Set(gapIds).size,
+    gap_kind_counts: kindCounts(gaps),
+    continuation_gap_count: continuationGapIds.length,
+    unique_continuation_gap_id_count: new Set(continuationGapIds).size,
+    continuation_gap_ids_bound:
+      continuationGapIds.every((gapId) => new Set(gapIds).has(gapId)),
+  };
+}
+
+function packetV3EvidenceAvailabilityTelemetry(packet, quality) {
+  if (!isPacketProjectionV3(packet)) {
+    return null;
+  }
+  const accounting = packetV3EvidenceGapAccounting(packet);
+  return {
+    kind: packet.kind ?? null,
+    status: packet.status ?? null,
+    terminal: packet.status !== "continuation_available",
+    retrieval_state: packet.retrieval?.state ?? null,
+    evidence_count: accounting.evidence_count,
+    evidence_kind_counts: accounting.evidence_kind_counts,
+    gap_count: accounting.gap_count,
+    gap_kind_counts: accounting.gap_kind_counts,
+    continuation_id: packet.continuation?.continuation_id ?? null,
+    continuation_gap_count: accounting.continuation_gap_count,
+    remaining_rounds: presentFiniteNumber(packet.continuation?.remaining_rounds),
+    available_quality_mismatch:
+      packet.status === "available" && quality?.pass === false,
+  };
+}
+
+function packetV3ContractBlockers(packet, options = {}) {
+  const blockers = [];
+  const isSha256 = (value) =>
+    SHA256_PATTERN.test(String(value ?? "")) && !/^0{64}$/.test(String(value));
+  const identity = packet.identity;
+  const publication = packet.publication;
+  const core = publication?.core;
+  const retrievalPublication = publication?.retrieval ?? null;
+  const retrieval = packet.retrieval;
+  const evidence = packet.evidence;
+  const gaps = packet.gaps;
+  const allowedStatuses = new Set([
+    "available",
+    "continuation_available",
+    "no_useful_evidence",
+    "unavailable",
+  ]);
+  const allowedRetrievalStates = new Set(["full", "degraded", "unavailable"]);
+  const allowedEvidenceKinds = new Set([
+    "exact_source",
+    "structural_source",
+    "graph_relation",
+    "retrieval_excerpt",
+  ]);
+  const allowedGapKinds = new Set([
+    "evidence_missing",
+    "retrieval_unavailable",
+    "source_unavailable",
+    "continuation_required",
+    "output_budget_exceeded",
+  ]);
+
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) {
+    blockers.push("packet v3 identity is missing or invalid");
+  } else {
+    for (const field of ["packet_id", "request_id"]) {
+      if (!nonemptyString(identity[field])) {
+        blockers.push(`packet v3 identity.${field} is missing`);
+      }
+    }
+    if (!isSha256(identity.question_sha256)) {
+      blockers.push("packet v3 identity.question_sha256 is invalid");
+    } else if (
+      options.expectedQuestion != null &&
+      identity.question_sha256 !== sha256Bytes(String(options.expectedQuestion))
+    ) {
+      blockers.push("packet v3 question digest does not match the benchmark task");
+    }
+  }
+  if (!core || typeof core !== "object" || Array.isArray(core)) {
+    blockers.push("packet v3 core publication is missing or invalid");
+  } else {
+    for (const field of ["project_id", "generation_id", "run_id"]) {
+      if (!nonemptyString(core[field])) {
+        blockers.push(`packet v3 publication.core.${field} is missing`);
+      }
+    }
+  }
+  if (!retrieval || typeof retrieval !== "object" || Array.isArray(retrieval)) {
+    blockers.push("packet v3 retrieval state is missing or invalid");
+  } else if (!allowedRetrievalStates.has(retrieval.state)) {
+    blockers.push(`packet v3 retrieval state=${retrieval.state ?? "missing"} is invalid`);
+  }
+  if (retrievalPublication != null) {
+    for (const field of [
+      "core_generation_id",
+      "core_run_id",
+      "retrieval_generation",
+      "semantic_generation",
+    ]) {
+      if (!nonemptyString(retrievalPublication[field])) {
+        blockers.push(`packet v3 publication.retrieval.${field} is missing`);
+      }
+    }
+    if (!isSha256(retrievalPublication.retrieval_input_sha256)) {
+      blockers.push("packet v3 publication.retrieval.retrieval_input_sha256 is invalid");
+    }
+    if (
+      core &&
+      (
+        retrievalPublication.core_generation_id !== core.generation_id ||
+        retrievalPublication.core_run_id !== core.run_id
+      )
+    ) {
+      blockers.push("packet v3 retrieval publication is not bound to the core publication");
+    }
+    if (retrieval?.generation_id !== retrievalPublication.retrieval_generation) {
+      blockers.push("packet v3 retrieval state generation does not match its publication");
+    }
+  }
+  if (retrieval?.state === "full" && !retrievalPublication) {
+    blockers.push("packet v3 full retrieval has no retrieval publication");
+  }
+  if (retrieval?.state === "unavailable" && retrievalPublication != null) {
+    blockers.push("packet v3 unavailable retrieval unexpectedly has a publication");
+  }
+  if (
+    ["degraded", "unavailable"].includes(retrieval?.state) &&
+    retrievalPublication == null &&
+    retrieval?.generation_id != null
+  ) {
+    blockers.push("packet v3 retrieval state has a generation without a publication");
+  }
+
+  if (!Array.isArray(gaps) || gaps.length > 256) {
+    blockers.push("packet v3 gaps are missing, invalid, or over the public row cap");
+  }
+  const gapIds = new Set();
+  for (const gap of Array.isArray(gaps) ? gaps : []) {
+    const gapId = gap?.identity?.gap_id;
+    if (!nonemptyString(gapId)) {
+      blockers.push("packet v3 gap identity is missing");
+    } else if (gapIds.has(gapId)) {
+      blockers.push(`packet v3 gap identity=${gapId} is duplicated`);
+    } else {
+      gapIds.add(gapId);
+    }
+    if (!allowedGapKinds.has(gap?.kind)) {
+      blockers.push(`packet v3 gap kind=${gap?.kind ?? "missing"} is invalid`);
+    }
+  }
+
+  const diagnostics = packet.diagnostics;
+  if (!diagnostics || !["available", "unavailable"].includes(diagnostics.availability)) {
+    blockers.push("packet v3 diagnostics capability is missing or invalid");
+  } else if (diagnostics.availability === "available") {
+    const reference = diagnostics.reference;
+    if (
+      !nonemptyString(reference?.artifact_id) ||
+      !isSha256(reference?.sha256) ||
+      !Number.isInteger(reference?.byte_length) ||
+      reference.byte_length < 0
+    ) {
+      blockers.push("packet v3 diagnostics reference is invalid");
+    }
+  } else if (diagnostics.reference != null) {
+    blockers.push("packet v3 unavailable diagnostics unexpectedly include a reference");
+  }
+
+  const compactBytes = Buffer.byteLength(JSON.stringify(packet), "utf8");
+  if (compactBytes > PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES) {
+    blockers.push(
+      `packet v3 compact bytes=${compactBytes} exceeds public cap=${PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES}`,
+    );
+  }
+
+  if (packet.kind === "complete") {
+    if (!Array.isArray(evidence) || evidence.length > 256) {
+      blockers.push("packet v3 evidence is missing, invalid, or over the public row cap");
+    }
+    const evidenceIds = new Set();
+    for (const row of Array.isArray(evidence) ? evidence : []) {
+      const evidenceId = row?.identity?.evidence_id;
+      if (!nonemptyString(evidenceId)) {
+        blockers.push("packet v3 evidence identity is missing");
+      } else if (evidenceIds.has(evidenceId)) {
+        blockers.push(`packet v3 evidence identity=${evidenceId} is duplicated`);
+      } else {
+        evidenceIds.add(evidenceId);
+      }
+      if (!allowedEvidenceKinds.has(row?.kind)) {
+        blockers.push(`packet v3 evidence kind=${row?.kind ?? "missing"} is invalid`);
+      }
+      if (
+        row?.start_line != null &&
+        (!Number.isInteger(row.start_line) || row.start_line < 1)
+      ) {
+        blockers.push(`packet v3 evidence start_line=${row.start_line} is invalid`);
+      }
+      if (
+        row?.end_line != null &&
+        (!Number.isInteger(row.end_line) || row.end_line < 1)
+      ) {
+        blockers.push(`packet v3 evidence end_line=${row.end_line} is invalid`);
+      }
+      if (
+        Number.isInteger(row?.start_line) &&
+        Number.isInteger(row?.end_line) &&
+        row.end_line < row.start_line
+      ) {
+        blockers.push("packet v3 evidence line range is reversed");
+      }
+    }
+    if (!allowedStatuses.has(packet.status)) {
+      blockers.push(`packet v3 status=${packet.status ?? "missing"} is invalid`);
+    }
+    const expectedStatus = packet.continuation != null
+      ? "continuation_available"
+      : Array.isArray(evidence) && evidence.length > 0
+        ? "available"
+        : retrieval?.state === "unavailable" ||
+            (Array.isArray(gaps) && gaps.some((gap) =>
+              ["retrieval_unavailable", "source_unavailable"].includes(gap?.kind)))
+          ? "unavailable"
+          : "no_useful_evidence";
+    if (allowedStatuses.has(packet.status) && packet.status !== expectedStatus) {
+      blockers.push(
+        `packet v3 status=${packet.status} does not match evidence availability=${expectedStatus}`,
+      );
+    }
+    const continuation = packet.continuation;
+    if (packet.status === "continuation_available") {
+      const references = continuation?.gap_ids;
+      if (
+        !nonemptyString(continuation?.continuation_id) ||
+        continuation?.remaining_rounds !== 1 ||
+        !Array.isArray(references) ||
+        references.length === 0
+      ) {
+        blockers.push("packet v3 continuation_available state has an invalid continuation");
+      } else {
+        const referenceIds = references.map((entry) => entry?.gap_id);
+        if (
+          referenceIds.some((gapId) => !nonemptyString(gapId) || !gapIds.has(gapId)) ||
+          new Set(referenceIds).size !== referenceIds.length
+        ) {
+          blockers.push("packet v3 continuation gap identities are missing, duplicated, or unbound");
+        }
+      }
+    } else if (continuation != null) {
+      blockers.push(`packet v3 status=${packet.status ?? "missing"} unexpectedly includes continuation`);
+    }
+    if (packet.status === "available" && (!Array.isArray(evidence) || evidence.length === 0)) {
+      blockers.push("packet v3 available status has no evidence");
+    }
+    if (
+      ["no_useful_evidence", "unavailable"].includes(packet.status) &&
+      Array.isArray(evidence) &&
+      evidence.length > 0
+    ) {
+      blockers.push(`packet v3 status=${packet.status} unexpectedly includes evidence`);
+    }
+    if (packet.maximum_bytes != null || packet.required_complete_bytes != null) {
+      blockers.push("packet v3 complete result unexpectedly includes budget fallback fields");
+    }
+  } else if (packet.kind === "budget_exceeded") {
+    if (packet.status !== "unavailable") {
+      blockers.push(`packet v3 budget fallback status=${packet.status ?? "missing"}; expected unavailable`);
+    }
+    if (packet.evidence != null || packet.continuation != null) {
+      blockers.push("packet v3 budget fallback contains partial evidence or continuation");
+    }
+    if (packet.maximum_bytes !== PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES) {
+      blockers.push(
+        `packet v3 budget fallback maximum_bytes=${packet.maximum_bytes ?? "missing"}; expected ${PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES}`,
+      );
+    }
+    if (
+      !Number.isInteger(packet.required_complete_bytes) ||
+      packet.required_complete_bytes <= PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES
+    ) {
+      blockers.push("packet v3 budget fallback required_complete_bytes is invalid");
+    }
+    if (
+      !Array.isArray(gaps) ||
+      gaps.length === 0 ||
+      gaps.some((gap) => gap?.kind !== "output_budget_exceeded")
+    ) {
+      blockers.push("packet v3 budget fallback lacks its output_budget_exceeded gap");
+    }
+  } else {
+    blockers.push(`packet v3 kind=${packet.kind ?? "missing"} is invalid`);
+  }
+
+  if (options.requireSupported) {
+    if (
+      packet.kind !== "complete" ||
+      packet.status !== "available" ||
+      packet.retrieval?.state !== "full" ||
+      !Array.isArray(packet.evidence) ||
+      packet.evidence.length === 0
+    ) {
+      blockers.push("packet v3 does not contain available full-retrieval evidence");
+    }
+  }
+  if (options.requireManagedRuntime) {
+    blockers.push(
+      ...managedRuntimeIdentityBlockers(
+        packet?._meta?.codestory_publication?.contract_runtime,
+        "packet",
+      ),
+    );
+  }
+  return blockers;
+}
+
 function packetPreludeContractBlockers(packet, stdout, options = {}) {
   if (!packet || typeof packet !== "object") {
     return ["packet JSON is missing"];
+  }
+  if (isPacketProjectionV3(packet)) {
+    return packetV3ContractBlockers(packet, options);
   }
   const blockers = [];
   const limits = packet.budget?.limits ?? {};
@@ -4809,7 +5303,10 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   if (
     result.status === "pass" &&
     !parseError &&
-    packet?.disposition?.kind === "drill_once"
+    (
+      packet?.disposition?.kind === "drill_once" ||
+      (isPacketProjectionV3(packet) && packet?.status === "continuation_available")
+    )
   ) {
     const drillArgs = drillPacketCommandArgs(repoConfig, run.task, opts, packet);
     if (drillArgs) {
@@ -4851,8 +5348,14 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     : packetPreludeContractBlockers(packet, result.stdout, {
         requireSupported: opts.publishable,
         requireManagedRuntime: opts.publishable,
+        expectedQuestion: run.task?.prompt ?? repoConfig.prompt,
       });
   const dispositionTelemetry = packetDispositionTelemetry(packet, manifestQuality);
+  const evidenceAvailabilityTelemetry = packetV3EvidenceAvailabilityTelemetry(
+    packet,
+    manifestQuality,
+  );
+  const evidenceGapAccounting = packetV3EvidenceGapAccounting(packet);
   const publicPrelude = preludePublicFields({
     command,
     args: activeArgs,
@@ -4867,8 +5370,16 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
     stderr_bytes: Buffer.byteLength(result.stderr, "utf8"),
     packet_parse_error: parseError,
-    packet_disposition_kind: dispositionTelemetry?.kind ?? null,
-    packet_disposition: dispositionTelemetry,
+    packet_schema_version: packet?.schema_version ?? null,
+    packet_projection_kind: isPacketProjectionV3(packet) ? packet?.kind ?? null : null,
+    packet_evidence_availability: evidenceAvailabilityTelemetry,
+    packet_evidence_gap_accounting: evidenceGapAccounting,
+    packet_evidence_count: evidenceGapAccounting?.evidence_count ?? null,
+    packet_gap_count: evidenceGapAccounting?.gap_count ?? null,
+    packet_disposition_kind: isPacketProjectionV3(packet)
+      ? null
+      : dispositionTelemetry?.kind ?? null,
+    packet_disposition: isPacketProjectionV3(packet) ? null : dispositionTelemetry,
     packet_support_count: dispositionTelemetry?.support_count ?? null,
     packet_support_kind_counts: dispositionTelemetry?.support_kind_counts ?? null,
     packet_citation_count: Array.isArray(packet?.answer?.citations)
@@ -5804,6 +6315,9 @@ function compactCachePreparation(preparation) {
     incremental_exit_code: preparation.incremental_exit_code ?? null,
     incremental_wall_ms: preparation.incremental_wall_ms ?? null,
     incremental_source_mutation: preparation.incremental_source_mutation ?? null,
+    coherence_refresh_status: preparation.coherence_refresh_status ?? null,
+    coherence_refresh_exit_code: preparation.coherence_refresh_exit_code ?? null,
+    coherence_semantic_generation: preparation.coherence_semantic_generation ?? null,
     retrieval_mode: preparation.retrieval_status?.retrieval_mode ?? null,
     retrieval_degraded_reason: preparation.retrieval_status?.degraded_reason ?? null,
     semantic_generation: preparation.retrieval_status?.semantic_generation ?? null,
@@ -6113,6 +6627,10 @@ async function measureExactIncrementalRefresh(opts, task, arm, row, childEnv) {
     if (restoredDoctor.freshness_status !== "fresh") {
       throw new Error(`incremental cache restoration stayed ${restoredDoctor.freshness_status ?? "unknown"}`);
     }
+    const refreshed = await exactCandidateRetrievalSnapshot(opts, task, arm);
+    row.retrieval_status = refreshed.retrieval_status;
+    row.retrieval_engine_diagnostics = refreshed.retrieval_engine_diagnostics;
+    row.after = refreshed.doctor;
   });
   const incremental = mutation.result;
   row.incremental_wall_ms = incrementalWallMs;
@@ -6128,6 +6646,92 @@ async function measureExactIncrementalRefresh(opts, task, arm, row, childEnv) {
   if (incremental?.status !== "pass") {
     throw new Error(`incremental timing failed for ${row.repo}/${arm}: ${trimTail(incremental?.stderr || incremental?.stdout)}`);
   }
+}
+
+async function exactCandidateRetrievalSnapshot(opts, task, arm, dependencies = {}) {
+  const statusSnapshot = dependencies.statusSnapshot ?? codestoryRetrievalStatusSnapshot;
+  const engineSnapshot = dependencies.engineSnapshot
+    ?? codestoryRetrievalEngineDiagnosticsSnapshot;
+  const doctorSnapshot = dependencies.doctorSnapshot ?? codestoryDoctorSnapshot;
+  const codestoryCli = resolveCodeStoryCliForArm(opts, arm);
+  const project = task.project ?? ALL_REPOS[task.repo]?.path;
+  if (!project) {
+    throw new Error(`exact candidate repository ${task.repo} has no project path`);
+  }
+  const childEnv = selectedBenchmarkChildEnv(opts, arm);
+  const timeoutMs = opts.prepareCodestoryTimeoutMs;
+  const publicRetrievalStatus = await statusSnapshot(
+    codestoryCli,
+    project,
+    timeoutMs,
+    childEnv,
+    opts.signal,
+  );
+  const retrievalEngineDiagnostics = await engineSnapshot(
+    codestoryCli,
+    project,
+    timeoutMs,
+    childEnv,
+    opts.signal,
+  );
+  const retrievalStatus = mergeRetrievalStatusWithEngineDiagnostics(
+    publicRetrievalStatus,
+    retrievalEngineDiagnostics,
+  );
+  const doctor = await doctorSnapshot(
+    codestoryCli,
+    project,
+    timeoutMs,
+    childEnv,
+    opts.signal,
+  );
+  if (
+    publicRetrievalStatus.status !== "pass" ||
+    retrievalEngineDiagnostics.status !== "pass" ||
+    retrievalStatus.retrieval_mode !== "full" ||
+    doctor.freshness_status !== "fresh"
+  ) {
+    throw new Error(
+      `exact candidate retrieval snapshot is not coherent for ${task.repo}/${arm}`,
+    );
+  }
+  return { retrieval_status: retrievalStatus, retrieval_engine_diagnostics: retrievalEngineDiagnostics, doctor };
+}
+
+async function refreshExactCandidatePreparation(
+  opts,
+  task,
+  arm,
+  row,
+  dependencies = {},
+) {
+  const run = dependencies.run ?? runProcess;
+  const codestoryCli = resolveCodeStoryCliForArm(opts, arm);
+  const childEnv = selectedBenchmarkChildEnv(opts, arm);
+  const refresh = await run(codestoryCli, retrievalIndexCommandArgs(row.project), {
+    env: childEnv,
+    signal: opts.signal,
+    timeoutMs: opts.prepareCodestoryTimeoutMs,
+    timeoutMessage: `final exact-candidate coherence refresh timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
+  });
+  if (refresh.status !== "pass") {
+    throw new Error(
+      `final exact-candidate coherence refresh failed for ${task.repo}/${arm}: ${trimTail(refresh.stderr || refresh.stdout)}`,
+    );
+  }
+  const snapshot = await exactCandidateRetrievalSnapshot(
+    opts,
+    task,
+    arm,
+    dependencies,
+  );
+  row.retrieval_status = snapshot.retrieval_status;
+  row.retrieval_engine_diagnostics = snapshot.retrieval_engine_diagnostics;
+  row.after = snapshot.doctor;
+  row.coherence_refresh_status = "pass";
+  row.coherence_refresh_exit_code = refresh.exitCode ?? 0;
+  row.coherence_semantic_generation = snapshot.retrieval_status.semantic_generation ?? null;
+  return row;
 }
 
 function exactCandidatePreparationArmOrder(index) {
@@ -6178,6 +6782,11 @@ async function prepareCodeStoryCaches(opts, tasks) {
         }
       }
       preparedByArm.set(arm, rows);
+    }
+    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      for (const row of preparedByArm.get(arm)) {
+        await refreshExactCandidatePreparation(opts, task, arm, row);
+      }
     }
     const publishedByRepo = new Map(preparedByArm.get("published_0_17_4").map((row) => [row.repo, row]));
     const candidateByRepo = new Map(preparedByArm.get("candidate_0_18").map((row) => [row.repo, row]));
@@ -6394,6 +7003,41 @@ function agentPacketPreludeCacheObservations(opts, repoName, packet, analysis, a
 }
 
 function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) {
+  const retrievalContract = cachePreparation?.retrieval_contract ?? null;
+  if (isPacketProjectionV3(packet)) {
+    const reference = packet?.diagnostics?.availability === "available"
+      ? packet.diagnostics.reference
+      : null;
+    return {
+      source: "packet.v3_public_projection",
+      schema_version: 3,
+      transport_mode: transportMode,
+      retrieval_contract: retrievalContract?.retrieval_contract ?? null,
+      embedding_engine: retrievalContract?.embedding_engine ?? null,
+      embedding_policy: retrievalContract?.execution_policy ?? null,
+      retrieval_mode: packet?.retrieval?.state ?? null,
+      packet_kind: packet?.kind ?? null,
+      evidence_status: packet?.status ?? null,
+      evidence_count: Array.isArray(packet?.evidence) ? packet.evidence.length : 0,
+      gap_count: Array.isArray(packet?.gaps) ? packet.gaps.length : 0,
+      core_generation: packet?.publication?.core?.generation_id ?? null,
+      core_run_id: packet?.publication?.core?.run_id ?? null,
+      retrieval_core_generation:
+        packet?.publication?.retrieval?.core_generation_id ?? null,
+      retrieval_core_run_id: packet?.publication?.retrieval?.core_run_id ?? null,
+      retrieval_generation:
+        packet?.publication?.retrieval?.retrieval_generation ?? null,
+      retrieval_state_generation: packet?.retrieval?.generation_id ?? null,
+      semantic_generation:
+        packet?.publication?.retrieval?.semantic_generation ?? null,
+      prepared_semantic_generation:
+        cachePreparation?.retrieval_status?.semantic_generation ?? null,
+      diagnostics_availability: packet?.diagnostics?.availability ?? null,
+      diagnostics_artifact_id: reference?.artifact_id ?? null,
+      diagnostics_sha256: reference?.sha256 ?? null,
+      diagnostics_byte_length: reference?.byte_length ?? null,
+    };
+  }
   const trace = packet?.answer?.retrieval_trace ?? null;
   const diagnostics = Array.isArray(trace?.packet_sidecar_diagnostics)
     ? trace.packet_sidecar_diagnostics
@@ -6414,7 +7058,6 @@ function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) 
   const fullDiagnosticCount = diagnostics.filter(
     (diagnostic) => diagnostic?.retrieval_mode === "full",
   ).length;
-  const retrievalContract = cachePreparation?.retrieval_contract ?? null;
   return {
     source: "packet.answer.retrieval_trace",
     transport_mode: transportMode,
@@ -6802,6 +7445,20 @@ function packetPayloadText(packet) {
     return String(packet ?? "");
   }
   const chunks = [];
+  if (isPacketProjectionV3(packet)) {
+    for (const row of packet.evidence ?? []) {
+      chunks.push([
+        row?.path,
+        row?.symbol_id,
+        row?.start_line == null ? null : `line ${row.start_line}`,
+        row?.summary,
+      ].filter(Boolean).join(" "));
+    }
+    for (const gap of packet.gaps ?? []) {
+      chunks.push([gap?.kind, gap?.message].filter(Boolean).join(" "));
+    }
+    return chunks.filter(Boolean).join("\n");
+  }
   chunks.push(packetAnswerText(packet));
   for (const citation of packet.answer?.citations ?? []) {
     chunks.push(
@@ -6828,6 +7485,16 @@ function packetAnswerText(packet) {
     return String(packet ?? "");
   }
   const chunks = [];
+  if (isPacketProjectionV3(packet)) {
+    for (const row of packet.evidence ?? []) {
+      chunks.push([
+        row?.path,
+        row?.symbol_id,
+        row?.summary,
+      ].filter(Boolean).join(" "));
+    }
+    return chunks.join("\n");
+  }
   if (packet.answer?.summary) {
     chunks.push(packet.answer.summary);
   }
@@ -6856,7 +7523,8 @@ function packetComposition(packet, task) {
       (task.expected_verification_files ?? []).map(String).map((value) => value.trim()).filter(Boolean),
     ),
   ];
-  const citationPaths = (packet.answer?.citations ?? [])
+  const citationPaths = [
+    ...(packet.answer?.citations ?? [])
     .map((citation, index) => ({
       source: "answer.citations",
       path: citation.file_path,
@@ -6864,7 +7532,19 @@ function packetComposition(packet, task) {
       display_name: citation.display_name ?? null,
       line: citation.line ?? null,
     }))
-    .filter((entry) => entry.path);
+    .filter((entry) => entry.path),
+    ...(isPacketProjectionV3(packet)
+      ? (packet.evidence ?? [])
+        .map((row, index) => ({
+          source: "packet.evidence",
+          path: row?.path,
+          rank: index + 1,
+          display_name: row?.symbol_id ?? null,
+          line: row?.start_line ?? null,
+        }))
+        .filter((entry) => entry.path)
+      : []),
+  ];
   const avoidOpeningPaths = packetAvoidOpeningRawPaths(packet)
     .map((pathValue, index) => ({
       source: "sufficiency.avoid_opening_paths",
@@ -7164,6 +7844,22 @@ function packetShape(packet) {
   if (!packet || typeof packet !== "object") {
     return null;
   }
+  if (isPacketProjectionV3(packet)) {
+    return {
+      schema_version: 3,
+      kind: packet.kind ?? null,
+      status: packet.status ?? null,
+      packet_bytes: jsonByteLength(packet),
+      evidence_count: Array.isArray(packet.evidence) ? packet.evidence.length : 0,
+      gap_count: Array.isArray(packet.gaps) ? packet.gaps.length : 0,
+      continuation_present: packet.continuation != null,
+      budget_limit_output_bytes: packet.kind === "budget_exceeded"
+        ? packet.maximum_bytes ?? null
+        : PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES,
+      budget_required_complete_bytes: packet.required_complete_bytes ?? null,
+      budget_truncated: packet.kind === "budget_exceeded",
+    };
+  }
   return {
     packet_bytes: jsonByteLength(packet),
     answer_bytes: jsonByteLength(packet.answer),
@@ -7179,6 +7875,9 @@ function packetShape(packet) {
 
 function packetDispositionTelemetry(packet, quality) {
   if (!packet || typeof packet !== "object") {
+    return null;
+  }
+  if (isPacketProjectionV3(packet)) {
     return null;
   }
   const support = Array.isArray(packet.support) ? packet.support : [];
@@ -7218,6 +7917,9 @@ function packetDispositionTelemetry(packet, quality) {
 
 function packetSufficiencyTelemetry(packet, quality) {
   if (!packet || typeof packet !== "object") {
+    return null;
+  }
+  if (isPacketProjectionV3(packet)) {
     return null;
   }
   const status = packet.sufficiency?.status ?? null;
@@ -7422,6 +8124,18 @@ function topPacketSearchQueries(searchSteps, limit = 8) {
 function packetLatencyTelemetry(packet, wallMs) {
   if (!packet || typeof packet !== "object") {
     return null;
+  }
+  if (isPacketProjectionV3(packet)) {
+    return {
+      schema_version: 3,
+      public_projection_only: true,
+      freshness_ms: null,
+      retrieval_total_ms: null,
+      accounted_trace_ms: null,
+      unaccounted_ms: Number.isFinite(wallMs) ? wallMs : null,
+      non_trace_wall_ms: Number.isFinite(wallMs) ? wallMs : null,
+      retrieval_shadow: null,
+    };
   }
   const retrievalTrace = packet.answer?.retrieval_trace ?? null;
   const retrievalShadow = packetRetrievalShadowTelemetry(packetRetrievalShadow(packet));
@@ -9162,6 +9876,76 @@ function managedCodeStoryRuntimeIdentityBlockers(result) {
   return reasons;
 }
 
+function exactPackageRuntimeIdentityBlockers(result) {
+  const reasons = [];
+  const packageIdentity = result?.package_identity;
+  if (packageIdentity?.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT) {
+    return ["CodeStory arm has no authenticated exact-package identity"];
+  }
+  const analysis = result?.transcript_analysis;
+  const started = analysis?.codestory_mcp_tool_calls_observed ?? 0;
+  if (started > 0) {
+    return managedCodeStoryRuntimeIdentityBlockers(result);
+  }
+  const prelude = result?.codestory_harness_prelude;
+  const runtime = prelude?.packet_contract_runtime;
+  if (prelude?.status !== "pass") {
+    reasons.push("CodeStory exact-package packet prelude did not pass");
+  }
+  if (
+    result?.codestory_prelude_cli_sha256 !== packageIdentity.cli_sha256 ||
+    result?.codestory_binary_identity?.prelude_cli_sha256 !== packageIdentity.cli_sha256 ||
+    !["prelude_only", "exact_match"].includes(result?.codestory_binary_identity?.status)
+  ) {
+    reasons.push("CodeStory exact-package CLI is not bound to the authenticated archive");
+  }
+  if (
+    runtime?.cli_source !== "direct_cli_launch" ||
+    runtime?.cli_version !== packageIdentity.package_version ||
+    runtime?.known_override_skew_channel !== false
+  ) {
+    reasons.push(
+      `CodeStory exact-package runtime is not a direct authenticated CLI ${packageIdentity.package_version}: ${JSON.stringify(runtime ?? null)}`,
+    );
+  }
+  return reasons;
+}
+
+function packetV3EvidenceGapAccountingError(accounting, label = "packet v3 evidence/gaps") {
+  if (!accounting || accounting.contract !== "codestory.packet-v3-evidence-gap-accounting/v1") {
+    return `${label} accounting is missing`;
+  }
+  for (const [count, uniqueCount, name] of [
+    [accounting.evidence_count, accounting.unique_evidence_id_count, "evidence"],
+    [accounting.gap_count, accounting.unique_gap_id_count, "gap"],
+    [
+      accounting.continuation_gap_count,
+      accounting.unique_continuation_gap_id_count,
+      "continuation gap",
+    ],
+  ]) {
+    if (!Number.isInteger(count) || count < 0 || uniqueCount !== count) {
+      return `${label} ${name} identities are missing or duplicated`;
+    }
+  }
+  if (accounting.continuation_gap_ids_bound !== true) {
+    return `${label} continuation gap identities are not bound to emitted gaps`;
+  }
+  if (accounting.kind === "complete") {
+    if (!["available", "continuation_available", "no_useful_evidence", "unavailable"].includes(accounting.status)) {
+      return `${label} availability status is invalid`;
+    }
+  } else if (
+    accounting.kind !== "budget_exceeded" ||
+    accounting.status !== "unavailable" ||
+    accounting.evidence_count !== 0 ||
+    accounting.gap_count <= 0
+  ) {
+    return `${label} budget fallback accounting is invalid`;
+  }
+  return null;
+}
+
 function agentPublishableBlockers(results, opts = {}) {
   const maxSourceReadsAfterPacket = opts.maxSourceReadsAfterPacket;
   const enforceRepoProvenance = Boolean(opts.publishable || opts.enforceRepoProvenance);
@@ -10285,13 +11069,26 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
           reasons.push(`unauthorized direct source read ${read.path ?? "unknown"} in ${row.task_id}/${row.arm}/${row.repeat}`);
         }
       }
-      const runtimeBlockers = managedCodeStoryRuntimeIdentityBlockers(row);
-      if (runtimeBlockers.length) reasons.push(`missing per-arm managed runtime proof: ${runtimeBlockers.join("; ")}`);
+      const runtimeBlockers = exactPackageRuntimeIdentityBlockers(row);
+      if (runtimeBlockers.length) reasons.push(`missing per-arm exact-package runtime proof: ${runtimeBlockers.join("; ")}`);
       const cacheBlockers = cacheProvenanceBlockers(row);
       if (cacheBlockers.length) reasons.push(`missing per-arm cache proof: ${cacheBlockers.join("; ")}`);
-      const obligation = resultPacketObligationAccounting(row);
-      const obligationError = packetObligationAccountingError(obligation, "exact packet obligations");
-      if (obligationError) reasons.push(`missing per-arm obligation proof: ${obligationError}`);
+      if (row.package_identity?.schema_version === 3) {
+        const accountingError = packetV3EvidenceGapAccountingError(
+          row.codestory_harness_prelude?.packet_evidence_gap_accounting,
+          "exact packet v3 evidence/gaps",
+        );
+        if (accountingError) {
+          reasons.push(`missing per-arm v3 evidence/gap proof: ${accountingError}`);
+        }
+      } else {
+        const obligation = resultPacketObligationAccounting(row);
+        const obligationError = packetObligationAccountingError(
+          obligation,
+          "exact packet obligations",
+        );
+        if (obligationError) reasons.push(`missing per-arm obligation proof: ${obligationError}`);
+      }
       if (row.codestory_harness_prelude?.packet_extra_probe_strategy != null) {
         reasons.push(`diagnostic manifest probes entered ${row.arm}`);
       }
@@ -10316,6 +11113,14 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
         cachePreparation?.incremental_wall_ms !== row.exact_candidate_timing?.incremental_ms
       ) {
         reasons.push(`cache lifecycle timings do not reconcile for ${row.repo}/${row.arm}`);
+      }
+      if (
+        cachePreparation?.coherence_refresh_status !== "pass" ||
+        !cachePreparation?.coherence_semantic_generation ||
+        cachePreparation.coherence_semantic_generation !==
+          row.codestory_cache_provenance?.semantic_generation
+      ) {
+        reasons.push(`final cross-arm cache coherence is missing for ${row.repo}/${row.arm}`);
       }
     }
   }
@@ -10368,6 +11173,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   const modelInitialization = lifecycle?.model_initialization_ms;
   const packageAuthenticationOrder = lifecycle?.package_authentication_order;
   const totalPackageAuthentication = lifecycle?.total_package_authentication_ms;
+  const costRates = lifecycle?.cost_rates;
   if (
     lifecycle?.contract !== "codestory.agent-benchmark-exact-lifecycle/v1" ||
     !packageAuthentication || !modelInitialization ||
@@ -10389,6 +11195,15 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       packageAuthentication.published_0_17_4 + packageAuthentication.candidate_0_18
   ) {
     reasons.push("exact per-arm one-time package and model lifecycle is missing or invalid");
+  }
+  if (
+    costRates?.currency !== "USD" ||
+    costRates?.model !== DEFAULT_BENCHMARK_MODEL ||
+    ![costRates.input_per_mtok, costRates.output_per_mtok].every(
+      (value) => typeof value === "number" && Number.isFinite(value) && value > 0,
+    )
+  ) {
+    reasons.push("exact configured model cost rates are missing or invalid");
   }
   if (
     !Array.isArray(preparationOrder) ||
@@ -11803,6 +12618,9 @@ async function main() {
   }
   const allTasks = await loadTasks(opts);
   validateExactCandidateShape(opts, allTasks);
+  opts.exactCandidateCostRates = opts.exactCandidate
+    ? exactCandidateCostRates(process.env)
+    : null;
   opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(allTasks, opts);
   if (opts.aggregateShards) {
     await aggregateShardRuns(opts, allTasks);
@@ -11878,6 +12696,7 @@ async function main() {
   try {
     if (opts.exactCandidate) {
       await initializeExactCandidateState(opts);
+      opts.exactCandidateLifecycle.cost_rates = opts.exactCandidateCostRates;
     }
     pipeline = await runAgentBenchmarkPipeline({
       opts,
@@ -12036,6 +12855,7 @@ async function main() {
     packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
+    cost_rates: opts.exactCandidateCostRates,
     exact_candidate_acceptance: opts.exactCandidate
       ? exactCandidateAcceptance(canonicalResults, opts.exactCandidateLifecycle)
       : null,
@@ -12167,10 +12987,14 @@ export {
   publicCoreCorpusAudit,
   planAgentRuns,
   exactCandidateAcceptance,
+  exactCandidateCostRates,
   authenticateExactCandidatePackages,
   exactCandidateArmEnv,
   exactCandidateBaselineEnv,
   exactCandidatePreparationArmOrder,
+  refreshExactCandidatePreparation,
+  packetV3EvidenceGapAccounting,
+  packetV3EvidenceGapAccountingError,
   withExactSourceMutation,
   validateExactCandidateShape,
   repoProvenanceBlockers,
