@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 // Versioned with proof-input semantics so older parser artifacts fail closed.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 28;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 29;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -357,7 +357,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 27,
+            resolution_input_schema_version: 28,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,
@@ -742,6 +742,39 @@ mod tests {
 
         assert_eq!(key_a, key_b);
         Ok(())
+    }
+
+    #[test]
+    fn parser_cache_key_distinguishes_raw_bytes_with_the_same_lossy_text() {
+        let config = crate::get_language_for_ext("c").expect("C config");
+        let root = Path::new("project");
+        let cache_path = Path::new("src/non-utf8.c");
+        let first = build_index_artifact_cache_key(
+            root,
+            cache_path,
+            b"/* \x80 */",
+            &config,
+            None,
+            false,
+            true,
+        )
+        .expect("first cache key");
+        let second = build_index_artifact_cache_key(
+            root,
+            cache_path,
+            b"/* \x81 */",
+            &config,
+            None,
+            false,
+            true,
+        )
+        .expect("second cache key");
+
+        assert_eq!(
+            String::from_utf8_lossy(b"/* \x80 */"),
+            String::from_utf8_lossy(b"/* \x81 */")
+        );
+        assert_ne!(first, second);
     }
 
     #[test]

@@ -2029,6 +2029,19 @@ function pipelinePreparation(repo, retrievalOverrides = {}) {
   };
 }
 
+function exactPipelinePreparation(repo, overridesByArm = {}) {
+  const published = pipelinePreparation(repo, overridesByArm.published_0_17_4);
+  const candidate = pipelinePreparation(repo, overridesByArm.candidate_0_18);
+  return {
+    ...candidate,
+    arm: "candidate_0_18",
+    arm_preparations: {
+      published_0_17_4: published,
+      candidate_0_18: candidate,
+    },
+  };
+}
+
 test("canary preparation requires complete live accelerator and server identity", () => {
   const preparation = pipelinePreparation("canary");
   assert.deepEqual(
@@ -2044,6 +2057,7 @@ test("canary preparation requires complete live accelerator and server identity"
     [{ embedding_execution_devices: [] }, /execution devices are missing/],
     [{ embedding_offloaded_layer_count: 12 }, /not every embedding model layer was offloaded/],
     [{ embedding_server_identity: { peer_verified: false } }, /peer identity is not verified/],
+    [{ embedding_engine_instance_id: "engine-2" }, /instance identities disagree/],
     [{ embedding_server_identity: { load_generation: 2 } }, /load identities disagree/],
   ]) {
     const blockers = cachePreparationCanaryBlockers(
@@ -2618,7 +2632,6 @@ test("preparation identity drift aborts before later rows and remains evidence o
     ["embedding_backend", "Vulkan"],
     ["embedding_adapter", "Different GPU"],
     ["embedding_policy", "different-policy"],
-    ["embedding_engine_instance_id", "engine-2"],
   ]) {
     const evidence = [];
     const launched = [];
@@ -2644,7 +2657,7 @@ test("preparation identity drift aborts before later rows and remains evidence o
   }
 });
 
-test("nonowner shard establishes a local preparation identity reference", async () => {
+test("preparation identity permits authenticated engine restarts on one host class", async () => {
   const fixture = pipelineFixture({
     repos: ["first", "second"],
     canaryTaskId: "global-canary-not-on-this-shard",
@@ -2655,7 +2668,10 @@ test("nonowner shard establishes a local preparation identity reference", async 
     materializeGroup: async () => {},
     prepareGroup: async (group) => [
       pipelinePreparation(group.repo, group.repo === "second"
-        ? { embedding_engine_instance_id: "engine-2" }
+        ? {
+            embedding_engine_instance_id: "engine-2",
+            embedding_server_identity: { server_instance_id: "engine-2" },
+          }
         : {}),
     ],
     executeRun: async (_opts, run) => {
@@ -2663,12 +2679,14 @@ test("nonowner shard establishes a local preparation identity reference", async 
       return pipelineResult(run);
     },
   });
-  assert.equal(outcome.firstFailure.kind, "preparation_identity_mismatch");
-  assert.deepEqual(outcome.cachePreparation.map((row) => row.repo), ["first"]);
-  assert.equal(launched.includes("second"), false);
-  assert.equal(
-    outcome.results.some((row) => row.arm === "with_codestory"),
-    false,
+  assert.equal(outcome.firstFailure, null);
+  assert.deepEqual(outcome.cachePreparation.map((row) => row.repo), ["first", "second"]);
+  assert.equal(launched.includes("second"), true);
+  assert.deepEqual(
+    outcome.cachePreparation.map(
+      (row) => row.retrieval_status.embedding_engine_instance_id,
+    ),
+    ["engine-1", "engine-2"],
   );
 });
 
@@ -2688,7 +2706,7 @@ test("identity failure aborts sibling preparation before durable failure recordi
       if (activePreparations === 2) bothStarted.resolve();
       await bothStarted.promise;
       if (group.repo === "failing") {
-        return [pipelinePreparation(group.repo, { embedding_engine_instance_id: "engine-2" })];
+        return [pipelinePreparation(group.repo, { embedding_model_sha256: "c".repeat(64) })];
       }
       await new Promise((resolve) => {
         if (signal.aborted) return resolve();
@@ -2728,13 +2746,43 @@ test("host class and shard attestation reject inconsistent preparation identity"
     ["embedding_backend", "Vulkan"],
     ["embedding_adapter", "Different GPU"],
     ["embedding_policy", "different-policy"],
-    ["embedding_engine_instance_id", "engine-2"],
   ]) {
     const changed = pipelinePreparation("second", { [field]: value });
     assert.match(cachePreparationIdentityBlockers(first, changed).join("\n"), new RegExp(field));
     assert.throws(
       () => benchmarkHostClass([first, changed]),
-      /do not share one retrieval engine identity/,
+      /do not share one retrieval host class/,
+    );
+  }
+  const restarted = pipelinePreparation("second", {
+    embedding_engine_instance_id: "engine-2",
+    embedding_server_identity: { server_instance_id: "engine-2" },
+  });
+  assert.deepEqual(cachePreparationIdentityBlockers(first, restarted), []);
+  assert.deepEqual(benchmarkHostClass([first, restarted]), hostClass);
+  const exactFirst = exactPipelinePreparation("first");
+  const exactRestarted = exactPipelinePreparation("second", {
+    published_0_17_4: {
+      embedding_engine_instance_id: "published-engine-2",
+      embedding_server_identity: { server_instance_id: "published-engine-2" },
+    },
+    candidate_0_18: {
+      embedding_engine_instance_id: "candidate-engine-2",
+      embedding_server_identity: { server_instance_id: "candidate-engine-2" },
+    },
+  });
+  assert.deepEqual(cachePreparationIdentityBlockers(exactFirst, exactRestarted), []);
+  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    const changed = exactPipelinePreparation("second", {
+      [arm]: { embedding_model_sha256: "c".repeat(64) },
+    });
+    assert.match(
+      cachePreparationIdentityBlockers(exactFirst, changed).join("\n"),
+      new RegExp(`${arm}.*embedding_model_sha256`),
+    );
+    assert.throws(
+      () => benchmarkHostClass([exactFirst, changed]),
+      /do not share one retrieval host class/,
     );
   }
   const fixture = pipelineFixture({ repos: ["first", "second"] });
@@ -2769,16 +2817,60 @@ test("host class and shard attestation reject inconsistent preparation identity"
     ),
     /preparation rows do not match/,
   );
-  await assert.rejects(
-    () => benchmarkShardAttestation(
-      fixture.opts,
-      fixture.tasks,
-      [first, pipelinePreparation("second", { embedding_engine_instance_id: "engine-2" })],
-      [],
-      CLEAN_SHARD_ATTESTATION,
-    ),
-    /do not share one retrieval engine identity/,
+  const restartedAttestation = await benchmarkShardAttestation(
+    fixture.opts,
+    fixture.tasks,
+    [first, restarted],
+    [],
+    CLEAN_SHARD_ATTESTATION,
   );
+  assert.deepEqual(restartedAttestation.host_class, hostClass);
+});
+
+test("exact-candidate preparation fences stable identity drift in either CodeStory arm", async () => {
+  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    const tasks = ["first", "second"].map((repo) => ({
+      id: `${repo}-task`,
+      repo,
+      prompt: `trace ${repo}`,
+    }));
+    const opts = {
+      exactCandidate: true,
+      exactCandidateStateRoot: "/fixture/exact-candidate-state",
+      arms: EXACT_CANDIDATE_ARMS,
+      jobs: 1,
+    };
+    const launched = [];
+    const outcome = await runAgentBenchmarkPipeline({
+      opts,
+      tasks,
+      plannedRuns: tasks.map((task) => ({
+        task,
+        repo: task.repo,
+        arm: "candidate_0_18",
+        repeat: 1,
+      })),
+      prepareGroup: async (group) => [exactPipelinePreparation(
+        group.repo,
+        group.repo === "second"
+          ? { [arm]: { embedding_adapter: "Different GPU" } }
+          : {},
+      )],
+      prepareIsolation: async () => ({ receipt: {} }),
+      executeRun: async (_runOpts, run) => {
+        launched.push(run.repo);
+        return pipelineResult(run);
+      },
+    });
+    assert.equal(outcome.firstFailure.kind, "preparation_failed");
+    assert.match(
+      outcome.firstFailure.error,
+      new RegExp(`${arm}.*embedding_adapter`),
+    );
+    assert.deepEqual(launched, []);
+    assert.equal(opts.cachePreparationByRepo.has("first"), true);
+    assert.equal(opts.cachePreparationByRepo.has("second"), false);
+  }
 });
 
 test("fail-fast closeout keeps the first failure instead of requiring unfinished shard preparation", async () => {

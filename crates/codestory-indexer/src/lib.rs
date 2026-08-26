@@ -1068,6 +1068,7 @@ struct PreparedIndexInput {
     full_path: PathBuf,
     artifact_cache_path: Option<PathBuf>,
     source: String,
+    source_utf8_exact: bool,
     compilation_info: Option<compilation_database::CompilationInfo>,
     language_config: LanguageConfig,
     artifact_cache_key: Option<String>,
@@ -3131,16 +3132,19 @@ impl WorkspaceIndexer {
             }
         };
         let content_hash = source_content_hash(&bytes);
-        // Decode before building the cache key so source-aware header detection can choose
-        // the same parser that will be used for indexing.
-        let source = match String::from_utf8(bytes) {
-            Ok(source) => source,
-            Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
-        };
-        if let Some(upgraded) =
-            maybe_upgrade_header_language_from_source(&full_path, &source, &language_config)
+        let source_utf8_exact = std::str::from_utf8(&bytes).is_ok();
+        // Inspect the parser source before building the cache key so source-aware header
+        // detection chooses the same language that will be used for indexing. The key remains
+        // bound to the raw bytes even when ordinary graph indexing uses a lossy view.
         {
-            language_config = upgraded;
+            let parser_source = String::from_utf8_lossy(&bytes);
+            if let Some(upgraded) = maybe_upgrade_header_language_from_source(
+                &full_path,
+                &parser_source,
+                &language_config,
+            ) {
+                language_config = upgraded;
+            }
         }
         let flags = index_feature_flags();
         let artifact_cache_path = index_artifact_cache_path(root, &full_path);
@@ -3148,13 +3152,17 @@ impl WorkspaceIndexer {
             build_index_artifact_cache_key(
                 root,
                 cache_path,
-                source.as_bytes(),
+                &bytes,
                 &language_config,
                 compilation_info.as_ref(),
                 flags.legacy_edge_identity,
                 flags.lazy_graph_execution,
             )
         });
+        let source = match String::from_utf8(bytes) {
+            Ok(source) => source,
+            Err(error) => String::from_utf8_lossy(&error.into_bytes()).into_owned(),
+        };
         stats.parser_artifact_cache.record_lookup();
 
         let Some(cache_path) = artifact_cache_path.as_ref() else {
@@ -3164,6 +3172,7 @@ impl WorkspaceIndexer {
                 full_path,
                 artifact_cache_path,
                 source,
+                source_utf8_exact,
                 compilation_info,
                 language_config,
                 artifact_cache_key,
@@ -3177,6 +3186,7 @@ impl WorkspaceIndexer {
                 full_path,
                 artifact_cache_path,
                 source,
+                source_utf8_exact,
                 compilation_info,
                 language_config,
                 artifact_cache_key,
@@ -3286,6 +3296,7 @@ impl WorkspaceIndexer {
                         full_path,
                         artifact_cache_path,
                         source,
+                        source_utf8_exact,
                         compilation_info,
                         language_config,
                         artifact_cache_key,
@@ -3300,6 +3311,7 @@ impl WorkspaceIndexer {
                     full_path,
                     artifact_cache_path,
                     source,
+                    source_utf8_exact,
                     compilation_info,
                     language_config,
                     artifact_cache_key,
@@ -3313,6 +3325,7 @@ impl WorkspaceIndexer {
                     full_path,
                     artifact_cache_path,
                     source,
+                    source_utf8_exact,
                     compilation_info,
                     language_config,
                     artifact_cache_key,
@@ -3732,9 +3745,16 @@ impl WorkspaceIndexer {
             };
 
         match index_result {
-            Ok((mut index_result, call_resolution_inputs, resolution_file)) => {
+            Ok((mut index_result, mut call_resolution_inputs, mut resolution_file)) => {
                 if let Some(file_info) = index_result.files.first_mut() {
                     file_info.modification_time = modification_time;
+                }
+                if !prepared_input.source_utf8_exact {
+                    call_resolution_inputs.clear();
+                    if let Some(file) = resolution_file.as_mut() {
+                        file.source_sha256 = prepared_input.content_hash.clone();
+                        file.lookup_input_complete = false;
+                    }
                 }
                 let artifact = CachedIndexArtifact::from_index_result_with_resolution_inputs(
                     index_result,

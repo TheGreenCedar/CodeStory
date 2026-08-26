@@ -1671,6 +1671,7 @@ fn parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached() -> R
         full_path: path.clone(),
         artifact_cache_path: Some(path.with_extension("artifact")),
         source: original.to_string(),
+        source_utf8_exact: true,
         compilation_info: None,
         language_config: get_language_for_ext("rs").expect("rust config"),
         artifact_cache_key: Some("old-source".to_string()),

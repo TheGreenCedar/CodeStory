@@ -5980,7 +5980,7 @@ function benchmarkHostClass(cachePreparations) {
       const blockers = cachePreparationIdentityBlockers(reference, preparation);
       if (blockers.length) {
         throw new Error(
-          `Benchmark preparations do not share one retrieval engine identity: ${blockers.join("; ")}`,
+          `Benchmark preparations do not share one retrieval host class: ${blockers.join("; ")}`,
         );
       }
     }
@@ -6009,7 +6009,6 @@ const BENCHMARK_PREPARATION_IDENTITY_FIELDS = [
   "embedding_backend",
   "embedding_adapter",
   "embedding_policy",
-  "embedding_engine_instance_id",
 ];
 
 function cachePreparationIdentity(preparation) {
@@ -6020,6 +6019,20 @@ function cachePreparationIdentity(preparation) {
 }
 
 function cachePreparationIdentityBlockers(referencePreparation, preparation) {
+  const referenceArms = referencePreparation?.arm_preparations;
+  const observedArms = preparation?.arm_preparations;
+  if (referenceArms || observedArms) {
+    return ["published_0_17_4", "candidate_0_18"].flatMap((arm) => {
+      const expected = referenceArms?.[arm];
+      const observed = observedArms?.[arm];
+      if (!expected || !observed) {
+        return [`${arm} retrieval preparation identity is missing`];
+      }
+      return cachePreparationIdentityBlockers(expected, observed).map(
+        (blocker) => `${arm}: ${blocker}`,
+      );
+    });
+  }
   const expected = cachePreparationIdentity(referencePreparation);
   const observed = cachePreparationIdentity(preparation);
   return BENCHMARK_PREPARATION_IDENTITY_FIELDS.flatMap((field) =>
@@ -11321,6 +11334,7 @@ async function runExactCandidatePipeline({
   opts.cachePreparationByRepo ??= new Map();
   const groups = [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({ repo, tasks: repoTasks }));
   let firstFailure = null;
+  let preparationIdentityReference = null;
   for (const group of groups) {
     try {
       await materializeGroup(group, null);
@@ -11340,9 +11354,18 @@ async function runExactCandidatePipeline({
           throw new Error(`${arm} preparation is not exact-candidate eligible: ${blockers.join("; ")}`);
         }
       }
+      const identityBlockers = preparationIdentityReference
+        ? cachePreparationIdentityBlockers(preparationIdentityReference, row)
+        : [];
+      if (identityBlockers.length) {
+        throw new Error(
+          `exact-candidate retrieval preparation identity changed: ${identityBlockers.join("; ")}`,
+        );
+      }
       await recordPreparation(row);
       cachePreparation.push(row);
       opts.cachePreparationByRepo.set(row.repo, row);
+      preparationIdentityReference ??= row;
       await recordPreparationState({ kind: "prepared", repo: group.repo });
     } catch (error) {
       firstFailure = pipelineStageFailure("preparation", group, error);
