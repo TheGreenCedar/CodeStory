@@ -1039,8 +1039,7 @@ fn swift_source_domain(path: &Path) -> Option<String> {
         return Some(format!("swift:Sources/{module}"));
     }
     components
-        .iter()
-        .any(|component| *component == "Source")
+        .contains(&"Source")
         .then(|| "swift:Source".to_string())
 }
 

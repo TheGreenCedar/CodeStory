@@ -540,8 +540,7 @@ fn swift_source_domain(path: &Path) -> Option<String> {
         return Some(format!("swift:Sources/{module}"));
     }
     components
-        .iter()
-        .any(|component| *component == "Source")
+        .contains(&"Source")
         .then(|| "swift:Source".to_string())
 }
 
@@ -5436,7 +5435,7 @@ fn typed_binding_from_surface(surface: &str, language: &str) -> Option<(String, 
         .last()?
         .trim_matches(|character: char| !character.is_alphanumeric() && character != '_');
     let owner = tokens
-        .get(tokens.len().checked_sub(2).unwrap_or_default())
+        .get(tokens.len().saturating_sub(2))
         .filter(|_| tokens.len() >= 2)
         .map(|owner| owner.trim_end_matches('?').to_string())
         .or(constructor_type)?;
