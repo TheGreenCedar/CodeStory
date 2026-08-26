@@ -76,6 +76,22 @@ when minimizing context matters more than keeping the fuller evidence set.
 
 Degraded retrieval is navigation help only. See [Glossary](../glossary.md#retrieval-mode).
 
+## Exact call-path verification
+
+Use the exact verifier only with a complete host-supplied translation containing
+the original source text, typed clause anchors, and exact ordered call spec:
+
+```sh
+codestory-cli prove-call-path --project <repo> --spec <request.json>
+cat request.json | codestory-cli prove-call-path --project <repo> --spec -
+```
+
+The command is observational and does not start broad semantic retrieval.
+`contract_proven` and `contract_refuted` apply only to the supplied indexed
+source-call contract. Translation gaps and unsupported proof-domain cases return
+typed `unknown` or `unavailable` results. CodeStory does not translate prose or
+recommend automatic verifier invocation.
+
 ## Stale local cache
 
 ```sh

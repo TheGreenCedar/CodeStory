@@ -69,6 +69,8 @@ pub(crate) enum Command {
     Context(ContextCommand),
     #[command(about = "Answer a broad repository question with evidence.")]
     Packet(PacketCommand),
+    #[command(about = "Verify one host-supplied exact indexed source call path.")]
+    ProveCallPath(ProveCallPathCommand),
     #[command(about = "Build owner-directed task workflow packets.")]
     Task(TaskCommand),
     #[command(about = "Check cache, index, and retrieval health.")]
@@ -127,6 +129,14 @@ pub(crate) enum Command {
     InternalEmbeddingServer,
     #[command(name = "internal-embedding-qualification-worker", hide = true)]
     InternalEmbeddingQualificationWorker(InternalEmbeddingQualificationCommand),
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ProveCallPathCommand {
+    #[arg(long, value_name = "ROOT")]
+    pub(crate) project: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) spec: PathBuf,
 }
 
 #[derive(Args, Debug)]

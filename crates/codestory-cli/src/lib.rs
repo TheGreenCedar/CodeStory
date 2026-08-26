@@ -21,6 +21,7 @@ mod http_transport;
 mod local_refresh_status;
 #[allow(dead_code)]
 mod output;
+mod prove_call_path;
 mod readiness;
 mod report;
 mod retrieval;

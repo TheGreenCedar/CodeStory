@@ -29,18 +29,19 @@ pub mod proof_qualification_support {
     use serde::Serialize;
 
     pub use super::indexed_source_call_path_v1::{
-        AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+        AdmittedRawCallEdge, BuiltCallPathFacts, CallPathSpec, CallableContainmentEvidence,
         CheckedBuiltCallPathIntegration, ClauseAnchor, ClauseClassification, ExactScopeSelector,
         ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
         InternalCorePublicationIdentity, InternalProjection, NonMaterialKind, PROOF_DOMAIN,
         PinnedNodeIdentity, ProofContractField, ProofHashes, RawAdmissionFailure,
-        RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
+        RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, TranslationGap, UnavailableReason,
         UnresolvedMaterialReason, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
         UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector,
         ValidatedCallPathContract, ValidatedContractRendering, ValidationOutcome,
         VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
         check_built_call_path_integration, diagnose_raw_call_edge,
-        project_internal_call_path_result, validate_compact_projection, validate_contract,
+        project_internal_call_path_result, project_translation_unknown_result,
+        validate_compact_projection, validate_contract,
     };
 
     /// Identifies the sealed request domain observed by benchmark qualification.
@@ -58,17 +59,18 @@ pub mod proof_qualification_support {
 #[doc(hidden)]
 pub mod proof_qualification_test_support {
     pub use super::indexed_source_call_path_v1::{
-        AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+        AdmittedRawCallEdge, BuiltCallPathFacts, CallPathSpec, CallableContainmentEvidence,
         CheckedBuiltCallPathIntegration, ClauseAnchor, ClauseClassification, ExactScopeSelector,
         ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
         InternalCorePublicationIdentity, InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity,
         ProofContractField, ProofDisposition, ProofGap, ProofHashes, RawAdmissionFailure,
-        RawCallEdgeAdmission, ReceiptRef, Refutation, ResolvedNodeIdentity, UnavailableReason,
-        UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
-        UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
-        ValidatedContractRendering, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
-        admit_raw_call_edge, check_built_call_path_integration, check_call_path,
-        diagnose_raw_call_edge, project_internal_call_path_result, validate_contract,
+        RawCallEdgeAdmission, ReceiptRef, Refutation, ResolvedNodeIdentity, TranslationGap,
+        UnavailableReason, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
+        UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector,
+        ValidatedCallPathContract, ValidatedContractRendering, ValidationOutcome,
+        VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+        check_built_call_path_integration, check_call_path, diagnose_raw_call_edge,
+        project_internal_call_path_result, project_translation_unknown_result, validate_contract,
     };
 }
 pub mod packet_citations;

@@ -633,8 +633,8 @@ const AGENT_PLANNING_MODULES: [&str; 28] = [
 ///   `agent_eval_hooks_stay_on_for_runtime_tests_and_off_for_product_builds`
 ///   pins how it compiles. Listing it as a planning module would hand the
 ///   import-DAG guard a file no product build links.
-/// - `indexed_source_call_path_v1.rs` is the dark v3 proof kernel. Task 2 keeps
-///   it behind the same test-support gate until the atomic public v3 cut.
+/// - `indexed_source_call_path_v1.rs` is the private v3 proof kernel. Public
+///   callers reach it only through the sealed exact-verifier facades.
 const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 3] =
     ["lib.rs", "eval_probes.rs", "indexed_source_call_path_v1.rs"];
 
@@ -838,7 +838,7 @@ fn legacy_dark_packet_v3_preparation_stays_inert_and_unshipped() {
 }
 
 #[test]
-fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
+fn public_exact_verifier_uses_the_revision_native_transport_once() {
     let cli_lib = read("crates/codestory-cli/src/lib.rs");
     assert!(
         cli_lib.contains("mod stdio_v3;"),
@@ -853,7 +853,7 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     ] {
         assert!(
             facade.contains(required),
-            "the dark stdio v3 facade lost its qualification seam via {required}"
+            "the stdio v3 facade lost its verifier transport seam via {required}"
         );
     }
 
@@ -875,28 +875,30 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
     ] {
         assert!(
             !production_cli.contains(forbidden),
-            "a production CLI module references the dark qualification seam via {forbidden}"
+            "a production CLI module references the transport measurement seam via {forbidden}"
         );
     }
 
-    for surface in [
-        "crates/codestory-cli/src/args.rs",
-        "crates/codestory-cli/src/http_transport.rs",
-        "plugins/codestory/generated-mcp-catalog.json",
-        "plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md",
-    ] {
-        let source = read(surface);
-        for forbidden in [
-            "measure_revision_native_proof_result_v3",
-            "RevisionNativeToolResultMeasurementV3",
-            "prove_call_path",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "{surface} registers or exposes the dark transport seam via {forbidden}"
-            );
-        }
-    }
+    let args = read("crates/codestory-cli/src/args.rs");
+    assert_eq!(
+        args.matches("ProveCallPath(ProveCallPathCommand)").count(),
+        1,
+        "the public CLI verifier command must be registered exactly once"
+    );
+    let catalog = read("crates/codestory-cli/src/stdio_v3/catalog.rs");
+    assert_eq!(
+        catalog
+            .matches("sources.push(proof_tool_source_v3());")
+            .count(),
+        1,
+        "the exact verifier must enter every revision catalog through one owning registration"
+    );
+    let stdio_catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
+    let legacy_catalog = source_between(&stdio_catalog, "static TOOLS:", "static RESOURCES:");
+    assert!(
+        !legacy_catalog.contains("prove_call_path"),
+        "the legacy Supported catalog must not reach the v3 verifier response"
+    );
 
     let launcher = read("plugins/codestory/scripts/codestory-mcp.cjs");
     let live_launcher = source_between(
@@ -927,170 +929,30 @@ fn proof_qualification_transport_measurement_is_bench_only_and_unregistered() {
 }
 
 #[test]
-fn proof_qualification_support_is_bench_only_and_never_a_product_feature() {
+fn public_exact_verifier_compiles_through_the_sealed_proof_facades() {
     const SUPPORT_FEATURE: &str = "proof-qualification-support";
-    const BENCHMARK_FEATURE: &str = "benchmark-support";
-
-    for crate_manifest in [
+    for manifest_path in [
         "crates/codestory-agent/Cargo.toml",
         "crates/codestory-runtime/Cargo.toml",
-        "crates/codestory-cli/Cargo.toml",
     ] {
-        let crate_manifest_value = manifest(crate_manifest);
-        let features = crate_manifest_value
+        let crate_manifest = manifest(manifest_path);
+        let features = crate_manifest
             .get("features")
             .and_then(Value::as_table)
-            .expect("qualification crate must declare features");
+            .expect("exact verifier features");
         assert!(
-            features.contains_key(SUPPORT_FEATURE),
-            "{crate_manifest} must declare the sealed {SUPPORT_FEATURE} feature"
+            features
+                .get("default")
+                .is_some_and(|default| default.to_string().contains(SUPPORT_FEATURE)),
+            "{manifest_path} must compile the sealed proof facade for the public verifier"
         );
     }
-
-    let agent_lib = read("crates/codestory-agent/src/lib.rs");
-    assert!(
-        agent_lib.contains("feature = \"proof-qualification-support\"")
-            && agent_lib.contains("pub mod proof_qualification_support"),
-        "the agent qualification facade must be feature-gated rather than public by default"
-    );
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
-    assert!(
-        runtime_lib.contains("feature = \"proof-qualification-support\"")
-            && runtime_lib.contains("pub mod proof_qualification_support;"),
-        "the runtime qualification facade must be feature-gated rather than public by default"
-    );
-    let cli_lib = read("crates/codestory-cli/src/lib.rs");
-    assert!(
-        cli_lib.contains("feature = \"proof-qualification-support\"")
-            && cli_lib.contains("pub mod proof_qualification_support"),
-        "the CLI qualification facade must be feature-gated rather than public by default"
-    );
-
-    let bench = manifest("crates/codestory-bench/Cargo.toml");
-    let dependencies = bench
-        .get("dependencies")
-        .and_then(Value::as_table)
-        .expect("qualification dependencies must be normal benchmark dependencies");
-    for required in [
-        "codestory-agent",
-        "codestory-runtime",
-        "codestory-cli",
-        "codestory-store",
-        "codestory-indexer",
-        "codestory-contracts",
-    ] {
-        assert!(
-            dependencies.contains_key(required),
-            "{required} must be a normal codestory-bench dependency"
-        );
-    }
-    for (dependency, expected) in [
-        ("codestory-agent", BTreeSet::from([SUPPORT_FEATURE])),
-        (
-            "codestory-runtime",
-            BTreeSet::from([SUPPORT_FEATURE, BENCHMARK_FEATURE]),
-        ),
-        ("codestory-cli", BTreeSet::from([SUPPORT_FEATURE])),
-    ] {
-        let enabled = dependencies
-            .get(dependency)
-            .and_then(Value::as_table)
-            .and_then(|entry| entry.get("features"))
-            .and_then(Value::as_array)
-            .expect("qualification dependency must declare its enabled features")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<BTreeSet<_>>();
-        assert!(
-            enabled.contains(SUPPORT_FEATURE),
-            "{dependency} must receive the sealed qualification feature from codestory-bench"
-        );
-        assert!(
-            !enabled.contains("test-support"),
-            "{dependency} must not receive test-support from codestory-bench"
-        );
-        assert_eq!(
-            enabled, expected,
-            "{dependency} must enable exactly the sealed benchmark features"
-        );
-    }
-
-    for crate_manifest in [
-        "crates/codestory-agent/Cargo.toml",
-        "crates/codestory-runtime/Cargo.toml",
-        "crates/codestory-cli/Cargo.toml",
-    ] {
-        for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
-            let crate_manifest_value = manifest(crate_manifest);
-            let Some(entries) = crate_manifest_value.get(table).and_then(Value::as_table) else {
-                continue;
-            };
-            for (dependency, entry) in entries {
-                let enabled = entry
-                    .as_table()
-                    .and_then(|entry| entry.get("features"))
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str);
-                assert!(
-                    !enabled.clone().any(|feature| feature == SUPPORT_FEATURE),
-                    "{crate_manifest} enables {SUPPORT_FEATURE} for {dependency}; only codestory-bench may do that"
-                );
-            }
-        }
-    }
-
-    let runtime_manifest = manifest("crates/codestory-runtime/Cargo.toml");
-    let runtime_features = runtime_manifest
-        .get("features")
-        .and_then(Value::as_table)
-        .expect("runtime features");
-    assert!(
-        runtime_features
-            .get(SUPPORT_FEATURE)
-            .is_some_and(|feature| feature
-                .to_string()
-                .contains("codestory-agent/proof-qualification-support")),
-        "runtime qualification support must carry the sealed agent feature"
-    );
-    let cli_manifest = manifest("crates/codestory-cli/Cargo.toml");
-    let cli_features = cli_manifest
-        .get("features")
-        .and_then(Value::as_table)
-        .expect("CLI features");
-    assert!(
-        cli_features
-            .get(SUPPORT_FEATURE)
-            .is_some_and(|feature| feature
-                .to_string()
-                .contains("codestory-runtime/proof-qualification-support")),
-        "CLI qualification support must carry the sealed runtime feature"
-    );
-
-    for surface in [
-        "crates/codestory-cli/src/args.rs",
-        "crates/codestory-cli/src/http_transport.rs",
-        "plugins/codestory/generated-mcp-catalog.json",
-        "plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md",
-        "plugins/codestory/plugin.json",
-        "plugins/codestory/.codex-plugin/plugin.json",
-        "plugins/codestory/.cursor-plugin/plugin.json",
-        "plugins/codestory/.claude-plugin/plugin.json",
-        "plugins/codestory/.github/plugin/plugin.json",
-    ] {
-        let source = read(surface);
-        for forbidden in [
-            SUPPORT_FEATURE,
-            "proof_qualification_support",
-            "prove_call_path",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "{surface} exposes qualification-only behavior via {forbidden}"
-            );
-        }
-    }
+    assert!(runtime_lib.contains("pub mod proof_qualification_support;"));
+    let cli = read_source_tree("crates/codestory-cli/src");
+    assert!(cli.contains("run_observed_call_path_public_operation"));
+    assert!(cli.contains("run_translation_unknown_public_operation"));
+    assert!(!read("crates/codestory-cli/src/http_transport.rs").contains("prove_call_path"));
 
     let launcher = read("plugins/codestory/scripts/codestory-mcp.cjs");
     let launcher_revisions = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
@@ -1379,86 +1241,36 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
     }
 }
 
-fn dark_call_path_release_surface_violations() -> Vec<String> {
-    const DARK_TOKENS: [&str; 5] = [
-        "indexed_source_call_path_v1",
-        "ValidatedCallPathContract",
-        "InternalProjection",
-        "InternalCorePublicationIdentity",
-        "IntegratedProjectedCallPathResult",
-    ];
-    let mut surfaces = vec![
-        (
-            "cli command/dispatcher/ToolSpec/HTTP/serializer source",
-            read_source_tree_excluding_many(
-                "crates/codestory-cli/src",
-                &[
-                    "stdio_v3/catalog.rs",
-                    "stdio_v3/diagnostics.rs",
-                    "stdio_v3/discovery.rs",
-                    "stdio_v3/mod.rs",
-                    "stdio_v3/profile.rs",
-                    "stdio_v3/transport.rs",
-                ],
-            ),
-        ),
-        (
-            "public API DTO source",
-            format!(
-                "{}\n{}",
-                read("crates/codestory-contracts/src/api.rs"),
-                read_source_tree("crates/codestory-contracts/src/api")
-            ),
-        ),
-        (
-            "generated MCP catalog",
-            read("plugins/codestory/generated-mcp-catalog.json"),
-        ),
-        ("plugin manifest", read("plugins/codestory/plugin.json")),
-        (
-            "Codex plugin manifest",
-            read("plugins/codestory/.codex-plugin/plugin.json"),
-        ),
-        (
-            "Cursor plugin manifest",
-            read("plugins/codestory/.cursor-plugin/plugin.json"),
-        ),
-        (
-            "Claude plugin manifest",
-            read("plugins/codestory/.claude-plugin/plugin.json"),
-        ),
-        (
-            "grounding skill syntax",
-            read("plugins/codestory/skills/codestory-grounding/SKILL.md"),
-        ),
-        (
-            "generated MCP skill syntax",
-            read("plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md"),
-        ),
-    ];
-    let gate = "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod indexed_source_call_path_v1;";
-    let runtime_facade = read("crates/codestory-runtime/src/lib.rs").replace(gate, "");
-    surfaces.push(("public runtime facade", runtime_facade));
-    surfaces.push((
-        "public runtime services",
-        production_source(&read("crates/codestory-runtime/src/services.rs")),
-    ));
+#[test]
+fn public_call_path_release_surfaces_are_unique_and_legacy_unreachable() {
+    let args = read("crates/codestory-cli/src/args.rs");
+    assert_eq!(
+        args.matches("ProveCallPath(ProveCallPathCommand)").count(),
+        1
+    );
 
-    let mut violations = Vec::new();
-    for (surface, source) in surfaces {
-        for token in DARK_TOKENS {
-            if source.contains(token) {
-                violations.push(format!("{surface}: {token}"));
-            }
-        }
-    }
+    let catalog = read("crates/codestory-cli/src/stdio_v3/catalog.rs");
+    assert_eq!(
+        catalog
+            .matches("sources.push(proof_tool_source_v3());")
+            .count(),
+        1
+    );
 
-    let adapter = production_source(&read(
-        "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
-    ));
-    if contains_word(&adapter, "source_text") {
-        violations.push("dark runtime adapter: raw source_text".to_owned());
-    }
+    let dispatcher = read("crates/codestory-cli/src/stdio_transport.rs");
+    let stdio_catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
+    let legacy_tools = source_between(&stdio_catalog, "static TOOLS:", "static RESOURCES:");
+    assert!(!legacy_tools.contains("prove_call_path"));
+    let public_proof = source_between(
+        &dispatcher,
+        "if name == \"prove_call_path\"",
+        "// Public-operation retry belongs",
+    );
+    assert_eq!(
+        public_proof.matches("build_proof_tool_result_v3").count(),
+        1
+    );
+    assert!(!public_proof.contains("Supported"));
 
     for consumer in [
         "crates/codestory-runtime/Cargo.toml",
@@ -1473,21 +1285,11 @@ fn dark_call_path_release_surface_violations() -> Vec<String> {
             .and_then(Value::as_array)
             .map(|values| values.iter().filter_map(Value::as_str).collect::<Vec<_>>())
             .unwrap_or_default();
-        if features.contains(&"test-support") {
-            violations.push(format!("{consumer}: ships codestory-agent/test-support"));
-        }
+        assert!(
+            !features.contains(&"test-support"),
+            "{consumer} must not ship codestory-agent/test-support"
+        );
     }
-    violations
-}
-
-#[test]
-fn dark_call_path_release_surfaces_remain_v2_only_and_test_support_unshipped() {
-    let violations = dark_call_path_release_surface_violations();
-    assert!(
-        violations.is_empty(),
-        "dark v3 call-path symbols reached a production route, DTO, serializer, manifest, skill, or shipping feature edge:\n{}",
-        violations.join("\n")
-    );
 }
 
 /// Packet planning lives in `codestory-agent`, and the crate DAG is what keeps

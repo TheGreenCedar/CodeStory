@@ -152,6 +152,16 @@ async function stopChildProcess(child) {
 test("fail-open tool schemas are the generated canonical MCP catalog", async () => {
   const catalog = JSON.parse(await readFile(join(pluginRoot, "generated-mcp-catalog.json"), "utf8"));
   assert.deepEqual(launcherTest.failOpenToolCatalog(), catalog.tools);
+  for (const [revision, profile] of Object.entries(catalog.revisionProfiles)) {
+    assert.equal(profile.tools.length, 21, `${revision} must advertise exactly 21 tools`);
+    assert.equal(
+      profile.tools.filter(({ name }) => name === "prove_call_path").length,
+      1,
+      `${revision} must advertise prove_call_path exactly once`,
+    );
+  }
+  assert.equal(catalog.tools.length, 21);
+  assert.equal(catalog.tools.filter(({ name }) => name === "prove_call_path").length, 1);
   assert.deepEqual(catalog.resources.map(({ uri }) => uri), ["codestory://agent-guide"]);
   assert.ok(
     catalog.resourceTemplates.some(({ uriTemplate }) =>
@@ -4159,13 +4169,8 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
       { method: "resources/read", uri: statusUri },
     ]);
     const toolNames = responses[2].result.tools.map((tool) => tool.name);
-    const catalogSource = await readFile(join(repoRoot, "crates", "codestory-cli", "src", "stdio_catalog.rs"), "utf8");
-    const canonicalTools = catalogSource.slice(
-      catalogSource.indexOf("static TOOLS: &[ToolSpec]"),
-      catalogSource.indexOf("static RESOURCES: &[ResourceSpec]"),
-    );
-    const canonicalToolNames = [...canonicalTools.matchAll(/\bname:\s*"([^"]+)"/gu)]
-      .map((match) => match[1]);
+    const canonicalToolNames = generatedCatalog.revisionProfiles[preferredRevision].tools
+      .map((tool) => tool.name);
     assert.deepEqual([...toolNames].sort(), [...canonicalToolNames].sort());
     const coldGroundTool = responses[2].result.tools.find((tool) => tool.name === "ground");
     const groundSafety = coldGroundTool._meta["com.thegreencedar.codestory/safety"];
@@ -5098,8 +5103,9 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
       id: "cold-tools",
       method: "tools/list",
     });
-    assert.equal(coldTools.result.tools.length, 20);
+    assert.equal(coldTools.result.tools.length, 21);
     assert.ok(coldTools.result.tools.some((tool) => tool.name === "ground"));
+    assert.equal(coldTools.result.tools.filter((tool) => tool.name === "prove_call_path").length, 1);
     const coldGround = await request({
       jsonrpc: "2.0",
       id: "cold-ground",

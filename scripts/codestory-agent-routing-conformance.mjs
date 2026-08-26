@@ -217,6 +217,11 @@ export const ROUTING_SCENARIOS = deepFreeze([
 const SCENARIOS_BY_ID = new Map(ROUTING_SCENARIOS.map((entry) => [entry.id, entry]));
 
 export const STATIC_PARITY_HOSTS = deepFreeze({
+  cursor: {
+    metadata: ".cursor-plugin/plugin.json",
+    hook: "hooks/cursor-hooks.json",
+    rule: "rules/codestory.mdc",
+  },
   claude_code: {
     metadata: ".claude-plugin/plugin.json",
     hook: "hooks/claude-codex-hooks.json",
@@ -242,8 +247,12 @@ const STATIC_ROSTER_PATHS = Object.freeze([
   "scripts/codestory-mcp.cjs",
   ".claude-plugin/plugin.json",
   ".github/plugin/plugin.json",
+  ".cursor-plugin/plugin.json",
   "hooks/claude-codex-hooks.json",
   "hooks/copilot-hooks.json",
+  "hooks/cursor-hooks.json",
+  "mcp.cursor.json",
+  "rules/codestory.mdc",
   "skills/codestory-grounding/SKILL.md",
 ]);
 
@@ -1950,6 +1959,7 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   const pin = await readJson(resolve(root, "cli-version.json"), "CLI version pin");
   const catalog = await readJson(resolve(root, "generated-mcp-catalog.json"), "generated MCP catalog");
   const mcp = await readJson(resolve(root, "mcp.json"), "portable MCP manifest");
+  const cursorMcp = await readJson(resolve(root, "mcp.cursor.json"), "Cursor MCP manifest");
   const launcherPath = resolve(root, expectedIdentity.launcher.relative_path);
   const launcherSha256 = await fileSha256(launcherPath);
 
@@ -1975,6 +1985,16 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
       || server.args[0] !== "${PLUGIN_ROOT}/scripts/codestory-mcp.cjs") {
     fail("portable MCP metadata does not bind the canonical launcher");
   }
+  const cursorServer = cursorMcp.mcpServers?.codestory;
+  if (cursorServer?.command !== "node"
+      || !Array.isArray(cursorServer.args)
+      || cursorServer.args.length !== 2
+      || cursorServer.args[0] !== "-e"
+      || typeof cursorServer.args[1] !== "string"
+      || !cursorServer.args[1].includes("Module.runMain()")
+      || !cursorServer.args[1].includes("codestory_cursor_mcp_launcher_not_found")) {
+    fail("Cursor MCP metadata does not bind the canonical launcher resolver");
+  }
 
   const hosts = [];
   for (const [host, inputs] of Object.entries(STATIC_PARITY_HOSTS)) {
@@ -1988,12 +2008,26 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
     if (metadata.name !== "codestory" || metadata.version !== portable.version) {
       fail(`${host} metadata does not match the portable package`);
     }
-    const expectedHook = host === "claude_code" ? `./${inputs.hook}` : inputs.hook;
+    const expectedHook = host === "claude_code" || host === "cursor"
+      ? `./${inputs.hook}`
+      : inputs.hook;
     if (metadata.hooks !== expectedHook) fail(`${host} metadata does not bind its declared hook`);
+    if (host === "cursor" && metadata.mcpServers !== "./mcp.cursor.json") {
+      fail("cursor metadata does not bind its declared MCP manifest");
+    }
     if (host.startsWith("copilot") && metadata.skills !== "skills/") {
       fail(`${host} metadata does not bind the canonical rule/skill directory`);
     }
-    if (host === "claude_code") {
+    if (host === "cursor") {
+      const sessionStart = hook.hooks?.sessionStart;
+      if (hook.version !== 1 || !Array.isArray(sessionStart) || sessionStart.length !== 1) {
+        fail("cursor hook structure is invalid");
+      }
+      const command = sessionStart[0];
+      requireExactKeys(command, ["command", "timeout"], "cursor hook command");
+      if (command.command !== "node \"${CURSOR_PLUGIN_ROOT}/hooks/codestory-activate.cjs\""
+          || command.timeout !== 300) fail("cursor hook command is not the canonical launcher");
+    } else if (host === "claude_code") {
       const sessionStart = hook.hooks?.SessionStart;
       if (!Array.isArray(sessionStart) || sessionStart.length !== 1
           || sessionStart[0].matcher !== "startup|resume|clear|compact"
@@ -2017,7 +2051,15 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
           || command.powershell !== "node \"${PLUGIN_ROOT}\\hooks\\codestory-activate.cjs\""
           || command.timeoutSec !== 300) fail(`${host} hook command is not the canonical launcher`);
     }
-    if (!/^---\nname: codestory-grounding\n/iu.test(ruleText)
+    if (host === "cursor") {
+      if (!/^---\ndescription: CodeStory local grounding\./u.test(ruleText)
+          || !ruleText.includes("alwaysApply: true")
+          || !ruleText.includes("Call the CodeStory tool that matches the task")
+          || !ruleText.includes("codestory-grounding")
+          || !ruleText.includes("owns the detailed tool and evidence contract")) {
+        fail("cursor rule does not delegate to the complete canonical grounding contract");
+      }
+    } else if (!/^---\nname: codestory-grounding\n/iu.test(ruleText)
         || !ruleText.includes("## Direct Tool Loop")
         || !ruleText.includes("## Task Router")
         || !ruleText.includes("## Evidence Rules")

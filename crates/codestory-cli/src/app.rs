@@ -79,6 +79,7 @@ mod drill;
 mod ground_smoke;
 mod index_command;
 mod lifecycle;
+mod prove_call_path;
 mod readiness_commands;
 pub(crate) mod rendering;
 pub(crate) mod resolution;
@@ -201,6 +202,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Report(cmd) => report::run_report(cmd),
         Command::Context(cmd) => agent_context::run_context(cmd),
         Command::Packet(cmd) => agent_context::run_packet(cmd),
+        Command::ProveCallPath(cmd) => prove_call_path::run_prove_call_path(cmd),
         Command::Task(cmd) => agent_context::run_task(cmd),
         Command::Doctor(cmd) => readiness_commands::run_doctor(cmd),
         Command::Ready(cmd) => readiness_commands::run_ready(cmd),

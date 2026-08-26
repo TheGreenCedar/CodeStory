@@ -1260,8 +1260,12 @@ function staticIdentityFor(root) {
     "scripts/codestory-mcp.cjs",
     ".claude-plugin/plugin.json",
     ".github/plugin/plugin.json",
+    ".cursor-plugin/plugin.json",
     "hooks/claude-codex-hooks.json",
     "hooks/copilot-hooks.json",
+    "hooks/cursor-hooks.json",
+    "mcp.cursor.json",
+    "rules/codestory.mdc",
     "skills/codestory-grounding/SKILL.md",
   ];
   staticIdentity.static_roster = Object.fromEntries(
@@ -1270,14 +1274,14 @@ function staticIdentityFor(root) {
   return staticIdentity;
 }
 
-test("static Claude Code and Copilot surfaces bind one package, launcher, hook, and rule core", async () => {
-  assert.deepEqual(Object.keys(STATIC_PARITY_HOSTS), ["claude_code", "copilot_cli", "copilot_editor"]);
+test("static Cursor Claude Code and Copilot surfaces bind one package launcher hook and rule core", async () => {
+  assert.deepEqual(Object.keys(STATIC_PARITY_HOSTS), ["cursor", "claude_code", "copilot_cli", "copilot_editor"]);
   const manifest = JSON.parse(await readFile(join(pluginRoot, "plugin.json"), "utf8"));
   const staticIdentity = staticIdentityFor(pluginRoot);
 
   const report = await validateStaticHostParity(pluginRoot, staticIdentity);
   assert.equal(report.status, "pass");
-  assert.deepEqual(report.hosts.map(({ host }) => host), ["claude_code", "copilot_cli", "copilot_editor"]);
+  assert.deepEqual(report.hosts.map(({ host }) => host), ["cursor", "claude_code", "copilot_cli", "copilot_editor"]);
   for (const host of report.hosts) {
     assert.equal(host.package_version, manifest.version);
     assert.equal(host.launcher_sha256, staticIdentity.launcher.sha256);
@@ -1319,6 +1323,22 @@ test("static parity rejects substituted bytes invalid or no-op hooks metadata dr
     writeFileSync(join(root, "skills", "codestory-grounding", "SKILL.md"), "---\nname: codestory-grounding\n---\n# CodeStory Grounding\n");
     const headingOnly = staticIdentityFor(root);
     await assert.rejects(validateStaticHostParity(root, headingOnly), /complete canonical grounding contract/u);
+
+    for (const relativePath of [
+      ".cursor-plugin/plugin.json",
+      "hooks/cursor-hooks.json",
+      "mcp.cursor.json",
+      "rules/codestory.mdc",
+    ]) {
+      cpSync(pluginRoot, root, { recursive: true, force: true });
+      const authenticated = staticIdentityFor(root);
+      writeFileSync(join(root, relativePath), "substituted cursor surface\n");
+      await assert.rejects(
+        validateStaticHostParity(root, authenticated),
+        new RegExp(`static digest roster.*${relativePath.split("/").pop().replaceAll(".", "\\.")}`, "u"),
+        relativePath,
+      );
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

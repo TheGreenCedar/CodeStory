@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added an observational exact call-path verifier to the CLI and MCP. It checks
+  a complete host-supplied typed contract against one pinned indexed
+  publication, reports proof-domain uncertainty explicitly, and never treats
+  packet, context, or search output as proof authority.
 - Packet, context, and search now return closed CodeStory schema-3 evidence
   projections. They report concrete evidence, gaps, retrieval state, and one
   bounded continuation without claiming that an arbitrary natural-language
