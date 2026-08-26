@@ -16707,7 +16707,11 @@ mod proof_resolution_cache_tests {
                     methods: vec![CachedClassMethod {
                         name: "target".to_owned(),
                         declaration: old_method,
+                        cross_module_visible: false,
                     }],
+                    cross_module_visible: false,
+                    runtime_closed: false,
+                    super_name: None,
                 }],
                 direct_exports: vec![CachedDirectExport {
                     exported_name: "C".to_owned(),

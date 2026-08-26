@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 // Versioned with proof-input semantics so older parser artifacts fail closed.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 26;
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 27;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
@@ -312,12 +312,20 @@ pub(crate) struct CachedClassDeclaration {
     pub name: String,
     pub declaration: NodeId,
     pub methods: Vec<CachedClassMethod>,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+    #[serde(default)]
+    pub runtime_closed: bool,
+    #[serde(default)]
+    pub super_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CachedClassMethod {
     pub name: String,
     pub declaration: NodeId,
+    #[serde(default)]
+    pub cross_module_visible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,7 +357,7 @@ impl CachedIndexArtifact {
         resolution_file: Option<CachedResolutionFile>,
     ) -> Self {
         Self {
-            resolution_input_schema_version: 24,
+            resolution_input_schema_version: 25,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,

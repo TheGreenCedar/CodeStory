@@ -1627,10 +1627,13 @@ fn dart_combinators_and_swift_visibility_are_replay_authoritative() -> anyhow::R
         rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
         let facts = store.get_proof_resolution_facts()?;
         assert!(
-            facts.iter().filter(|fact| {
-                fact.provenance.language_adapter == language
-                    && fact.callsite.raw_target == target
-            }).all(|fact| fact.status != ProofResolutionStatus::Exact),
+            facts
+                .iter()
+                .filter(|fact| {
+                    fact.provenance.language_adapter == language
+                        && fact.callsite.raw_target == target
+                })
+                .all(|fact| fact.status != ProofResolutionStatus::Exact),
             "{name} bypassed import/access visibility: {facts:#?}"
         );
     }
@@ -1663,10 +1666,15 @@ fn csharp_swift_and_dart_cache_blob_semantics_are_not_self_authenticating() -> a
         )?;
         let mut artifact: serde_json::Value = serde_json::from_slice(&blob)?;
         match mutation {
-            "binding" => artifact["call_resolution_inputs"][0]["binding"]["kind"] = "unsupported".into(),
+            "binding" => {
+                artifact["call_resolution_inputs"][0]["binding"]["kind"] = "unsupported".into()
+            }
             "poison" => artifact["resolution_file"]["export_poison_all"] = true.into(),
             "domain" => artifact["resolution_file"]["java_kotlin_package"] = "ForgedModule".into(),
-            "import" => artifact["call_resolution_inputs"][0]["binding"]["package_name"] = "ForgedModule".into(),
+            "import" => {
+                artifact["call_resolution_inputs"][0]["binding"]["package_name"] =
+                    "ForgedModule".into()
+            }
             _ => unreachable!(),
         }
         store.get_connection().execute(

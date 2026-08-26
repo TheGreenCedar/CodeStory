@@ -48,6 +48,8 @@ use helpers::{
 
 pub use helpers::{StoredVectorEncoding, stored_vector_encoding};
 pub use proof_resolution::{ProofResolutionPublication, seal_call_resolution_fact};
+#[cfg(debug_assertions)]
+pub use proof_resolution::{reset_store_replay_work, store_replay_work};
 
 const SCHEMA_VERSION: u32 = 32;
 // Reserved outside the sequential migration range so a future real schema version cannot
