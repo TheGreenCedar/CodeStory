@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { copyFile, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -36,6 +36,12 @@ const benchmarkHarnessPath = fileURLToPath(import.meta.url);
 const benchmarkScorerPath = path.join(scriptDir, "codestory-agent-value-score.mjs");
 const repoRoot = path.resolve(scriptDir, "..");
 const siblingRoot = path.resolve(repoRoot, "..");
+const currentSourcePackageVersion = (() => {
+  const manifest = readFileSync(path.join(repoRoot, "crates", "codestory-cli", "Cargo.toml"), "utf8");
+  const match = /^version\s*=\s*"([^"]+)"\s*$/mu.exec(manifest);
+  if (!match) throw new Error("current CodeStory source package version is missing");
+  return match[1];
+})();
 const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 const defaultRepoCacheRoot = path.join(repoRoot, "target", "agent-benchmark", "repos");
 const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
@@ -1215,8 +1221,13 @@ async function authenticateExactCandidatePackages(opts) {
       [...candidateKeys].some((key) => !Object.hasOwn(candidate, key))) {
     throw new Error("candidate receipt must contain exactly the immutable package identity fields");
   }
-  if (candidate.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT || candidate.arm !== "candidate_0_18" || candidate.package_version !== "0.18.0") {
+  if (candidate.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT || candidate.arm !== "candidate_0_18") {
     throw new Error("candidate receipt identity is not the frozen 0.18 candidate");
+  }
+  if (candidate.package_version !== currentSourcePackageVersion) {
+    throw new Error(
+      `candidate receipt package version ${candidate.package_version ?? "missing"} does not match current source package version ${currentSourcePackageVersion}`,
+    );
   }
   const candidateExpected = {
     package_version: candidate.package_version,
@@ -10096,7 +10107,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   for (const arm of ["published_0_17_4", "candidate_0_18"]) {
     const identities = byArm[arm].map((row) => row.package_identity);
     const reference = identities[0];
-    const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : "0.18.0";
+    const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : currentSourcePackageVersion;
     const expectedSchema = arm === "published_0_17_4" ? 2 : 3;
     const invalidReference =
       reference?.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT ||

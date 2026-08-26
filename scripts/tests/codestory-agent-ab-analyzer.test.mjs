@@ -206,7 +206,7 @@ function exactCandidateRows() {
     for (let repeat = 1; repeat <= 3; repeat += 1) {
       for (const arm of EXACT_CANDIDATE_ARMS) {
         const codestory = arm !== "without_codestory";
-        const packageVersion = arm === "published_0_17_4" ? "0.17.4" : "0.18.0";
+        const packageVersion = "0.17.4";
         const packageByte = arm === "published_0_17_4" ? "a" : "b";
         rows.push({
           repo,
@@ -463,7 +463,15 @@ test("exact-candidate planning balances deterministic arm position across 162 fr
   }
 });
 
-async function makeExactArchive(root, name, { version, schema, source, tree, discovery, executionMarker = null }) {
+async function makeExactArchive(root, name, {
+  version,
+  runtimeVersion = version,
+  schema,
+  source,
+  tree,
+  discovery,
+  executionMarker = null,
+}) {
   const packageRoot = path.join(root, `${name}-root`);
   await mkdir(packageRoot, { recursive: true });
   const cliPath = path.join(packageRoot, "codestory-cli");
@@ -482,7 +490,7 @@ rl.on("line", (line) => {
     id: request.id,
     result: {
       protocolVersion: request.params.protocolVersion,
-      serverInfo: { name: "codestory", version: ${JSON.stringify(version)} },
+      serverInfo: { name: "codestory", version: ${JSON.stringify(runtimeVersion)} },
       _meta: {
         codestory_publication: { schema_version: ${schema} },
         codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discovery)} },
@@ -519,7 +527,7 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
       version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
     });
     const candidate = await makeExactArchive(root, "candidate", {
-      version: "0.18.0", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+      version: "0.17.4", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
     });
     const checksumPath = path.join(root, "SHA256SUMS.txt");
     await writeFile(checksumPath, `${published.sha256}  ${path.basename(published.archivePath)}\n`);
@@ -528,7 +536,7 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
     const baseReceipt = {
       contract: "codestory.agent-benchmark-package/v2",
       arm: "candidate_0_18",
-      package_version: "0.18.0",
+      package_version: "0.17.4",
       archive_path: candidate.archivePath,
       archive_sha256: candidate.sha256,
       source_commit: "d".repeat(40),
@@ -561,6 +569,7 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
       ["archive substitution", { ...baseReceipt, archive_path: published.archivePath, archive_sha256: published.sha256 }, {}, /version|source|runtime/i],
       ["local CLI substitution", { ...baseReceipt, cli_path: path.join(root, "decoy") }, {}, /exactly.*fields/i],
       ["runtime drift", { ...baseReceipt, schema_version: 4 }, {}, /runtime\/source identity/i],
+      ["receipt version disagrees with source", { ...baseReceipt, package_version: "0.18.0" }, {}, /source package version/i],
       ["source drift", { ...baseReceipt, source_tree: "9".repeat(40) }, {}, /source tree drifted/i],
       ["null source", { ...baseReceipt, source_commit: null }, {}, /runtime\/source identity/i],
       ["all-zero archive digest", { ...baseReceipt, archive_sha256: "0".repeat(64) }, {}, /all-zero digest/i],
@@ -570,6 +579,25 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
     for (const [label, receipt, overrides, expected] of hostile) {
       await assert.rejects(run(receipt, overrides), expected, label);
     }
+
+    const manifestDrift = await makeExactArchive(root, "candidate-manifest-version-drift", {
+      version: "0.17.5", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+    });
+    await assert.rejects(run({
+      ...baseReceipt,
+      archive_path: manifestDrift.archivePath,
+      archive_sha256: manifestDrift.sha256,
+    }), /native manifest version drifted/i);
+
+    const runtimeDrift = await makeExactArchive(root, "candidate-runtime-version-drift", {
+      version: "0.17.4", runtimeVersion: "0.17.5", schema: 3,
+      source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+    });
+    await assert.rejects(run({
+      ...baseReceipt,
+      archive_path: runtimeDrift.archivePath,
+      archive_sha256: runtimeDrift.sha256,
+    }), /runtime package_version=0\.17\.5; expected 0\.17\.4/i);
     await writeFile(receiptPath, "");
     await truncate(receiptPath, 64 * 1024 + 1);
     await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
@@ -627,14 +655,14 @@ test("exact input ingestion makes every caller path irrelevant before parsing ex
         version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
       });
       const candidate = await makeExactArchive(root, "candidate-original", {
-        version: "0.18.0", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+        version: "0.17.4", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
       });
       const publishedSubstitute = await makeExactArchive(root, "published-substitute", {
         version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: "c".repeat(64),
         executionMarker: marker,
       });
       const candidateSubstitute = await makeExactArchive(root, "candidate-substitute", {
-        version: "0.18.0", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+        version: "0.17.4", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
         executionMarker: marker,
       });
       const publishedInput = path.join(root, "published-input.tar.gz");
@@ -647,7 +675,7 @@ test("exact input ingestion makes every caller path irrelevant before parsing ex
       await writeFile(receiptPath, JSON.stringify({
         contract: "codestory.agent-benchmark-package/v2",
         arm: "candidate_0_18",
-        package_version: "0.18.0",
+        package_version: "0.17.4",
         archive_path: candidateInput,
         archive_sha256: candidate.sha256,
         source_commit: "d".repeat(40),
