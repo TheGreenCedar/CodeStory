@@ -1583,6 +1583,110 @@ fn dart_exact_dispatch_requires_a_closed_same_library_override_domain() -> anyho
         });
         assert_eq!(exact, should_be_exact, "{name}: {facts:#?}");
     }
+
+    let ancestry_cases = [
+        (
+            "closed_without_override",
+            vec![
+                ("lib/a.dart", "final class A { void target() {} }\n"),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nfinal class B extends A {}\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'b.dart';\nfinal class C extends B {}\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'a.dart';\nvoid caller(A receiver) { receiver.target(); }\n",
+                ),
+            ],
+            true,
+        ),
+        (
+            "transitive_override",
+            vec![
+                ("lib/a.dart", "final class A { void target() {} }\n"),
+                (
+                    "lib/b.dart",
+                    "import 'a.dart';\nfinal class B extends A {}\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'b.dart';\nfinal class C extends B { @override void target() {} }\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'a.dart';\nvoid caller(A receiver) { receiver.target(); }\n",
+                ),
+            ],
+            false,
+        ),
+        (
+            "cyclic_ancestry",
+            vec![
+                (
+                    "lib/a.dart",
+                    "import 'c.dart';\nfinal class A extends C { void target() {} }\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'a.dart';\nfinal class C extends A {}\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'a.dart';\nvoid caller(A receiver) { receiver.target(); }\n",
+                ),
+            ],
+            false,
+        ),
+        (
+            "ambiguous_parent",
+            vec![
+                ("lib/a.dart", "final class A { void target() {} }\n"),
+                (
+                    "lib/b_one.dart",
+                    "import 'a.dart';\nfinal class B extends A {}\n",
+                ),
+                (
+                    "lib/b_two.dart",
+                    "import 'a.dart';\nfinal class B extends A {}\n",
+                ),
+                (
+                    "lib/c.dart",
+                    "import 'b_one.dart';\nfinal class C extends B { @override void target() {} }\n",
+                ),
+                (
+                    "lib/caller.dart",
+                    "import 'a.dart';\nvoid caller(A receiver) { receiver.target(); }\n",
+                ),
+            ],
+            false,
+        ),
+    ];
+    for (name, files, should_be_exact) in ancestry_cases {
+        for reordered in [false, true] {
+            let mut files = files.clone();
+            if reordered {
+                files.reverse();
+            }
+            let project = tempfile::tempdir()?;
+            let mut store = Store::new_in_memory()?;
+            index_files(project.path(), &mut store, &files)?;
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+            let facts = store.get_proof_resolution_facts()?;
+            let exact = facts.iter().any(|fact| {
+                fact.provenance.language_adapter == "dart"
+                    && fact.callsite.raw_target == "target"
+                    && fact.status == ProofResolutionStatus::Exact
+            });
+            assert_eq!(
+                exact, should_be_exact,
+                "{name} reordered={reordered} violated ancestry closure: {facts:#?}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1636,6 +1740,52 @@ fn dart_combinators_and_swift_visibility_are_replay_authoritative() -> anyhow::R
                 .all(|fact| fact.status != ProofResolutionStatus::Exact),
             "{name} bypassed import/access visibility: {facts:#?}"
         );
+    }
+
+    for visibility in ["public", "open"] {
+        let comment_cases = [
+            (
+                "type",
+                format!("struct /* {visibility} */ Worker {{ public func target() {{}} }}\n"),
+                "func caller() { Worker().target() }\n",
+                "target",
+            ),
+            (
+                "member",
+                format!("public struct Worker {{ func /* {visibility} */ target() {{}} }}\n"),
+                "func caller() { Worker().target() }\n",
+                "target",
+            ),
+            (
+                "top_level",
+                format!("func /* {visibility} */ target() {{}}\n"),
+                "func caller() { target() }\n",
+                "target",
+            ),
+        ];
+        for (surface, declaration, caller, target) in comment_cases {
+            let project = tempfile::tempdir()?;
+            let mut store = Store::new_in_memory()?;
+            let caller = format!("import WorkerModule\n{caller}");
+            index_files(
+                project.path(),
+                &mut store,
+                &[
+                    ("Sources/WorkerModule/Worker.swift", declaration.as_str()),
+                    ("Sources/App/Caller.swift", caller.as_str()),
+                ],
+            )?;
+            rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+            let facts = store.get_proof_resolution_facts()?;
+            assert!(
+                facts.iter().all(|fact| {
+                    fact.provenance.language_adapter != "swift"
+                        || fact.callsite.raw_target != target
+                        || fact.status != ProofResolutionStatus::Exact
+                }),
+                "Swift {visibility} comment forged {surface} visibility: {facts:#?}"
+            );
+        }
     }
     Ok(())
 }
