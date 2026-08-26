@@ -282,7 +282,7 @@ function exactCandidateRows() {
                 source_commit: (arm === "published_0_17_4" ? "e" : "f").repeat(40),
                 source_tree: (arm === "published_0_17_4" ? "1" : "2").repeat(40),
                 schema_version: arm === "published_0_17_4" ? 2 : 3,
-                protocol_revision: "2025-11-25",
+                protocol_revision: arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25",
                 discovery_contract_sha256: (arm === "published_0_17_4" ? "3" : "4").repeat(64),
                 trust_root_kind: arm === "published_0_17_4"
                   ? "official_published_checksum"
@@ -562,6 +562,7 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
     };
     const accepted = await run(baseReceipt);
     assert.equal(accepted.packages.get("published_0_17_4").package_sha256, published.sha256);
+    assert.equal(accepted.packages.get("published_0_17_4").protocol_revision, "2024-11-05");
     assert.equal(accepted.packages.get("candidate_0_18").package_sha256, candidate.sha256);
     assert.match(accepted.packages.get("candidate_0_18").cli_path, /state-/);
 

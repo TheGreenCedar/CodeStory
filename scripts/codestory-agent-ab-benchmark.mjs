@@ -1254,7 +1254,7 @@ async function authenticateExactCandidatePackages(opts) {
       arm: "published_0_17_4",
       sourceArchivePath: publishedArchive,
       archiveSha256: normalizeExternalSha256(publishedMatches[0], "official published archive sha256"),
-      expected: { package_version: "0.17.4", schema_version: 2, protocol_revision: "2025-11-25" },
+      expected: { package_version: "0.17.4", schema_version: 2, protocol_revision: "2024-11-05" },
       trustRoot: { kind: "official_published_checksum", sha256: publishedManifest.sha256 },
     },
     candidate_0_18: {
@@ -10109,6 +10109,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     const reference = identities[0];
     const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : currentSourcePackageVersion;
     const expectedSchema = arm === "published_0_17_4" ? 2 : 3;
+    const expectedProtocol = arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25";
     const invalidReference =
       reference?.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT ||
       reference?.arm !== arm ||
@@ -10122,7 +10123,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       !/^[0-9a-f]{40}$/.test(String(reference?.source_tree ?? "")) ||
       /^0{40}$/.test(String(reference?.source_tree ?? "")) ||
       reference?.schema_version !== expectedSchema ||
-      reference?.protocol_revision !== "2025-11-25" ||
+      reference?.protocol_revision !== expectedProtocol ||
       !SHA256_PATTERN.test(String(reference?.discovery_contract_sha256 ?? "")) ||
       /^0{64}$/.test(String(reference?.discovery_contract_sha256 ?? "")) ||
       reference?.trust_root_kind !== (arm === "published_0_17_4"
