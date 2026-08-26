@@ -1182,7 +1182,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     answer: {
       citations: [{ node_id: "carrier", file_path: "src/lib.rs" }],
       graphs: Array.from(
-        { length: 21 },
+        { length: 61 },
         () => ({ graph: { edges: [{ id: "protected" }] } }),
       ),
       retrieval_trace: {
@@ -1194,13 +1194,13 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     disposition: { kind: "supported", omission_receipts: [] },
     budget: {
       limits: {
-        max_anchors: 13,
+        max_anchors: 16,
         max_files: 1,
-        max_output_bytes: 98_304,
+        max_output_bytes: 128 * 1024,
         max_snippets: 1,
-        max_trail_edges: 20,
+        max_trail_edges: 60,
       },
-      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 1, trail_edges: 21 },
+      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 1, trail_edges: 61 },
     },
   };
   const stdout = exactPacketStdout(packet);
@@ -1208,11 +1208,11 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     requireSupported: true,
     requireManagedRuntime: true,
   });
-  assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=21 exceeds 20")));
+  assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=61 exceeds 60")));
   assert.equal(blockers.some((blocker) => blocker.includes("stdout bytes")), false);
 
   packet.answer.graphs.pop();
-  packet.budget.used.trail_edges = 20;
+  packet.budget.used.trail_edges = 60;
   const validStdout = exactPacketStdout(packet);
   assert.deepEqual(packetPreludeContractBlockers(packet, validStdout, {
     requireSupported: true,
@@ -1237,9 +1237,9 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   });
 
   for (const [field, lowered, publicCap] of [
-    ["max_anchors", 12, 13],
-    ["max_trail_edges", 19, 20],
-    ["max_output_bytes", 90_000, 98_304],
+    ["max_anchors", 15, 16],
+    ["max_trail_edges", 59, 60],
+    ["max_output_bytes", 120_000, 128 * 1024],
   ]) {
     const original = packet.budget.limits[field];
     packet.budget.limits[field] = lowered;
@@ -1304,22 +1304,22 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   packet.answer.retrieval_trace.retrieval_shadow = { retrieval_mode: "full" };
 
   packet.budget.limits.max_output_bytes = 200_000;
-  packet.hostile_padding = "x".repeat(100_000);
+  packet.hostile_padding = "x".repeat(140_000);
   const raisedLimitStdout = exactPacketStdout(packet);
-  assert.ok(packet.budget.used.output_bytes > 98_304);
+  assert.ok(packet.budget.used.output_bytes > 128 * 1024);
   assert.match(
     packetPreludeContractBlockers(packet, raisedLimitStdout, {
       requireSupported: true,
       requireManagedRuntime: true,
     }).join("\n"),
-    /max_output_bytes=200000 does not equal public cap=98304.*used\.output_bytes=.*exceeds public cap=98304/s,
+    /max_output_bytes=200000 does not equal public cap=131072.*used\.output_bytes=.*exceeds public cap=131072/s,
   );
   delete packet.hostile_padding;
-  packet.budget.limits.max_output_bytes = 98_304;
+  packet.budget.limits.max_output_bytes = 128 * 1024;
 
-  for (const identity of [
-    managedRuntimeIdentity({ plugin_version: "0.16.3" }),
-    managedRuntimeIdentity({ cli_source: "override", known_override_skew_channel: true }),
+  for (const [identity, selectedVersion] of [
+    [managedRuntimeIdentity({ plugin_version: "0.16.3" }), "0.16.3"],
+    [managedRuntimeIdentity({ cli_source: "override", known_override_skew_channel: true }), "0.17.0"],
   ]) {
     packet._meta.codestory_publication.contract_runtime = identity;
     const staleStdout = exactPacketStdout(packet);
@@ -1328,7 +1328,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
         requireSupported: true,
         requireManagedRuntime: true,
       }).join("\n"),
-      /runtime identity is not managed 0\.17\.0/,
+      new RegExp(`runtime identity is not managed ${selectedVersion.replaceAll(".", "\\.")}`, "u"),
     );
   }
   packet._meta.codestory_publication.contract_runtime = managedRuntimeIdentity();

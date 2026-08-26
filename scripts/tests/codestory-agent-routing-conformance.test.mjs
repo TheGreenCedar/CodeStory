@@ -22,6 +22,7 @@ import {
   STATIC_PARITY_HOSTS,
   canonicalRequestContractDigest,
   parseInstalledTranscript,
+  validateProofCallInputAgainstCatalog,
   validateInstalledSession,
   validateStaticHostParity,
 } from "../codestory-agent-routing-conformance.mjs";
@@ -125,27 +126,34 @@ function proofContract({ prohibited = false } = {}) {
     clauses: [
       {
         clause_id: "contract",
-        start: 0,
-        end: Buffer.byteLength(sourceText),
+        start_byte: 0,
+        end_byte_exclusive: Buffer.byteLength(sourceText),
         quote: sourceText,
-        classification: "resolved_material",
-        fields,
-        reason: null,
-        non_material_kind: null,
+        classification: { kind: "resolved_material", fields },
       },
     ],
     spec: {
       start: { kind: "canonical_id", canonical_id: "rust:crate::start" },
-      steps: [{
-        relation: "direct_outgoing_call",
-        target: { kind: "canonical_id", canonical_id: "rust:crate::finish" },
-      }],
+      steps: [{ target: { kind: "canonical_id", canonical_id: "rust:crate::finish" } }],
       prohibit_traversal_through: prohibited
         ? [{ kind: "canonical_id", canonical_id: "rust:crate::blocked" }]
         : [],
       exclude_from_projection: [],
     },
   };
+}
+
+function projectedProofClauses(contract) {
+  return contract.clauses.map((clause) => ({
+    start: clause.start_byte,
+    end: clause.end_byte_exclusive,
+    clause_id: clause.clause_id,
+    quote: clause.quote,
+    classification: clause.classification.kind,
+    fields: clause.classification.kind === "resolved_material" ? clone(clause.classification.fields) : [],
+    reason: clause.classification.kind === "unresolved_material" ? clause.classification.reason : null,
+    non_material_kind: clause.classification.kind === "non_material" ? clause.classification.reason : null,
+  }));
 }
 
 function runtimeMeta(overrides = {}) {
@@ -278,7 +286,7 @@ function proofBody(disposition, contract, detail = {}) {
       prohibit_traversal_through: clone(contract.spec.prohibit_traversal_through),
       exclude_from_projection: clone(contract.spec.exclude_from_projection),
     },
-    clauses: clone(contract.clauses),
+    clauses: projectedProofClauses(contract),
     disposition: projectedDisposition,
     steps: [{ step_index: 0, status: stepStatus, receipt: hasReceipt ? 0 : null }],
     receipts,
@@ -503,11 +511,11 @@ function baseRun(scenarioId) {
       });
       break;
     case "malformed_proof_contract": {
-      const malformed = { source_text: "A calls B", clauses: [] };
+      const malformed = { ...typed, source_text: "A calls B", clauses: [] };
       run.request.proof_contract = malformed;
       run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...malformed }, {
         code: "invalid_proof_interpretation",
-        message: "spec is required",
+        message: "source text is unclassified",
       }, { isError: true })];
       run.final = finalClaim({ authority: "none", outcome: "invalid_contract", reason_codes: ["invalid_proof_interpretation"] });
       break;
@@ -727,6 +735,52 @@ for (const host of ["codex", "cursor"]) {
     }
   });
 }
+
+const PROOF_CALL_SCENARIOS = [
+  "typed_proof_contract_proven",
+  "typed_proof_contract_refuted",
+  "typed_proof_unknown",
+  "typed_proof_unavailable",
+  "malformed_proof_contract",
+  "proof_observational",
+  "hidden_proof_tool_discovery",
+];
+
+test("all proof scenarios preserve the public input DTO through both installed-host parsers", () => {
+  for (const scenarioId of PROOF_CALL_SCENARIOS) {
+    const run = baseRun(scenarioId);
+    const expected = run.request.proof_contract;
+    const proofStep = run.steps.find((step) => step.tool === "prove_call_path");
+    assert.deepEqual(
+      { source_text: proofStep.args.source_text, clauses: proofStep.args.clauses, spec: proofStep.args.spec },
+      expected,
+      scenarioId,
+    );
+    assert.equal(validateProofCallInputAgainstCatalog(proofStep.args), true, scenarioId);
+    for (const host of ["codex", "cursor"]) {
+      assert.equal(validate(host, run).status, "pass", `${host}:${scenarioId}`);
+    }
+  }
+});
+
+test("the old normalized proof-response projection is rejected as public tool input", () => {
+  const input = { project: "/workspace/repo", ...proofContract() };
+  input.clauses = input.clauses.map((clause) => ({
+    start: clause.start_byte,
+    end: clause.end_byte_exclusive,
+    clause_id: clause.clause_id,
+    quote: clause.quote,
+    classification: clause.classification.kind,
+    fields: clause.classification.fields,
+    reason: null,
+    non_material_kind: null,
+  }));
+  input.spec.steps = input.spec.steps.map((step) => ({ relation: "direct_outgoing_call", ...step }));
+  assert.throws(
+    () => validateProofCallInputAgainstCatalog(input),
+    /prove_call_path input schema/u,
+  );
+});
 
 test("actual parsers reject malformed, incomplete, and cross-host transcripts", () => {
   assert.throws(() => parseInstalledTranscript("codex", "{not-json}\n"), /malformed JSONL/u);

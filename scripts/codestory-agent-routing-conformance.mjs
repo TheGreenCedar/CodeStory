@@ -15,6 +15,10 @@ const PROOF_DISPOSITIONS = new Set([
   "unknown",
   "unavailable",
 ]);
+const PROVE_CALL_PATH_INPUT_SCHEMA = JSON.parse(readFileSync(
+  new URL("../plugins/codestory/generated-mcp-catalog.json", import.meta.url),
+  "utf8",
+)).tools.find(({ name }) => name === "prove_call_path")?.inputSchema;
 const ROUTING_ACTIONS = Object.freeze([
   "source_read",
   "search",
@@ -301,6 +305,50 @@ function canonical(value) {
 
 function equalJson(left, right) {
   return canonical(left) === canonical(right);
+}
+
+function matchesJsonSchema(value, schema) {
+  if (!plainObject(schema)) return false;
+  if (Array.isArray(schema.oneOf)) {
+    return schema.oneOf.filter((candidate) => matchesJsonSchema(value, candidate)).length === 1;
+  }
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => equalJson(candidate, value))) return false;
+  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+  if (schema.type !== undefined && !types.some((type) => {
+    if (type === "null") return value === null;
+    if (type === "array") return Array.isArray(value);
+    if (type === "object") return plainObject(value);
+    if (type === "integer") return Number.isInteger(value);
+    if (type === "number") return typeof value === "number" && Number.isFinite(value);
+    return typeof value === type;
+  })) return false;
+  if (typeof value === "string" && Number.isInteger(schema.minLength) && value.length < schema.minLength) return false;
+  if (typeof value === "number") {
+    if (typeof schema.minimum === "number" && value < schema.minimum) return false;
+    if (typeof schema.maximum === "number" && value > schema.maximum) return false;
+  }
+  if (Array.isArray(value)) {
+    if (Number.isInteger(schema.minItems) && value.length < schema.minItems) return false;
+    if (Number.isInteger(schema.maxItems) && value.length > schema.maxItems) return false;
+    if (plainObject(schema.items) && !value.every((item) => matchesJsonSchema(item, schema.items))) return false;
+  }
+  if (plainObject(value)) {
+    const properties = plainObject(schema.properties) ? schema.properties : {};
+    if (Array.isArray(schema.required) && schema.required.some((key) => !Object.hasOwn(value, key))) return false;
+    if (schema.additionalProperties === false && Object.keys(value).some((key) => !Object.hasOwn(properties, key))) return false;
+    for (const [key, child] of Object.entries(value)) {
+      if (Object.hasOwn(properties, key) && !matchesJsonSchema(child, properties[key])) return false;
+    }
+  }
+  return true;
+}
+
+export function validateProofCallInputAgainstCatalog(input) {
+  if (!plainObject(PROVE_CALL_PATH_INPUT_SCHEMA)
+      || !matchesJsonSchema(input, PROVE_CALL_PATH_INPUT_SCHEMA)) {
+    fail("prove_call_path input schema does not match the generated catalog");
+  }
+  return true;
 }
 
 function compareUtf8(left, right) {
@@ -812,10 +860,13 @@ function validateSelector(selector, label) {
     return;
   }
   if (selector.kind === "qualified_name") {
-    requireExactKeys(selector, ["kind", "qualified_name", "project_file_components"], label);
-    if (!nonemptyString(selector.qualified_name)
-        || !(selector.project_file_components === null || (Array.isArray(selector.project_file_components)
-          && selector.project_file_components.length > 0))) fail(`${label} is invalid`);
+    const hasPath = Object.hasOwn(selector, "project_file_components");
+    requireExactKeys(selector, hasPath
+      ? ["kind", "qualified_name", "project_file_components"]
+      : ["kind", "qualified_name"], label);
+    if (!nonemptyString(selector.qualified_name) || (hasPath
+      && !(selector.project_file_components === null || (Array.isArray(selector.project_file_components)
+        && selector.project_file_components.length > 0)))) fail(`${label} is invalid`);
     return;
   }
   if (selector.kind === "pinned_node") {
@@ -826,6 +877,63 @@ function validateSelector(selector, label) {
     return;
   }
   fail(`${label} uses an unsupported selector kind`);
+}
+
+function normalizeTypedContract(contract) {
+  requireExactKeys(contract, ["source_text", "clauses", "spec"], "typed proof contract");
+  if (!nonemptyString(contract.source_text) || !Array.isArray(contract.clauses) || !plainObject(contract.spec)) {
+    fail("typed proof contract source_text, clauses, and spec are required");
+  }
+  requireExactKeys(contract.spec, ["start", "steps", "prohibit_traversal_through", "exclude_from_projection"], "typed proof spec");
+  if (!Array.isArray(contract.spec.steps) || !Array.isArray(contract.spec.prohibit_traversal_through)
+      || !Array.isArray(contract.spec.exclude_from_projection)) fail("typed proof spec arrays are invalid");
+  return {
+    source_text: contract.source_text,
+    clauses: contract.clauses.map((clause, index) => {
+      requireExactKeys(
+        clause,
+        ["clause_id", "start_byte", "end_byte_exclusive", "quote", "classification"],
+        `typed proof contract clause ${index}`,
+      );
+      if (!plainObject(clause.classification) || !nonemptyString(clause.classification.kind)) {
+        fail(`typed proof contract clause ${index} classification is invalid`);
+      }
+      let fields = [];
+      let reason = null;
+      let nonMaterialKind = null;
+      if (clause.classification.kind === "resolved_material") {
+        requireExactKeys(clause.classification, ["kind", "fields"], `typed proof contract clause ${index} classification`);
+        fields = clause.classification.fields;
+      } else if (clause.classification.kind === "unresolved_material") {
+        requireExactKeys(clause.classification, ["kind", "reason"], `typed proof contract clause ${index} classification`);
+        reason = clause.classification.reason;
+      } else if (clause.classification.kind === "non_material") {
+        requireExactKeys(clause.classification, ["kind", "reason"], `typed proof contract clause ${index} classification`);
+        nonMaterialKind = clause.classification.reason;
+      } else {
+        fail(`typed proof contract clause ${index} classification is invalid`);
+      }
+      return {
+        start: clause.start_byte,
+        end: clause.end_byte_exclusive,
+        clause_id: clause.clause_id,
+        quote: clause.quote,
+        classification: clause.classification.kind,
+        fields,
+        reason,
+        non_material_kind: nonMaterialKind,
+      };
+    }),
+    spec: {
+      start: contract.spec.start,
+      steps: contract.spec.steps.map((step, index) => {
+        requireExactKeys(step, ["target"], `typed proof step ${index}`);
+        return { relation: "direct_outgoing_call", target: step.target };
+      }),
+      prohibit_traversal_through: contract.spec.prohibit_traversal_through,
+      exclude_from_projection: contract.spec.exclude_from_projection,
+    },
+  };
 }
 
 function validateScopeSelectorList(selectors, label) {
@@ -854,8 +962,8 @@ function proofContractFieldKey(field, stepCount, prohibitionCount, exclusionCoun
 
 function validTypedContract(contract) {
   try {
-    requireExactKeys(contract, ["source_text", "clauses", "spec"], "typed proof contract");
-    if (!nonemptyString(contract.source_text) || !Array.isArray(contract.clauses) || contract.clauses.length === 0) {
+    contract = normalizeTypedContract(contract);
+    if (contract.clauses.length === 0) {
       fail("typed proof contract source_text and clauses are required");
     }
     requireExactKeys(contract.spec, ["start", "steps", "prohibit_traversal_through", "exclude_from_projection"], "typed proof spec");
@@ -1038,14 +1146,15 @@ function groupedContractClauses(contract) {
 
 export function canonicalRequestContractDigest(contract) {
   if (!validTypedContract(contract)) fail("typed proof contract is not canonicalizable");
-  const sourceTextSha256 = sha256Bytes(Buffer.from(contract.source_text));
+  const normalized = normalizeTypedContract(contract);
+  const sourceTextSha256 = sha256Bytes(Buffer.from(normalized.source_text));
   const document = {
     schema_version: 1,
     proof_domain: "indexed_source_call_path_v1",
     guard_version: "clause_guard_v1",
     source_text_sha256: sourceTextSha256,
-    clauses: normalizedContractClauses(contract),
-    spec: contract.spec,
+    clauses: normalizedContractClauses(normalized),
+    spec: normalized.spec,
   };
   return sha256Bytes(Buffer.concat([PROOF_CONTRACT_DIGEST_DOMAIN, Buffer.from(canonical(document))]));
 }
@@ -1634,6 +1743,7 @@ function validateSelectorReceiptBinding(selector, expectedSymbol, label) {
 }
 
 function validateCanonicalProofResult(result, contract) {
+  const normalized = normalizeTypedContract(contract);
   validateProofResult(result);
   const sequence = dispositionReceiptSequence(result, result.spec.steps.length);
   validateSemanticReceiptTable(result, sequence);
@@ -1644,15 +1754,15 @@ function validateCanonicalProofResult(result, contract) {
   if (result.contract_digest !== expectedDigest || result.disposition.contract_digest !== expectedDigest) {
     proofSemanticFail("contract digest is not derived from the unchanged typed request");
   }
-  if (!equalJson(result.clauses, groupedContractClauses(contract))) {
+  if (!equalJson(result.clauses, groupedContractClauses(normalized))) {
     proofSemanticFail("clauses do not match the canonical unchanged typed request");
   }
   const firstSource = sequence.length === 0 ? null : result.receipts[sequence[0]].source;
   validateSelectorReceiptBinding(result.spec.start, firstSource, "proof start selector");
-  if (!equalJson(projectedSelectorValue(result.spec.start, result, "proof result start selector"), contract.spec.start)) {
+  if (!equalJson(projectedSelectorValue(result.spec.start, result, "proof result start selector"), normalized.spec.start)) {
     proofSemanticFail("start selector does not match the unchanged typed request");
   }
-  if (result.spec.steps.length !== contract.spec.steps.length) proofSemanticFail("steps do not match the unchanged typed request");
+  if (result.spec.steps.length !== normalized.spec.steps.length) proofSemanticFail("steps do not match the unchanged typed request");
   result.spec.steps.forEach((step, index) => {
     const expectedTarget = index < sequence.length ? result.receipts[sequence[index]].target : null;
     validateSelectorReceiptBinding(step.target, expectedTarget, `proof step ${index} target`);
@@ -1660,10 +1770,10 @@ function validateCanonicalProofResult(result, contract) {
       relation: step.relation,
       target: projectedSelectorValue(step.target, result, `proof result step ${index} target`),
     };
-    if (!equalJson(projected, contract.spec.steps[index])) proofSemanticFail(`step ${index} does not match the unchanged typed request`);
+    if (!equalJson(projected, normalized.spec.steps[index])) proofSemanticFail(`step ${index} does not match the unchanged typed request`);
   });
-  if (!equalJson(result.spec.prohibit_traversal_through, contract.spec.prohibit_traversal_through)
-      || !equalJson(result.spec.exclude_from_projection, contract.spec.exclude_from_projection)) {
+  if (!equalJson(result.spec.prohibit_traversal_through, normalized.spec.prohibit_traversal_through)
+      || !equalJson(result.spec.exclude_from_projection, normalized.spec.exclude_from_projection)) {
     proofSemanticFail("scope selectors do not match the unchanged typed request");
   }
 }
@@ -1680,6 +1790,7 @@ function validateProofCalls(scenarioContract, request, actions, results) {
   if (!plainObject(request.proof_contract)) {
     fail(`${scenarioContract.id} proof requires a host-supplied typed contract; free-English construction is forbidden`);
   }
+  validateProofCallInputAgainstCatalog(proofCalls[0].args);
   if (!equalJson(stripProject(proofCalls[0].args), request.proof_contract)) {
     fail(`${scenarioContract.id} proof request must preserve the host-supplied typed contract exactly`);
   }
