@@ -3428,6 +3428,66 @@ fn c_cpp_header_extensions_are_always_canonical_nonexact() -> anyhow::Result<()>
 }
 
 #[test]
+fn inferred_cpp_headers_rematerialize_with_the_indexed_parser_provenance() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "fixture.h",
+            "namespace sample { inline void target() {} inline void caller() { target(); } }\n",
+        )],
+    )?;
+
+    let indexed = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with("fixture.h"))
+        .expect("indexed header");
+    assert_eq!(indexed.language, "cpp");
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let fact = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .unwrap_or_else(|| panic!("C++ header emitted no canonical target fact: {facts:#?}"));
+    assert_eq!(fact.status, ProofResolutionStatus::Unsupported);
+    assert!(fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty());
+
+    let project = tempfile::tempdir()?;
+    let header = project.path().join("compiled.h");
+    fs::write(
+        project.path().join("compile_commands.json"),
+        format!(
+            "[{{\"directory\":{},\"command\":\"clang++ -std=c++20 -c compiled.h\",\"file\":{}}}]",
+            serde_json::to_string(project.path())?,
+            serde_json::to_string(&header)?,
+        ),
+    )?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "compiled.h",
+            "void target() {} void caller() { target(); }\n",
+        )],
+    )?;
+    let indexed = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with("compiled.h"))
+        .expect("compilation-database header");
+    assert_eq!(indexed.language, "cpp");
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    Ok(())
+}
+
+#[test]
 fn python_closed_exact_subset_authorizes_s1_through_s4() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let mut store = Store::new_in_memory()?;

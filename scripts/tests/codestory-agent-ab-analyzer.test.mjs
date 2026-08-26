@@ -1019,6 +1019,227 @@ test("exact candidate setup removes every allocated root after a later setup fai
   }
 });
 
+test("exact candidate setup preserves its primary failure across every cleanup failure", async () => {
+  for (const failedRoots of [
+    new Set(["/fixture/baseline-state"]),
+    new Set(["/fixture/exact-state"]),
+    new Set(["/fixture/baseline-state", "/fixture/exact-state"]),
+  ]) {
+    const opts = { exactCandidate: true };
+    const primary = new Error("primary authentication failure");
+    const initializationRemovals = [];
+    let allocation = 0;
+    let observed;
+    try {
+      await benchmarkHarness.initializeExactCandidateState(opts, {
+        createPrivateStateRoot: async () => [
+          "/fixture/exact-state",
+          "/fixture/baseline-state",
+        ][allocation++],
+        makeDirectory: async () => {},
+        authenticatePackages: async () => {
+          throw primary;
+        },
+        remove: async (root, options) => {
+          initializationRemovals.push({ root, options });
+          if (failedRoots.has(root)) {
+            const error = new Error(`cleanup failed for ${root}`);
+            error.code = "ENOTEMPTY";
+            throw error;
+          }
+        },
+      });
+    } catch (error) {
+      observed = error;
+    }
+    assert.equal(observed, primary);
+    assert.deepEqual(initializationRemovals.map(({ root }) => root), [
+      "/fixture/baseline-state",
+      "/fixture/exact-state",
+    ]);
+    assert.ok(initializationRemovals.every(({ options }) => options.maxRetries >= 10));
+    assert.equal(
+      opts.exactCandidateBaselineContainerRoot,
+      failedRoots.has("/fixture/baseline-state") ? "/fixture/baseline-state" : undefined,
+    );
+    assert.equal(
+      opts.exactCandidateStateRoot,
+      failedRoots.has("/fixture/exact-state") ? "/fixture/exact-state" : undefined,
+    );
+
+    const finalizationRemovals = [];
+    const failures = await benchmarkHarness.finalizeBenchmarkResources(
+      opts,
+      { close: async () => {} },
+      { close: async () => {} },
+      {
+        remove: async (root) => {
+          finalizationRemovals.push(root);
+        },
+      },
+    );
+    assert.deepEqual(finalizationRemovals, [...failedRoots].reverse());
+    assert.deepEqual(
+      new Set(failures.map(({ path }) => path)),
+      failedRoots,
+    );
+    assert.equal(benchmarkHarness.finalBenchmarkFailure(primary, failures), primary);
+  }
+});
+
+test("durable JSONL appender closes its handle after every pending failure", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-ledger-close-"));
+  try {
+    for (const stage of ["serialization", "write", "sync"]) {
+      let closeCalls = 0;
+      const stageFailure = new Error(`${stage} failed`);
+      const closeFailure = new Error(`${stage} close failed`);
+      const appender = await createDurableJsonlAppender(
+        path.join(root, `${stage}.jsonl`),
+        {
+          openFile: async () => ({
+            write: async () => {
+              if (stage === "write") throw stageFailure;
+            },
+            sync: async () => {
+              if (stage === "sync") throw stageFailure;
+            },
+            close: async () => {
+              closeCalls += 1;
+              throw closeFailure;
+            },
+          }),
+        },
+      );
+      const row = {};
+      if (stage === "serialization") row.self = row;
+      let appendFailure;
+      try {
+        await appender.append(row);
+      } catch (error) {
+        appendFailure = error;
+      }
+      let observedCloseFailure;
+      try {
+        await appender.close();
+      } catch (error) {
+        observedCloseFailure = error;
+      }
+      assert.equal(closeCalls, 1);
+      assert.equal(observedCloseFailure, appendFailure);
+      assert.deepEqual(observedCloseFailure.benchmarkSecondaryFailures, [{
+        resource: "ledger_handle",
+        code: null,
+        message: closeFailure.message,
+      }]);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("benchmark finalization retries owned roots and preserves the pipeline failure", async () => {
+  const removed = [];
+  const opts = {
+    exactCandidateStateRoot: "/fixture/exact-state",
+    exactCandidateBaselineContainerRoot: "/fixture/baseline-state",
+    exactCandidateBaselineStateRoot: "/fixture/baseline-state/private-state",
+    exactCandidatePackageByArm: new Map(),
+    exactCandidateLifecycle: {},
+  };
+  const pipelineFailure = { kind: "preparation_failed", repo: "fmtlib-fmt" };
+  const failures = await benchmarkHarness.finalizeBenchmarkResources(
+    opts,
+    { close: async () => {} },
+    { close: async () => {} },
+    {
+      remove: async (root, options) => {
+        removed.push({ root, options });
+        if (root.endsWith("exact-state")) {
+          const error = new Error("directory not empty");
+          error.code = "ENOTEMPTY";
+          throw error;
+        }
+      },
+    },
+  );
+
+  assert.deepEqual(removed.map(({ root }) => root), [
+    "/fixture/exact-state",
+    "/fixture/baseline-state",
+  ]);
+  for (const { options } of removed) {
+    assert.equal(options.recursive, true);
+    assert.equal(options.force, true);
+    assert.ok(options.maxRetries >= 10);
+    assert.ok(options.retryDelay >= 100);
+  }
+  assert.deepEqual(failures, [{
+    resource: "exact_candidate_state",
+    path: "/fixture/exact-state",
+    code: "ENOTEMPTY",
+    message: "directory not empty",
+  }]);
+  assert.equal(
+    benchmarkHarness.finalBenchmarkFailure(pipelineFailure, failures),
+    pipelineFailure,
+  );
+  assert.equal(opts.exactCandidateStateRoot, undefined);
+  assert.equal(opts.exactCandidateBaselineContainerRoot, undefined);
+  assert.equal(opts.exactCandidateBaselineStateRoot, undefined);
+  assert.ok(opts.exactCandidatePackageByArm instanceof Map);
+  assert.deepEqual(opts.exactCandidateLifecycle, {});
+});
+
+test("benchmark finalization closes and cleans every resource after independent failures", async () => {
+  const events = [];
+  const opts = {
+    exactCandidateStateRoot: "/fixture/exact-state",
+    exactCandidateBaselineContainerRoot: "/fixture/baseline-state",
+  };
+  const failures = await benchmarkHarness.finalizeBenchmarkResources(
+    opts,
+    {
+      close: async () => {
+        events.push("runs");
+        const error = new Error("runs close failed");
+        error.benchmarkSecondaryFailures = [{
+          resource: "ledger_handle",
+          code: "EIO",
+          message: "runs descriptor close failed",
+        }];
+        throw error;
+      },
+    },
+    {
+      close: async () => {
+        events.push("preparations");
+        throw new Error("preparations close failed");
+      },
+    },
+    {
+      remove: async (root) => {
+        events.push(root);
+        if (root.endsWith("exact-state")) throw new Error("exact cleanup failed");
+      },
+    },
+  );
+
+  assert.deepEqual(events, [
+    "runs",
+    "preparations",
+    "/fixture/exact-state",
+    "/fixture/baseline-state",
+  ]);
+  assert.deepEqual(failures.map(({ resource }) => resource), [
+    "runs_ledger",
+    "runs_ledger.ledger_handle",
+    "preparations_ledger",
+    "exact_candidate_state",
+  ]);
+  assert.equal(benchmarkHarness.finalBenchmarkFailure(null, failures).kind, "cleanup_failed");
+});
+
 test("exact Codex isolation keeps scalar namespace credentials out of cache roots and cwd", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-isolation-"));
   const sourceCodexHome = path.join(root, "source-codex-home");

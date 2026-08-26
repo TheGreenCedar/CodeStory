@@ -699,6 +699,31 @@ async function createExactCandidatePrivateStateRoot(prefix) {
   }
 }
 
+const OWNED_BENCHMARK_ROOT_REMOVE_OPTIONS = Object.freeze({
+  recursive: true,
+  force: true,
+  maxRetries: 12,
+  retryDelay: 250,
+});
+
+function benchmarkResourceFailure(resource, error, resourcePath = null) {
+  return {
+    resource,
+    ...(resourcePath ? { path: resourcePath } : {}),
+    code: typeof error?.code === "string" ? error.code : null,
+    message: error instanceof Error ? error.message : String(error),
+  };
+}
+
+async function removeOwnedBenchmarkRoot(remove, resource, root) {
+  try {
+    await remove(root, OWNED_BENCHMARK_ROOT_REMOVE_OPTIONS);
+    return null;
+  } catch (error) {
+    return benchmarkResourceFailure(resource, error, root);
+  }
+}
+
 async function initializeExactCandidateState(opts, dependencies = {}) {
   const createPrivateStateRoot = dependencies.createPrivateStateRoot
     ?? createExactCandidatePrivateStateRoot;
@@ -711,11 +736,22 @@ async function initializeExactCandidateState(opts, dependencies = {}) {
     opts.exactCandidateStateRoot = await createPrivateStateRoot(
       "codestory-agent-exact-candidate-",
     );
-    allocated.push(opts.exactCandidateStateRoot);
+    allocated.push({
+      resource: "exact_candidate_state",
+      root: opts.exactCandidateStateRoot,
+      clear: () => delete opts.exactCandidateStateRoot,
+    });
     opts.exactCandidateBaselineContainerRoot = await createPrivateStateRoot(
       "agent-exact-baseline-",
     );
-    allocated.push(opts.exactCandidateBaselineContainerRoot);
+    allocated.push({
+      resource: "exact_candidate_baseline_state",
+      root: opts.exactCandidateBaselineContainerRoot,
+      clear: () => {
+        delete opts.exactCandidateBaselineContainerRoot;
+        delete opts.exactCandidateBaselineStateRoot;
+      },
+    });
     opts.exactCandidateBaselineStateRoot = path.join(
       opts.exactCandidateBaselineContainerRoot,
       "private-state",
@@ -728,16 +764,71 @@ async function initializeExactCandidateState(opts, dependencies = {}) {
     opts.exactCandidatePackageByArm = authenticated.packages;
     opts.exactCandidateLifecycle = authenticated.lifecycle;
   } catch (error) {
-    for (const root of allocated.reverse()) {
-      await remove(root, { recursive: true, force: true });
+    const cleanupFailures = [];
+    for (const allocation of allocated.reverse()) {
+      const failure = await removeOwnedBenchmarkRoot(
+        remove,
+        allocation.resource,
+        allocation.root,
+      );
+      if (failure) {
+        cleanupFailures.push(failure);
+      } else {
+        allocation.clear();
+      }
     }
-    delete opts.exactCandidateStateRoot;
-    delete opts.exactCandidateBaselineContainerRoot;
-    delete opts.exactCandidateBaselineStateRoot;
+    if (cleanupFailures.length) {
+      opts.exactCandidateInitializationCleanupFailures = cleanupFailures;
+    } else {
+      delete opts.exactCandidateInitializationCleanupFailures;
+    }
     delete opts.exactCandidatePackageByArm;
     delete opts.exactCandidateLifecycle;
     throw error;
   }
+}
+
+async function finalizeBenchmarkResources(opts, ledger, preparationLedger, dependencies = {}) {
+  const remove = dependencies.remove ?? rm;
+  const failures = [...(opts.exactCandidateInitializationCleanupFailures ?? [])];
+  const attempt = async (resource, action, resourcePath = null) => {
+    try {
+      await action();
+    } catch (error) {
+      failures.push(benchmarkResourceFailure(resource, error, resourcePath));
+      for (const secondary of error?.benchmarkSecondaryFailures ?? []) {
+        failures.push({
+          ...secondary,
+          resource: `${resource}.${secondary.resource}`,
+        });
+      }
+    }
+  };
+
+  await attempt("runs_ledger", () => ledger.close());
+  await attempt("preparations_ledger", () => preparationLedger.close());
+  for (const [resource, root] of [
+    ["exact_candidate_state", opts.exactCandidateStateRoot],
+    ["exact_candidate_baseline_state", opts.exactCandidateBaselineContainerRoot],
+  ]) {
+    if (!root) continue;
+    const failure = await removeOwnedBenchmarkRoot(remove, resource, root);
+    if (failure) failures.push(failure);
+  }
+  delete opts.exactCandidateStateRoot;
+  delete opts.exactCandidateBaselineContainerRoot;
+  delete opts.exactCandidateBaselineStateRoot;
+  delete opts.exactCandidateInitializationCleanupFailures;
+  return failures;
+}
+
+function finalBenchmarkFailure(primaryFailure, finalizationFailures) {
+  if (primaryFailure) return primaryFailure;
+  if (!finalizationFailures.length) return null;
+  const reason = finalizationFailures
+    .map((failure) => `${failure.resource}: ${failure.message}`)
+    .join("; ");
+  return pipelineStageFailure("cleanup", null, new Error(reason));
 }
 
 const EXACT_BASELINE_ENV_ALLOWLIST = Object.freeze([
@@ -6493,9 +6584,10 @@ async function reanalysisPacketManifestQuality(result, runDir, task) {
   return packetManifestQualitySummary(packet, task);
 }
 
-async function createDurableJsonlAppender(filePath) {
+async function createDurableJsonlAppender(filePath, dependencies = {}) {
   await mkdir(path.dirname(filePath), { recursive: true });
-  const handle = await open(filePath, "a");
+  const openFile = dependencies.openFile ?? open;
+  const handle = await openFile(filePath, "a");
   let pending = Promise.resolve();
   return {
     append(row) {
@@ -6506,8 +6598,28 @@ async function createDurableJsonlAppender(filePath) {
       return pending;
     },
     async close() {
-      await pending;
-      await handle.close();
+      let pendingFailure = null;
+      let handleFailure = null;
+      try {
+        await pending;
+      } catch (error) {
+        pendingFailure = error;
+      }
+      try {
+        await handle.close();
+      } catch (error) {
+        handleFailure = error;
+      }
+      if (pendingFailure) {
+        if (handleFailure && pendingFailure instanceof Error) {
+          Object.defineProperty(pendingFailure, "benchmarkSecondaryFailures", {
+            configurable: true,
+            value: [benchmarkResourceFailure("ledger_handle", handleFailure)],
+          });
+        }
+        throw pendingFailure;
+      }
+      if (handleFailure) throw handleFailure;
     },
   };
 }
@@ -11738,6 +11850,8 @@ async function main() {
   opts.cachePreparationByRepo = new Map();
   let agentCodexIsolation = null;
   let pipeline = null;
+  let pipelineError = null;
+  let finalizationFailures = [];
   try {
     if (opts.exactCandidate) {
       await initializeExactCandidateState(opts);
@@ -11787,24 +11901,49 @@ async function main() {
         "utf8",
       ),
     });
+  } catch (error) {
+    pipelineError = error;
   } finally {
-    await ledger.close();
-    await preparationLedger.close();
-    if (opts.exactCandidateStateRoot) {
-      await rm(opts.exactCandidateStateRoot, { recursive: true, force: true });
+    finalizationFailures = await finalizeBenchmarkResources(
+      opts,
+      ledger,
+      preparationLedger,
+    );
+  }
+  if (finalizationFailures.length) {
+    try {
+      await writeFile(
+        path.join(outDir, "cleanup-failure.json"),
+        `${JSON.stringify({ failures: finalizationFailures }, null, 2)}\n`,
+        "utf8",
+      );
+    } catch (error) {
+      finalizationFailures.push({
+        resource: "cleanup_failure_receipt",
+        code: typeof error?.code === "string" ? error.code : null,
+        message: error instanceof Error ? error.message : String(error),
+      });
     }
-    if (opts.exactCandidateBaselineContainerRoot) {
-      await rm(opts.exactCandidateBaselineContainerRoot, { recursive: true, force: true });
-    }
+  }
+  if (pipelineError) {
+    throw pipelineError;
   }
 
   const {
     results,
-    firstFailure,
+    firstFailure: pipelineFirstFailure,
     comparativeFailure,
     comparativePublishable,
     cachePreparation,
   } = pipeline;
+  const firstFailure = finalBenchmarkFailure(pipelineFirstFailure, finalizationFailures);
+  if (!pipelineFirstFailure && firstFailure) {
+    await writeFile(
+      path.join(outDir, "first-failure.json"),
+      `${JSON.stringify(firstFailure, null, 2)}\n`,
+      "utf8",
+    );
+  }
 
   const canonicalResults = sortAgentResultsCanonical(results, tasks, opts.arms);
   if (cachePreparation.length) {
@@ -11878,6 +12017,7 @@ async function main() {
       ? exactCandidateAcceptance(canonicalResults, opts.exactCandidateLifecycle)
       : null,
     exact_candidate_lifecycle: opts.exactCandidate ? opts.exactCandidateLifecycle : null,
+    finalization_failures: finalizationFailures,
   };
   await writeFile(path.join(outDir, "summary.json"), `${JSON.stringify(summaryPayload, null, 2)}\n`, "utf8");
   await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts, costAccounting), "utf8");
@@ -11967,6 +12107,8 @@ export {
   resourceUriMatches,
   createDurableJsonlAppender,
   createExactCandidatePrivateStateRoot,
+  finalizeBenchmarkResources,
+  finalBenchmarkFailure,
   initializeExactCandidateState,
   benchmarkAgentScopeArgs,
   retrievalIndexCommandArgs,

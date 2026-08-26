@@ -4015,10 +4015,13 @@ fn c_cpp_sort_calls_by_span(calls: &mut Vec<IndexedCCppCall<'_>>) {
     }
 }
 
-fn expected_parser_fingerprint(path: &Path, language: &str) -> Option<String> {
+fn expected_parser_config(path: &Path, language: &str) -> Option<crate::LanguageConfig> {
     let extension = path.extension()?.to_str()?;
     let config = crate::get_language_for_ext(extension)?;
-    (config.language_name == language).then(|| crate::resolution_parser_fingerprint(&config))
+    if config.language_name == language {
+        return Some(config);
+    }
+    (language == "cpp" && crate::path_is_c_header(path)).then(crate::cpp_language_config)
 }
 
 pub(crate) fn cached_resolution_inputs_are_current(
@@ -13303,7 +13306,7 @@ pub fn rematerialize_proof_resolution_projection(
                     indexed_file.path.display()
                 )
             })?;
-        let expected_parser_fingerprint = expected_parser_fingerprint(
+        let expected_parser_config = expected_parser_config(
             &indexed_file.path,
             &indexed_file.language,
         )
@@ -13314,6 +13317,8 @@ pub fn rematerialize_proof_resolution_projection(
                 indexed_file.path.display()
             )
         })?;
+        let expected_parser_fingerprint =
+            crate::resolution_parser_fingerprint(&expected_parser_config);
         if record.file.parser_fingerprint != expected_parser_fingerprint
             || record
                 .calls
@@ -13393,27 +13398,12 @@ pub fn rematerialize_proof_resolution_projection(
                     indexed_file.path.display()
                 )
             })?;
-            let extension = indexed_file
-                .path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .ok_or_else(|| anyhow!("proof resolution semantic cache path has no extension"))?;
-            let config = crate::get_language_for_ext(extension).ok_or_else(|| {
-                anyhow!(
-                    "proof resolution semantic cache has no parser for {}",
-                    indexed_file.path.display()
-                )
-            })?;
-            if config.language_name != indexed_file.language {
-                return Err(anyhow!(
-                    "proof resolution semantic cache parser language drifted for {}",
-                    indexed_file.path.display()
-                ));
-            }
             let mut parser = Parser::new();
-            parser.set_language(&config.language).map_err(|error| {
-                anyhow!("proof resolution semantic cache parser failed: {error:?}")
-            })?;
+            parser
+                .set_language(&expected_parser_config.language)
+                .map_err(|error| {
+                    anyhow!("proof resolution semantic cache parser failed: {error:?}")
+                })?;
             let tree = parser
                 .parse(source, None)
                 .ok_or_else(|| anyhow!("proof resolution semantic cache source did not parse"))?;
