@@ -3458,6 +3458,40 @@ fn inferred_cpp_headers_rematerialize_with_the_indexed_parser_provenance() -> an
     assert!(fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty());
 
     let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "hostile.h",
+            concat!(
+                "namespace sample { inline void target() {} inline void caller() { target(); } }\n",
+                "template <typename T> struct getter : T {\n",
+                "  static auto get(const T& value) -> T { return {value.*(&getter::field)}; }\n",
+                "  int field;\n",
+                "};\n",
+            ),
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    assert_eq!(
+        facts.len(),
+        1,
+        "hostile parser leaf became a fact: {facts:#?}"
+    );
+    let fact = &facts[0];
+    assert_eq!(fact.callsite.raw_target, "target");
+    assert_eq!(fact.status, ProofResolutionStatus::IncompleteDomain);
+    assert!(
+        fact.callsite.start_byte < fact.callsite.end_byte_exclusive
+            && fact.edge_id.is_none()
+            && fact.target.is_none()
+            && fact.evidence_chain.is_empty()
+    );
+
+    let project = tempfile::tempdir()?;
     let header = project.path().join("compiled.h");
     fs::write(
         project.path().join("compile_commands.json"),
@@ -10299,7 +10333,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v26", "adapter", "language"]
+            ["stale", "schema-v27", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -10730,7 +10764,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             "{language} must invalidate parser inputs through its explicit adapter identity"
         );
     }
-    for (language, version) in [("c", "reference-v2"), ("cpp", "reference-v3")] {
+    for (language, version) in [("c", "reference-v2"), ("cpp", "reference-v4")] {
         assert_eq!(
             receipt
                 .adapter_roster

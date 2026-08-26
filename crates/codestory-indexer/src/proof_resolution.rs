@@ -212,14 +212,14 @@ const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const JAVA_ADAPTER_VERSION: &str = "reference-v2";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
 const C_ADAPTER_VERSION: &str = "reference-v2";
-const CPP_ADAPTER_VERSION: &str = "reference-v3";
+const CPP_ADAPTER_VERSION: &str = "reference-v4";
 const RUBY_ADAPTER_VERSION: &str = "reference-v3";
 const PHP_ADAPTER_VERSION: &str = "reference-v2";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v2";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
 const BASH_ADAPTER_VERSION: &str = "reference-v1";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 26;
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 27;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("bash", BASH_ADAPTER_VERSION),
     ("go", GO_ADAPTER_VERSION),
@@ -279,7 +279,7 @@ pub(crate) fn collect_call_resolution_inputs(
         };
     }
     let complete = !tree.root_node().has_error();
-    let lookup_input_complete = complete;
+    let mut lookup_input_complete = complete;
     let source_sha256 = source_content_hash(source.as_bytes());
     let javascript_index = is_javascript_language(language).then(|| {
         JavascriptResolutionIndex::build(tree, source, source_path, language, file_id, nodes)
@@ -355,6 +355,10 @@ pub(crate) fn collect_call_resolution_inputs(
     let mut calls = Vec::new();
     let mut emit_call =
         |callee: TsNode<'_>, form: CalleeForm, raw_target: String, callable_id: Option<usize>| {
+            if callee.start_byte() >= callee.end_byte() || raw_target.trim().is_empty() {
+                lookup_input_complete = false;
+                return;
+            }
             let mut callsite = ExactCallsite {
                 file_id: FileId(file_id.0),
                 source_sha256: source_sha256.clone(),
