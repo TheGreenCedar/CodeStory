@@ -729,11 +729,11 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         .finish()
         .context("finish coherent sidecar input snapshot")?;
     record_finalize_phase_timing("input fingerprint", fingerprint_started.elapsed());
-    let previous_manifest = storage
-        .get_retrieval_index_manifest(&project_id)
-        .context("load previous retrieval_index_manifest")?;
-    let mut previous_manifest_unavailable_reason =
-        previous_manifest.as_ref().and_then(|manifest| {
+    let previous_manifest = physical_predecessor_manifest(&storage, &project_id)?;
+    let mut previous_manifest_unavailable_reason = previous_manifest
+        .as_ref()
+        .filter(|manifest| manifest.project_id == project_id)
+        .and_then(|manifest| {
             manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
         });
     if previous_manifest_unavailable_reason.is_none()
@@ -1008,6 +1008,28 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     )
 }
 
+fn physical_predecessor_manifest(
+    storage: &Store,
+    project_id: &str,
+) -> Result<Option<RetrievalIndexManifest>> {
+    if let Some(manifest) = storage
+        .get_retrieval_index_manifest(project_id)
+        .context("load previous retrieval_index_manifest")?
+    {
+        return Ok(Some(manifest));
+    }
+    Ok(storage
+        .list_retrieval_index_manifests()
+        .context("load physical predecessor retrieval manifests")?
+        .into_iter()
+        .filter(|manifest| manifest_has_current_sidecar_contract(&manifest.project_id, manifest))
+        .max_by(|left, right| {
+            left.built_at_epoch_ms
+                .cmp(&right.built_at_epoch_ms)
+                .then_with(|| left.project_id.cmp(&right.project_id))
+        }))
+}
+
 fn with_finalize_progress<T>(
     progress: &mut impl FnMut(&'static str),
     phase: &'static str,
@@ -1056,7 +1078,11 @@ fn ensure_lexical_generation(
                 if let Some(work) = work {
                     record_finalize_component_work(
                         "lexical",
-                        "copy_on_write",
+                        if work.direct_reference {
+                            "reused"
+                        } else {
+                            "copy_on_write"
+                        },
                         Some(work.retained),
                         Some(work.inserted),
                         Some(work.removed),
@@ -1318,7 +1344,11 @@ fn ensure_semantic_index(
     {
         record_finalize_component_work(
             "vectors",
-            "copy_on_write",
+            if work.direct_reference {
+                "reused"
+            } else {
+                "copy_on_write"
+            },
             Some(work.retained),
             Some(work.inserted),
             Some(work.removed),
@@ -1681,7 +1711,9 @@ fn ensure_scip_artifacts(
         Ok(outcome) if outcome.revision.is_some() => {
             record_finalize_component_work(
                 "graph",
-                if outcome.cloned {
+                if outcome.direct_reference {
+                    "reused"
+                } else if outcome.cloned {
                     "copy_on_write"
                 } else {
                     "complete"
@@ -3890,6 +3922,36 @@ mod tests {
     }
 
     #[test]
+    fn dirty_identity_reuses_the_latest_valid_physical_predecessor() {
+        let storage_dir = TempDir::new().expect("storage dir");
+        let mut storage = Store::open(storage_dir.path().join("codestory.db"))
+            .expect("open retrieval manifest store");
+        let mut canonical =
+            crate::test_support::retrieval_manifest_fixture("repo-v2-clean", "canonical-input");
+        canonical.built_at_epoch_ms = 7;
+        storage
+            .upsert_retrieval_index_manifest(&canonical)
+            .expect("publish canonical manifest");
+
+        let selected = physical_predecessor_manifest(&storage, "workspace-dirty")
+            .expect("select physical predecessor")
+            .expect("canonical predecessor");
+        assert_eq!(selected, canonical);
+
+        let mut dirty =
+            crate::test_support::retrieval_manifest_fixture("workspace-dirty", "dirty-input");
+        dirty.built_at_epoch_ms = 1;
+        storage
+            .upsert_retrieval_index_manifest(&dirty)
+            .expect("publish dirty manifest");
+
+        let selected = physical_predecessor_manifest(&storage, "workspace-dirty")
+            .expect("select current identity manifest")
+            .expect("dirty predecessor");
+        assert_eq!(selected, dirty, "the exact identity must win over recency");
+    }
+
+    #[test]
     fn manifest_promotion_rejects_same_count_content_drift_and_preserves_current() {
         let _env = crate::test_support::env_lock();
         let project = TempDir::new().expect("project dir");
@@ -4538,6 +4600,8 @@ mod tests {
         );
         let vector_path =
             crate::embedded_vector::index_path(&runtime.layout, &previous.semantic_generation);
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make rollback vector database writable for corruption");
         std::fs::OpenOptions::new()
             .append(true)
             .open(&vector_path)

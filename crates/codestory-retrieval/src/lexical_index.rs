@@ -18,6 +18,8 @@ use std::sync::Arc;
 
 pub const LEXICAL_INDEX_VERSION: &str = "sqlite-fts5-v1";
 pub const LEXICAL_INDEX_FILE: &str = "lexical-index.sqlite3";
+const LEXICAL_COMPONENT_ENVELOPE_FILE: &str = "lexical-component-envelope.json";
+const LEXICAL_COMPONENT_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 #[cfg(any(test, feature = "test-support"))]
 const LEGACY_INDEX_FILE: &str = "lexical-index.jsonl";
 #[cfg(any(test, feature = "test-support"))]
@@ -146,6 +148,63 @@ struct LexicalShardMetadata {
     file_count: u32,
     coverage: LexicalCoverage,
     binding_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LexicalComponentEnvelope {
+    schema_version: u32,
+    generation: String,
+    sidecar_input_hash: String,
+    physical_project_id: String,
+    physical_input_hash: String,
+    lexical_hash: String,
+    file_count: u32,
+    coverage: LexicalCoverage,
+    binding_sha256: String,
+}
+
+impl LexicalComponentEnvelope {
+    fn new(generation: &str, sidecar_input_hash: &str, physical: &LexicalShardMetadata) -> Self {
+        let mut envelope = Self {
+            schema_version: LEXICAL_COMPONENT_ENVELOPE_SCHEMA_VERSION,
+            generation: generation.to_string(),
+            sidecar_input_hash: sidecar_input_hash.to_string(),
+            physical_project_id: physical.project_id.clone(),
+            physical_input_hash: physical.sidecar_input_hash.clone(),
+            lexical_hash: physical.lexical_hash.clone(),
+            file_count: physical.file_count,
+            coverage: physical.coverage.clone(),
+            binding_sha256: String::new(),
+        };
+        envelope.binding_sha256 = lexical_component_envelope_binding(&envelope);
+        envelope
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != LEXICAL_COMPONENT_ENVELOPE_SCHEMA_VERSION
+            || self.generation.trim().is_empty()
+            || self.sidecar_input_hash.trim().is_empty()
+            || self.physical_project_id.trim().is_empty()
+            || self.physical_input_hash.trim().is_empty()
+            || self.lexical_hash.len() != 64
+            || !self
+                .lexical_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            || self.binding_sha256 != lexical_component_envelope_binding(self)
+        {
+            bail!("lexical component envelope is invalid");
+        }
+        Ok(())
+    }
+
+    fn matches_physical(&self, physical: &LexicalShardMetadata) -> bool {
+        self.physical_project_id == physical.project_id
+            && self.physical_input_hash == physical.sidecar_input_hash
+            && self.lexical_hash == physical.lexical_hash
+            && self.file_count == physical.file_count
+            && self.coverage == physical.coverage
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -305,12 +364,14 @@ pub fn build_lexical_shard(
             Some((expected.file_count, expected.hash.as_str())),
         )?;
         publish_immutable_lexical_database(&temp_path, &index_path)?;
+        publish_lexical_component_envelope(
+            &shard_dir,
+            &LexicalComponentEnvelope::new(project_id, sidecar_input_hash, &staged),
+        )?;
         Ok(rebuilt)
     })();
     if result.is_err() {
-        if let Ok(metadata) = std::fs::metadata(&temp_path) {
-            let _ = make_file_owner_writable(&temp_path, &metadata.permissions());
-        }
+        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
         let _ = std::fs::remove_file(&temp_path);
     }
     let rebuilt = result?;
@@ -330,6 +391,7 @@ pub(crate) struct IncrementalLexicalWork {
     pub retained: u64,
     pub inserted: u64,
     pub removed: u64,
+    pub direct_reference: bool,
 }
 
 pub(crate) fn build_prepared_lexical_shard(
@@ -356,22 +418,40 @@ pub(crate) fn build_prepared_lexical_shard(
         std::fs::remove_file(&temp_path)?;
         let mut incremental = None;
         if let Some(previous_project_id) = previous_project_id {
-            let previous_path =
-                shard_dir_for(lexical_data_dir, previous_project_id).join(LEXICAL_INDEX_FILE);
-            let predecessor_is_current = verify_lexical_database_contents(&previous_path)
-                .is_ok_and(|metadata| metadata.lexical_hash.len() == 64);
-            if predecessor_is_current
-                && crate::copy_on_write::clone_file(&previous_path, &temp_path)?
-            {
-                let permissions = std::fs::metadata(&temp_path)?.permissions();
-                make_file_owner_writable(&temp_path, &permissions)?;
-                incremental = Some(reconcile_cloned_lexical_database(
-                    &temp_path,
-                    project_id,
-                    sidecar_input_hash,
-                    &expected.fingerprint,
-                    &expected.documents,
-                )?);
+            let previous_shard = shard_dir_for(lexical_data_dir, previous_project_id);
+            let previous_path = previous_shard.join(LEXICAL_INDEX_FILE);
+            let predecessor =
+                read_lexical_component_envelope(&previous_shard, Some(previous_project_id), None)
+                    .ok()
+                    .and_then(|envelope| {
+                        verify_lexical_database_contents(&previous_path)
+                            .ok()
+                            .filter(|metadata| envelope.matches_physical(metadata))
+                            .map(|metadata| (envelope, metadata))
+                    });
+            if let Some((_, predecessor_metadata)) = predecessor {
+                let same_component = predecessor_metadata.lexical_hash == expected.fingerprint.hash
+                    && predecessor_metadata.file_count == expected.fingerprint.file_count
+                    && predecessor_metadata.coverage == expected.fingerprint.coverage;
+                if same_component
+                    && crate::copy_on_write::reference_file(&previous_path, &temp_path)?
+                {
+                    incremental = Some(IncrementalLexicalWork {
+                        retained: expected.document_count(),
+                        inserted: 0,
+                        removed: 0,
+                        direct_reference: true,
+                    });
+                } else if crate::copy_on_write::clone_file(&previous_path, &temp_path)? {
+                    crate::copy_on_write::make_file_owner_writable(&temp_path)?;
+                    incremental = Some(reconcile_cloned_lexical_database(
+                        &temp_path,
+                        project_id,
+                        sidecar_input_hash,
+                        &expected.fingerprint,
+                        &expected.documents,
+                    )?);
+                }
             }
         }
         if incremental.is_none() {
@@ -392,75 +472,27 @@ pub(crate) fn build_prepared_lexical_shard(
             )?;
         }
         let staged = verify_lexical_database_contents(&temp_path)?;
-        match_lexical_shard_expectations(
-            &staged,
-            project_id,
-            sidecar_input_hash,
-            Some((
-                expected.fingerprint.file_count,
-                expected.fingerprint.hash.as_str(),
-            )),
-        )?;
+        if staged.lexical_hash != expected.fingerprint.hash
+            || staged.file_count != expected.fingerprint.file_count
+            || staged.coverage != expected.fingerprint.coverage
+        {
+            bail!("staged lexical component does not match current lexical input");
+        }
+        let envelope = LexicalComponentEnvelope::new(project_id, sidecar_input_hash, &staged);
         before_publish()?;
         publish_immutable_lexical_database(&temp_path, &index_path)?;
+        publish_lexical_component_envelope(&shard_dir, &envelope)?;
         Ok((expected.fingerprint.clone(), incremental))
     })();
     if result.is_err() {
-        if let Ok(metadata) = std::fs::metadata(&temp_path) {
-            let _ = make_file_owner_writable(&temp_path, &metadata.permissions());
-        }
+        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
         let _ = std::fs::remove_file(&temp_path);
     }
     result
 }
 
 fn publish_immutable_lexical_database(temp_path: &Path, index_path: &Path) -> Result<()> {
-    let previous_permissions = match std::fs::metadata(index_path) {
-        Ok(metadata) => {
-            let permissions = metadata.permissions();
-            if permissions.readonly() {
-                make_file_owner_writable(index_path, &permissions)?;
-            }
-            Some(permissions)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let result =
-        codestory_workspace::atomic_file::publish_existing_file_atomic(temp_path, index_path);
-    match result {
-        Ok(()) => {
-            let mut permissions = std::fs::metadata(index_path)?.permissions();
-            permissions.set_readonly(true);
-            std::fs::set_permissions(index_path, permissions).with_context(|| {
-                format!("protect immutable lexical shard {}", index_path.display())
-            })
-        }
-        Err(error) => {
-            if let Some(permissions) = previous_permissions {
-                let _ = std::fs::set_permissions(index_path, permissions);
-            }
-            Err(error)
-        }
-    }
-}
-
-#[allow(clippy::permissions_set_readonly_false)]
-fn make_file_owner_writable(path: &Path, permissions: &std::fs::Permissions) -> Result<()> {
-    let mut writable = permissions.clone();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        writable.set_mode(writable.mode() | 0o200);
-    }
-    #[cfg(windows)]
-    writable.set_readonly(false);
-    std::fs::set_permissions(path, writable).with_context(|| {
-        format!(
-            "prepare immutable lexical shard replacement {}",
-            path.display()
-        )
-    })
+    crate::copy_on_write::publish_immutable_file_atomic(temp_path, index_path)
 }
 
 pub fn shard_has_lexical_index(shard_dir: &Path, expected_sidecar_input_hash: &str) -> bool {
@@ -575,6 +607,7 @@ fn search_lexical_index_with_cancel_inner(
     connection.progress_handler(1_000, Some(move || progress_cancelled()))?;
     let _metadata = validate_open_database_metadata(
         &connection,
+        shard_dir,
         project_id,
         expected_sidecar_input_hash,
         None,
@@ -616,6 +649,7 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
     connection.progress_handler(1_000, Some(move || progress_cancelled()))?;
     let _metadata = validate_open_database_metadata(
         &connection,
+        shard_dir,
         project_id,
         expected_sidecar_input_hash,
         None,
@@ -1422,6 +1456,7 @@ fn reconcile_cloned_lexical_database(
         retained: u64::try_from(retained).unwrap_or(u64::MAX),
         inserted: u64::try_from(missing.len()).unwrap_or(u64::MAX),
         removed: u64::try_from(removed).unwrap_or(u64::MAX),
+        direct_reference: false,
     })
 }
 
@@ -1439,17 +1474,28 @@ fn validate_lexical_database(
     expected_sidecar_input_hash: &str,
     expected_lexical: Option<(u32, &str)>,
 ) -> Result<LexicalShardMetadata> {
+    let shard_dir = path
+        .parent()
+        .context("lexical shard has no generation directory")?;
     let metadata = LEXICAL_SHARD_RECEIPTS.validate_sealed(
         path.to_path_buf(),
         &sqlite_file_with_sidecars(path),
         || verify_lexical_database_contents(path),
     )?;
-    match_lexical_shard_expectations(
-        &metadata,
+    let envelope = resolve_lexical_component_envelope(
+        shard_dir,
         expected_project_id,
         expected_sidecar_input_hash,
-        expected_lexical,
+        &metadata,
     )?;
+    if !envelope.matches_physical(&metadata) {
+        bail!("lexical component envelope does not match its physical database");
+    }
+    if let Some((file_count, lexical_hash)) = expected_lexical
+        && (metadata.file_count != file_count || metadata.lexical_hash != lexical_hash)
+    {
+        bail!("lexical SQLite shard does not match current lexical input");
+    }
     Ok(metadata)
 }
 
@@ -1524,18 +1570,27 @@ fn verify_open_database_contents(
 
 fn validate_open_database_metadata(
     connection: &Connection,
+    shard_dir: &Path,
     expected_project_id: &str,
     expected_sidecar_input_hash: &str,
     expected_lexical: Option<(u32, &str)>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<LexicalShardMetadata> {
     let metadata = read_open_database_metadata(connection, cancelled)?;
-    match_lexical_shard_expectations(
-        &metadata,
+    let envelope = resolve_lexical_component_envelope(
+        shard_dir,
         expected_project_id,
         expected_sidecar_input_hash,
-        expected_lexical,
+        &metadata,
     )?;
+    if !envelope.matches_physical(&metadata) {
+        bail!("lexical component envelope does not match its physical database");
+    }
+    if let Some((file_count, lexical_hash)) = expected_lexical
+        && (metadata.file_count != file_count || metadata.lexical_hash != lexical_hash)
+    {
+        bail!("lexical SQLite shard does not match current lexical input");
+    }
     Ok(metadata)
 }
 
@@ -1614,6 +1669,7 @@ fn read_open_database_metadata(
 }
 
 /// The caller-dependent half: never receipted, always re-checked.
+#[cfg(any(test, feature = "test-support"))]
 fn match_lexical_shard_expectations(
     metadata: &LexicalShardMetadata,
     expected_project_id: &str,
@@ -1664,6 +1720,110 @@ fn metadata_binding(
     }
     hasher.update(file_count.to_le_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn lexical_component_envelope_binding(envelope: &LexicalComponentEnvelope) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-lexical-component-envelope-v1\0");
+    for value in [
+        envelope.generation.as_str(),
+        envelope.sidecar_input_hash.as_str(),
+        envelope.physical_project_id.as_str(),
+        envelope.physical_input_hash.as_str(),
+        envelope.lexical_hash.as_str(),
+    ] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(envelope.file_count.to_le_bytes());
+    let coverage = serde_json::to_vec(&envelope.coverage)
+        .expect("lexical coverage serialization is infallible");
+    hasher.update((coverage.len() as u64).to_le_bytes());
+    hasher.update(coverage);
+    format!("{:x}", hasher.finalize())
+}
+
+fn read_lexical_component_envelope(
+    shard_dir: &Path,
+    expected_generation: Option<&str>,
+    expected_sidecar_input_hash: Option<&str>,
+) -> Result<LexicalComponentEnvelope> {
+    let path = shard_dir.join(LEXICAL_COMPONENT_ENVELOPE_FILE);
+    let envelope: LexicalComponentEnvelope = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("read lexical component envelope {}", path.display()))?,
+    )
+    .with_context(|| format!("parse lexical component envelope {}", path.display()))?;
+    envelope.validate()?;
+    if expected_generation.is_some_and(|expected| envelope.generation != expected)
+        || expected_sidecar_input_hash
+            .is_some_and(|expected| envelope.sidecar_input_hash != expected)
+    {
+        bail!("lexical component envelope does not match the retrieval publication");
+    }
+    Ok(envelope)
+}
+
+fn resolve_lexical_component_envelope(
+    shard_dir: &Path,
+    expected_generation: &str,
+    expected_sidecar_input_hash: &str,
+    physical: &LexicalShardMetadata,
+) -> Result<LexicalComponentEnvelope> {
+    let path = shard_dir.join(LEXICAL_COMPONENT_ENVELOPE_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("lexical component envelope is not a regular file");
+            }
+            read_lexical_component_envelope(
+                shard_dir,
+                Some(expected_generation),
+                Some(expected_sidecar_input_hash),
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if physical.project_id != expected_generation
+                || physical.sidecar_input_hash != expected_sidecar_input_hash
+            {
+                bail!("legacy lexical component is not bound to the retrieval publication");
+            }
+            Ok(LexicalComponentEnvelope::new(
+                expected_generation,
+                expected_sidecar_input_hash,
+                physical,
+            ))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("inspect lexical component envelope {}", path.display())),
+    }
+}
+
+fn publish_lexical_component_envelope(
+    shard_dir: &Path,
+    envelope: &LexicalComponentEnvelope,
+) -> Result<()> {
+    envelope.validate()?;
+    let path = shard_dir.join(LEXICAL_COMPONENT_ENVELOPE_FILE);
+    let bytes = serde_json::to_vec_pretty(envelope)?;
+    codestory_workspace::atomic_file::write_file_atomic(
+        &path,
+        "lexical-component-envelope",
+        |file| {
+            use std::io::Write;
+            file.write_all(&bytes)?;
+            Ok(())
+        },
+        |temp_path| {
+            let observed: LexicalComponentEnvelope =
+                serde_json::from_slice(&std::fs::read(temp_path)?)?;
+            observed.validate()?;
+            if &observed != envelope {
+                bail!("staged lexical component envelope changed before publication");
+            }
+            Ok(())
+        },
+    )
 }
 
 fn scan_lexical_documents(
@@ -2504,6 +2664,50 @@ mod tests {
     }
 
     #[test]
+    fn publication_only_lexical_churn_directly_references_the_component_without_clone() {
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("data");
+        let prepared = prepared_documents(vec![
+            source_document("src/a.rs", "alpha"),
+            source_document("src/b.rs", "beta"),
+        ]);
+        build_prepared_lexical_shard(&data, "previous", &prepared, "input-v1", None, || Ok(()))
+            .expect("previous shard");
+        let previous_path = shard_dir_for(&data, "previous").join(LEXICAL_INDEX_FILE);
+
+        let (_, work) = crate::copy_on_write::with_clone_disabled(|| {
+            build_prepared_lexical_shard(
+                &data,
+                "current",
+                &prepared,
+                "input-v2",
+                Some("previous"),
+                || Ok(()),
+            )
+        })
+        .expect("publication-only lexical shard");
+        let work = work.expect("direct-reference work");
+        assert!(work.direct_reference);
+        assert_eq!(work.retained, 2);
+        assert_eq!(work.inserted, 0);
+        assert_eq!(work.removed, 0);
+
+        let current_path = shard_dir_for(&data, "current").join(LEXICAL_INDEX_FILE);
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&previous_path)
+                .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(&current_path).expect("current identity"),
+            "publication-only churn must retain the exact immutable physical component",
+        );
+        assert_eq!(
+            search_lexical_index(&shard_dir_for(&data, "current"), "input-v2", "alpha", 8)
+                .expect("search current envelope")
+                .len(),
+            1,
+        );
+    }
+
+    #[test]
     fn cancelled_lexical_reconciliation_leaves_no_candidate_shard() {
         let root = TempDir::new().expect("tempdir");
         let data = root.path().join("data");
@@ -2545,10 +2749,8 @@ mod tests {
         build_prepared_lexical_shard(&data, "previous", &previous, "input-v1", None, || Ok(()))
             .expect("previous shard");
         let previous_path = shard_dir_for(&data, "previous").join(LEXICAL_INDEX_FILE);
-        let permissions = std::fs::metadata(&previous_path)
-            .expect("previous metadata")
-            .permissions();
-        make_file_owner_writable(&previous_path, &permissions).expect("make predecessor writable");
+        crate::copy_on_write::make_file_owner_writable(&previous_path)
+            .expect("make predecessor writable");
         std::fs::write(&previous_path, b"not sqlite").expect("corrupt predecessor");
         let current = prepared_documents(vec![source_document("src/a.rs", "current needle")]);
 
