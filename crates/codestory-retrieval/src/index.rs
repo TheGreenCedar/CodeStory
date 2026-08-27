@@ -1,8 +1,8 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
 use crate::embedded_vector::{
-    AttestedSemanticPoint, EmbeddedVectorIndex, ExpectedVectorAnchor, SemanticPoint,
-    VectorEvidenceContract, VectorGenerationManifest, build_vector_producer_evidence,
-    producer_evidence_mismatches, vector_compatibility_identity,
+    AttestedSemanticPoint, CurrentVectorAnchor, EmbeddedVectorIndex, ExpectedVectorAnchor,
+    SemanticPoint, VectorEvidenceContract, VectorGenerationManifest,
+    build_vector_producer_evidence, producer_evidence_mismatches, vector_compatibility_identity,
     vector_producer_compatibility_identity,
 };
 use crate::generation::{
@@ -11,8 +11,9 @@ use crate::generation::{
 };
 use crate::health::probe_sidecar_health_for_runtime;
 use crate::lexical_index::{
-    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, build_lexical_shard,
-    finish_lexical_input_for_store, lexical_source_input,
+    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, PreparedLexicalInput,
+    build_prepared_lexical_shard, finish_lexical_input_for_store, lexical_source_input,
+    prepare_lexical_input_for_store,
 };
 use crate::retention::{
     FsGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
@@ -21,7 +22,7 @@ use crate::retention::{
     scan_retention_protection, write_retention_marker,
 };
 use crate::scip_index::{
-    SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
+    SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store_incremental,
     import_precise_semantic_scip_artifact,
 };
 use anyhow::{Context, Result, bail};
@@ -41,9 +42,34 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(not(feature = "test-support"), test))]
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+thread_local! {
+    static FINALIZE_PHASE_TIMINGS: std::cell::RefCell<Option<(Instant, Vec<FinalizePhaseTiming>)>> =
+        const { std::cell::RefCell::new(None) };
+    static FINALIZE_COMPONENT_WORK: std::cell::RefCell<Vec<FinalizeComponentWork>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizePhaseTiming {
+    pub phase: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeComponentWork {
+    pub component: String,
+    pub mode: String,
+    pub retained: Option<u64>,
+    pub inserted: Option<u64>,
+    pub removed: Option<u64>,
+    pub reordered: Option<u64>,
+    pub predecessor_bytes: Option<u64>,
+    pub output_bytes: Option<u64>,
+    pub attested_bytes: Option<u64>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FinalizeIndexOutcome {
@@ -53,6 +79,100 @@ pub struct FinalizeIndexOutcome {
     pub scip_stubbed: bool,
     pub generation_retention_plan: GenerationRetentionPlan,
     pub generation_retention: GenerationRetentionApplyReport,
+    #[serde(skip)]
+    pub phase_timings: Vec<FinalizePhaseTiming>,
+    #[serde(skip)]
+    pub component_work: Vec<FinalizeComponentWork>,
+}
+
+fn begin_finalize_phase_timings() {
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        *state.borrow_mut() = Some((Instant::now(), Vec::new()));
+    });
+    FINALIZE_COMPONENT_WORK.with(|state| state.borrow_mut().clear());
+}
+
+fn record_finalize_component_work(
+    component: &'static str,
+    mode: &'static str,
+    retained: Option<u64>,
+    inserted: Option<u64>,
+    removed: Option<u64>,
+) {
+    FINALIZE_COMPONENT_WORK.with(|state| {
+        state.borrow_mut().push(FinalizeComponentWork {
+            component: component.to_string(),
+            mode: mode.to_string(),
+            retained,
+            inserted,
+            removed,
+            reordered: None,
+            predecessor_bytes: None,
+            output_bytes: None,
+            attested_bytes: None,
+        });
+    });
+}
+
+fn record_finalize_component_details(
+    component: &'static str,
+    reordered: Option<u64>,
+    predecessor_bytes: Option<u64>,
+    output_bytes: Option<u64>,
+    attested_bytes: Option<u64>,
+) {
+    FINALIZE_COMPONENT_WORK.with(|state| {
+        if let Some(work) = state
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|work| work.component == component)
+        {
+            work.reordered = reordered;
+            work.predecessor_bytes = predecessor_bytes;
+            work.output_bytes = output_bytes;
+            work.attested_bytes = attested_bytes;
+        }
+    });
+}
+
+fn component_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+fn finish_finalize_component_work() -> Vec<FinalizeComponentWork> {
+    FINALIZE_COMPONENT_WORK.with(|state| std::mem::take(&mut *state.borrow_mut()))
+}
+
+fn record_finalize_phase_timing(phase: &'static str, elapsed: Duration) {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        if let Some((_, timings)) = state.borrow_mut().as_mut() {
+            timings.push(FinalizePhaseTiming {
+                phase: phase.to_string(),
+                elapsed_ms,
+            });
+        }
+    });
+    info!(phase, elapsed_ms, "retrieval finalization phase completed");
+}
+
+fn finish_finalize_phase_timings() -> Vec<FinalizePhaseTiming> {
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        let Some((started, mut timings)) = state.borrow_mut().take() else {
+            return Vec::new();
+        };
+        let total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let attributed = timings
+            .iter()
+            .map(|timing| timing.elapsed_ms)
+            .fold(0_u64, u64::saturating_add);
+        timings.push(FinalizePhaseTiming {
+            phase: "unattributed".to_string(),
+            elapsed_ms: total_ms.saturating_sub(attributed),
+        });
+        timings
+    })
 }
 
 /// Typed signal that source-derived retrieval input drifted during preparation.
@@ -542,6 +662,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     cancelled: &AtomicBool,
     mut progress: impl FnMut(&'static str),
 ) -> Result<FinalizeIndexOutcome> {
+    begin_finalize_phase_timings();
     ensure_retrieval_index_not_cancelled(cancelled, "preflight")?;
     let layout = runtime.layout.clone();
     let project_identity = runtime.validated_project_identity(project_root)?;
@@ -582,6 +703,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         u32::try_from(embedding_dim).context("negative embedding dimension")?,
     )?;
 
+    let fingerprint_started = Instant::now();
     let storage = Store::open(storage_path).context("open storage for retrieval sidecar input")?;
     let lexical_source =
         lexical_source_input(project_root, storage_path).context("hash lexical source input")?;
@@ -593,16 +715,20 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         dimension: embedding_dim,
         producer_compatibility_identity: &producer_compatibility_identity,
     };
-    let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
+    let prepared_lexical =
+        prepare_lexical_input_for_store(lexical_source, project_root, input_snapshot.storage())
+            .context("prepare pinned lexical input")?;
+    let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_fingerprint(
         input_snapshot.storage(),
         project_root,
         &project_id,
         &embedding_contract,
-        lexical_source,
+        prepared_lexical.fingerprint.clone(),
     )?;
     input_snapshot
         .finish()
         .context("finish coherent sidecar input snapshot")?;
+    record_finalize_phase_timing("input fingerprint", fingerprint_started.elapsed());
     let previous_manifest = storage
         .get_retrieval_index_manifest(&project_id)
         .context("load previous retrieval_index_manifest")?;
@@ -682,14 +808,61 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             };
             let semantic_point_count = semantic_ready_point_count(&previous_semantic);
             if unchanged_generation_is_reusable(&status, semantic_point_count) {
+                record_finalize_component_work(
+                    "lexical",
+                    "reused",
+                    Some(prepared_lexical.document_count()),
+                    Some(0),
+                    Some(0),
+                );
+                record_finalize_component_work(
+                    "vectors",
+                    "reused",
+                    semantic_point_count,
+                    Some(0),
+                    Some(0),
+                );
+                let vector_bytes = component_size(&crate::embedded_vector::index_path(
+                    &layout,
+                    &previous.semantic_generation,
+                ));
+                record_finalize_component_details(
+                    "vectors",
+                    None,
+                    None,
+                    vector_bytes,
+                    vector_bytes,
+                );
+                record_finalize_component_work("graph", "reused", None, Some(0), Some(0));
                 let mut manifest = previous.clone();
                 if let Some(generation) = manifest.sidecar_generation.clone() {
                     let scip_dir = layout.scip_project_dir(&generation);
+                    let lexical_bytes = component_size(
+                        &crate::lexical_index::shard_dir_for(&layout.lexical_data_dir, &generation)
+                            .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+                    );
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        None,
+                        lexical_bytes,
+                        lexical_bytes,
+                    );
+                    let graph_bytes =
+                        component_size(&crate::scip_index::scip_symbols_component_path(&scip_dir));
+                    record_finalize_component_details(
+                        "graph",
+                        Some(0),
+                        None,
+                        graph_bytes,
+                        graph_bytes,
+                    );
                     if update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?
                     {
                         return persist_finalized_manifest(
                             project_root,
                             storage_path,
+                            &prepared_lexical,
                             &retention_context,
                             cancelled,
                             &sidecar_input,
@@ -711,6 +884,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
                 return persist_finalized_manifest(
                     project_root,
                     storage_path,
+                    &prepared_lexical,
                     &retention_context,
                     cancelled,
                     &sidecar_input,
@@ -776,16 +950,14 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
 
     let lexical_outcome = with_finalize_progress(&mut progress, "lexical sidecar", || {
         ensure_lexical_generation(
-            project_root,
-            storage_path,
             &layout,
             &generation,
-            &LexicalInputFingerprint {
-                file_count: sidecar_input.lexical_file_count,
-                hash: sidecar_input.lexical_hash.clone(),
-                coverage: sidecar_input.lexical_coverage.clone(),
-            },
+            &prepared_lexical,
             &sidecar_input.hash,
+            previous_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sidecar_generation.as_deref()),
+            cancelled,
             lexical_ready,
         )
     })?;
@@ -806,6 +978,11 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             &scip_dir,
             &project_id,
             &generation,
+            previous_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sidecar_generation.as_deref())
+                .map(|previous| layout.scip_project_dir(previous)),
+            cancelled,
             scip_ready,
             &mut manifest,
         )
@@ -816,19 +993,19 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
     manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
 
-    with_finalize_progress(&mut progress, "manifest write", || {
-        persist_finalized_manifest(
-            project_root,
-            storage_path,
-            &retention_context,
-            cancelled,
-            &sidecar_input,
-            project_id,
-            manifest,
-            degraded_modes,
-            SidecarStubFlags { scip_stubbed },
-        )
-    })
+    progress("manifest write");
+    persist_finalized_manifest(
+        project_root,
+        storage_path,
+        &prepared_lexical,
+        &retention_context,
+        cancelled,
+        &sidecar_input,
+        project_id,
+        manifest,
+        degraded_modes,
+        SidecarStubFlags { scip_stubbed },
+    )
 }
 
 fn with_finalize_progress<T>(
@@ -837,32 +1014,103 @@ fn with_finalize_progress<T>(
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     progress(phase);
-    action()
+    let started = Instant::now();
+    let result = action();
+    record_finalize_phase_timing(phase, started.elapsed());
+    result
 }
 
 fn ensure_lexical_generation(
-    project_root: &Path,
-    storage_path: &Path,
     layout: &SidecarLayout,
     generation: &str,
-    expected: &LexicalInputFingerprint,
+    expected: &PreparedLexicalInput,
     sidecar_input_hash: &str,
+    previous_generation: Option<&str>,
+    cancelled: &AtomicBool,
     mut lexical_ready: bool,
 ) -> Result<LexicalGenerationOutcome> {
+    let output_path = crate::lexical_index::shard_dir_for(&layout.lexical_data_dir, generation)
+        .join(crate::lexical_index::LEXICAL_INDEX_FILE);
     if lexical_ready {
         info!(sidecar_generation = %generation, "SQLite lexical shard reused");
+        record_finalize_component_work(
+            "lexical",
+            "reused",
+            Some(expected.document_count()),
+            Some(0),
+            Some(0),
+        );
+        let output_bytes = component_size(&output_path);
+        record_finalize_component_details("lexical", None, None, output_bytes, output_bytes);
     } else {
-        match build_lexical_shard(
-            project_root,
-            Some(storage_path),
+        match build_prepared_lexical_shard(
             &layout.lexical_data_dir,
             generation,
             expected,
             sidecar_input_hash,
+            previous_generation,
+            || ensure_retrieval_index_not_cancelled(cancelled, "lexical shard publication"),
         ) {
-            Ok(_) => {
+            Ok((_, work)) => {
                 lexical_ready = true;
-                info!(sidecar_generation = %generation, "SQLite lexical shard built");
+                if let Some(work) = work {
+                    record_finalize_component_work(
+                        "lexical",
+                        "copy_on_write",
+                        Some(work.retained),
+                        Some(work.inserted),
+                        Some(work.removed),
+                    );
+                    let predecessor_bytes = previous_generation.and_then(|previous| {
+                        component_size(
+                            &crate::lexical_index::shard_dir_for(
+                                &layout.lexical_data_dir,
+                                previous,
+                            )
+                            .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+                        )
+                    });
+                    let output_bytes = component_size(&output_path);
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        predecessor_bytes,
+                        output_bytes,
+                        output_bytes,
+                    );
+                    info!(
+                        sidecar_generation = %generation,
+                        retained_document_count = work.retained,
+                        inserted_document_count = work.inserted,
+                        removed_document_count = work.removed,
+                        "SQLite lexical shard reconciled from immutable predecessor"
+                    );
+                } else {
+                    record_finalize_component_work(
+                        "lexical",
+                        "complete",
+                        Some(0),
+                        Some(expected.document_count()),
+                        Some(0),
+                    );
+                    let output_bytes = component_size(&output_path);
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        previous_generation.and_then(|previous| {
+                            component_size(
+                                &crate::lexical_index::shard_dir_for(
+                                    &layout.lexical_data_dir,
+                                    previous,
+                                )
+                                .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+                            )
+                        }),
+                        output_bytes,
+                        output_bytes,
+                    );
+                    info!(sidecar_generation = %generation, "SQLite lexical shard built");
+                }
             }
             Err(error) => {
                 bail!("mandatory SQLite lexical shard build failed for {generation}: {error}")
@@ -873,8 +1121,8 @@ fn ensure_lexical_generation(
         || !crate::lexical_index::shard_matches_lexical_input(
             &layout.lexical_data_dir,
             generation,
-            expected.file_count,
-            &expected.hash,
+            expected.fingerprint.file_count,
+            &expected.fingerprint.hash,
             sidecar_input_hash,
         )
     {
@@ -964,6 +1212,20 @@ fn ensure_semantic_index(
             document_hash: anchor.document_hash.clone(),
         })
         .collect::<Vec<_>>();
+    let current_vector_anchors = anchors
+        .iter()
+        .map(|anchor| CurrentVectorAnchor {
+            node_id: anchor.node_id.0.to_string(),
+            document_hash: anchor.document_hash.clone(),
+            display_name: anchor
+                .qualified_name
+                .clone()
+                .unwrap_or_else(|| anchor.display_name.clone()),
+            file_path: anchor.file_path.clone(),
+            file_role: Some(anchor.file_role),
+            dense_reason: Some(anchor.selection_reason.clone()),
+        })
+        .collect::<Vec<_>>();
 
     let reusable_point_count = semantic_ready_points.and_then(|point_count| {
         let validation = (|| {
@@ -1003,12 +1265,112 @@ fn ensure_semantic_index(
     });
 
     let point_count = if let Some(point_count) = reusable_point_count {
+        record_finalize_component_work("vectors", "reused", Some(point_count), Some(0), Some(0));
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        record_finalize_component_details("vectors", None, None, output_bytes, output_bytes);
         info!(
             project_id = %project_id,
             sidecar_generation = %semantic.generation,
             point_count,
             "attested vector generation reused"
         );
+        point_count
+    } else if let Some((attestation, work)) = retention
+        .previous_manifest
+        .filter(|previous| previous.semantic_generation != semantic.collection)
+        .map(|previous| {
+            with_finalize_progress(progress, "incremental embedded vectors", || {
+                EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                    crate::embedded_vector::AttestedVectorPublication {
+                        layout: semantic.layout,
+                        collection: semantic.collection,
+                        generation: semantic.generation,
+                        input_hash: semantic.input_hash,
+                        contract: &contract,
+                        expected_anchors: &expected_anchors,
+                    },
+                    &previous.semantic_generation,
+                    &evidence,
+                    &current_vector_anchors,
+                    || {
+                        ensure_retrieval_index_not_cancelled(
+                            cancelled,
+                            "incremental vector database publication",
+                        )
+                    },
+                    |missing, visit| {
+                        produce_missing_dense_anchors(
+                            &anchors,
+                            missing,
+                            retention.runtime,
+                            cancelled,
+                            visit,
+                        )
+                    },
+                )
+            })
+        })
+        .transpose()?
+        .flatten()
+    {
+        record_finalize_component_work(
+            "vectors",
+            "copy_on_write",
+            Some(work.retained),
+            Some(work.inserted),
+            Some(work.removed),
+        );
+        let predecessor_bytes = retention.previous_manifest.and_then(|previous| {
+            component_size(&crate::embedded_vector::index_path(
+                semantic.layout,
+                &previous.semantic_generation,
+            ))
+        });
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        record_finalize_component_details(
+            "vectors",
+            None,
+            predecessor_bytes,
+            output_bytes,
+            output_bytes,
+        );
+        info!(
+            project_id = %project_id,
+            sidecar_generation = %semantic.generation,
+            retained_point_count = work.retained,
+            embedded_point_count = work.inserted,
+            removed_point_count = work.removed,
+            "vector generation reconciled from immutable predecessor"
+        );
+        let point_count = attestation.point_count;
+        let generation_manifest =
+            VectorGenerationManifest::new(evidence.clone(), attestation.clone())?;
+        EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
+            semantic.layout,
+            semantic.collection,
+            &generation_manifest,
+            || {
+                ensure_retrieval_index_not_cancelled(
+                    cancelled,
+                    "producer-evidence manifest publication",
+                )
+            },
+        )?;
+        EmbeddedVectorIndex::validate_published_attestation(
+            semantic.layout,
+            semantic.collection,
+            semantic.generation,
+            semantic.input_hash,
+            &contract,
+            &expected_anchors,
+            &attestation,
+        )?;
         point_count
     } else {
         let reusable_vectors = retention
@@ -1146,6 +1508,24 @@ fn ensure_semantic_index(
             )
         })?;
         let point_count = attestation.point_count;
+        record_finalize_component_work("vectors", "complete", Some(0), Some(point_count), Some(0));
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        let predecessor_bytes = retention.previous_manifest.and_then(|previous| {
+            component_size(&crate::embedded_vector::index_path(
+                semantic.layout,
+                &previous.semantic_generation,
+            ))
+        });
+        record_finalize_component_details(
+            "vectors",
+            None,
+            predecessor_bytes,
+            output_bytes,
+            output_bytes,
+        );
         let generation_manifest = VectorGenerationManifest::new(evidence, attestation.clone())?;
         EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
             semantic.layout,
@@ -1187,6 +1567,73 @@ fn ensure_semantic_index(
     Ok(point_count)
 }
 
+fn produce_missing_dense_anchors(
+    anchors: &[DenseAnchorInput],
+    missing: &[ExpectedVectorAnchor],
+    runtime: &SidecarRuntimeConfig,
+    cancelled: &AtomicBool,
+    visit: &mut dyn FnMut(AttestedSemanticPoint) -> Result<()>,
+) -> Result<()> {
+    let anchors_by_node = anchors
+        .iter()
+        .map(|anchor| (anchor.node_id.0.to_string(), anchor))
+        .collect::<BTreeMap<_, _>>();
+    let missing_anchors = missing
+        .iter()
+        .map(|expected| {
+            let anchor = anchors_by_node
+                .get(&expected.node_id)
+                .with_context(|| format!("missing dense anchor {}", expected.node_id))?;
+            if anchor.document_hash != expected.document_hash {
+                bail!(
+                    "dense anchor document hash changed for {}",
+                    expected.node_id
+                );
+            }
+            Ok(*anchor)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let client = crate::embeddings::ProductEmbeddingClient::new(runtime);
+    for batch in missing_anchors.chunks(runtime.retrieval.llm_doc_embed_batch_size.max(1)) {
+        ensure_retrieval_index_not_cancelled(cancelled, "incremental embedding batch")?;
+        let texts = batch
+            .iter()
+            .map(|anchor| anchor.text.clone())
+            .collect::<Vec<_>>();
+        let vectors = client
+            .embed_documents_with_control(&texts, None, &|| cancelled.load(Ordering::Acquire))
+            .context("embed changed dense anchor batch")?;
+        ensure_retrieval_index_not_cancelled(
+            cancelled,
+            "persisting an incremental embedding batch",
+        )?;
+        if vectors.len() != batch.len() {
+            bail!(
+                "embedding engine returned {} vectors for {} changed anchors",
+                vectors.len(),
+                batch.len()
+            );
+        }
+        for (anchor, vector) in batch.iter().zip(vectors) {
+            visit(AttestedSemanticPoint {
+                point: SemanticPoint {
+                    display_name: anchor
+                        .qualified_name
+                        .clone()
+                        .unwrap_or_else(|| anchor.display_name.clone()),
+                    node_id: anchor.node_id.0.to_string(),
+                    file_path: anchor.file_path.clone(),
+                    file_role: Some(anchor.file_role),
+                    dense_reason: Some(anchor.selection_reason.clone()),
+                    vector: normalize_vector(vector)?,
+                },
+                document_hash: anchor.document_hash.clone(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
 fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
     if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
         bail!("embedding engine returned an empty or non-finite vector");
@@ -1205,25 +1652,72 @@ fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
     Ok(vector)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_scip_artifacts(
     storage_path: &Path,
     scip_dir: &Path,
     project_id: &str,
     generation: &str,
+    previous_project_dir: Option<PathBuf>,
+    cancelled: &AtomicBool,
     scip_ready: bool,
     manifest: &mut RetrievalIndexManifest,
 ) -> Result<()> {
     if scip_ready {
         info!(project_id = %project_id, sidecar_generation = %generation, "SCIP graph artifacts reused");
+        record_finalize_component_work("graph", "reused", None, Some(0), Some(0));
+        let output_bytes =
+            component_size(&crate::scip_index::scip_symbols_component_path(scip_dir));
+        record_finalize_component_details("graph", Some(0), None, output_bytes, output_bytes);
         return Ok(());
     }
-    match emit_scip_artifacts_from_store(storage_path, scip_dir, generation) {
-        Ok(Some(revision)) => {
+    match emit_scip_artifacts_from_store_incremental(
+        storage_path,
+        scip_dir,
+        generation,
+        previous_project_dir.as_deref(),
+        || ensure_retrieval_index_not_cancelled(cancelled, "SCIP component publication"),
+    ) {
+        Ok(outcome) if outcome.revision.is_some() => {
+            record_finalize_component_work(
+                "graph",
+                if outcome.cloned {
+                    "copy_on_write"
+                } else {
+                    "complete"
+                },
+                Some(outcome.retained_records),
+                Some(outcome.inserted_records),
+                Some(outcome.removed_records),
+            );
+            let predecessor_bytes = previous_project_dir.as_deref().and_then(|previous| {
+                component_size(&crate::scip_index::scip_symbols_component_path(previous))
+            });
+            let output_bytes =
+                component_size(&crate::scip_index::scip_symbols_component_path(scip_dir));
+            record_finalize_component_details(
+                "graph",
+                Some(outcome.reordered_records),
+                predecessor_bytes,
+                output_bytes,
+                output_bytes,
+            );
+            let revision = outcome.revision.expect("matched present revision");
             manifest.scip_revision = Some(revision.clone());
-            info!(project_id = %project_id, sidecar_generation = %generation, %revision, "SCIP graph artifacts emitted from store");
+            info!(
+                project_id = %project_id,
+                sidecar_generation = %generation,
+                %revision,
+                retained_record_count = outcome.retained_records,
+                inserted_record_count = outcome.inserted_records,
+                removed_record_count = outcome.removed_records,
+                reordered_record_count = outcome.reordered_records,
+                cloned = outcome.cloned,
+                "SCIP graph artifacts emitted from store"
+            );
             Ok(())
         }
-        Ok(None) => {
+        Ok(_) => {
             bail!("mandatory SCIP graph artifacts unavailable for {project_id}");
         }
         Err(error) => {
@@ -1388,6 +1882,7 @@ fn with_embedding_publication_residency<T>(
 fn persist_finalized_manifest(
     project_root: &Path,
     storage_path: &Path,
+    prepared_lexical: &PreparedLexicalInput,
     retention_context: &GenerationRetentionContext<'_>,
     cancelled: &AtomicBool,
     sidecar_input: &SidecarInputFingerprint,
@@ -1396,6 +1891,7 @@ fn persist_finalized_manifest(
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
 ) -> Result<FinalizeIndexOutcome> {
+    let manifest_started = Instant::now();
     manifest.built_at_epoch_ms = Utc::now().timestamp_millis();
     manifest.degraded_modes_json =
         serde_json::to_string(&degraded_modes).unwrap_or_else(|_| "[]".into());
@@ -1414,20 +1910,21 @@ fn persist_finalized_manifest(
                 sidecar_input,
                 &manifest,
                 |storage| {
-                    let lexical_source = lexical_source_input(project_root, storage_path)
-                        .context("rescan lexical source at publication fence")?;
+                    prepared_lexical
+                        .revalidate_source_seals(project_root, storage_path)
+                        .context("revalidate lexical source identities at publication fence")?;
                     let embedding_contract = SidecarEmbeddingContract {
                         backend: &embedding_backend,
                         dimension: embedding_dim,
                         producer_compatibility_identity: &retention_context
                             .producer_compatibility_identity,
                     };
-                    let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
+                    let current_input = compute_sidecar_input_fingerprint_with_lexical_fingerprint(
                         storage,
                         project_root,
                         &project_id,
                         &embedding_contract,
-                        lexical_source,
+                        prepared_lexical.fingerprint.clone(),
                     )?;
                     if let Some(reason) = manifest_unavailable_reason_for_runtime(
                         &project_id,
@@ -1544,6 +2041,7 @@ fn persist_finalized_manifest(
         "retrieval index manifest persisted"
     );
 
+    record_finalize_phase_timing("manifest write", manifest_started.elapsed());
     Ok(FinalizeIndexOutcome {
         project_id,
         manifest,
@@ -1551,6 +2049,8 @@ fn persist_finalized_manifest(
         scip_stubbed: stub_flags.scip_stubbed,
         generation_retention_plan,
         generation_retention,
+        phase_timings: finish_finalize_phase_timings(),
+        component_work: finish_finalize_component_work(),
     })
 }
 
@@ -2081,6 +2581,22 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
 ) -> Result<SidecarInputFingerprint> {
     let lexical = finish_lexical_input_for_store(lexical_source, project_root, storage)
         .context("hash lexical symbol input")?;
+    compute_sidecar_input_fingerprint_with_lexical_fingerprint(
+        storage,
+        project_root,
+        project_id,
+        embedding,
+        lexical,
+    )
+}
+
+fn compute_sidecar_input_fingerprint_with_lexical_fingerprint(
+    storage: &Store,
+    project_root: &Path,
+    project_id: &str,
+    embedding: &SidecarEmbeddingContract<'_>,
+    lexical: LexicalInputFingerprint,
+) -> Result<SidecarInputFingerprint> {
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
     hash_part(&mut hasher, "codestory-sidecar-input-v10");
@@ -2322,6 +2838,27 @@ mod tests {
         serde_json::to_writer(&mut file, value).expect("write private control");
         file.write_all(b"\n").expect("terminate private control");
         file.sync_all().expect("sync private control");
+    }
+
+    #[test]
+    fn finalization_receipt_includes_manifest_time_and_component_bytes() {
+        begin_finalize_phase_timings();
+        record_finalize_phase_timing("input fingerprint", Duration::from_millis(2));
+        record_finalize_component_work("vectors", "copy_on_write", Some(4), Some(1), Some(1));
+        record_finalize_component_details("vectors", None, Some(1_024), Some(1_100), Some(1_100));
+        record_finalize_phase_timing("manifest write", Duration::from_millis(3));
+
+        let timings = finish_finalize_phase_timings();
+        let work = finish_finalize_component_work();
+
+        assert!(
+            timings
+                .iter()
+                .any(|timing| timing.phase == "manifest write" && timing.elapsed_ms == 3)
+        );
+        assert_eq!(work[0].predecessor_bytes, Some(1_024));
+        assert_eq!(work[0].output_bytes, Some(1_100));
+        assert_eq!(work[0].attested_bytes, Some(1_100));
     }
 
     #[test]

@@ -513,9 +513,7 @@ fn has_real_scip_artifact(project_dir: &Path, generation: &str) -> bool {
     else {
         return false;
     };
-    project_dir
-        .join(crate::scip_index::SCIP_SYMBOLS_FILE)
-        .is_file()
+    crate::scip_index::scip_symbols_component_path(project_dir).is_file()
         // `index.scip` is parsed and bound to this generation's revision.
         // Existence alone let a corrupt-but-present marker publish clean.
         && crate::scip_index::parse_scip_index_marker(project_dir, &revision).is_ok()
