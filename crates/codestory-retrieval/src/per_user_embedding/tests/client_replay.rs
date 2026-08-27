@@ -61,7 +61,11 @@ fn pure_rpc_replays_once_and_only_once_on_typed_loss() {
 #[test]
 fn windows_pipe_closing_write_loss_is_classified_and_replayed_exactly_once() {
     let transport = BootstrapTestTransport::new(
-        [BootstrapConnectOutcome::WriteDisconnect],
+        [
+            BootstrapConnectOutcome::WriteDisconnect,
+            BootstrapConnectOutcome::NoOwner,
+            BootstrapConnectOutcome::Connected,
+        ],
         BootstrapConnectOutcome::Connected,
         Duration::from_millis(5),
     );
@@ -87,6 +91,8 @@ fn windows_pipe_closing_write_loss_is_classified_and_replayed_exactly_once() {
     assert_eq!(attempts[1].outcome, "completed");
     assert_eq!(attempts[1].loss_code, None);
     assert_ne!(attempts[0].request_id, attempts[1].request_id);
+    assert_eq!(transport.connect_count.load(Ordering::Acquire), 3);
+    assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -117,6 +123,38 @@ fn pure_rpc_replay_waits_for_a_fail_stopped_owner_to_release_authority() {
     assert_eq!(attempts[1].outcome, "completed");
     assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
     assert_eq!(transport.connect_count.load(Ordering::Acquire), 5);
+}
+
+#[test]
+fn pure_rpc_replay_rejects_the_same_dying_server_before_replacement() {
+    let transport = BootstrapTestTransport::new(
+        [
+            BootstrapConnectOutcome::Loss,
+            BootstrapConnectOutcome::Connected,
+            BootstrapConnectOutcome::NoOwner,
+            BootstrapConnectOutcome::OwnerUnresponsive,
+            BootstrapConnectOutcome::Connected,
+        ],
+        BootstrapConnectOutcome::Connected,
+        Duration::from_millis(6),
+    );
+    let client = PerUserEmbeddingClient {
+        transport: transport.clone(),
+        compatibility: EmbeddingCompatibility::current(true),
+        scope_id: "test-scope".into(),
+    };
+
+    let (_, attempts) = client
+        .embed_query_with_qualification_attempts("x")
+        .expect("the replay waits for a distinct server instance");
+
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].outcome, "server_loss");
+    assert_eq!(attempts[0].server_instance_id, "server-1");
+    assert_eq!(attempts[1].outcome, "completed");
+    assert_eq!(attempts[1].server_instance_id, "server-2");
+    assert_eq!(transport.connect_count.load(Ordering::Acquire), 5);
+    assert_eq!(transport.spawn_count.load(Ordering::Acquire), 1);
 }
 
 #[test]

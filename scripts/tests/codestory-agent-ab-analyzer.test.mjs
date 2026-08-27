@@ -803,6 +803,14 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
   assert.equal(accepted.expected_runs, 162);
   assert.equal(accepted.completed_runs, 162);
 
+  const failedCommandTelemetry = exactCandidateRows();
+  failedCommandTelemetry[0].transcript_analysis.interaction_turns.failed_tool_actions = 1;
+  assert.equal(
+    benchmarkHarness.exactCandidateAcceptance(failedCommandTelemetry, exactLifecycle()).pass,
+    true,
+    "a reconciled failed command is telemetry, not an incomplete run",
+  );
+
   const mutations = [
     ["complete rows", (rows) => rows.pop(), /162 complete runs/i],
     ["candidate quality vs published", (rows) => {
@@ -896,6 +904,10 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     ["empty category telemetry", (rows) => {
       rows[0].transcript_analysis.tool_categories = {};
     }, /tool or command categories/i],
+    ["failed action overcount", (rows) => {
+      rows[0].transcript_analysis.interaction_turns.failed_tool_actions =
+        rows[0].transcript_analysis.interaction_turns.tool_actions + 1;
+    }, /interaction accounting/i],
     ["factual count mismatch", (rows) => {
       rows[0].quality.material_factual_errors.found = 1;
     }, /error or proof-claim counts/i],
@@ -5284,6 +5296,20 @@ for ($i = 1; $i -le 2; $i++) { "{0}: {1}" -f $i, $lines[$i - 1] }'`;
   assert.equal(analysis.direct_source_reads_total, 1);
   assert.equal(analysis.ordinary_source_reads_after_first_packet, 1);
   assert.deepEqual(analysis.direct_file_reads_duplicated, {});
+});
+
+test("multiline numbered reads do not treat the next nl command as a sed path", () => {
+  const command = `/bin/zsh -lc "nl -ba src/first.java | sed -n '1,20p'
+nl -ba src/second.java | sed -n '30,40p'"`;
+  const events = [
+    commandEvent("read", "item.started", command),
+    commandEvent("read", "item.completed", command, "source"),
+  ];
+  const analysis = analyzeTranscript(events);
+  assert.deepEqual(
+    analysis.direct_source_reads.map((read) => read.path),
+    ["src/first.java", "src/second.java"],
+  );
 });
 
 test("counts modern Codex JSONL tool categories including web search", () => {

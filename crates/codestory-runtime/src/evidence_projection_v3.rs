@@ -27,6 +27,7 @@ use crate::{
             DiagnosticArtifactBuildV3, FinalizedContextProjectionInputV3,
             FinalizedSearchProjectionInputV3, build_context_projection_v3,
             build_diagnostic_artifact_v3, build_packet_projection_v3, build_search_projection_v3,
+            finalize_packet_projection_v3,
         },
     },
     services::PublicOperationService,
@@ -51,6 +52,17 @@ pub struct PacketEvidenceProductV3 {
     pub diagnostics: PacketDiagnosticProjectionV3,
 }
 
+/// Re-apply the packet budget against an adapter's complete serialized
+/// representation. This is required when the adapter adds publication
+/// metadata or mirrors the root after the runtime projection was built.
+pub fn finalize_packet_projection_v3_for_representation(
+    projection: &mut PacketProjectionV3Dto,
+    measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+) -> Result<usize, codestory_contracts::api::ApiError> {
+    finalize_packet_projection_v3(projection, measure)
+        .map_err(|error| projection_error("packet representation budget", error))
+}
+
 /// Convert the runtime's finalized packet execution into the only public v3
 /// packet vocabulary. The legacy disposition is consumed only to retain gaps
 /// and a bounded continuation; it is never serialized or treated as proof.
@@ -61,14 +73,7 @@ pub fn project_packet_v3(
     packet: &AgentPacketDto,
     mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
 ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
-    let mut evidence = packet
-        .support
-        .iter()
-        .filter_map(packet_evidence_row)
-        .take(codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3)
-        .collect::<Vec<_>>();
-    evidence.sort_by(|left, right| left.identity.cmp(&right.identity));
-    evidence.dedup_by(|left, right| left.identity == right.identity);
+    let evidence = packet_evidence_rows(&packet.support);
 
     let mut gaps = packet_gaps(packet);
     if packet_evidence_was_bounded(&packet.support, evidence.len()) {
@@ -129,6 +134,32 @@ pub fn project_packet_v3(
             request_digest: record.request_sha256().as_str().to_owned(),
         },
     })
+}
+
+fn packet_evidence_rows(support: &[SupportUnitDto]) -> Vec<PacketEvidenceRowV3Dto> {
+    let mut ranked_support = support
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| unit.kind != SupportUnitKindDto::CompleteQueryNegative)
+        .collect::<Vec<_>>();
+    ranked_support.sort_by_key(|(original_rank, unit)| {
+        (packet_evidence_context_priority(unit.kind), *original_rank)
+    });
+    ranked_support
+        .into_iter()
+        .enumerate()
+        .filter_map(|(projection_rank, (_, unit))| packet_evidence_row(projection_rank, unit))
+        .take(codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3)
+        .collect()
+}
+
+fn packet_evidence_context_priority(kind: SupportUnitKindDto) -> u8 {
+    match kind {
+        SupportUnitKindDto::SourceRange => 0,
+        SupportUnitKindDto::TypedGraphEdge => 1,
+        SupportUnitKindDto::SymbolLocation => 2,
+        SupportUnitKindDto::CompleteQueryNegative => 3,
+    }
 }
 
 /// Project a context answer without exposing answer confidence or claim state.
@@ -292,12 +323,15 @@ fn projection_envelope(
     Ok((identity, publication, retrieval))
 }
 
-fn packet_evidence_row(unit: &SupportUnitDto) -> Option<PacketEvidenceRowV3Dto> {
+fn packet_evidence_row(index: usize, unit: &SupportUnitDto) -> Option<PacketEvidenceRowV3Dto> {
     if unit.kind == SupportUnitKindDto::CompleteQueryNegative {
         return None;
     }
     Some(PacketEvidenceRowV3Dto {
-        identity: evidence_identity(&format!("packet-{}", unit.id)),
+        // The execution record canonicalizes by identity. A fixed-width rank
+        // prefix keeps that canonical order equal to the projection's useful-
+        // context order while avoiding repository-shaped identifiers.
+        identity: evidence_identity(&format!("packet-evidence-{index:03}")),
         kind: match unit.kind {
             SupportUnitKindDto::SymbolLocation | SupportUnitKindDto::SourceRange => {
                 EvidenceKindV3Dto::ExactSource
@@ -309,8 +343,56 @@ fn packet_evidence_row(unit: &SupportUnitDto) -> Option<PacketEvidenceRowV3Dto> 
         symbol_id: symbol_text(unit.symbol_id.as_deref()),
         start_line: unit.start_line,
         end_line: unit.end_line,
-        summary: Some(summary_text(&unit.summary)),
+        summary: packet_evidence_summary(unit),
     })
+}
+
+const PACKET_EVIDENCE_SUMMARY_MAX_BYTES_V3: usize = 512;
+
+fn packet_evidence_summary(unit: &SupportUnitDto) -> Option<SummaryTextV3> {
+    let text = match unit.kind {
+        SupportUnitKindDto::SourceRange => unit
+            .snippet
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(&unit.summary)
+            .to_owned(),
+        SupportUnitKindDto::TypedGraphEdge => {
+            match (
+                unit.from_symbol.as_deref(),
+                unit.edge_kind.as_deref(),
+                unit.to_symbol.as_deref(),
+            ) {
+                (Some(from), Some(edge), Some(to)) => format!("{from} -[{edge}]-> {to}"),
+                _ => unit.summary.clone(),
+            }
+        }
+        SupportUnitKindDto::SymbolLocation => packet_symbol_location_summary(unit),
+        SupportUnitKindDto::CompleteQueryNegative => return None,
+    };
+    Some(summary_text_bounded(
+        &text,
+        PACKET_EVIDENCE_SUMMARY_MAX_BYTES_V3,
+    ))
+}
+
+fn packet_symbol_location_summary(unit: &SupportUnitDto) -> String {
+    let Some((label, _)) = unit.summary.rsplit_once(" at ") else {
+        return unit.summary.clone();
+    };
+    let label_is_absolute = label.starts_with('/')
+        || label
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':');
+    if !label_is_absolute {
+        return unit.summary.clone();
+    }
+    match (unit.path.as_deref(), unit.start_line) {
+        (Some(path), Some(line)) => format!("{path}:{line}"),
+        (Some(path), None) => path.to_owned(),
+        _ => "project source location".to_owned(),
+    }
 }
 
 fn packet_evidence_was_bounded(support: &[SupportUnitDto], projected_len: usize) -> bool {
@@ -549,12 +631,8 @@ fn symbol_id_text(value: &str) -> SymbolIdTextV3 {
     .expect("truncated symbol id is bounded")
 }
 
-fn summary_text(value: &str) -> SummaryTextV3 {
-    SummaryTextV3::new(truncate_utf8(
-        value,
-        codestory_contracts::packet_projection_v3::SUMMARY_MAX_BYTES_V3,
-    ))
-    .expect("truncated summary is bounded")
+fn summary_text_bounded(value: &str, maximum: usize) -> SummaryTextV3 {
+    SummaryTextV3::new(truncate_utf8(value, maximum)).expect("truncated summary is bounded")
 }
 
 fn bounded_excerpt(value: &str) -> codestory_contracts::packet_projection_v3::ExcerptTextV3 {
@@ -628,6 +706,77 @@ mod tests {
             &[support_unit(SupportUnitKindDto::SourceRange)],
             0
         ));
+    }
+
+    #[test]
+    fn packet_evidence_keeps_ranked_source_and_relation_context_in_compact_identities() {
+        let mut source = support_unit(SupportUnitKindDto::SourceRange);
+        source.id = "repository-shaped-source-id".to_owned();
+        source.summary = "source range".to_owned();
+        source.snippet = Some(format!("fn useful() {{}}\n{}", "x".repeat(700)));
+        source.path = Some("src/useful.rs".to_owned());
+        let source = packet_evidence_row(7, &source).expect("source evidence");
+        assert_eq!(source.identity.evidence_id.as_str(), "packet-evidence-007");
+        assert_eq!(source.summary.as_ref().unwrap().as_str().len(), 512);
+        assert!(
+            source
+                .summary
+                .as_ref()
+                .unwrap()
+                .as_str()
+                .starts_with("fn useful()")
+        );
+
+        let mut relation = support_unit(SupportUnitKindDto::TypedGraphEdge);
+        relation.from_symbol = Some("caller".to_owned());
+        relation.edge_kind = Some("CALL".to_owned());
+        relation.to_symbol = Some("callee".to_owned());
+        let relation = packet_evidence_row(8, &relation).expect("relation evidence");
+        assert_eq!(
+            relation.summary.as_ref().unwrap().as_str(),
+            "caller -[CALL]-> callee"
+        );
+    }
+
+    #[test]
+    fn packet_evidence_prioritizes_source_excerpts_and_relations_before_locations() {
+        let mut location = support_unit(SupportUnitKindDto::SymbolLocation);
+        location.summary = "location".to_owned();
+        let mut relation = support_unit(SupportUnitKindDto::TypedGraphEdge);
+        relation.from_symbol = Some("caller".to_owned());
+        relation.edge_kind = Some("CALL".to_owned());
+        relation.to_symbol = Some("callee".to_owned());
+        let mut source = support_unit(SupportUnitKindDto::SourceRange);
+        source.snippet = Some("fn useful() {}".to_owned());
+
+        let rows = packet_evidence_rows(&[location, relation, source]);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.summary.as_ref().unwrap().as_str())
+                .collect::<Vec<_>>(),
+            ["fn useful() {}", "caller -[CALL]-> callee", "location"]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.identity.evidence_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "packet-evidence-000",
+                "packet-evidence-001",
+                "packet-evidence-002"
+            ]
+        );
+    }
+
+    #[test]
+    fn packet_symbol_locations_do_not_repeat_absolute_project_paths_in_summary_text() {
+        let mut location = support_unit(SupportUnitKindDto::SymbolLocation);
+        location.summary = "/private/project/src/lib.rs at src/lib.rs:7".to_owned();
+        location.path = Some("src/lib.rs".to_owned());
+        location.start_line = Some(7);
+
+        let row = packet_evidence_row(0, &location).expect("location evidence");
+        assert_eq!(row.summary.as_ref().unwrap().as_str(), "src/lib.rs:7");
     }
 
     #[test]

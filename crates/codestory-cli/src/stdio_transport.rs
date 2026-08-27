@@ -2371,112 +2371,54 @@ fn build_served_tool_result_v3(
     Ok(result)
 }
 
-fn packet_budget_exceeded_root_v3(
-    complete: &serde_json::Value,
-    required_complete_bytes: usize,
-) -> std::result::Result<serde_json::Value, ()> {
-    let required_complete_bytes = u64::try_from(required_complete_bytes).map_err(|_| ())?;
-    Ok(serde_json::json!({
-        "kind": "budget_exceeded",
-        "schema_version": complete.get("schema_version").cloned().ok_or(())?,
-        "identity": complete.get("identity").cloned().ok_or(())?,
-        "publication": complete.get("publication").cloned().ok_or(())?,
-        "status": "unavailable",
-        "retrieval": complete.get("retrieval").cloned().ok_or(())?,
-        "diagnostics": complete.get("diagnostics").cloned().ok_or(())?,
-        "gaps": [{
-            "identity": {"gap_id": "packet-output-budget-exceeded"},
-            "kind": "output_budget_exceeded",
-            "message": null
-        }],
-        "maximum_bytes": STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
-        "required_complete_bytes": required_complete_bytes
-    }))
-}
-
 fn finalize_packet_projection_for_stdio_v3(
     root: &mut serde_json::Value,
     revision: crate::stdio_v3::McpRevisionV3,
     publication_meta: Option<&serde_json::Value>,
 ) -> std::result::Result<usize, crate::stdio_v3::StdioV3InternalError> {
-    let measure = |candidate: &serde_json::Value| {
-        let result = build_served_tool_result_v3(revision, "packet", candidate, publication_meta)?;
-        v3_serialize_call_tool_result(&result)
-            .map(|bytes| bytes.len())
-            .map_err(|error| {
-                crate::stdio_v3::StdioV3InternalError::Serialization(error.to_string())
-            })
-    };
-    let mut required_complete_bytes = measure(root)?;
-    if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-        return Ok(required_complete_bytes);
+    let diagnostics_uri = root.pointer("/diagnostics/reference/uri").cloned();
+    let mut typed_root = root.clone();
+    if let Some(reference) = typed_root
+        .pointer_mut("/diagnostics/reference")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        reference.remove("uri");
     }
-    if root.get("kind").and_then(serde_json::Value::as_str) != Some("complete") {
-        return Err(crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
-            maximum_bytes: STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
-            actual_bytes: required_complete_bytes,
-        });
+    let mut projection = serde_json::from_value::<
+        codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
+    >(typed_root)
+    .map_err(|error| crate::stdio_v3::StdioV3InternalError::InvalidProjection(error.to_string()))?;
+    let measured = codestory_runtime::finalize_packet_projection_v3_for_representation(
+        &mut projection,
+        |candidate| {
+            let mut candidate = serde_json::to_value(candidate).map_err(|_| ())?;
+            if let (Some(uri), Some(reference)) = (
+                diagnostics_uri.as_ref(),
+                candidate
+                    .pointer_mut("/diagnostics/reference")
+                    .and_then(serde_json::Value::as_object_mut),
+            ) {
+                reference.insert("uri".to_owned(), uri.clone());
+            }
+            let result =
+                build_served_tool_result_v3(revision, "packet", &candidate, publication_meta)
+                    .map_err(|_| ())?;
+            v3_serialize_call_tool_result(&result)
+                .map(|bytes| bytes.len())
+                .map_err(|_| ())
+        },
+    )
+    .map_err(|error| crate::stdio_v3::StdioV3InternalError::InvalidProjection(error.message))?;
+    *root = serde_json::to_value(projection)
+        .map_err(|error| crate::stdio_v3::StdioV3InternalError::Serialization(error.to_string()))?;
+    if let (Some(uri), Some(reference)) = (
+        diagnostics_uri,
+        root.pointer_mut("/diagnostics/reference")
+            .and_then(serde_json::Value::as_object_mut),
+    ) {
+        reference.insert("uri".to_owned(), uri);
     }
-
-    let mut compact = root.clone();
-    let removed_summaries = compact
-        .get_mut("evidence")
-        .and_then(serde_json::Value::as_array_mut)
-        .is_some_and(|evidence| {
-            evidence
-                .iter_mut()
-                .filter_map(serde_json::Value::as_object_mut)
-                .fold(false, |removed, row| {
-                    let had_summary = row.get("summary").is_some_and(|value| !value.is_null());
-                    if had_summary {
-                        row.insert("summary".to_string(), serde_json::Value::Null);
-                    }
-                    had_summary || removed
-                })
-        });
-    if removed_summaries {
-        required_complete_bytes = measure(&compact)?;
-        if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-            *root = compact;
-            return Ok(required_complete_bytes);
-        }
-    }
-
-    let removed_gap_messages = compact
-        .get_mut("gaps")
-        .and_then(serde_json::Value::as_array_mut)
-        .is_some_and(|gaps| {
-            gaps.iter_mut()
-                .filter_map(serde_json::Value::as_object_mut)
-                .fold(false, |removed, row| {
-                    let had_message = row.get("message").is_some_and(|value| !value.is_null());
-                    if had_message {
-                        row.insert("message".to_string(), serde_json::Value::Null);
-                    }
-                    had_message || removed
-                })
-        });
-    if removed_gap_messages {
-        required_complete_bytes = measure(&compact)?;
-        if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-            *root = compact;
-            return Ok(required_complete_bytes);
-        }
-    }
-
-    *root = packet_budget_exceeded_root_v3(&compact, required_complete_bytes).map_err(|_| {
-        crate::stdio_v3::StdioV3InternalError::InvalidProjection(
-            "packet fallback could not retain its mandatory envelope".to_string(),
-        )
-    })?;
-    let fallback_bytes = measure(root)?;
-    if fallback_bytes > STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-        return Err(crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
-            maximum_bytes: STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
-            actual_bytes: fallback_bytes,
-        });
-    }
-    Ok(fallback_bytes)
+    Ok(measured)
 }
 
 fn stdio_jsonrpc_tool_execution_v3(
@@ -8115,13 +8057,17 @@ mod tests {
                     assert_eq!(root["kind"], "complete");
                     assert_eq!(emitted.len(), target);
                 } else {
-                    assert_eq!(root["kind"], "budget_exceeded");
-                    assert_eq!(root["status"], "unavailable");
-                    assert_eq!(root["required_complete_bytes"], target);
+                    assert_eq!(root["kind"], "complete");
                     assert_eq!(root["gaps"].as_array().unwrap().len(), 1);
                     assert_eq!(root["gaps"][0]["kind"], "output_budget_exceeded");
-                    assert!(root.get("evidence").is_none());
-                    assert!(root.get("continuation").is_none());
+                    assert_eq!(root["evidence"].as_array().unwrap().len(), 8);
+                    assert!(root["evidence"].as_array().unwrap().iter().any(|row| {
+                        row["path"].is_null()
+                            && row["symbol_id"].is_null()
+                            && row["start_line"].is_null()
+                            && row["end_line"].is_null()
+                            && row["summary"].is_null()
+                    }));
                 }
 
                 let diagnostic_bytes = vec![7; 123];
@@ -8163,14 +8109,7 @@ mod tests {
                         .expect("emitted JSON text mirror"),
                 )
                 .unwrap();
-                assert_eq!(
-                    actual_text["kind"],
-                    if target <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-                        json!("complete")
-                    } else {
-                        json!("budget_exceeded")
-                    }
-                );
+                assert_eq!(actual_text["kind"], json!("complete"));
                 assert!(
                     actual_text
                         .pointer("/diagnostics/reference/wall_expiry_epoch_ms")
@@ -8182,6 +8121,31 @@ mod tests {
                     assert_eq!(actual_result["structuredContent"], actual_text);
                 }
             }
+
+            let mut mandatory = root_with_padding(0, 0);
+            mandatory["evidence"] = json!((0..256)
+                .map(|index| json!({
+                    "identity":{"evidence_id":format!("mandatory-{index:03}-{}", "x".repeat(180))},
+                    "kind":"exact_source",
+                    "path":null,
+                    "symbol_id":null,
+                    "start_line":null,
+                    "end_line":null,
+                    "summary":null
+                }))
+                .collect::<Vec<_>>());
+            reserve_packet_diagnostics_capability_v3(&mut mandatory, 1_725_000_600_123).unwrap();
+            let measured = finalize_packet_projection_for_stdio_v3(
+                &mut mandatory,
+                *revision,
+                Some(&publication_meta),
+            )
+            .expect("typed mandatory-envelope fallback fits");
+            assert!(measured <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
+            assert_eq!(mandatory["kind"], "budget_exceeded");
+            assert_eq!(mandatory["status"], "unavailable");
+            assert!(mandatory.get("evidence").is_none());
+            assert!(mandatory.get("continuation").is_none());
         }
     }
 

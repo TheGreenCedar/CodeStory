@@ -509,7 +509,7 @@ impl PerUserEmbeddingClient {
         let control = EmbeddingCallControl::new(operation_timeout, outer_timeout, cancelled)?;
         let clock = self.transport.clock();
         let mut replayed = false;
-        let mut recover_after_inflight_loss = false;
+        let mut lost_server_instance_id = None;
         let mut attempts = Vec::with_capacity(2);
         loop {
             control.check()?;
@@ -517,7 +517,7 @@ impl PerUserEmbeddingClient {
                 EmbeddingConnectIntent::Activate,
                 true,
                 Some(&control),
-                recover_after_inflight_loss,
+                lost_server_instance_id.as_deref(),
             ) {
                 Ok(connection) => connection,
                 Err(error) if !replayed && is_server_loss(&error) => {
@@ -576,7 +576,7 @@ impl PerUserEmbeddingClient {
             attempts.push(EmbeddingQualificationAttemptResult {
                 ordinal: attempts.len() as u32 + 1,
                 request_id,
-                server_instance_id,
+                server_instance_id: server_instance_id.clone(),
                 submitted_ns,
                 completed_ns,
                 outcome: outcome.into(),
@@ -587,7 +587,7 @@ impl PerUserEmbeddingClient {
                 Err(error) if !replayed && is_server_loss(&error) => {
                     control.check()?;
                     replayed = true;
-                    recover_after_inflight_loss = true;
+                    lost_server_instance_id = Some(server_instance_id);
                 }
                 Err(error) => return Err(error),
             }
@@ -641,7 +641,7 @@ impl PerUserEmbeddingClient {
         intent: EmbeddingConnectIntent,
         may_spawn: bool,
     ) -> Result<ValidatedEmbeddingConnection> {
-        self.connect_with_control(intent, may_spawn, None, false)
+        self.connect_with_control(intent, may_spawn, None, None)
     }
 
     fn connect_with_control(
@@ -649,7 +649,7 @@ impl PerUserEmbeddingClient {
         intent: EmbeddingConnectIntent,
         may_spawn: bool,
         control: Option<&EmbeddingCallControl<'_>>,
-        recover_after_server_loss: bool,
+        lost_server_instance_id: Option<&str>,
     ) -> Result<ValidatedEmbeddingConnection> {
         let budgets = self.transport.budgets();
         let mut spawned_at_ns = None;
@@ -710,7 +710,9 @@ impl PerUserEmbeddingClient {
                         &executable,
                     ) {
                         Ok(snapshot) => snapshot,
-                        Err(error) if recover_after_server_loss && is_server_loss(&error) => {
+                        Err(error)
+                            if lost_server_instance_id.is_some() && is_server_loss(&error) =>
+                        {
                             let recovery_started_at_ns = owner_recovery_started_at_ns
                                 .get_or_insert_with(|| self.transport.clock().now_ns());
                             wait_for_convergence(*recovery_started_at_ns)?;
@@ -720,6 +722,14 @@ impl PerUserEmbeddingClient {
                     };
                     if let Some(control) = control {
                         control.check()?;
+                    }
+                    if lost_server_instance_id
+                        .is_some_and(|lost| snapshot.process.server_instance_id == lost)
+                    {
+                        let recovery_started_at_ns = owner_recovery_started_at_ns
+                            .get_or_insert_with(|| self.transport.clock().now_ns());
+                        wait_for_convergence(*recovery_started_at_ns)?;
+                        continue;
                     }
                     return Ok(ValidatedEmbeddingConnection { stream, snapshot });
                 }
@@ -756,7 +766,7 @@ impl PerUserEmbeddingClient {
                         wait_for_convergence(spawned_at_ns)?;
                         continue;
                     }
-                    if recover_after_server_loss {
+                    if lost_server_instance_id.is_some() {
                         let recovery_started_at_ns = owner_recovery_started_at_ns
                             .get_or_insert_with(|| self.transport.clock().now_ns());
                         wait_for_convergence(*recovery_started_at_ns)?;

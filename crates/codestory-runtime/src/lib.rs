@@ -108,7 +108,8 @@ pub use agent::{
     packet_step_trace_json, plan_packet,
 };
 pub use evidence_projection_v3::{
-    PacketDiagnosticProjectionV3, PacketEvidenceProductV3, project_context_v3, project_packet_v3,
+    PacketDiagnosticProjectionV3, PacketEvidenceProductV3,
+    finalize_packet_projection_v3_for_representation, project_context_v3, project_packet_v3,
     project_search_v3,
 };
 
