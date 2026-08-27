@@ -806,7 +806,8 @@ fn dense_policy_does_not_treat_the_generic_src_directory_as_a_public_api() {
 
 #[test]
 fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
-    for path in ["lib/application.js"] {
+    {
+        let path = "lib/application.js";
         assert!(semantic_file_is_package_callable_surface(Some(path)));
 
         let node = semantic_policy_node(11, NodeKind::FUNCTION, "handle", 1);
