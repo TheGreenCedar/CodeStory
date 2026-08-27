@@ -24,6 +24,7 @@ import {
   ROUTING_SCENARIOS,
   STATIC_PARITY_HOSTS,
   canonicalRequestContractDigest,
+  materializeRoutingRequests,
   parseInstalledTranscript,
   validateProofCallInputAgainstCatalog,
   validateRoutingRequestCorpus,
@@ -968,6 +969,18 @@ test("checked-in request corpus covers the routing matrix exactly once", () => {
   assert.equal(Object.isFrozen(ROUTING_REQUEST_CORPUS), true);
   for (const entry of ROUTING_REQUEST_CORPUS.scenarios) {
     assert.doesNotMatch(entry.prompt, /\b(search|context|packet|prove_call_path)\b/iu, entry.id);
+  }
+});
+
+test("installed-host prompts close the final claim vocabulary and direct-read identity contract", () => {
+  const prompts = materializeRoutingRequests(repoRoot).map(({ request }) => request.text);
+  assert.equal(prompts.length, SCENARIO_IDS.length);
+  for (const prompt of prompts) {
+    assert.match(prompt, /authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none/u);
+    assert.match(prompt, /outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused/u);
+    assert.match(prompt, /For a direct source read, record evidence identity source:<project-relative-path>/u);
+    assert.match(prompt, /runtime_execution_claim and absence_claim must each be false/u);
+    assert.match(prompt, /material_omissions contains only unresolved material requested by the user/u);
   }
 });
 
