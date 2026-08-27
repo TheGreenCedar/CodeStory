@@ -209,6 +209,34 @@ function passingCacheProvenance(schemaVersion = 2) {
     },
   };
   if (schemaVersion === 3) {
+    provenance.cache_preparation.cold_retrieval_work_evidence = {
+      core_phase_timings: { total_ms: 80 },
+      retrieval_phase_timings: [
+        { phase: "input fingerprint", elapsed_ms: 1 },
+        { phase: "lexical sidecar", elapsed_ms: 20 },
+        { phase: "embedded vectors", elapsed_ms: 40 },
+        { phase: "graph artifact", elapsed_ms: 19 },
+      ],
+      retrieval_component_work: [
+        { component: "lexical", mode: "complete", retained: 0, inserted: 100, removed: 0 },
+        { component: "vectors", mode: "complete", retained: 0, inserted: 80, removed: 0 },
+        { component: "graph", mode: "complete", retained: 0, inserted: 120, removed: 0 },
+      ],
+    };
+    provenance.cache_preparation.incremental_retrieval_work_evidence = {
+      core_phase_timings: { total_ms: 12 },
+      retrieval_phase_timings: [
+        { phase: "input fingerprint", elapsed_ms: 1 },
+        { phase: "lexical sidecar", elapsed_ms: 4 },
+        { phase: "embedded vectors", elapsed_ms: 4 },
+        { phase: "graph artifact", elapsed_ms: 3 },
+      ],
+      retrieval_component_work: [
+        { component: "lexical", mode: "copy_on_write", retained: 99, inserted: 1, removed: 1 },
+        { component: "vectors", mode: "reused", retained: 80, inserted: 0, removed: 0 },
+        { component: "graph", mode: "copy_on_write", retained: 119, inserted: 1, removed: 1 },
+      ],
+    };
     provenance.packet_embedding_execution = {
       source: "packet.v3_public_projection",
       schema_version: 3,
@@ -935,6 +963,25 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     ["candidate source mutation digest", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_source_mutation.original_sha256 = null;
     }, /missing verified source mutation/i],
+    ["candidate cold work evidence", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.cold_retrieval_work_evidence = null;
+    }, /missing candidate cold retrieval work evidence/i],
+    ["candidate incremental work evidence", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence = null;
+    }, /missing candidate incremental retrieval work evidence/i],
+    ["candidate incremental complete rebuild", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence.retrieval_component_work[1].mode = "complete";
+    }, /candidate incremental retrieval rebuilt vectors completely/i],
+    ["candidate incremental duplicate component", (rows) => {
+      const evidence = rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence;
+      evidence.retrieval_component_work[2].component = "vectors";
+    }, /candidate incremental retrieval component roster/i],
+    ["candidate incremental invalid component work", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence.retrieval_component_work[0].retained = -1;
+    }, /candidate incremental retrieval component work/i],
+    ["candidate incremental missing phase timing", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence.retrieval_phase_timings = [];
+    }, /candidate incremental retrieval phase timings/i],
     ["cache timing mismatch", (rows) => {
       rows.find((row) => row.arm === "published_0_17_4").codestory_cache_provenance.cache_preparation.incremental_wall_ms = 19;
     }, /cache lifecycle timings do not reconcile/i],
@@ -1002,6 +1049,25 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     assert.equal(result.pass, false, `${label}: ${JSON.stringify(result)}`);
     assert.match(result.reasons.join("\n"), expected, label);
   }
+});
+
+test("retrieval index work evidence preserves the measured trust-boundary fields", () => {
+  const evidence = benchmarkHarness.retrievalIndexWorkEvidence(JSON.stringify({
+    unrelated: "discarded",
+    core_phase_timings: { publish_ms: 7 },
+    retrieval_phase_timings: [{ phase: "graph artifact", elapsed_ms: 3 }],
+    retrieval_component_work: [
+      { component: "graph", mode: "copy_on_write", retained: 9, inserted: 1, removed: 1 },
+    ],
+  }, null, 2));
+  assert.deepEqual(evidence, {
+    core_phase_timings: { publish_ms: 7 },
+    retrieval_phase_timings: [{ phase: "graph artifact", elapsed_ms: 3 }],
+    retrieval_component_work: [
+      { component: "graph", mode: "copy_on_write", retained: 9, inserted: 1, removed: 1 },
+    ],
+  });
+  assert.equal(benchmarkHarness.retrievalIndexWorkEvidence("not json"), null);
 });
 
 test("exact lifecycle alternates preparation and restores the selected source bytes", async () => {

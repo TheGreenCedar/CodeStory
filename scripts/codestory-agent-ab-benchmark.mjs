@@ -6305,6 +6305,74 @@ function cachePreparationAction(snapshot) {
   return cacheNeedsPreparation(snapshot) ? "retrieval-index-auto" : "already-ready";
 }
 
+function retrievalIndexWorkEvidence(stdout) {
+  let payload;
+  try {
+    payload = JSON.parse(String(stdout ?? ""));
+  } catch {
+    return null;
+  }
+  const evidence = {
+    core_phase_timings: payload?.core_phase_timings ?? null,
+    retrieval_phase_timings: payload?.retrieval_phase_timings ?? null,
+    retrieval_component_work: payload?.retrieval_component_work ?? null,
+  };
+  return Object.values(evidence).some((value) => value != null) ? evidence : null;
+}
+
+function retrievalWorkEvidenceShapeBlockers(evidence, label) {
+  if (!evidence || typeof evidence !== "object") {
+    return [`missing ${label} retrieval work evidence`];
+  }
+  const blockers = [];
+  const coreTimings = evidence.core_phase_timings;
+  if (!coreTimings || typeof coreTimings !== "object" || Array.isArray(coreTimings) || Object.keys(coreTimings).length === 0) {
+    blockers.push(`${label} core phase timings are missing`);
+  }
+  const phaseTimings = evidence.retrieval_phase_timings;
+  if (
+    !Array.isArray(phaseTimings) || phaseTimings.length === 0 ||
+    phaseTimings.some((phase) =>
+      typeof phase?.phase !== "string" || !phase.phase ||
+      typeof phase?.elapsed_ms !== "number" || !Number.isFinite(phase.elapsed_ms) || phase.elapsed_ms < 0
+    )
+  ) {
+    blockers.push(`${label} retrieval phase timings are missing or invalid`);
+  }
+  const componentWork = evidence.retrieval_component_work;
+  const expectedComponents = ["graph", "lexical", "vectors"];
+  const observedComponents = Array.isArray(componentWork)
+    ? componentWork.map((entry) => entry?.component).sort()
+    : [];
+  if (
+    observedComponents.length !== expectedComponents.length ||
+    observedComponents.some((component, index) => component !== expectedComponents[index])
+  ) {
+    blockers.push(`${label} retrieval component roster must contain graph, lexical, and vectors exactly once`);
+  } else if (componentWork.some((entry) =>
+    !["complete", "copy_on_write", "reused"].includes(entry.mode) ||
+    ![entry.retained, entry.inserted, entry.removed].every((value) =>
+      typeof value === "number" && Number.isInteger(value) && value >= 0
+    )
+  )) {
+    blockers.push(`${label} retrieval component work is missing or invalid`);
+  }
+  return blockers;
+}
+
+function candidateIncrementalRetrievalWorkBlockers(evidence) {
+  const label = "candidate incremental";
+  const blockers = retrievalWorkEvidenceShapeBlockers(evidence, label);
+  if (blockers.length === 0) {
+    for (const entry of evidence.retrieval_component_work) {
+      if (entry.mode === "complete") {
+        blockers.push(`${label} retrieval rebuilt ${entry.component} completely`);
+      }
+    }
+  }
+  return blockers;
+}
+
 function compactCachePreparation(preparation) {
   if (!preparation) {
     return null;
@@ -6324,6 +6392,8 @@ function compactCachePreparation(preparation) {
     incremental_exit_code: preparation.incremental_exit_code ?? null,
     incremental_wall_ms: preparation.incremental_wall_ms ?? null,
     incremental_source_mutation: preparation.incremental_source_mutation ?? null,
+    cold_retrieval_work_evidence: preparation.cold_retrieval_work_evidence ?? null,
+    incremental_retrieval_work_evidence: preparation.incremental_retrieval_work_evidence ?? null,
     coherence_refresh_status: preparation.coherence_refresh_status ?? null,
     coherence_refresh_exit_code: preparation.coherence_refresh_exit_code ?? null,
     coherence_semantic_generation: preparation.coherence_semantic_generation ?? null,
@@ -6645,6 +6715,7 @@ async function measureExactIncrementalRefresh(opts, task, arm, row, childEnv) {
   row.incremental_wall_ms = incrementalWallMs;
   row.incremental_status = incremental?.status ?? "error";
   row.incremental_exit_code = incremental?.exitCode ?? null;
+  row.incremental_retrieval_work_evidence = retrievalIndexWorkEvidence(incremental?.stdout);
   row.incremental_source_mutation = {
     path: normalizePathLike(path.relative(projectRoot, sourcePath)),
     original_sha256: mutation.original_sha256,
@@ -6654,6 +6725,16 @@ async function measureExactIncrementalRefresh(opts, task, arm, row, childEnv) {
   };
   if (incremental?.status !== "pass") {
     throw new Error(`incremental timing failed for ${row.repo}/${arm}: ${trimTail(incremental?.stderr || incremental?.stdout)}`);
+  }
+  if (arm === "candidate_0_18") {
+    const blockers = candidateIncrementalRetrievalWorkBlockers(
+      row.incremental_retrieval_work_evidence,
+    );
+    if (blockers.length) {
+      throw new Error(
+        `candidate incremental retrieval work is not admissible for ${row.repo}: ${blockers.join("; ")}`,
+      );
+    }
   }
 }
 
@@ -6845,6 +6926,7 @@ async function prepareCodeStoryCaches(opts, tasks) {
       index_stderr_tail: null,
       retrieval_status: null,
       retrieval_engine_diagnostics: null,
+      cold_retrieval_work_evidence: null,
       retrieval_index_stdout_tail: null,
       retrieval_index_stderr_tail: null,
       after: null,
@@ -6879,6 +6961,9 @@ async function prepareCodeStoryCaches(opts, tasks) {
           Math.round((performance.now() - retrievalStarted) * 1000) / 1000;
         preparation.retrieval_index_stdout_tail = trimTail(retrievalIndex.stdout);
         preparation.retrieval_index_stderr_tail = trimTail(retrievalIndex.stderr);
+        preparation.cold_retrieval_work_evidence = retrievalIndexWorkEvidence(
+          retrievalIndex.stdout,
+        );
         if (retrievalIndex.status !== "pass") {
           throw new Error(
             `mandatory retrieval index failed for ${repo}: ${trimTail(retrievalIndex.stderr || retrievalIndex.stdout)}`,
@@ -11123,6 +11208,15 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       ) {
         reasons.push(`cache lifecycle timings do not reconcile for ${row.repo}/${row.arm}`);
       }
+      if (row.arm === "candidate_0_18") {
+        reasons.push(...retrievalWorkEvidenceShapeBlockers(
+          cachePreparation?.cold_retrieval_work_evidence,
+          "candidate cold",
+        ));
+        reasons.push(...candidateIncrementalRetrievalWorkBlockers(
+          cachePreparation?.incremental_retrieval_work_evidence,
+        ));
+      }
       if (
         cachePreparation?.coherence_refresh_status !== "pass" ||
         !cachePreparation?.coherence_semantic_generation ||
@@ -12954,6 +13048,7 @@ export {
   codeStoryArmInstruction,
   cachePreparationCanaryBlockers,
   cachePreparationIdentityBlockers,
+  candidateIncrementalRetrievalWorkBlockers,
   mergeRetrievalStatusWithEngineDiagnostics,
   projectResourceUri,
   retrievalEngineDiagnosticsSnapshotFromOutput,
@@ -12965,6 +13060,7 @@ export {
   initializeExactCandidateState,
   benchmarkAgentScopeArgs,
   retrievalIndexCommandArgs,
+  retrievalIndexWorkEvidence,
   retrievalStatusSnapshotFromOutput,
   retrievalStatusCommandArgs,
   packetComposition,
