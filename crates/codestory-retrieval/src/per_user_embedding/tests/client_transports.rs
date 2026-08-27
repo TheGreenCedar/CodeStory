@@ -143,6 +143,8 @@ pub(super) enum BootstrapConnectOutcome {
     Loss,
     WriteDisconnect,
     HelloLoss,
+    HelloCapacity,
+    HelloHandlerCapacity,
     NoOwner,
     OwnerUnresponsive,
 }
@@ -314,6 +316,15 @@ impl BootstrapTestTransport {
         fallback: BootstrapConnectOutcome,
         spawn: Duration,
     ) -> Arc<Self> {
+        Self::with_connect_budget(outcomes, fallback, Duration::from_millis(1), spawn)
+    }
+
+    pub(super) fn with_connect_budget(
+        outcomes: impl IntoIterator<Item = BootstrapConnectOutcome>,
+        fallback: BootstrapConnectOutcome,
+        connect: Duration,
+        spawn: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             clock: TestClock::new(),
             connect_count: AtomicUsize::new(0),
@@ -321,7 +332,7 @@ impl BootstrapTestTransport {
             outcomes: Mutex::new(outcomes.into_iter().collect()),
             fallback,
             budgets: EmbeddingClientBudgets {
-                connect: Duration::from_millis(1),
+                connect,
                 spawn,
                 retry_after: Duration::from_millis(1),
                 query_request: Duration::from_secs(1),
@@ -366,6 +377,19 @@ impl EmbeddingClientTransport for BootstrapTestTransport {
                 ScriptStream::new(ScriptOutcome::HelloLoss, self.compatibility.clone())
                     .with_server_instance(format!("server-{server_generation}")),
             )),
+            BootstrapConnectOutcome::HelloCapacity => EmbeddingConnectOutcome::Connected(Box::new(
+                ScriptStream::new(ScriptOutcome::HelloCapacity, self.compatibility.clone())
+                    .with_server_instance(format!("server-{server_generation}")),
+            )),
+            BootstrapConnectOutcome::HelloHandlerCapacity => {
+                EmbeddingConnectOutcome::Connected(Box::new(
+                    ScriptStream::new(
+                        ScriptOutcome::HelloHandlerCapacity,
+                        self.compatibility.clone(),
+                    )
+                    .with_server_instance(format!("server-{server_generation}")),
+                ))
+            }
             BootstrapConnectOutcome::NoOwner => EmbeddingConnectOutcome::NoOwner,
             BootstrapConnectOutcome::OwnerUnresponsive => {
                 EmbeddingConnectOutcome::OwnerUnresponsive(EmbeddingTransportFailure {

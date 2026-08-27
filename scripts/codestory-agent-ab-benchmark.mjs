@@ -213,7 +213,7 @@ const CODESTORY_ARM_INSTRUCTION =
   "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.";
 
 const CODESTORY_V3_ARM_INSTRUCTION =
-  "Use the CodeStory packet supplied by the harness as repository evidence, not as proof or an answer-authority verdict. Answer only from its evidence rows and state every material gap. Follow at most one declared continuation using the packet's continuation and publication identities. Inspect a source file only when the user named that file or the packet explicitly reports an evidence gap, Unknown, or Unavailable boundary; a packet-cited path or range alone is not read authorization, and an unrelated gap does not authorize arbitrary files. Do not broaden into unconstrained repository exploration. Do not turn missing evidence into absence or runtime behavior. Do not repeat the initial packet call or use web search, browser tools, remote URLs, or upstream mirrors.";
+  "Use the CodeStory packet supplied by the harness as repository evidence, not as proof or an answer-authority verdict. Answer only from its evidence rows and state every material gap. Follow at most one declared continuation using the packet's continuation and publication identities, then stop. Inspect a source file only when the user named that file or the packet reports a material evidence-missing, Unknown, or Unavailable boundary. An output_budget_exceeded gap is descriptive and does not authorize a source read or another repository tool by itself. A packet-cited path or range alone is not read authorization, and an unrelated gap does not authorize arbitrary files. Do not use search, context, shell, git, or direct source reads as packet recovery in this controlled comparison. Do not broaden into unconstrained repository exploration. Do not turn missing evidence into absence or runtime behavior. Do not repeat the initial packet call or use web search, browser tools, remote URLs, or upstream mirrors.";
 
 const ARMS = {
   without_codestory:
@@ -2493,7 +2493,7 @@ Run that answer packet before any repository search, direct source read, git com
     isCodeStoryArm(armName)
       ? isPacketProjectionV3(context.codestoryPrelude?.packet)
         ? `
-The packet is an evidence-only projection. Use its evidence rows directly, name every gap, and do not infer proof, completeness, runtime behavior, or absence from availability. If status is \`continuation_available\`, execute exactly the declared one-shot continuation and then stop. A source read is allowed only for a user-named file or an explicit packet gap, \`Unknown\`, or \`Unavailable\` boundary. A packet-cited path or range alone is not authorization, and an unrelated gap does not authorize arbitrary files.`
+The packet is an evidence-only projection. Use its evidence rows directly, name every gap, and do not infer proof, completeness, runtime behavior, or absence from availability. If status is \`continuation_available\`, execute exactly the declared one-shot continuation and then stop. A source read is allowed only for a user-named file or a material \`evidence_missing\`, \`Unknown\`, or \`Unavailable\` boundary. An \`output_budget_exceeded\` gap is descriptive and does not authorize a source read or another repository tool by itself. A packet-cited path or range alone is not authorization, and an unrelated gap does not authorize arbitrary files.`
         : `
 The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. A \`not_established\` packet can still contain directly useful support: answer those established parts, identify the material gaps, and do not infer the missing links. On \`drill_once\`, execute exactly the declared one-shot packet continuation, apply the same terminal answer rule, and then stop regardless of its result.`
       : "";
@@ -12951,6 +12951,7 @@ export {
   parseArgs,
   parseJsonLines,
   cachePolicyForRun,
+  codeStoryArmInstruction,
   cachePreparationCanaryBlockers,
   cachePreparationIdentityBlockers,
   mergeRetrievalStatusWithEngineDiagnostics,

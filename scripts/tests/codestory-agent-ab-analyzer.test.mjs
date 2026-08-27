@@ -4855,6 +4855,15 @@ test("benchmark artifact run ids strip path separators from dynamic parts", () =
   );
 });
 
+test("v3 benchmark routing treats projection bounds as descriptive rather than read authority", () => {
+  const instruction = benchmarkHarness.codeStoryArmInstruction({ schema_version: 3 });
+
+  assert.match(instruction, /output_budget_exceeded gap is descriptive/);
+  assert.match(instruction, /does not authorize a source read or another repository tool/);
+  assert.match(instruction, /at most one declared continuation/);
+  assert.match(instruction, /then stop/);
+});
+
 test("publishable benchmark args reject diagnostic packet probes", () => {
   assert.throws(
     () =>

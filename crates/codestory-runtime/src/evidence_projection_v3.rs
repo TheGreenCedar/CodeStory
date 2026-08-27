@@ -263,15 +263,33 @@ fn select_packet_evidence_indices(
         &mut selected_indices,
     );
 
-    for order in [&source_order, &location_order, &relation_order] {
-        select_packet_evidence_kind(
-            order,
-            PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3,
-            &mut selected,
-            &mut selected_indices,
-        );
+    let mut remainder = (0..distinct.len())
+        .filter(|index| !selected_indices.contains(index))
+        .collect::<Vec<_>>();
+    remainder.sort_by_key(|index| {
+        (
+            Reverse(distinct[*index].2),
+            packet_evidence_kind_priority(distinct[*index].0),
+            *index,
+        )
+    });
+    for index in remainder {
+        if selected.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
+            break;
+        }
+        selected.push(index);
+        selected_indices.insert(index);
     }
     selected
+}
+
+fn packet_evidence_kind_priority(kind: SupportUnitKindDto) -> u8 {
+    match kind {
+        SupportUnitKindDto::SourceRange => 0,
+        SupportUnitKindDto::SymbolLocation => 1,
+        SupportUnitKindDto::TypedGraphEdge => 2,
+        SupportUnitKindDto::CompleteQueryNegative => 3,
+    }
 }
 
 fn select_packet_evidence_kind(
@@ -441,8 +459,8 @@ fn packet_evidence_was_bounded(support: &[SupportUnitDto]) -> bool {
 }
 
 const PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3: usize = 8;
-const PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3: usize = 4;
-const PACKET_PUBLIC_RELATION_ROWS_TARGET_V3: usize = 4;
+const PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3: usize = 2;
+const PACKET_PUBLIC_RELATION_ROWS_TARGET_V3: usize = 2;
 const PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3: usize = 16;
 
 /// Project a context answer without exposing answer confidence or claim state.
@@ -1115,16 +1133,16 @@ mod tests {
                 .iter()
                 .filter(|row| row.kind == EvidenceKindV3Dto::ExactSource)
                 .count(),
-            12,
-            "the closed envelope keeps eight excerpts and four symbol locations"
+            14,
+            "the closed envelope keeps twelve excerpts and two symbol locations"
         );
         assert_eq!(
             evidence
                 .iter()
                 .filter(|row| row.kind == EvidenceKindV3Dto::GraphRelation)
                 .count(),
-            4,
-            "the closed envelope reserves four relation receipts"
+            2,
+            "the closed envelope reserves two relation receipts"
         );
         assert_eq!(
             evidence
@@ -1142,12 +1160,12 @@ mod tests {
                 "fn source_7() {}",
                 "fixture",
                 "fixture",
-                "fixture",
-                "fixture",
                 "caller-0 -[CALL]-> callee-0",
                 "caller-1 -[CALL]-> callee-1",
-                "caller-2 -[CALL]-> callee-2",
-                "caller-3 -[CALL]-> callee-3",
+                "fn source_8() {}",
+                "fn source_9() {}",
+                "fn source_10() {}",
+                "fn source_11() {}",
             ]
         );
         assert!(packet_evidence_was_bounded(&support));
@@ -1217,6 +1235,52 @@ mod tests {
         );
 
         assert_eq!(evidence[0].path.as_ref().unwrap().as_str(), "src/server.c");
+    }
+
+    #[test]
+    fn packet_evidence_spends_unreserved_rows_on_the_most_relevant_evidence() {
+        let support = (0..12)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("source-{index}");
+                unit.path = Some(format!("src/source-{index}.rs"));
+                unit.symbol_id = Some(format!("format_stage_{index}"));
+                unit.snippet = Some(format!("fn format_stage_{index}() {{}}"));
+                unit
+            })
+            .chain((0..8).map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SymbolLocation);
+                unit.id = format!("location-{index}");
+                unit.path = Some(format!("src/location-{index}.rs"));
+                unit.summary = format!("unrelated location {index}");
+                unit
+            }))
+            .chain((0..8).map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::TypedGraphEdge);
+                unit.id = format!("edge-{index}");
+                unit.from_symbol = Some(format!("caller-{index}"));
+                unit.edge_kind = Some("CALL".to_owned());
+                unit.to_symbol = Some(format!("callee-{index}"));
+                unit
+            }))
+            .collect::<Vec<_>>();
+
+        let evidence =
+            packet_evidence_rows_for_request(&support, "Explain the format stages.", &[]);
+
+        assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+        assert!(
+            evidence
+                .iter()
+                .filter(|row| {
+                    row.path
+                        .as_ref()
+                        .is_some_and(|path| path.as_str().starts_with("src/source-"))
+                })
+                .count()
+                >= 12,
+            "unreserved rows should prefer relevant source evidence over low-value duplicate locations"
+        );
     }
 
     #[test]

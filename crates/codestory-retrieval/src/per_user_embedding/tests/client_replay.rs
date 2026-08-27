@@ -337,6 +337,58 @@ fn typed_capacity_does_not_spawn_or_replay() {
 }
 
 #[test]
+fn transient_handshake_capacity_retries_within_one_connect_budget() {
+    let transport = BootstrapTestTransport::with_connect_budget(
+        [
+            BootstrapConnectOutcome::HelloCapacity,
+            BootstrapConnectOutcome::HelloHandlerCapacity,
+            BootstrapConnectOutcome::Connected,
+        ],
+        BootstrapConnectOutcome::Connected,
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    );
+    let client = PerUserEmbeddingClient {
+        transport: transport.clone(),
+        compatibility: EmbeddingCompatibility::current(true),
+        scope_id: "test-scope".into(),
+    };
+
+    let (_, attempts) = client
+        .embed_query_with_qualification_attempts("x")
+        .expect("both bounded connection-capacity reasons recover without an RPC replay");
+
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].outcome, "completed");
+    assert_eq!(transport.connect_count.load(Ordering::Acquire), 3);
+    assert_eq!(transport.spawn_count.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn persistent_handshake_capacity_remains_typed_and_bounded() {
+    let transport = BootstrapTestTransport::with_connect_budget(
+        [],
+        BootstrapConnectOutcome::HelloCapacity,
+        Duration::from_millis(3),
+        Duration::from_millis(10),
+    );
+    let client = PerUserEmbeddingClient {
+        transport: transport.clone(),
+        compatibility: EmbeddingCompatibility::current(true),
+        scope_id: "test-scope".into(),
+    };
+
+    let error = client
+        .embed_query("x")
+        .expect_err("connection admission cannot retry beyond the connect budget");
+    let pressure = embedding_capacity_pressure(&error).expect("typed connection pressure");
+
+    assert_eq!(pressure.reason, "pre_request_full");
+    assert_eq!(transport.connect_count.load(Ordering::Acquire), 3);
+    assert_eq!(transport.spawn_count.load(Ordering::Acquire), 0);
+}
+
+#[test]
 fn post_spawn_authority_without_endpoint_converges_within_spawn_budget() {
     let transport = BootstrapTestTransport::new(
         [

@@ -259,6 +259,8 @@ pub(super) enum ScriptOutcome {
     Loss,
     WriteDisconnect,
     HelloLoss,
+    HelloCapacity,
+    HelloHandlerCapacity,
     Capacity,
     TimedBulk {
         hello_delay: Duration,
@@ -372,6 +374,37 @@ impl ScriptStream {
         if matches!(self.outcome, ScriptOutcome::HelloLoss) {
             return Ok(None);
         }
+        if matches!(
+            self.outcome,
+            ScriptOutcome::HelloCapacity | ScriptOutcome::HelloHandlerCapacity
+        ) {
+            let mut pressure = test_capacity();
+            pressure.reason = match &self.outcome {
+                ScriptOutcome::HelloCapacity => "pre_request_full",
+                ScriptOutcome::HelloHandlerCapacity => "connection_handler_full",
+                _ => unreachable!("matched handshake capacity"),
+            }
+            .into();
+            pressure.queue_class = "connection".into();
+            pressure.capacity = 8;
+            pressure.depth = 8;
+            pressure.retry_after_ms = 1;
+            pressure.retry_condition = "an authenticated connection handler completes".into();
+            return Ok(Some((
+                failure_response(
+                    request_id,
+                    EmbeddingProtocolError {
+                        code: "embedding_capacity".into(),
+                        message: "embedding connection admission is full".into(),
+                        retry_class: "after_delay".into(),
+                        retry_after_ms: 1,
+                        retry_condition: pressure.retry_condition.clone(),
+                        capacity: Some(pressure),
+                    },
+                ),
+                Vec::new(),
+            )));
+        }
         if let ScriptOutcome::TimedBulk { hello_delay, .. } = self.outcome {
             thread::sleep(hello_delay);
         }
@@ -444,7 +477,11 @@ impl ScriptStream {
                     Vec::new(),
                 )))
             }
-            ScriptOutcome::HelloLoss => Err(io::Error::other("query reached hello-loss stream")),
+            ScriptOutcome::HelloLoss
+            | ScriptOutcome::HelloCapacity
+            | ScriptOutcome::HelloHandlerCapacity => {
+                Err(io::Error::other("query reached handshake-only stream"))
+            }
             ScriptOutcome::WriteDisconnect => Err(io::Error::other(
                 "query write must fail before a response is produced",
             )),
