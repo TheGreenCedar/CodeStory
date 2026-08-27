@@ -3490,6 +3490,8 @@ function anchorSearchVariants(anchor) {
   ) {
     variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1::$2"));
     variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1#$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "(*$1).$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "($1).$2"));
   }
   if (/[a-z_][a-z0-9_]*#[a-z_][a-z0-9_]*/i.test(normalized)) {
     variants.add(normalized.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1.$2"));

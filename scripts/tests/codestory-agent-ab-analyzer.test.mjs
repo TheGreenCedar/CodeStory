@@ -5912,6 +5912,35 @@ test("quality scoring treats Ruby instance separator variants as symbol matches"
   assert.equal(quality.pass, true);
 });
 
+test("quality scoring treats Go receiver notation as a canonical member match", () => {
+  const task = {
+    id: "go-receiver-symbol",
+    task_class: "route_tracing",
+    expected_files: ["gin.go", "context.go"],
+    expected_symbols: ["Engine.handleHTTPRequest", "Context.Next"],
+    expected_claims: ["Engine dispatches a matched request through the context handler chain."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 1,
+      min_expected_file_recall: 1,
+      min_expected_symbol_recall: 1,
+      min_expected_claim_recall: 1,
+      min_citation_coverage: 1,
+      max_forbidden_claims: 0,
+    },
+  };
+  const events = [
+    agentMessageEvent(
+      "`(*Engine).handleHTTPRequest` in `gin.go` dispatches a matched request through the context handler chain by calling `(*Context).Next` in `context.go`.",
+    ),
+  ];
+
+  const quality = scoreQuality(events, task);
+
+  assert.equal(quality.expected_symbols.recall, 1);
+  assert.equal(quality.pass, true);
+});
+
 test("quality scoring treats namespace-qualified symbol tails as matches", () => {
   const task = {
     id: "ruby-namespace-symbol-tail",
