@@ -367,14 +367,15 @@ pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
 };
 pub use retrieval_boundary::{
-    CacheCleanPlan, CacheCleanReport, FinalizeIndexOutcome, GenerationRetentionApplyReport,
-    GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
-    RetainedRollbackObservation, RetrievalIndexManifest, RetrievalProcessDefaults,
-    RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, RetrievalStatusReport,
-    RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
-    RuntimeRetrievalConfig, RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarGcReport, SidecarInventoryReport, apply_cache_clean,
-    ensure_product_embedding_backend_for_runtime, plan_cache_clean, retrieval_process_defaults,
+    CacheCleanPlan, CacheCleanReport, FinalizeComponentWork, FinalizeIndexOutcome,
+    FinalizePhaseTiming, GenerationRetentionApplyReport, GenerationRetentionPlan,
+    ProcessOwnerState, ProcessStartProbe, QueryResult, RetainedRollbackObservation,
+    RetrievalIndexManifest, RetrievalProcessDefaults, RetrievalRuntimeDefaults,
+    RetrievalRuntimeOverrides, RetrievalStatusReport, RollbackActivationError,
+    RollbackActivationOutcome, RollbackActivationRefusal, RuntimeRetrievalConfig,
+    RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarGcReport,
+    SidecarInventoryReport, apply_cache_clean, ensure_product_embedding_backend_for_runtime,
+    plan_cache_clean, retrieval_process_defaults,
 };
 pub(crate) use search_runtime::SearchEngine;
 
