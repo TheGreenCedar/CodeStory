@@ -854,6 +854,14 @@ test("Codex excludes exactly one authenticated installed-skill read from product
   run.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
   assert.deepEqual(validate("codex", run).actions, ["source_read"]);
 
+  const countedRead = baseRun("named_file_direct_read");
+  countedRead.steps = [{
+    kind: "shell",
+    command: `/bin/zsh -lc ${JSON.stringify("wc -l src/named.rs && sed -n '1,240p' src/named.rs")}`,
+    output: "1 src/named.rs\nsource fixture\n",
+  }];
+  assert.deepEqual(validate("codex", countedRead).actions, ["source_read"]);
+
   const tampered = baseRun("named_file_direct_read");
   tampered.steps.unshift({
     kind: "host_guidance_read",
@@ -934,6 +942,8 @@ test("Codex excludes exactly one authenticated installed-skill read from product
     "/bin/zsh -lc \"cat `pwd`/src/lib.rs\"",
     "/bin/zsh -lc \"cat src/*.rs\"",
     "/bin/zsh -lc \"cat src/lib.rs src/one.rs\"",
+    "/bin/zsh -lc \"wc -l src/lib.rs && sed -n '1,240p' src/one.rs\"",
+    "/bin/zsh -lc \"wc -l src/lib.rs; sed -n '1,240p' src/lib.rs\"",
     "/bin/zsh -lc \"cat ~/secret\"",
     "/bin/zsh -lc \"cat =ls\"",
   ]) {
@@ -979,6 +989,11 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none/u);
     assert.match(prompt, /outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused/u);
     assert.match(prompt, /For a direct source read, record evidence identity source:<project-relative-path>/u);
+    assert.match(prompt, /Use supported for a direct source read/u);
+    assert.match(prompt, /Use refused only when the user requested exact proof without supplying a typed interpretation/u);
+    assert.match(prompt, /target_id must be null unless a CodeStory tool result returned a target identity/u);
+    assert.match(prompt, /reason_codes may contain only CodeStory tool result codes or typed_contract_required/u);
+    assert.match(prompt, /refutation_basis must be null unless a ContractRefuted result supplied the basis/u);
     assert.match(prompt, /runtime_execution_claim and absence_claim must each be false/u);
     assert.match(prompt, /material_omissions contains only unresolved material requested by the user/u);
   }

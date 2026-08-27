@@ -266,7 +266,7 @@ export function validateRoutingRequestCorpus(document = ROUTING_CORPUS_DOCUMENT)
 
 export const ROUTING_REQUEST_CORPUS = deepFreeze(structuredClone(ROUTING_CORPUS_DOCUMENT));
 
-const FINAL_REPORT_INSTRUCTION = `Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused: use discovery_only for a search lead, preserve the exact proof result boundary, use invalid_contract for a rejected typed interpretation, and use refused when no typed interpretation was supplied. Use null for absent scalar identities and [] for absent lists. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, reason, disposition, target, and refutation identities only from the tool results. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
+const FINAL_REPORT_INSTRUCTION = `Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read or a supported evidence result, discovery_only for a search lead, and preserve the exact proof result boundary. Use invalid_contract for a rejected typed interpretation. Use refused only when the user requested exact proof without supplying a typed interpretation. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
 
 export function materializeRoutingRequests(projectRoot) {
   const project = realpathSync(projectRoot);
@@ -480,8 +480,16 @@ function singleShellWord(value) {
 function singleFileReadPath(command) {
   const text = unwrapCodexShell(command);
   if (!text) return null;
+  const countedRead = text.match(
+    /^wc\s+-l\s+(\S+)\s+&&\s+sed\s+-n\s+(?:'\d+,\d+p'|"\d+,\d+p"|\d+,\d+p)\s+(\S+)$/u,
+  );
+  if (countedRead) {
+    const countedPath = singleShellWord(countedRead[1]);
+    const readPath = singleShellWord(countedRead[2]);
+    return countedPath && countedPath === readPath ? readPath : null;
+  }
   const patterns = [
-    /^sed\s+-n\s+(?:'\d+,\d+p'|"\d+,\d+p")\s+(.+)$/u,
+    /^sed\s+-n\s+(?:'\d+,\d+p'|"\d+,\d+p"|\d+,\d+p)\s+(.+)$/u,
     /^(?:cat|type|nl)(?:\s+-[A-Za-z]+)*\s+(.+)$/u,
     /^Get-Content(?:\s+-(?:LiteralPath|Path))?\s+(.+)$/iu,
   ];
