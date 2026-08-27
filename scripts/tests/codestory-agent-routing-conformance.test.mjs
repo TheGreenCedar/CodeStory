@@ -41,8 +41,17 @@ const codexPluginRoot = join(
   codexControlRoot, "plugins", "cache", "RoutingCandidate", "codestory", "0.17.4",
 );
 const codexSkillPath = join(codexPluginRoot, "skills", "codestory-grounding", "SKILL.md");
-mkdirSync(dirname(codexSkillPath), { recursive: true });
-copyFileSync(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), codexSkillPath);
+const codexGuidancePaths = [
+  "skills/codestory-grounding/SKILL.md",
+  "skills/codestory-grounding/references/generated-mcp-syntax.md",
+  "skills/codestory-grounding/references/search.md",
+  "skills/codestory-grounding/references/context.md",
+];
+for (const path of codexGuidancePaths) {
+  const destination = join(codexPluginRoot, path);
+  mkdirSync(dirname(destination), { recursive: true });
+  copyFileSync(join(pluginRoot, path), destination);
+}
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -89,7 +98,10 @@ const EXPECTED_IDENTITY = Object.freeze({
     sha256: sha256(readFileSync(installedReceipt)),
   }),
   static_roster: Object.freeze({
-    "skills/codestory-grounding/SKILL.md": sha256(readFileSync(codexSkillPath)),
+    ...Object.fromEntries(codexGuidancePaths.map((path) => [
+      path,
+      sha256(readFileSync(join(codexPluginRoot, path))),
+    ])),
   }),
 });
 
@@ -848,11 +860,23 @@ function validate(host, run, expectedIdentity = EXPECTED_IDENTITY, receipt = ins
   });
 }
 
-test("Codex excludes exactly one authenticated installed-skill read from product routing", () => {
+test("Codex excludes only roster-authenticated installed guidance read before product routing", () => {
   const run = baseRun("named_file_direct_read");
   run.steps[0].wrapped = true;
   run.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
   assert.deepEqual(validate("codex", run).actions, ["source_read"]);
+
+  const linkedGuidance = baseRun("exact_symbol_search");
+  const linkedPaths = codexGuidancePaths.slice(1).map((path) => join(codexPluginRoot, path));
+  linkedGuidance.steps.unshift(
+    { kind: "host_guidance_read", path: codexSkillPath },
+    {
+      kind: "shell",
+      command: `/bin/zsh -lc ${JSON.stringify(linkedPaths.map((path) => `sed -n '1,260p' ${path}`).join(" && "))}`,
+      output: linkedPaths.map((path) => readFileSync(path, "utf8")).join(""),
+    },
+  );
+  assert.deepEqual(validate("codex", linkedGuidance).actions, ["search"]);
 
   const countedRead = baseRun("named_file_direct_read");
   countedRead.steps = [{
@@ -924,7 +948,7 @@ test("Codex excludes exactly one authenticated installed-skill read from product
     { kind: "host_guidance_read", path: codexSkillPath },
     { kind: "host_guidance_read", path: codexSkillPath },
   );
-  assert.throws(() => validate("codex", duplicate), /authenticated installed guidance more than once/u);
+  assert.throws(() => validate("codex", duplicate), /authenticated installed guidance repeated/u);
 
   const late = baseRun("named_file_direct_read");
   late.steps.push({ kind: "host_guidance_read", path: codexSkillPath });
@@ -933,6 +957,23 @@ test("Codex excludes exactly one authenticated installed-skill read from product
   const arbitraryShell = baseRun("named_file_direct_read");
   arbitraryShell.steps.unshift({ kind: "shell", command: "/bin/zsh -lc \"pwd\"" });
   assert.throws(() => validate("codex", arbitraryShell), /required action sequence|forbidden tool/u);
+
+  const unrosteredPath = join(codexPluginRoot, "skills", "codestory-grounding", "references", "unrostered.md");
+  writeFileSync(unrosteredPath, "unrostered guidance\n");
+  const unrostered = baseRun("exact_symbol_search");
+  unrostered.steps.unshift({ kind: "host_guidance_read", path: unrosteredPath });
+  assert.throws(() => validate("codex", unrostered), /required action sequence|forbidden tool/u);
+
+  const nonguidancePath = join(codexPluginRoot, "plugin.json");
+  writeFileSync(nonguidancePath, "{}\n");
+  const nonguidanceIdentity = clone(EXPECTED_IDENTITY);
+  nonguidanceIdentity.static_roster["plugin.json"] = sha256(readFileSync(nonguidancePath));
+  const nonguidance = baseRun("exact_symbol_search");
+  nonguidance.steps.unshift({ kind: "host_guidance_read", path: nonguidancePath });
+  assert.throws(
+    () => validate("codex", nonguidance, nonguidanceIdentity),
+    /required action sequence|forbidden tool/u,
+  );
 
   for (const command of [
     "/bin/zsh -lc \"cat src/lib.rs | head\"",
@@ -1597,6 +1638,17 @@ function staticIdentityFor(root) {
     "rules/codestory.mdc",
     "skills/codestory-grounding/SKILL.md",
     "skills/codestory-grounding/agents/openai.yaml",
+    "skills/codestory-grounding/references/generated-mcp-syntax.md",
+    "skills/codestory-grounding/references/status-contract.md",
+    "skills/codestory-grounding/references/ground.md",
+    "skills/codestory-grounding/references/files.md",
+    "skills/codestory-grounding/references/affected.md",
+    "skills/codestory-grounding/references/packet.md",
+    "skills/codestory-grounding/references/search.md",
+    "skills/codestory-grounding/references/context.md",
+    "skills/codestory-grounding/references/symbol.md",
+    "skills/codestory-grounding/references/trail.md",
+    "skills/codestory-grounding/references/snippet.md",
   ];
   staticIdentity.static_roster = Object.fromEntries(
     rosterPaths.map((path) => [path, sha256(readFileSync(join(root, path)))]),
@@ -1628,6 +1680,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
   );
   for (const [label, guidance] of [["skill", skill], ["Cursor rule", cursorRule]]) {
     assert.match(guidance, /discovery leads?.*`search`/isu, label);
+    assert.match(guidance, /successful search.*stop.*(?:do not|never).*source/isu, label);
     assert.match(guidance, /selected target.*`context`/isu, label);
     assert.match(guidance, /broad.*`packet`.*continuation.*once/isu, label);
     assert.match(guidance, /host-supplied.*`prove_call_path`/isu, label);
@@ -1703,7 +1756,7 @@ Call the CodeStory tool that matches the task. The codestory-grounding skill own
     writeFileSync(
       openAiMetadataPath,
       readFileSync(openAiMetadataPath, "utf8").replace(
-        /Use search for discovery leads, context for one selected target, packet for broad evidence with at most one continuation, and prove_call_path only for a complete host-supplied typed contract\./u,
+        /Use search for discovery leads and stop after a successful search until the user selects an exact target; do not inspect source merely to upgrade a discovery result\./u,
         "Call the CodeStory tool that matches the repository task.",
       ),
     );

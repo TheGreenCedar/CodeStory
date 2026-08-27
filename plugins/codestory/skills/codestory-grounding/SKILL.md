@@ -53,7 +53,7 @@ plugin result unless the user explicitly asks.
 | --- | --- |
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
 | Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
-| Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. Select one exact target before asking for evidence. |
+| Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. After a successful search, stop at the returned lead until the user selects one exact target. Do not inspect source or request focused evidence merely to upgrade a discovery result. |
 | Get evidence for one selected target | Use `context` with that exact selected target. Do not broaden the target or treat evidence availability as proof. |
 | Follow a call path for navigation | `callers`, `callees`, `trace`, or `trail` can navigate the ordinary graph. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node; none of these tools returns an exact proof disposition. |
 | Verify an already translated exact call-path contract | For a host-supplied or user-supplied complete typed contract, call `prove_call_path` with the unchanged `source_text`, clauses, and exact spec. Do not infer or assemble a typed contract from English. |

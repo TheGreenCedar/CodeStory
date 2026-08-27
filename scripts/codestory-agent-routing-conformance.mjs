@@ -324,6 +324,31 @@ const STATIC_ROSTER_PATHS = Object.freeze([
   "rules/codestory.mdc",
   "skills/codestory-grounding/SKILL.md",
   "skills/codestory-grounding/agents/openai.yaml",
+  "skills/codestory-grounding/references/generated-mcp-syntax.md",
+  "skills/codestory-grounding/references/status-contract.md",
+  "skills/codestory-grounding/references/ground.md",
+  "skills/codestory-grounding/references/files.md",
+  "skills/codestory-grounding/references/affected.md",
+  "skills/codestory-grounding/references/packet.md",
+  "skills/codestory-grounding/references/search.md",
+  "skills/codestory-grounding/references/context.md",
+  "skills/codestory-grounding/references/symbol.md",
+  "skills/codestory-grounding/references/trail.md",
+  "skills/codestory-grounding/references/snippet.md",
+]);
+const CODEX_GUIDANCE_PATHS = new Set([
+  "skills/codestory-grounding/SKILL.md",
+  "skills/codestory-grounding/references/generated-mcp-syntax.md",
+  "skills/codestory-grounding/references/status-contract.md",
+  "skills/codestory-grounding/references/ground.md",
+  "skills/codestory-grounding/references/files.md",
+  "skills/codestory-grounding/references/affected.md",
+  "skills/codestory-grounding/references/packet.md",
+  "skills/codestory-grounding/references/search.md",
+  "skills/codestory-grounding/references/context.md",
+  "skills/codestory-grounding/references/symbol.md",
+  "skills/codestory-grounding/references/trail.md",
+  "skills/codestory-grounding/references/snippet.md",
 ]);
 
 class ConformanceError extends Error {
@@ -2161,45 +2186,74 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
   if (claim.material_omissions.length > 0) fail(`${scenarioContract.id} final claim contains material omissions`);
 }
 
-const CANONICAL_SKILL_PATH = "skills/codestory-grounding/SKILL.md";
+function sedPrefix(text, endLine) {
+  const lines = text.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+  if (lines.length > endLine) return null;
+  return lines.join("");
+}
 
-function isAuthenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIdentity) {
+function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedIdentity) {
   if (action.kind !== "shell" || !action.completed || action.error || typeof action.result !== "string") {
-    return false;
+    return null;
   }
-  const candidate = singleFileReadPath(action.command);
-  if (!candidate || !installedPluginRoot) return false;
+  const command = unwrapCodexShell(action.command);
+  if (!command || !installedPluginRoot) return null;
+  const reads = command.split(/\s+&&\s+/u).map((segment) => segment.match(
+    /^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u,
+  ));
+  if (reads.length === 0 || reads.some((match) => match === null)) return null;
   let root;
-  let actual;
   try {
     root = realpathSync(installedPluginRoot);
-    if (!lstatSync(candidate).isFile()) return false;
-    actual = realpathSync(candidate);
   } catch {
-    return false;
+    return null;
   }
-  const rel = relative(root, actual);
-  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || resolve(root, rel) !== actual) return false;
-  if (rel.split(sep).join("/") !== CANONICAL_SKILL_PATH) return false;
-  const expectedDigest = expectedIdentity.static_roster?.[CANONICAL_SKILL_PATH];
-  if (!SHA256.test(String(expectedDigest)) || /^0{64}$/u.test(String(expectedDigest))) return false;
-  return sha256Bytes(readFileSync(actual)) === expectedDigest
-    && sha256Bytes(Buffer.from(action.result, "utf8")) === expectedDigest;
+  const paths = [];
+  const expectedOutput = [];
+  for (const match of reads) {
+    const endLine = Number(match[1] ?? match[2] ?? match[3]);
+    const candidate = singleShellWord(match[4]);
+    if (!candidate || !Number.isSafeInteger(endLine) || endLine < 1) return null;
+    let actual;
+    try {
+      if (!lstatSync(candidate).isFile()) return null;
+      actual = realpathSync(candidate);
+    } catch {
+      return null;
+    }
+    const rel = relative(root, actual);
+    if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || resolve(root, rel) !== actual) return null;
+    const rosterPath = rel.split(sep).join("/");
+    if (!CODEX_GUIDANCE_PATHS.has(rosterPath)) return null;
+    const expectedDigest = expectedIdentity.static_roster?.[rosterPath];
+    if (!SHA256.test(String(expectedDigest)) || /^0{64}$/u.test(String(expectedDigest))) return null;
+    const bytes = readFileSync(actual);
+    if (sha256Bytes(bytes) !== expectedDigest) return null;
+    const output = sedPrefix(bytes.toString("utf8"), endLine);
+    if (output === null) return null;
+    paths.push(rosterPath);
+    expectedOutput.push(output);
+  }
+  if (action.result !== expectedOutput.join("")) return null;
+  return paths;
 }
 
 function productRoutingActions(host, actions, installedPluginRoot, expectedIdentity) {
   if (String(host).toLowerCase() !== "codex") return actions;
   const product = [];
-  let guidanceReads = 0;
+  const guidancePaths = new Set();
   for (const action of actions) {
-    if (isAuthenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIdentity)) {
+    const authenticatedPaths = authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedIdentity);
+    if (authenticatedPaths) {
       if (product.length > 0) fail("Codex read authenticated installed guidance after the first product action");
-      guidanceReads += 1;
+      for (const path of authenticatedPaths) {
+        if (guidancePaths.has(path)) fail(`Codex authenticated installed guidance repeated ${path}`);
+        guidancePaths.add(path);
+      }
     } else {
       product.push(action);
     }
   }
-  if (guidanceReads > 1) fail("Codex read authenticated installed guidance more than once");
   return product;
 }
 
@@ -2279,6 +2333,7 @@ async function readJson(path, label) {
 function validateRoutingGuidance(text, label) {
   const requirements = [
     [/discovery leads?.*`search`/isu, "search discovery authority"],
+    [/successful search.*stop.*(?:do not|never).*source/isu, "successful-search stop boundary"],
     [/selected target.*`context`/isu, "selected-target context authority"],
     [/broad.*`packet`.*continuation.*once/isu, "bounded packet routing"],
     [/host-supplied.*`prove_call_path`/isu, "host-supplied proof routing"],

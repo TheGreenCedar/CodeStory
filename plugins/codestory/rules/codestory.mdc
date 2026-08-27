@@ -22,7 +22,7 @@ The **codestory-grounding** skill is loaded by the plugin and owns the detailed 
 Routing contract:
 
 - Read an exact user-named file directly when the question is file-local.
-- Discovery leads come from `search`; they identify candidates and do not prove a claim.
+- Discovery leads come from `search`; they identify candidates and do not prove a claim. After a successful search, stop at the returned lead until the user selects an exact target; do not inspect source merely to upgrade the result.
 - For one selected target, use `context` for evidence around that target only.
 - For a broad structural question, use `packet`, preserve every returned gap, and follow a bounded continuation at most once.
 - For a complete host-supplied or user-supplied typed contract, call `prove_call_path` unchanged. Never construct that contract from English or from packet, search, or context output.

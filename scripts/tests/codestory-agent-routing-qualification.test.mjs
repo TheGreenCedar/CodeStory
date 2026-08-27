@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dirname } from "node:path";
@@ -19,6 +19,7 @@ import {
   validateRoutingArtifactMatrix,
   verifyStagedCandidateInstallation,
   writeRoutingQualificationArtifacts,
+  writeRoutingSessionCapture,
 } from "../codestory-agent-routing-qualification.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -120,6 +121,38 @@ test("qualification artifacts require exactly 32 separately validated host sessi
     assert.throws(() => validateRoutingArtifactMatrix(duplicate), /exactly once/u);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("qualification retains owner-only bounded host bytes before validation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-routing-capture-"));
+  try {
+    const capture = await writeRoutingSessionCapture(root, "codex", "exact_symbol_search", {
+      stdout: '{"type":"turn.completed"}\n',
+      stderr: "sanitized fixture stderr\n",
+      code: 0,
+      signal: null,
+    });
+    const metadata = JSON.parse(await readFile(capture.metadataPath, "utf8"));
+    assert.equal(metadata.host, "codex");
+    assert.equal(metadata.scenario_id, "exact_symbol_search");
+    assert.equal(metadata.stdout_sha256, sha256(await readFile(capture.stdoutPath)));
+    assert.equal(metadata.stderr_sha256, sha256(await readFile(capture.stderrPath)));
+    for (const path of Object.values(capture)) {
+      assert.equal((await stat(path)).mode & 0o777, 0o600);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("qualification static roster authenticates every linked routing reference", async () => {
+  const source = await readFile(join(repoRoot, "scripts", "codestory-agent-routing-qualification.mjs"), "utf8");
+  for (const reference of [
+    "generated-mcp-syntax.md", "status-contract.md", "ground.md", "files.md", "affected.md",
+    "packet.md", "search.md", "context.md", "symbol.md", "trail.md", "snippet.md",
+  ]) {
+    assert.equal(source.includes(`skills/codestory-grounding/references/${reference}`), true);
   }
 });
 

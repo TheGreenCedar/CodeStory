@@ -58,6 +58,17 @@ const STATIC_ROSTER_PATHS = [
   "rules/codestory.mdc",
   "skills/codestory-grounding/SKILL.md",
   "skills/codestory-grounding/agents/openai.yaml",
+  "skills/codestory-grounding/references/generated-mcp-syntax.md",
+  "skills/codestory-grounding/references/status-contract.md",
+  "skills/codestory-grounding/references/ground.md",
+  "skills/codestory-grounding/references/files.md",
+  "skills/codestory-grounding/references/affected.md",
+  "skills/codestory-grounding/references/packet.md",
+  "skills/codestory-grounding/references/search.md",
+  "skills/codestory-grounding/references/context.md",
+  "skills/codestory-grounding/references/symbol.md",
+  "skills/codestory-grounding/references/trail.md",
+  "skills/codestory-grounding/references/snippet.md",
 ];
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -249,6 +260,36 @@ export async function writeRoutingQualificationArtifacts(outDir, rows, identity 
   };
   await writeFile(join(outDir, "summary.json"), `${JSON.stringify(summary, null, 2)}\n`, "utf8");
   return summary;
+}
+
+export async function writeRoutingSessionCapture(outDir, host, scenarioId, session) {
+  if (!["codex", "cursor"].includes(host) || !ROUTING_SCENARIOS.some(({ id }) => id === scenarioId)
+      || !plainObject(session) || typeof session.stdout !== "string" || typeof session.stderr !== "string") {
+    fail("routing session capture is invalid");
+  }
+  const directory = join(resolve(outDir), "captures", host);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const stdoutPath = join(directory, `${scenarioId}.stdout.jsonl`);
+  const stderrPath = join(directory, `${scenarioId}.stderr.txt`);
+  const metadataPath = join(directory, `${scenarioId}.capture.json`);
+  const stdout = Buffer.from(session.stdout, "utf8");
+  const stderr = Buffer.from(session.stderr, "utf8");
+  const metadata = Buffer.from(`${JSON.stringify({
+    schema_version: 1,
+    host,
+    scenario_id: scenarioId,
+    stdout_bytes: stdout.length,
+    stdout_sha256: digestBytes(stdout),
+    stderr_bytes: stderr.length,
+    stderr_sha256: digestBytes(stderr),
+    exit_code: session.code,
+    signal: session.signal,
+  }, null, 2)}\n`, "utf8");
+  for (const [path, bytes] of [[stdoutPath, stdout], [stderrPath, stderr], [metadataPath, metadata]]) {
+    await writeFile(path, bytes, { mode: 0o600 });
+    await chmod(path, 0o600);
+  }
+  return { stdoutPath, stderrPath, metadataPath };
 }
 
 async function walkFiles(root) {
@@ -936,19 +977,25 @@ async function main(argv) {
         prompt: entry.request.text,
       });
       const session = await runSession(command, sessionEnv);
+      const capture = await writeRoutingSessionCapture(resolve(options.out), host, entry.scenario_id, session);
       if (session.spawned !== true || session.code !== 0 || session.signal !== null || !session.stdout.trim()) {
-        fail(`${host}:${entry.scenario_id} did not complete a real installed host session: ${session.stderr.trim()}`);
+        fail(`${host}:${entry.scenario_id} did not complete a real installed host session; capture ${capture.metadataPath}`);
       }
-      const report = validateInstalledSession({
-        host,
-        scenarioId: entry.scenario_id,
-        request: entry.request,
-        installedRoot: authenticated.installedRoot,
-        installedReceipt: authenticated.installedReceipt,
-        expectedIdentity: authenticated.expectedIdentity,
-        installedPluginRoot,
-        transcript: session.stdout,
-      });
+      let report;
+      try {
+        report = validateInstalledSession({
+          host,
+          scenarioId: entry.scenario_id,
+          request: entry.request,
+          installedRoot: authenticated.installedRoot,
+          installedReceipt: authenticated.installedReceipt,
+          expectedIdentity: authenticated.expectedIdentity,
+          installedPluginRoot,
+          transcript: session.stdout,
+        });
+      } catch (error) {
+        fail(`${error.message}; capture ${capture.metadataPath}`);
+      }
       if (id === "proof_observational") {
         await requireMissingRetrievalProjection({
           cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv,
