@@ -729,11 +729,11 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         .finish()
         .context("finish coherent sidecar input snapshot")?;
     record_finalize_phase_timing("input fingerprint", fingerprint_started.elapsed());
-    let previous_manifest = storage
-        .get_retrieval_index_manifest(&project_id)
-        .context("load previous retrieval_index_manifest")?;
-    let mut previous_manifest_unavailable_reason =
-        previous_manifest.as_ref().and_then(|manifest| {
+    let previous_manifest = physical_predecessor_manifest(&storage, &project_id)?;
+    let mut previous_manifest_unavailable_reason = previous_manifest
+        .as_ref()
+        .filter(|manifest| manifest.project_id == project_id)
+        .and_then(|manifest| {
             manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
         });
     if previous_manifest_unavailable_reason.is_none()
@@ -1006,6 +1006,28 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         degraded_modes,
         SidecarStubFlags { scip_stubbed },
     )
+}
+
+fn physical_predecessor_manifest(
+    storage: &Store,
+    project_id: &str,
+) -> Result<Option<RetrievalIndexManifest>> {
+    if let Some(manifest) = storage
+        .get_retrieval_index_manifest(project_id)
+        .context("load previous retrieval_index_manifest")?
+    {
+        return Ok(Some(manifest));
+    }
+    Ok(storage
+        .list_retrieval_index_manifests()
+        .context("load physical predecessor retrieval manifests")?
+        .into_iter()
+        .filter(|manifest| manifest_has_current_sidecar_contract(&manifest.project_id, manifest))
+        .max_by(|left, right| {
+            left.built_at_epoch_ms
+                .cmp(&right.built_at_epoch_ms)
+                .then_with(|| left.project_id.cmp(&right.project_id))
+        }))
 }
 
 fn with_finalize_progress<T>(
@@ -3897,6 +3919,36 @@ mod tests {
 
         assert_ne!(clean, dirty);
         assert_eq!(dirty, project_id_for_root(project.path()));
+    }
+
+    #[test]
+    fn dirty_identity_reuses_the_latest_valid_physical_predecessor() {
+        let storage_dir = TempDir::new().expect("storage dir");
+        let mut storage = Store::open(storage_dir.path().join("codestory.db"))
+            .expect("open retrieval manifest store");
+        let mut canonical =
+            crate::test_support::retrieval_manifest_fixture("repo-v2-clean", "canonical-input");
+        canonical.built_at_epoch_ms = 7;
+        storage
+            .upsert_retrieval_index_manifest(&canonical)
+            .expect("publish canonical manifest");
+
+        let selected = physical_predecessor_manifest(&storage, "workspace-dirty")
+            .expect("select physical predecessor")
+            .expect("canonical predecessor");
+        assert_eq!(selected, canonical);
+
+        let mut dirty =
+            crate::test_support::retrieval_manifest_fixture("workspace-dirty", "dirty-input");
+        dirty.built_at_epoch_ms = 1;
+        storage
+            .upsert_retrieval_index_manifest(&dirty)
+            .expect("publish dirty manifest");
+
+        let selected = physical_predecessor_manifest(&storage, "workspace-dirty")
+            .expect("select current identity manifest")
+            .expect("dirty predecessor");
+        assert_eq!(selected, dirty, "the exact identity must win over recency");
     }
 
     #[test]
