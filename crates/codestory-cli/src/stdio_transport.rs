@@ -7890,12 +7890,12 @@ mod tests {
     }
 
     #[test]
-    fn packet_thirty_two_row_identity_envelope_stays_complete_for_every_revision() {
-        let evidence = (0..32)
+    fn packet_sixteen_row_identity_envelope_stays_complete_for_every_revision() {
+        let evidence = (0..16)
             .map(|index| {
                 json!({
                     "identity":{"evidence_id":format!("packet-evidence-{index:03}")},
-                    "kind":if index < 16 { "exact_source" } else { "graph_relation" },
+                    "kind":if index < 12 { "exact_source" } else { "graph_relation" },
                     "path":format!("src/{index}/{}-é.rs", "path-segment-".repeat(12)),
                     "symbol_id":format!("qualified::symbol::{index}::{}", "member".repeat(16)),
                     "start_line":index + 1,
@@ -7966,7 +7966,7 @@ mod tests {
             let emitted = v3_serialize_call_tool_result(&result).unwrap();
 
             assert_eq!(root["kind"], "complete", "{revision:?}");
-            assert_eq!(root["evidence"].as_array().unwrap().len(), 32);
+            assert_eq!(root["evidence"].as_array().unwrap().len(), 16);
             assert_eq!(measured, emitted.len());
             assert!(measured <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
         }

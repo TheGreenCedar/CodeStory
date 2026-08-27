@@ -3684,7 +3684,10 @@ function forbiddenClaimMatched(haystack, claim) {
 
     const matched = expectedTokens.filter((token) => claimTokenMatched(token, sentenceTokens)).length;
     const ratio = matched / expectedTokens.length;
-    if (matched < Math.min(4, expectedTokens.length) || ratio < 0.65) {
+    // Polarity-bearing forbidden claims need near-complete semantic coverage. A lower ratio
+    // confuses an explicit evidence-gap sentence with the opposite claim when both name the same
+    // subsystem, binary route, and dispatch vocabulary.
+    if (matched < Math.min(4, expectedTokens.length) || ratio < 0.8) {
       return false;
     }
     return polarityTokens.every((token) => claimTokenMatched(token, sentenceTokens));

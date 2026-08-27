@@ -139,12 +139,12 @@ fn packet_cli_json_budget_measures_publication_metadata_and_newline() {
 }
 
 #[test]
-fn packet_cli_thirty_two_row_identity_envelope_stays_complete() {
-    let evidence = (0..32)
+fn packet_cli_sixteen_row_identity_envelope_stays_complete() {
+    let evidence = (0..16)
         .map(|index| {
             serde_json::json!({
                 "identity":{"evidence_id":format!("packet-evidence-{index:03}")},
-                "kind":if index < 16 { "exact_source" } else { "graph_relation" },
+                "kind":if index < 12 { "exact_source" } else { "graph_relation" },
                 "path":format!("src/{index}/{}-é.rs", "path-segment-".repeat(12)),
                 "symbol_id":format!("qualified::symbol::{index}::{}", "member".repeat(16)),
                 "start_line":index + 1,

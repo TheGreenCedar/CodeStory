@@ -6429,6 +6429,58 @@ test("forbidden claim scoring keeps polarity inside one candidate sentence", () 
   assert.equal(quality.pass, true);
 });
 
+test("forbidden claim scoring does not invert an explicit evidence-gap sentence", () => {
+  const task = runtimeQualityTask("forbidden-shell-gap-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = [
+    "nvm is a compiled binary and does not dispatch through shell functions.",
+  ];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "Material gaps: the packet does not establish how downloaded nvm.sh is added to or sourced by a shell profile, the main nvm() command-dispatch cases for install, download, or use, the binary-install route, or any nvm use execution path.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 0);
+  assert.equal(quality.pass, true);
+});
+
+test("forbidden claim scoring still catches a polarity-preserving paraphrase", () => {
+  const task = runtimeQualityTask("forbidden-shell-paraphrase-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = [
+    "nvm is a compiled binary and does not dispatch through shell functions.",
+  ];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "nvm is a compiled binary; it does not dispatch through shell functions.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 1);
+  assert.equal(quality.pass, false);
+});
+
 function pinnedRepoProvenance() {
   return {
     manifest_overridden_by_builtin: false,

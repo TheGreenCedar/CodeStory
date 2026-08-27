@@ -157,32 +157,25 @@ struct PacketEvidenceContentKeyV3 {
 }
 
 fn packet_evidence_selection(support: &[SupportUnitDto]) -> PacketEvidenceSelectionV3 {
-    let mut ranked_support = support
-        .iter()
-        .enumerate()
-        .filter(|(_, unit)| unit.kind != SupportUnitKindDto::CompleteQueryNegative)
-        .collect::<Vec<_>>();
-    ranked_support.sort_by_key(|(original_rank, unit)| {
-        (packet_evidence_context_priority(unit.kind), *original_rank)
-    });
-
     let mut seen = HashSet::new();
     let mut distinct = Vec::new();
-    for (_, unit) in ranked_support {
+    for unit in support
+        .iter()
+        .filter(|unit| unit.kind != SupportUnitKindDto::CompleteQueryNegative)
+    {
         let Some(row) = packet_evidence_row(0, unit) else {
             continue;
         };
         if seen.insert(packet_evidence_content_key(&row)) {
-            distinct.push(row);
+            distinct.push((unit.kind, row));
         }
     }
 
     let distinct_rows = distinct.len();
-    let mut rows = Vec::with_capacity(distinct_rows.min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3));
-    for mut row in distinct
-        .into_iter()
-        .take(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3)
-    {
+    let selected = select_packet_evidence_indices(&distinct);
+    let mut rows = Vec::with_capacity(selected.len());
+    for index in selected {
+        let mut row = distinct[index].1.clone();
         row.identity = evidence_identity(&format!("packet-evidence-{:03}", rows.len()));
         rows.push(row);
     }
@@ -190,6 +183,110 @@ fn packet_evidence_selection(support: &[SupportUnitDto]) -> PacketEvidenceSelect
     PacketEvidenceSelectionV3 {
         rows,
         was_bounded: distinct_rows > PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3,
+    }
+}
+
+fn select_packet_evidence_indices(
+    distinct: &[(SupportUnitKindDto, PacketEvidenceRowV3Dto)],
+) -> Vec<usize> {
+    // Close the mandatory identity envelope before transport compaction. Preserve the runtime's
+    // native rank inside each class while reserving useful context for paths, symbols, and edges.
+    let mut selected = Vec::with_capacity(distinct.len().min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3));
+    let mut selected_indices = HashSet::new();
+
+    let mut source_paths = HashSet::new();
+    for (index, (kind, row)) in distinct.iter().enumerate() {
+        if *kind == SupportUnitKindDto::SourceRange
+            && source_paths.insert(row.path.as_ref().map(|path| path.as_str()))
+        {
+            selected.push(index);
+            selected_indices.insert(index);
+            if selected.len() == PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3 {
+                break;
+            }
+        }
+    }
+
+    let mut source_symbols = selected
+        .iter()
+        .filter_map(|index| distinct[*index].1.symbol_id.as_ref())
+        .map(|symbol| symbol.as_str())
+        .collect::<HashSet<_>>();
+    for (index, (kind, row)) in distinct.iter().enumerate() {
+        if selected.len() == PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3 {
+            break;
+        }
+        if *kind == SupportUnitKindDto::SourceRange
+            && !selected_indices.contains(&index)
+            && row
+                .symbol_id
+                .as_ref()
+                .is_some_and(|symbol| source_symbols.insert(symbol.as_str()))
+        {
+            selected.push(index);
+            selected_indices.insert(index);
+        }
+    }
+    select_packet_evidence_kind(
+        distinct,
+        SupportUnitKindDto::SourceRange,
+        PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3,
+        &mut selected,
+        &mut selected_indices,
+    );
+    let location_target = selected
+        .len()
+        .saturating_add(PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3)
+        .min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+    select_packet_evidence_kind(
+        distinct,
+        SupportUnitKindDto::SymbolLocation,
+        location_target,
+        &mut selected,
+        &mut selected_indices,
+    );
+    let relation_target = selected
+        .len()
+        .saturating_add(PACKET_PUBLIC_RELATION_ROWS_TARGET_V3)
+        .min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+    select_packet_evidence_kind(
+        distinct,
+        SupportUnitKindDto::TypedGraphEdge,
+        relation_target,
+        &mut selected,
+        &mut selected_indices,
+    );
+
+    for kind in [
+        SupportUnitKindDto::SourceRange,
+        SupportUnitKindDto::SymbolLocation,
+        SupportUnitKindDto::TypedGraphEdge,
+    ] {
+        select_packet_evidence_kind(
+            distinct,
+            kind,
+            PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3,
+            &mut selected,
+            &mut selected_indices,
+        );
+    }
+    selected
+}
+
+fn select_packet_evidence_kind(
+    distinct: &[(SupportUnitKindDto, PacketEvidenceRowV3Dto)],
+    selected_kind: SupportUnitKindDto,
+    maximum_total: usize,
+    selected: &mut Vec<usize>,
+    selected_indices: &mut HashSet<usize>,
+) {
+    for (index, (kind, _)) in distinct.iter().enumerate() {
+        if selected.len() == maximum_total {
+            break;
+        }
+        if *kind == selected_kind && selected_indices.insert(index) {
+            selected.push(index);
+        }
     }
 }
 
@@ -222,16 +319,10 @@ fn packet_evidence_was_bounded(support: &[SupportUnitDto]) -> bool {
     packet_evidence_selection(support).was_bounded
 }
 
-const PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3: usize = 32;
-
-fn packet_evidence_context_priority(kind: SupportUnitKindDto) -> u8 {
-    match kind {
-        SupportUnitKindDto::SourceRange => 0,
-        SupportUnitKindDto::TypedGraphEdge => 1,
-        SupportUnitKindDto::SymbolLocation => 2,
-        SupportUnitKindDto::CompleteQueryNegative => 3,
-    }
-}
+const PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3: usize = 8;
+const PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3: usize = 4;
+const PACKET_PUBLIC_RELATION_ROWS_TARGET_V3: usize = 4;
+const PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3: usize = 16;
 
 /// Project a context answer without exposing answer confidence or claim state.
 pub fn project_context_v3(
@@ -801,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_evidence_prioritizes_source_excerpts_and_relations_before_locations() {
+    fn packet_evidence_prioritizes_source_excerpts_locations_and_relations() {
         let mut location = support_unit(SupportUnitKindDto::SymbolLocation);
         location.summary = "location".to_owned();
         let mut relation = support_unit(SupportUnitKindDto::TypedGraphEdge);
@@ -816,7 +907,7 @@ mod tests {
             rows.iter()
                 .map(|row| row.summary.as_ref().unwrap().as_str())
                 .collect::<Vec<_>>(),
-            ["fn useful() {}", "caller -[CALL]-> callee", "location"]
+            ["fn useful() {}", "location", "caller -[CALL]-> callee"]
         );
         assert_eq!(
             rows.iter()
@@ -870,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_evidence_closes_the_public_identity_envelope_before_optional_compaction() {
+    fn packet_evidence_closes_a_diverse_content_bearing_identity_envelope() {
         let support = (0..15)
             .map(|index| {
                 let mut unit = support_unit(SupportUnitKindDto::SourceRange);
@@ -903,18 +994,79 @@ mod tests {
                 .iter()
                 .filter(|row| row.kind == EvidenceKindV3Dto::ExactSource)
                 .count(),
-            15,
-            "all source receipts must precede lower-value rows"
+            12,
+            "the closed envelope keeps eight excerpts and four symbol locations"
         );
         assert_eq!(
             evidence
                 .iter()
                 .filter(|row| row.kind == EvidenceKindV3Dto::GraphRelation)
                 .count(),
-            17,
-            "the remaining slots must retain the next graph relations"
+            4,
+            "the closed envelope reserves four relation receipts"
+        );
+        assert_eq!(
+            evidence
+                .iter()
+                .filter_map(|row| row.summary.as_ref().map(|summary| summary.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                "fn source_0() {}",
+                "fn source_1() {}",
+                "fn source_2() {}",
+                "fn source_3() {}",
+                "fn source_4() {}",
+                "fn source_5() {}",
+                "fn source_6() {}",
+                "fn source_7() {}",
+                "fixture",
+                "fixture",
+                "fixture",
+                "fixture",
+                "caller-0 -[CALL]-> callee-0",
+                "caller-1 -[CALL]-> callee-1",
+                "caller-2 -[CALL]-> callee-2",
+                "caller-3 -[CALL]-> callee-3",
+            ]
         );
         assert!(packet_evidence_was_bounded(&support));
+    }
+
+    #[test]
+    fn packet_evidence_uses_distinct_source_paths_before_repeated_ranges() {
+        let support = (0..12)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("source-{index}");
+                unit.path = Some(if index < 5 {
+                    "src/repeated.rs".to_owned()
+                } else {
+                    format!("src/distinct-{index}.rs")
+                });
+                unit.start_line = Some(index + 1);
+                unit.snippet = Some(format!("source {index}"));
+                unit
+            })
+            .collect::<Vec<_>>();
+
+        let evidence = packet_evidence_rows(&support);
+        let first_eight_paths = evidence
+            .iter()
+            .take(8)
+            .filter_map(|row| row.path.as_ref().map(|path| path.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_eight_paths.len(), 8);
+        assert_eq!(
+            first_eight_paths
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            8,
+            "each available source path gets one content-bearing row before repeats"
+        );
+        assert_eq!(first_eight_paths[0], "src/repeated.rs");
     }
 
     #[test]
