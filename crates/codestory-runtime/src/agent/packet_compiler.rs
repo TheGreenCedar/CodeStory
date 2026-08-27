@@ -154,10 +154,10 @@ fn typed_edge_support_units(
     graph: &GraphResponse,
     seen: &mut BTreeSet<String>,
 ) -> Vec<SupportUnitDto> {
-    let labels = graph
+    let nodes = graph
         .nodes
         .iter()
-        .map(|node| (node.id.0.as_str(), node.label.as_str()))
+        .map(|node| (node.id.0.as_str(), node))
         .collect::<std::collections::HashMap<_, _>>();
     let mut units = Vec::new();
     for edge in &graph.edges {
@@ -178,13 +178,13 @@ fn typed_edge_support_units(
         if !seen.insert(id.clone()) {
             continue;
         }
-        let from = labels
-            .get(edge.source.0.as_str())
-            .copied()
+        let source_node = nodes.get(edge.source.0.as_str()).copied();
+        let from = source_node
+            .map(|node| node.label.as_str())
             .unwrap_or(edge.source.0.as_str());
-        let to = labels
+        let to = nodes
             .get(edge.target.0.as_str())
-            .copied()
+            .map(|node| node.label.as_str())
             .unwrap_or(edge.target.0.as_str());
         let kind = match edge.kind {
             EdgeKind::CALL => "CALL",
@@ -198,8 +198,10 @@ fn typed_edge_support_units(
             id,
             kind: SupportUnitKindDto::TypedGraphEdge,
             summary: format!("`{from}` {kind} `{to}`"),
-            path: None,
-            symbol_id: None,
+            path: source_node
+                .and_then(|node| node.file_path.as_deref())
+                .map(packet_display_path),
+            symbol_id: Some(edge.source.0.clone()),
             start_line: None,
             end_line: None,
             snippet: None,
@@ -1589,7 +1591,7 @@ mod tests {
             badge_visible_members: None,
             badge_total_members: None,
             merged_symbol_examples: Vec::new(),
-            file_path: None,
+            file_path: (id == "builder").then(|| "src/builder.rs".to_string()),
             qualified_name: None,
             member_access: None,
         };
@@ -1631,5 +1633,7 @@ mod tests {
                 .all(|unit| unit.kind == SupportUnitKindDto::TypedGraphEdge)
         );
         assert_eq!(units[0].summary, "`builder` TYPE_USAGE `config`");
+        assert_eq!(units[0].path.as_deref(), Some("src/builder.rs"));
+        assert_eq!(units[0].symbol_id.as_deref(), Some("builder"));
     }
 }

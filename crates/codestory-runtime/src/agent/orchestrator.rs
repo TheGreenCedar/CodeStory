@@ -2417,7 +2417,14 @@ fn citation_needs_bounded_source_read(citation: &AgentCitationDto) -> bool {
             .evidence_producer
             .as_deref()
             .is_some_and(|producer| producer.starts_with("structural_"));
-    structural_source || citation_is_lexical_source_range(citation)
+    let internal_synthetic_source = citation.evidence_tier
+        == Some(PacketEvidenceTierDto::SyntheticSourceScan)
+        && citation.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+        && citation
+            .evidence_producer
+            .as_deref()
+            .is_some_and(|producer| producer.starts_with("packet_"));
+    structural_source || citation_is_lexical_source_range(citation) || internal_synthetic_source
 }
 
 fn demote_parser_partial_citations_without_source_receipts(
@@ -8424,6 +8431,20 @@ mod tests {
         assert!(citation_needs_bounded_source_read(&citation));
 
         citation.resolution_status = Some(PacketEvidenceResolutionDto::Unresolved);
+        assert!(!citation_needs_bounded_source_read(&citation));
+    }
+
+    #[test]
+    fn internal_synthetic_source_scan_uses_its_path_and_line_for_the_receipt() {
+        let mut citation = test_packet_citation("format_arg_store", "include/fmt/base.h", 46.0);
+        citation.kind = NodeKind::STRUCT;
+        citation.evidence_tier = Some(PacketEvidenceTierDto::SyntheticSourceScan);
+        citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+        citation.evidence_producer = Some("packet_cited_formatting_type".to_owned());
+
+        assert!(citation_needs_bounded_source_read(&citation));
+
+        citation.evidence_producer = Some("external_source_scan".to_owned());
         assert!(!citation_needs_bounded_source_read(&citation));
     }
 
