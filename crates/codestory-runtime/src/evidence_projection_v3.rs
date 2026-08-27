@@ -1,11 +1,11 @@
 //! Public evidence-only projection facade for CodeStory schema 3.
 
-use std::collections::HashSet;
+use std::{cmp::Reverse, collections::HashSet};
 
 use codestory_contracts::{
     api::{
         AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, PacketDispositionKindDto, SearchHit,
-        SearchResultsDto, SupportUnitDto, SupportUnitKindDto,
+        SearchResultsDto, SupportUnitDto, SupportUnitKindDto, decode_drill_option_id,
     },
     packet_projection_v3::{
         BoundedVecV3, ContextEvidenceRowV3Dto, ContextProjectionV3Dto, ContextTargetV3Dto,
@@ -78,7 +78,10 @@ pub fn project_packet_v3(
     let PacketEvidenceSelectionV3 {
         rows: evidence,
         was_bounded: evidence_was_bounded,
-    } = packet_evidence_selection(&packet.support);
+    } = packet_evidence_selection(
+        &packet.support,
+        &packet_evidence_ranking_terms(&request.question, &request.option_ids),
+    );
 
     let mut gaps = packet_gaps(packet);
     if evidence_was_bounded {
@@ -156,7 +159,10 @@ struct PacketEvidenceContentKeyV3 {
     summary: Option<String>,
 }
 
-fn packet_evidence_selection(support: &[SupportUnitDto]) -> PacketEvidenceSelectionV3 {
+fn packet_evidence_selection(
+    support: &[SupportUnitDto],
+    ranking_terms: &HashSet<String>,
+) -> PacketEvidenceSelectionV3 {
     let mut seen = HashSet::new();
     let mut distinct = Vec::new();
     for unit in support
@@ -167,7 +173,8 @@ fn packet_evidence_selection(support: &[SupportUnitDto]) -> PacketEvidenceSelect
             continue;
         };
         if seen.insert(packet_evidence_content_key(&row)) {
-            distinct.push((unit.kind, row));
+            let relevance = packet_evidence_relevance(&row, ranking_terms);
+            distinct.push((unit.kind, row, relevance));
         }
     }
 
@@ -187,20 +194,22 @@ fn packet_evidence_selection(support: &[SupportUnitDto]) -> PacketEvidenceSelect
 }
 
 fn select_packet_evidence_indices(
-    distinct: &[(SupportUnitKindDto, PacketEvidenceRowV3Dto)],
+    distinct: &[(SupportUnitKindDto, PacketEvidenceRowV3Dto, usize)],
 ) -> Vec<usize> {
     // Close the mandatory identity envelope before transport compaction. Preserve the runtime's
     // native rank inside each class while reserving useful context for paths, symbols, and edges.
     let mut selected = Vec::with_capacity(distinct.len().min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3));
     let mut selected_indices = HashSet::new();
+    let source_order = packet_evidence_kind_order(distinct, SupportUnitKindDto::SourceRange);
+    let location_order = packet_evidence_kind_order(distinct, SupportUnitKindDto::SymbolLocation);
+    let relation_order = packet_evidence_kind_order(distinct, SupportUnitKindDto::TypedGraphEdge);
 
     let mut source_paths = HashSet::new();
-    for (index, (kind, row)) in distinct.iter().enumerate() {
-        if *kind == SupportUnitKindDto::SourceRange
-            && source_paths.insert(row.path.as_ref().map(|path| path.as_str()))
-        {
-            selected.push(index);
-            selected_indices.insert(index);
+    for index in &source_order {
+        let row = &distinct[*index].1;
+        if source_paths.insert(row.path.as_ref().map(|path| path.as_str())) {
+            selected.push(*index);
+            selected_indices.insert(*index);
             if selected.len() == PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3 {
                 break;
             }
@@ -212,24 +221,23 @@ fn select_packet_evidence_indices(
         .filter_map(|index| distinct[*index].1.symbol_id.as_ref())
         .map(|symbol| symbol.as_str())
         .collect::<HashSet<_>>();
-    for (index, (kind, row)) in distinct.iter().enumerate() {
+    for index in &source_order {
         if selected.len() == PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3 {
             break;
         }
-        if *kind == SupportUnitKindDto::SourceRange
-            && !selected_indices.contains(&index)
+        let row = &distinct[*index].1;
+        if !selected_indices.contains(index)
             && row
                 .symbol_id
                 .as_ref()
                 .is_some_and(|symbol| source_symbols.insert(symbol.as_str()))
         {
-            selected.push(index);
-            selected_indices.insert(index);
+            selected.push(*index);
+            selected_indices.insert(*index);
         }
     }
     select_packet_evidence_kind(
-        distinct,
-        SupportUnitKindDto::SourceRange,
+        &source_order,
         PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3,
         &mut selected,
         &mut selected_indices,
@@ -239,8 +247,7 @@ fn select_packet_evidence_indices(
         .saturating_add(PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3)
         .min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
     select_packet_evidence_kind(
-        distinct,
-        SupportUnitKindDto::SymbolLocation,
+        &location_order,
         location_target,
         &mut selected,
         &mut selected_indices,
@@ -250,21 +257,15 @@ fn select_packet_evidence_indices(
         .saturating_add(PACKET_PUBLIC_RELATION_ROWS_TARGET_V3)
         .min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
     select_packet_evidence_kind(
-        distinct,
-        SupportUnitKindDto::TypedGraphEdge,
+        &relation_order,
         relation_target,
         &mut selected,
         &mut selected_indices,
     );
 
-    for kind in [
-        SupportUnitKindDto::SourceRange,
-        SupportUnitKindDto::SymbolLocation,
-        SupportUnitKindDto::TypedGraphEdge,
-    ] {
+    for order in [&source_order, &location_order, &relation_order] {
         select_packet_evidence_kind(
-            distinct,
-            kind,
+            order,
             PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3,
             &mut selected,
             &mut selected_indices,
@@ -274,20 +275,127 @@ fn select_packet_evidence_indices(
 }
 
 fn select_packet_evidence_kind(
-    distinct: &[(SupportUnitKindDto, PacketEvidenceRowV3Dto)],
-    selected_kind: SupportUnitKindDto,
+    ordered_indices: &[usize],
     maximum_total: usize,
     selected: &mut Vec<usize>,
     selected_indices: &mut HashSet<usize>,
 ) {
-    for (index, (kind, _)) in distinct.iter().enumerate() {
+    for index in ordered_indices {
         if selected.len() == maximum_total {
             break;
         }
-        if *kind == selected_kind && selected_indices.insert(index) {
-            selected.push(index);
+        if selected_indices.insert(*index) {
+            selected.push(*index);
         }
     }
+}
+
+fn packet_evidence_kind_order(
+    distinct: &[(SupportUnitKindDto, PacketEvidenceRowV3Dto, usize)],
+    selected_kind: SupportUnitKindDto,
+) -> Vec<usize> {
+    let mut indices = distinct
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (kind, _, _))| (*kind == selected_kind).then_some(index))
+        .collect::<Vec<_>>();
+    indices.sort_by_key(|index| (Reverse(distinct[*index].2), *index));
+    indices
+}
+
+fn packet_evidence_ranking_terms(question: &str, option_ids: &[String]) -> HashSet<String> {
+    let mut terms = packet_evidence_terms(question);
+    for option_id in option_ids {
+        if let Some((_, target)) = decode_drill_option_id(option_id) {
+            terms.extend(packet_evidence_terms(&target));
+        }
+    }
+    terms
+}
+
+fn packet_evidence_relevance(
+    row: &PacketEvidenceRowV3Dto,
+    ranking_terms: &HashSet<String>,
+) -> usize {
+    let mut text = String::new();
+    for value in [
+        row.path.as_ref().map(|value| value.as_str()),
+        row.symbol_id.as_ref().map(|value| value.as_str()),
+        row.summary.as_ref().map(|value| value.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        text.push_str(value);
+        text.push(' ');
+    }
+    let evidence_terms = packet_evidence_terms(&text);
+    ranking_terms
+        .iter()
+        .filter(|expected| {
+            evidence_terms
+                .iter()
+                .any(|observed| packet_evidence_term_matches(expected, observed))
+        })
+        .count()
+}
+
+fn packet_evidence_terms(value: &str) -> HashSet<String> {
+    let mut normalized = String::with_capacity(value.len());
+    let mut previous_was_lower_or_digit = false;
+    for ch in value.chars() {
+        if ch.is_alphanumeric() {
+            if ch.is_uppercase() && previous_was_lower_or_digit {
+                normalized.push(' ');
+            }
+            for lowercase in ch.to_lowercase() {
+                normalized.push(lowercase);
+            }
+            previous_was_lower_or_digit = ch.is_lowercase() || ch.is_ascii_digit();
+        } else {
+            normalized.push(' ');
+            previous_was_lower_or_digit = false;
+        }
+    }
+    normalized
+        .split_whitespace()
+        .filter(|term| term.len() >= 4 && !packet_evidence_stopword(term))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn packet_evidence_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "cite"
+            | "cited"
+            | "cites"
+            | "explain"
+            | "file"
+            | "files"
+            | "from"
+            | "into"
+            | "name"
+            | "named"
+            | "source"
+            | "sources"
+            | "supporting"
+            | "symbol"
+            | "symbols"
+            | "that"
+            | "them"
+            | "then"
+            | "this"
+            | "through"
+            | "with"
+    )
+}
+
+fn packet_evidence_term_matches(expected: &str, observed: &str) -> bool {
+    expected == observed
+        || (expected.chars().count() >= 4
+            && observed.chars().count() >= 4
+            && expected.chars().take(4).eq(observed.chars().take(4)))
 }
 
 fn packet_evidence_content_key(row: &PacketEvidenceRowV3Dto) -> PacketEvidenceContentKeyV3 {
@@ -311,12 +419,25 @@ fn packet_evidence_content_key(row: &PacketEvidenceRowV3Dto) -> PacketEvidenceCo
 
 #[cfg(test)]
 fn packet_evidence_rows(support: &[SupportUnitDto]) -> Vec<PacketEvidenceRowV3Dto> {
-    packet_evidence_selection(support).rows
+    packet_evidence_selection(support, &HashSet::new()).rows
+}
+
+#[cfg(test)]
+fn packet_evidence_rows_for_request(
+    support: &[SupportUnitDto],
+    question: &str,
+    option_ids: &[String],
+) -> Vec<PacketEvidenceRowV3Dto> {
+    packet_evidence_selection(
+        support,
+        &packet_evidence_ranking_terms(question, option_ids),
+    )
+    .rows
 }
 
 #[cfg(test)]
 fn packet_evidence_was_bounded(support: &[SupportUnitDto]) -> bool {
-    packet_evidence_selection(support).was_bounded
+    packet_evidence_selection(support, &HashSet::new()).was_bounded
 }
 
 const PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3: usize = 8;
@@ -1067,6 +1188,71 @@ mod tests {
             "each available source path gets one content-bearing row before repeats"
         );
         assert_eq!(first_eight_paths[0], "src/repeated.rs");
+    }
+
+    #[test]
+    fn packet_evidence_prioritizes_question_terms_inside_each_evidence_class() {
+        let mut support = (0..10)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("unrelated-{index}");
+                unit.path = Some(format!("src/unrelated-{index}.rs"));
+                unit.symbol_id = Some(format!("unrelated-{index}"));
+                unit.snippet = Some(format!("fn unrelated_{index}() {{}}"));
+                unit
+            })
+            .collect::<Vec<_>>();
+        let mut relevant = support_unit(SupportUnitKindDto::SourceRange);
+        relevant.id = "process-command".to_owned();
+        relevant.path = Some("src/server.c".to_owned());
+        relevant.symbol_id = Some("process-command".to_owned());
+        relevant.summary = "source for processCommand".to_owned();
+        relevant.snippet = Some("int processCommand(client *c) { return execute(c); }".to_owned());
+        support.push(relevant);
+
+        let evidence = packet_evidence_rows_for_request(
+            &support,
+            "Trace how the server routes a command for execution.",
+            &[],
+        );
+
+        assert_eq!(evidence[0].path.as_ref().unwrap().as_str(), "src/server.c");
+    }
+
+    #[test]
+    fn packet_evidence_prioritizes_the_selected_continuation_gap() {
+        let mut support = (0..10)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("base-{index}");
+                unit.path = Some(format!("source/base-{index}.css"));
+                unit.symbol_id = Some(format!("base-{index}"));
+                unit.snippet = Some(format!(".base-{index} {{ animation-duration: 1s; }}"));
+                unit
+            })
+            .collect::<Vec<_>>();
+        let mut bounce = support_unit(SupportUnitKindDto::SourceRange);
+        bounce.id = "bounce-keyframes".to_owned();
+        bounce.path = Some("source/attention_seekers/bounce.css".to_owned());
+        bounce.symbol_id = Some("bounce-keyframes".to_owned());
+        bounce.summary = "source for @keyframes bounce".to_owned();
+        bounce.snippet = Some("@keyframes bounce { from { transform: none; } }".to_owned());
+        support.push(bounce);
+        let option_id = codestory_contracts::api::encode_drill_option_id(
+            codestory_contracts::api::DrillGapKindDto::OmittedMandatorySupport,
+            "symbol:packet::css_import::source/attention_seekers/bounce.css::@keyframes bounce",
+        );
+
+        let evidence = packet_evidence_rows_for_request(
+            &support,
+            "Explain how the animation classes connect.",
+            &[option_id],
+        );
+
+        assert_eq!(
+            evidence[0].path.as_ref().unwrap().as_str(),
+            "source/attention_seekers/bounce.css"
+        );
     }
 
     #[test]
