@@ -613,6 +613,8 @@ mod tests {
             &fixture.runtime.layout,
             &fixture.rollback.manifest.semantic_generation,
         );
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make retained rollback vector database writable for corruption");
         std::fs::OpenOptions::new()
             .append(true)
             .open(&vector_path)

@@ -4600,6 +4600,8 @@ mod tests {
         );
         let vector_path =
             crate::embedded_vector::index_path(&runtime.layout, &previous.semantic_generation);
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make rollback vector database writable for corruption");
         std::fs::OpenOptions::new()
             .append(true)
             .open(&vector_path)
