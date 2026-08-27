@@ -1746,6 +1746,34 @@ fn cited_source_paths_with_extensions(
         }
         paths.push(path);
     }
+    for node in answer
+        .graphs
+        .iter()
+        .filter_map(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => Some(&graph.nodes),
+            GraphArtifactDto::Mermaid { .. } => None,
+        })
+        .flatten()
+    {
+        let Some(raw) = node.file_path.as_deref() else {
+            continue;
+        };
+        let path = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            project_root.join(raw)
+        };
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if extensions.iter().any(|expected| extension == *expected)
+            && !paths.iter().any(|existing| existing == &path)
+        {
+            paths.push(path);
+        }
+    }
     paths
 }
 
@@ -11094,6 +11122,31 @@ mod tests {
         assert!(
             !displays.contains(&"ILeftoverMapper"),
             "uncited mapper files must not be scanned: {displays:?}"
+        );
+
+        let mut graphed = packet_answer_fixture(prompt, Vec::new());
+        let mut mapper_node = typed_graph_node("runtime-mapper", NodeKind::CLASS);
+        mapper_node.file_path = Some(
+            root.join("src/ObjectMapping/RuntimeMapper.cs")
+                .display()
+                .to_string(),
+        );
+        graphed.graphs = vec![uml_artifact(
+            "mapper-flow",
+            "runtime-mapper",
+            vec![mapper_node],
+            Vec::new(),
+        )];
+        maybe_append_cited_mapper_interface_citations(&root, prompt, &mut graphed);
+        let graphed_displays = graphed
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            graphed_displays.contains(&"IRuntimeMapperBase")
+                && graphed_displays.contains(&"IRuntimeMapper"),
+            "retained graph source should promote mapper interfaces: {graphed_displays:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
