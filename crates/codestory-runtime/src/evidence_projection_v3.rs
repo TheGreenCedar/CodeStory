@@ -1,5 +1,7 @@
 //! Public evidence-only projection facade for CodeStory schema 3.
 
+use std::collections::HashSet;
+
 use codestory_contracts::{
     api::{
         AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, PacketDispositionKindDto, SearchHit,
@@ -73,10 +75,13 @@ pub fn project_packet_v3(
     packet: &AgentPacketDto,
     mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
 ) -> Result<PacketEvidenceProductV3, codestory_contracts::api::ApiError> {
-    let evidence = packet_evidence_rows(&packet.support);
+    let PacketEvidenceSelectionV3 {
+        rows: evidence,
+        was_bounded: evidence_was_bounded,
+    } = packet_evidence_selection(&packet.support);
 
     let mut gaps = packet_gaps(packet);
-    if packet_evidence_was_bounded(&packet.support, evidence.len()) {
+    if evidence_was_bounded {
         gaps.push(gap_row(
             "evidence-projection-bounded",
             GapKindV3Dto::OutputBudgetExceeded,
@@ -136,7 +141,22 @@ pub fn project_packet_v3(
     })
 }
 
-fn packet_evidence_rows(support: &[SupportUnitDto]) -> Vec<PacketEvidenceRowV3Dto> {
+struct PacketEvidenceSelectionV3 {
+    rows: Vec<PacketEvidenceRowV3Dto>,
+    was_bounded: bool,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct PacketEvidenceContentKeyV3 {
+    kind: u8,
+    path: Option<String>,
+    symbol_id: Option<String>,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    summary: Option<String>,
+}
+
+fn packet_evidence_selection(support: &[SupportUnitDto]) -> PacketEvidenceSelectionV3 {
     let mut ranked_support = support
         .iter()
         .enumerate()
@@ -145,13 +165,64 @@ fn packet_evidence_rows(support: &[SupportUnitDto]) -> Vec<PacketEvidenceRowV3Dt
     ranked_support.sort_by_key(|(original_rank, unit)| {
         (packet_evidence_context_priority(unit.kind), *original_rank)
     });
-    ranked_support
+
+    let mut seen = HashSet::new();
+    let mut distinct = Vec::new();
+    for (_, unit) in ranked_support {
+        let Some(row) = packet_evidence_row(0, unit) else {
+            continue;
+        };
+        if seen.insert(packet_evidence_content_key(&row)) {
+            distinct.push(row);
+        }
+    }
+
+    let distinct_rows = distinct.len();
+    let mut rows = Vec::with_capacity(distinct_rows.min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3));
+    for mut row in distinct
         .into_iter()
-        .enumerate()
-        .filter_map(|(projection_rank, (_, unit))| packet_evidence_row(projection_rank, unit))
-        .take(codestory_contracts::packet_projection_v3::EVIDENCE_ROWS_MAX_V3)
-        .collect()
+        .take(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3)
+    {
+        row.identity = evidence_identity(&format!("packet-evidence-{:03}", rows.len()));
+        rows.push(row);
+    }
+
+    PacketEvidenceSelectionV3 {
+        rows,
+        was_bounded: distinct_rows > PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3,
+    }
 }
+
+fn packet_evidence_content_key(row: &PacketEvidenceRowV3Dto) -> PacketEvidenceContentKeyV3 {
+    PacketEvidenceContentKeyV3 {
+        kind: match row.kind {
+            EvidenceKindV3Dto::ExactSource => 0,
+            EvidenceKindV3Dto::StructuralSource => 1,
+            EvidenceKindV3Dto::GraphRelation => 2,
+            EvidenceKindV3Dto::RetrievalExcerpt => 3,
+        },
+        path: row.path.as_ref().map(|value| value.as_str().to_owned()),
+        symbol_id: row
+            .symbol_id
+            .as_ref()
+            .map(|value| value.as_str().to_owned()),
+        start_line: row.start_line,
+        end_line: row.end_line,
+        summary: row.summary.as_ref().map(|value| value.as_str().to_owned()),
+    }
+}
+
+#[cfg(test)]
+fn packet_evidence_rows(support: &[SupportUnitDto]) -> Vec<PacketEvidenceRowV3Dto> {
+    packet_evidence_selection(support).rows
+}
+
+#[cfg(test)]
+fn packet_evidence_was_bounded(support: &[SupportUnitDto]) -> bool {
+    packet_evidence_selection(support).was_bounded
+}
+
+const PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3: usize = 32;
 
 fn packet_evidence_context_priority(kind: SupportUnitKindDto) -> u8 {
     match kind {
@@ -393,14 +464,6 @@ fn packet_symbol_location_summary(unit: &SupportUnitDto) -> String {
         (Some(path), None) => path.to_owned(),
         _ => "project source location".to_owned(),
     }
-}
-
-fn packet_evidence_was_bounded(support: &[SupportUnitDto], projected_len: usize) -> bool {
-    support
-        .iter()
-        .filter(|unit| unit.kind != SupportUnitKindDto::CompleteQueryNegative)
-        .count()
-        > projected_len
 }
 
 fn packet_gaps(packet: &AgentPacketDto) -> Vec<ProjectionGapRowV3Dto> {
@@ -701,11 +764,10 @@ mod tests {
     fn complete_query_negative_is_a_gap_not_a_bounded_evidence_row() {
         let support = vec![support_unit(SupportUnitKindDto::CompleteQueryNegative)];
 
-        assert!(!packet_evidence_was_bounded(&support, 0));
-        assert!(packet_evidence_was_bounded(
-            &[support_unit(SupportUnitKindDto::SourceRange)],
-            0
-        ));
+        assert!(!packet_evidence_was_bounded(&support));
+        assert!(!packet_evidence_was_bounded(&[support_unit(
+            SupportUnitKindDto::SourceRange
+        )]));
     }
 
     #[test]
@@ -766,6 +828,93 @@ mod tests {
                 "packet-evidence-002"
             ]
         );
+    }
+
+    #[test]
+    fn packet_evidence_deduplicates_identical_public_rows_before_applying_the_bound() {
+        let duplicate = || {
+            let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+            unit.path = Some("src/repeated.rs".to_owned());
+            unit.symbol_id = Some("repeated".to_owned());
+            unit.start_line = Some(7);
+            unit.end_line = Some(9);
+            unit.snippet = Some("fn repeated() {}".to_owned());
+            unit
+        };
+        let mut support = (0..40)
+            .map(|index| {
+                let mut unit = duplicate();
+                unit.id = format!("duplicate-{index}");
+                unit
+            })
+            .collect::<Vec<_>>();
+        let mut distinct = duplicate();
+        distinct.id = "distinct".to_owned();
+        distinct.path = Some("src/distinct.rs".to_owned());
+        support.push(distinct);
+
+        let evidence = packet_evidence_rows(&support);
+
+        assert_eq!(evidence.len(), 2);
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|row| row.path.as_ref().unwrap().as_str())
+                .collect::<Vec<_>>(),
+            ["src/repeated.rs", "src/distinct.rs"]
+        );
+        assert!(
+            !packet_evidence_was_bounded(&support),
+            "discarding duplicate renderings must not report missing evidence"
+        );
+    }
+
+    #[test]
+    fn packet_evidence_closes_the_public_identity_envelope_before_optional_compaction() {
+        let support = (0..15)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("source-{index}");
+                unit.path = Some(format!("src/source-{index}.rs"));
+                unit.snippet = Some(format!("fn source_{index}() {{}}"));
+                unit
+            })
+            .chain((0..24).map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::TypedGraphEdge);
+                unit.id = format!("edge-{index}");
+                unit.from_symbol = Some(format!("caller-{index}"));
+                unit.edge_kind = Some("CALL".to_owned());
+                unit.to_symbol = Some(format!("callee-{index}"));
+                unit
+            }))
+            .chain((0..14).map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SymbolLocation);
+                unit.id = format!("location-{index}");
+                unit.path = Some(format!("src/location-{index}.rs"));
+                unit
+            }))
+            .collect::<Vec<_>>();
+
+        let evidence = packet_evidence_rows(&support);
+
+        assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|row| row.kind == EvidenceKindV3Dto::ExactSource)
+                .count(),
+            15,
+            "all source receipts must precede lower-value rows"
+        );
+        assert_eq!(
+            evidence
+                .iter()
+                .filter(|row| row.kind == EvidenceKindV3Dto::GraphRelation)
+                .count(),
+            17,
+            "the remaining slots must retain the next graph relations"
+        );
+        assert!(packet_evidence_was_bounded(&support));
     }
 
     #[test]

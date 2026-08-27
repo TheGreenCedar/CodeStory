@@ -5,10 +5,12 @@ use crate::app::diagnostics::{index_next_commands, semantic_contract_check};
 use crate::app::{packet_budget_mode_label, packet_task_class_label, render_packet_markdown};
 use crate::output::{REPO_CONTENT_BOUNDARY_LINE, render_public_operation_json_content};
 use codestory_contracts::api::{
-    AgentResponseBlockDto, AgentResponseSectionDto, IndexFreshnessDto,
-    IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto, PacketBudgetModeDto,
-    PacketTaskClassDto, RetrievalFallbackReasonDto, SearchHitOrigin,
+    AgentResponseBlockDto, AgentResponseSectionDto, EmbeddingVectorPublicationIdentityDto,
+    IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto,
+    IndexPublicationDto, IndexPublicationModeDto, PacketBudgetModeDto, PacketTaskClassDto,
+    RetrievalFallbackReasonDto, SearchHitOrigin,
 };
+use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
 use std::path::Path;
 
 #[test]
@@ -134,6 +136,93 @@ fn packet_cli_json_budget_measures_publication_metadata_and_newline() {
         operation.value.budget.used.output_bytes as usize,
         rendered.len()
     );
+}
+
+#[test]
+fn packet_cli_thirty_two_row_identity_envelope_stays_complete() {
+    let evidence = (0..32)
+        .map(|index| {
+            serde_json::json!({
+                "identity":{"evidence_id":format!("packet-evidence-{index:03}")},
+                "kind":if index < 16 { "exact_source" } else { "graph_relation" },
+                "path":format!("src/{index}/{}-é.rs", "path-segment-".repeat(12)),
+                "symbol_id":format!("qualified::symbol::{index}::{}", "member".repeat(16)),
+                "start_line":index + 1,
+                "end_line":index + 2,
+                "summary":format!("quote=\" slash=\\ control=\n {}", "evidence ".repeat(60))
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut projection: PacketProjectionV3Dto = serde_json::from_value(serde_json::json!({
+        "kind":"complete",
+        "schema_version":3,
+        "identity":{
+            "packet_id":"b96ac0cc-e552-4c35-a0ba-c83b9ead67de",
+            "request_id":"request-1",
+            "question_sha256":"a".repeat(64)
+        },
+        "publication":{
+            "core":{
+                "project_id":"project-1",
+                "generation_id":"core-generation-1",
+                "run_id":"core-run-1"
+            },
+            "retrieval":null
+        },
+        "status":"available",
+        "retrieval":{"state":"full","generation_id":"retrieval-generation-1"},
+        "evidence":evidence,
+        "gaps":[{
+            "identity":{"gap_id":"evidence-projection-bounded"},
+            "kind":"output_budget_exceeded",
+            "message":"Additional internal support rows were omitted from the bounded public projection."
+        }],
+        "continuation":null,
+        "diagnostics":{
+            "availability":"available",
+            "reference":{
+                "artifact_id":"artifact-1",
+                "sha256":"b".repeat(64),
+                "byte_length":123
+            }
+        }
+    }))
+    .expect("valid packet projection fixture");
+    let envelope = codestory_runtime::PublicOperation {
+        value: (),
+        core_publication: Some(IndexPublicationDto {
+            generation: 3,
+            generation_id: "core-generation-1".to_owned(),
+            run_id: "core-run-1".to_owned(),
+            mode: IndexPublicationModeDto::Incremental,
+            published_at_epoch_ms: 1_725_000_600_123,
+        }),
+        retrieval_publication: Some(EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-generation-1".to_owned(),
+            core_run_id: "core-run-1".to_owned(),
+            retrieval_generation: "retrieval-generation-with-multibyte-é🦀".to_owned(),
+            retrieval_input_hash: "c".repeat(64),
+            semantic_generation: "semantic-generation-1".to_owned(),
+        }),
+        operation_id: "public-operation-123456789".to_owned(),
+        attempt: 2,
+    };
+
+    let measured = codestory_runtime::finalize_packet_projection_v3_for_representation(
+        &mut projection,
+        |candidate| {
+            render_public_operation_json_content(&envelope, candidate)
+                .map(|content| content.len())
+                .map_err(|_| ())
+        },
+    )
+    .expect("the CLI identity envelope must fit after optional compaction");
+    let rendered = render_public_operation_json_content(&envelope, &projection)
+        .expect("render complete packet projection");
+
+    assert!(matches!(projection, PacketProjectionV3Dto::Complete { .. }));
+    assert_eq!(measured, rendered.len());
+    assert!(measured <= 16 * 1024);
 }
 
 #[test]

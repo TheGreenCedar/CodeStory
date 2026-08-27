@@ -7890,6 +7890,89 @@ mod tests {
     }
 
     #[test]
+    fn packet_thirty_two_row_identity_envelope_stays_complete_for_every_revision() {
+        let evidence = (0..32)
+            .map(|index| {
+                json!({
+                    "identity":{"evidence_id":format!("packet-evidence-{index:03}")},
+                    "kind":if index < 16 { "exact_source" } else { "graph_relation" },
+                    "path":format!("src/{index}/{}-é.rs", "path-segment-".repeat(12)),
+                    "symbol_id":format!("qualified::symbol::{index}::{}", "member".repeat(16)),
+                    "start_line":index + 1,
+                    "end_line":index + 2,
+                    "summary":format!("quote=\" slash=\\ control=\n {}", "evidence ".repeat(60))
+                })
+            })
+            .collect::<Vec<_>>();
+        let candidate = json!({
+            "kind":"complete",
+            "schema_version":3,
+            "identity":{
+                "packet_id":"b96ac0cc-e552-4c35-a0ba-c83b9ead67de",
+                "request_id":"request-1",
+                "question_sha256":"a".repeat(64)
+            },
+            "publication":{
+                "core":{
+                    "project_id":"project-1",
+                    "generation_id":"core-generation-1",
+                    "run_id":"core-run-1"
+                },
+                "retrieval":null
+            },
+            "status":"available",
+            "retrieval":{"state":"full","generation_id":"retrieval-generation-1"},
+            "evidence":evidence,
+            "gaps":[{
+                "identity":{"gap_id":"evidence-projection-bounded"},
+                "kind":"output_budget_exceeded",
+                "message":"Additional internal support rows were omitted from the bounded public projection."
+            }],
+            "continuation":null,
+            "diagnostics":{
+                "availability":"available",
+                "reference":{
+                    "artifact_id":"artifact-1",
+                    "sha256":"b".repeat(64),
+                    "byte_length":123
+                }
+            }
+        });
+        let publication_meta = json!({
+            "schema_version":3,
+            "minimum_compatible_schema_version":3,
+            "core_publication":{
+                "generation_id":"core-generation-with-escaped-\"-metadata",
+                "run_id":"core-run-1"
+            },
+            "retrieval_publication":{
+                "retrieval_generation":"retrieval-generation-with-multibyte-é🦀"
+            },
+            "operation":{"operation_id":"public-operation-123456789","attempt":2}
+        });
+
+        for revision in crate::stdio_v3::McpRevisionV3::all() {
+            let mut root = candidate.clone();
+            reserve_packet_diagnostics_capability_v3(&mut root, 1_725_000_600_123).unwrap();
+            let measured = finalize_packet_projection_for_stdio_v3(
+                &mut root,
+                *revision,
+                Some(&publication_meta),
+            )
+            .expect("the closed evidence envelope must fit every transport profile");
+            let result =
+                build_served_tool_result_v3(*revision, "packet", &root, Some(&publication_meta))
+                    .unwrap();
+            let emitted = v3_serialize_call_tool_result(&result).unwrap();
+
+            assert_eq!(root["kind"], "complete", "{revision:?}");
+            assert_eq!(root["evidence"].as_array().unwrap().len(), 32);
+            assert_eq!(measured, emitted.len());
+            assert!(measured <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
+        }
+    }
+
+    #[test]
     fn packet_final_result_cap_boundaries_are_exact_for_old_and_modern_profiles() {
         fn root_with_padding(ascii_padding: usize, controls: usize) -> serde_json::Value {
             let hostile = "quote-\"-slash-\\-control-\u{0000}-café-🦀-";
