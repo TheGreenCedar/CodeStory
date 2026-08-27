@@ -317,11 +317,13 @@ const STATIC_ROSTER_PATHS = Object.freeze([
   ".github/plugin/plugin.json",
   ".cursor-plugin/plugin.json",
   "hooks/claude-codex-hooks.json",
+  "hooks/codestory-activate.cjs",
   "hooks/copilot-hooks.json",
   "hooks/cursor-hooks.json",
   "mcp.cursor.json",
   "rules/codestory.mdc",
   "skills/codestory-grounding/SKILL.md",
+  "skills/codestory-grounding/agents/openai.yaml",
 ]);
 
 class ConformanceError extends Error {
@@ -2192,6 +2194,20 @@ async function readJson(path, label) {
   return value;
 }
 
+function validateRoutingGuidance(text, label) {
+  const requirements = [
+    [/discovery leads?.*`search`/isu, "search discovery authority"],
+    [/selected target.*`context`/isu, "selected-target context authority"],
+    [/broad.*`packet`.*continuation.*once/isu, "bounded packet routing"],
+    [/host-supplied.*`prove_call_path`/isu, "host-supplied proof routing"],
+    [/`unknown`.*not absence/isu, "unknown boundary"],
+    [/runtime execution/iu, "runtime-execution boundary"],
+  ];
+  for (const [pattern, requirement] of requirements) {
+    if (!pattern.test(text)) fail(`${label} is missing ${requirement}`);
+  }
+}
+
 export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   validateIdentityShape(expectedIdentity, "expected identity");
   const root = resolve(pluginRoot);
@@ -2206,6 +2222,8 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   const catalog = await readJson(resolve(root, "generated-mcp-catalog.json"), "generated MCP catalog");
   const mcp = await readJson(resolve(root, "mcp.json"), "portable MCP manifest");
   const cursorMcp = await readJson(resolve(root, "mcp.cursor.json"), "Cursor MCP manifest");
+  const canonicalSkillText = await readFile(resolve(root, "skills/codestory-grounding/SKILL.md"), "utf8");
+  const openAiMetadataText = await readFile(resolve(root, "skills/codestory-grounding/agents/openai.yaml"), "utf8");
   const launcherPath = resolve(root, expectedIdentity.launcher.relative_path);
   const launcherSha256 = await fileSha256(launcherPath);
 
@@ -2240,6 +2258,12 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
       || !cursorServer.args[1].includes("Module.runMain()")
       || !cursorServer.args[1].includes("codestory_cursor_mcp_launcher_not_found")) {
     fail("Cursor MCP metadata does not bind the canonical launcher resolver");
+  }
+  validateRoutingGuidance(canonicalSkillText, "canonical grounding skill");
+  if (!/search.*context.*packet.*prove_call_path/isu.test(openAiMetadataText)
+      || !/host-supplied/iu.test(openAiMetadataText)
+      || !/unknown.*not absence/isu.test(openAiMetadataText)) {
+    fail("OpenAI skill metadata is missing the canonical routing boundary");
   }
 
   const hosts = [];
@@ -2305,6 +2329,7 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
           || !ruleText.includes("owns the detailed tool and evidence contract")) {
         fail("cursor rule does not delegate to the complete canonical grounding contract");
       }
+      validateRoutingGuidance(ruleText, "cursor rule");
     } else if (!/^---\nname: codestory-grounding\n/iu.test(ruleText)
         || !ruleText.includes("## Direct Tool Loop")
         || !ruleText.includes("## Task Router")
@@ -2312,6 +2337,8 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
         || !ruleText.includes("`packet`")
         || !ruleText.includes("`context`")) {
       fail(`${host} rule input is not the complete canonical grounding contract`);
+    } else {
+      validateRoutingGuidance(ruleText, `${host} rule input`);
     }
     hosts.push({
       host,

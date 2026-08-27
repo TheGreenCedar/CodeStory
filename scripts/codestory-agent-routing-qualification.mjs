@@ -51,11 +51,13 @@ const STATIC_ROSTER_PATHS = [
   ".github/plugin/plugin.json",
   ".cursor-plugin/plugin.json",
   "hooks/claude-codex-hooks.json",
+  "hooks/codestory-activate.cjs",
   "hooks/copilot-hooks.json",
   "hooks/cursor-hooks.json",
   "mcp.cursor.json",
   "rules/codestory.mdc",
   "skills/codestory-grounding/SKILL.md",
+  "skills/codestory-grounding/agents/openai.yaml",
 ];
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 

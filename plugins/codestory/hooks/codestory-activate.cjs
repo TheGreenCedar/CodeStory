@@ -8,7 +8,7 @@ const {
 const SESSION_CONTEXT = [
   'CODESTORY GROUNDING AVAILABLE',
   '',
-  'For repository work, use the codestory-grounding skill and call the tool that matches the task. Resolve the target repository root and pass that exact absolute path as project on every request; the session cwd is only a starting hint.',
+  'For repository work, follow the loaded CodeStory rule or codestory-grounding skill and call the tool that matches the task. Resolve the target repository root and pass that exact absolute path as project on every request; the session cwd is only a starting hint.',
   'Call status only for diagnostics. If a tool reports preparing, retry that same tool after its reported delay; do not ask the user to configure CodeStory.',
   'If the intended CodeStory tool is hidden and tool_search is available, search only for that tool by name, then call it directly.',
 ].join('\n');

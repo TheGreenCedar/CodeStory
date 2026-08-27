@@ -53,12 +53,13 @@ plugin result unless the user explicitly asks.
 | --- | --- |
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
 | Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
-| Find a symbol | `symbol`, then `definition` or `snippet`. |
-| Follow a call path | `callers`, `callees`, `trace`, or `trail`. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node. |
-| Verify an already translated exact call-path contract | `prove_call_path`, only when the host or user supplied the complete `source_text`, typed clauses, and exact spec. Do not infer or assemble this contract automatically. |
+| Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. Select one exact target before asking for evidence. |
+| Get evidence for one selected target | Use `context` with that exact selected target. Do not broaden the target or treat evidence availability as proof. |
+| Follow a call path for navigation | `callers`, `callees`, `trace`, or `trail` can navigate the ordinary graph. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node; none of these tools returns an exact proof disposition. |
+| Verify an already translated exact call-path contract | For a host-supplied or user-supplied complete typed contract, call `prove_call_path` with the unchanged `source_text`, clauses, and exact spec. Do not infer or assemble a typed contract from English. |
 | Review change impact | `affected` with explicit Git-changed `paths` (or `changed_paths` / `change_records`). Never omit the path source. |
-| One graph node | `get_node`, `definition`, `references`, or `symbols`. |
-| Broad structural question | `packet`; answer only from its evidence rows, name its gaps, and stop unless it returns one bounded continuation. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
+| One ordinary graph node | `get_node`, `definition`, `references`, or `symbols` provide navigation details, not a proof disposition. Use `context` when the task needs the schema-v3 evidence projection for that selected target. |
+| Broad structural question | Use `packet`; answer only from its evidence rows, name its gaps, and follow a returned bounded continuation at most once. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
 
 ## Evidence Rules
 
@@ -76,6 +77,10 @@ plugin result unless the user explicitly asks.
   `contract_refuted`. It verifies a host-supplied interpretation; it does not
   translate prose. Never call it automatically from a packet, search result,
   context result, or guessed natural-language contract.
+- Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable`
+  exactly. `unknown` is not absence, and `unavailable` is not negative proof.
+  Exact structural proof does not establish runtime execution, reachability,
+  temporal order, ownership, data flow, or subsystem non-participation.
 - When `packet.status=continuation_available`, execute only the returned bounded
   continuation, once, against its pinned publication: repeat the question with
   `parent_packet_id=continuation.continuation_id`, use
@@ -83,9 +88,10 @@ plugin result unless the user explicitly asks.
   IDs from `publication`. Then answer from the combined evidence and gaps. Do
   not start a free-form `search` / `context` / `trail` / `snippet` recovery
   loop from packet.
-- `no_useful_evidence` and `unavailable` are terminal. For the former, report
-  the material evidence gap; for the latter, use ordinary source inspection and
-  report that broad retrieval could not serve the request.
+- `no_useful_evidence` and `unavailable` are terminal CodeStory states. Report
+  the material gap or availability reason. Inspect ordinary source only when
+  the user named the file or the returned gap identifies the exact focused
+  surface; never turn a gap into an unconstrained repository search.
 - `affected` is planning evidence, not a guarantee that every runtime effect was
   found.
 - Tagged probes select exact or additional evidence work. They do not choose

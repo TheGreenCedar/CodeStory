@@ -1491,6 +1491,8 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   assert.match(agentMetadata, /type: "mcp"/u);
   assert.match(agentMetadata, /value: "codestory"/u);
   assert.match(agentMetadata, /allow_implicit_invocation: true/u);
+  assert.match(agentMetadata, /search.*context.*packet.*prove_call_path/isu);
+  assert.match(agentMetadata, /unknown.*not absence/isu);
   assert.equal(mcp.mcpServers.codestory.command, "node");
   assert.deepEqual(mcp.mcpServers.codestory.args, [
     "./scripts/codestory-mcp.cjs",
@@ -5978,6 +5980,7 @@ test("startup hook records active project without runtime bootstrap", async () =
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
     assert.match(context, /CODESTORY GROUNDING AVAILABLE/u);
+    assert.match(context, /loaded CodeStory rule or codestory-grounding skill/u);
     assert.match(context, /Call status only for diagnostics/u);
     assert.match(context, /retry that same tool/u);
     assert.match(context, /tool_search/u);
@@ -7697,6 +7700,7 @@ test("Cursor sessionStart emits the Cursor additional_context contract", async (
       );
       assert.deepEqual(Object.keys(output), ["additional_context"]);
       assert.match(output.additional_context, /CODESTORY GROUNDING AVAILABLE/u);
+      assert.match(output.additional_context, /loaded CodeStory rule or codestory-grounding skill/u);
     }
     const state = JSON.parse(await readFile(join(dataDir, ".codestory-active"), "utf8"));
     assert.equal(state.cwd, repoRoot);

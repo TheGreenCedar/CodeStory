@@ -1423,11 +1423,13 @@ function staticIdentityFor(root) {
     ".github/plugin/plugin.json",
     ".cursor-plugin/plugin.json",
     "hooks/claude-codex-hooks.json",
+    "hooks/codestory-activate.cjs",
     "hooks/copilot-hooks.json",
     "hooks/cursor-hooks.json",
     "mcp.cursor.json",
     "rules/codestory.mdc",
     "skills/codestory-grounding/SKILL.md",
+    "skills/codestory-grounding/agents/openai.yaml",
   ];
   staticIdentity.static_roster = Object.fromEntries(
     rosterPaths.map((path) => [path, sha256(readFileSync(join(root, path)))]),
@@ -1450,6 +1452,24 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     assert.equal(host.hook_sha256.length, 64);
     assert.equal(host.model_routing_evaluated, false);
   }
+
+  const skill = await readFile(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), "utf8");
+  const cursorRule = await readFile(join(pluginRoot, "rules", "codestory.mdc"), "utf8");
+  const openAiMetadata = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "agents", "openai.yaml"),
+    "utf8",
+  );
+  for (const [label, guidance] of [["skill", skill], ["Cursor rule", cursorRule]]) {
+    assert.match(guidance, /discovery leads?.*`search`/isu, label);
+    assert.match(guidance, /selected target.*`context`/isu, label);
+    assert.match(guidance, /broad.*`packet`.*continuation.*once/isu, label);
+    assert.match(guidance, /host-supplied.*`prove_call_path`/isu, label);
+    assert.match(guidance, /`unknown`.*not absence/isu, label);
+    assert.match(guidance, /runtime execution/iu, label);
+  }
+  assert.match(openAiMetadata, /search.*context.*packet.*prove_call_path/isu);
+  assert.match(openAiMetadata, /host-supplied/iu);
+  assert.match(openAiMetadata, /unknown.*not absence/isu);
 });
 
 test("static parity rejects substituted bytes invalid or no-op hooks metadata drift and heading-only rules", async () => {
@@ -1483,7 +1503,45 @@ test("static parity rejects substituted bytes invalid or no-op hooks metadata dr
     cpSync(join(pluginRoot, ".github", "plugin", "plugin.json"), copilotMetadataPath);
     writeFileSync(join(root, "skills", "codestory-grounding", "SKILL.md"), "---\nname: codestory-grounding\n---\n# CodeStory Grounding\n");
     const headingOnly = staticIdentityFor(root);
-    await assert.rejects(validateStaticHostParity(root, headingOnly), /complete canonical grounding contract/u);
+    await assert.rejects(validateStaticHostParity(root, headingOnly), /search discovery authority/u);
+
+    cpSync(pluginRoot, root, { recursive: true, force: true });
+    const skillPath = join(root, "skills", "codestory-grounding", "SKILL.md");
+    writeFileSync(
+      skillPath,
+      readFileSync(skillPath, "utf8").replace(
+        /Discovery leads come from `search`; they identify candidates and never prove a claim\./u,
+        "Use ordinary symbol lookup for candidates.",
+      ),
+    );
+    const incompleteSkill = staticIdentityFor(root);
+    await assert.rejects(validateStaticHostParity(root, incompleteSkill), /search discovery authority/u);
+
+    cpSync(pluginRoot, root, { recursive: true, force: true });
+    writeFileSync(join(root, "rules", "codestory.mdc"), `---
+description: CodeStory local grounding. Use repo evidence before source claims.
+globs:
+alwaysApply: true
+---
+
+# CodeStory Grounding
+
+Call the CodeStory tool that matches the task. The codestory-grounding skill owns the detailed tool and evidence contract.
+`);
+    const delegatedOnlyCursorRule = staticIdentityFor(root);
+    await assert.rejects(validateStaticHostParity(root, delegatedOnlyCursorRule), /search discovery authority/u);
+
+    cpSync(pluginRoot, root, { recursive: true, force: true });
+    const openAiMetadataPath = join(root, "skills", "codestory-grounding", "agents", "openai.yaml");
+    writeFileSync(
+      openAiMetadataPath,
+      readFileSync(openAiMetadataPath, "utf8").replace(
+        /Use search for discovery leads, context for one selected target, packet for broad evidence with at most one continuation, and prove_call_path only for a complete host-supplied typed contract\./u,
+        "Call the CodeStory tool that matches the repository task.",
+      ),
+    );
+    const incompleteOpenAiMetadata = staticIdentityFor(root);
+    await assert.rejects(validateStaticHostParity(root, incompleteOpenAiMetadata), /OpenAI skill metadata/u);
 
     for (const relativePath of [
       ".cursor-plugin/plugin.json",
