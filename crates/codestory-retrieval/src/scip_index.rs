@@ -1154,8 +1154,7 @@ fn publish_scip_component(
             bail!("staged scip component differs from its pinned graph projection");
         }
         before_publish()?;
-        codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
-        crate::copy_on_write::make_file_immutable(&path)?;
+        crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
         let legacy = project_dir.join(SCIP_SYMBOLS_FILE);
         if legacy.is_file() {
             std::fs::remove_file(legacy)?;
@@ -1962,6 +1961,44 @@ mod tests {
         assert!(
             std::fs::metadata(changed_path)
                 .expect("changed permissions")
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[test]
+    fn same_generation_scip_retry_replaces_a_readonly_component_before_marker_completion() {
+        let root = TempDir::new().expect("tempdir");
+        let project_dir = root.path().join("partial");
+        std::fs::create_dir_all(&project_dir).expect("partial dir");
+        let partial = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "partial")],
+        );
+        publish_scip_component(&project_dir, None, &partial, &mut || Ok(()))
+            .expect("publish component before markers");
+        let path = project_dir.join(SCIP_SYMBOLS_DATABASE_FILE);
+        assert!(
+            std::fs::metadata(&path)
+                .expect("partial permissions")
+                .permissions()
+                .readonly()
+        );
+
+        let repaired = component_index(
+            "generation-v1",
+            vec![component_symbol("1", "src/a.rs", "repaired")],
+        );
+        publish_scip_component(&project_dir, None, &repaired, &mut || Ok(()))
+            .expect("repair same-generation component");
+
+        assert_eq!(
+            load_scip_symbols_database(&path).expect("load repaired component"),
+            repaired
+        );
+        assert!(
+            std::fs::metadata(path)
+                .expect("repaired permissions")
                 .permissions()
                 .readonly()
         );

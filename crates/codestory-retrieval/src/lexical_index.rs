@@ -371,9 +371,7 @@ pub fn build_lexical_shard(
         Ok(rebuilt)
     })();
     if result.is_err() {
-        if let Ok(metadata) = std::fs::metadata(&temp_path) {
-            let _ = make_file_owner_writable(&temp_path, &metadata.permissions());
-        }
+        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
         let _ = std::fs::remove_file(&temp_path);
     }
     let rebuilt = result?;
@@ -445,8 +443,7 @@ pub(crate) fn build_prepared_lexical_shard(
                         direct_reference: true,
                     });
                 } else if crate::copy_on_write::clone_file(&previous_path, &temp_path)? {
-                    let permissions = std::fs::metadata(&temp_path)?.permissions();
-                    make_file_owner_writable(&temp_path, &permissions)?;
+                    crate::copy_on_write::make_file_owner_writable(&temp_path)?;
                     incremental = Some(reconcile_cloned_lexical_database(
                         &temp_path,
                         project_id,
@@ -488,65 +485,14 @@ pub(crate) fn build_prepared_lexical_shard(
         Ok((expected.fingerprint.clone(), incremental))
     })();
     if result.is_err() {
-        if let Ok(metadata) = std::fs::metadata(&temp_path) {
-            let _ = make_file_owner_writable(&temp_path, &metadata.permissions());
-        }
+        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
         let _ = std::fs::remove_file(&temp_path);
     }
     result
 }
 
 fn publish_immutable_lexical_database(temp_path: &Path, index_path: &Path) -> Result<()> {
-    let previous_permissions = match std::fs::metadata(index_path) {
-        Ok(metadata) => {
-            let permissions = metadata.permissions();
-            if permissions.readonly() {
-                make_file_owner_writable(index_path, &permissions)?;
-            }
-            Some(permissions)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let result =
-        codestory_workspace::atomic_file::publish_existing_file_atomic(temp_path, index_path);
-    match result {
-        Ok(()) => {
-            let mut permissions = std::fs::metadata(index_path)?.permissions();
-            if permissions.readonly() {
-                Ok(())
-            } else {
-                permissions.set_readonly(true);
-                std::fs::set_permissions(index_path, permissions).with_context(|| {
-                    format!("protect immutable lexical shard {}", index_path.display())
-                })
-            }
-        }
-        Err(error) => {
-            if let Some(permissions) = previous_permissions {
-                let _ = std::fs::set_permissions(index_path, permissions);
-            }
-            Err(error)
-        }
-    }
-}
-
-#[allow(clippy::permissions_set_readonly_false)]
-fn make_file_owner_writable(path: &Path, permissions: &std::fs::Permissions) -> Result<()> {
-    let mut writable = permissions.clone();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        writable.set_mode(writable.mode() | 0o200);
-    }
-    #[cfg(windows)]
-    writable.set_readonly(false);
-    std::fs::set_permissions(path, writable).with_context(|| {
-        format!(
-            "prepare immutable lexical shard replacement {}",
-            path.display()
-        )
-    })
+    crate::copy_on_write::publish_immutable_file_atomic(temp_path, index_path)
 }
 
 pub fn shard_has_lexical_index(shard_dir: &Path, expected_sidecar_input_hash: &str) -> bool {
@@ -2803,10 +2749,8 @@ mod tests {
         build_prepared_lexical_shard(&data, "previous", &previous, "input-v1", None, || Ok(()))
             .expect("previous shard");
         let previous_path = shard_dir_for(&data, "previous").join(LEXICAL_INDEX_FILE);
-        let permissions = std::fs::metadata(&previous_path)
-            .expect("previous metadata")
-            .permissions();
-        make_file_owner_writable(&previous_path, &permissions).expect("make predecessor writable");
+        crate::copy_on_write::make_file_owner_writable(&previous_path)
+            .expect("make predecessor writable");
         std::fs::write(&previous_path, b"not sqlite").expect("corrupt predecessor");
         let current = prepared_documents(vec![source_document("src/a.rs", "current needle")]);
 

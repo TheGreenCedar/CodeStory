@@ -771,7 +771,7 @@ impl EmbeddedVectorIndex {
                 attestation.generation = publication.generation.to_string();
                 attestation.input_hash = publication.input_hash.to_string();
                 before_publish()?;
-                codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
+                crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
                 Ok((
                     attestation,
                     IncrementalVectorWork {
@@ -811,8 +811,7 @@ impl EmbeddedVectorIndex {
                 None,
             )?;
             before_publish()?;
-            codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
-            crate::copy_on_write::make_file_immutable(&path)?;
+            crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
             Ok((attestation, work))
         })();
         if result.is_err() {
@@ -1140,8 +1139,7 @@ fn build_and_publish_database(
             None,
         )?;
         before_publish()?;
-        codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
-        crate::copy_on_write::make_file_immutable(&path)?;
+        crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
         Ok(attestation)
     })();
     if result.is_err() {
@@ -3124,6 +3122,62 @@ mod tests {
             std::fs::read(&evidence_path).expect("read evidence after cancellation"),
             prior_evidence,
             "cancelled evidence publication replaced the prior manifest"
+        );
+    }
+
+    #[test]
+    fn same_generation_vector_retry_replaces_a_readonly_partial_component() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let contract = evidence_contract();
+        let expected = expected_anchors();
+        EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "partial",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("publish component before envelope");
+        let path = index_path(&layout, "partial");
+        assert!(
+            std::fs::metadata(&path)
+                .expect("partial permissions")
+                .permissions()
+                .readonly()
+        );
+
+        EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "partial",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![0.0, 1.0]))?;
+                visit(attested_point("2", "document-2", vec![1.0, 0.0]))
+            },
+        )
+        .expect("repair same-generation partial component");
+
+        assert!(
+            std::fs::metadata(&path)
+                .expect("repaired permissions")
+                .permissions()
+                .readonly()
+        );
+        assert_eq!(
+            search_database(&path, "generation-v1", "input-v1", &[1.0, 0.0], 1, || false)
+                .expect("search repaired component")[0]
+                .node_id
+                .as_deref(),
+            Some("2")
         );
     }
 
