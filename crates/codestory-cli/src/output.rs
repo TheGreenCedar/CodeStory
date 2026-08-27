@@ -389,7 +389,7 @@ fn append_index_members(markdown: &mut String, output: &IndexOutput<'_>) {
     }
 }
 
-fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+pub(crate) fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
     let _ = writeln!(
         markdown,
         "timings_ms: parse={} flush={} resolve={} cleanup={} cache_refresh={}",

@@ -1,9 +1,9 @@
 use crate::candidate::{CandidateGraphDirection, CandidateGraphEvidence};
 use crate::config::SidecarLayout;
 use crate::scip_index::{
-    SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_STUB_MARKER_FILE, SCIP_SYMBOLS_FILE,
-    ScipAdjacencyDirection, ScipIndexMarkerError, ScipNormalizedSymbol, ScipSymbolRecord,
-    load_fresh_scip_query_view, parse_scip_index_marker,
+    SCIP_GRAPH_PROJECTION_PROVENANCE, SCIP_STUB_MARKER_FILE, ScipAdjacencyDirection,
+    ScipIndexMarkerError, ScipNormalizedSymbol, ScipSymbolRecord, load_fresh_scip_query_view,
+    parse_scip_index_marker, scip_symbols_component_path,
 };
 use codestory_contracts::graph::EdgeKind;
 use std::cmp::Ordering;
@@ -658,7 +658,7 @@ fn read_scip_revision(dir: &Path) -> Option<String> {
 }
 
 fn scip_artifact_status(project_dir: &Path, revision: &str, generation: &str) -> &'static str {
-    if !project_dir.join(SCIP_SYMBOLS_FILE).is_file()
+    if !scip_symbols_component_path(project_dir).is_file()
         || !project_dir.join("revision.txt").is_file()
         || project_dir.join(SCIP_STUB_MARKER_FILE).is_file()
     {
@@ -720,7 +720,7 @@ mod tests {
             proofs,
         };
         std::fs::write(
-            project_dir.join(SCIP_SYMBOLS_FILE),
+            scip_symbols_component_path(project_dir),
             serde_json::to_string_pretty(&index).expect("serialize"),
         )
         .expect("write symbols");

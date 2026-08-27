@@ -14,6 +14,7 @@ mod cache_clean;
 mod candidate;
 mod capabilities;
 mod config;
+mod copy_on_write;
 mod embedded_vector;
 mod embedding_contract;
 mod embedding_server_compat;
@@ -292,11 +293,11 @@ pub use health::{
     probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
-    FinalizeIndexOutcome, RetrievalIndexCancelled, SidecarInputChanged, finalize_index,
-    finalize_index_for_runtime, finalize_index_for_runtime_with_cancel,
-    finalize_index_for_runtime_with_progress, finalize_index_for_runtime_with_progress_and_cancel,
-    is_retrieval_index_cancelled, is_sidecar_input_changed, project_id_for_root,
-    sidecar_project_id_for_root,
+    FinalizeComponentWork, FinalizeIndexOutcome, FinalizePhaseTiming, RetrievalIndexCancelled,
+    SidecarInputChanged, finalize_index, finalize_index_for_runtime,
+    finalize_index_for_runtime_with_cancel, finalize_index_for_runtime_with_progress,
+    finalize_index_for_runtime_with_progress_and_cancel, is_retrieval_index_cancelled,
+    is_sidecar_input_changed, project_id_for_root, sidecar_project_id_for_root,
 };
 pub use inventory::{
     SidecarGcReport, SidecarInventoryReport, sidecar_gc_apply_with_storage,
