@@ -13,6 +13,7 @@ use codestory_store::{
     seal_call_resolution_fact,
 };
 use codestory_workspace::{BuildMode, RefreshInfo};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
@@ -3424,6 +3425,100 @@ fn c_cpp_header_extensions_are_always_canonical_nonexact() -> anyhow::Result<()>
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn inferred_cpp_headers_rematerialize_with_the_indexed_parser_provenance() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "fixture.h",
+            "namespace sample { inline void target() {} inline void caller() { target(); } }\n",
+        )],
+    )?;
+
+    let indexed = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with("fixture.h"))
+        .expect("indexed header");
+    assert_eq!(indexed.language, "cpp");
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    let fact = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .unwrap_or_else(|| panic!("C++ header emitted no canonical target fact: {facts:#?}"));
+    assert_eq!(fact.status, ProofResolutionStatus::Unsupported);
+    assert!(fact.edge_id.is_none() && fact.target.is_none() && fact.evidence_chain.is_empty());
+
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "hostile.h",
+            concat!(
+                "namespace sample { inline void target() {} inline void caller() { target(); } }\n",
+                "template <typename T> struct getter : T {\n",
+                "  static auto get(const T& value) -> T { return {value.*(&getter::field)}; }\n",
+                "  int field;\n",
+                "};\n",
+            ),
+        )],
+    )?;
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let facts = store.get_proof_resolution_facts()?;
+    assert_eq!(
+        facts.len(),
+        1,
+        "hostile parser leaf became a fact: {facts:#?}"
+    );
+    let fact = &facts[0];
+    assert_eq!(fact.callsite.raw_target, "target");
+    assert_eq!(fact.status, ProofResolutionStatus::IncompleteDomain);
+    assert!(
+        fact.callsite.start_byte < fact.callsite.end_byte_exclusive
+            && fact.edge_id.is_none()
+            && fact.target.is_none()
+            && fact.evidence_chain.is_empty()
+    );
+
+    let project = tempfile::tempdir()?;
+    let header = project.path().join("compiled.h");
+    fs::write(
+        project.path().join("compile_commands.json"),
+        format!(
+            "[{{\"directory\":{},\"command\":\"clang++ -std=c++20 -c compiled.h\",\"file\":{}}}]",
+            serde_json::to_string(project.path())?,
+            serde_json::to_string(&header)?,
+        ),
+    )?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[(
+            "compiled.h",
+            "void target() {} void caller() { target(); }\n",
+        )],
+    )?;
+    let indexed = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path.ends_with("compiled.h"))
+        .expect("compilation-database header");
+    assert_eq!(indexed.language, "cpp");
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
     Ok(())
 }
 
@@ -10239,7 +10334,7 @@ fn complete_projection_rejects_cache_schema_adapter_and_language_mismatch() -> a
             .expect_err("cache provenance mismatch must reject the complete projection");
         let message = error.to_string();
         assert!(
-            ["stale", "schema-v26", "adapter", "language"]
+            ["stale", "schema-v28", "adapter", "language"]
                 .iter()
                 .any(|needle| message.contains(needle)),
             "{mutation}: {error}"
@@ -10670,7 +10765,7 @@ fn proof_resolution_roster_tracks_the_current_adapter_version() -> anyhow::Resul
             "{language} must invalidate parser inputs through its explicit adapter identity"
         );
     }
-    for (language, version) in [("c", "reference-v2"), ("cpp", "reference-v3")] {
+    for (language, version) in [("c", "reference-v2"), ("cpp", "reference-v4")] {
         assert_eq!(
             receipt
                 .adapter_roster
@@ -11378,6 +11473,110 @@ fn parser_incomplete_governed_source_publishes_incomplete_domain_fact() -> anyho
     assert_eq!(fact.edge_id, None);
     assert!(fact.evidence_chain.is_empty());
     assert_eq!(fact.provenance.dependency_file_hashes.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn non_utf8_parser_source_keeps_navigation_but_cannot_authorize_proof() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let source_path = project.path().join("src/non_utf8.c");
+    fs::create_dir_all(source_path.parent().expect("source parent"))?;
+    let source = b"void target(void) {}\nvoid caller(void) { target(); }\n/* invalid: \x80 */\n";
+    fs::write(&source_path, source)?;
+    let expected_hash = format!("{:x}", Sha256::digest(source));
+    let refresh = RefreshInfo {
+        mode: BuildMode::Incremental,
+        files_to_index: vec![source_path.clone()],
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
+    };
+    let indexer = WorkspaceIndexer::new(project.path().to_path_buf());
+    let mut store = Store::new_in_memory()?;
+
+    let first = indexer.run_incremental(&mut store, &refresh, &EventBus::new(), None)?;
+    assert_eq!(first.artifact_cache_hits, 0);
+    let indexed_file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path == source_path)
+        .expect("indexed C file");
+    assert_eq!(
+        store.get_file_content_hash(indexed_file.id)?.as_deref(),
+        Some(expected_hash.as_str())
+    );
+    assert!(
+        store
+            .get_edges()?
+            .iter()
+            .any(|edge| edge.kind == EdgeKind::CALL),
+        "lossy parsing remains available to the ordinary navigation graph"
+    );
+
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    assert_eq!(artifact["resolution_file"]["source_sha256"], expected_hash);
+    assert_eq!(artifact["resolution_file"]["lookup_input_complete"], false);
+    assert_eq!(
+        artifact["call_resolution_inputs"].as_array().map(Vec::len),
+        Some(0)
+    );
+
+    let receipt = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    assert_eq!(receipt.fact_count, 0);
+    assert!(store.get_proof_resolution_facts()?.is_empty());
+
+    let replay = indexer.run_incremental(&mut store, &refresh, &EventBus::new(), None)?;
+    assert_eq!(replay.artifact_cache_hits, 1);
+    rematerialize_proof_resolution_projection(&mut store, &publication(2))?;
+    store.validate_proof_resolution_publication(&publication(2))?;
+    Ok(())
+}
+
+#[test]
+fn non_utf8_semantic_reauthentication_accepts_only_coverage_without_calls() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let source_path = project.path().join("src/non_utf8.sh");
+    fs::create_dir_all(source_path.parent().expect("source parent"))?;
+    fs::write(
+        &source_path,
+        b"target() { :; }\ncaller() { target; }\n# invalid: \x80\n",
+    )?;
+    let mut store = Store::new_in_memory()?;
+    WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+        &mut store,
+        &RefreshInfo {
+            mode: BuildMode::Incremental,
+            files_to_index: vec![source_path],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+
+    let receipt = rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    assert_eq!(receipt.fact_count, 0);
+
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    artifact["resolution_file"]["lookup_input_complete"] = true.into();
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&artifact)?],
+    )?;
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("non-UTF-8 source cannot authenticate complete semantic inputs");
+    assert!(error.to_string().contains("not UTF-8"), "{error}");
     Ok(())
 }
 

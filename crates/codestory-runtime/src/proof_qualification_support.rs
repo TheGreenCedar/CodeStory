@@ -1,8 +1,7 @@
-//! Sealed observations used only by the proof-qualification benchmark.
+//! Sealed runtime facade for exact call-path verification and qualification.
 //!
-//! This facade is intentionally feature-gated and owns no product route. The
-//! benchmark receives its domain identity and gate observations through this
-//! module without exposing the dark kernel or registering a product route.
+//! The CLI and benchmark share this pinned-core operation without exposing the
+//! private proof kernel or allowing transport adapters to own orchestration.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -19,16 +18,19 @@ pub use crate::indexed_source_call_path_v1::{
 };
 pub use codestory_agent::proof_qualification_support::{
     BuiltCallPathFacts, CallableContainmentEvidence, ClauseAnchor, ClauseClassification,
-    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
-    PinnedNodeIdentity, ProofContractField, ReceiptRef, ResolvedNodeIdentity,
+    FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
+    InternalProjection, NonMaterialKind, PinnedNodeIdentity, ProofContractField, ProofHashes,
+    ReceiptRef, ResolvedNodeIdentity, UnavailableReason, UnresolvedMaterialReason,
     UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
-    UnvalidatedExactSymbolSelector, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
-    check_built_call_path_integration, project_internal_call_path_result, validate_contract,
+    UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
+    ValidatedContractRendering, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
+    check_built_call_path_integration, project_internal_call_path_result,
+    project_translation_unknown_result, validate_contract,
 };
 
-/// Executes one observed proof through the runtime's existing core-only public
-/// operation. The benchmark cannot obtain the controller or add a second
-/// publication retry around this call.
+/// Executes one proof through the runtime's existing core-only public
+/// operation. Callers cannot obtain the controller or add a second publication
+/// retry around this call.
 pub fn run_observed_call_path_public_operation(
     runtime: &crate::Runtime,
     contract: &codestory_agent::proof_qualification_support::ValidatedCallPathContract,
@@ -58,6 +60,45 @@ pub fn run_observed_call_path_public_operation(
         .controller
         .finish_proof_publication_validation_operation();
     result
+}
+
+/// Projects an incomplete host translation against the same pinned core
+/// publication without reading graph or retrieval state.
+pub fn run_translation_unknown_public_operation(
+    runtime: &crate::Runtime,
+    spec: &codestory_agent::proof_qualification_support::CallPathSpec,
+    hashes: &codestory_agent::proof_qualification_support::ProofHashes,
+    rendering: &codestory_agent::proof_qualification_support::ValidatedContractRendering,
+    gaps: &[codestory_agent::proof_qualification_support::TranslationGap],
+    cancelled: Arc<AtomicBool>,
+) -> Result<crate::PublicOperation<InternalProjection>, ApiError> {
+    runtime
+        .public_operation_service()
+        .run_observational_with_cancel(proof_domain(), cancelled, || {
+            let publication = runtime
+                .controller
+                .active_core_publication()
+                .ok_or_else(|| {
+                    ApiError::new(
+                        "proof_semantic_projection_unavailable",
+                        "the exact proof core publication is unavailable",
+                    )
+                })?;
+            let project_root = runtime.controller.require_project_root()?;
+            let project_id = codestory_workspace::project_identity_v3(&project_root).project_id;
+            project_translation_unknown_result(
+                spec,
+                hashes,
+                rendering,
+                gaps,
+                &InternalCorePublicationIdentity {
+                    project_id,
+                    generation_id: publication.generation_id,
+                    run_id: publication.run_id,
+                },
+            )
+            .map_err(|error| ApiError::new("invalid_proof_projection", format!("{error:?}")))
+        })
 }
 
 /// Identifies the request domain observed by proof qualification.

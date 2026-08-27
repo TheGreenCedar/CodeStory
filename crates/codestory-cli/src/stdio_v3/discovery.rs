@@ -32,7 +32,7 @@ impl NativeSessionV3 {
             .and_then(McpRevisionV3::parse)
             .unwrap_or_else(McpRevisionV3::preferred);
         let discovery_identity =
-            discovery_contract_for_surface_v3(negotiated_revision, V3SurfaceSet::EvidenceOnly);
+            discovery_contract_for_surface_v3(negotiated_revision, V3SurfaceSet::WithProof);
         Self {
             requested_revision,
             negotiated_revision,
@@ -226,9 +226,7 @@ mod tests {
     fn discovery_contracts_are_deterministic_distinct_and_initialize_bound() {
         let identities = McpRevisionV3::all()
             .iter()
-            .map(|revision| {
-                discovery_contract_for_surface_v3(*revision, V3SurfaceSet::EvidenceOnly)
-            })
+            .map(|revision| discovery_contract_for_surface_v3(*revision, V3SurfaceSet::WithProof))
             .collect::<Vec<_>>();
         assert_eq!(
             identities
@@ -242,7 +240,7 @@ mod tests {
             assert_eq!(identity.sha256.len(), 64);
             assert!(identity.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
             assert_eq!(
-                discovery_contract_for_surface_v3(identity.revision, V3SurfaceSet::EvidenceOnly),
+                discovery_contract_for_surface_v3(identity.revision, V3SurfaceSet::WithProof),
                 *identity
             );
 

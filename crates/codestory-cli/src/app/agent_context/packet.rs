@@ -2,9 +2,12 @@ use super::super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
 use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
 use crate::args;
 use crate::args::PacketCommand;
-use crate::output::{REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, emit_public_operation};
 #[cfg(test)]
-use crate::output::{render_context_markdown, render_public_operation_json_content};
+use crate::output::render_context_markdown;
+use crate::output::{
+    REPO_CONTENT_BOUNDARY_LINE, RenderedPublicOutput, emit_public_operation,
+    render_public_operation_json_content,
+};
 use crate::runtime;
 use crate::runtime::map_api_error;
 use anyhow::Result;
@@ -33,7 +36,7 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     )?;
 
     let request = packet_request_from_command(&cmd);
-    let operation = runtime.run_public_operation("packet", || {
+    let mut operation = runtime.run_public_operation("packet", || {
         let packet = runtime
             .browser
             .packet(request.clone())
@@ -51,6 +54,22 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
         )
         .map_err(map_api_error)
     })?;
+    let envelope = codestory_runtime::PublicOperation {
+        value: (),
+        core_publication: operation.core_publication.clone(),
+        retrieval_publication: operation.retrieval_publication.clone(),
+        operation_id: operation.operation_id.clone(),
+        attempt: operation.attempt,
+    };
+    codestory_runtime::finalize_packet_projection_v3_for_representation(
+        &mut operation.value.projection,
+        |projection| {
+            render_public_operation_json_content(&envelope, projection)
+                .map(|content| content.len())
+                .map_err(|_| ())
+        },
+    )
+    .map_err(map_api_error)?;
     if let Some(path) = cmd.diagnostics_out.as_deref() {
         if std::fs::symlink_metadata(path).is_ok() {
             anyhow::bail!(

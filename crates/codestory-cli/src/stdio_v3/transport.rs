@@ -95,7 +95,6 @@ pub(crate) fn build_proof_tool_result_v3(
     {
         return Err(StdioV3InternalError::OutputSchemaViolation);
     }
-    #[cfg(feature = "proof-qualification-support")]
     codestory_runtime::proof_qualification_support::validate_compact_projection(root)
         .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let result = build_tool_result_for_surface_v3(
@@ -119,7 +118,6 @@ pub(crate) fn build_proof_tool_result_v3(
     {
         return Err(StdioV3InternalError::OutputSchemaViolation);
     }
-    #[cfg(feature = "proof-qualification-support")]
     codestory_runtime::proof_qualification_support::validate_compact_projection(&fallback)
         .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let fallback_result = build_tool_result_for_surface_v3(
@@ -250,21 +248,21 @@ pub(crate) fn jsonrpc_internal_error_v3(id: Value, _error: &StdioV3InternalError
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "proof-qualification-support")]
     use codestory_contracts::graph::NodeId;
-    #[cfg(feature = "proof-qualification-support")]
     use codestory_contracts::proof_resolution::{
         DependencyFileHash, ResolutionEvidence, ResolutionProvenance,
     };
-    #[cfg(feature = "proof-qualification-support")]
     use codestory_runtime::proof_qualification_support::{
-        BuiltCallPathFacts, CallableContainmentEvidence, ClauseAnchor, ClauseClassification,
-        IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
-        InternalProjection, PinnedNodeIdentity, ProofContractField, ReceiptRef,
-        ResolvedNodeIdentity, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
-        UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector, ValidationOutcome,
-        VerifiedDirectCallFact, VerifiedProofFact, check_built_call_path_integration,
+        BuiltCallPathFacts, ClauseAnchor, ClauseClassification, FactBuildGap,
+        InternalCorePublicationIdentity, InternalProjection, ProofContractField, ProofHashes,
+        UnavailableReason, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
+        UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
+        ValidatedContractRendering, ValidationOutcome, check_built_call_path_integration,
         project_internal_call_path_result, validate_contract,
+    };
+    use codestory_runtime::proof_qualification_support::{
+        CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
+        ReceiptRef, ResolvedNodeIdentity, VerifiedDirectCallFact, VerifiedProofFact,
     };
     use sha2::{Digest, Sha256};
 
@@ -276,8 +274,11 @@ mod tests {
         format!("{:x}", hasher.finalize())
     }
 
-    #[cfg(feature = "proof-qualification-support")]
-    fn actual_projected_root(text: String) -> Value {
+    fn validated_test_contract() -> (
+        ValidatedCallPathContract,
+        ProofHashes,
+        ValidatedContractRendering,
+    ) {
         let source = "exact direct ordered call path";
         let ValidationOutcome::Validated {
             contract,
@@ -313,6 +314,11 @@ mod tests {
         else {
             panic!("fixture contract validates")
         };
+        (*contract, hashes, rendering)
+    }
+
+    fn actual_projected_root(text: String) -> Value {
+        let (contract, hashes, rendering) = validated_test_contract();
         let node = |node_id: &str, canonical_id: &str, qualified_name: &str, path: &[&str]| {
             ResolvedNodeIdentity::new(
                 PinnedNodeIdentity {
@@ -410,7 +416,6 @@ mod tests {
         root
     }
 
-    #[cfg(feature = "proof-qualification-support")]
     fn set_receipt_line_text(root: &mut Value, text: String) {
         let byte_start = root["receipts"][0]["line_window"]["byte_start"]
             .as_u64()
@@ -571,113 +576,48 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "proof-qualification-support")]
     fn proof_root(disposition_kind: &str) -> Value {
-        let mut root = actual_projected_root("x".to_owned());
         match disposition_kind {
-            "proven" => root,
-            "unavailable" => {
-                root["identities"] = json!({
-                    "files":[],"symbols":[],"provenance_profiles":[],"evidence":[]
-                });
-                root["spec"]["start"] = json!({"kind":"canonical_id","canonical_id":"A"});
-                root["spec"]["steps"][0]["target"] =
-                    json!({"kind":"canonical_id","canonical_id":"B"});
-                root["disposition"] = json!({
-                    "kind":"unavailable",
-                    "contract_digest":root["contract_digest"],
-                    "reasons":["publication_pin_mismatch"]
-                });
-                root["steps"] = json!([{"step_index":0,"status":"unavailable","receipt":null}]);
-                root["receipts"] = json!([]);
+            "proven" => actual_projected_root("x".to_owned()),
+            "unknown" | "unavailable" => {
+                let (contract, hashes, rendering) = validated_test_contract();
+                let integration = check_built_call_path_integration(
+                    &contract,
+                    &hashes,
+                    &rendering,
+                    BuiltCallPathFacts {
+                        publication: InternalCorePublicationIdentity {
+                            project_id: "project".to_owned(),
+                            generation_id: "generation".to_owned(),
+                            run_id: "run".to_owned(),
+                        },
+                        facts: Vec::new(),
+                        receipts: Vec::new(),
+                        gaps: (disposition_kind == "unknown")
+                            .then_some(FactBuildGap::DirectCallMissing { step_index: 0 })
+                            .into_iter()
+                            .collect(),
+                        unavailable: (disposition_kind == "unavailable")
+                            .then_some(UnavailableReason::PublicationPinMismatch)
+                            .into_iter()
+                            .collect(),
+                    },
+                )
+                .expect("canonical uncertainty integration");
+                let InternalProjection::Complete { root, .. } =
+                    project_internal_call_path_result(&integration)
+                        .expect("canonical uncertainty projection")
+                else {
+                    panic!("uncertainty fixture remains a complete projection")
+                };
+                codestory_runtime::proof_qualification_support::validate_compact_projection(&root)
+                    .unwrap_or_else(|error| {
+                        panic!("canonical {disposition_kind} projection must validate: {error}")
+                    });
                 root
             }
-            _ => {
-                root["identities"] = json!({
-                    "files":[],"symbols":[],"provenance_profiles":[],"evidence":[]
-                });
-                root["spec"]["start"] = json!({"kind":"canonical_id","canonical_id":"A"});
-                root["spec"]["steps"][0]["target"] =
-                    json!({"kind":"canonical_id","canonical_id":"B"});
-                root["disposition"] = json!({
-                    "kind":"unknown",
-                    "contract_digest":root["contract_digest"],
-                    "gaps":[{"kind":"direct_call_missing","step_index":0}],
-                    "connected_receipts":[]
-                });
-                root["steps"] = json!([{"step_index":0,"status":"unknown","receipt":null}]);
-                root["receipts"] = json!([]);
-                root
-            }
+            other => panic!("unsupported fixture disposition {other}"),
         }
-    }
-
-    #[cfg(not(feature = "proof-qualification-support"))]
-    fn proof_root(disposition_kind: &str) -> Value {
-        let disposition = match disposition_kind {
-            "proven" => json!({
-                "kind": "contract_proven",
-                "contract_digest": "b".repeat(64),
-                "receipts": [0]
-            }),
-            "unavailable" => json!({
-                "kind": "unavailable",
-                "contract_digest": "b".repeat(64),
-                "reasons": ["publication_pin_mismatch"]
-            }),
-            _ => json!({
-                "kind": "unknown",
-                "contract_digest": "b".repeat(64),
-                "gaps": [{"kind":"direct_call_missing","step_index":0}],
-                "connected_receipts": []
-            }),
-        };
-        let (identities, steps, receipts) = if disposition_kind == "proven" {
-            (
-                json!({
-                    "files":[{"file_node_id":"1","project_file_components":["src","lib.rs"],"indexed_sha256":"c".repeat(64),"observed_sha256":"c".repeat(64)}],
-                    "symbols":[
-                        {"node_id":"1","canonical_id":"A","qualified_name":"crate::A","file":0},
-                        {"node_id":"2","canonical_id":"B","qualified_name":"crate::B","file":0}
-                    ],
-                    "provenance_profiles":[{"producer":"codestory-internal","fact_schema_version":1,"algorithm":"exact-call-resolution-v1","language_adapter":"rust","language_adapter_version":"test-v1","parser_fingerprint":"e".repeat(64)}],
-                    "evidence":[{"fact_id":resolution_fact_id(&"f".repeat(64)),"caller":0,"target":1,"edge_id":"1","callsite_identity":"1:1:1:2|rust","chain":[{"kind":"same_file_declaration","symbols":[1]}],"provenance":{"profile":0,"dependency_files":[0],"evidence_sha256":"f".repeat(64)}}]
-                }),
-                json!([{"step_index":0,"status":"proven","receipt":0}]),
-                json!([{"receipt_id":"receipt-1","edge_id":"1","source":0,"target":1,"evidence":0,"exact_callsite_start_byte":0,"callsite_identity":"1:1:1:2|rust","column_or_ordinal":1,"containment":{"file":0,"owner":0,"start_line":1,"end_line":1},"line_window":{"kind":"indexed_line_v1","file":0,"anchor_line":1,"byte_start":0,"byte_end":1,"text":"x"}}]),
-            )
-        } else {
-            let step_status = if disposition_kind == "unavailable" {
-                "unavailable"
-            } else {
-                "unknown"
-            };
-            (
-                json!({"files":[],"symbols":[],"provenance_profiles":[],"evidence":[]}),
-                json!([{"step_index":0,"status":step_status,"receipt":null}]),
-                json!([]),
-            )
-        };
-        json!({
-            "kind": "complete",
-            "schema_version": 1,
-            "domain": "indexed_source_call_path_v1",
-            "contract_interpretation": "host_supplied",
-            "guard_version": "clause_guard_v1",
-            "source_text_sha256": "a".repeat(64),
-            "contract_digest": "b".repeat(64),
-            "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
-            "identities": identities,
-            "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[{"target":{"kind":"canonical_id","canonical_id":"B"},"relation":"direct_outgoing_call"}],"prohibit_traversal_through":[],"exclude_from_projection":[]},
-            "clauses": [{
-                "start":0,"end":1,"clause_id":"c","quote":"x","classification":"resolved_material",
-                "fields":[{"kind":"start"},{"kind":"step_target","step":0},{"kind":"directness","step":0},{"kind":"ordering","step":0},{"kind":"relation","step":0}],
-                "reason":null,"non_material_kind":null
-            }],
-            "disposition": disposition,
-            "steps": steps,
-            "receipts": receipts,
-        })
     }
 
     #[test]
@@ -776,7 +716,9 @@ mod tests {
         for disposition in ["unknown", "unavailable"] {
             let root = proof_root(disposition);
             for revision in McpRevisionV3::all() {
-                let result = build_proof_tool_result_v3(*revision, &root).expect("tool result");
+                let result = build_proof_tool_result_v3(*revision, &root).unwrap_or_else(|error| {
+                    panic!("{disposition} {revision:?} tool result: {error:?}")
+                });
                 assert_eq!(result["isError"], false);
                 let text = result
                     .pointer("/content/0/text")

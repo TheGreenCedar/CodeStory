@@ -1665,7 +1665,7 @@ fn handle_stdio_request(
                     "Invalid params: missing tool name",
                 ));
             };
-            if !is_stdio_tool_name(name) {
+            if !is_stdio_tool_name(name) && name != "prove_call_path" {
                 return Some(stdio_jsonrpc_error(
                     id,
                     -32602,
@@ -1688,6 +1688,12 @@ fn handle_stdio_request(
             }
             let prepared = match prepare_stdio_tool_call(session, name, &request) {
                 Ok(prepared) => prepared,
+                Err(error) if name == "prove_call_path" => {
+                    return Some(crate::stdio_v3::jsonrpc_invalid_params_v3(
+                        id,
+                        &error.message,
+                    ));
+                }
                 Err(error) => {
                     return Some(stdio_jsonrpc_success(
                         id,
@@ -1729,7 +1735,15 @@ fn handle_stdio_request(
                     });
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
                 }
-                let activation = if observes_complete_core {
+                let activation = if name == "prove_call_path" {
+                    runtime
+                        .activation
+                        .bind_existing_complete_core_for_observation(
+                            &runtime.project_root,
+                            &runtime.storage_path,
+                            Arc::clone(cancelled),
+                        )
+                } else if observes_complete_core {
                     runtime.activation.ensure_complete_core_for_observation(
                         &runtime.project_root,
                         &runtime.storage_path,
@@ -1855,6 +1869,82 @@ fn handle_stdio_request(
                     }
                 }
                 state.status_cache = None;
+            }
+            if name == "prove_call_path" {
+                let PreparedStdioToolCall::ProveCallPath(proof_request) = &prepared else {
+                    return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
+                };
+                let validation =
+                    match crate::prove_call_path::validate_request(proof_request.clone()) {
+                        Ok(validation) => validation,
+                        Err(message) => {
+                            return Some(stdio_jsonrpc_success(
+                                id,
+                                crate::stdio_v3::semantic_tool_error_v3(&message),
+                            ));
+                        }
+                    };
+                let root = match validation {
+                    codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
+                        contract,
+                        hashes,
+                        rendering,
+                    } => {
+                        let operation = match codestory_runtime::proof_qualification_support::
+                            run_observed_call_path_public_operation(
+                                &runtime.runtime,
+                                &contract,
+                                &hashes,
+                                &rendering,
+                                Arc::clone(cancelled),
+                            ) {
+                            Ok(operation) => operation,
+                            Err(error) => {
+                                return Some(stdio_jsonrpc_success(
+                                    id,
+                                    crate::stdio_v3::semantic_tool_error_v3(&error.message),
+                                ));
+                            }
+                        };
+                        match crate::prove_call_path::projection_root(&operation) {
+                            Ok(root) => root,
+                            Err(_) => {
+                                return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
+                            }
+                        }
+                    }
+                    codestory_runtime::proof_qualification_support::ValidationOutcome::Unknown {
+                        spec,
+                        hashes,
+                        rendering,
+                        gaps,
+                    } => {
+                        let operation = match codestory_runtime::proof_qualification_support::
+                            run_translation_unknown_public_operation(
+                                &runtime.runtime,
+                                &spec,
+                                &hashes,
+                                &rendering,
+                                &gaps,
+                                Arc::clone(cancelled),
+                            ) {
+                            Ok(operation) => operation,
+                            Err(error) => {
+                                return Some(stdio_jsonrpc_success(
+                                    id,
+                                    crate::stdio_v3::semantic_tool_error_v3(&error.message),
+                                ));
+                            }
+                        };
+                        crate::prove_call_path::internal_projection_root(&operation.value)
+                    }
+                };
+                return Some(
+                    match crate::stdio_v3::build_proof_tool_result_v3(revision, &root) {
+                        Ok(result) => stdio_jsonrpc_success(id, result),
+                        Err(error) => crate::stdio_v3::jsonrpc_internal_error_v3(id, &error),
+                    },
+                );
             }
             // Public-operation retry belongs to codestory-runtime's pinned
             // retrieval wrapper. The transport executes one logical operation
@@ -2281,112 +2371,54 @@ fn build_served_tool_result_v3(
     Ok(result)
 }
 
-fn packet_budget_exceeded_root_v3(
-    complete: &serde_json::Value,
-    required_complete_bytes: usize,
-) -> std::result::Result<serde_json::Value, ()> {
-    let required_complete_bytes = u64::try_from(required_complete_bytes).map_err(|_| ())?;
-    Ok(serde_json::json!({
-        "kind": "budget_exceeded",
-        "schema_version": complete.get("schema_version").cloned().ok_or(())?,
-        "identity": complete.get("identity").cloned().ok_or(())?,
-        "publication": complete.get("publication").cloned().ok_or(())?,
-        "status": "unavailable",
-        "retrieval": complete.get("retrieval").cloned().ok_or(())?,
-        "diagnostics": complete.get("diagnostics").cloned().ok_or(())?,
-        "gaps": [{
-            "identity": {"gap_id": "packet-output-budget-exceeded"},
-            "kind": "output_budget_exceeded",
-            "message": null
-        }],
-        "maximum_bytes": STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
-        "required_complete_bytes": required_complete_bytes
-    }))
-}
-
 fn finalize_packet_projection_for_stdio_v3(
     root: &mut serde_json::Value,
     revision: crate::stdio_v3::McpRevisionV3,
     publication_meta: Option<&serde_json::Value>,
 ) -> std::result::Result<usize, crate::stdio_v3::StdioV3InternalError> {
-    let measure = |candidate: &serde_json::Value| {
-        let result = build_served_tool_result_v3(revision, "packet", candidate, publication_meta)?;
-        v3_serialize_call_tool_result(&result)
-            .map(|bytes| bytes.len())
-            .map_err(|error| {
-                crate::stdio_v3::StdioV3InternalError::Serialization(error.to_string())
-            })
-    };
-    let mut required_complete_bytes = measure(root)?;
-    if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-        return Ok(required_complete_bytes);
+    let diagnostics_uri = root.pointer("/diagnostics/reference/uri").cloned();
+    let mut typed_root = root.clone();
+    if let Some(reference) = typed_root
+        .pointer_mut("/diagnostics/reference")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        reference.remove("uri");
     }
-    if root.get("kind").and_then(serde_json::Value::as_str) != Some("complete") {
-        return Err(crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
-            maximum_bytes: STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
-            actual_bytes: required_complete_bytes,
-        });
+    let mut projection = serde_json::from_value::<
+        codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
+    >(typed_root)
+    .map_err(|error| crate::stdio_v3::StdioV3InternalError::InvalidProjection(error.to_string()))?;
+    let measured = codestory_runtime::finalize_packet_projection_v3_for_representation(
+        &mut projection,
+        |candidate| {
+            let mut candidate = serde_json::to_value(candidate).map_err(|_| ())?;
+            if let (Some(uri), Some(reference)) = (
+                diagnostics_uri.as_ref(),
+                candidate
+                    .pointer_mut("/diagnostics/reference")
+                    .and_then(serde_json::Value::as_object_mut),
+            ) {
+                reference.insert("uri".to_owned(), uri.clone());
+            }
+            let result =
+                build_served_tool_result_v3(revision, "packet", &candidate, publication_meta)
+                    .map_err(|_| ())?;
+            v3_serialize_call_tool_result(&result)
+                .map(|bytes| bytes.len())
+                .map_err(|_| ())
+        },
+    )
+    .map_err(|error| crate::stdio_v3::StdioV3InternalError::InvalidProjection(error.message))?;
+    *root = serde_json::to_value(projection)
+        .map_err(|error| crate::stdio_v3::StdioV3InternalError::Serialization(error.to_string()))?;
+    if let (Some(uri), Some(reference)) = (
+        diagnostics_uri,
+        root.pointer_mut("/diagnostics/reference")
+            .and_then(serde_json::Value::as_object_mut),
+    ) {
+        reference.insert("uri".to_owned(), uri);
     }
-
-    let mut compact = root.clone();
-    let removed_summaries = compact
-        .get_mut("evidence")
-        .and_then(serde_json::Value::as_array_mut)
-        .is_some_and(|evidence| {
-            evidence
-                .iter_mut()
-                .filter_map(serde_json::Value::as_object_mut)
-                .fold(false, |removed, row| {
-                    let had_summary = row.get("summary").is_some_and(|value| !value.is_null());
-                    if had_summary {
-                        row.insert("summary".to_string(), serde_json::Value::Null);
-                    }
-                    had_summary || removed
-                })
-        });
-    if removed_summaries {
-        required_complete_bytes = measure(&compact)?;
-        if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-            *root = compact;
-            return Ok(required_complete_bytes);
-        }
-    }
-
-    let removed_gap_messages = compact
-        .get_mut("gaps")
-        .and_then(serde_json::Value::as_array_mut)
-        .is_some_and(|gaps| {
-            gaps.iter_mut()
-                .filter_map(serde_json::Value::as_object_mut)
-                .fold(false, |removed, row| {
-                    let had_message = row.get("message").is_some_and(|value| !value.is_null());
-                    if had_message {
-                        row.insert("message".to_string(), serde_json::Value::Null);
-                    }
-                    had_message || removed
-                })
-        });
-    if removed_gap_messages {
-        required_complete_bytes = measure(&compact)?;
-        if required_complete_bytes <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-            *root = compact;
-            return Ok(required_complete_bytes);
-        }
-    }
-
-    *root = packet_budget_exceeded_root_v3(&compact, required_complete_bytes).map_err(|_| {
-        crate::stdio_v3::StdioV3InternalError::InvalidProjection(
-            "packet fallback could not retain its mandatory envelope".to_string(),
-        )
-    })?;
-    let fallback_bytes = measure(root)?;
-    if fallback_bytes > STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-        return Err(crate::stdio_v3::StdioV3InternalError::ResultExceedsBudget {
-            maximum_bytes: STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3,
-            actual_bytes: fallback_bytes,
-        });
-    }
-    Ok(fallback_bytes)
+    Ok(measured)
 }
 
 fn stdio_jsonrpc_tool_execution_v3(
@@ -2632,7 +2664,7 @@ fn stdio_tool_reads_publication(name: &str) -> bool {
 }
 
 fn stdio_tool_observes_complete_core(name: &str) -> bool {
-    name == "affected"
+    matches!(name, "affected" | "prove_call_path")
 }
 
 fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -> &'a str {
@@ -3456,6 +3488,7 @@ enum PreparedStdioToolCall {
     Raw,
     Affected(AffectedAnalysisRequest),
     Snippet(StdioSnippetRequest),
+    ProveCallPath(crate::prove_call_path::ProveCallPathRequestDto),
 }
 
 #[derive(Debug, Clone)]
@@ -3478,6 +3511,19 @@ fn prepare_stdio_tool_call(
             Ok(PreparedStdioToolCall::Affected(affected))
         }
         "snippet" => stdio_snippet_request(request).map(PreparedStdioToolCall::Snippet),
+        "prove_call_path" => {
+            let mut arguments = request
+                .pointer("/params/arguments")
+                .cloned()
+                .ok_or_else(|| ApiError::invalid_argument("proof arguments must be an object"))?;
+            arguments
+                .as_object_mut()
+                .ok_or_else(|| ApiError::invalid_argument("proof arguments must be an object"))?
+                .remove("project");
+            crate::prove_call_path::parse_request(arguments)
+                .map(PreparedStdioToolCall::ProveCallPath)
+                .map_err(ApiError::invalid_argument)
+        }
         _ => Ok(PreparedStdioToolCall::Raw),
     }
 }
@@ -7844,6 +7890,89 @@ mod tests {
     }
 
     #[test]
+    fn packet_sixteen_row_identity_envelope_stays_complete_for_every_revision() {
+        let evidence = (0..16)
+            .map(|index| {
+                json!({
+                    "identity":{"evidence_id":format!("packet-evidence-{index:03}")},
+                    "kind":if index < 12 { "exact_source" } else { "graph_relation" },
+                    "path":format!("src/{index}/{}-é.rs", "path-segment-".repeat(12)),
+                    "symbol_id":format!("qualified::symbol::{index}::{}", "member".repeat(16)),
+                    "start_line":index + 1,
+                    "end_line":index + 2,
+                    "summary":format!("quote=\" slash=\\ control=\n {}", "evidence ".repeat(60))
+                })
+            })
+            .collect::<Vec<_>>();
+        let candidate = json!({
+            "kind":"complete",
+            "schema_version":3,
+            "identity":{
+                "packet_id":"b96ac0cc-e552-4c35-a0ba-c83b9ead67de",
+                "request_id":"request-1",
+                "question_sha256":"a".repeat(64)
+            },
+            "publication":{
+                "core":{
+                    "project_id":"project-1",
+                    "generation_id":"core-generation-1",
+                    "run_id":"core-run-1"
+                },
+                "retrieval":null
+            },
+            "status":"available",
+            "retrieval":{"state":"full","generation_id":"retrieval-generation-1"},
+            "evidence":evidence,
+            "gaps":[{
+                "identity":{"gap_id":"evidence-projection-bounded"},
+                "kind":"output_budget_exceeded",
+                "message":"Additional internal support rows were omitted from the bounded public projection."
+            }],
+            "continuation":null,
+            "diagnostics":{
+                "availability":"available",
+                "reference":{
+                    "artifact_id":"artifact-1",
+                    "sha256":"b".repeat(64),
+                    "byte_length":123
+                }
+            }
+        });
+        let publication_meta = json!({
+            "schema_version":3,
+            "minimum_compatible_schema_version":3,
+            "core_publication":{
+                "generation_id":"core-generation-with-escaped-\"-metadata",
+                "run_id":"core-run-1"
+            },
+            "retrieval_publication":{
+                "retrieval_generation":"retrieval-generation-with-multibyte-é🦀"
+            },
+            "operation":{"operation_id":"public-operation-123456789","attempt":2}
+        });
+
+        for revision in crate::stdio_v3::McpRevisionV3::all() {
+            let mut root = candidate.clone();
+            reserve_packet_diagnostics_capability_v3(&mut root, 1_725_000_600_123).unwrap();
+            let measured = finalize_packet_projection_for_stdio_v3(
+                &mut root,
+                *revision,
+                Some(&publication_meta),
+            )
+            .expect("the closed evidence envelope must fit every transport profile");
+            let result =
+                build_served_tool_result_v3(*revision, "packet", &root, Some(&publication_meta))
+                    .unwrap();
+            let emitted = v3_serialize_call_tool_result(&result).unwrap();
+
+            assert_eq!(root["kind"], "complete", "{revision:?}");
+            assert_eq!(root["evidence"].as_array().unwrap().len(), 16);
+            assert_eq!(measured, emitted.len());
+            assert!(measured <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
+        }
+    }
+
+    #[test]
     fn packet_final_result_cap_boundaries_are_exact_for_old_and_modern_profiles() {
         fn root_with_padding(ascii_padding: usize, controls: usize) -> serde_json::Value {
             let hostile = "quote-\"-slash-\\-control-\u{0000}-café-🦀-";
@@ -8011,13 +8140,17 @@ mod tests {
                     assert_eq!(root["kind"], "complete");
                     assert_eq!(emitted.len(), target);
                 } else {
-                    assert_eq!(root["kind"], "budget_exceeded");
-                    assert_eq!(root["status"], "unavailable");
-                    assert_eq!(root["required_complete_bytes"], target);
+                    assert_eq!(root["kind"], "complete");
                     assert_eq!(root["gaps"].as_array().unwrap().len(), 1);
                     assert_eq!(root["gaps"][0]["kind"], "output_budget_exceeded");
-                    assert!(root.get("evidence").is_none());
-                    assert!(root.get("continuation").is_none());
+                    assert_eq!(root["evidence"].as_array().unwrap().len(), 8);
+                    assert!(root["evidence"].as_array().unwrap().iter().any(|row| {
+                        row["path"].is_null()
+                            && row["symbol_id"].is_null()
+                            && row["start_line"].is_null()
+                            && row["end_line"].is_null()
+                            && row["summary"].is_null()
+                    }));
                 }
 
                 let diagnostic_bytes = vec![7; 123];
@@ -8059,14 +8192,7 @@ mod tests {
                         .expect("emitted JSON text mirror"),
                 )
                 .unwrap();
-                assert_eq!(
-                    actual_text["kind"],
-                    if target <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-                        json!("complete")
-                    } else {
-                        json!("budget_exceeded")
-                    }
-                );
+                assert_eq!(actual_text["kind"], json!("complete"));
                 assert!(
                     actual_text
                         .pointer("/diagnostics/reference/wall_expiry_epoch_ms")
@@ -8078,6 +8204,31 @@ mod tests {
                     assert_eq!(actual_result["structuredContent"], actual_text);
                 }
             }
+
+            let mut mandatory = root_with_padding(0, 0);
+            mandatory["evidence"] = json!((0..256)
+                .map(|index| json!({
+                    "identity":{"evidence_id":format!("mandatory-{index:03}-{}", "x".repeat(180))},
+                    "kind":"exact_source",
+                    "path":null,
+                    "symbol_id":null,
+                    "start_line":null,
+                    "end_line":null,
+                    "summary":null
+                }))
+                .collect::<Vec<_>>());
+            reserve_packet_diagnostics_capability_v3(&mut mandatory, 1_725_000_600_123).unwrap();
+            let measured = finalize_packet_projection_for_stdio_v3(
+                &mut mandatory,
+                *revision,
+                Some(&publication_meta),
+            )
+            .expect("typed mandatory-envelope fallback fits");
+            assert!(measured <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
+            assert_eq!(mandatory["kind"], "budget_exceeded");
+            assert_eq!(mandatory["status"], "unavailable");
+            assert!(mandatory.get("evidence").is_none());
+            assert!(mandatory.get("continuation").is_none());
         }
     }
 

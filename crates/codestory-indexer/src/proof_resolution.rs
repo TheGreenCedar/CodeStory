@@ -212,14 +212,14 @@ const TYPESCRIPT_ADAPTER_VERSION: &str = "reference-v17";
 const JAVA_ADAPTER_VERSION: &str = "reference-v2";
 const KOTLIN_ADAPTER_VERSION: &str = "reference-v2";
 const C_ADAPTER_VERSION: &str = "reference-v2";
-const CPP_ADAPTER_VERSION: &str = "reference-v3";
+const CPP_ADAPTER_VERSION: &str = "reference-v4";
 const RUBY_ADAPTER_VERSION: &str = "reference-v3";
 const PHP_ADAPTER_VERSION: &str = "reference-v2";
 const CSHARP_ADAPTER_VERSION: &str = "reference-v2";
 const SWIFT_ADAPTER_VERSION: &str = "reference-v2";
 const DART_ADAPTER_VERSION: &str = "reference-v2";
 const BASH_ADAPTER_VERSION: &str = "reference-v1";
-const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 26;
+const RESOLUTION_INPUT_SCHEMA_VERSION: u32 = 28;
 const INSTALLED_ADAPTERS: &[(&str, &str)] = &[
     ("bash", BASH_ADAPTER_VERSION),
     ("go", GO_ADAPTER_VERSION),
@@ -279,7 +279,7 @@ pub(crate) fn collect_call_resolution_inputs(
         };
     }
     let complete = !tree.root_node().has_error();
-    let lookup_input_complete = complete;
+    let mut lookup_input_complete = complete;
     let source_sha256 = source_content_hash(source.as_bytes());
     let javascript_index = is_javascript_language(language).then(|| {
         JavascriptResolutionIndex::build(tree, source, source_path, language, file_id, nodes)
@@ -355,6 +355,10 @@ pub(crate) fn collect_call_resolution_inputs(
     let mut calls = Vec::new();
     let mut emit_call =
         |callee: TsNode<'_>, form: CalleeForm, raw_target: String, callable_id: Option<usize>| {
+            if callee.start_byte() >= callee.end_byte() || raw_target.trim().is_empty() {
+                lookup_input_complete = false;
+                return;
+            }
             let mut callsite = ExactCallsite {
                 file_id: FileId(file_id.0),
                 source_sha256: source_sha256.clone(),
@@ -3999,26 +4003,36 @@ fn c_cpp_source_role(path: &Path) -> CachedCCppSourceRole {
 }
 
 fn c_cpp_sort_calls_by_span(calls: &mut Vec<IndexedCCppCall<'_>>) {
-    for shift in (0..usize::BITS).step_by(8) {
-        let mut buckets = (0..=u8::MAX)
-            .map(|_| Vec::new())
-            .collect::<Vec<Vec<IndexedCCppCall<'_>>>>();
-        for call in std::mem::take(calls) {
-            count_c_cpp_resolution_work(1);
-            let bucket = (call.callee.start_byte() >> shift) & usize::from(u8::MAX);
-            buckets[bucket].push(call);
-        }
-        for bucket in buckets {
-            count_c_cpp_resolution_work(bucket.len());
-            calls.extend(bucket);
+    for end_byte_first in [true, false] {
+        for shift in (0..usize::BITS).step_by(8) {
+            let mut buckets = (0..=u8::MAX)
+                .map(|_| Vec::new())
+                .collect::<Vec<Vec<IndexedCCppCall<'_>>>>();
+            for call in std::mem::take(calls) {
+                count_c_cpp_resolution_work(1);
+                let coordinate = if end_byte_first {
+                    call.callee.end_byte()
+                } else {
+                    call.callee.start_byte()
+                };
+                let bucket = (coordinate >> shift) & usize::from(u8::MAX);
+                buckets[bucket].push(call);
+            }
+            for bucket in buckets {
+                count_c_cpp_resolution_work(bucket.len());
+                calls.extend(bucket);
+            }
         }
     }
 }
 
-fn expected_parser_fingerprint(path: &Path, language: &str) -> Option<String> {
+fn expected_parser_config(path: &Path, language: &str) -> Option<crate::LanguageConfig> {
     let extension = path.extension()?.to_str()?;
     let config = crate::get_language_for_ext(extension)?;
-    (config.language_name == language).then(|| crate::resolution_parser_fingerprint(&config))
+    if config.language_name == language {
+        return Some(config);
+    }
+    (language == "cpp" && crate::path_is_c_header(path)).then(crate::cpp_language_config)
 }
 
 pub(crate) fn cached_resolution_inputs_are_current(
@@ -13303,7 +13317,7 @@ pub fn rematerialize_proof_resolution_projection(
                     indexed_file.path.display()
                 )
             })?;
-        let expected_parser_fingerprint = expected_parser_fingerprint(
+        let expected_parser_config = expected_parser_config(
             &indexed_file.path,
             &indexed_file.language,
         )
@@ -13314,6 +13328,8 @@ pub fn rematerialize_proof_resolution_projection(
                 indexed_file.path.display()
             )
         })?;
+        let expected_parser_fingerprint =
+            crate::resolution_parser_fingerprint(&expected_parser_config);
         if record.file.parser_fingerprint != expected_parser_fingerprint
             || record
                 .calls
@@ -13387,52 +13403,39 @@ pub fn rematerialize_proof_resolution_projection(
                     indexed_file.path.display()
                 ));
             }
-            let source = std::str::from_utf8(&source_bytes).with_context(|| {
-                format!(
+            if let Ok(source) = std::str::from_utf8(&source_bytes) {
+                let mut parser = Parser::new();
+                parser
+                    .set_language(&expected_parser_config.language)
+                    .map_err(|error| {
+                        anyhow!("proof resolution semantic cache parser failed: {error:?}")
+                    })?;
+                let tree = parser.parse(source, None).ok_or_else(|| {
+                    anyhow!("proof resolution semantic cache source did not parse")
+                })?;
+                let regenerated = collect_call_resolution_inputs(
+                    &tree,
+                    source,
+                    &indexed_file.path,
+                    &indexed_file.language,
+                    &expected_parser_fingerprint,
+                    NodeId(indexed_file.id),
+                    csd_nodes_by_file
+                        .get(&indexed_file.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                );
+                if regenerated.file.as_ref() != Some(&record.file)
+                    || regenerated.calls != record.calls
+                {
+                    return Err(anyhow!(
+                        "proof resolution semantic cache does not match authenticated source for {}",
+                        indexed_file.path.display()
+                    ));
+                }
+            } else if record.file.lookup_input_complete || !record.calls.is_empty() {
+                return Err(anyhow!(
                     "proof resolution semantic cache source is not UTF-8 for {}",
-                    indexed_file.path.display()
-                )
-            })?;
-            let extension = indexed_file
-                .path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .ok_or_else(|| anyhow!("proof resolution semantic cache path has no extension"))?;
-            let config = crate::get_language_for_ext(extension).ok_or_else(|| {
-                anyhow!(
-                    "proof resolution semantic cache has no parser for {}",
-                    indexed_file.path.display()
-                )
-            })?;
-            if config.language_name != indexed_file.language {
-                return Err(anyhow!(
-                    "proof resolution semantic cache parser language drifted for {}",
-                    indexed_file.path.display()
-                ));
-            }
-            let mut parser = Parser::new();
-            parser.set_language(&config.language).map_err(|error| {
-                anyhow!("proof resolution semantic cache parser failed: {error:?}")
-            })?;
-            let tree = parser
-                .parse(source, None)
-                .ok_or_else(|| anyhow!("proof resolution semantic cache source did not parse"))?;
-            let regenerated = collect_call_resolution_inputs(
-                &tree,
-                source,
-                &indexed_file.path,
-                &indexed_file.language,
-                &expected_parser_fingerprint,
-                NodeId(indexed_file.id),
-                csd_nodes_by_file
-                    .get(&indexed_file.id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            );
-            if regenerated.file.as_ref() != Some(&record.file) || regenerated.calls != record.calls
-            {
-                return Err(anyhow!(
-                    "proof resolution semantic cache does not match authenticated source for {}",
                     indexed_file.path.display()
                 ));
             }
@@ -20068,6 +20071,54 @@ mod c_cpp_complexity_tests {
             large <= small * 2 + 256,
             "C++ parser/index work grew superlinearly: {small} -> {large}"
         );
+    }
+
+    #[test]
+    fn c_cpp_nested_calls_are_ordered_by_complete_span() {
+        let source = "void caller() { factory(); }\n";
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .expect("C++ grammar must load");
+        let tree = parser.parse(source, None).expect("C++ source must parse");
+        let mut expression = None;
+        walk_nodes(tree.root_node(), &mut |node| {
+            if expression.is_none() && node.kind() == "call_expression" {
+                expression = Some(node);
+            }
+        });
+        let expression = expression.expect("call expression");
+        let identifier = expression
+            .child_by_field_name("function")
+            .expect("callee identifier");
+        assert_eq!(expression.start_byte(), identifier.start_byte());
+        assert!(expression.end_byte() > identifier.end_byte());
+        let call = |callee| IndexedCCppCall {
+            callee,
+            form: CalleeForm::DynamicAccess,
+            raw_target: "fixture".to_string(),
+            caller: None,
+            callable_id: None,
+            namespace_path: Vec::new(),
+            owner_index: None,
+            unsupported: true,
+            identifier_shadowed: false,
+            receiver: CCppCallReceiver::Blocked,
+        };
+        let mut calls = vec![call(expression), call(identifier)];
+        reset_c_cpp_resolution_work();
+        c_cpp_sort_calls_by_span(&mut calls);
+        let spans = calls
+            .iter()
+            .map(|call| (call.callee.start_byte(), call.callee.end_byte()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(spans[0].0, spans[1].0);
+        assert!(
+            spans.windows(2).all(|pair| pair[0] <= pair[1]),
+            "callsites must use the native (start, end) witness order: {spans:?}"
+        );
+        assert!(c_cpp_resolution_work() >= spans.len() * 4);
     }
 }
 

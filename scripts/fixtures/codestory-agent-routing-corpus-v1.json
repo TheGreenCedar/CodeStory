@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "named_file_direct_read",
+      "prompt": "Read the user-named file src/lib.rs directly and report only what that source establishes.",
+      "request": { "named_files": ["src/lib.rs"], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
+    },
+    {
+      "id": "exact_symbol_search",
+    "prompt": "Where is the exact symbol start declared? Treat a broad match as a discovery lead rather than proof.",
+      "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
+    },
+    {
+      "id": "ambiguous_symbol_then_context",
+      "prompt": "Find Thing. I mean the definition in src/one.rs; give focused evidence for that exact returned symbol.",
+      "request": { "named_files": [], "selected_target": "src/one.rs", "gap_source_paths": [], "proof_contract": null }
+    },
+    {
+      "id": "selected_target_context",
+    "prompt": "Give me focused evidence for the selected target start without broadening the question.",
+      "request": { "named_files": [], "selected_target": "start", "gap_source_paths": [], "proof_contract": null }
+    },
+    {
+      "id": "broad_packet",
+      "prompt": "Explain how routing_fixture::start reaches finish across the project. Preserve any evidence gaps.",
+      "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
+    },
+    {
+      "id": "packet_single_continuation",
+      "prompt": "Trace the complete routing flow and account for `src/unread.rs` if the index cannot cover it. If the evidence surface offers one bounded continuation, follow that exact offer once.",
+      "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
+    },
+    {
+      "id": "packet_gap_to_focused_source",
+      "prompt": "Investigate the missing route branch. Read src/gap.rs only if the broad project evidence identifies a gap that authorizes that focused read.",
+      "request": { "named_files": [], "selected_target": null, "gap_source_paths": ["src/gap.rs"], "proof_contract": null }
+    },
+    {
+      "id": "packet_unavailable_to_source",
+      "prompt": "Explain the deliberately oversized routing catalog. If the complete evidence response is unavailable because of its output budget, read src/fallback.rs and preserve that reason.",
+      "request": { "named_files": [], "selected_target": null, "gap_source_paths": ["src/fallback.rs"], "proof_contract": null }
+    },
+    {
+      "id": "typed_proof_contract_proven",
+      "prompt": "Verify the supplied exact typed contract unchanged and report only the verifier's disposition.",
+      "request": {
+        "named_files": [], "selected_target": null, "gap_source_paths": [],
+        "proof_contract": {
+          "source_text": "`routing_fixture::start` directly calls `routing_fixture::finish`.",
+          "clauses": [{
+            "clause_id": "contract", "start_byte": 0, "end_byte_exclusive": 66,
+            "quote": "`routing_fixture::start` directly calls `routing_fixture::finish`.",
+            "classification": { "kind": "resolved_material", "fields": [{ "kind": "start" }, { "kind": "step_target", "step": 0 }, { "kind": "directness", "step": 0 }, { "kind": "ordering", "step": 0 }, { "kind": "relation", "step": 0 }] }
+          }],
+          "spec": {
+            "start": { "kind": "qualified_name", "qualified_name": "start", "project_file_components": ["src", "lib.rs"] },
+            "steps": [{ "target": { "kind": "qualified_name", "qualified_name": "finish", "project_file_components": ["src", "lib.rs"] } }],
+            "prohibit_traversal_through": [], "exclude_from_projection": []
+          }
+        }
+      }
+    },
+    {
+      "id": "typed_proof_contract_refuted",
+      "prompt": "Verify the supplied exact typed prohibition contract unchanged and preserve the verifier's disposition.",
+      "request": {
+        "named_files": [], "selected_target": null, "gap_source_paths": [],
+        "proof_contract": {
+          "source_text": "`refuted_start` directly calls `detour`, then `detour` directly calls `finish`, and must not traverse `detour`.",
+          "clauses": [{
+            "clause_id": "contract", "start_byte": 0, "end_byte_exclusive": 111,
+            "quote": "`refuted_start` directly calls `detour`, then `detour` directly calls `finish`, and must not traverse `detour`.",
+            "classification": { "kind": "resolved_material", "fields": [{ "kind": "start" }, { "kind": "step_target", "step": 0 }, { "kind": "directness", "step": 0 }, { "kind": "ordering", "step": 0 }, { "kind": "relation", "step": 0 }, { "kind": "step_target", "step": 1 }, { "kind": "directness", "step": 1 }, { "kind": "ordering", "step": 1 }, { "kind": "relation", "step": 1 }, { "kind": "traversal_prohibition", "index": 0 }] }
+          }],
+          "spec": {
+            "start": { "kind": "qualified_name", "qualified_name": "refuted_start", "project_file_components": ["src", "lib.rs"] },
+            "steps": [{ "target": { "kind": "qualified_name", "qualified_name": "detour", "project_file_components": ["src", "lib.rs"] } }, { "target": { "kind": "qualified_name", "qualified_name": "finish", "project_file_components": ["src", "lib.rs"] } }],
+            "prohibit_traversal_through": [{ "kind": "qualified_name", "qualified_name": "detour", "project_file_components": ["src", "lib.rs"] }],
+            "exclude_from_projection": []
+          }
+        }
+      }
+    },
+    {
+      "id": "typed_proof_unknown",
+      "prompt": "Verify the supplied exact typed missing-selector contract unchanged. Do not turn uncertainty into absence.",
+      "request": {
+        "named_files": [], "selected_target": null, "gap_source_paths": [],
+        "proof_contract": {
+          "source_text": "`routing_fixture::missing` directly calls `routing_fixture::finish`.",
+          "clauses": [{
+            "clause_id": "contract", "start_byte": 0, "end_byte_exclusive": 68,
+            "quote": "`routing_fixture::missing` directly calls `routing_fixture::finish`.",
+            "classification": { "kind": "resolved_material", "fields": [{ "kind": "start" }, { "kind": "step_target", "step": 0 }, { "kind": "directness", "step": 0 }, { "kind": "ordering", "step": 0 }, { "kind": "relation", "step": 0 }] }
+          }],
+          "spec": {
+            "start": { "kind": "qualified_name", "qualified_name": "missing", "project_file_components": ["src", "lib.rs"] },
+            "steps": [{ "target": { "kind": "qualified_name", "qualified_name": "finish", "project_file_components": ["src", "lib.rs"] } }],
+            "prohibit_traversal_through": [], "exclude_from_projection": []
+          }
+        }
+      }
+    },
+    {
+      "id": "typed_proof_unavailable",
+      "prompt": "Verify the supplied exact publication-pinned contract unchanged and preserve the verifier's availability result.",
+      "request": {
+        "named_files": [], "selected_target": null, "gap_source_paths": [],
+        "proof_contract": {
+          "source_text": "The pinned start directly calls the pinned finish.",
+          "clauses": [{
+            "clause_id": "contract", "start_byte": 0, "end_byte_exclusive": 50,
+            "quote": "The pinned start directly calls the pinned finish.",
+            "classification": { "kind": "resolved_material", "fields": [{ "kind": "start" }, { "kind": "step_target", "step": 0 }, { "kind": "directness", "step": 0 }, { "kind": "ordering", "step": 0 }, { "kind": "relation", "step": 0 }] }
+          }],
+          "spec": {
+            "start": { "kind": "pinned_node", "project_id": "wrong-project", "core_generation_id": "wrong-generation", "core_run_id": "wrong-run", "node_id": "1" },
+            "steps": [{ "target": { "kind": "pinned_node", "project_id": "wrong-project", "core_generation_id": "wrong-generation", "core_run_id": "wrong-run", "node_id": "2" } }],
+            "prohibit_traversal_through": [], "exclude_from_projection": []
+          }
+        }
+      }
+    },
+    {
+      "id": "malformed_proof_contract",
+      "prompt": "Verify the supplied JSON-shaped but semantically incomplete typed contract unchanged and preserve the verifier's semantic error.",
+      "request": {
+        "named_files": [], "selected_target": null, "gap_source_paths": [],
+        "proof_contract": {
+          "source_text": "A calls B", "clauses": [],
+          "spec": { "start": { "kind": "canonical_id", "canonical_id": "missing:A" }, "steps": [{ "target": { "kind": "canonical_id", "canonical_id": "missing:B" } }], "prohibit_traversal_through": [], "exclude_from_projection": [] }
+        }
+      }
+    },
+    {
+      "id": "refuse_free_english_proof",
+      "prompt": "Does start call finish? I supplied only this English sentence, not a typed verification contract. Do not invent one.",
+      "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
+    },
+    {
+      "id": "proof_observational",
+      "prompt": "Verify the supplied exact typed unsupported-call contract unchanged and report whether this observational check activated semantic retrieval.",
+      "request": {
+        "named_files": [], "selected_target": null, "gap_source_paths": [],
+        "proof_contract": {
+          "source_text": "`routing_fixture::dynamic_start` directly calls `routing_fixture::finish`.",
+          "clauses": [{
+            "clause_id": "contract", "start_byte": 0, "end_byte_exclusive": 74,
+            "quote": "`routing_fixture::dynamic_start` directly calls `routing_fixture::finish`.",
+            "classification": { "kind": "resolved_material", "fields": [{ "kind": "start" }, { "kind": "step_target", "step": 0 }, { "kind": "directness", "step": 0 }, { "kind": "ordering", "step": 0 }, { "kind": "relation", "step": 0 }] }
+          }],
+          "spec": {
+            "start": { "kind": "qualified_name", "qualified_name": "dynamic_start", "project_file_components": ["src", "lib.rs"] },
+            "steps": [{ "target": { "kind": "qualified_name", "qualified_name": "finish", "project_file_components": ["src", "lib.rs"] } }],
+            "prohibit_traversal_through": [], "exclude_from_projection": []
+          }
+        }
+      }
+    },
+    {
+      "id": "hidden_proof_tool_discovery",
+      "prompt": "The exact verifier may be hidden. Locate only the verifier needed for the supplied typed contract, verify it unchanged, and preserve the result.",
+      "request": {
+        "named_files": [], "selected_target": null, "gap_source_paths": [],
+        "proof_contract": {
+          "source_text": "`routing_fixture::start` directly calls `routing_fixture::finish`.",
+          "clauses": [{
+            "clause_id": "contract", "start_byte": 0, "end_byte_exclusive": 66,
+            "quote": "`routing_fixture::start` directly calls `routing_fixture::finish`.",
+            "classification": { "kind": "resolved_material", "fields": [{ "kind": "start" }, { "kind": "step_target", "step": 0 }, { "kind": "directness", "step": 0 }, { "kind": "ordering", "step": 0 }, { "kind": "relation", "step": 0 }] }
+          }],
+          "spec": {
+            "start": { "kind": "qualified_name", "qualified_name": "start", "project_file_components": ["src", "lib.rs"] },
+            "steps": [{ "target": { "kind": "qualified_name", "qualified_name": "finish", "project_file_components": ["src", "lib.rs"] } }],
+            "prohibit_traversal_through": [], "exclude_from_projection": []
+          }
+        }
+      }
+    }
+  ]
+}

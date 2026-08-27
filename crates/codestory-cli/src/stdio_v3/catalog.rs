@@ -7,7 +7,7 @@ const PROJECTION_ROWS_MAX_V3: usize = 256;
 const PROJECTION_REFERENCES_MAX_V3: usize = 256;
 
 pub(crate) fn tools_for_revision_v3(revision: McpRevisionV3) -> Vec<Value> {
-    tools_for_surface_v3(revision, V3SurfaceSet::EvidenceOnly)
+    tools_for_surface_v3(revision, V3SurfaceSet::WithProof)
 }
 
 pub(crate) fn tools_for_surface_v3(revision: McpRevisionV3, surface: V3SurfaceSet) -> Vec<Value> {
@@ -209,6 +209,45 @@ fn proof_gap_schema_v3() -> Value {
     json!({
         "type":"object",
         "oneOf":[
+            closed_object_schema_v3(vec![(
+                "kind",
+                enum_schema_v3(&["unclassified_source_text"]),
+            )]),
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["unresolved_material_clause"])),
+                ("clause_id", string_schema_v3()),
+                (
+                    "reason",
+                    enum_schema_v3(&[
+                        "missing_selector_resolution",
+                        "ambiguous_selector_resolution",
+                        "unsupported_interpretation",
+                    ]),
+                ),
+            ]),
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["material_token_misclassified"])),
+                ("clause_id", string_schema_v3()),
+                (
+                    "guard_families",
+                    json!({
+                        "type":"array",
+                        "items":enum_schema_v3(&[
+                            "quoted_or_backticked_identifier",
+                            "arrow_or_relation_notation",
+                            "directness",
+                            "ordering_or_ordinal",
+                            "only",
+                            "negation_or_exclusion",
+                            "path_like_string",
+                            "qualified_symbol_notation",
+                        ]),
+                        "minItems":1,
+                        "maxItems":8,
+                        "uniqueItems":true,
+                    }),
+                ),
+            ]),
             selector_gap("selector_missing"),
             selector_gap("selector_ambiguous"),
             selector_gap("non_callable_selector"),
@@ -912,27 +951,157 @@ fn successful_with_preparing_schema_v3(success: Value) -> Value {
     })
 }
 
-fn proof_tool_source_v3() -> Value {
+pub(crate) fn proof_tool_source_v3() -> Value {
     json!({
         "name": "prove_call_path",
         "description": "Verify one host-translated exact indexed source call-path contract against a pinned publication.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "project": {"type":"string","minLength":1},
-                "source_text": {"type":"string","minLength":1},
-                "clauses": {"type":"array"},
-                "spec": {"type":"object"}
-            },
-            "required": ["project", "source_text", "clauses", "spec"],
-            "additionalProperties": false
-        },
+        "inputSchema": proof_input_schema_v3(),
         "outputSchema": proof_output_schema_v3(),
         "safety": {
             "effect": "read_only",
             "activatesProject": false,
             "sideEffects": false
         }
+    })
+}
+
+fn proof_input_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("project", json!({"type":"string","minLength":1})),
+        ("source_text", json!({"type":"string","minLength":1})),
+        (
+            "clauses",
+            json!({"type":"array","items":proof_clause_anchor_input_schema_v3()}),
+        ),
+        ("spec", proof_spec_input_schema_v3()),
+    ])
+}
+
+fn proof_clause_anchor_input_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("clause_id", json!({"type":"string","minLength":1})),
+        ("start_byte", unsigned_integer_schema_v3()),
+        ("end_byte_exclusive", unsigned_integer_schema_v3()),
+        ("quote", string_schema_v3()),
+        (
+            "classification",
+            proof_clause_classification_input_schema_v3(),
+        ),
+    ])
+}
+
+fn proof_clause_classification_input_schema_v3() -> Value {
+    json!({
+        "type":"object",
+        "oneOf":[
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["resolved_material"])),
+                ("fields", json!({
+                    "type":"array",
+                    "items":proof_contract_field_input_schema_v3(),
+                    "minItems":1,
+                })),
+            ]),
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["unresolved_material"])),
+                ("reason", enum_schema_v3(&[
+                    "missing_selector_resolution",
+                    "ambiguous_selector_resolution",
+                    "unsupported_interpretation",
+                ])),
+            ]),
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["non_material"])),
+                ("reason", enum_schema_v3(&[
+                    "whitespace",
+                    "punctuation",
+                    "connector",
+                    "commentary",
+                ])),
+            ]),
+        ],
+    })
+}
+
+fn proof_contract_field_input_schema_v3() -> Value {
+    let step = |kind| {
+        closed_object_schema_v3(vec![
+            ("kind", enum_schema_v3(&[kind])),
+            ("step", json!({"type":"integer","minimum":0,"maximum":5})),
+        ])
+    };
+    let scope = |kind| {
+        closed_object_schema_v3(vec![
+            ("kind", enum_schema_v3(&[kind])),
+            ("index", json!({"type":"integer","minimum":0,"maximum":255})),
+        ])
+    };
+    json!({
+        "type":"object",
+        "oneOf":[
+            closed_object_schema_v3(vec![("kind", enum_schema_v3(&["start"]))]),
+            step("step_target"),
+            step("directness"),
+            step("ordering"),
+            step("relation"),
+            scope("traversal_prohibition"),
+            scope("projection_exclusion"),
+        ],
+    })
+}
+
+fn proof_spec_input_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("start", proof_selector_input_schema_v3()),
+        (
+            "steps",
+            json!({
+                "type":"array",
+                "items":closed_object_schema_v3(vec![("target", proof_selector_input_schema_v3())]),
+                "minItems":1,
+                "maxItems":6,
+            }),
+        ),
+        (
+            "prohibit_traversal_through",
+            json!({"type":"array","items":proof_selector_input_schema_v3(),"maxItems":256}),
+        ),
+        (
+            "exclude_from_projection",
+            json!({"type":"array","items":proof_selector_input_schema_v3(),"maxItems":256}),
+        ),
+    ])
+}
+
+fn proof_selector_input_schema_v3() -> Value {
+    let file_components = json!({
+        "type":["array","null"],
+        "items":{"type":"string","minLength":1},
+    });
+    json!({
+        "type":"object",
+        "oneOf":[
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["pinned_node"])),
+                ("project_id", string_schema_v3()),
+                ("core_generation_id", string_schema_v3()),
+                ("core_run_id", string_schema_v3()),
+                ("node_id", string_schema_v3()),
+            ]),
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["canonical_id"])),
+                ("canonical_id", string_schema_v3()),
+            ]),
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["qualified_name"])),
+                ("qualified_name", string_schema_v3()),
+            ]),
+            closed_object_schema_v3(vec![
+                ("kind", enum_schema_v3(&["qualified_name"])),
+                ("qualified_name", string_schema_v3()),
+                ("project_file_components", file_components),
+            ]),
+        ],
     })
 }
 

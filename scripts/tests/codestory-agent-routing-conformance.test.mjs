@@ -18,10 +18,13 @@ import test, { after } from "node:test";
 
 import {
   INSTALLED_IDENTITY_FIELDS,
+  ROUTING_REQUEST_CORPUS,
   ROUTING_SCENARIOS,
   STATIC_PARITY_HOSTS,
   canonicalRequestContractDigest,
   parseInstalledTranscript,
+  validateProofCallInputAgainstCatalog,
+  validateRoutingRequestCorpus,
   validateInstalledSession,
   validateStaticHostParity,
 } from "../codestory-agent-routing-conformance.mjs";
@@ -125,27 +128,34 @@ function proofContract({ prohibited = false } = {}) {
     clauses: [
       {
         clause_id: "contract",
-        start: 0,
-        end: Buffer.byteLength(sourceText),
+        start_byte: 0,
+        end_byte_exclusive: Buffer.byteLength(sourceText),
         quote: sourceText,
-        classification: "resolved_material",
-        fields,
-        reason: null,
-        non_material_kind: null,
+        classification: { kind: "resolved_material", fields },
       },
     ],
     spec: {
       start: { kind: "canonical_id", canonical_id: "rust:crate::start" },
-      steps: [{
-        relation: "direct_outgoing_call",
-        target: { kind: "canonical_id", canonical_id: "rust:crate::finish" },
-      }],
+      steps: [{ target: { kind: "canonical_id", canonical_id: "rust:crate::finish" } }],
       prohibit_traversal_through: prohibited
         ? [{ kind: "canonical_id", canonical_id: "rust:crate::blocked" }]
         : [],
       exclude_from_projection: [],
     },
   };
+}
+
+function projectedProofClauses(contract) {
+  return contract.clauses.map((clause) => ({
+    start: clause.start_byte,
+    end: clause.end_byte_exclusive,
+    clause_id: clause.clause_id,
+    quote: clause.quote,
+    classification: clause.classification.kind,
+    fields: clause.classification.kind === "resolved_material" ? clone(clause.classification.fields) : [],
+    reason: clause.classification.kind === "unresolved_material" ? clause.classification.reason : null,
+    non_material_kind: clause.classification.kind === "non_material" ? clause.classification.reason : null,
+  }));
 }
 
 function runtimeMeta(overrides = {}) {
@@ -176,6 +186,125 @@ function result(body, { isError = false, meta = runtimeMeta() } = {}) {
     content: [{ type: "text", text: JSON.stringify(body) }],
     ...(isError ? { isError: true } : { structuredContent: body }),
     _meta: meta,
+  };
+}
+
+function v3Publication() {
+  return {
+    core: { project_id: "project-1", generation_id: "core-1", run_id: "run-1" },
+    retrieval: {
+      core_generation_id: "core-1",
+      core_run_id: "run-1",
+      retrieval_generation: "retrieval-1",
+      retrieval_input_sha256: "e".repeat(64),
+      semantic_generation: "semantic-1",
+    },
+  };
+}
+
+function v3Identity(packetId = "packet-1") {
+  return {
+    packet_id: packetId,
+    request_id: `request-${packetId}`,
+    question_sha256: "f".repeat(64),
+  };
+}
+
+function v3Gap(gapId, kind = "evidence_missing") {
+  return { identity: { gap_id: gapId }, kind, message: null };
+}
+
+function v3SearchEvidence(evidenceId, path, symbolId) {
+  return {
+    identity: { evidence_id: evidenceId },
+    path,
+    symbol_id: symbolId,
+    start_line: 1,
+    end_line: 1,
+    excerpt: "fixture evidence",
+  };
+}
+
+function v3ContextEvidence(evidenceId, path, symbolId) {
+  return v3SearchEvidence(evidenceId, path, symbolId);
+}
+
+function v3PacketEvidence(evidenceId, path, symbolId = null) {
+  return {
+    identity: { evidence_id: evidenceId },
+    kind: "exact_source",
+    path,
+    symbol_id: symbolId,
+    start_line: 1,
+    end_line: 1,
+    summary: "fixture evidence",
+  };
+}
+
+function v3Search({ evidence, gaps = [], status = "available" }) {
+  return {
+    kind: "complete",
+    schema_version: 3,
+    identity: v3Identity("search-1"),
+    publication: v3Publication(),
+    status,
+    evidence,
+    gaps,
+    continuation: null,
+    retrieval: { state: "full", generation_id: "retrieval-1" },
+    diagnostics: { availability: "unavailable" },
+  };
+}
+
+function v3Context({ target, evidence, gaps = [], status = "available" }) {
+  return {
+    kind: "complete",
+    schema_version: 3,
+    identity: v3Identity("context-1"),
+    publication: v3Publication(),
+    status,
+    target,
+    evidence,
+    gaps,
+    continuation: null,
+    diagnostics: { availability: "unavailable" },
+  };
+}
+
+function v3Packet({
+  packetId = "packet-1",
+  evidence = [],
+  gaps = [],
+  status = "available",
+  continuation = null,
+  retrievalState = "full",
+}) {
+  return {
+    kind: "complete",
+    schema_version: 3,
+    identity: v3Identity(packetId),
+    publication: v3Publication(),
+    status,
+    retrieval: { state: retrievalState, generation_id: retrievalState === "unavailable" ? null : "retrieval-1" },
+    evidence,
+    gaps,
+    continuation,
+    diagnostics: { availability: "unavailable" },
+  };
+}
+
+function v3PacketBudgetExceeded() {
+  return {
+    kind: "budget_exceeded",
+    schema_version: 3,
+    identity: v3Identity("packet-budget"),
+    publication: v3Publication(),
+    status: "unavailable",
+    retrieval: { state: "full", generation_id: "retrieval-1" },
+    diagnostics: { availability: "unavailable" },
+    gaps: [v3Gap("output-budget", "output_budget_exceeded")],
+    maximum_bytes: 16_384,
+    required_complete_bytes: 16_385,
   };
 }
 
@@ -278,7 +407,7 @@ function proofBody(disposition, contract, detail = {}) {
       prohibit_traversal_through: clone(contract.spec.prohibit_traversal_through),
       exclude_from_projection: clone(contract.spec.exclude_from_projection),
     },
-    clauses: clone(contract.clauses),
+    clauses: projectedProofClauses(contract),
     disposition: projectedDisposition,
     steps: [{ step_index: 0, status: stepStatus, receipt: hasReceipt ? 0 : null }],
     receipts,
@@ -326,12 +455,9 @@ function baseRun(scenarioId) {
       run.final = finalClaim({ authority: "source", evidence_ids: ["source:src/named.rs"] });
       break;
     case "exact_symbol_search":
-      run.steps = [mcp("search", { project: "/workspace/repo", query: "ExactThing" }, {
-        kind: "complete",
-        publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-        leads: [{ lead_id: "lead-1", canonical_id: "rust:crate::ExactThing" }],
-        gaps: [],
-      })];
+      run.steps = [mcp("search", { project: "/workspace/repo", query: "ExactThing" }, v3Search({
+        evidence: [v3SearchEvidence("lead-1", "src/lib.rs", "rust:crate::ExactThing")],
+      }))];
       run.final = finalClaim({
         authority: "search_lead",
         outcome: "discovery_only",
@@ -343,24 +469,21 @@ function baseRun(scenarioId) {
       run.request.selected_target = "rust:crate::one::Thing";
       run.steps = [
         mcp("search", { project: "/workspace/repo", query: "Thing" }, {
-          kind: "complete",
-          publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-          leads: [
-            { lead_id: "lead-1", canonical_id: "rust:crate::one::Thing" },
-            { lead_id: "lead-2", canonical_id: "rust:crate::two::Thing" },
-          ],
-          gaps: [{ code: "selector_ambiguous" }],
+          ...v3Search({
+            evidence: [
+              v3SearchEvidence("lead-1", "src/one.rs", "rust:crate::one::Thing"),
+              v3SearchEvidence("lead-2", "src/two.rs", "rust:crate::two::Thing"),
+            ],
+            gaps: [v3Gap("selector_ambiguous")],
+          }),
         }),
         mcp("context", {
           project: "/workspace/repo",
-          selector: { canonical_id: "rust:crate::one::Thing" },
-        }, {
-          kind: "complete",
-          publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-          target: { canonical_id: "rust:crate::one::Thing" },
-          evidence: [{ evidence_id: "context-1", path: "src/one.rs" }],
-          gaps: [],
-        }),
+          id: "rust:crate::one::Thing",
+        }, v3Context({
+          target: { path: "src/one.rs", symbol_id: "rust:crate::one::Thing" },
+          evidence: [v3ContextEvidence("context-1", "src/one.rs", "rust:crate::one::Thing")],
+        })),
       ];
       run.final = finalClaim({
         authority: "context_evidence",
@@ -373,14 +496,11 @@ function baseRun(scenarioId) {
       run.request.selected_target = "rust:crate::ExactThing";
       run.steps = [mcp("context", {
         project: "/workspace/repo",
-        selector: { canonical_id: "rust:crate::ExactThing" },
-      }, {
-        kind: "complete",
-        publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-        target: { canonical_id: "rust:crate::ExactThing" },
-        evidence: [{ evidence_id: "context-1", path: "src/lib.rs" }],
-        gaps: [],
-      })];
+        id: "rust:crate::ExactThing",
+      }, v3Context({
+        target: { path: "src/lib.rs", symbol_id: "rust:crate::ExactThing" },
+        evidence: [v3ContextEvidence("context-1", "src/lib.rs", "rust:crate::ExactThing")],
+      }))];
       run.final = finalClaim({
         authority: "context_evidence",
         target_id: "rust:crate::ExactThing",
@@ -388,42 +508,34 @@ function baseRun(scenarioId) {
       });
       break;
     case "broad_packet":
-      run.steps = [mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, {
-        kind: "complete",
-        packet_id: "packet-1",
-        status: "complete",
-        publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-        evidence: [{ evidence_id: "evidence-1", path: "src/flow.rs" }],
-        gaps: [],
-      })];
+      run.steps = [mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, v3Packet({
+        evidence: [v3PacketEvidence("evidence-1", "src/flow.rs")],
+      }))];
       run.final = finalClaim({ authority: "packet_evidence", evidence_ids: ["evidence-1"] });
       break;
     case "packet_single_continuation":
       run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, {
-          kind: "complete",
-          packet_id: "packet-1",
+        mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, v3Packet({
           status: "continuation_available",
-          publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-          continuation: { continuation_id: "continuation-1", gap_ids: ["gap-1"] },
-          evidence: [{ evidence_id: "evidence-1", path: "src/flow.rs" }],
-          gaps: [{ gap_id: "gap-1" }],
-        }),
+          continuation: {
+            continuation_id: "continuation-1",
+            remaining_rounds: 1,
+            gap_ids: [{ gap_id: "gap-1" }],
+          },
+          evidence: [v3PacketEvidence("evidence-1", "src/flow.rs")],
+          gaps: [v3Gap("gap-1", "continuation_required")],
+        })),
         mcp("packet", {
           project: "/workspace/repo",
           question: "How does the flow work?",
           parent_packet_id: "continuation-1",
           option_ids: ["gap-1"],
           core_generation_id: "core-1",
-          retrieval_generation_id: "retrieval-1",
-        }, {
-          kind: "complete",
-          packet_id: "packet-2",
-          status: "complete",
-          publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-          evidence: [{ evidence_id: "evidence-2", path: "src/more.rs" }],
-          gaps: [],
-        }),
+          retrieval_generation: "retrieval-1",
+        }, v3Packet({
+          packetId: "packet-2",
+          evidence: [v3PacketEvidence("evidence-2", "src/more.rs")],
+        })),
       ];
       run.final = finalClaim({
         authority: "packet_evidence",
@@ -432,36 +544,27 @@ function baseRun(scenarioId) {
       });
       break;
     case "packet_gap_to_focused_source":
+      run.request.gap_source_paths = ["src/gap.rs"];
       run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, {
-          kind: "complete",
-          packet_id: "packet-1",
+        mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, v3Packet({
           status: "no_useful_evidence",
-          publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-          evidence: [],
-          gaps: [{ gap_id: "gap-1", authorized_source_paths: ["src/gap.rs"] }],
-        }),
+          gaps: [v3Gap("gap-1")],
+        })),
         read("src/gap.rs"),
       ];
       run.final = finalClaim({ authority: "source", evidence_ids: ["source:src/gap.rs"], gap_ids: ["gap-1"] });
       break;
     case "packet_unavailable_to_source":
       run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, {
-          kind: "budget_exceeded",
-          status: "unavailable",
-          reason: "retrieval_unavailable",
-          publication: { core_generation_id: "core-1", retrieval_generation_id: "retrieval-1" },
-          evidence: [],
-          gaps: [],
-        }),
+        mcp("packet", { project: "/workspace/repo", question: "How does the oversized catalog work?" }, v3PacketBudgetExceeded()),
         read("src/fallback.rs"),
       ];
       run.final = finalClaim({
         authority: "source",
         outcome: "unavailable",
         evidence_ids: ["source:src/fallback.rs"],
-        reason_codes: ["retrieval_unavailable"],
+        gap_ids: ["output-budget"],
+        reason_codes: ["output_budget_exceeded"],
       });
       break;
     case "typed_proof_contract_proven":
@@ -503,11 +606,11 @@ function baseRun(scenarioId) {
       });
       break;
     case "malformed_proof_contract": {
-      const malformed = { source_text: "A calls B", clauses: [] };
+      const malformed = { ...typed, source_text: "A calls B", clauses: [] };
       run.request.proof_contract = malformed;
       run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...malformed }, {
         code: "invalid_proof_interpretation",
-        message: "spec is required",
+        message: "source text is unclassified",
       }, { isError: true })];
       run.final = finalClaim({ authority: "none", outcome: "invalid_contract", reason_codes: ["invalid_proof_interpretation"] });
       break;
@@ -717,6 +820,18 @@ test("freezes exactly the sixteen accepted routing scenarios", () => {
   assert.equal(Object.isFrozen(ROUTING_SCENARIOS[0]), true);
 });
 
+test("checked-in request corpus covers the routing matrix exactly once", () => {
+  assert.equal(validateRoutingRequestCorpus(), true);
+  assert.deepEqual(
+    ROUTING_REQUEST_CORPUS.scenarios.map(({ id }) => id),
+    SCENARIO_IDS,
+  );
+  assert.equal(Object.isFrozen(ROUTING_REQUEST_CORPUS), true);
+  for (const entry of ROUTING_REQUEST_CORPUS.scenarios) {
+    assert.doesNotMatch(entry.prompt, /\b(search|context|packet|prove_call_path)\b/iu, entry.id);
+  }
+});
+
 for (const host of ["codex", "cursor"]) {
   test(`${host} real-session parser accepts all sixteen frozen scenarios`, () => {
     for (const scenarioId of SCENARIO_IDS) {
@@ -727,6 +842,52 @@ for (const host of ["codex", "cursor"]) {
     }
   });
 }
+
+const PROOF_CALL_SCENARIOS = [
+  "typed_proof_contract_proven",
+  "typed_proof_contract_refuted",
+  "typed_proof_unknown",
+  "typed_proof_unavailable",
+  "malformed_proof_contract",
+  "proof_observational",
+  "hidden_proof_tool_discovery",
+];
+
+test("all proof scenarios preserve the public input DTO through both installed-host parsers", () => {
+  for (const scenarioId of PROOF_CALL_SCENARIOS) {
+    const run = baseRun(scenarioId);
+    const expected = run.request.proof_contract;
+    const proofStep = run.steps.find((step) => step.tool === "prove_call_path");
+    assert.deepEqual(
+      { source_text: proofStep.args.source_text, clauses: proofStep.args.clauses, spec: proofStep.args.spec },
+      expected,
+      scenarioId,
+    );
+    assert.equal(validateProofCallInputAgainstCatalog(proofStep.args), true, scenarioId);
+    for (const host of ["codex", "cursor"]) {
+      assert.equal(validate(host, run).status, "pass", `${host}:${scenarioId}`);
+    }
+  }
+});
+
+test("the old normalized proof-response projection is rejected as public tool input", () => {
+  const input = { project: "/workspace/repo", ...proofContract() };
+  input.clauses = input.clauses.map((clause) => ({
+    start: clause.start_byte,
+    end: clause.end_byte_exclusive,
+    clause_id: clause.clause_id,
+    quote: clause.quote,
+    classification: clause.classification.kind,
+    fields: clause.classification.fields,
+    reason: null,
+    non_material_kind: null,
+  }));
+  input.spec.steps = input.spec.steps.map((step) => ({ relation: "direct_outgoing_call", ...step }));
+  assert.throws(
+    () => validateProofCallInputAgainstCatalog(input),
+    /prove_call_path input schema/u,
+  );
+});
 
 test("actual parsers reject malformed, incomplete, and cross-host transcripts", () => {
   assert.throws(() => parseInstalledTranscript("codex", "{not-json}\n"), /malformed JSONL/u);
@@ -883,7 +1044,7 @@ const MUTATIONS = [
     name: "search result without leads",
     scenario: "exact_symbol_search",
     mutate(run) {
-      mutateBody(run, 0, (body) => delete body.leads);
+      mutateBody(run, 0, (body) => delete body.evidence);
     },
     error: /search result/u,
   },
@@ -1038,10 +1199,10 @@ const MUTATIONS = [
     scenario: "selected_target_context",
     mutate(run) {
       mutateBody(run, 0, (body) => {
-        body.target.canonical_id = "rust:crate::OtherThing";
+        body.target.symbol_id = "rust:crate::OtherThing";
       });
     },
-    error: /context result does not match the selected target/u,
+    error: /context result does not (?:match the selected target|bind its returned target to evidence)/u,
   },
 ];
 
@@ -1235,8 +1396,8 @@ test("packet continuation and selected-context correlation are exact", () => {
   assert.throws(() => validate("cursor", continuation), /continuation arguments/u);
 
   const context = baseRun("ambiguous_symbol_then_context");
-  context.steps[1].args.selector.canonical_id = "rust:crate::two::Thing";
-  assert.throws(() => validate("codex", context), /selected target/u);
+  context.steps[1].args.id = "rust:crate::two::Thing";
+  assert.throws(() => validate("codex", context), /selected (?:search )?target/u);
 });
 
 function staticIdentityFor(root) {
@@ -1260,8 +1421,12 @@ function staticIdentityFor(root) {
     "scripts/codestory-mcp.cjs",
     ".claude-plugin/plugin.json",
     ".github/plugin/plugin.json",
+    ".cursor-plugin/plugin.json",
     "hooks/claude-codex-hooks.json",
     "hooks/copilot-hooks.json",
+    "hooks/cursor-hooks.json",
+    "mcp.cursor.json",
+    "rules/codestory.mdc",
     "skills/codestory-grounding/SKILL.md",
   ];
   staticIdentity.static_roster = Object.fromEntries(
@@ -1270,14 +1435,14 @@ function staticIdentityFor(root) {
   return staticIdentity;
 }
 
-test("static Claude Code and Copilot surfaces bind one package, launcher, hook, and rule core", async () => {
-  assert.deepEqual(Object.keys(STATIC_PARITY_HOSTS), ["claude_code", "copilot_cli", "copilot_editor"]);
+test("static Cursor Claude Code and Copilot surfaces bind one package launcher hook and rule core", async () => {
+  assert.deepEqual(Object.keys(STATIC_PARITY_HOSTS), ["cursor", "claude_code", "copilot_cli", "copilot_editor"]);
   const manifest = JSON.parse(await readFile(join(pluginRoot, "plugin.json"), "utf8"));
   const staticIdentity = staticIdentityFor(pluginRoot);
 
   const report = await validateStaticHostParity(pluginRoot, staticIdentity);
   assert.equal(report.status, "pass");
-  assert.deepEqual(report.hosts.map(({ host }) => host), ["claude_code", "copilot_cli", "copilot_editor"]);
+  assert.deepEqual(report.hosts.map(({ host }) => host), ["cursor", "claude_code", "copilot_cli", "copilot_editor"]);
   for (const host of report.hosts) {
     assert.equal(host.package_version, manifest.version);
     assert.equal(host.launcher_sha256, staticIdentity.launcher.sha256);
@@ -1319,6 +1484,22 @@ test("static parity rejects substituted bytes invalid or no-op hooks metadata dr
     writeFileSync(join(root, "skills", "codestory-grounding", "SKILL.md"), "---\nname: codestory-grounding\n---\n# CodeStory Grounding\n");
     const headingOnly = staticIdentityFor(root);
     await assert.rejects(validateStaticHostParity(root, headingOnly), /complete canonical grounding contract/u);
+
+    for (const relativePath of [
+      ".cursor-plugin/plugin.json",
+      "hooks/cursor-hooks.json",
+      "mcp.cursor.json",
+      "rules/codestory.mdc",
+    ]) {
+      cpSync(pluginRoot, root, { recursive: true, force: true });
+      const authenticated = staticIdentityFor(root);
+      writeFileSync(join(root, relativePath), "substituted cursor surface\n");
+      await assert.rejects(
+        validateStaticHostParity(root, authenticated),
+        new RegExp(`static digest roster.*${relativePath.split("/").pop().replaceAll(".", "\\.")}`, "u"),
+        relativePath,
+      );
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

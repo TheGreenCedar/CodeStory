@@ -509,7 +509,7 @@ impl PerUserEmbeddingClient {
         let control = EmbeddingCallControl::new(operation_timeout, outer_timeout, cancelled)?;
         let clock = self.transport.clock();
         let mut replayed = false;
-        let mut recover_after_inflight_loss = false;
+        let mut lost_server_instance_id = None;
         let mut attempts = Vec::with_capacity(2);
         loop {
             control.check()?;
@@ -517,7 +517,7 @@ impl PerUserEmbeddingClient {
                 EmbeddingConnectIntent::Activate,
                 true,
                 Some(&control),
-                recover_after_inflight_loss,
+                lost_server_instance_id.as_deref(),
             ) {
                 Ok(connection) => connection,
                 Err(error) if !replayed && is_server_loss(&error) => {
@@ -576,7 +576,7 @@ impl PerUserEmbeddingClient {
             attempts.push(EmbeddingQualificationAttemptResult {
                 ordinal: attempts.len() as u32 + 1,
                 request_id,
-                server_instance_id,
+                server_instance_id: server_instance_id.clone(),
                 submitted_ns,
                 completed_ns,
                 outcome: outcome.into(),
@@ -587,7 +587,7 @@ impl PerUserEmbeddingClient {
                 Err(error) if !replayed && is_server_loss(&error) => {
                     control.check()?;
                     replayed = true;
-                    recover_after_inflight_loss = true;
+                    lost_server_instance_id = Some(server_instance_id);
                 }
                 Err(error) => return Err(error),
             }
@@ -641,7 +641,7 @@ impl PerUserEmbeddingClient {
         intent: EmbeddingConnectIntent,
         may_spawn: bool,
     ) -> Result<ValidatedEmbeddingConnection> {
-        self.connect_with_control(intent, may_spawn, None, false)
+        self.connect_with_control(intent, may_spawn, None, None)
     }
 
     fn connect_with_control(
@@ -649,11 +649,12 @@ impl PerUserEmbeddingClient {
         intent: EmbeddingConnectIntent,
         may_spawn: bool,
         control: Option<&EmbeddingCallControl<'_>>,
-        recover_after_server_loss: bool,
+        lost_server_instance_id: Option<&str>,
     ) -> Result<ValidatedEmbeddingConnection> {
         let budgets = self.transport.budgets();
         let mut spawned_at_ns = None;
         let mut owner_recovery_started_at_ns = None;
+        let mut capacity_retry_started_at_ns = None;
         let mut spawn_attempt = None;
         let wait_for_convergence = |started_at_ns| -> Result<()> {
             if let Some(control) = control {
@@ -689,10 +690,16 @@ impl PerUserEmbeddingClient {
             if let Some(control) = control {
                 control.check()?;
             }
+            let capacity_remaining = capacity_retry_started_at_ns.map(|started_at_ns| {
+                budgets.connect.saturating_sub(elapsed_since(
+                    self.transport.clock().as_ref(),
+                    started_at_ns,
+                ))
+            });
             let connect_budget = control
-                .map(|control| control.remaining(budgets.connect))
+                .map(|control| control.remaining(capacity_remaining.unwrap_or(budgets.connect)))
                 .transpose()?
-                .unwrap_or(budgets.connect);
+                .unwrap_or_else(|| capacity_remaining.unwrap_or(budgets.connect));
             match self
                 .transport
                 .connect(intent, connect_budget, spawn_attempt.as_ref())
@@ -710,16 +717,50 @@ impl PerUserEmbeddingClient {
                         &executable,
                     ) {
                         Ok(snapshot) => snapshot,
-                        Err(error) if recover_after_server_loss && is_server_loss(&error) => {
+                        Err(error)
+                            if lost_server_instance_id.is_some() && is_server_loss(&error) =>
+                        {
                             let recovery_started_at_ns = owner_recovery_started_at_ns
                                 .get_or_insert_with(|| self.transport.clock().now_ns());
                             wait_for_convergence(*recovery_started_at_ns)?;
+                            continue;
+                        }
+                        Err(error) if retryable_handshake_capacity(&error).is_some() => {
+                            let retry_after_ms = retryable_handshake_capacity(&error)
+                                .expect("matched handshake capacity has retry state");
+                            let started_at_ns = *capacity_retry_started_at_ns
+                                .get_or_insert_with(|| self.transport.clock().now_ns());
+                            let remaining = budgets.connect.saturating_sub(elapsed_since(
+                                self.transport.clock().as_ref(),
+                                started_at_ns,
+                            ));
+                            if remaining.is_zero() {
+                                return Err(error);
+                            }
+                            let remaining = control
+                                .map(|control| control.remaining(remaining))
+                                .transpose()?
+                                .unwrap_or(remaining);
+                            let retry_after =
+                                Duration::from_millis(retry_after_ms).max(budgets.retry_after);
+                            if retry_after >= remaining {
+                                return Err(error);
+                            }
+                            self.transport.clock().sleep(retry_after);
                             continue;
                         }
                         Err(error) => return Err(error),
                     };
                     if let Some(control) = control {
                         control.check()?;
+                    }
+                    if lost_server_instance_id
+                        .is_some_and(|lost| snapshot.process.server_instance_id == lost)
+                    {
+                        let recovery_started_at_ns = owner_recovery_started_at_ns
+                            .get_or_insert_with(|| self.transport.clock().now_ns());
+                        wait_for_convergence(*recovery_started_at_ns)?;
+                        continue;
                     }
                     return Ok(ValidatedEmbeddingConnection { stream, snapshot });
                 }
@@ -756,7 +797,7 @@ impl PerUserEmbeddingClient {
                         wait_for_convergence(spawned_at_ns)?;
                         continue;
                     }
-                    if recover_after_server_loss {
+                    if lost_server_instance_id.is_some() {
                         let recovery_started_at_ns = owner_recovery_started_at_ns
                             .get_or_insert_with(|| self.transport.clock().now_ns());
                         wait_for_convergence(*recovery_started_at_ns)?;
@@ -775,6 +816,18 @@ impl PerUserEmbeddingClient {
             }
         }
     }
+}
+
+fn retryable_handshake_capacity(error: &anyhow::Error) -> Option<u64> {
+    let typed = error.downcast_ref::<PerUserEmbeddingError>()?;
+    let pressure = typed.capacity.as_ref()?;
+    (typed.retry_class == "after_delay"
+        && pressure.queue_class == "connection"
+        && matches!(
+            pressure.reason.as_str(),
+            "pre_request_full" | "connection_handler_full"
+        ))
+    .then_some(typed.retry_after_ms)
 }
 
 pub struct PerUserEmbeddingResidencyLease {

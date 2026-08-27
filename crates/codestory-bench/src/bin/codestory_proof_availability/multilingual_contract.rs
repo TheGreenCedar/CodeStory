@@ -25,8 +25,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub const PUBLIC_PROOF_ROUTE_DARK: bool = true;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FixtureClass {
     Supported,

@@ -28,6 +28,7 @@ old or new publication.
 | Repo-text or semantic suggestion without a resolved symbol | Navigation hint to verify in source |
 | `working_locally` state | Use local graph tools; broad search is still preparing |
 | `unavailable` state | Fall back to focused source inspection and state the gap |
+| Exact verifier `contract_proven` / `contract_refuted` | Authority only for the complete host-supplied indexed source-call contract; it does not prove runtime execution or translate prose |
 
 `retrieval_mode=full` proves that the retrieval infrastructure is coherent. It
 does not guarantee that a particular answer found enough evidence. The packet's

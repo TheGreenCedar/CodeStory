@@ -15,6 +15,9 @@ pub(super) fn embedding_client_transport_mode(
 ) -> Option<embedding_server_transport::ClientTransportMode> {
     match command {
         Command::Ground(_) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
+        Command::ProveCallPath(_) => {
+            Some(embedding_server_transport::ClientTransportMode::ObserveOnly)
+        }
         Command::Retrieval(args::RetrievalCommand {
             action: args::RetrievalAction::Status(_),
         }) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
