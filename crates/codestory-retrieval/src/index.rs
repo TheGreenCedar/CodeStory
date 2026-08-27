@@ -1056,7 +1056,11 @@ fn ensure_lexical_generation(
                 if let Some(work) = work {
                     record_finalize_component_work(
                         "lexical",
-                        "copy_on_write",
+                        if work.direct_reference {
+                            "reused"
+                        } else {
+                            "copy_on_write"
+                        },
                         Some(work.retained),
                         Some(work.inserted),
                         Some(work.removed),
@@ -1318,7 +1322,11 @@ fn ensure_semantic_index(
     {
         record_finalize_component_work(
             "vectors",
-            "copy_on_write",
+            if work.direct_reference {
+                "reused"
+            } else {
+                "copy_on_write"
+            },
             Some(work.retained),
             Some(work.inserted),
             Some(work.removed),
@@ -1681,7 +1689,9 @@ fn ensure_scip_artifacts(
         Ok(outcome) if outcome.revision.is_some() => {
             record_finalize_component_work(
                 "graph",
-                if outcome.cloned {
+                if outcome.direct_reference {
+                    "reused"
+                } else if outcome.cloned {
                     "copy_on_write"
                 } else {
                     "complete"

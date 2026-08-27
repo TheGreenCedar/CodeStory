@@ -96,6 +96,7 @@ pub(crate) struct IncrementalVectorWork {
     pub retained: u64,
     pub inserted: u64,
     pub removed: u64,
+    pub direct_reference: bool,
 }
 
 pub(crate) struct AttestedVectorPublication<'a> {
@@ -743,6 +744,12 @@ impl EmbeddedVectorIndex {
         {
             return Ok(None);
         }
+        crate::copy_on_write::make_file_immutable(&previous_path)?;
+
+        let previous_current_anchors = match read_current_vector_anchor_map(&previous_path) {
+            Ok(anchors) => anchors,
+            Err(_) => return Ok(None),
+        };
 
         let path = index_path(publication.layout, publication.collection);
         let parent = path
@@ -755,9 +762,35 @@ impl EmbeddedVectorIndex {
         drop(reserved);
         std::fs::remove_file(&temp_path)
             .with_context(|| format!("release vector clone reservation {}", temp_path.display()))?;
+        if previous_anchors == expected_anchors
+            && previous_current_anchors == current_anchors
+            && crate::copy_on_write::reference_file(&previous_path, &temp_path)?
+        {
+            let result = (|| {
+                let mut attestation = previous_manifest.vectors.clone();
+                attestation.generation = publication.generation.to_string();
+                attestation.input_hash = publication.input_hash.to_string();
+                before_publish()?;
+                codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
+                Ok((
+                    attestation,
+                    IncrementalVectorWork {
+                        retained: u64::try_from(expected_anchors.len()).unwrap_or(u64::MAX),
+                        inserted: 0,
+                        removed: 0,
+                        direct_reference: true,
+                    },
+                ))
+            })();
+            if result.is_err() {
+                let _ = std::fs::remove_file(&temp_path);
+            }
+            return result.map(Some);
+        }
         if !crate::copy_on_write::clone_file(&previous_path, &temp_path)? {
             return Ok(None);
         }
+        crate::copy_on_write::make_file_owner_writable(&temp_path)?;
 
         let result = (|| {
             let work = reconcile_cloned_database(
@@ -779,6 +812,7 @@ impl EmbeddedVectorIndex {
             )?;
             before_publish()?;
             codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
+            crate::copy_on_write::make_file_immutable(&path)?;
             Ok((attestation, work))
         })();
         if result.is_err() {
@@ -1107,6 +1141,7 @@ fn build_and_publish_database(
         )?;
         before_publish()?;
         codestory_workspace::atomic_file::publish_existing_file_atomic(&temp_path, &path)?;
+        crate::copy_on_write::make_file_immutable(&path)?;
         Ok(attestation)
     })();
     if result.is_err() {
@@ -1328,6 +1363,34 @@ fn read_vector_anchor_map(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(anchors)
 }
 
+fn read_current_vector_anchor_map(path: &Path) -> Result<BTreeMap<String, CurrentVectorAnchor>> {
+    let connection = open_read_only(path)?;
+    let mut statement = connection.prepare(
+        "SELECT node_id, document_hash, display_name, file_path, file_role, dense_reason
+         FROM vectors ORDER BY node_id ASC",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut anchors = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let node_id = row.get::<_, String>(0)?;
+        let file_role = row
+            .get::<_, Option<String>>(4)?
+            .map(|role| FileRole::from_db_value(&role));
+        let anchor = CurrentVectorAnchor {
+            node_id: node_id.clone(),
+            document_hash: row.get(1)?,
+            display_name: row.get(2)?,
+            file_path: row.get(3)?,
+            file_role,
+            dense_reason: row.get(5)?,
+        };
+        if anchors.insert(node_id.clone(), anchor).is_some() {
+            bail!("duplicate embedded vector row {node_id}");
+        }
+    }
+    Ok(anchors)
+}
+
 fn reconcile_cloned_database(
     path: &Path,
     generation: &str,
@@ -1507,6 +1570,7 @@ fn reconcile_cloned_database(
         retained: u64::try_from(retained).unwrap_or(u64::MAX),
         inserted: u64::try_from(missing.len()).unwrap_or(u64::MAX),
         removed: u64::try_from(removed).unwrap_or(u64::MAX),
+        direct_reference: false,
     })
 }
 
@@ -1524,9 +1588,14 @@ pub(crate) fn validate_database(
         .with_context(|| format!("quick-check embedded vector index {}", path.display()))?;
     let metadata = read_metadata(&connection)
         .with_context(|| format!("read embedded vector metadata {}", path.display()))?;
+    let physical_envelope_is_compatible =
+        if metadata.component_schema_version == VECTOR_COMPONENT_SCHEMA_VERSION {
+            !metadata.generation.trim().is_empty() && !metadata.input_hash.trim().is_empty()
+        } else {
+            metadata.generation == generation && metadata.input_hash == input_hash
+        };
     if metadata.schema_version != VECTOR_INDEX_SCHEMA_VERSION
-        || metadata.generation != generation
-        || metadata.input_hash != input_hash
+        || !physical_envelope_is_compatible
         || metadata.embedding_backend != contract.embedding_backend
         || metadata.embedding_dim != contract.embedding_dim as i64
         || metadata.point_count < 0
@@ -1569,8 +1638,16 @@ pub(crate) fn validate_database(
     }
     let attestation = VectorDatabaseAttestation {
         schema_version: metadata.schema_version,
-        generation: metadata.generation,
-        input_hash: metadata.input_hash,
+        generation: if metadata.component_schema_version == VECTOR_COMPONENT_SCHEMA_VERSION {
+            generation.to_string()
+        } else {
+            metadata.generation
+        },
+        input_hash: if metadata.component_schema_version == VECTOR_COMPONENT_SCHEMA_VERSION {
+            input_hash.to_string()
+        } else {
+            metadata.input_hash
+        },
         embedding_backend: metadata.embedding_backend,
         embedding_dim: metadata.embedding_dim as usize,
         point_count: metadata.point_count as u64,
@@ -1606,9 +1683,10 @@ fn validate_health_database(
 ) -> Result<u64> {
     let connection = open_read_only(path)?;
     let metadata = read_metadata(&connection)?;
+    let envelope_matches =
+        vector_publication_envelope_matches(path, &metadata, generation, input_hash)?;
     if metadata.schema_version != VECTOR_INDEX_SCHEMA_VERSION
-        || metadata.generation != generation
-        || metadata.input_hash != input_hash
+        || !envelope_matches
         || metadata.embedding_backend != embedding_backend
         || metadata.embedding_dim != embedding_dim as i64
         || metadata.point_count < 0
@@ -1623,12 +1701,53 @@ fn validate_health_database(
             actual.max(0)
         );
     }
-    if metadata.component_schema_version == VECTOR_COMPONENT_SCHEMA_VERSION
-        && canonical_vector_component_digest(&connection)? != metadata.component_sha256
-    {
-        bail!("embedded vector physical component digest mismatch");
+    if metadata.component_schema_version == VECTOR_COMPONENT_SCHEMA_VERSION {
+        let digest = canonical_vector_component_digest(&connection)?;
+        if digest != metadata.component_sha256 {
+            bail!("embedded vector physical component digest mismatch");
+        }
     }
     Ok(actual as u64)
+}
+
+fn vector_publication_envelope_matches(
+    path: &Path,
+    metadata: &DatabaseMetadata,
+    generation: &str,
+    input_hash: &str,
+) -> Result<bool> {
+    let manifest_path = path
+        .parent()
+        .context("embedded vector database has no generation directory")?
+        .join(VECTOR_GENERATION_MANIFEST_FILE);
+    match std::fs::symlink_metadata(&manifest_path) {
+        Ok(file_metadata) => {
+            if file_metadata.file_type().is_symlink() || !file_metadata.is_file() {
+                bail!("vector generation manifest is not a regular file");
+            }
+            let manifest: VectorGenerationManifest =
+                serde_json::from_slice(&std::fs::read(&manifest_path).with_context(|| {
+                    format!(
+                        "read vector generation manifest {}",
+                        manifest_path.display()
+                    )
+                })?)?;
+            manifest.validate()?;
+            Ok(metadata.point_count >= 0
+                && metadata.embedding_dim >= 0
+                && manifest.vectors.generation == generation
+                && manifest.vectors.input_hash == input_hash
+                && manifest.vectors.component_schema_version == metadata.component_schema_version
+                && manifest.vectors.component_sha256 == metadata.component_sha256
+                && manifest.vectors.embedding_backend == metadata.embedding_backend
+                && manifest.vectors.embedding_dim == metadata.embedding_dim as usize
+                && manifest.vectors.point_count == metadata.point_count as u64)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(metadata.generation == generation && metadata.input_hash == input_hash)
+        }
+        Err(error) => Err(error).context("inspect vector generation manifest"),
+    }
 }
 
 fn expected_anchor_map(
@@ -2061,17 +2180,13 @@ fn search_database_batch_with_abstention(
         return Ok(vec![Vec::new(); queries.len()]);
     }
     let connection = open_read_only(path)?;
-    let (stored_generation, stored_hash, stored_dim): (String, String, i64) = connection
-        .query_row(
-            "SELECT generation, input_hash, embedding_dim FROM metadata",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-    if stored_generation != generation
-        || stored_hash != input_hash
+    let metadata = read_metadata(&connection)?;
+    if !vector_publication_envelope_matches(path, &metadata, generation, input_hash)?
+        || metadata.generation.trim().is_empty()
+        || metadata.input_hash.trim().is_empty()
         || queries
             .iter()
-            .any(|(query, limit)| *limit != 0 && stored_dim != query.len() as i64)
+            .any(|(query, limit)| *limit != 0 && metadata.embedding_dim != query.len() as i64)
     {
         bail!("embedded vector index publication identity changed");
     }
@@ -3196,6 +3311,166 @@ mod tests {
             )
             .expect("removed row");
         assert_eq!(removed_count, 0);
+        assert!(
+            std::fs::metadata(index_path(&layout, "previous"))
+                .expect("previous permissions")
+                .permissions()
+                .readonly()
+        );
+        assert!(
+            std::fs::metadata(index_path(&layout, "current"))
+                .expect("current permissions")
+                .permissions()
+                .readonly()
+        );
+    }
+
+    #[test]
+    fn publication_only_vector_churn_directly_references_the_component_without_clone() {
+        let root = tempdir().expect("tempdir");
+        let layout = layout(root.path());
+        let device = accelerated_device();
+        let identity = accelerated_identity();
+        let evidence = build_vector_producer_evidence(
+            &device,
+            Some(&identity),
+            crate::embeddings::RETRIEVAL_EMBEDDING_DIM as u32,
+            EmbeddingVectorPublicationIdentityDto {
+                core_generation_id: "core-v2".into(),
+                core_run_id: "run-v2".into(),
+                retrieval_generation: "generation-v2".into(),
+                retrieval_input_hash: "input-v2".into(),
+                semantic_generation: "current".into(),
+            },
+        );
+        let contract = VectorEvidenceContract::new(
+            "backend",
+            2,
+            "producer-v1",
+            vector_compatibility_identity(&evidence).expect("compatibility"),
+        );
+        let expected = expected_anchors();
+        let previous_attestation = EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "previous",
+            "generation-v1",
+            "input-v1",
+            &contract,
+            &expected,
+            |visit| {
+                visit(attested_point("1", "document-1", vec![1.0, 0.0]))?;
+                visit(attested_point("2", "document-2", vec![0.0, 1.0]))
+            },
+        )
+        .expect("build predecessor");
+        let mut previous_evidence = evidence.clone();
+        previous_evidence.publication = EmbeddingVectorPublicationIdentityDto {
+            core_generation_id: "core-v1".into(),
+            core_run_id: "run-v1".into(),
+            retrieval_generation: "generation-v1".into(),
+            retrieval_input_hash: "input-v1".into(),
+            semantic_generation: "previous".into(),
+        };
+        EmbeddedVectorIndex::publish_generation_manifest(
+            &layout,
+            "previous",
+            &VectorGenerationManifest::new(previous_evidence, previous_attestation)
+                .expect("predecessor manifest"),
+        )
+        .expect("publish predecessor manifest");
+        let previous_path = index_path(&layout, "previous");
+
+        let outcome = crate::copy_on_write::with_clone_disabled(|| {
+            EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                AttestedVectorPublication {
+                    layout: &layout,
+                    collection: "current",
+                    generation: "generation-v2",
+                    input_hash: "input-v2",
+                    contract: &contract,
+                    expected_anchors: &expected,
+                },
+                "previous",
+                &evidence,
+                &[
+                    current_anchor("1", "document-1", "symbol_1"),
+                    current_anchor("2", "document-2", "symbol_2"),
+                ],
+                || Ok(()),
+                |_, _| panic!("publication-only reuse must not request vector production"),
+            )
+        })
+        .expect("publication-only vector build")
+        .expect("direct-reference outcome");
+        let (attestation, work) = outcome;
+        assert!(work.direct_reference);
+        assert_eq!(work.retained, 2);
+        assert_eq!(work.inserted, 0);
+        assert_eq!(work.removed, 0);
+        let current_path = index_path(&layout, "current");
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(&previous_path)
+                .expect("previous identity"),
+            codestory_workspace::workspace_path_identity(&current_path).expect("current identity"),
+        );
+        assert_eq!(attestation.generation, "generation-v2");
+        assert_eq!(attestation.input_hash, "input-v2");
+        assert!(
+            std::fs::metadata(&previous_path)
+                .expect("previous permissions")
+                .permissions()
+                .readonly()
+        );
+        assert!(
+            std::fs::metadata(&current_path)
+                .expect("current permissions")
+                .permissions()
+                .readonly()
+        );
+        EmbeddedVectorIndex::validate_published_attestation(
+            &layout,
+            "current",
+            "generation-v2",
+            "input-v2",
+            &contract,
+            &expected,
+            &attestation,
+        )
+        .expect("validate current envelope over referenced vectors");
+        EmbeddedVectorIndex::publish_generation_manifest(
+            &layout,
+            "current",
+            &VectorGenerationManifest::new(evidence, attestation)
+                .expect("current generation manifest"),
+        )
+        .expect("publish current generation manifest");
+        search_database(
+            &current_path,
+            "generation-v2",
+            "input-v2",
+            &[1.0, 0.0],
+            1,
+            || false,
+        )
+        .expect("search current direct-reference envelope");
+        for (generation, input_hash) in [
+            ("wrong-generation", "input-v2"),
+            ("generation-v2", "wrong-input"),
+        ] {
+            let error = search_database(
+                &current_path,
+                generation,
+                input_hash,
+                &[1.0, 0.0],
+                1,
+                || false,
+            )
+            .expect_err("direct-reference search must reject the wrong envelope");
+            assert!(
+                format!("{error:#}").contains("publication identity changed"),
+                "unexpected error: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -3310,7 +3585,10 @@ mod tests {
             VectorGenerationManifest::new(evidence.clone(), attestation).expect("manifest");
         EmbeddedVectorIndex::publish_generation_manifest(&layout, "previous", &manifest)
             .expect("publish manifest");
-        let connection = Connection::open(index_path(&layout, "previous")).expect("open vector db");
+        let previous_path = index_path(&layout, "previous");
+        crate::copy_on_write::make_file_owner_writable(&previous_path)
+            .expect("authorize hostile corruption");
+        let connection = Connection::open(previous_path).expect("open vector db");
         connection
             .execute("DROP TRIGGER vectors_vector_update_guard", [])
             .expect("remove mutation guard");
@@ -3458,9 +3736,12 @@ mod tests {
             .is_err()
         );
 
+        let drift_path = index_path(&layout, "codestory_drift");
+        crate::copy_on_write::make_file_owner_writable(&drift_path)
+            .expect("make database writable for hostile drift injection");
         std::fs::OpenOptions::new()
             .append(true)
-            .open(index_path(&layout, "codestory_drift"))
+            .open(drift_path)
             .expect("open database for drift")
             .write_all(b"drift")
             .expect("append database drift");
@@ -3513,9 +3794,12 @@ mod tests {
         );
         validate().expect("admit complete reader generation");
 
+        let vector_path = index_path(&layout, &manifest.semantic_generation);
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make database writable for hostile byte drift injection");
         std::fs::OpenOptions::new()
             .append(true)
-            .open(index_path(&layout, &manifest.semantic_generation))
+            .open(&vector_path)
             .expect("open database for exact-byte drift")
             .write_all(b"byte-drift")
             .expect("append exact-byte drift");
@@ -3531,6 +3815,8 @@ mod tests {
             &identity,
             |_| {},
         );
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make database writable for hostile vector drift injection");
         let mut changed_vector = vec![0.0_f32; crate::embeddings::RETRIEVAL_EMBEDDING_DIM];
         changed_vector[1] = 1.0;
         Connection::open(index_path(&layout, &manifest.semantic_generation))
@@ -3552,6 +3838,8 @@ mod tests {
             &identity,
             |_| {},
         );
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make database writable for hostile document drift injection");
         Connection::open(index_path(&layout, &manifest.semantic_generation))
             .expect("open database for document drift")
             .execute(
@@ -3571,6 +3859,8 @@ mod tests {
             &identity,
             |_| {},
         );
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make database writable for hostile cardinality drift injection");
         Connection::open(index_path(&layout, &manifest.semantic_generation))
             .expect("open database for cardinality drift")
             .execute("DELETE FROM vectors WHERE node_id = '1'", [])
