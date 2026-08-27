@@ -321,8 +321,8 @@ fn select_packet_evidence_indices(
 fn packet_evidence_kind_priority(kind: SupportUnitKindDto) -> u8 {
     match kind {
         SupportUnitKindDto::SourceRange => 0,
-        SupportUnitKindDto::SymbolLocation => 1,
-        SupportUnitKindDto::TypedGraphEdge => 2,
+        SupportUnitKindDto::TypedGraphEdge => 1,
+        SupportUnitKindDto::SymbolLocation => 2,
         SupportUnitKindDto::CompleteQueryNegative => 3,
     }
 }
@@ -494,7 +494,7 @@ fn packet_evidence_was_bounded(support: &[SupportUnitDto]) -> bool {
 }
 
 const PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3: usize = 8;
-const PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3: usize = 2;
+const PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3: usize = 0;
 const PACKET_PUBLIC_RELATION_ROWS_TARGET_V3: usize = 4;
 const PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3: usize = 16;
 
@@ -1081,7 +1081,7 @@ mod tests {
             rows.iter()
                 .map(|row| row.summary.as_ref().unwrap().as_str())
                 .collect::<Vec<_>>(),
-            ["fn useful() {}", "location", "caller -[CALL]-> callee"]
+            ["fn useful() {}", "caller -[CALL]-> callee", "location"]
         );
         assert_eq!(
             rows.iter()
@@ -1224,7 +1224,7 @@ mod tests {
                 .filter(|row| row.kind == EvidenceKindV3Dto::ExactSource)
                 .count(),
             12,
-            "the closed envelope keeps ten excerpts and two symbol locations"
+            "the closed envelope keeps twelve source excerpts"
         );
         assert_eq!(
             evidence
@@ -1248,14 +1248,14 @@ mod tests {
                 "fn source_5() {}",
                 "fn source_6() {}",
                 "fn source_7() {}",
-                "fixture",
-                "fixture",
                 "caller-0 -[CALL]-> callee-0",
                 "caller-1 -[CALL]-> callee-1",
                 "caller-2 -[CALL]-> callee-2",
                 "caller-3 -[CALL]-> callee-3",
                 "fn source_8() {}",
                 "fn source_9() {}",
+                "fn source_10() {}",
+                "fn source_11() {}",
             ]
         );
         assert!(packet_evidence_was_bounded(&support));
@@ -1368,7 +1368,7 @@ mod tests {
                         .is_some_and(|path| path.as_str().starts_with("src/source-"))
                 })
                 .count()
-                >= 10,
+                >= 12,
             "unreserved rows should prefer relevant source evidence over low-value duplicate locations"
         );
     }
