@@ -8,6 +8,8 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -33,6 +35,13 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..", "..");
 const pluginRoot = join(repoRoot, "plugins", "codestory");
 const SHA_D = "d".repeat(64);
+const codexControlRoot = realpathSync(mkdtempSync(join(tmpdir(), "codestory-routing-codex-home-")));
+const codexPluginRoot = join(
+  codexControlRoot, "plugins", "cache", "RoutingCandidate", "codestory", "0.17.4",
+);
+const codexSkillPath = join(codexPluginRoot, "skills", "codestory-grounding", "SKILL.md");
+mkdirSync(dirname(codexSkillPath), { recursive: true });
+copyFileSync(join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"), codexSkillPath);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -78,6 +87,9 @@ const EXPECTED_IDENTITY = Object.freeze({
     relative_path: "installed-receipt.json",
     sha256: sha256(readFileSync(installedReceipt)),
   }),
+  static_roster: Object.freeze({
+    "skills/codestory-grounding/SKILL.md": sha256(readFileSync(codexSkillPath)),
+  }),
 });
 
 function cloneForFreeze(value) {
@@ -88,7 +100,10 @@ function cloneForFreeze(value) {
   return value;
 }
 
-after(() => rmSync(installedRoot, { recursive: true, force: true }));
+after(() => {
+  rmSync(installedRoot, { recursive: true, force: true });
+  rmSync(codexControlRoot, { recursive: true, force: true });
+});
 
 const SCENARIO_IDS = [
   "named_file_direct_read",
@@ -672,11 +687,39 @@ function codexJsonl(run) {
       events.push({ type: "item.started", item });
       events.push({ type: "item.completed", item: { ...item, status: "completed", result: { tools: step.tools } } });
     } else if (step.kind === "source_read") {
-      const item = { id, type: "command_execution", command: `sed -n '1,120p' '${step.path}'` };
+      const bare = `sed -n '1,120p' ${step.wrapped ? step.path : `'${step.path}'`}`;
+      const item = {
+        id,
+        type: "command_execution",
+        command: step.wrapped ? `/bin/zsh -lc ${JSON.stringify(bare)}` : bare,
+      };
       events.push({ type: "item.started", item });
       events.push({
         type: "item.completed",
         item: { ...item, status: "completed", exit_code: 0, aggregated_output: "source fixture\n" },
+      });
+    } else if (step.kind === "host_guidance_read") {
+      const item = {
+        id,
+        type: "command_execution",
+        command: `/bin/zsh -lc ${JSON.stringify(`sed -n '1,240p' ${step.path}`)}`,
+      };
+      events.push({ type: "item.started", item });
+      events.push({
+        type: "item.completed",
+        item: {
+          ...item,
+          status: "completed",
+          exit_code: 0,
+          aggregated_output: step.content ?? readFileSync(step.path, "utf8"),
+        },
+      });
+    } else if (step.kind === "shell") {
+      const item = { id, type: "command_execution", command: step.command };
+      events.push({ type: "item.started", item });
+      events.push({
+        type: "item.completed",
+        item: { ...item, status: "completed", exit_code: 0, aggregated_output: step.output ?? "" },
       });
     }
   }
@@ -799,9 +842,105 @@ function validate(host, run, expectedIdentity = EXPECTED_IDENTITY, receipt = ins
     installedRoot: root,
     installedReceipt: receipt,
     expectedIdentity,
+    installedPluginRoot: host === "codex" ? codexPluginRoot : null,
     transcript: transcript(host, run),
   });
 }
+
+test("Codex excludes exactly one authenticated installed-skill read from product routing", () => {
+  const run = baseRun("named_file_direct_read");
+  run.steps[0].wrapped = true;
+  run.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
+  assert.deepEqual(validate("codex", run).actions, ["source_read"]);
+
+  const tampered = baseRun("named_file_direct_read");
+  tampered.steps.unshift({
+    kind: "host_guidance_read",
+    path: codexSkillPath,
+    content: `${readFileSync(codexSkillPath, "utf8")}tampered\n`,
+  });
+  assert.throws(() => validate("codex", tampered), /required action sequence|forbidden tool/u);
+
+  const wrongDigest = clone(EXPECTED_IDENTITY);
+  wrongDigest.static_roster["skills/codestory-grounding/SKILL.md"] = "f".repeat(64);
+  const wrongDigestRun = baseRun("named_file_direct_read");
+  wrongDigestRun.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
+  assert.throws(
+    () => validate("codex", wrongDigestRun, wrongDigest),
+    /required action sequence|forbidden tool/u,
+  );
+
+  const zeroDigest = clone(EXPECTED_IDENTITY);
+  zeroDigest.static_roster["skills/codestory-grounding/SKILL.md"] = "0".repeat(64);
+  assert.throws(
+    () => validate("codex", wrongDigestRun, zeroDigest),
+    /required action sequence|forbidden tool/u,
+  );
+
+  const originalSkill = readFileSync(codexSkillPath);
+  try {
+    writeFileSync(codexSkillPath, Buffer.concat([originalSkill, Buffer.from("tampered\n")]));
+    const changedInstalledBytes = baseRun("named_file_direct_read");
+    changedInstalledBytes.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
+    assert.throws(
+      () => validate("codex", changedInstalledBytes),
+      /required action sequence|forbidden tool/u,
+    );
+  } finally {
+    writeFileSync(codexSkillPath, originalSkill);
+  }
+
+  const symlinkTarget = join(codexControlRoot, "outside-skill.md");
+  writeFileSync(symlinkTarget, originalSkill);
+  try {
+    unlinkSync(codexSkillPath);
+    symlinkSync(symlinkTarget, codexSkillPath);
+    const symlinked = baseRun("named_file_direct_read");
+    symlinked.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
+    assert.throws(() => validate("codex", symlinked), /required action sequence|forbidden tool/u);
+  } finally {
+    unlinkSync(codexSkillPath);
+    writeFileSync(codexSkillPath, originalSkill);
+  }
+
+  const escaped = baseRun("named_file_direct_read");
+  escaped.steps.unshift({
+    kind: "host_guidance_read",
+    path: join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
+  });
+  assert.throws(() => validate("codex", escaped), /required action sequence|forbidden tool/u);
+
+  const duplicate = baseRun("named_file_direct_read");
+  duplicate.steps.unshift(
+    { kind: "host_guidance_read", path: codexSkillPath },
+    { kind: "host_guidance_read", path: codexSkillPath },
+  );
+  assert.throws(() => validate("codex", duplicate), /authenticated installed guidance more than once/u);
+
+  const late = baseRun("named_file_direct_read");
+  late.steps.push({ kind: "host_guidance_read", path: codexSkillPath });
+  assert.throws(() => validate("codex", late), /authenticated installed guidance after the first product action/u);
+
+  const arbitraryShell = baseRun("named_file_direct_read");
+  arbitraryShell.steps.unshift({ kind: "shell", command: "/bin/zsh -lc \"pwd\"" });
+  assert.throws(() => validate("codex", arbitraryShell), /required action sequence|forbidden tool/u);
+
+  for (const command of [
+    "/bin/zsh -lc \"cat src/lib.rs | head\"",
+    "/bin/zsh -lc \"cat src/lib.rs > /tmp/out\"",
+    "/bin/zsh -lc \"cat src/lib.rs; pwd\"",
+    "/bin/zsh -lc \"cat $(pwd)/src/lib.rs\"",
+    "/bin/zsh -lc \"cat `pwd`/src/lib.rs\"",
+    "/bin/zsh -lc \"cat src/*.rs\"",
+    "/bin/zsh -lc \"cat src/lib.rs src/one.rs\"",
+    "/bin/zsh -lc \"cat ~/secret\"",
+    "/bin/zsh -lc \"cat =ls\"",
+  ]) {
+    const hostile = baseRun("named_file_direct_read");
+    hostile.steps.unshift({ kind: "shell", command });
+    assert.throws(() => validate("codex", hostile), /required action sequence|forbidden tool/u, command);
+  }
+});
 
 test("freezes exactly the sixteen accepted routing scenarios", () => {
   assert.deepEqual(ROUTING_SCENARIOS.map(({ id }) => id), SCENARIO_IDS);

@@ -679,7 +679,7 @@ async function installCodexQualificationPlugin({ executable, codexHome, pluginRo
   if (await directoryContractSha256(installedPath) !== await directoryContractSha256(pluginRoot)) {
     fail("installed Codex qualification plugin bytes drifted from the staged candidate");
   }
-  return installed;
+  return { ...installed, installedPath };
 }
 
 export async function materializeRoutingFixture(sourceRoot, destination, { oversized = false } = {}) {
@@ -915,14 +915,16 @@ async function main(argv) {
       }
       await preflightRoutingScenario({ cli: authenticated.staged.managedCli, entry, projectRoot, env: sessionEnv });
       let codexHome = null;
+      let installedPluginRoot = null;
       if (host === "codex") {
         codexHome = join(sessionRoot, "codex-home");
         await mkdir(codexHome, { recursive: true, mode: 0o700 });
         await copyFile(resolve(options.codex_auth), join(codexHome, "auth.json"));
-        await installCodexQualificationPlugin({
+        const installedPlugin = await installCodexQualificationPlugin({
           executable: options.codex_command ?? "codex", codexHome,
           pluginRoot: authenticated.pluginRoot, env: sessionEnv,
         });
+        installedPluginRoot = installedPlugin.installedPath;
       }
       const command = buildRoutingHostCommand({
         host,
@@ -944,6 +946,7 @@ async function main(argv) {
         installedRoot: authenticated.installedRoot,
         installedReceipt: authenticated.installedReceipt,
         expectedIdentity: authenticated.expectedIdentity,
+        installedPluginRoot,
         transcript: session.stdout,
       });
       if (id === "proof_observational") {

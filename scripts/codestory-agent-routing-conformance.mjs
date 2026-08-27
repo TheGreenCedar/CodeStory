@@ -454,18 +454,48 @@ function normalizePath(path) {
   return parts.join("/");
 }
 
-function sourceReadPath(command) {
+function unwrapCodexShell(command) {
   const text = String(command ?? "").trim();
+  const prefix = "/bin/zsh -lc ";
+  if (!text.startsWith(prefix)) return text;
+  try {
+    const inner = JSON.parse(text.slice(prefix.length));
+    return typeof inner === "string" ? inner.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function singleShellWord(value) {
+  const text = String(value ?? "");
+  if (text.startsWith("'") && text.endsWith("'") && !text.slice(1, -1).includes("'")) {
+    return text.slice(1, -1);
+  }
+  if (text.startsWith('"') && text.endsWith('"') && !/["$`\\]/u.test(text.slice(1, -1))) {
+    return text.slice(1, -1);
+  }
+  return /^\/?[A-Za-z0-9._@+-]+(?:\/[A-Za-z0-9._@+-]+)*$/u.test(text) ? text : null;
+}
+
+function singleFileReadPath(command) {
+  const text = unwrapCodexShell(command);
+  if (!text) return null;
   const patterns = [
-    /^sed\s+-n\s+['"][^'"]+['"]\s+['"]([^'"]+)['"]\s*$/u,
-    /^(?:cat|type|nl)(?:\s+-[A-Za-z]+)*\s+['"]([^'"]+)['"]\s*$/u,
-    /^Get-Content(?:\s+-(?:LiteralPath|Path))?\s+['"]([^'"]+)['"]\s*$/iu,
+    /^sed\s+-n\s+(?:'\d+,\d+p'|"\d+,\d+p")\s+(.+)$/u,
+    /^(?:cat|type|nl)(?:\s+-[A-Za-z]+)*\s+(.+)$/u,
+    /^Get-Content(?:\s+-(?:LiteralPath|Path))?\s+(.+)$/iu,
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    if (match) return normalizePath(match[1]);
+    if (match) return singleShellWord(match[1]);
   }
   return null;
+}
+
+function sourceReadPath(command) {
+  const path = singleFileReadPath(command);
+  if (!path || path.startsWith("/") || /^[a-z]:[\\/]/iu.test(path)) return null;
+  return normalizePath(path);
 }
 
 function beginAction(state, id, action) {
@@ -2123,6 +2153,48 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
   if (claim.material_omissions.length > 0) fail(`${scenarioContract.id} final claim contains material omissions`);
 }
 
+const CANONICAL_SKILL_PATH = "skills/codestory-grounding/SKILL.md";
+
+function isAuthenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIdentity) {
+  if (action.kind !== "shell" || !action.completed || action.error || typeof action.result !== "string") {
+    return false;
+  }
+  const candidate = singleFileReadPath(action.command);
+  if (!candidate || !installedPluginRoot) return false;
+  let root;
+  let actual;
+  try {
+    root = realpathSync(installedPluginRoot);
+    if (!lstatSync(candidate).isFile()) return false;
+    actual = realpathSync(candidate);
+  } catch {
+    return false;
+  }
+  const rel = relative(root, actual);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || resolve(root, rel) !== actual) return false;
+  if (rel.split(sep).join("/") !== CANONICAL_SKILL_PATH) return false;
+  const expectedDigest = expectedIdentity.static_roster?.[CANONICAL_SKILL_PATH];
+  if (!SHA256.test(String(expectedDigest)) || /^0{64}$/u.test(String(expectedDigest))) return false;
+  return sha256Bytes(readFileSync(actual)) === expectedDigest
+    && sha256Bytes(Buffer.from(action.result, "utf8")) === expectedDigest;
+}
+
+function productRoutingActions(host, actions, installedPluginRoot, expectedIdentity) {
+  if (String(host).toLowerCase() !== "codex") return actions;
+  const product = [];
+  let guidanceReads = 0;
+  for (const action of actions) {
+    if (isAuthenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIdentity)) {
+      if (product.length > 0) fail("Codex read authenticated installed guidance after the first product action");
+      guidanceReads += 1;
+    } else {
+      product.push(action);
+    }
+  }
+  if (guidanceReads > 1) fail("Codex read authenticated installed guidance more than once");
+  return product;
+}
+
 export function validateInstalledSession({
   host,
   scenarioId,
@@ -2130,6 +2202,7 @@ export function validateInstalledSession({
   installedRoot,
   installedReceipt,
   expectedIdentity,
+  installedPluginRoot = null,
   transcript,
 }) {
   const scenarioContract = SCENARIOS_BY_ID.get(scenarioId);
@@ -2140,10 +2213,11 @@ export function validateInstalledSession({
   if (String(host).toLowerCase() === "cursor" && parsed.user_text !== request.text) {
     fail(`${scenarioId} Cursor user text does not match the declared request`);
   }
-  validateActionOrder(scenarioContract, parsed.actions);
+  const actions = productRoutingActions(host, parsed.actions, installedPluginRoot, expectedIdentity);
+  validateActionOrder(scenarioContract, actions);
 
   const results = new Map();
-  for (const action of parsed.actions) {
+  for (const action of actions) {
     if (!action.completed) fail(`${scenarioId} has an incomplete ${action.tool} action`);
     if (["search", "context", "packet", "prove_call_path"].includes(action.kind)) {
       validateToolInputSchema(action);
@@ -2161,12 +2235,12 @@ export function validateInstalledSession({
     }
   }
 
-  validateSourceReads(scenarioContract, request, parsed.actions, results);
-  validateProofCalls(scenarioContract, request, parsed.actions, results);
-  validatePacketContinuation(scenarioContract, parsed.actions, results);
-  validateSelectedContext(scenarioContract, request, parsed.actions, results);
-  validateHiddenDiscovery(scenarioContract, parsed.actions, results);
-  validateFinalClaims(scenarioContract, parsed.final, parsed.actions, results);
+  validateSourceReads(scenarioContract, request, actions, results);
+  validateProofCalls(scenarioContract, request, actions, results);
+  validatePacketContinuation(scenarioContract, actions, results);
+  validateSelectedContext(scenarioContract, request, actions, results);
+  validateHiddenDiscovery(scenarioContract, actions, results);
+  validateFinalClaims(scenarioContract, parsed.final, actions, results);
 
   return {
     schema_version: 1,
@@ -2174,8 +2248,8 @@ export function validateInstalledSession({
     host: String(host).toLowerCase(),
     scenario_id: scenarioId,
     identity_binding: "exact",
-    actions: parsed.actions.map(actionName),
-    proof_disposition: proofDisposition(parsed.actions, results),
+    actions: actions.map(actionName),
+    proof_disposition: proofDisposition(actions, results),
   };
 }
 
