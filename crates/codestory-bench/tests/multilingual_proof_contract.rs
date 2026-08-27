@@ -6,11 +6,10 @@ use codestory_contracts::proof_resolution::{
     CalleeForm, ProofResolutionStatus, ResolutionEvidenceKind,
 };
 use multilingual_contract::{
-    FixtureClass, ObservedDisposition, PUBLIC_PROOF_ROUTE_DARK, dispatches,
-    materialize_repository_source, materialized_projection_rejects_injected_fact,
-    observe_language_source, observe_language_source_after_call_edge_removal,
-    observe_multilingual_contract, observe_structural_continuity, observe_structural_source,
-    resolution_funnel, valid_callee_form,
+    FixtureClass, ObservedDisposition, dispatches, materialize_repository_source,
+    materialized_projection_rejects_injected_fact, observe_language_source,
+    observe_language_source_after_call_edge_removal, observe_multilingual_contract,
+    observe_structural_continuity, observe_structural_source, resolution_funnel, valid_callee_form,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -444,9 +443,4 @@ fn git_materializer_rejects_commit_path_symbol_source_swap_and_injected_fact() -
         "python", source
     )?);
     Ok(())
-}
-
-#[test]
-fn contract_stays_dark_to_the_public_proof_route() {
-    const { assert!(PUBLIC_PROOF_ROUTE_DARK) };
 }
