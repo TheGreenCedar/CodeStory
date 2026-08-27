@@ -495,10 +495,8 @@ fn collect_drill_options(
             && obligation.carrier_edge_proofs.is_empty()
             && let Some(target) = obligation.carrier_node_ids.first()
         {
-            let option = DrillOptionDto::omitted_symbol(
-                format!("omitted-edge:{}", obligation.id),
-                &target.0,
-            );
+            let option =
+                omitted_support_option(answer, format!("omitted-edge:{}", obligation.id), target);
             if seen.insert(option.id.clone()) {
                 options.push(option);
             }
@@ -508,10 +506,8 @@ fn collect_drill_options(
             .as_deref()
             .is_some_and(|reason| reason.starts_with("named_sql_table_carriers_missing:"));
         if !named_schema_gap && let Some(node) = obligation.carrier_node_ids.first() {
-            let option = DrillOptionDto::omitted_symbol(
-                format!("omitted-material:{}", obligation.id),
-                &node.0,
-            );
+            let option =
+                omitted_support_option(answer, format!("omitted-material:{}", obligation.id), node);
             if seen.insert(option.id.clone()) {
                 options.push(option);
             }
@@ -570,6 +566,23 @@ fn collect_drill_options(
     options
 }
 
+fn omitted_support_option(
+    answer: &AgentAnswerDto,
+    gap_id: impl Into<String>,
+    node: &codestory_contracts::api::NodeId,
+) -> DrillOptionDto {
+    if node.0.starts_with("packet::")
+        && let Some(path) = answer
+            .citations
+            .iter()
+            .find(|citation| citation.node_id == *node)
+            .and_then(|citation| citation.file_path.as_deref())
+    {
+        return DrillOptionDto::omitted_source_path(gap_id, packet_display_path(path));
+    }
+    DrillOptionDto::omitted_symbol(gap_id, &node.0)
+}
+
 pub fn apply_compiled_evidence(
     packet: &mut AgentPacketDto,
     request: Option<&AgentPacketRequestDto>,
@@ -622,8 +635,15 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
                     DrillOptionDto::bounded_source_read(format!("named-path:{target}"), target)
                 }
                 codestory_contracts::api::DrillGapKindDto::OmittedMandatorySupport => {
-                    let symbol = target.strip_prefix("symbol:").unwrap_or(&target);
-                    DrillOptionDto::omitted_symbol(format!("omitted-symbol:{symbol}"), symbol)
+                    if let Some(path) = target.strip_prefix("path:") {
+                        DrillOptionDto::omitted_source_path(
+                            format!("omitted-source-path:{path}"),
+                            path,
+                        )
+                    } else {
+                        let symbol = target.strip_prefix("symbol:").unwrap_or(&target);
+                        DrillOptionDto::omitted_symbol(format!("omitted-symbol:{symbol}"), symbol)
+                    }
                 }
                 codestory_contracts::api::DrillGapKindDto::DeadlineLostCandidate => {
                     DrillOptionDto::deadline_lost_query(format!("deadline-lost:{target}"), target)
@@ -642,10 +662,11 @@ mod tests {
     use codestory_agent::packet_command::packet_follow_up_argv;
     use codestory_contracts::api::{
         AgentCitationDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
-        AgentRetrievalStepStatusDto, NodeId, NodeKind, PacketBudgetModeDto, PacketPlanDto,
-        PacketProbeDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
-        PacketQueryObligationDto, PacketQueryObligationKindDto, PacketTaskClassDto,
-        SearchHitOrigin, SourceCoverageObservationDto,
+        AgentRetrievalStepStatusDto, DrillGapKindDto, NodeId, NodeKind, PacketBudgetModeDto,
+        PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketPlanDto, PacketProbeDto,
+        PacketProbeResolutionDto, PacketProbeResolutionStatusDto, PacketQueryObligationDto,
+        PacketQueryObligationKindDto, PacketTaskClassDto, SearchHitOrigin,
+        SourceCoverageObservationDto,
     };
     use std::path::Path;
 
@@ -872,6 +893,61 @@ mod tests {
 
         assert_eq!(disposition.kind, PacketDispositionKindDto::NotEstablished);
         assert!(disposition.drill.is_none());
+    }
+
+    #[test]
+    fn synthetic_source_carriers_drill_by_exact_path_instead_of_opaque_symbol_id() {
+        let mut packet = test_packet("explain the imported animation keyframe", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        let mut citation = eligible_citation(
+            "@keyframes bounce",
+            "/private/tmp/product-value/repos/animate-css-animate-css/source/attention_seekers/bounce.css",
+        );
+        citation.node_id = NodeId(
+            "packet::css_import::source/attention_seekers/bounce.css::@keyframes bounce"
+                .to_string(),
+        );
+        citation.resolvable = false;
+        citation.evidence_tier = Some(PacketEvidenceTierDto::SyntheticSourceScan);
+        citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+        packet.answer.citations = vec![citation.clone()];
+
+        let mut obligation = claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Reported,
+        );
+        obligation.carrier_node_ids = vec![citation.node_id];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![obligation];
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+        let option = disposition
+            .drill
+            .expect("synthetic source omission should offer one bounded continuation")
+            .options
+            .into_iter()
+            .next()
+            .expect("bounded continuation option");
+
+        assert_eq!(option.kind, DrillGapKindDto::OmittedMandatorySupport);
+        assert_eq!(
+            option.path.as_deref(),
+            Some("source/attention_seekers/bounce.css")
+        );
+        assert!(option.symbol_id.is_none());
+        let decoded = drill_options_from_ids(&[option.id]);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].path.as_deref(),
+            Some("source/attention_seekers/bounce.css")
+        );
+        assert!(decoded[0].symbol_id.is_none());
     }
 
     #[test]

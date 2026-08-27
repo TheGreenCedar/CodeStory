@@ -3332,6 +3332,22 @@ impl DrillOptionDto {
         }
     }
 
+    pub fn omitted_source_path(gap_id: impl Into<String>, path: impl Into<String>) -> Self {
+        let path = path.into();
+        let gap_id = gap_id.into();
+        Self {
+            id: encode_drill_option_id(
+                DrillGapKindDto::OmittedMandatorySupport,
+                &format!("path:{path}"),
+            ),
+            gap_id,
+            kind: DrillGapKindDto::OmittedMandatorySupport,
+            path: Some(path),
+            symbol_id: None,
+            query: None,
+        }
+    }
+
     pub fn deadline_lost_query(gap_id: impl Into<String>, query: impl Into<String>) -> Self {
         let query = query.into();
         let gap_id = gap_id.into();
