@@ -163,12 +163,32 @@ fn packet_evidence_selection(
     support: &[SupportUnitDto],
     ranking_terms: &HashSet<String>,
 ) -> PacketEvidenceSelectionV3 {
+    let source_symbols = support
+        .iter()
+        .filter(|unit| {
+            unit.kind == SupportUnitKindDto::SourceRange
+                && unit
+                    .snippet
+                    .as_deref()
+                    .is_some_and(|snippet| !snippet.trim().is_empty())
+        })
+        .filter_map(|unit| Some((unit.path.as_deref()?, unit.symbol_id.as_deref()?)))
+        .collect::<HashSet<_>>();
     let mut seen = HashSet::new();
     let mut distinct = Vec::new();
     for unit in support
         .iter()
         .filter(|unit| unit.kind != SupportUnitKindDto::CompleteQueryNegative)
     {
+        if unit.kind == SupportUnitKindDto::SymbolLocation
+            && unit
+                .path
+                .as_deref()
+                .zip(unit.symbol_id.as_deref())
+                .is_some_and(|identity| source_symbols.contains(&identity))
+        {
+            continue;
+        }
         let Some(row) = packet_evidence_row(0, unit) else {
             continue;
         };
@@ -256,6 +276,21 @@ fn select_packet_evidence_indices(
         .len()
         .saturating_add(PACKET_PUBLIC_RELATION_ROWS_TARGET_V3)
         .min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+    let mut relation_callers = HashSet::new();
+    for index in &relation_order {
+        if selected.len() == relation_target {
+            break;
+        }
+        let caller = distinct[*index]
+            .1
+            .summary
+            .as_ref()
+            .and_then(|summary| summary.as_str().split_once(" -[").map(|(caller, _)| caller));
+        if !selected_indices.contains(index) && relation_callers.insert(caller) {
+            selected.push(*index);
+            selected_indices.insert(*index);
+        }
+    }
     select_packet_evidence_kind(
         &relation_order,
         relation_target,
@@ -460,7 +495,7 @@ fn packet_evidence_was_bounded(support: &[SupportUnitDto]) -> bool {
 
 const PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3: usize = 8;
 const PACKET_PUBLIC_LOCATION_ROWS_TARGET_V3: usize = 2;
-const PACKET_PUBLIC_RELATION_ROWS_TARGET_V3: usize = 2;
+const PACKET_PUBLIC_RELATION_ROWS_TARGET_V3: usize = 4;
 const PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3: usize = 16;
 
 /// Project a context answer without exposing answer confidence or claim state.
@@ -1100,6 +1135,61 @@ mod tests {
     }
 
     #[test]
+    fn packet_evidence_drops_a_location_when_the_same_symbol_has_source_content() {
+        let mut location = support_unit(SupportUnitKindDto::SymbolLocation);
+        location.path = Some("src/mapper.cs".to_owned());
+        location.symbol_id = Some("Mapper.Map".to_owned());
+        location.start_line = Some(12);
+        let mut source = support_unit(SupportUnitKindDto::SourceRange);
+        source.path = location.path.clone();
+        source.symbol_id = location.symbol_id.clone();
+        source.start_line = location.start_line;
+        source.end_line = Some(18);
+        source.snippet = Some("public object Map(...) => MapCore(...);".to_owned());
+
+        let evidence = packet_evidence_rows(&[location, source]);
+
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(
+            evidence[0].summary.as_ref().unwrap().as_str(),
+            "public object Map(...) => MapCore(...);"
+        );
+    }
+
+    #[test]
+    fn packet_evidence_relation_floor_spans_distinct_callers_before_repeats() {
+        let repeated = (0..8).map(|index| {
+            let mut unit = support_unit(SupportUnitKindDto::TypedGraphEdge);
+            unit.id = format!("repeated-{index}");
+            unit.from_symbol = Some("one_caller".to_owned());
+            unit.edge_kind = Some("CALL".to_owned());
+            unit.to_symbol = Some(format!("callee-{index}"));
+            unit
+        });
+        let distinct = (0..4).map(|index| {
+            let mut unit = support_unit(SupportUnitKindDto::TypedGraphEdge);
+            unit.id = format!("distinct-{index}");
+            unit.from_symbol = Some(format!("caller-{index}"));
+            unit.edge_kind = Some("CALL".to_owned());
+            unit.to_symbol = Some(format!("target-{index}"));
+            unit
+        });
+
+        let evidence = packet_evidence_rows(&repeated.chain(distinct).collect::<Vec<_>>());
+        let first_callers = evidence
+            .iter()
+            .take(PACKET_PUBLIC_RELATION_ROWS_TARGET_V3)
+            .filter_map(|row| {
+                row.summary
+                    .as_ref()
+                    .and_then(|summary| summary.as_str().split(" -[").next())
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(first_callers.len(), PACKET_PUBLIC_RELATION_ROWS_TARGET_V3);
+    }
+
+    #[test]
     fn packet_evidence_closes_a_diverse_content_bearing_identity_envelope() {
         let support = (0..15)
             .map(|index| {
@@ -1133,16 +1223,16 @@ mod tests {
                 .iter()
                 .filter(|row| row.kind == EvidenceKindV3Dto::ExactSource)
                 .count(),
-            14,
-            "the closed envelope keeps twelve excerpts and two symbol locations"
+            12,
+            "the closed envelope keeps ten excerpts and two symbol locations"
         );
         assert_eq!(
             evidence
                 .iter()
                 .filter(|row| row.kind == EvidenceKindV3Dto::GraphRelation)
                 .count(),
-            2,
-            "the closed envelope reserves two relation receipts"
+            4,
+            "the closed envelope reserves four relation receipts"
         );
         assert_eq!(
             evidence
@@ -1162,10 +1252,10 @@ mod tests {
                 "fixture",
                 "caller-0 -[CALL]-> callee-0",
                 "caller-1 -[CALL]-> callee-1",
+                "caller-2 -[CALL]-> callee-2",
+                "caller-3 -[CALL]-> callee-3",
                 "fn source_8() {}",
                 "fn source_9() {}",
-                "fn source_10() {}",
-                "fn source_11() {}",
             ]
         );
         assert!(packet_evidence_was_bounded(&support));
@@ -1278,7 +1368,7 @@ mod tests {
                         .is_some_and(|path| path.as_str().starts_with("src/source-"))
                 })
                 .count()
-                >= 12,
+                >= 10,
             "unreserved rows should prefer relevant source evidence over low-value duplicate locations"
         );
     }
