@@ -14,16 +14,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const CACHE_SCHEMA_VERSION: i64 = 4;
-const CACHE_DIRECTORY: &str = "content-addressed-vectors-v4";
-const CACHE_KEY_DOMAIN: &[u8] = b"codestory-content-addressed-vector-batch-v4\0";
-const CACHE_CORPUS_DOMAIN: &[u8] = b"codestory-content-addressed-vector-corpus-v3\0";
-const CACHE_CONTRACT_DOMAIN: &[u8] = b"codestory-content-addressed-vector-contract-v4\0";
+const CACHE_SCHEMA_VERSION: i64 = 5;
+const CACHE_DIRECTORY: &str = "content-addressed-vectors-v5";
+const CACHE_KEY_DOMAIN: &[u8] = b"codestory-content-addressed-vector-batch-v5\0";
+const CACHE_CORPUS_DOMAIN: &[u8] = b"codestory-content-addressed-vector-corpus-v4\0";
+const CACHE_CONTRACT_DOMAIN: &[u8] = b"codestory-content-addressed-vector-contract-v5\0";
 const CACHE_PACKING_CONTRACT: &str = "ordered-outer-request-native-token-pack-v1";
 const CACHE_TRUNCATION_CONTRACT: &str = "native-tokenize-truncate-max-input-v1";
 const CACHE_NORMALIZATION_CONTRACT: &str = "server-f32-l2-then-index-f64-l2-v1";
-const CACHE_MAX_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
-const CACHE_MAX_DATABASE_BYTES: u64 = 160 * 1024 * 1024;
+const CACHE_MAX_PAYLOAD_BYTES: u64 = 96 * 1024 * 1024;
+const CACHE_MAX_DATABASE_BYTES: u64 = 128 * 1024 * 1024;
 const CACHE_ROW_ACCOUNTING_BYTES: u64 = 512;
 
 pub(crate) struct VectorCacheBatchInput<'a> {
