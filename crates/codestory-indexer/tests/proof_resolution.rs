@@ -13,6 +13,7 @@ use codestory_store::{
     seal_call_resolution_fact,
 };
 use codestory_workspace::{BuildMode, RefreshInfo};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::PathBuf;
@@ -3424,6 +3425,86 @@ fn c_cpp_header_extensions_are_always_canonical_nonexact() -> anyhow::Result<()>
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn proof_parser_evidence_uses_the_raw_predecode_source_hash() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let path = project.path().join("fixture.c");
+    let raw_source =
+        b"void target(void) {}\nvoid caller(void) { target(); }\n/* non-UTF-8: \xff */\n";
+    fs::write(&path, raw_source)?;
+
+    let mut store = Store::new_in_memory()?;
+    WorkspaceIndexer::new(project.path().to_path_buf()).run_incremental(
+        &mut store,
+        &RefreshInfo {
+            mode: BuildMode::Incremental,
+            files_to_index: vec![path.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+
+    let indexed_file = store
+        .get_files()?
+        .into_iter()
+        .find(|file| file.path == path)
+        .expect("indexed C fixture");
+    let raw_hash = store
+        .get_file_content_hash(indexed_file.id)?
+        .expect("raw source hash");
+    let decoded_hash = format!(
+        "{:x}",
+        Sha256::digest(String::from_utf8_lossy(raw_source).as_bytes())
+    );
+    assert_ne!(
+        raw_hash, decoded_hash,
+        "fixture must exercise lossy decoding"
+    );
+
+    let artifact_blob = store.get_connection().query_row(
+        "SELECT artifact_blob FROM index_artifact_cache",
+        [],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    assert_eq!(artifact["resolution_file"]["source_sha256"], raw_hash);
+    assert!(
+        artifact["call_resolution_inputs"]
+            .as_array()
+            .expect("call inputs")
+            .iter()
+            .all(|call| call["callsite"]["source_sha256"] == raw_hash)
+    );
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    let fact = store
+        .get_proof_resolution_facts()?
+        .into_iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("C target fact");
+    assert_eq!(fact.callsite.source_sha256, raw_hash);
+
+    let mut substituted: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+    substituted["resolution_file"]["source_sha256"] = decoded_hash.clone().into();
+    for call in substituted["call_resolution_inputs"]
+        .as_array_mut()
+        .expect("call inputs")
+    {
+        call["callsite"]["source_sha256"] = decoded_hash.clone().into();
+    }
+    store.get_connection().execute(
+        "UPDATE index_artifact_cache SET artifact_blob = ?1",
+        [serde_json::to_vec(&substituted)?],
+    )?;
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("a decoded-text hash must not substitute for the raw source hash");
+    assert!(error.to_string().contains("hash"), "{error}");
     Ok(())
 }
 

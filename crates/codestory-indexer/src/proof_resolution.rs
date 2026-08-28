@@ -266,6 +266,7 @@ pub(crate) struct CollectedResolutionInputs {
 pub(crate) fn collect_call_resolution_inputs(
     tree: &Tree,
     source: &str,
+    raw_source_sha256: &str,
     source_path: &Path,
     language: &str,
     parser_fingerprint: &str,
@@ -280,7 +281,7 @@ pub(crate) fn collect_call_resolution_inputs(
     }
     let complete = !tree.root_node().has_error();
     let lookup_input_complete = complete;
-    let source_sha256 = source_content_hash(source.as_bytes());
+    let source_sha256 = raw_source_sha256.to_string();
     let javascript_index = is_javascript_language(language).then(|| {
         JavascriptResolutionIndex::build(tree, source, source_path, language, file_id, nodes)
     });
@@ -4025,6 +4026,7 @@ pub(crate) fn cached_resolution_inputs_are_current(
     artifact: &CachedIndexArtifact,
     language: &str,
     expected_parser_fingerprint: &str,
+    expected_source_sha256: &str,
 ) -> bool {
     !is_installed_language(language)
         || (artifact.resolution_input_schema_version == RESOLUTION_INPUT_SCHEMA_VERSION
@@ -4032,10 +4034,12 @@ pub(crate) fn cached_resolution_inputs_are_current(
                 file.language == language
                     && file.adapter_version == adapter_version(language)
                     && file.parser_fingerprint == expected_parser_fingerprint
+                    && file.source_sha256 == expected_source_sha256
                     && artifact.call_resolution_inputs.iter().all(|call| {
                         call.language == language
                             && call.adapter_version == adapter_version(language)
                             && call.parser_fingerprint == expected_parser_fingerprint
+                            && call.callsite.source_sha256 == expected_source_sha256
                     })
             }))
 }
@@ -13420,6 +13424,7 @@ pub fn rematerialize_proof_resolution_projection(
             let regenerated = collect_call_resolution_inputs(
                 &tree,
                 source,
+                stored_hash,
                 &indexed_file.path,
                 &indexed_file.language,
                 &expected_parser_fingerprint,
