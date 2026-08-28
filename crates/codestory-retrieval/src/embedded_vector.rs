@@ -2015,7 +2015,7 @@ fn digest_vector_rows(
     Ok((hex_digest(digest.finalize()), seen.len()))
 }
 
-fn validate_vector(node_id: &str, vector: &[f32], embedding_dim: usize) -> Result<()> {
+pub(crate) fn validate_vector(node_id: &str, vector: &[f32], embedding_dim: usize) -> Result<()> {
     if vector.len() != embedding_dim {
         bail!(
             "embedded vector dimension mismatch for node {node_id}: expected {embedding_dim}, found {}",

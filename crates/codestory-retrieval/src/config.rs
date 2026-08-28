@@ -685,7 +685,7 @@ fn temporary_cache_root() -> PathBuf {
 /// An existing name is not trusted for being there — it is accepted only after
 /// `symlink_metadata` shows a real directory (never a symlink) owned by the
 /// effective uid with `mode & 0o077 == 0`.
-fn private_cache_directory(path: &Path) -> std::io::Result<()> {
+pub(crate) fn private_cache_directory(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
