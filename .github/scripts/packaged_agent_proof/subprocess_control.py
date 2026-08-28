@@ -20,6 +20,9 @@ from .foundation import (
 )
 
 
+PREFERRED_MCP_PROTOCOL_VERSION = "2025-11-25"
+
+
 def mcp_search_arguments(project: Path, query: str) -> dict[str, str]:
     """Build the closed public MCP search argument shape."""
 
@@ -211,7 +214,7 @@ class McpProcess:
                 "id": "initialize",
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": PREFERRED_MCP_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
                         "name": "packaged-proof",
@@ -222,6 +225,12 @@ class McpProcess:
         )
         require(
             "error" not in response, f"MCP initialize failed: {response.get('error')}"
+        )
+        negotiated_protocol = response.get("result", {}).get("protocolVersion")
+        require(
+            negotiated_protocol == PREFERRED_MCP_PROTOCOL_VERSION,
+            "MCP initialize negotiated an unexpected protocol revision: "
+            f"expected {PREFERRED_MCP_PROTOCOL_VERSION}, got {negotiated_protocol!r}",
         )
         assert self.process.stdin
         self.process.stdin.write(

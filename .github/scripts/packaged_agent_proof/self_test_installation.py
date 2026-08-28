@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 from .foundation import REPOSITORY_ROOT, ProofFailure, require
 from .subprocess_control import McpProcess
@@ -27,6 +28,54 @@ class ScriptedMcpProcess(McpProcess):
             return next(self.responses)
         except StopIteration as exc:
             raise ProofFailure("scripted MCP response sequence was exhausted") from exc
+
+
+class ScriptedInitializeProcess(McpProcess):
+    def __init__(self, response_protocol: str):
+        self.response_protocol = response_protocol
+        self.requests: list[dict] = []
+        self.notifications: list[dict] = []
+        self.process = SimpleNamespace(stdin=self)
+
+    def send(self, request: dict, deadline: float | None = None) -> dict:
+        del deadline
+        self.requests.append(request)
+        return {
+            "jsonrpc": "2.0",
+            "id": request.get("id"),
+            "result": {"protocolVersion": self.response_protocol},
+        }
+
+    def write(self, payload: str) -> None:
+        self.notifications.append(json.loads(payload))
+
+    def flush(self) -> None:
+        return None
+
+
+def _modern_protocol_initialization_test() -> None:
+    modern = ScriptedInitializeProcess("2025-11-25")
+    modern.initialize()
+    require(
+        modern.requests[0]["params"]["protocolVersion"] == "2025-11-25",
+        "packaged proof did not request CodeStory's preferred MCP revision",
+    )
+    require(
+        modern.notifications
+        == [{"jsonrpc": "2.0", "method": "notifications/initialized"}],
+        "packaged proof did not complete the preferred-revision handshake",
+    )
+
+    downgraded = ScriptedInitializeProcess("2024-11-05")
+    try:
+        downgraded.initialize()
+    except ProofFailure as exc:
+        require(
+            "protocol revision" in str(exc),
+            f"protocol downgrade failure omitted its diagnostic: {exc}",
+        )
+    else:
+        raise ProofFailure("packaged proof accepted a downgraded MCP revision")
 
 
 def _ready_retrieval_fixture() -> dict:
@@ -198,6 +247,7 @@ def _hostile_result_tests(query: str, ready_retrieval: dict) -> None:
 
 
 def run_installation_self_tests() -> None:
+    _modern_protocol_initialization_test()
     query = "scripted-search"
     ready_retrieval = _ready_retrieval_fixture()
     _readiness_convergence_test(query, ready_retrieval)
