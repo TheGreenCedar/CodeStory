@@ -1751,7 +1751,7 @@
         "file": "packaged-platform-pr.yml",
         "job": "route",
         "step": "Resolve trusted exact head",
-        "sha256": "057bb7924c9ec281671defe683519debfb71359729d66fb0afb84513dc22bf5f",
+        "sha256": "21182e5058df0de35760e22c2dd1f9708fde0dc416cefbec69a60cfd271b74e4",
         "reason": "The coordinator's trusted-head resolver authenticates the exact frozen-candidate head for every broad proof mode; its executable text must match the reviewed contract, not merely contain its tokens."
       },
       "marketplace_sync_dispatch_guard": {
@@ -1779,7 +1779,7 @@
       "packaged_platform_pr_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-pr.yml",
-        "sha256": "a633fd7e6def5305940844aca96a6869fca77622050dc79f0c4682f5e0a9c1c3",
+        "sha256": "965ee4bb3e73bbf483816fec614a6193e9fbf1fdfb7913574d95bde2e1542f7e",
         "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "frozen_candidate_quality_workflow": {
@@ -3379,7 +3379,8 @@
           "test \"$INPUT_HEAD_SHA\" = \"$current_head\"",
           "test \"$GITHUB_REF\" = \"refs/heads/$head_ref\"",
           "test \"$GITHUB_SHA\" = \"$INPUT_HEAD_SHA\"",
-          "test \"$base_ref\" = \"dev/codestory-next\"",
+          "case \"$base_ref\" in",
+          "dev/codestory-next|dev/codestory-0.18) ;;",
           "test \"$INPUT_HEAD_SHA\" = \"$dev_head\"",
           "test \"$GITHUB_REF\" = \"refs/heads/dev/codestory-next\"",
           "test \"$GITHUB_SHA\" = \"$dev_head\"",
@@ -3388,7 +3389,7 @@
           "test -n \"$INPUT_CALIBRATION_RUN_ID\"",
           "--ref $head_ref"
         ],
-        "reason": "The coordinator may run only for an exact trusted head: same-repository PR heads must match the event and input SHA, branch dispatches must resolve to the live dev/codestory-next head, and qualification dispatches must name the calibration bundle and its producer run. Each fragment pins one conjunct of that resolution."
+        "reason": "The coordinator may run only for an exact trusted head: same-repository PR heads must match the event and input SHA, integration dispatches must resolve to the live dev/codestory-next head, calibration and qualification may target only dev/codestory-next or the isolated dev/codestory-0.18 lane, and qualification dispatches must name the calibration bundle and its producer run. Each fragment pins one conjunct of that resolution."
       },
       "packaged_platform_pr_route_release_freeze": {
         "kind": "require",

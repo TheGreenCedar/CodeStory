@@ -8917,8 +8917,12 @@ export function releaseFreezeBarrierWorkflowViolations(
   add(
     violations,
     barrierSource.includes('gh(["api", `repos/${repository}/pulls/${number}`])')
+      && barrierSource.includes("const CANDIDATE_BASE_BRANCHES = new Set([")
+      && barrierSource.includes('"dev/codestory-next"')
+      && barrierSource.includes('"dev/codestory-0.18"')
+      && barrierSource.includes("CANDIDATE_BASE_BRANCHES.has(baseBranch)")
       && barrierSource.includes(
-        "`repos/${repository}/git/ref/heads/dev/codestory-next`",
+        "`repos/${repository}/git/ref/heads/${baseBranch}`",
       )
       && barrierSource.includes(
         "`repos/${repository}/compare/${liveBaseCommit}...${commit}`",
@@ -8950,12 +8954,14 @@ export function releaseFreezeBarrierWorkflowViolations(
     violations,
     sameMembers(at(invalidation, "on", "pull_request", "branches"), [
       "dev/codestory-next",
+      "dev/codestory-0.18",
     ])
       && sameMembers(at(invalidation, "on", "pull_request", "types"), [
         "synchronize",
       ])
       && sameMembers(at(invalidation, "on", "push", "branches"), [
         "dev/codestory-next",
+        "dev/codestory-0.18",
       ])
       && object(invalidation.permissions).actions === "write"
       && object(invalidation.permissions).contents === "read"

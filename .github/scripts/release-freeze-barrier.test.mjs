@@ -100,6 +100,16 @@ test("a frozen-candidate receipt carries no future mutation and passes", () => {
   assert.equal(frozen.next_permitted_mutation, null);
 });
 
+test("a 0.18 candidate receipt binds the isolated integration base", () => {
+  const candidate = receipt();
+  candidate.release_pr = {
+    ...candidate.release_pr,
+    base: "dev/codestory-0.18",
+  };
+  candidate.digest = receiptDigest(candidate);
+  validateReceipt(candidate, RECEIPT_CONTEXT);
+});
+
 test("source stabilization finishes before calibration and has no later source proof", () => {
   const actions = receipt().planned_proof_actions;
   assert.ok(actions.indexOf("source-stabilization") < actions.indexOf("calibration"));
@@ -164,6 +174,9 @@ for (const [name, mutate, pattern] of [
   }, /bind the open release PR/u],
   ["unbound release base", (value) => {
     value.release_pr.base_commit = "";
+  }, /bind the open release PR/u],
+  ["unsupported release base", (value) => {
+    value.release_pr.base = "main";
   }, /bind the open release PR/u],
   ["undeclared source change", (value) => {
     value.known_future_source_changes.push(".github/workflows/release.yml");
@@ -414,7 +427,7 @@ test("record-actions-receipt refuses to mint authority outside GitHub Actions", 
   );
 });
 
-test("record-actions-receipt rejects a PR whose snapshot omits the live dev head", () => {
+test("record-actions-receipt rejects a 0.18 PR whose snapshot omits the live base", () => {
   const sandbox = mkdtempSync(path.join(tmpdir(), "codestory-freeze-stale-base-"));
   const root = path.join(sandbox, "repo");
   mkdirSync(root);
@@ -437,10 +450,10 @@ test("record-actions-receipt rejects a PR whose snapshot omits the live dev head
     fakeGh,
     `#!/bin/sh
 if [ "$1" = "api" ] && [ "$2" = "repos/${REPOSITORY}/pulls/1597" ]; then
-  printf '%s\\n' '{"number":1597,"state":"open","base":{"ref":"dev/codestory-next","sha":"${staleBase}"},"head":{"ref":"codex/release","sha":"${commit}","repo":{"full_name":"${REPOSITORY}"}}}'
+  printf '%s\\n' '{"number":1597,"state":"open","base":{"ref":"dev/codestory-0.18","sha":"${staleBase}"},"head":{"ref":"codex/release","sha":"${commit}","repo":{"full_name":"${REPOSITORY}"}}}'
   exit 0
 fi
-if [ "$1" = "api" ] && [ "$2" = "repos/${REPOSITORY}/git/ref/heads/dev/codestory-next" ]; then
+if [ "$1" = "api" ] && [ "$2" = "repos/${REPOSITORY}/git/ref/heads/dev/codestory-0.18" ]; then
   printf '%s\\n' '{"object":{"sha":"${liveBase}"}}'
   exit 0
 fi

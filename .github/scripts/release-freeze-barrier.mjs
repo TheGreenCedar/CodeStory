@@ -58,6 +58,10 @@ const CANCEL_POLL_MS = Number.parseInt(
   10,
 );
 const COMMAND_OUTPUT_MAX_BYTES = 64 * 1024 * 1024;
+const CANDIDATE_BASE_BRANCHES = new Set([
+  "dev/codestory-next",
+  "dev/codestory-0.18",
+]);
 
 function fail(message) {
   throw new Error(message);
@@ -278,7 +282,7 @@ export function validateReceipt(
     || receipt.release_pr.number <= 0
     || receipt?.release_pr?.head_commit !== commit
     || receipt?.release_pr?.head !== receipt.branch
-    || receipt?.release_pr?.base !== "dev/codestory-next"
+    || !CANDIDATE_BASE_BRANCHES.has(receipt?.release_pr?.base)
     || !/^[0-9a-f]{40}$/u.test(String(receipt?.release_pr?.base_commit ?? ""))
   ) {
     fail("freeze receipt must bind the open release PR at this exact head");
@@ -478,14 +482,17 @@ function supportPr(repository, number, commit, repo) {
 
 function releasePr(repository, number, { branch, commit }) {
   const pr = JSON.parse(gh(["api", `repos/${repository}/pulls/${number}`]));
+  const baseBranch = pr?.base?.ref;
+  if (!CANDIDATE_BASE_BRANCHES.has(baseBranch)) {
+    fail(`release PR #${number} uses unsupported candidate base ${baseBranch}`);
+  }
   const liveBaseRef = JSON.parse(gh([
     "api",
-    `repos/${repository}/git/ref/heads/dev/codestory-next`,
+    `repos/${repository}/git/ref/heads/${baseBranch}`,
   ]));
   const liveBaseCommit = liveBaseRef?.object?.sha;
   if (
     pr.state !== "open"
-    || pr?.base?.ref !== "dev/codestory-next"
     || pr?.head?.ref !== branch
     || pr?.head?.sha !== commit
     || pr?.head?.repo?.full_name !== repository
@@ -493,7 +500,7 @@ function releasePr(repository, number, { branch, commit }) {
   ) {
     fail(
       `release PR #${number} must be an open same-repository ${branch} -> `
-      + `dev/codestory-next PR at exact head ${commit}`,
+      + `${baseBranch} PR at exact head ${commit}`,
     );
   }
   const comparison = JSON.parse(gh([

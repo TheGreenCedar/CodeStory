@@ -146,10 +146,13 @@ jobs:
           fi
           if [ "$mode" = "calibration" ] || [ "$mode" = "qualification" ]; then
             test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
-            test "$base_ref" = "dev/codestory-next" || {
-              echo "::error::$mode requires a PR into dev/codestory-next, not $base_ref."
-              exit 1
-            }
+            case "$base_ref" in
+              dev/codestory-next|dev/codestory-0.18) ;;
+              *)
+                echo "::error::$mode requires a PR into dev/codestory-next or dev/codestory-0.18, not $base_ref."
+                exit 1
+                ;;
+            esac
             jq -e 'any(.labels[]; .name == "review-accepted")' <<<"$pr" >/dev/null || {
               echo "::error::PR #$pr_number does not carry the review-accepted label."
               exit 1

@@ -1057,7 +1057,7 @@ function moveNamedStepAfter(job, movedName, afterName) {
   job.steps.splice(afterIndex + 1, 0, moved);
 }
 
-function runResolver(file, jobName, environment) {
+function runResolver(file, jobName, environment, baseRef = "dev/codestory-next") {
   const workflow = loadWorkflows().get(file);
   const run = draftStep(workflow.jobs[jobName], "Resolve trusted exact head").run;
   const directory = mkdtempSync(path.join(os.tmpdir(), "codestory-proof-resolver-"));
@@ -1072,7 +1072,7 @@ case "$*" in
       sha: fullSha,
       ref: "codex/exact-head",
     },
-    base: { sha: baseSha, ref: "dev/codestory-next" },
+    base: { sha: baseSha, ref: baseRef },
     labels: [{ name: "review-accepted" }],
   })}' ;;
 esac
@@ -3635,6 +3635,39 @@ test("proof resolvers reject hostile refs, SHAs, and labeled-event drift before 
       GITHUB_REF: "refs/heads/codex/exact-head",
     });
     assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+
+    const accepted018Qualification = runResolver(
+      "packaged-platform-pr.yml",
+      "route",
+      {
+        ...packagedEnvironment,
+        INPUT_MODE: "qualification",
+        INPUT_CALIBRATION_ARTIFACT: "calibration",
+        INPUT_CALIBRATION_RUN_ID: "77",
+        GITHUB_REF: "refs/heads/codex/exact-head",
+      },
+      "dev/codestory-0.18",
+    );
+    assert.equal(
+      accepted018Qualification.status,
+      0,
+      accepted018Qualification.stderr || accepted018Qualification.stdout,
+    );
+
+    const rejectedMainQualification = runResolver(
+      "packaged-platform-pr.yml",
+      "route",
+      {
+        ...packagedEnvironment,
+        INPUT_MODE: "qualification",
+        INPUT_CALIBRATION_ARTIFACT: "calibration",
+        INPUT_CALIBRATION_RUN_ID: "77",
+        GITHUB_REF: "refs/heads/codex/exact-head",
+      },
+      "main",
+    );
+    assert.notEqual(rejectedMainQualification.status, 0);
+    assert.match(rejectedMainQualification.stdout, /requires a PR into/u);
   });
 
   await t.test("platform labeled event", () => {
@@ -4669,7 +4702,7 @@ test("release freeze policy pins live PR base and support ancestry revalidation"
       )],
     ["release base lookup stops using the live integration ref", value =>
       value.replace(
-        "`repos/${repository}/git/ref/heads/dev/codestory-next`",
+        "`repos/${repository}/git/ref/heads/${baseBranch}`",
         "`repos/${repository}/git/commits/${pr.base.sha}`",
       )],
     ["release PR head stops proving it contains the current dev base", value =>
