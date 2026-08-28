@@ -5288,7 +5288,7 @@ test("transcript analysis authorizes source reads only from user-named files or 
 
   const gapEvents = [
     commandEvent("packet", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
-    commandEvent("packet", "item.completed", "$CODESTORY_CLI packet --project . --question flow", "Unknown: explicit evidence gap"),
+    commandEvent("packet", "item.completed", "$CODESTORY_CLI packet --project . --question flow", "Unknown: explicit evidence gap for src/gap.ts"),
     commandEvent("gap-read", "item.started", "Get-Content src/gap.ts"),
     commandEvent("gap-read", "item.completed", "Get-Content src/gap.ts", "source"),
   ];
@@ -5308,7 +5308,7 @@ test("transcript analysis authorizes source reads only from user-named files or 
       JSON.stringify({
         schema_version: 3,
         status: "continuation_available",
-        gaps: [{ kind: "evidence_missing" }],
+        gaps: [{ kind: "evidence_missing", message: "Missing evidence for src/v3-gap.ts" }],
       }),
     ),
     commandEvent("v3-gap-read", "item.started", "Get-Content src/v3-gap.ts"),
@@ -5321,11 +5321,150 @@ test("transcript analysis authorizes source reads only from user-named files or 
   assert.equal(v3Gap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
   assert.equal(v3Gap.direct_source_reads[0].authorization.evidence_command_id, "packet-v3");
 
+  const unrelatedGapEvents = [
+    ...v3GapEvents.slice(0, 2),
+    commandEvent("unrelated-read", "item.started", "Get-Content src/unrelated.ts"),
+    commandEvent("unrelated-read", "item.completed", "Get-Content src/unrelated.ts", "source"),
+  ];
+  const unrelatedGap = analyzeTranscript(unrelatedGapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(unrelatedGap.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const outputBudgetEvents = [
+    commandEvent("packet-budget", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet-budget",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      JSON.stringify({
+        status: "unavailable",
+        reason: "output_budget_exceeded for src/budget.ts",
+      }),
+    ),
+    commandEvent("budget-read", "item.started", "Get-Content src/budget.ts"),
+    commandEvent("budget-read", "item.completed", "Get-Content src/budget.ts", "source"),
+  ];
+  const outputBudget = analyzeTranscript(outputBudgetEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(outputBudget.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const failedGapEvents = [
+    commandEvent("packet-failed", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet-failed",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      "Unknown: missing evidence for src/failed.ts",
+      1,
+    ),
+    commandEvent("failed-read", "item.started", "Get-Content src/failed.ts"),
+    commandEvent("failed-read", "item.completed", "Get-Content src/failed.ts", "source"),
+  ];
+  const failedGap = analyzeTranscript(failedGapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(failedGap.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const retroactiveGapEvents = [
+    commandEvent("packet-late", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent("late-read", "item.started", "Get-Content src/late.ts"),
+    commandEvent(
+      "packet-late",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      "Unknown: missing evidence for src/late.ts",
+    ),
+    commandEvent("late-read", "item.completed", "Get-Content src/late.ts", "source"),
+  ];
+  const retroactiveGap = analyzeTranscript(retroactiveGapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(retroactiveGap.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const citedPathEvents = [
+    commandEvent("packet-cited", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet-cited",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      "Unknown: missing evidence for src/other.ts, cited src/cited.ts",
+    ),
+    commandEvent("cited-read", "item.started", "Get-Content src/cited.ts"),
+    commandEvent("cited-read", "item.completed", "Get-Content src/cited.ts", "source"),
+  ];
+  const citedPath = analyzeTranscript(citedPathEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(citedPath.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const mcpGapBody = {
+    status: "no_useful_evidence",
+    gaps: [{ kind: "evidence_missing", message: "Missing evidence for src/mcp-gap.ts" }],
+  };
+  const mcpGapEvents = [
+    {
+      type: "item.started",
+      item: { id: "mcp-gap", type: "mcp_tool_call", server: "codestory", tool: "packet" },
+    },
+    {
+      type: "item.completed",
+      item: {
+        id: "mcp-gap",
+        type: "mcp_tool_call",
+        server: "codestory",
+        tool: "packet",
+        result: {
+          structuredContent: mcpGapBody,
+          content: [{ type: "text", text: JSON.stringify(mcpGapBody) }],
+        },
+      },
+    },
+    commandEvent("mcp-gap-read", "item.started", "Get-Content src/mcp-gap.ts"),
+    commandEvent("mcp-gap-read", "item.completed", "Get-Content src/mcp-gap.ts", "source"),
+  ];
+  const mcpGap = analyzeTranscript(mcpGapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(mcpGap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
+  assert.equal(mcpGap.direct_source_reads[0].authorization.evidence_event_index, 1);
+
+  const mismatchedMirrorEvents = structuredClone(mcpGapEvents);
+  mismatchedMirrorEvents[1].item.result.structuredContent.gaps[0].message = "Missing evidence for src/other.ts";
+  const mismatchedMirror = analyzeTranscript(mismatchedMirrorEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(mismatchedMirror.direct_source_reads[0].authorization.status, "unauthorized");
+
   const unauthorized = analyzeTranscript(namedEvents, project, {
     arm: "candidate_0_18",
     task: { prompt: "Explain the flow." },
   });
   assert.equal(unauthorized.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const prefixCollision = analyzeTranscript(namedEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Inspect src/named.tsx and explain the call." },
+  });
+  assert.equal(prefixCollision.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const escapedEvents = [
+    commandEvent("escaped", "item.started", "Get-Content ../secret.ts"),
+    commandEvent("escaped", "item.completed", "Get-Content ../secret.ts", "source"),
+  ];
+  const escaped = analyzeTranscript(escapedEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Inspect ../secret.ts and explain the call." },
+  });
+  assert.equal(escaped.direct_source_reads[0].authorization.status, "unauthorized");
 
   const baseline = analyzeTranscript(gapEvents.slice(2), project, {
     arm: "without_codestory",

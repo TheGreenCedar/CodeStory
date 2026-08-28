@@ -39,7 +39,7 @@
     {
       "id": "packet_unavailable_to_source",
       "prompt": "Explain the deliberately oversized routing catalog. If the complete evidence response is unavailable because of its output budget, read src/fallback.rs and preserve that reason.",
-      "request": { "named_files": [], "selected_target": null, "gap_source_paths": ["src/fallback.rs"], "proof_contract": null }
+      "request": { "named_files": ["src/fallback.rs"], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {
       "id": "typed_proof_contract_proven",

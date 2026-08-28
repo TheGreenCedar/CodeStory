@@ -161,7 +161,7 @@ export const ROUTING_SCENARIOS = deepFreeze([
     id: "packet_unavailable_to_source",
     first: "packet",
     followups: ["source_read"],
-    source: "packet_unavailable",
+    source: "user_named_file",
     required: ["output_budget_exceeded", "source"],
     forbidden: NO_PROOF_CLAIMS,
   }),
@@ -477,6 +477,32 @@ function normalizePath(path) {
     fail(`source read path is invalid: ${JSON.stringify(path)}`);
   }
   return parts.join("/");
+}
+
+function textMentionsExactPath(value, normalizedPath) {
+  const text = String(value ?? "").replaceAll("\\", "/");
+  let offset = text.indexOf(normalizedPath);
+  while (offset >= 0) {
+    const before = offset === 0 ? "" : text[offset - 1];
+    const afterOffset = offset + normalizedPath.length;
+    const after = afterOffset >= text.length ? "" : text[afterOffset];
+    const pathCharacter = /[A-Za-z0-9._~:/-]/;
+    if ((!before || !pathCharacter.test(before)) && (!after || !pathCharacter.test(after))) return true;
+    offset = text.indexOf(normalizedPath, offset + 1);
+  }
+  return false;
+}
+
+function materialGapMessageAuthorizesPath(value, normalizedPath) {
+  const materialGap = /\b(?:unknown|unavailable|not_established|evidence gap|material gap|missing evidence|evidence_missing|retrieval_unavailable|source_unavailable)\b/iu;
+  const text = String(value ?? "").replaceAll("\\", "/");
+  if (!materialGap.test(text) || !textMentionsExactPath(text, normalizedPath)) return false;
+  const paths = new Set(
+    (text.match(/(?:[A-Za-z0-9_@+.-]+\/)+[A-Za-z0-9_@+.-]*[A-Za-z0-9_@+-]|[A-Za-z0-9_@+-]+\.[A-Za-z0-9_@+.-]*[A-Za-z0-9_@+-]/gu) ?? [])
+      .map((entry) => entry.replaceAll("\\", "/")),
+  );
+  paths.add(normalizedPath);
+  return paths.size === 1;
 }
 
 function unwrapCodexShell(command) {
@@ -959,15 +985,17 @@ function validateSourceReads(scenarioContract, request, actions, results) {
   const packet = actions.find((action) => action.kind === "packet");
   const body = packet ? results.get(packet)?.body : null;
   if (kind === "packet_evidence_gap") {
-    if (!Array.isArray(body?.gaps) || body.gaps.length === 0) fail(`${scenarioContract.id} source read lacks an explicit packet evidence gap`);
+    const materialGaps = Array.isArray(body?.gaps)
+      ? body.gaps.filter((gap) => ["evidence_missing", "retrieval_unavailable", "source_unavailable"].includes(gap?.kind))
+      : [];
+    if (materialGaps.length === 0) fail(`${scenarioContract.id} source read lacks an explicit packet evidence gap`);
     const allowed = new Set((request.gap_source_paths ?? []).map(normalizePath));
     for (const read of reads) {
       if (!allowed.has(read.path)) fail(`${scenarioContract.id} source read is not authorized by the packet evidence gap`);
+      if (!materialGaps.some((gap) => materialGapMessageAuthorizesPath(gap.message, read.path))) {
+        fail(`${scenarioContract.id} source read is not correlated with the packet evidence gap`);
+      }
     }
-    return;
-  }
-  if (kind === "packet_unavailable") {
-    if (body?.status !== "unavailable") fail(`${scenarioContract.id} source read requires packet Unavailable`);
     return;
   }
   fail(`${scenarioContract.id} has unsupported source-read authorization ${kind}`);

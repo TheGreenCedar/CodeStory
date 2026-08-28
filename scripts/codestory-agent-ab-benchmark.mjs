@@ -3153,6 +3153,113 @@ function interactionTurnTelemetry(events) {
   };
 }
 
+const MATERIAL_SOURCE_GAP_CODES = new Set([
+  "unknown",
+  "unavailable",
+  "not_established",
+  "evidence_missing",
+  "retrieval_unavailable",
+  "source_unavailable",
+]);
+
+const MATERIAL_SOURCE_GAP_TEXT =
+  /\b(?:unknown|unavailable|not_established|evidence gap|material gap|missing evidence|evidence_missing|retrieval_unavailable|source_unavailable)\b/i;
+const NON_AUTHORIZING_GAP_TEXT = /\b(?:output_budget_exceeded|continuation_required)\b/i;
+
+function textMentionsExactPath(value, normalizedPath) {
+  if (!normalizedPath) return false;
+  const text = String(value ?? "").replaceAll("\\", "/");
+  let offset = text.indexOf(normalizedPath);
+  while (offset >= 0) {
+    const before = offset === 0 ? "" : text[offset - 1];
+    const afterOffset = offset + normalizedPath.length;
+    const after = afterOffset >= text.length ? "" : text[afterOffset];
+    const pathCharacter = /[A-Za-z0-9._~:/-]/;
+    if ((!before || !pathCharacter.test(before)) && (!after || !pathCharacter.test(after))) {
+      return true;
+    }
+    offset = text.indexOf(normalizedPath, offset + 1);
+  }
+  return false;
+}
+
+function gapTextUniquelyCorrelatesPath(value, normalizedPath) {
+  if (!textMentionsExactPath(value, normalizedPath)) return false;
+  const text = String(value ?? "").replaceAll("\\", "/");
+  const paths = new Set(
+    (text.match(/(?:[A-Za-z0-9_@+.-]+\/)+[A-Za-z0-9_@+.-]*[A-Za-z0-9_@+-]|[A-Za-z0-9_@+-]+\.[A-Za-z0-9_@+.-]*[A-Za-z0-9_@+-]/gu) ?? [])
+      .map(normalizePathLike),
+  );
+  paths.add(normalizedPath);
+  return paths.size === 1;
+}
+
+function explicitEvidenceGapAuthorizesPath(value, normalizedPath, seen = new Set()) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+      try {
+        return explicitEvidenceGapAuthorizesPath(JSON.parse(trimmed), normalizedPath, seen);
+      } catch {
+        // Fall through to bounded line correlation for non-JSON tool output.
+      }
+    }
+    return trimmed.split(/\r?\n/u).some((line) =>
+      MATERIAL_SOURCE_GAP_TEXT.test(line) &&
+      !NON_AUTHORIZING_GAP_TEXT.test(line) &&
+      gapTextUniquelyCorrelatesPath(line, normalizedPath)
+    );
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => explicitEvidenceGapAuthorizesPath(entry, normalizedPath, seen));
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+
+  const code = String(value.kind ?? value.status ?? "").trim().toLowerCase();
+  const classificationText = [value.kind, value.status, value.message, value.reason, value.reasons]
+    .flat()
+    .filter((entry) => entry != null)
+    .join(" ");
+  if (MATERIAL_SOURCE_GAP_CODES.has(code) && !NON_AUTHORIZING_GAP_TEXT.test(classificationText)) {
+    const correlationText = ["message", "reason", "reasons", "detail", "details", "path", "source_path", "source_paths"]
+      .flatMap((field) => Array.isArray(value[field]) ? value[field] : [value[field]])
+      .filter((entry) => entry != null)
+      .join("\n");
+    if (gapTextUniquelyCorrelatesPath(correlationText, normalizedPath)) return true;
+  }
+
+  return ["gaps", "gap", "disposition", "result", "structuredContent", "structured_content", "content", "text"]
+    .some((field) => explicitEvidenceGapAuthorizesPath(value[field], normalizedPath, seen));
+}
+
+function canonicalMcpEvidenceResult(result) {
+  if (!result || typeof result !== "object") return null;
+  const structured = result.structuredContent ?? result.structured_content ?? null;
+  const textItems = Array.isArray(result.content)
+    ? result.content.filter((entry) => entry?.type === "text" && typeof entry.text === "string")
+    : [];
+  const parsedText = [];
+  for (const item of textItems) {
+    try {
+      parsedText.push(JSON.parse(item.text));
+    } catch {
+      return null;
+    }
+  }
+  if (structured != null) {
+    if (parsedText.some((value) => stableJsonForHash(value) !== stableJsonForHash(structured))) return null;
+    return structured;
+  }
+  if (parsedText.length === 1) return parsedText[0];
+  if (parsedText.length > 1) {
+    const expected = stableJsonForHash(parsedText[0]);
+    return parsedText.every((value) => stableJsonForHash(value) === expected) ? parsedText[0] : null;
+  }
+  return result;
+}
+
 function directSourceReadAuthorization(read, commands, events, projectRoot, context) {
   if (context.arm === "without_codestory") {
     return { status: "baseline_local_exploration", reason: "without_codestory" };
@@ -3162,14 +3269,23 @@ function directSourceReadAuthorization(read, commands, events, projectRoot, cont
   const relativePath = isAbsolutePathLike(normalizedPath) && projectRoot
     ? normalizePathLike(path.relative(projectRoot, normalizedPath))
     : normalizedPath;
-  if (relativePath && prompt.includes(relativePath)) {
+  const pathComponents = relativePath.split("/");
+  if (
+    !relativePath ||
+    isAbsolutePathLike(relativePath) ||
+    pathComponents.some((component) => !component || component === "." || component === ".." || component.includes("\0"))
+  ) {
+    return { status: "unauthorized", reason: null };
+  }
+  if (relativePath && textMentionsExactPath(prompt, relativePath)) {
     return { status: "authorized", reason: "user_named_file" };
   }
-  const gapPattern = /\b(?:unknown|unavailable|not_established|evidence gap|material gap|missing evidence|evidence_missing|retrieval_unavailable|source_unavailable|continuation_required|output_budget_exceeded)\b/i;
   const priorCommand = [...commands].reverse().find((command) =>
     command.category === "codestory_cli" &&
+    command.exit_code === 0 &&
+    String(command.status ?? "completed").toLowerCase() !== "failed" &&
     (command.completed_event_index ?? -1) < (read.event_index ?? -1) &&
-    gapPattern.test(String(command.aggregated_output ?? ""))
+    explicitEvidenceGapAuthorizesPath(command.aggregated_output, relativePath)
   );
   if (priorCommand) {
     return {
@@ -3181,7 +3297,10 @@ function directSourceReadAuthorization(read, commands, events, projectRoot, cont
   const priorMcpEventIndex = events.findLastIndex((event, index) =>
     index < (read.event_index ?? -1) &&
     isSuccessfulCodeStoryMcpToolCallEvent(event) &&
-    gapPattern.test(JSON.stringify(event)),
+    explicitEvidenceGapAuthorizesPath(
+      canonicalMcpEvidenceResult(itemOf(event).result ?? event.result),
+      relativePath,
+    ),
   );
   if (priorMcpEventIndex >= 0) {
     return {
@@ -3213,7 +3332,7 @@ function analyzeTranscript(events, projectRoot = null, context = {}) {
         path: filePath,
         command_id: command.id,
         category: command.category,
-        event_index: command.completed_event_index ?? command.started_event_index,
+        event_index: command.started_event_index ?? command.completed_event_index,
         source_like: isLikelySourcePath(filePath),
         repo_like: isPathInsideProject(filePath, projectRoot),
       });

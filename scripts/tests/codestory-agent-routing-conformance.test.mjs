@@ -238,8 +238,8 @@ function v3Identity(packetId = "packet-1") {
   };
 }
 
-function v3Gap(gapId, kind = "evidence_missing") {
-  return { identity: { gap_id: gapId }, kind, message: null };
+function v3Gap(gapId, kind = "evidence_missing", message = null) {
+  return { identity: { gap_id: gapId }, kind, message };
 }
 
 function v3SearchEvidence(evidenceId, path, symbolId) {
@@ -576,13 +576,14 @@ function baseRun(scenarioId) {
       run.steps = [
         mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, v3Packet({
           status: "no_useful_evidence",
-          gaps: [v3Gap("gap-1")],
+          gaps: [v3Gap("gap-1", "evidence_missing", "Missing evidence for src/gap.rs")],
         })),
         read("src/gap.rs"),
       ];
       run.final = finalClaim({ authority: "source", evidence_ids: ["source:src/gap.rs"], gap_ids: ["gap-1"] });
       break;
     case "packet_unavailable_to_source":
+      run.request.named_files = ["src/fallback.rs"];
       run.steps = [
         mcp("packet", { project: "/workspace/repo", question: "How does the oversized catalog work?" }, v3PacketBudgetExceeded()),
         read("src/fallback.rs"),
@@ -1222,6 +1223,33 @@ const MUTATIONS = [
       run.steps[1].path = "src/unrelated.rs";
     },
     error: /source read is not authorized/u,
+  },
+  {
+    name: "gap path prefix does not authorize a different file",
+    scenario: "packet_gap_to_focused_source",
+    mutate(run) {
+      run.request.gap_source_paths = ["src/gap.rs.bak"];
+      run.steps[1].path = "src/gap.rs.bak";
+    },
+    error: /source read is not correlated with the packet evidence gap/u,
+  },
+  {
+    name: "material gap citation does not authorize a different file",
+    scenario: "packet_gap_to_focused_source",
+    mutate(run) {
+      mutateBody(run, 0, (body) => {
+        body.gaps[0].message = "Missing evidence for src/other.rs, cited src/gap.rs";
+      });
+    },
+    error: /source read is not correlated with the packet evidence gap/u,
+  },
+  {
+    name: "output budget packet does not authorize an unnamed source read",
+    scenario: "packet_unavailable_to_source",
+    mutate(run) {
+      run.request.named_files = [];
+    },
+    error: /source read is not authorized by a user-named file/u,
   },
   {
     name: "authority escalation in final claim",
