@@ -385,14 +385,20 @@ def _search_evidence_contains_expected(
 def rank_v3_search_evidence(
     project: Path, payload: dict, query: str, expected: str
 ) -> int | None:
+    projection = dict(payload)
+    metadata = projection.pop("_meta", None)
+    require(
+        isinstance(metadata, dict),
+        f"qualification CLI search omitted its transport metadata: {payload!r}",
+    )
     evidence, retrieval = validate_v3_search_projection(
-        payload,
+        projection,
         query,
         "qualification CLI search",
     )
     require(
         retrieval.get("state") == "full",
-        f"qualification CLI search was not full retrieval: {payload!r}",
+        f"qualification CLI search was not full retrieval: {projection!r}",
     )
     position = next(
         (

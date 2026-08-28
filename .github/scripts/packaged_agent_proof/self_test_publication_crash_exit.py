@@ -44,6 +44,7 @@ def _v3_search_evidence_rank_test() -> None:
             encoding="utf-8",
         )
         payload = {
+            "_meta": {"codestory_publication": {"schema_version": 3}},
             "kind": "complete",
             "schema_version": 3,
             "identity": {
@@ -99,6 +100,17 @@ def _v3_search_evidence_rank_test() -> None:
             == 2,
             "v3 qualification search changed its evidence rank",
         )
+
+        missing_metadata = dict(payload)
+        del missing_metadata["_meta"]
+        try:
+            publication_protocol.rank_v3_search_evidence(
+                project, missing_metadata, query, query
+            )
+        except ProofFailure:
+            pass
+        else:
+            raise ProofFailure("qualification CLI search accepted a bare MCP projection")
 
         hostile = dict(payload)
         hostile["evidence"] = [
