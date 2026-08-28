@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const VECTOR_INDEX_SCHEMA_VERSION: i64 =
     crate::embedding_contract::EMBEDDING_VECTOR_SCHEMA_VERSION as i64;
@@ -802,6 +802,7 @@ impl EmbeddedVectorIndex {
                 &current_anchors,
                 produce_missing,
             )?;
+            let validation_started = Instant::now();
             let attestation = validate_database(
                 &temp_path,
                 publication.generation,
@@ -810,6 +811,10 @@ impl EmbeddedVectorIndex {
                 &expected_anchors,
                 None,
             )?;
+            crate::index::record_finalize_phase_timing(
+                "vector final validation",
+                validation_started.elapsed(),
+            );
             before_publish()?;
             crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
             Ok((attestation, work))
@@ -835,14 +840,20 @@ impl EmbeddedVectorIndex {
         expected_attestation: &VectorDatabaseAttestation,
     ) -> Result<VectorDatabaseAttestation> {
         let expected_anchors = expected_anchor_map(expected_anchors)?;
-        validate_database(
+        let validation_started = Instant::now();
+        let result = validate_database(
             &index_path(layout, collection),
             generation,
             input_hash,
             contract,
             &expected_anchors,
             Some(expected_attestation),
-        )
+        );
+        crate::index::record_finalize_phase_timing(
+            "vector final validation",
+            validation_started.elapsed(),
+        );
+        result
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1130,6 +1141,7 @@ fn build_and_publish_database(
             produce,
         )?;
         let authoritative_anchors = expected_anchors.unwrap_or(&actual_anchors);
+        let validation_started = Instant::now();
         let attestation = validate_database(
             &temp_path,
             generation,
@@ -1138,6 +1150,10 @@ fn build_and_publish_database(
             authoritative_anchors,
             None,
         )?;
+        crate::index::record_finalize_phase_timing(
+            "vector final validation",
+            validation_started.elapsed(),
+        );
         before_publish()?;
         crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &path)?;
         Ok(attestation)
@@ -1156,12 +1172,17 @@ fn write_database(
     expected_anchors: Option<&BTreeMap<String, String>>,
     produce: impl FnOnce(&mut dyn FnMut(AttestedSemanticPoint) -> Result<()>) -> Result<()>,
 ) -> Result<BTreeMap<String, String>> {
+    let mut persistence_elapsed = Duration::ZERO;
+    let mut hashing_elapsed = Duration::ZERO;
+    let persistence_started = Instant::now();
     let mut connection = Connection::open(sqlite_open_path(path))
         .with_context(|| format!("create embedded vector index {}", path.display()))?;
+    persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
     // The staged file is deleted on any failure and only published after
     // `validate_database` passes, so a rollback journal adds no durability.
     // Keeping it off also matches the lexical shard builder and avoids the
     // derived `-journal` sibling, the longest path SQLite would create here.
+    let persistence_started = Instant::now();
     connection
         .execute_batch(
             "PRAGMA journal_mode=OFF;
@@ -1197,11 +1218,15 @@ fn write_database(
          END;",
         )
         .with_context(|| format!("create embedded vector schema {}", path.display()))?;
+    persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
+    let persistence_started = Instant::now();
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .with_context(|| format!("begin embedded vector write transaction {}", path.display()))?;
+    persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
     let mut actual_anchors = BTreeMap::new();
     {
+        let persistence_started = Instant::now();
         let mut insert = transaction
             .prepare(
                 "INSERT INTO vectors (
@@ -1210,6 +1235,7 @@ fn write_database(
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )
             .with_context(|| format!("prepare embedded vector insert {}", path.display()))?;
+        persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
         let mut visit = |attested: AttestedSemanticPoint| -> Result<()> {
             let AttestedSemanticPoint {
                 point,
@@ -1238,8 +1264,11 @@ fn write_database(
             {
                 bail!("duplicate embedded vector anchor {}", point.node_id);
             }
+            let hashing_started = Instant::now();
             let bytes = vector_bytes(&point.vector);
             let vector_sha256 = hex_digest(Sha256::digest(&bytes));
+            hashing_elapsed = hashing_elapsed.saturating_add(hashing_started.elapsed());
+            let persistence_started = Instant::now();
             insert
                 .execute(params![
                     point.node_id,
@@ -1252,6 +1281,7 @@ fn write_database(
                     vector_sha256,
                 ])
                 .with_context(|| format!("write embedded vector index {}", path.display()))?;
+            persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
             Ok(())
         };
         produce(&mut visit)?;
@@ -1272,8 +1302,11 @@ fn write_database(
             missing
         );
     }
+    let hashing_started = Instant::now();
     let vector_digest = canonical_vector_component_digest(&transaction)
         .with_context(|| format!("digest embedded vector component {}", path.display()))?;
+    hashing_elapsed = hashing_elapsed.saturating_add(hashing_started.elapsed());
+    let persistence_started = Instant::now();
     transaction
         .execute(
             "INSERT INTO metadata VALUES (
@@ -1307,6 +1340,9 @@ fn write_database(
         .with_context(|| format!("open embedded vector index for sync {}", path.display()))?
         .sync_all()
         .with_context(|| format!("sync embedded vector index {}", path.display()))?;
+    persistence_elapsed = persistence_elapsed.saturating_add(persistence_started.elapsed());
+    crate::index::record_finalize_phase_timing("vector sqlite persistence", persistence_elapsed);
+    crate::index::record_finalize_phase_timing("vector hashing", hashing_elapsed);
     Ok(actual_anchors)
 }
 

@@ -97,6 +97,16 @@
     "ok",
     "protocol_error"
   ],
+  "vector_response_observability": {
+    "timings_optional": true,
+    "clock_domain": "server_process_monotonic",
+    "unit": "nanoseconds",
+    "fields": [
+      "tokenization_ns",
+      "native_encode_ns",
+      "normalization_ns"
+    ]
+  },
   "retry_classes": [
     "after_capacity_change",
     "after_delay",
