@@ -1152,7 +1152,9 @@ fn nonempty_quoted_spans(text: &str, delimiter: char) -> Vec<(usize, usize)> {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     positions
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .filter(|pair| pair[0] + delimiter.len_utf8() < pair[1])
         .map(|pair| (pair[0], pair[1] + delimiter.len_utf8()))
         .collect()

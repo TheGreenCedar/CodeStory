@@ -315,7 +315,7 @@ fn decode_hex_32_v3(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut decoded = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_nibble_v3(pair[0])?;
         let low = hex_nibble_v3(pair[1])?;
         decoded[index] = (high << 4) | low;

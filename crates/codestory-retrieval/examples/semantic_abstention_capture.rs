@@ -157,12 +157,10 @@ fn main() -> Result<()> {
             bail!("captured query vector for {} is truncated", spec.task_id);
         }
         let query_vector = vector_bytes
-            .chunks_exact(4)
-            .map(|chunk| {
-                f32::from_bits(u32::from_le_bytes(
-                    chunk.try_into().expect("four-byte vector chunk"),
-                ))
-            })
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_bits(u32::from_le_bytes(*chunk)))
             .collect::<Vec<_>>();
         let candidates =
             raw_semantic_scan(&vector_database, generation, input_hash, &query_vector, 64)?;

@@ -704,6 +704,11 @@ fn diagnostic_artifact_id_v3(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::agent::packet_execution_record_v3::{
+        FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3, PacketProfileV3,
+        PacketRequestFingerprintV3, build_packet_execution_record_fixture_v3,
+    };
     use codestory_contracts::{
         api::{AgentPacketRequestDto, PacketBudgetModeDto},
         packet_projection_v3::{
@@ -716,13 +721,6 @@ mod tests {
             PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
             SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3,
         },
-    };
-    use sha2::Digest as _;
-
-    use super::*;
-    use crate::agent::packet_execution_record_v3::{
-        FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3, PacketProfileV3,
-        PacketRequestFingerprintV3, build_packet_execution_record_fixture_v3,
     };
 
     fn identity(value: &str) -> IdentityTextV3 {

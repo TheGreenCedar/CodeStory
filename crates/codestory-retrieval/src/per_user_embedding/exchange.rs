@@ -464,8 +464,10 @@ pub(super) fn decode_vectors(rows: u32, columns: u32, payload: &[u8]) -> Result<
     let mut vectors = Vec::with_capacity(rows as usize);
     for row in payload.chunks_exact(columns as usize * std::mem::size_of::<f32>()) {
         let vector = row
-            .chunks_exact(std::mem::size_of::<f32>())
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte f32 chunk")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         vectors.push(vector);
     }
