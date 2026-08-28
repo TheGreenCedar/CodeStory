@@ -263,6 +263,9 @@ pub(crate) struct CollectedResolutionInputs {
     pub file: Option<CachedResolutionFile>,
 }
 
+// Keep the raw byte hash explicit beside the decoded parser input: combining either
+// with another argument would blur the proof provenance boundary this collector owns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_call_resolution_inputs(
     tree: &Tree,
     source: &str,
