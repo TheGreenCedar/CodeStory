@@ -22,6 +22,10 @@ CLI flags. Every call requires `project` (absolute repository root).
 - Do not pass broad questions to `context`. Use `packet` with `question` for
   broad tasks, `search` for candidate discovery, then `context` with `id` for
   selected anchors.
+- When a name is ambiguous and the user supplies an exact path, search the bare
+  symbol, choose the returned candidate with that exact path, and call context
+  with its returned `id`. Do not combine the name and path into a free-text
+  `query`.
 - Good `query` values are symbol names, file names, string literals, API paths,
   module names, and specific behavior terms.
 - Use `symbol`, `trail`, or `snippet` for local navigation when retrieval is

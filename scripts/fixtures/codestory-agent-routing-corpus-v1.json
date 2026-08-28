@@ -13,7 +13,7 @@
     },
     {
       "id": "ambiguous_symbol_then_context",
-      "prompt": "Find Thing. I mean the definition in src/one.rs; give focused evidence for that exact returned symbol.",
+      "prompt": "Get the candidate list for Thing first. Then choose the returned identity whose path is src/one.rs and give focused evidence for that exact identity. Do not combine the name and path into a free-text target.",
       "request": { "named_files": [], "selected_target": "src/one.rs", "gap_source_paths": [], "proof_contract": null }
     },
     {

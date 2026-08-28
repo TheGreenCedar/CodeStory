@@ -2458,6 +2458,10 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
     resolve(root, "skills/codestory-grounding/references/search.md"),
     "utf8",
   );
+  const contextReferenceText = await readFile(
+    resolve(root, "skills/codestory-grounding/references/context.md"),
+    "utf8",
+  );
   const launcherPath = resolve(root, expectedIdentity.launcher.relative_path);
   const launcherSha256 = await fileSha256(launcherPath);
 
@@ -2500,6 +2504,10 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   if (!/omit optional numeric bounds.*generated schema/isu.test(canonicalSkillText)
       || !/limit.*1.*50/isu.test(searchReferenceText)) {
     fail("canonical grounding guidance is missing the bounded optional-argument contract");
+  }
+  if (!/bare\s+symbol.*exact path.*returned.*`id`/isu.test(contextReferenceText)
+      || !/do not combine.*name.*path.*free-text.*`query`/isu.test(contextReferenceText)) {
+    fail("canonical context guidance is missing the returned-identity disambiguation contract");
   }
   if (!/search.*context.*packet.*prove_call_path/isu.test(openAiMetadataText)
       || !/host-supplied/iu.test(openAiMetadataText)

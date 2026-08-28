@@ -1083,6 +1083,10 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
   const discoveryPrompt = materialized.find(({ scenario_id }) => scenario_id === "exact_symbol_search").request.text;
   assert.match(discoveryPrompt, /discovery candidates only/iu);
   assert.match(discoveryPrompt, /do not select or verify one in this turn/iu);
+  const ambiguousPrompt = materialized.find(({ scenario_id }) => scenario_id === "ambiguous_symbol_then_context").request.text;
+  assert.match(ambiguousPrompt, /candidate list for Thing first/iu);
+  assert.match(ambiguousPrompt, /returned identity whose path is src\/one\.rs/iu);
+  assert.match(ambiguousPrompt, /do not combine the name and path into a free-text target/iu);
 });
 
 test("terminal routing scenarios reject every unauthorized source upgrade", () => {
@@ -1845,6 +1849,10 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     join(pluginRoot, "skills", "codestory-grounding", "references", "search.md"),
     "utf8",
   );
+  const contextReference = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "references", "context.md"),
+    "utf8",
+  );
   for (const [label, guidance] of [["skill", skill], ["Cursor rule", cursorRule]]) {
     assert.match(guidance, /discovery leads?.*`search`/isu, label);
     assert.match(guidance, /successful search.*stop.*(?:do not|never).*source/isu, label);
@@ -1863,6 +1871,8 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
   assert.match(openAiMetadata, /transport.*tool absence.*source/isu);
   assert.match(skill, /omit optional numeric bounds.*generated schema/isu);
   assert.match(searchReference, /limit.*1.*50/isu);
+  assert.match(contextReference, /bare\s+symbol.*exact path.*returned.*`id`/isu);
+  assert.match(contextReference, /do not combine.*name.*path.*free-text\s+`query`/isu);
 });
 
 test("static parity rejects substituted bytes invalid or no-op hooks metadata drift and heading-only rules", async () => {
