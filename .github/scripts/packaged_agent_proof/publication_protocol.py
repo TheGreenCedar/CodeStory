@@ -30,7 +30,7 @@ from .foundation import (
     require,
 )
 from .process_identity import ExactProcessExitWaiter
-from .subprocess_control import json_command, run
+from .subprocess_control import json_command, run, validate_v3_search_projection
 
 SERVER_PRODUCER_LABEL = "the per-user embedding qualification server"
 _WORKER_LABEL = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
@@ -343,6 +343,68 @@ def publication_identity_from_status(status: dict) -> str:
     )
 
 
+def _search_evidence_contains_expected(
+    project: Path, evidence: dict, expected: str
+) -> bool:
+    require(
+        isinstance(evidence, dict),
+        f"qualification search emitted non-object evidence: {evidence!r}",
+    )
+    raw_path = evidence.get("path")
+    require(
+        isinstance(raw_path, str) and bool(raw_path),
+        f"qualification search evidence omitted its source path: {evidence!r}",
+    )
+    project_root = project.resolve(strict=True)
+    candidate = Path(raw_path)
+    source_path = (candidate if candidate.is_absolute() else project_root / candidate).resolve(
+        strict=True
+    )
+    require(
+        source_path.is_relative_to(project_root),
+        f"qualification search evidence escaped the project root: {evidence!r}",
+    )
+    start_line = evidence.get("start_line")
+    end_line = evidence.get("end_line")
+    if not (
+        isinstance(start_line, int)
+        and not isinstance(start_line, bool)
+        and isinstance(end_line, int)
+        and not isinstance(end_line, bool)
+        and 1 <= start_line <= end_line
+    ):
+        return False
+    lines = source_path.read_text(encoding="utf-8").splitlines()
+    require(
+        end_line <= len(lines),
+        f"qualification search evidence source range is out of bounds: {evidence!r}",
+    )
+    return expected in "\n".join(lines[start_line - 1 : end_line])
+
+
+def rank_v3_search_evidence(
+    project: Path, payload: dict, query: str, expected: str
+) -> int | None:
+    evidence, retrieval = validate_v3_search_projection(
+        payload,
+        query,
+        "qualification CLI search",
+    )
+    require(
+        retrieval.get("state") == "full",
+        f"qualification CLI search was not full retrieval: {payload!r}",
+    )
+    position = next(
+        (
+            index
+            for index, item in enumerate(evidence[:10])
+            if _search_evidence_contains_expected(project, item, expected)
+        ),
+        None,
+    )
+    return None if position is None else position + 1
+
+
 def run_quality_search(
     cli: Path,
     env: dict[str, str],
@@ -378,19 +440,7 @@ def run_quality_search(
         cwd=project,
         timeout=timeout,
     )
-    hits = payload.get("indexed_symbol_hits")
-    require(isinstance(hits, list), "qualification search omitted indexed symbol hits")
-    position = next(
-        (
-            index
-            for index, hit in enumerate(hits)
-            if isinstance(hit, dict)
-            and isinstance(hit.get("display_name"), str)
-            and expected in hit["display_name"]
-        ),
-        None,
-    )
-    rank = None if position is None or position >= 10 else position + 1
+    rank = rank_v3_search_evidence(project, payload, query, expected)
     output_sha256 = hashlib.sha256(result["stdout"].encode("utf-8")).hexdigest()
     return rank, output_sha256
 

@@ -8,8 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-from . import runtime_bootstrap_continuity
-from .foundation import ProofFailure, require
+from . import runtime_bootstrap_cold, runtime_bootstrap_continuity
+from .foundation import ProofFailure, project_node_resource_uri, require
 
 _PROJECT_A = Path("/self-test/large-project")
 _PROJECT_B = Path("/self-test/small-project")
@@ -167,6 +167,68 @@ def _live_retrieval_scope_tests() -> None:
         )
 
 
+def _v3_snippet_contract_test() -> None:
+    setup = _setup()
+    node_id = "node-v3-search-evidence"
+    search = {
+        "kind": "complete",
+        "schema_version": 3,
+        "evidence": [
+            {"path": "lib.rs", "symbol_id": None},
+            {"path": "lib.rs", "symbol_id": node_id},
+        ],
+    }
+    cold = SimpleNamespace(
+        results={
+            "search-b": (
+                {"result": {"structuredContent": search, "isError": False}},
+                1,
+            )
+        }
+    )
+    snippet = {
+        "scope": "function_body",
+        "requested_context": 0,
+        "range_source": "callable",
+        "snippet": f"pub fn {_QUERY_B}() {{}}",
+        "node": {"id": node_id},
+    }
+    host_b = Mock()
+    host_b.resource.return_value = {"node": {"id": node_id}}
+    host_b.tool_until_ready.return_value = (
+        {"result": {"structuredContent": snippet, "isError": False}},
+        2,
+    )
+    hosts = SimpleNamespace(host_b=host_b)
+
+    observed, attempts = runtime_bootstrap_cold._snippet_contract(setup, hosts, cold)
+
+    expected_uri = project_node_resource_uri(
+        "codestory://snippet", node_id, _PROJECT_B
+    )
+    require(
+        observed == snippet and attempts == 2,
+        "v3 search evidence did not drive the packaged snippet contract",
+    )
+    require(
+        host_b.method_calls
+        == [
+            call.resource(expected_uri, "snippet-resource-contract"),
+            call.tool_until_ready(
+                "snippet",
+                {
+                    "project": str(_PROJECT_B),
+                    "id": node_id,
+                    "function_body": True,
+                    "lines": 0,
+                },
+                "snippet-contract",
+            ),
+        ],
+        "packaged snippet did not use the exact v3 evidence symbol identity",
+    )
+
+
 def _run_continuity_case(proof_tier: str, expected_project: Path) -> None:
     setup = _setup()
     cold = _cold()
@@ -317,4 +379,5 @@ def _continuity_scope_tests() -> None:
 
 def run_runtime_bootstrap_scope_self_tests() -> None:
     _live_retrieval_scope_tests()
+    _v3_snippet_contract_test()
     _continuity_scope_tests()

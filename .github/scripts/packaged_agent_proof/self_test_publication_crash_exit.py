@@ -8,6 +8,8 @@ issue one immutable replacement-worker query.
 
 from __future__ import annotations
 
+import hashlib
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -29,6 +31,94 @@ class _Clock:
         require(seconds > 0, "publication crash-exit self-test slept nonpositively")
         self.sleeps.append(seconds)
         self.now += seconds
+
+
+def _v3_search_evidence_rank_test() -> None:
+    query = "qualification_anchor_00"
+    with tempfile.TemporaryDirectory() as temporary:
+        project = Path(temporary) / "project"
+        project.mkdir()
+        (project / "lib.rs").write_text(
+            "pub fn qualification_anchor_01() {}\n"
+            "pub fn qualification_anchor_00() {}\n",
+            encoding="utf-8",
+        )
+        payload = {
+            "kind": "complete",
+            "schema_version": 3,
+            "identity": {
+                "packet_id": "packet-publication-self-test",
+                "request_id": "request-publication-self-test",
+                "question_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest()
+            },
+            "publication": {
+                "core": {
+                    "project_id": "project-publication-self-test",
+                    "generation_id": "core-generation-publication-self-test",
+                    "run_id": "core-run-publication-self-test",
+                },
+                "retrieval": {
+                    "core_generation_id": "core-generation-publication-self-test",
+                    "core_run_id": "core-run-publication-self-test",
+                    "retrieval_generation": "retrieval-publication-self-test",
+                    "retrieval_input_sha256": "a" * 64,
+                    "semantic_generation": "semantic-publication-self-test",
+                },
+            },
+            "status": "available",
+            "evidence": [
+                {
+                    "identity": {"evidence_id": "evidence-wrong-line"},
+                    "path": "lib.rs",
+                    "symbol_id": None,
+                    "start_line": 1,
+                    "end_line": 1,
+                    "excerpt": query,
+                },
+                {
+                    "identity": {"evidence_id": "evidence-right-line"},
+                    "path": "lib.rs",
+                    "symbol_id": None,
+                    "start_line": 2,
+                    "end_line": 2,
+                    "excerpt": None,
+                },
+            ],
+            "gaps": [],
+            "continuation": None,
+            "retrieval": {
+                "state": "full",
+                "generation_id": "retrieval-publication-self-test",
+            },
+            "diagnostics": {"availability": "unavailable"},
+        }
+        require(
+            publication_protocol.rank_v3_search_evidence(
+                project, payload, query, query
+            )
+            == 2,
+            "v3 qualification search changed its evidence rank",
+        )
+
+        hostile = dict(payload)
+        hostile["evidence"] = [
+            {
+                "identity": {"evidence_id": "evidence-escaped"},
+                "path": "../outside.rs",
+                "symbol_id": None,
+                "start_line": 1,
+                "end_line": 1,
+                "excerpt": query,
+            }
+        ]
+        try:
+            publication_protocol.rank_v3_search_evidence(
+                project, hostile, query, query
+            )
+        except (OSError, ProofFailure):
+            pass
+        else:
+            raise ProofFailure("v3 qualification search accepted an escaped source path")
 
 
 class _OversleepClock(_Clock):
@@ -646,6 +736,7 @@ def _replacement_requires_the_durable_accepted_event() -> None:
 
 
 def run_publication_crash_exit_self_tests() -> None:
+    _v3_search_evidence_rank_test()
     _delayed_exit_blocks_then_invokes_exactly_one_replacement()
     _accepted_event_pins_the_process_that_answered()
     _immediate_exit_adds_no_delay()

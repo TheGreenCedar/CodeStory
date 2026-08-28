@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import subprocess
@@ -21,12 +22,252 @@ from .foundation import (
 
 
 PREFERRED_MCP_PROTOCOL_VERSION = "2025-11-25"
+_SEARCH_PROJECTION_FIELDS = {
+    "kind",
+    "schema_version",
+    "identity",
+    "publication",
+    "status",
+    "evidence",
+    "gaps",
+    "continuation",
+    "retrieval",
+    "diagnostics",
+}
+_SEARCH_STATUS_VALUES = {
+    "available",
+    "continuation_available",
+    "no_useful_evidence",
+    "unavailable",
+}
+_SEARCH_GAP_KINDS = {
+    "evidence_missing",
+    "retrieval_unavailable",
+    "source_unavailable",
+    "continuation_required",
+    "output_budget_exceeded",
+}
+
+
+def _require_closed_object(value: object, fields: set[str], label: str) -> dict:
+    require(
+        isinstance(value, dict) and set(value) == fields,
+        f"{label} did not match its closed object shape: {value!r}",
+    )
+    return value
+
+
+def _is_nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _is_unsigned_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdefABCDEF" for character in value)
+    )
 
 
 def mcp_search_arguments(project: Path, query: str) -> dict[str, str]:
     """Build the closed public MCP search argument shape."""
 
     return {"project": str(project), "query": query}
+
+
+def validate_v3_search_projection(
+    payload: dict, query: str, label: str
+) -> tuple[list, dict]:
+    query_sha256 = hashlib.sha256(query.encode("utf-8")).hexdigest()
+    _require_closed_object(payload, _SEARCH_PROJECTION_FIELDS, label)
+    require(
+        payload.get("kind") == "complete"
+        and payload.get("schema_version") == 3
+        and payload.get("status") in _SEARCH_STATUS_VALUES,
+        f"{label} returned an invalid v3 search projection for {query!r}: {payload!r}",
+    )
+
+    identity = _require_closed_object(
+        payload["identity"],
+        {"packet_id", "request_id", "question_sha256"},
+        f"{label} identity",
+    )
+    require(
+        _is_nonempty_string(identity["packet_id"])
+        and _is_nonempty_string(identity["request_id"])
+        and _is_sha256(identity["question_sha256"])
+        and identity["question_sha256"] == query_sha256,
+        f"{label} returned an invalid v3 search identity: {identity!r}",
+    )
+
+    publication = _require_closed_object(
+        payload["publication"], {"core", "retrieval"}, f"{label} publication"
+    )
+    core = _require_closed_object(
+        publication["core"],
+        {"project_id", "generation_id", "run_id"},
+        f"{label} core publication",
+    )
+    require(
+        all(_is_nonempty_string(core[field]) for field in core),
+        f"{label} returned an invalid core publication: {core!r}",
+    )
+    retrieval_publication = publication["retrieval"]
+    if retrieval_publication is not None:
+        retrieval_publication = _require_closed_object(
+            retrieval_publication,
+            {
+                "core_generation_id",
+                "core_run_id",
+                "retrieval_generation",
+                "retrieval_input_sha256",
+                "semantic_generation",
+            },
+            f"{label} retrieval publication",
+        )
+        require(
+            _is_nonempty_string(retrieval_publication["core_generation_id"])
+            and _is_nonempty_string(retrieval_publication["core_run_id"])
+            and _is_nonempty_string(retrieval_publication["retrieval_generation"])
+            and _is_sha256(retrieval_publication["retrieval_input_sha256"])
+            and _is_nonempty_string(retrieval_publication["semantic_generation"])
+            and retrieval_publication["core_generation_id"] == core["generation_id"]
+            and retrieval_publication["core_run_id"] == core["run_id"],
+            f"{label} returned a retrieval publication for a different core: "
+            f"{retrieval_publication!r}",
+        )
+
+    evidence = payload["evidence"]
+    require(
+        isinstance(evidence, list) and len(evidence) <= 256,
+        f"{label} returned an invalid v3 evidence collection: {evidence!r}",
+    )
+    for index, row_value in enumerate(evidence):
+        row = _require_closed_object(
+            row_value,
+            {"identity", "path", "symbol_id", "start_line", "end_line", "excerpt"},
+            f"{label} evidence[{index}]",
+        )
+        evidence_identity = _require_closed_object(
+            row["identity"], {"evidence_id"}, f"{label} evidence[{index}] identity"
+        )
+        require(
+            _is_nonempty_string(evidence_identity["evidence_id"])
+            and _is_nonempty_string(row["path"])
+            and (row["symbol_id"] is None or isinstance(row["symbol_id"], str))
+            and (
+                row["start_line"] is None or _is_unsigned_integer(row["start_line"])
+            )
+            and (row["end_line"] is None or _is_unsigned_integer(row["end_line"]))
+            and (row["excerpt"] is None or isinstance(row["excerpt"], str)),
+            f"{label} returned invalid v3 evidence: {row!r}",
+        )
+
+    gaps = payload["gaps"]
+    require(
+        isinstance(gaps, list) and len(gaps) <= 256,
+        f"{label} returned an invalid v3 gap collection: {gaps!r}",
+    )
+    for index, row_value in enumerate(gaps):
+        row = _require_closed_object(
+            row_value,
+            {"identity", "kind", "message"},
+            f"{label} gap[{index}]",
+        )
+        gap_identity = _require_closed_object(
+            row["identity"], {"gap_id"}, f"{label} gap[{index}] identity"
+        )
+        require(
+            _is_nonempty_string(gap_identity["gap_id"])
+            and row["kind"] in _SEARCH_GAP_KINDS
+            and (row["message"] is None or isinstance(row["message"], str)),
+            f"{label} returned invalid v3 gap: {row!r}",
+        )
+
+    continuation = payload["continuation"]
+    if continuation is not None:
+        continuation = _require_closed_object(
+            continuation,
+            {"continuation_id", "remaining_rounds", "gap_ids"},
+            f"{label} continuation",
+        )
+        require(
+            _is_nonempty_string(continuation["continuation_id"])
+            and _is_unsigned_integer(continuation["remaining_rounds"])
+            and 1 <= continuation["remaining_rounds"] <= 65535
+            and isinstance(continuation["gap_ids"], list)
+            and len(continuation["gap_ids"]) <= 256,
+            f"{label} returned an invalid v3 continuation: {continuation!r}",
+        )
+        for index, gap_value in enumerate(continuation["gap_ids"]):
+            gap_identity = _require_closed_object(
+                gap_value,
+                {"gap_id"},
+                f"{label} continuation gap_ids[{index}]",
+            )
+            require(
+                _is_nonempty_string(gap_identity["gap_id"]),
+                f"{label} returned an invalid continuation gap identity: "
+                f"{gap_identity!r}",
+            )
+
+    retrieval = payload.get("retrieval")
+    retrieval = _require_closed_object(
+        retrieval, {"state", "generation_id"}, f"{label} retrieval"
+    )
+    require(
+        retrieval["state"] in ("full", "degraded")
+        and (
+            retrieval["generation_id"] is None
+            or _is_nonempty_string(retrieval["generation_id"])
+        ),
+        f"{label} did not return a full or degraded v3 retrieval projection: {payload!r}",
+    )
+    if retrieval_publication is None:
+        require(
+            retrieval["state"] == "degraded" and retrieval["generation_id"] is None,
+            f"{label} retrieval state was not bound to its publication: {payload!r}",
+        )
+    else:
+        require(
+            retrieval["generation_id"]
+            == retrieval_publication["retrieval_generation"],
+            f"{label} retrieval generation did not match its publication: {payload!r}",
+        )
+
+    diagnostics = _require_closed_object(
+        payload["diagnostics"],
+        (
+            {"availability"}
+            if isinstance(payload["diagnostics"], dict)
+            and payload["diagnostics"].get("availability") == "unavailable"
+            else {"availability", "reference"}
+        ),
+        f"{label} diagnostics",
+    )
+    require(
+        diagnostics["availability"] in ("available", "unavailable"),
+        f"{label} returned invalid diagnostics availability: {diagnostics!r}",
+    )
+    if diagnostics["availability"] == "available":
+        reference = _require_closed_object(
+            diagnostics["reference"],
+            {"artifact_id", "sha256", "byte_length", "uri", "wall_expiry_epoch_ms"},
+            f"{label} diagnostics reference",
+        )
+        require(
+            _is_nonempty_string(reference["artifact_id"])
+            and _is_sha256(reference["sha256"])
+            and _is_unsigned_integer(reference["byte_length"])
+            and _is_nonempty_string(reference["uri"])
+            and _is_unsigned_integer(reference["wall_expiry_epoch_ms"]),
+            f"{label} returned an invalid diagnostics reference: {reference!r}",
+        )
+    return evidence, retrieval
 
 
 def run(command: list[str], *, env: dict[str, str], cwd: Path, timeout: int) -> dict:
@@ -328,16 +569,16 @@ class McpProcess:
                 isinstance(result, dict),
                 f"MCP {name} attempt {attempt} returned a non-object result: {result!r}",
             )
+            require(
+                result.get("isError") is False,
+                f"MCP {name} attempt {attempt} returned invalid isError or a terminal error envelope: {result!r}",
+            )
             state = result.get("structuredContent")
             require(
                 isinstance(state, dict),
                 f"MCP {name} attempt {attempt} returned non-object structuredContent: {result!r}",
             )
-            retryable = (state.get("code"), state.get("state")) in (
-                ("codestory_preparing", "preparing"),
-                ("codestory_updating", "updating"),
-            )
-            if retryable:
+            if state.get("kind") == "preparing":
                 self._wait_for_readiness_retry(
                     name,
                     attempt,
@@ -345,11 +586,6 @@ class McpProcess:
                     deadline,
                 )
                 continue
-            if result.get("isError") is True:
-                require(
-                    False,
-                    f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
-                )
             return response, attempt
 
     def _wait_for_readiness_retry(
@@ -360,22 +596,15 @@ class McpProcess:
         deadline: float,
     ) -> None:
         require(
-            (state.get("code"), state.get("state"))
-            in (
-                ("codestory_preparing", "preparing"),
-                ("codestory_updating", "updating"),
-            ),
+            (state.get("kind"), state.get("state")) == ("preparing", "preparing")
+            and isinstance(state.get("operation"), dict),
             f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
-        )
-        require(
-            state.get("retry_tool") == name,
-            f"MCP {name} attempt {attempt} returned the wrong retry tool: {state!r}",
         )
         retry_after_ms = state.get("retry_after_ms")
         require(
             isinstance(retry_after_ms, int)
             and not isinstance(retry_after_ms, bool)
-            and retry_after_ms >= 0,
+            and retry_after_ms >= 1,
             f"MCP {name} attempt {attempt} returned invalid retry_after_ms: {state!r}",
         )
         remaining = deadline - time.monotonic()
@@ -402,20 +631,15 @@ class McpProcess:
             state = response["result"]["structuredContent"]
             query = arguments.get("query")
             require(
-                isinstance(query, str) and state.get("query") == query,
-                f"MCP search returned a mismatched query: expected {query!r}, response={state!r}",
+                isinstance(query, str),
+                f"MCP search request omitted its query: {arguments!r}",
             )
-            require(
-                isinstance(state.get("hits"), list),
-                f"MCP search returned non-array hits: {state!r}",
+            _, retrieval = validate_v3_search_projection(
+                state,
+                query,
+                "MCP search",
             )
-            retrieval = state.get("retrieval")
-            require(
-                isinstance(retrieval, dict)
-                and retrieval.get("state") in ("ready", "degraded"),
-                f"MCP search did not return the ready installed retrieval projection: {state!r}",
-            )
-            if retrieval.get("state") == "ready":
+            if retrieval.get("state") == "full":
                 return response, total_attempts
             # The projection reports the real retrieval state, so a fresh install
             # answers lexically while the semantic sidecar is still publishing.
