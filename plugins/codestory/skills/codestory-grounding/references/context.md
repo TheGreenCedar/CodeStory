@@ -23,9 +23,10 @@ CLI flags. Every call requires `project` (absolute repository root).
   broad tasks, `search` for candidate discovery, then `context` with `id` for
   selected anchors.
 - When a name is ambiguous and the user supplies an exact path, search the bare
-  symbol, choose the returned candidate with that exact path, and call context
-  with its returned `id`. Do not combine the name and path into a free-text
-  `query`.
+  symbol, ignore rows whose `symbol_id` is null, normalize typed result paths
+  under the project root, and choose the unique typed candidate at that exact
+  path. Copy its `evidence[].symbol_id` into `context.id`; do not send `query`
+  too. Do not combine the name and path into a free-text `query`.
 - Good `query` values are symbol names, file names, string literals, API paths,
   module names, and specific behavior terms.
 - Use `symbol`, `trail`, or `snippet` for local navigation when retrieval is

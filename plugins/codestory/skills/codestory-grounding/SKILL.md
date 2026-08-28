@@ -56,7 +56,7 @@ plugin result unless the user explicitly asks.
 | --- | --- |
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
 | Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
-| Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. After a successful search, stop for that turn at the returned lead until the user selects one exact target in a later turn. Do not inspect source or request focused evidence merely to upgrade a discovery result. Missing excerpts, unavailable diagnostics, and multiple leads do not authorize source inspection. |
+| Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. After a successful search, stop for that turn unless the current request already supplied an exact selection criterion such as one project-relative path and asked for focused evidence after disambiguation. In that case only, choose the unique typed evidence row with a non-null `symbol_id` that matches the exact path, then call `context` with that `symbol_id` as `id`. Do not inspect source merely to upgrade a discovery result. Missing excerpts, unavailable diagnostics, and multiple leads do not authorize source inspection. |
 | Get evidence for one selected target | Use `context` with that exact selected target. Do not broaden the target or treat evidence availability as proof. |
 | Follow a call path for navigation | `callers`, `callees`, `trace`, or `trail` can navigate the ordinary graph. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node; none of these tools returns an exact proof disposition. |
 | Verify an already translated exact call-path contract | For a host-supplied or user-supplied complete typed contract, call `prove_call_path` with the unchanged `source_text`, clauses, and exact spec. Do not infer or assemble a typed contract from English. |
@@ -76,7 +76,10 @@ plugin result unless the user explicitly asks.
   claim is true. Cite only the returned evidence rows and state every material
   returned gap. Never turn `available` into authority for a claim the rows do
   not establish.
-- A successful discovery-only `search` is terminal for that turn. Successful
+- A successful discovery-only `search` is terminal for that turn unless the
+  request already supplied one exact selection criterion. That exception may
+  map the unique matching non-null `evidence[].symbol_id` into `context.id`;
+  it does not authorize source inspection or another discovery query. Successful
   `context`, completed `packet`, and `prove_call_path` results are also terminal
   except for an explicitly returned packet continuation or an exact authorized
   source fallback. Do not raise authority by adding an unrequested source read.
@@ -91,7 +94,8 @@ plugin result unless the user explicitly asks.
 - When `packet.status=continuation_available`, execute only the returned bounded
   continuation, once, against its pinned publication: repeat the question with
   `parent_packet_id=continuation.continuation_id`, use
-  `continuation.gap_ids` as `option_ids`, and copy the core/retrieval generation
+  `continuation.gap_ids.map((item) => item.gap_id)` as the string `option_ids`,
+  and copy the core/retrieval generation
   IDs from `publication`. Then answer from the combined evidence and gaps. Do
   not start a free-form `search` / `context` / `trail` / `snippet` recovery
   loop from packet.
@@ -104,6 +108,9 @@ plugin result unless the user explicitly asks.
   found.
 - Tagged probes select exact or additional evidence work. They do not choose
   route order or replace the packet availability and gap fields.
+- A path named only for a conditional continuation or source fallback is
+  fallback-only. Do not send it as an initial packet probe or synthesize
+  continuation pins before the first result explicitly returns them.
 - Do not paste empty grounding output as context. If a repository truly has no
   supported files, fall back to ordinary inspection or resolve the intended
   root when it is ambiguous.

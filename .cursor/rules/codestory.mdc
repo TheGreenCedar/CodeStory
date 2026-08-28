@@ -22,7 +22,7 @@ This repository-managed setup provides the rule and MCP adapter only. Install th
 Routing contract:
 
 - Read an exact user-named file directly when the question is file-local.
-- Discovery leads come from `search`; they identify candidates and do not prove a claim. After a successful search, stop for that turn at the returned lead until the user selects an exact target in a later turn; missing excerpts or unavailable diagnostics do not authorize source inspection.
+- Discovery leads come from `search`; they identify candidates and do not prove a claim. After a successful search, stop for that turn unless the request already supplied one exact selection criterion. That exception may copy the unique matching non-null `evidence[].symbol_id` into `context.id`; it never authorizes source inspection. Missing excerpts or unavailable diagnostics do not authorize source inspection.
 - For one selected target, use `context` for evidence around that target only.
 - For a broad structural question, use `packet`, preserve every returned gap, and follow a bounded continuation at most once.
 - For a complete host-supplied or user-supplied typed contract, call `prove_call_path` unchanged. Never construct that contract from English or from packet, search, or context output.

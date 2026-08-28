@@ -1087,6 +1087,17 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
   assert.match(ambiguousPrompt, /candidate list for Thing first/iu);
   assert.match(ambiguousPrompt, /returned identity whose path is src\/one\.rs/iu);
   assert.match(ambiguousPrompt, /do not combine the name and path into a free-text target/iu);
+  const selectedPrompt = materialized.find(({ scenario_id }) => scenario_id === "selected_target_context").request.text;
+  assert.match(selectedPrompt, /already selected exact symbol dynamic_start/iu);
+  assert.match(selectedPrompt, /use that exact selector without discovering or broadening/iu);
+  for (const scenarioId of [
+    "packet_single_continuation",
+    "packet_gap_to_focused_source",
+    "packet_unavailable_to_source",
+  ]) {
+    const prompt = materialized.find(({ scenario_id }) => scenario_id === scenarioId).request.text;
+    assert.match(prompt, /fallback-only.*initial broad request.*do not add probes or continuation pins/isu, scenarioId);
+  }
 });
 
 test("terminal routing scenarios reject every unauthorized source upgrade", () => {
@@ -1772,6 +1783,24 @@ test("packet continuation and selected-context correlation are exact", () => {
   const context = baseRun("ambiguous_symbol_then_context");
   context.steps[1].args.id = "rust:crate::two::Thing";
   assert.throws(() => validate("codex", context), /selected (?:search )?target/u);
+
+  const mappedPath = baseRun("ambiguous_symbol_then_context");
+  mappedPath.request.selected_target = "src/one.rs";
+  mutateBody(mappedPath, 0, (body) => {
+    body.evidence[0].path = "/workspace/repo/src/one.rs";
+    body.evidence.push(v3SearchEvidence("repo-text", "src/one.rs", null));
+  });
+  assert.equal(validate("codex", mappedPath).status, "pass");
+
+  const ambiguousPath = clone(mappedPath);
+  mutateBody(ambiguousPath, 0, (body) => {
+    body.evidence.push(v3SearchEvidence("typed-duplicate", "/workspace/repo/src/one.rs", "rust:crate::duplicate::Thing"));
+  });
+  assert.throws(() => validate("codex", ambiguousPath), /selected target does not identify exactly one/u);
+
+  const initialProbe = baseRun("packet_gap_to_focused_source");
+  initialProbe.steps[0].args.probes = [{ kind: "exact_path", path: "src/gap.rs" }];
+  assert.throws(() => validate("codex", initialProbe), /initial packet arguments/u);
 });
 
 function staticIdentityFor(root) {
@@ -1853,9 +1882,15 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     join(pluginRoot, "skills", "codestory-grounding", "references", "context.md"),
     "utf8",
   );
+  const packetReference = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "references", "packet.md"),
+    "utf8",
+  );
   for (const [label, guidance] of [["skill", skill], ["Cursor rule", cursorRule]]) {
     assert.match(guidance, /discovery leads?.*`search`/isu, label);
     assert.match(guidance, /successful search.*stop.*(?:do not|never).*source/isu, label);
+    assert.match(guidance, /successful search.*stop.*unless.*exact selection/isu, label);
+    assert.match(guidance, /symbol_id.*context.*(?:`id`|\.id)/isu, label);
     assert.match(guidance, /selected target.*`context`/isu, label);
     assert.match(guidance, /broad.*`packet`.*continuation.*once/isu, label);
     assert.match(guidance, /host-supplied.*`prove_call_path`/isu, label);
@@ -1867,12 +1902,15 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
   assert.match(openAiMetadata, /search.*context.*packet.*prove_call_path/isu);
   assert.match(openAiMetadata, /host-supplied/iu);
   assert.match(openAiMetadata, /unknown.*not absence/isu);
+  assert.match(openAiMetadata, /successful search.*unless.*exact selection/isu);
   assert.match(openAiMetadata, /typed `Unavailable`.*terminal/isu);
   assert.match(openAiMetadata, /transport.*tool absence.*source/isu);
   assert.match(skill, /omit optional numeric bounds.*generated schema/isu);
   assert.match(searchReference, /limit.*1.*50/isu);
-  assert.match(contextReference, /bare\s+symbol.*exact path.*returned.*`id`/isu);
+  assert.match(contextReference, /bare\s+symbol.*exact\s+path.*evidence\[\]\.symbol_id.*context\.id/isu);
   assert.match(contextReference, /do not combine.*name.*path.*free-text\s+`query`/isu);
+  assert.match(packetReference, /continuation\.gap_ids.*map.*gap_id/isu);
+  assert.match(packetReference, /fallback-only.*initial.*probe/isu);
 });
 
 test("static parity rejects substituted bytes invalid or no-op hooks metadata drift and heading-only rules", async () => {

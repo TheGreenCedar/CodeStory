@@ -18,8 +18,8 @@
     },
     {
       "id": "selected_target_context",
-    "prompt": "Give me focused evidence for the selected target start without broadening the question.",
-      "request": { "named_files": [], "selected_target": "start", "gap_source_paths": [], "proof_contract": null }
+      "prompt": "Give me focused evidence for the already selected exact symbol dynamic_start. Use that exact selector without discovering or broadening.",
+      "request": { "named_files": [], "selected_target": "dynamic_start", "gap_source_paths": [], "proof_contract": null }
     },
     {
       "id": "broad_packet",
@@ -28,17 +28,17 @@
     },
     {
       "id": "packet_single_continuation",
-      "prompt": "Trace the complete routing flow and account for `src/unread.rs` if the index cannot cover it. If the evidence surface offers one bounded continuation, follow that exact offer once.",
+      "prompt": "Trace the complete routing flow. Treat src/unread.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. If the evidence surface offers one bounded continuation, follow that exact offer once.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {
       "id": "packet_gap_to_focused_source",
-      "prompt": "Investigate the missing route branch. Read src/gap.rs only if the broad project evidence identifies a gap that authorizes that focused read.",
+      "prompt": "Investigate the missing route branch. Treat src/gap.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. Read it only if the broad project evidence identifies a gap that authorizes that focused read.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": ["src/gap.rs"], "proof_contract": null }
     },
     {
       "id": "packet_unavailable_to_source",
-      "prompt": "Explain the deliberately oversized routing catalog. If the complete evidence response is unavailable because of its output budget, read src/fallback.rs and preserve that reason.",
+      "prompt": "Explain the deliberately oversized routing catalog. Treat src/fallback.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. If the complete evidence response is unavailable because of its output budget, read that file and preserve the reason.",
       "request": { "named_files": ["src/fallback.rs"], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {

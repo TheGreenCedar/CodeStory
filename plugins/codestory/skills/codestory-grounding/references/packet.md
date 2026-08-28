@@ -15,7 +15,7 @@ CLI flags. Every call requires `project` (absolute repository root).
 |------|---------|-----------------|
 | Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
 | `available` | Answer only what the returned evidence rows establish and name material gaps. | Terminal. Do not search to strengthen the answer. |
-| `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids` from `continuation.gap_ids`, and the core/retrieval generation IDs from `publication`. | One bounded continuation, then answer from the combined evidence and gaps. |
+| `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids=continuation.gap_ids.map((item) => item.gap_id)`, and the core/retrieval generation IDs from `publication.core.generation_id` and `publication.retrieval.retrieval_generation`. | One bounded continuation, then answer from the combined evidence and gaps. |
 | `no_useful_evidence` / `unavailable` | State the evidence gap. Use focused source inspection when CodeStory could not serve broad retrieval. | Terminal. |
 | User-named exact target | `search`, `context`, `trail`, or `snippet` only when the user named that target. | Not packet recovery. |
 | Integration edge | Use JSON/MCP structured content. Preserve exact paths, symbol IDs, ranges, evidence IDs, and gap IDs. | The public result carries no proof disposition. |
@@ -31,6 +31,10 @@ CLI flags. Every call requires `project` (absolute repository root).
   `{"kind":"exact_path","path":"assets/desk.svg"}` selects that exact
   project-relative file without fuzzy substitution. Typed and legacy probes share
   one combined 16-item limit; every string field is limited to 240 characters.
+- A path named only for a conditional continuation or source fallback is
+  fallback-only. The initial broad request uses only `project` and `question`;
+  do not send that path as an initial probe or invent continuation pins unless
+  the user explicitly requested a probe.
 - Exact path, symbol-ID, file-symbol, and symbol-bound continuation probes add
   exact citations keyed by path or stable node ID. They are not converted back
   into display-name searches.

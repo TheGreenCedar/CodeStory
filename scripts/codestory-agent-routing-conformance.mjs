@@ -2082,6 +2082,13 @@ function validateProofCalls(scenarioContract, request, actions, results) {
 function validatePacketContinuation(scenarioContract, actions, results) {
   const packets = actions.filter((action) => action.kind === "packet");
   if (packets.length > 2) fail(`${scenarioContract.id} allows at most one packet continuation`);
+  if (packets.length > 0) {
+    requireExactKeys(
+      packets[0].args,
+      ["project", "question"],
+      `${scenarioContract.id} initial packet arguments`,
+    );
+  }
   if (packets.length < 2) return;
   const first = results.get(packets[0])?.body;
   if (first?.status !== "continuation_available") fail(`${scenarioContract.id} repeated packet without a continuation offer`);
@@ -2096,6 +2103,15 @@ function validatePacketContinuation(scenarioContract, actions, results) {
   if (!equalJson(packets[1].args, expected)) fail(`${scenarioContract.id} packet continuation arguments do not match the pinned offer`);
 }
 
+function projectRelativeSelectionPath(path, projectRoot) {
+  if (!nonemptyString(path) || !nonemptyString(projectRoot)) return null;
+  const root = resolve(projectRoot);
+  const candidate = resolve(root, path);
+  const candidateRelative = relative(root, candidate);
+  if (!candidateRelative || candidateRelative === ".." || candidateRelative.startsWith(`..${sep}`)) return null;
+  return candidateRelative.split(sep).join("/");
+}
+
 function validateSelectedContext(scenarioContract, request, actions, results) {
   const contexts = actions.filter((action) => action.kind === "context");
   if (contexts.length === 0) return;
@@ -2104,8 +2120,13 @@ function validateSelectedContext(scenarioContract, request, actions, results) {
   }
   const search = actions.find((action) => action.kind === "search");
   if (search) {
-    const selected = results.get(search).body.evidence.filter((entry) =>
-      entry.symbol_id === request.selected_target || entry.path === request.selected_target);
+    const selectedPath = projectRelativeSelectionPath(request.selected_target, search.args?.project);
+    const selected = results.get(search).body.evidence.filter((entry) => (
+      nonemptyString(entry.symbol_id)
+      && (entry.symbol_id === request.selected_target
+        || (selectedPath !== null
+          && projectRelativeSelectionPath(entry.path, search.args?.project) === selectedPath))
+    ));
     if (selected.length !== 1 || !nonemptyString(selected[0].symbol_id)) {
       fail(`${scenarioContract.id} selected target does not identify exactly one search evidence row`);
     }
@@ -2425,6 +2446,8 @@ function validateRoutingGuidance(text, label) {
   const requirements = [
     [/discovery leads?.*`search`/isu, "search discovery authority"],
     [/successful search.*stop.*(?:do not|never).*source/isu, "successful-search stop boundary"],
+    [/successful search.*stop.*unless.*exact selection/isu, "preselected-target search exception"],
+    [/symbol_id.*context.*(?:`id`|\.id)/isu, "stable context identity mapping"],
     [/selected target.*`context`/isu, "selected-target context authority"],
     [/broad.*`packet`.*continuation.*once/isu, "bounded packet routing"],
     [/host-supplied.*`prove_call_path`/isu, "host-supplied proof routing"],
@@ -2460,6 +2483,10 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   );
   const contextReferenceText = await readFile(
     resolve(root, "skills/codestory-grounding/references/context.md"),
+    "utf8",
+  );
+  const packetReferenceText = await readFile(
+    resolve(root, "skills/codestory-grounding/references/packet.md"),
     "utf8",
   );
   const launcherPath = resolve(root, expectedIdentity.launcher.relative_path);
@@ -2505,13 +2532,18 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
       || !/limit.*1.*50/isu.test(searchReferenceText)) {
     fail("canonical grounding guidance is missing the bounded optional-argument contract");
   }
-  if (!/bare\s+symbol.*exact path.*returned.*`id`/isu.test(contextReferenceText)
+  if (!/bare\s+symbol.*exact\s+path.*evidence\[\]\.symbol_id.*context\.id/isu.test(contextReferenceText)
       || !/do not combine.*name.*path.*free-text.*`query`/isu.test(contextReferenceText)) {
     fail("canonical context guidance is missing the returned-identity disambiguation contract");
+  }
+  if (!/continuation\.gap_ids.*map.*gap_id/isu.test(packetReferenceText)
+      || !/fallback-only.*initial.*probe/isu.test(packetReferenceText)) {
+    fail("canonical packet guidance is missing exact continuation and fallback-only argument rules");
   }
   if (!/search.*context.*packet.*prove_call_path/isu.test(openAiMetadataText)
       || !/host-supplied/iu.test(openAiMetadataText)
       || !/unknown.*not absence/isu.test(openAiMetadataText)
+      || !/successful search.*unless.*exact selection/isu.test(openAiMetadataText)
       || !/typed `Unavailable`.*terminal/isu.test(openAiMetadataText)
       || !/transport.*tool absence.*source/isu.test(openAiMetadataText)) {
     fail("OpenAI skill metadata is missing the canonical routing boundary");
