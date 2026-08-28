@@ -897,8 +897,14 @@ impl VectorCacheRetention {
 
         (|| {
             let mut inactive = Vec::new();
-            let mut reserved_or_stored_bytes = 0_u64;
-            for registered in self.registered_scopes()? {
+            let registered_scopes = self.registered_scopes()?;
+            let registered_identities = registered_scopes
+                .iter()
+                .map(|registered| (registered.root_name.clone(), registered.scope_name.clone()))
+                .collect::<HashSet<_>>();
+            let mut reserved_or_stored_bytes =
+                unregistered_vector_cache_bytes(&self.cache_root, &registered_identities)?;
+            for registered in registered_scopes {
                 validate_registered_scope(
                     &registered.root_name,
                     &registered.scope_name,
@@ -967,7 +973,7 @@ impl VectorCacheRetention {
                 > max_aggregate_database_bytes
             {
                 bail!(
-                    "aggregate vector cache limit cannot reserve the current cache without deleting an active scope"
+                    "aggregate vector cache limit cannot reserve the current cache while preserving active and unowned bytes"
                 );
             }
             for entry in inactive {
@@ -1158,6 +1164,84 @@ fn known_scope_bytes(path: &Path) -> Result<Option<u64>> {
             .context("vector cache scope byte count overflow")?;
     }
     Ok(Some(total))
+}
+
+fn unregistered_vector_cache_bytes(
+    cache_root: &Path,
+    registered: &HashSet<(String, String)>,
+) -> Result<u64> {
+    let entries = match std::fs::read_dir(cache_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("enumerate vector cache root {}", cache_root.display()));
+        }
+    };
+    let mut total = 0_u64;
+    for root_entry in entries {
+        let root_entry = root_entry?;
+        let Some(root_name) = root_entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(version) = root_name.strip_prefix("content-addressed-vectors-v") else {
+            continue;
+        };
+        if version.is_empty() || !version.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let root_type = root_entry.file_type()?;
+        if root_type.is_symlink() || !root_type.is_dir() {
+            bail!("unregistered vector cache root contains unknown or unsafe artifacts");
+        }
+        for scope_entry in std::fs::read_dir(root_entry.path()).with_context(|| {
+            format!(
+                "enumerate unregistered vector cache scopes {}",
+                root_entry.path().display()
+            )
+        })? {
+            let scope_entry = scope_entry?;
+            let scope_name = scope_entry.file_name().to_string_lossy().into_owned();
+            if registered.contains(&(root_name.clone(), scope_name)) {
+                continue;
+            }
+            total = total
+                .checked_add(unregistered_vector_cache_entry_bytes(&scope_entry.path())?)
+                .context("aggregate unregistered vector cache byte count overflow")?;
+        }
+    }
+    Ok(total)
+}
+
+fn unregistered_vector_cache_entry_bytes(path: &Path) -> Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect unregistered vector cache entry {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("unregistered vector cache scope contains unknown or unsafe artifacts");
+    }
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        bail!("unregistered vector cache scope contains unknown or unsafe artifacts");
+    }
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path).with_context(|| {
+        format!(
+            "enumerate unregistered vector cache scope {}",
+            path.display()
+        )
+    })? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            bail!("unregistered vector cache scope contains unknown or unsafe artifacts");
+        }
+        total = total
+            .checked_add(entry.metadata()?.len())
+            .context("unregistered vector cache scope byte count overflow")?;
+    }
+    Ok(total)
 }
 
 fn scope_has_database(scope: &Path) -> Result<bool> {
@@ -2278,14 +2362,44 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_retention_refuses_unregistered_or_unknown_artifacts() {
+    fn aggregate_retention_refuses_oversized_unregistered_scope_without_deleting_it() {
         let cache = TempDir::new().expect("cache root");
         let selected_runtime = runtime(&cache, 128);
         let cache_root = selected_runtime.cache_root.join(CACHE_DIRECTORY);
         private_cache_directory(&cache_root).expect("cache root");
         let unknown = cache_root.join("0".repeat(64));
         private_cache_directory(&unknown).expect("unknown scope");
-        std::fs::write(unknown.join("sentinel"), b"not owned").expect("unknown sentinel");
+        let unknown_bytes = vec![0x5a; 32 * 1024];
+        std::fs::write(unknown.join("sentinel"), &unknown_bytes).expect("unknown sentinel");
+
+        let error = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "current-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 16 * 1024,
+        )
+        .err()
+        .expect("oversized unknown scope must refuse aggregate admission");
+        assert!(error.to_string().contains("aggregate vector cache limit"));
+        assert_eq!(
+            std::fs::read(unknown.join("sentinel")).expect("unknown survives"),
+            unknown_bytes
+        );
+    }
+
+    #[test]
+    fn aggregate_retention_accounts_for_bounded_unregistered_scope_without_deleting_it() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let cache_root = selected_runtime.cache_root.join(CACHE_DIRECTORY);
+        private_cache_directory(&cache_root).expect("cache root");
+        let unknown = cache_root.join("0".repeat(64));
+        private_cache_directory(&unknown).expect("unknown scope");
+        let unknown_bytes = vec![0x5a; 8 * 1024];
+        std::fs::write(unknown.join("sentinel"), &unknown_bytes).expect("unknown sentinel");
 
         ContentAddressedVectorCache::open_with_retention_limits(
             &selected_runtime,
@@ -2296,10 +2410,10 @@ mod tests {
             1024 * 1024,
             1024 * 1024 + 16 * 1024,
         )
-        .expect("open current scope");
+        .expect("bounded unknown scope fits aggregate admission");
         assert_eq!(
             std::fs::read(unknown.join("sentinel")).expect("unknown survives"),
-            b"not owned"
+            unknown_bytes
         );
     }
 
