@@ -3429,6 +3429,114 @@ fn c_cpp_header_extensions_are_always_canonical_nonexact() -> anyhow::Result<()>
 }
 
 #[test]
+fn c_cpp_header_provenance_uses_the_language_selected_during_indexing() -> anyhow::Result<()> {
+    let project = tempfile::tempdir()?;
+    let mut store = Store::new_in_memory()?;
+    index_files(
+        project.path(),
+        &mut store,
+        &[
+            (
+                "plain.h",
+                "void c_target(void) {}\nvoid c_caller(void) { c_target(); }\n",
+            ),
+            (
+                "selected.h",
+                concat!(
+                    "namespace fixture {\n",
+                    "void cpp_target() {}\n",
+                    "void cpp_caller() { cpp_target(); }\n",
+                    "}\n",
+                ),
+            ),
+        ],
+    )?;
+
+    let indexed_languages = store
+        .get_files()?
+        .into_iter()
+        .map(|file| {
+            (
+                file.path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("UTF-8 fixture name")
+                    .to_string(),
+                file.language,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    assert_eq!(
+        indexed_languages.get("plain.h").map(String::as_str),
+        Some("c")
+    );
+    assert_eq!(
+        indexed_languages.get("selected.h").map(String::as_str),
+        Some("cpp")
+    );
+
+    let cached_fingerprints = {
+        let mut statement = store
+            .get_connection()
+            .prepare("SELECT artifact_blob FROM index_artifact_cache ORDER BY file_path")?;
+        let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut fingerprints = HashMap::new();
+        for row in rows {
+            let artifact: serde_json::Value = serde_json::from_slice(&row?)?;
+            let file = &artifact["resolution_file"];
+            let language = file["language"].as_str().expect("cached language");
+            let fingerprint = file["parser_fingerprint"]
+                .as_str()
+                .expect("cached parser fingerprint");
+            fingerprints.insert(language.to_string(), fingerprint.to_string());
+        }
+        fingerprints
+    };
+    assert_ne!(cached_fingerprints.get("c"), cached_fingerprints.get("cpp"));
+
+    rematerialize_proof_resolution_projection(&mut store, &publication(1))?;
+    store.validate_proof_resolution_publication(&publication(1))?;
+    assert!(store.get_proof_resolution_facts()?.iter().any(|fact| {
+        fact.provenance.language_adapter == "cpp" && fact.callsite.raw_target == "cpp_target"
+    }));
+
+    let c_fingerprint = cached_fingerprints
+        .get("c")
+        .expect("C parser fingerprint")
+        .clone();
+    let cached_rows = {
+        let mut statement = store.get_connection().prepare(
+            "SELECT file_path, artifact_blob FROM index_artifact_cache ORDER BY file_path",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (file_path, artifact_blob) in cached_rows {
+        let mut artifact: serde_json::Value = serde_json::from_slice(&artifact_blob)?;
+        if artifact["resolution_file"]["language"] == "cpp" {
+            artifact["resolution_file"]["parser_fingerprint"] = c_fingerprint.clone().into();
+            for call in artifact["call_resolution_inputs"]
+                .as_array_mut()
+                .expect("call inputs")
+            {
+                call["parser_fingerprint"] = c_fingerprint.clone().into();
+            }
+            store.get_connection().execute(
+                "UPDATE index_artifact_cache SET artifact_blob = ?1 WHERE file_path = ?2",
+                (serde_json::to_vec(&artifact)?, file_path),
+            )?;
+        }
+    }
+
+    let error = rematerialize_proof_resolution_projection(&mut store, &publication(2))
+        .expect_err("a C fingerprint must not authenticate source selected as C++");
+    assert!(error.to_string().contains("fingerprint"), "{error}");
+    Ok(())
+}
+
+#[test]
 fn proof_parser_evidence_uses_the_raw_predecode_source_hash() -> anyhow::Result<()> {
     let project = tempfile::tempdir()?;
     let path = project.path().join("fixture.c");
