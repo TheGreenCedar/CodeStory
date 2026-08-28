@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dirname } from "node:path";
@@ -12,7 +12,7 @@ import { ROUTING_SCENARIOS } from "../codestory-agent-routing-conformance.mjs";
 import {
   buildRoutingHostCommand,
   buildCodexPluginInstallCommand,
-  authenticateSplitCandidateInstallation,
+  authenticateSourceCandidateInstallation,
   materializeRoutingFixture,
   parseRoutingQualificationOptions,
   validateRoutingPreflight,
@@ -107,6 +107,21 @@ test("qualification CLI has no synthetic transcript input", () => {
   );
 });
 
+test("qualification CLI accepts only the mission source candidate boundary", () => {
+  assert.deepEqual(parseRoutingQualificationOptions([
+    "--candidate-source-root", "/candidate/source",
+    "--candidate-cli", "/candidate/codestory-cli",
+    "--candidate-cli-sha256", "a".repeat(64),
+  ]), {
+    candidate_source_root: "/candidate/source",
+    candidate_cli: "/candidate/codestory-cli",
+    candidate_cli_sha256: "a".repeat(64),
+  });
+  for (const option of ["--package-receipt", "--package-receipt-sha256", "--archive", "--source-root"]) {
+    assert.throws(() => parseRoutingQualificationOptions([option, "/legacy"]), new RegExp(`unknown option ${option}`, "u"));
+  }
+});
+
 test("qualification artifacts require exactly 32 separately validated host sessions", async () => {
   const root = await mkdtemp(join(tmpdir(), "codestory-routing-artifacts-"));
   try {
@@ -165,7 +180,7 @@ test("qualification static roster authenticates every linked routing reference",
   }
 });
 
-async function splitCandidateFixture(root) {
+async function sourceCandidateFixture(root, { liveIdentity = {} } = {}) {
   const sourceRoot = join(root, "source");
   await mkdir(join(sourceRoot, "plugins"), { recursive: true });
   await cp(pluginRoot, join(sourceRoot, "plugins", "codestory"), { recursive: true });
@@ -184,60 +199,70 @@ async function splitCandidateFixture(root) {
   const revision = catalog.wireContract.preferredMcpProtocolVersion;
   const sourceCommit = spawnSync("git", ["-C", sourceRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
   const sourceTree = spawnSync("git", ["-C", sourceRoot, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).stdout.trim();
-  const assetTarget = "macos-arm64";
-  const cliBytes = Buffer.from("#!/bin/sh\nexit 0\n");
-  const cliSha256 = sha256(cliBytes);
-  const packageName = `codestory-cli-v${packageVersion}-${assetTarget}`;
-  const packageRoot = join(root, "archive-build", packageName);
-  await mkdir(packageRoot, { recursive: true });
-  await writeFile(join(packageRoot, "codestory-cli"), cliBytes);
-  await writeFile(join(packageRoot, "codestory-native-manifest.json"), JSON.stringify({
-    release_version: packageVersion,
-    asset_target: assetTarget,
-    source: { commit: sourceCommit, tree: sourceTree, tracked_dirty: false },
-    binary: { name: "codestory-cli", sha256: cliSha256 },
-  }));
-  const archivePath = join(root, `${packageName}.tar.gz`);
-  const tar = spawnSync("tar", ["-czf", archivePath, "-C", join(root, "archive-build"), packageName]);
-  assert.equal(tar.status, 0, tar.stderr?.toString());
-  const archiveBytes = await readFile(archivePath);
-  const archiveSha256 = sha256(archiveBytes);
-
-  const receipt = {
-    contract: "codestory.agent-benchmark-package/v2",
-    arm: "candidate_0_18",
-    package_version: packageVersion,
-    archive_path: `${packageName}.tar.gz`,
-    archive_sha256: archiveSha256,
-    source_commit: sourceCommit,
-    source_tree: sourceTree,
-    schema_version: 3,
-    protocol_revision: revision,
-    discovery_contract_sha256: catalog.wireContract.discoveryContracts[revision],
+  const observed = {
+    version: liveIdentity.version ?? packageVersion,
+    schema: liveIdentity.schema ?? 3,
+    protocol: liveIdentity.protocol ?? revision,
+    discovery: liveIdentity.discovery ?? catalog.wireContract.discoveryContracts[revision],
   };
-  const packageReceiptPath = join(root, "package-receipt.json");
-  await writeFile(packageReceiptPath, `${JSON.stringify(receipt, null, 2)}\n`);
+  const candidateCliPath = join(root, "candidate-cli");
+  const cliBytes = Buffer.from(`#!/usr/bin/env node
+const frames = [];
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => frames.push(chunk));
+process.stdin.on("end", () => {
+  for (const line of frames.join("").split(/\\r?\\n/u).filter(Boolean)) {
+    const request = JSON.parse(line);
+    if (request.method === "initialize") process.stdout.write(JSON.stringify({
+      jsonrpc: "2.0", id: request.id, result: {
+        protocolVersion: ${JSON.stringify(observed.protocol)},
+        version: ${JSON.stringify(observed.version)},
+        serverInfo: { name: "codestory", version: ${JSON.stringify(observed.version)} },
+        capabilities: {},
+        _meta: {
+          codestory_publication: { schema_version: ${JSON.stringify(observed.schema)} },
+          codestory_protocol: {
+            negotiated: ${JSON.stringify(observed.protocol)},
+            preferred: ${JSON.stringify(observed.protocol)},
+            discovery_contract_sha256: ${JSON.stringify(observed.discovery)},
+          },
+        },
+      },
+    }) + "\\n");
+  }
+});
+`);
+  await writeFile(candidateCliPath, cliBytes);
+  await chmod(candidateCliPath, 0o700);
 
   const qualificationNonce = "c".repeat(64);
   return {
-    packageReceiptPath,
-    packageReceiptSha256: sha256(await readFile(packageReceiptPath)),
-    archivePath,
-    sourceRoot,
+    candidateSourceRoot: sourceRoot,
+    candidateCliPath,
+    candidateCliSha256: sha256(cliBytes),
     qualificationNonce,
     stageRoot: join(root, "stage"),
+    sourceCommit,
+    sourceTree,
+    packageVersion,
+    revision,
+    discovery: catalog.wireContract.discoveryContracts[revision],
   };
 }
 
-test("split candidate authentication stages source plugin archive CLI attestation and marker itself", async () => {
-  const root = await mkdtemp(join(tmpdir(), "codestory-routing-split-"));
+test("source candidate authentication binds clean source archived plugin bytes, external CLI bytes, and live v3 identity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-routing-source-candidate-"));
   try {
-    const fixture = await splitCandidateFixture(root);
-    const accepted = await authenticateSplitCandidateInstallation(fixture);
+    const fixture = await sourceCandidateFixture(root);
+    const accepted = await authenticateSourceCandidateInstallation(fixture);
     assert.equal(accepted.expectedIdentity.publication.schema_version, 3);
-    assert.equal(accepted.expectedIdentity.cli.sha256, sha256(Buffer.from("#!/bin/sh\nexit 0\n")));
+    assert.equal(accepted.expectedIdentity.cli.sha256, fixture.candidateCliSha256);
+    assert.equal(accepted.publicIdentity.source_commit, fixture.sourceCommit);
+    assert.equal(accepted.publicIdentity.source_tree, fixture.sourceTree);
+    assert.equal(accepted.publicIdentity.protocol_revision, fixture.revision);
+    assert.equal(accepted.publicIdentity.discovery_contract_sha256, fixture.discovery);
     assert.equal(accepted.launcherEnv.CODESTORY_PLUGIN_DATA, await realpath(accepted.pluginData));
-    assert.equal(JSON.parse(await readFile(accepted.staged.attestationPath, "utf8")).candidate.producer.kind, "local_candidate");
+    assert.equal(JSON.parse(await readFile(accepted.staged.attestationPath, "utf8")).candidate.producer.kind, "source_candidate");
 
     const originalManaged = await readFile(accepted.staged.managedCli);
     await writeFile(accepted.staged.managedCli, "substituted\n");
@@ -249,16 +274,39 @@ test("split candidate authentication stages source plugin archive CLI attestatio
     marker.archive_sha256 = "d".repeat(64);
     await writeFile(markerPath, JSON.stringify(marker));
     await assert.rejects(verifyStagedCandidateInstallation(accepted.staged), /qualification marker/u);
+    marker.archive_sha256 = accepted.launcherEnv.CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256;
+    await writeFile(markerPath, JSON.stringify(marker));
 
     const attestation = JSON.parse(await readFile(accepted.staged.attestationPath, "utf8"));
     attestation.plugin.source_tree = "e".repeat(40);
     await writeFile(accepted.staged.attestationPath, JSON.stringify(attestation));
     await assert.rejects(verifyStagedCandidateInstallation(accepted.staged), /attestation drifted/u);
 
-    await writeFile(join(fixture.sourceRoot, "untracked.txt"), "drift\n");
-    await assert.rejects(authenticateSplitCandidateInstallation({
+    await writeFile(join(fixture.candidateSourceRoot, "untracked.txt"), "drift\n");
+    await assert.rejects(authenticateSourceCandidateInstallation({
       ...fixture, stageRoot: join(root, "stage-source-drift"),
-    }), /not the clean receipt commit and tree/u);
+    }), /source root is not a clean HEAD and tree/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("source candidate authentication rejects the full input-identity mismatch class", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-routing-source-hostile-"));
+  try {
+    const wrongHash = await sourceCandidateFixture(join(root, "wrong-hash"));
+    await assert.rejects(authenticateSourceCandidateInstallation({
+      ...wrongHash, candidateCliSha256: "d".repeat(64),
+    }), /CLI digest does not match/u);
+
+    for (const [name, liveIdentity, pattern] of [
+      ["schema", { schema: 2 }, /live schema/u],
+      ["protocol", { protocol: "2025-06-18" }, /live preferred protocol/u],
+      ["discovery", { discovery: "e".repeat(64) }, /live discovery identity/u],
+    ]) {
+      const fixture = await sourceCandidateFixture(join(root, name), { liveIdentity });
+      await assert.rejects(authenticateSourceCandidateInstallation(fixture), pattern);
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

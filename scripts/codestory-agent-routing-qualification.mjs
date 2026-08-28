@@ -29,8 +29,8 @@ const SHA256 = /^[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
 const EXPECTED_SESSION_COUNT = 32;
 const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
-const MAX_RECEIPT_BYTES = 256 * 1024;
-const MAX_ARCHIVE_BYTES = 1024 * 1024 * 1024;
+const MAX_CANDIDATE_CLI_BYTES = 1024 * 1024 * 1024;
+const MAX_PLUGIN_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const PROCESS_TIMEOUT_MS = 10 * 60 * 1000;
 const CODEX_MARKETPLACE = "RoutingCandidate";
 const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
@@ -205,8 +205,8 @@ export function buildRoutingHostCommand({
 
 export function parseRoutingQualificationOptions(argv) {
   const valueOptions = new Set([
-    "--out", "--package-receipt", "--package-receipt-sha256", "--archive",
-    "--qualification-nonce", "--fixture-project", "--source-root",
+    "--out", "--candidate-source-root", "--candidate-cli", "--candidate-cli-sha256",
+    "--qualification-nonce", "--fixture-project",
     "--codex-command", "--cursor-command", "--codex-auth", "--codex-model", "--cursor-model",
   ]);
   const values = {};
@@ -391,157 +391,189 @@ async function gitValue(sourceRoot, args, label) {
   return (await successfulProcess("git", ["-C", sourceRoot, ...args], { timeoutMs: 30_000 }, label)).trim();
 }
 
-function safeRelativeInput(value, label) {
-  if (typeof value !== "string" || value.length === 0 || value.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(value)
-      || value.replaceAll("\\", "/").split("/").some((part) => !part || part === "." || part === "..")) {
-    fail(`${label} must be a safe relative path`);
-  }
-  return value;
-}
-
 export async function verifyStagedCandidateInstallation(staged) {
   const {
-    receipt, packageReceiptSha256, archiveSha256, pluginRoot, pluginData,
-    attestationPath, qualificationDir, qualificationNonce, nativeManifest,
-    managedCli, managedManifestPath,
+    sourceHead, sourceTree, packageVersion, pluginArchiveSha256, candidateCliSha256,
+    candidateTokenSha256, target, authenticatedCliPath, pluginRoot, pluginData,
+    attestationPath, qualificationDir, qualificationNonce, managedCli, managedManifestPath,
   } = staged;
   const attestation = await readJson(attestationPath, "generated candidate install attestation");
   exactKeys(attestation, ["schema_version", "installation_source", "installation", "plugin", "candidate"], "generated candidate install attestation");
   exactKeys(attestation.installation, ["plugin_root", "plugin_data"], "generated candidate installation paths");
   exactKeys(attestation.plugin, ["id", "version", "source_commit", "source_tree", "package_sha256"], "generated candidate installed plugin");
-  exactKeys(attestation.candidate, ["archive_sha256", "asset_target", "producer"], "generated candidate install identity");
-  exactKeys(attestation.candidate.producer, ["kind", "package_receipt_sha256"], "generated candidate producer");
-  if (attestation.schema_version !== 2 || attestation.installation_source !== "candidate_archive"
+  exactKeys(attestation.candidate, ["cli_sha256", "plugin_archive_sha256", "producer"], "generated candidate install identity");
+  exactKeys(attestation.candidate.producer, ["kind"], "generated candidate producer");
+  if (attestation.schema_version !== 2 || attestation.installation_source !== "source_candidate"
       || realpathSync(attestation.installation.plugin_root) !== realpathSync(pluginRoot)
       || realpathSync(attestation.installation.plugin_data) !== realpathSync(pluginData)
-      || attestation.plugin.id !== "codestory" || attestation.plugin.version !== receipt.package_version
-      || attestation.plugin.source_commit !== receipt.source_commit || attestation.plugin.source_tree !== receipt.source_tree
-      || attestation.candidate.archive_sha256 !== archiveSha256
-      || attestation.candidate.asset_target !== nativeManifest.asset_target
-      || attestation.candidate.producer.kind !== "local_candidate"
-      || attestation.candidate.producer.package_receipt_sha256 !== packageReceiptSha256) {
-    fail("generated candidate attestation drifted from staged source and archive identity");
+      || attestation.plugin.id !== "codestory" || attestation.plugin.version !== packageVersion
+      || attestation.plugin.source_commit !== sourceHead || attestation.plugin.source_tree !== sourceTree
+      || attestation.candidate.cli_sha256 !== candidateCliSha256
+      || attestation.candidate.plugin_archive_sha256 !== pluginArchiveSha256
+      || attestation.candidate.producer.kind !== "source_candidate") {
+    fail("generated candidate attestation drifted from staged source and CLI identity");
   }
   requiredDigest(attestation.plugin.package_sha256, "generated candidate plugin package digest");
   if (await directoryContractSha256(pluginRoot) !== attestation.plugin.package_sha256) {
     fail("generated candidate plugin bytes drifted from their attestation");
   }
   const managedManifest = await readJson(managedManifestPath, "generated managed CLI manifest");
-  if (managedManifest.version !== receipt.package_version || managedManifest.path !== basename(managedCli)
-      || managedManifest.build_source !== "candidate_archive" || managedManifest.repo_ref !== receipt.source_commit
-      || managedManifest.archive_sha256 !== archiveSha256
-      || managedManifest.archive_url !== `candidate-archive:${archiveSha256}`
-      || managedManifest.target !== nativeManifest.asset_target
+  if (managedManifest.version !== packageVersion || managedManifest.path !== basename(managedCli)
+      || managedManifest.build_source !== "candidate_archive" || managedManifest.repo_ref !== sourceHead
+      || managedManifest.archive_sha256 !== candidateTokenSha256
+      || managedManifest.archive_url !== `candidate-archive:${candidateTokenSha256}`
+      || managedManifest.target !== target
       || managedManifest.stdio_initialize_verified !== true
-      || managedManifest.sha256 !== nativeManifest.binary.sha256
-      || await digestFile(managedCli) !== nativeManifest.binary.sha256) {
-    fail("generated managed CLI installation drifted from archive-extracted bytes");
+      || managedManifest.sha256 !== candidateCliSha256
+      || await digestFile(authenticatedCliPath) !== candidateCliSha256
+      || await digestFile(managedCli) !== candidateCliSha256) {
+    fail("generated managed CLI installation drifted from authenticated source-candidate bytes");
   }
   const marker = await readJson(join(qualificationDir, "candidate-managed-install.json"), "generated candidate qualification marker");
   exactKeys(marker, ["schema_version", "purpose", "archive_sha256", "qualification_nonce_sha256"], "generated candidate qualification marker");
   if (!SHA256.test(qualificationNonce) || marker.schema_version !== 1
-      || marker.purpose !== "codestory-candidate-managed-install" || marker.archive_sha256 !== archiveSha256
+      || marker.purpose !== "codestory-candidate-managed-install" || marker.archive_sha256 !== candidateTokenSha256
       || marker.qualification_nonce_sha256 !== digestBytes(Buffer.from(qualificationNonce))) {
-    fail("generated candidate qualification marker drifted from its archive and nonce");
+    fail("generated candidate qualification marker drifted from its source candidate and nonce");
   }
   return attestation;
 }
 
-export async function authenticateSplitCandidateInstallation({
-  packageReceiptPath,
-  packageReceiptSha256,
-  archivePath,
-  sourceRoot,
+function nativeAssetTarget() {
+  if (process.platform === "darwin" && process.arch === "arm64") return "macos-arm64";
+  if (process.platform === "linux" && process.arch === "x64") return "linux-x64";
+  if (process.platform === "win32" && process.arch === "x64") return "windows-x64";
+  fail(`source candidate qualification does not support ${process.platform}-${process.arch}`);
+}
+
+function nativeArchiveName(version, target) {
+  const extension = target === "windows-x64" ? "zip" : "tar.gz";
+  return `codestory-cli-v${version}-${target}.${extension}`;
+}
+
+async function probeSourceCandidateCli({ cli, packageVersion, protocolRevision, discoveryContractSha256 }) {
+  const id = "source-candidate-authentication";
+  const stdout = await successfulProcess(cli, ["serve", "--stdio", "--multi-project", "--refresh", "none"], {
+    stdin: `${JSON.stringify({
+      jsonrpc: "2.0",
+      id,
+      method: "initialize",
+      params: {
+        protocolVersion: protocolRevision,
+        capabilities: {},
+        clientInfo: { name: "codestory-routing-qualification", version: "1" },
+      },
+    })}\n`,
+    timeoutMs: 30_000,
+  }, "source candidate live initialize");
+  let response;
+  try {
+    response = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line)).find((frame) => frame.id === id);
+  } catch (error) {
+    fail(`source candidate live initialize returned invalid JSON: ${error.message}`);
+  }
+  if (!plainObject(response?.result) || response.error) fail("source candidate live initialize did not return a result");
+  const result = response.result;
+  if (result.serverInfo?.version !== packageVersion || result.version !== packageVersion) {
+    fail("source candidate live version does not match the archived plugin and CLI pin");
+  }
+  if (result._meta?.codestory_publication?.schema_version !== 3) {
+    fail("source candidate live schema must be 3");
+  }
+  if (result.protocolVersion !== protocolRevision
+      || result._meta?.codestory_protocol?.negotiated !== protocolRevision
+      || result._meta?.codestory_protocol?.preferred !== protocolRevision) {
+    fail("source candidate live preferred protocol does not match the archived catalog");
+  }
+  if (result._meta?.codestory_protocol?.discovery_contract_sha256 !== discoveryContractSha256) {
+    fail("source candidate live discovery identity does not match the archived catalog");
+  }
+}
+
+export async function authenticateSourceCandidateInstallation({
+  candidateSourceRoot,
+  candidateCliPath,
+  candidateCliSha256,
   qualificationNonce,
   stageRoot,
 }) {
-  requiredDigest(packageReceiptSha256, "package receipt external digest");
+  requiredDigest(candidateCliSha256, "candidate CLI external digest");
   if (!SHA256.test(String(qualificationNonce))) fail("qualification nonce must be a 64-hex value");
-  sourceRoot = realpathSync(sourceRoot);
+  const sourceRoot = realpathSync(candidateSourceRoot);
   await rm(stageRoot, { recursive: true, force: true });
   await mkdir(stageRoot, { recursive: true, mode: 0o700 });
-  const stagedReceipt = await ingestImmutable(
-    realpathSync(packageReceiptPath), join(stageRoot, "authenticated-inputs", "candidate-receipt.json"),
-    MAX_RECEIPT_BYTES, "candidate package receipt",
-  );
-  if (stagedReceipt.sha256 !== packageReceiptSha256) fail("package receipt digest does not match its staged bytes");
-  const receipt = await readJson(stagedReceipt.path, "candidate package receipt");
-  exactKeys(receipt, [
-    "contract", "arm", "package_version", "archive_path", "archive_sha256",
-    "source_commit", "source_tree", "schema_version", "protocol_revision",
-    "discovery_contract_sha256",
-  ], "candidate package receipt");
-  if (receipt.contract !== "codestory.agent-benchmark-package/v2" || receipt.arm !== "candidate_0_18"
-      || !COMMIT.test(receipt.source_commit) || /^0{40}$/u.test(receipt.source_commit)
-      || !COMMIT.test(receipt.source_tree) || /^0{40}$/u.test(receipt.source_tree)
-      || receipt.schema_version !== 3 || receipt.protocol_revision !== "2025-11-25") {
-    fail("candidate package receipt identity is invalid");
-  }
-  requiredDigest(receipt.archive_sha256, "candidate archive digest");
-  requiredDigest(receipt.discovery_contract_sha256, "candidate discovery digest");
-  safeRelativeInput(receipt.archive_path, "candidate receipt archive_path");
-  const receiptArchivePath = resolve(dirname(realpathSync(packageReceiptPath)), receipt.archive_path);
-  if (realpathSync(receiptArchivePath) !== realpathSync(archivePath)) fail("candidate package receipt archive path does not match the supplied archive");
-  const stagedArchiveInput = await ingestImmutable(
-    realpathSync(archivePath), join(stageRoot, "authenticated-inputs", basename(archivePath)),
-    MAX_ARCHIVE_BYTES, "candidate archive",
-  );
-  const archiveSha256 = stagedArchiveInput.sha256;
-  if (archiveSha256 !== receipt.archive_sha256) fail("candidate archive digest does not match the immutable package receipt");
-
   const sourceHead = await gitValue(sourceRoot, ["rev-parse", "HEAD"], "candidate source HEAD");
   const sourceTree = await gitValue(sourceRoot, ["rev-parse", "HEAD^{tree}"], "candidate source tree");
   const sourceStatus = await gitValue(sourceRoot, ["status", "--porcelain=v1", "--untracked-files=all"], "candidate source cleanliness");
-  if (sourceHead !== receipt.source_commit || sourceTree !== receipt.source_tree || sourceStatus) {
-    fail("candidate source root is not the clean receipt commit and tree");
+  if (!COMMIT.test(sourceHead) || /^0{40}$/u.test(sourceHead)
+      || !COMMIT.test(sourceTree) || /^0{40}$/u.test(sourceTree) || sourceStatus) {
+    fail("candidate source root is not a clean HEAD and tree");
   }
+  const authenticatedCli = await ingestImmutable(
+    realpathSync(candidateCliPath), join(stageRoot, "authenticated-inputs", "codestory-cli"),
+    MAX_CANDIDATE_CLI_BYTES, "candidate CLI",
+  );
+  if (authenticatedCli.sha256 !== candidateCliSha256) fail("candidate CLI digest does not match its immutable staged bytes");
+
+  const scratchRoot = join(stageRoot, "scratch");
+  await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
+  const scratchArchive = join(scratchRoot, "plugin-source.tar");
+  await successfulProcess("git", ["-C", sourceRoot, "archive", "--format=tar", `--output=${scratchArchive}`, sourceHead, "plugins/codestory"], { timeoutMs: 30_000 }, "candidate plugin source staging");
+  const pluginArchive = await ingestImmutable(
+    scratchArchive, join(stageRoot, "authenticated-inputs", "plugin-source.tar"),
+    MAX_PLUGIN_ARCHIVE_BYTES, "candidate plugin source archive",
+  );
+  await rm(scratchRoot, { recursive: true, force: true });
+  const afterHead = await gitValue(sourceRoot, ["rev-parse", "HEAD"], "candidate source post-staging HEAD");
+  const afterTree = await gitValue(sourceRoot, ["rev-parse", "HEAD^{tree}"], "candidate source post-staging tree");
+  const afterStatus = await gitValue(sourceRoot, ["status", "--porcelain=v1", "--untracked-files=all"], "candidate source post-staging cleanliness");
+  if (afterHead !== sourceHead || afterTree !== sourceTree || afterStatus) {
+    fail("candidate source root changed while its plugin bytes were staged");
+  }
+
   const sourceStage = join(stageRoot, "source");
-  await mkdir(sourceStage, { recursive: true, mode: 0o700 });
-  const sourceArchive = join(stageRoot, "authenticated-inputs", "plugin-source.tar");
-  await successfulProcess("git", ["-C", sourceRoot, "archive", "--format=tar", `--output=${sourceArchive}`, receipt.source_commit, "plugins/codestory"], { timeoutMs: 30_000 }, "candidate plugin source staging");
-  await successfulProcess("tar", ["-xf", sourceArchive, "-C", sourceStage], { timeoutMs: 30_000 }, "candidate plugin source extraction");
+  await extractAuthenticatedArchive(pluginArchive.path, sourceStage);
   const pluginRoot = realpathSync(join(sourceStage, "plugins", "codestory"));
 
   const pluginManifest = await readJson(join(pluginRoot, "plugin.json"), "candidate plugin manifest");
   const cliVersion = await readJson(join(pluginRoot, "cli-version.json"), "candidate CLI version pin");
   const catalog = await readJson(join(pluginRoot, "generated-mcp-catalog.json"), "candidate generated catalog");
-  if (pluginManifest.name !== "codestory" || pluginManifest.version !== receipt.package_version
-      || cliVersion.cli_version !== receipt.package_version
-      || catalog.wireContract?.publicationStampSchemaVersion !== receipt.schema_version
-      || catalog.wireContract?.preferredMcpProtocolVersion !== receipt.protocol_revision
-      || catalog.wireContract?.discoveryContracts?.[receipt.protocol_revision] !== receipt.discovery_contract_sha256) {
-    fail("candidate plugin/catalog identity drifted from the immutable package receipt");
+  const packageVersion = pluginManifest.version;
+  const protocolRevision = catalog.wireContract?.preferredMcpProtocolVersion;
+  const discoveryContractSha256 = catalog.wireContract?.discoveryContracts?.[protocolRevision];
+  if (pluginManifest.name !== "codestory" || typeof packageVersion !== "string" || !packageVersion
+      || cliVersion.cli_version !== packageVersion
+      || catalog.wireContract?.publicationStampSchemaVersion !== 3
+      || catalog.wireContract?.minimumCompatiblePublicationStampSchemaVersion !== 3
+      || protocolRevision !== "2025-11-25") {
+    fail("candidate archived plugin/catalog identity is not the required v3 preferred profile");
   }
-
-  const extractedRoot = join(stageRoot, "archive");
-  const archiveFiles = await extractAuthenticatedArchive(stagedArchiveInput.path, extractedRoot);
-  const nativeManifests = archiveFiles.filter((path) => basename(path) === "codestory-native-manifest.json");
-  if (nativeManifests.length !== 1) fail("candidate archive must contain exactly one native manifest");
-  const nativeManifest = await readJson(nativeManifests[0], "candidate native manifest");
-  if (nativeManifest.release_version !== receipt.package_version
-      || nativeManifest.source?.commit !== receipt.source_commit
-      || nativeManifest.source?.tree !== receipt.source_tree
-      || nativeManifest.source?.tracked_dirty !== false
-      || !plainObject(nativeManifest.binary)) fail("candidate native manifest identity drifted from the immutable receipt");
-  requiredDigest(nativeManifest.binary.sha256, "candidate native CLI digest");
-  const extractedCli = archiveFiles.filter((path) => basename(path) === nativeManifest.binary.name);
-  if (extractedCli.length !== 1 || await digestFile(extractedCli[0]) !== nativeManifest.binary.sha256) {
-    fail("candidate archive does not bind exactly one native CLI");
-  }
+  requiredDigest(discoveryContractSha256, "candidate archived catalog discovery digest");
 
   const pluginData = join(stageRoot, "plugin-data");
-  const managedRoot = join(pluginData, "codestory-cli", receipt.package_version);
+  const managedRoot = join(pluginData, "codestory-cli", packageVersion);
   await mkdir(managedRoot, { recursive: true, mode: 0o700 });
-  const managedCli = join(managedRoot, basename(extractedCli[0]));
-  await copyFile(extractedCli[0], managedCli);
+  const managedCli = join(managedRoot, process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
+  await copyFile(authenticatedCli.path, managedCli);
   await chmod(managedCli, 0o700);
+  await probeSourceCandidateCli({
+    cli: managedCli,
+    packageVersion,
+    protocolRevision,
+    discoveryContractSha256,
+  });
+  const target = nativeAssetTarget();
+  const candidateTokenSha256 = digestBytes(Buffer.from([
+    "codestory-routing-source-candidate-v1", sourceHead, sourceTree,
+    pluginArchive.sha256, candidateCliSha256,
+  ].join("\0")));
   const managedManifestPath = join(managedRoot, "manifest.json");
   await writeFile(managedManifestPath, `${JSON.stringify({
-    path: basename(managedCli), sha256: nativeManifest.binary.sha256,
-    version: receipt.package_version, build_source: "candidate_archive",
-    repo_ref: receipt.source_commit, archive: basename(stagedArchiveInput.path),
-    archive_url: `candidate-archive:${archiveSha256}`, archive_sha256: archiveSha256,
-    archive_bytes: stagedArchiveInput.bytes, target: nativeManifest.asset_target,
+    path: basename(managedCli), sha256: candidateCliSha256,
+    version: packageVersion, build_source: "candidate_archive",
+    repo_ref: sourceHead, archive: nativeArchiveName(packageVersion, target),
+    archive_url: `candidate-archive:${candidateTokenSha256}`, archive_sha256: candidateTokenSha256,
+    archive_bytes: authenticatedCli.bytes, target,
     stdio_initialize_verified: true,
   }, null, 2)}\n`, { mode: 0o600 });
 
@@ -549,7 +581,7 @@ export async function authenticateSplitCandidateInstallation({
   await mkdir(qualificationDir, { recursive: true, mode: 0o700 });
   await writeFile(join(qualificationDir, "candidate-managed-install.json"), `${JSON.stringify({
     schema_version: 1, purpose: "codestory-candidate-managed-install",
-    archive_sha256: archiveSha256,
+    archive_sha256: candidateTokenSha256,
     qualification_nonce_sha256: digestBytes(Buffer.from(qualificationNonce)),
   }, null, 2)}\n`, { mode: 0o600 });
 
@@ -557,21 +589,22 @@ export async function authenticateSplitCandidateInstallation({
   const attestationPath = join(stageRoot, "candidate-install-attestation.json");
   await writeFile(attestationPath, `${JSON.stringify({
     schema_version: 2,
-    installation_source: "candidate_archive",
+    installation_source: "source_candidate",
     installation: { plugin_root: pluginRoot, plugin_data: pluginData },
     plugin: {
-      id: "codestory", version: receipt.package_version,
-      source_commit: receipt.source_commit, source_tree: receipt.source_tree,
+      id: "codestory", version: packageVersion,
+      source_commit: sourceHead, source_tree: sourceTree,
       package_sha256: pluginPackageSha256,
     },
     candidate: {
-      archive_sha256: archiveSha256, asset_target: nativeManifest.asset_target,
-      producer: { kind: "local_candidate", package_receipt_sha256: packageReceiptSha256 },
+      cli_sha256: candidateCliSha256, plugin_archive_sha256: pluginArchive.sha256,
+      producer: { kind: "source_candidate" },
     },
   }, null, 2)}\n`, { mode: 0o600 });
   const staged = {
-    receipt, packageReceiptSha256, archiveSha256, pluginRoot, pluginData,
-    attestationPath, qualificationDir, qualificationNonce, nativeManifest,
+    sourceHead, sourceTree, packageVersion, pluginArchiveSha256: pluginArchive.sha256,
+    candidateCliSha256, candidateTokenSha256, target, authenticatedCliPath: authenticatedCli.path,
+    pluginRoot, pluginData, attestationPath, qualificationDir, qualificationNonce,
     managedCli, managedManifestPath,
   };
   await verifyStagedCandidateInstallation(staged);
@@ -580,10 +613,10 @@ export async function authenticateSplitCandidateInstallation({
   await mkdir(join(installedRoot, "archives"), { recursive: true });
   await mkdir(join(installedRoot, "scripts"), { recursive: true });
   await mkdir(join(installedRoot, "managed"), { recursive: true });
-  const installedArchive = join(installedRoot, "archives", basename(stagedArchiveInput.path));
+  const installedArchive = join(installedRoot, "archives", basename(pluginArchive.path));
   const installedLauncher = join(installedRoot, "scripts", "codestory-mcp.cjs");
   const installedCli = join(installedRoot, "managed", basename(managedCli));
-  await copyFile(stagedArchiveInput.path, installedArchive);
+  await copyFile(pluginArchive.path, installedArchive);
   await copyFile(join(pluginRoot, "scripts", "codestory-mcp.cjs"), installedLauncher);
   await copyFile(managedCli, installedCli);
   await chmod(installedCli, 0o700);
@@ -591,21 +624,21 @@ export async function authenticateSplitCandidateInstallation({
     installation: { root: realpathSync(installedRoot) },
     package: {
       name: "codestory",
-      version: receipt.package_version,
+      version: packageVersion,
       archive_relative_path: `archives/${basename(installedArchive)}`,
-      sha256: archiveSha256,
+      sha256: pluginArchive.sha256,
     },
     launcher: { relative_path: "scripts/codestory-mcp.cjs", sha256: await digestFile(installedLauncher) },
     cli: {
       relative_path: `managed/${basename(installedCli)}`,
-      version: receipt.package_version,
+      version: packageVersion,
       sha256: await digestFile(installedCli),
       source: "managed",
     },
-    publication: { schema_version: receipt.schema_version },
+    publication: { schema_version: 3 },
     protocol: {
-      revision: receipt.protocol_revision,
-      discovery_contract_sha256: receipt.discovery_contract_sha256,
+      revision: protocolRevision,
+      discovery_contract_sha256: discoveryContractSha256,
     },
   };
   const installedReceipt = join(installedRoot, "installed-receipt.json");
@@ -625,21 +658,20 @@ export async function authenticateSplitCandidateInstallation({
     installedReceipt,
     expectedIdentity,
     publicIdentity: {
-      package_receipt_sha256: packageReceiptSha256,
-      archive_sha256: archiveSha256,
+      plugin_archive_sha256: pluginArchive.sha256,
       attestation_sha256: await digestFile(attestationPath),
       plugin_package_sha256: pluginPackageSha256,
       cli_sha256: identity.cli.sha256,
-      source_commit: receipt.source_commit,
-      source_tree: receipt.source_tree,
-      schema_version: receipt.schema_version,
-      protocol_revision: receipt.protocol_revision,
-      discovery_contract_sha256: receipt.discovery_contract_sha256,
+      source_commit: sourceHead,
+      source_tree: sourceTree,
+      schema_version: 3,
+      protocol_revision: protocolRevision,
+      discovery_contract_sha256: discoveryContractSha256,
     },
     launcherEnv: {
       CODESTORY_PLUGIN_DATA: realpathSync(pluginData),
       PLUGIN_DATA: realpathSync(pluginData),
-      CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256: archiveSha256,
+      CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256: candidateTokenSha256,
       CODESTORY_EMBED_QUALIFICATION_DIR: qualificationDir,
       CODESTORY_EMBED_QUALIFICATION_NONCE: qualificationNonce,
     },
@@ -908,17 +940,16 @@ async function runSession(command, baseEnv, timeoutMs = PROCESS_TIMEOUT_MS) {
 async function main(argv) {
   const options = parseRoutingQualificationOptions(argv);
   const required = [
-    "out", "package_receipt", "package_receipt_sha256", "archive", "source_root",
+    "out", "candidate_source_root", "candidate_cli", "candidate_cli_sha256",
     "qualification_nonce", "codex_auth", "cursor_model",
   ];
   for (const key of required) if (!options[key]) fail(`--${key.replaceAll("_", "-")} is required`);
   validateRoutingRequestCorpus();
-  const authenticated = await authenticateSplitCandidateInstallation({
-    packageReceiptPath: options.package_receipt,
-    packageReceiptSha256: options.package_receipt_sha256,
-    archivePath: options.archive,
+  const authenticated = await authenticateSourceCandidateInstallation({
+    candidateSourceRoot: options.candidate_source_root,
+    candidateCliPath: options.candidate_cli,
+    candidateCliSha256: options.candidate_cli_sha256,
     qualificationNonce: options.qualification_nonce,
-    sourceRoot: options.source_root,
     stageRoot: join(resolve(options.out), "authenticated-installation"),
   });
   await validateStaticHostParity(authenticated.pluginRoot, authenticated.expectedIdentity);
