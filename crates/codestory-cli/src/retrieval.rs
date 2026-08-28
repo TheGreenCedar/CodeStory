@@ -425,6 +425,13 @@ const RETRIEVAL_PHASE_ALLOWLIST: &[&str] = &[
     "lexical sidecar",
     "incremental embedded vectors",
     "embedded vectors",
+    "vector tokenization",
+    "vector native encode",
+    "vector normalization",
+    "vector sqlite persistence",
+    "vector hashing",
+    "vector final validation",
+    "vector ipc and orchestration",
     "graph artifact",
     "manifest write",
     "unattributed",
@@ -706,6 +713,34 @@ mod tests {
                 elapsed_ms: 17,
             },
             FinalizePhaseTiming {
+                phase: "vector tokenization".into(),
+                elapsed_ms: 3,
+            },
+            FinalizePhaseTiming {
+                phase: "vector native encode".into(),
+                elapsed_ms: 23,
+            },
+            FinalizePhaseTiming {
+                phase: "vector normalization".into(),
+                elapsed_ms: 2,
+            },
+            FinalizePhaseTiming {
+                phase: "vector sqlite persistence".into(),
+                elapsed_ms: 7,
+            },
+            FinalizePhaseTiming {
+                phase: "vector hashing".into(),
+                elapsed_ms: 5,
+            },
+            FinalizePhaseTiming {
+                phase: "vector final validation".into(),
+                elapsed_ms: 11,
+            },
+            FinalizePhaseTiming {
+                phase: "vector ipc and orchestration".into(),
+                elapsed_ms: 13,
+            },
+            FinalizePhaseTiming {
                 phase: "/private/source/path".into(),
                 elapsed_ms: 99,
             },
@@ -736,9 +771,16 @@ mod tests {
         ];
 
         let safe_phases = safe_retrieval_phase_timings(&phases);
-        assert_eq!(safe_phases.len(), 1);
+        assert_eq!(safe_phases.len(), 8);
         assert_eq!(safe_phases[0].phase, "lexical sidecar");
         assert_eq!(safe_phases[0].elapsed_ms, 17);
+        assert_eq!(safe_phases[1].phase, "vector tokenization");
+        assert_eq!(safe_phases[2].phase, "vector native encode");
+        assert_eq!(safe_phases[3].phase, "vector normalization");
+        assert_eq!(safe_phases[4].phase, "vector sqlite persistence");
+        assert_eq!(safe_phases[5].phase, "vector hashing");
+        assert_eq!(safe_phases[6].phase, "vector final validation");
+        assert_eq!(safe_phases[7].phase, "vector ipc and orchestration");
 
         let safe_work = safe_retrieval_component_work(&work);
         assert_eq!(safe_work.len(), 1);

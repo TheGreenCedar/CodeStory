@@ -160,7 +160,10 @@ pub(in crate::per_user_embedding) fn serve_embedding_request(
         match handle.try_recv_with_completion() {
             Ok(Some(Ok(completion))) => {
                 let native_completion_sequence = completion.completion_sequence;
+                let normalization_started = std::time::Instant::now();
                 let vectors = normalize_and_validate_vectors(completion.vectors)?;
+                let normalization_ns =
+                    u64::try_from(normalization_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 let payload = encode_vectors(&vectors)?;
                 let snapshot = engine.snapshot().map_err(engine_error)?;
                 let identity = engine_identity(&state.process.server_instance_id, &snapshot)?;
@@ -190,6 +193,13 @@ pub(in crate::per_user_embedding) fn serve_embedding_request(
                             columns: RETRIEVAL_EMBEDDING_DIM as u32,
                             encoding: "f32_le".into(),
                             identity: Box::new(identity),
+                            timings: Some(
+                                crate::per_user_embedding::protocol::EmbeddingVectorTimings {
+                                    tokenization_ns: completion.timings.tokenization_ns,
+                                    native_encode_ns: completion.timings.native_encode_ns,
+                                    normalization_ns,
+                                },
+                            ),
                         },
                     ),
                     &payload,
