@@ -338,22 +338,35 @@ function exactCandidateRows() {
               ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
             },
           },
-          package_identity: codestory
+          package_identity: arm === "published_0_17_4"
             ? {
                 contract: "codestory.agent-benchmark-package/v2",
                 arm,
                 package_version: packageVersion,
                 package_sha256: packageByte.repeat(64),
-                cli_sha256: (arm === "published_0_17_4" ? "c" : "d").repeat(64),
-                source_commit: (arm === "published_0_17_4" ? "e" : "f").repeat(40),
-                source_tree: (arm === "published_0_17_4" ? "1" : "2").repeat(40),
-                schema_version: arm === "published_0_17_4" ? 2 : 3,
-                protocol_revision: arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25",
-                discovery_contract_sha256: arm === "published_0_17_4" ? null : "4".repeat(64),
-                trust_root_kind: arm === "published_0_17_4"
-                  ? "official_published_checksum"
-                  : "immutable_candidate_receipt",
-                trust_root_sha256: (arm === "published_0_17_4" ? "5" : "6").repeat(64),
+                cli_sha256: "c".repeat(64),
+                source_commit: "e".repeat(40),
+                source_tree: "1".repeat(40),
+                schema_version: 2,
+                protocol_revision: "2024-11-05",
+                discovery_contract_sha256: null,
+                trust_root_kind: "official_published_checksum",
+                trust_root_sha256: "5".repeat(64),
+              }
+            : null,
+          source_cli_identity: arm === "candidate_0_18"
+            ? {
+                contract: "codestory.agent-benchmark-source-cli/v1",
+                arm,
+                package_version: packageVersion,
+                cli_sha256: "d".repeat(64),
+                source_commit: "f".repeat(40),
+                source_tree: "2".repeat(40),
+                schema_version: 3,
+                protocol_revision: "2025-11-25",
+                discovery_contract_sha256: "4".repeat(64),
+                plugin_manifest_sha256: "6".repeat(64),
+                catalog_sha256: "7".repeat(64),
               }
             : null,
           codestory_prelude_cli: codestory ? "/authenticated/codestory-cli" : null,
@@ -420,8 +433,9 @@ function exactArgs(extra = []) {
     "--published-archive", "/tmp/published.tar.gz",
     "--published-checksum-manifest", "/tmp/SHA256SUMS.txt",
     "--published-checksum-sha256", "a".repeat(64),
-    "--candidate-package-receipt", "/tmp/candidate.json",
-    "--candidate-receipt-sha256", "b".repeat(64),
+    "--candidate-source-root", "/tmp/candidate-source",
+    "--candidate-cli", "/tmp/candidate-cli",
+    "--candidate-cli-sha256", "b".repeat(64),
     ...extra,
   ];
 }
@@ -515,18 +529,19 @@ test("exact-candidate mode closes every option that can change freshness oracle 
     "--published-archive",
     "--published-checksum-manifest",
     "--published-checksum-sha256",
-    "--candidate-package-receipt",
-    "--candidate-receipt-sha256",
+    "--candidate-source-root",
+    "--candidate-cli",
+    "--candidate-cli-sha256",
   ]) {
     const args = exactArgs();
     args.splice(args.indexOf(required), 2);
     assert.throws(
       () => benchmarkHarness.parseArgs(args),
-      /requires authenticated published and candidate package inputs/i,
+      /requires authenticated published archive and candidate source\/CLI inputs/i,
       required,
     );
   }
-  for (const digestOption of ["--published-checksum-sha256", "--candidate-receipt-sha256"]) {
+  for (const digestOption of ["--published-checksum-sha256", "--candidate-cli-sha256"]) {
     const args = exactArgs();
     args[args.indexOf(digestOption) + 1] = "0".repeat(64);
     assert.throws(() => benchmarkHarness.parseArgs(args), /all-zero digest/i, digestOption);
@@ -623,34 +638,87 @@ rl.on("line", (line) => {
   };
 }
 
-test("exact package authentication rejects archive CLI receipt and runtime substitution as one trust class", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-three-arm-receipt-"));
+async function makeCandidateSourceCli(root, name, {
+  version = "0.17.5",
+  pluginVersion = version,
+  runtimeVersion = version,
+  schema = 3,
+  catalogSchema = 3,
+  protocol = "2025-11-25",
+  discovery = "f".repeat(64),
+  executionMarker = null,
+}) {
+  const sourceRoot = path.join(root, `${name}-source`);
+  await mkdir(path.join(sourceRoot, "crates", "codestory-cli"), { recursive: true });
+  await mkdir(path.join(sourceRoot, "plugins", "codestory"), { recursive: true });
+  await writeFile(path.join(sourceRoot, "crates", "codestory-cli", "Cargo.toml"), `[package]\nname = "codestory-cli"\nversion = "${version}"\n`);
+  const pluginBytes = Buffer.from(`${JSON.stringify({ name: "codestory", version: pluginVersion }, null, 2)}\n`);
+  const catalogBytes = Buffer.from(`${JSON.stringify({
+    wireContract: {
+      publicationStampSchemaVersion: catalogSchema,
+      minimumCompatiblePublicationStampSchemaVersion: catalogSchema,
+      supportedMcpProtocolVersions: ["2024-11-05", "2025-03-26", "2025-06-18", protocol],
+      preferredMcpProtocolVersion: protocol,
+      discoveryContracts: { [protocol]: discovery },
+    },
+  }, null, 2)}\n`);
+  await writeFile(path.join(sourceRoot, "plugins", "codestory", "plugin.json"), pluginBytes);
+  await writeFile(path.join(sourceRoot, "plugins", "codestory", "generated-mcp-catalog.json"), catalogBytes);
+  for (const args of [
+    ["init", "-q", sourceRoot],
+    ["-C", sourceRoot, "config", "user.email", "fixture@example.com"],
+    ["-C", sourceRoot, "config", "user.name", "Fixture"],
+    ["-C", sourceRoot, "add", "."],
+    ["-C", sourceRoot, "commit", "-q", "-m", "fixture"],
+  ]) {
+    const result = spawnSync("git", args, { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  }
+  const cliPath = path.join(root, `${name}-codestory-cli`);
+  await writeFile(cliPath, `#!/usr/bin/env node
+const readline = require("node:readline");
+const fs = require("node:fs");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method !== "initialize") return;
+  ${executionMarker ? `fs.writeFileSync(${JSON.stringify(executionMarker)}, "executed");` : ""}
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
+    protocolVersion: request.params.protocolVersion,
+    serverInfo: { name: "codestory", version: ${JSON.stringify(runtimeVersion)} },
+    _meta: {
+      codestory_publication: { schema_version: ${schema} },
+      codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discovery)} },
+    },
+  } }) + "\\n");
+});
+`);
+  await chmod(cliPath, 0o755);
+  const cliSha256 = createHash("sha256").update(await readFile(cliPath)).digest("hex");
+  const sourceCommit = spawnSync("git", ["-C", sourceRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  const sourceTree = spawnSync("git", ["-C", sourceRoot, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).stdout.trim();
+  return {
+    sourceRoot,
+    cliPath,
+    cliSha256,
+    sourceCommit,
+    sourceTree,
+    pluginSha256: createHash("sha256").update(pluginBytes).digest("hex"),
+    catalogSha256: createHash("sha256").update(catalogBytes).digest("hex"),
+  };
+}
+
+test("exact candidate binds clean source, checked-in identities, immutable CLI bytes, and live initialize", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-three-arm-source-cli-"));
   try {
     const published = await makeExactArchive(root, "published", {
       version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
     });
-    const candidate = await makeExactArchive(root, "candidate", {
-      version: "0.17.4", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
-    });
+    const candidate = await makeCandidateSourceCli(root, "candidate", {});
     const checksumPath = path.join(root, "SHA256SUMS.txt");
     await writeFile(checksumPath, `${published.sha256}  ${path.basename(published.archivePath)}\n`);
     const checksumSha = createHash("sha256").update(await readFile(checksumPath)).digest("hex");
-    const receiptPath = path.join(root, "candidate-receipt.json");
-    const baseReceipt = {
-      contract: "codestory.agent-benchmark-package/v2",
-      arm: "candidate_0_18",
-      package_version: "0.17.4",
-      archive_path: candidate.archivePath,
-      archive_sha256: candidate.sha256,
-      source_commit: "d".repeat(40),
-      source_tree: "e".repeat(40),
-      schema_version: 3,
-      protocol_revision: "2025-11-25",
-      discovery_contract_sha256: "f".repeat(64),
-    };
-    const run = async (receipt, overrides = {}) => {
-      await writeFile(receiptPath, JSON.stringify(receipt));
-      const receiptSha = createHash("sha256").update(await readFile(receiptPath)).digest("hex");
+    const run = async (candidateInput = candidate, overrides = {}) => {
       const state = await mkdtemp(path.join(root, "state-"));
       return await benchmarkHarness.authenticateExactCandidatePackages({
         exactCandidate: true,
@@ -658,89 +726,36 @@ test("exact package authentication rejects archive CLI receipt and runtime subst
         publishedArchive: published.archivePath,
         publishedChecksumManifest: checksumPath,
         publishedChecksumSha256: checksumSha,
-        candidatePackageReceipt: receiptPath,
-        candidateReceiptSha256: receiptSha,
+        candidateSourceRoot: candidateInput.sourceRoot,
+        candidateCli: candidateInput.cliPath,
+        candidateCliSha256: candidateInput.cliSha256,
         ...overrides,
       });
     };
-    const accepted = await run(baseReceipt);
+    const accepted = await run();
     assert.equal(accepted.packages.get("published_0_17_4").package_sha256, published.sha256);
     assert.equal(accepted.packages.get("published_0_17_4").protocol_revision, "2024-11-05");
     assert.equal(accepted.packages.get("published_0_17_4").discovery_contract_sha256, null);
-    assert.equal(accepted.packages.get("candidate_0_18").package_sha256, candidate.sha256);
+    const candidateIdentity = accepted.packages.get("candidate_0_18");
+    assert.equal(candidateIdentity.contract, "codestory.agent-benchmark-source-cli/v1");
+    assert.equal(candidateIdentity.source_commit, candidate.sourceCommit);
+    assert.equal(candidateIdentity.source_tree, candidate.sourceTree);
+    assert.equal(candidateIdentity.cli_sha256, candidate.cliSha256);
+    assert.equal(candidateIdentity.plugin_manifest_sha256, candidate.pluginSha256);
+    assert.equal(candidateIdentity.catalog_sha256, candidate.catalogSha256);
+    assert.equal(Object.hasOwn(candidateIdentity, "package_sha256"), false);
+    assert.equal(Object.hasOwn(candidateIdentity, "trust_root"), false);
     assert.match(accepted.packages.get("candidate_0_18").cli_path, /state-/);
-
-    const hostile = [
-      ["archive substitution", { ...baseReceipt, archive_path: published.archivePath, archive_sha256: published.sha256 }, {}, /version|source|runtime/i],
-      ["local CLI substitution", { ...baseReceipt, cli_path: path.join(root, "decoy") }, {}, /exactly.*fields/i],
-      ["runtime drift", { ...baseReceipt, schema_version: 4 }, {}, /runtime\/source identity/i],
-      ["receipt version disagrees with source", { ...baseReceipt, package_version: "0.18.0" }, {}, /source package version/i],
-      ["source drift", { ...baseReceipt, source_tree: "9".repeat(40) }, {}, /source tree drifted/i],
-      ["null source", { ...baseReceipt, source_commit: null }, {}, /runtime\/source identity/i],
-      ["all-zero archive digest", { ...baseReceipt, archive_sha256: "0".repeat(64) }, {}, /all-zero digest/i],
-      ["forged receipt", baseReceipt, { candidateReceiptSha256: "1".repeat(64) }, /external digest/i],
-      ["forged published manifest", baseReceipt, { publishedChecksumSha256: "2".repeat(64) }, /external digest/i],
-    ];
-    for (const [label, receipt, overrides, expected] of hostile) {
-      await assert.rejects(run(receipt, overrides), expected, label);
-    }
-
-    const manifestDrift = await makeExactArchive(root, "candidate-manifest-version-drift", {
-      version: "0.17.5", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
-    });
-    await assert.rejects(run({
-      ...baseReceipt,
-      archive_path: manifestDrift.archivePath,
-      archive_sha256: manifestDrift.sha256,
-    }), /native manifest version drifted/i);
-
-    const runtimeDrift = await makeExactArchive(root, "candidate-runtime-version-drift", {
-      version: "0.17.4", runtimeVersion: "0.17.5", schema: 3,
-      source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
-    });
-    await assert.rejects(run({
-      ...baseReceipt,
-      archive_path: runtimeDrift.archivePath,
-      archive_sha256: runtimeDrift.sha256,
-    }), /runtime package_version=0\.17\.5; expected 0\.17\.4/i);
-    await writeFile(receiptPath, "");
-    await truncate(receiptPath, 64 * 1024 + 1);
-    await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
-      exactCandidate: true,
-      exactCandidateStateRoot: await mkdtemp(path.join(root, "state-")),
-      publishedArchive: published.archivePath,
-      publishedChecksumManifest: checksumPath,
-      publishedChecksumSha256: checksumSha,
-      candidatePackageReceipt: receiptPath,
-      candidateReceiptSha256: "7".repeat(64),
-    }), /bound/i);
-
-    await writeFile(checksumPath, "");
-    await truncate(checksumPath, 1024 * 1024 + 1);
-    await writeFile(receiptPath, JSON.stringify(baseReceipt));
-    await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
-      exactCandidate: true,
-      exactCandidateStateRoot: await mkdtemp(path.join(root, "state-")),
-      publishedArchive: published.archivePath,
-      publishedChecksumManifest: checksumPath,
-      publishedChecksumSha256: "8".repeat(64),
-      candidatePackageReceipt: receiptPath,
-      candidateReceiptSha256: createHash("sha256").update(await readFile(receiptPath)).digest("hex"),
-    }), /bound/i);
-
-    const oversizedArchive = path.join(root, "oversized.tar.gz");
-    await writeFile(oversizedArchive, "");
-    await truncate(oversizedArchive, 8 * 1024 * 1024 * 1024 + 1);
-    await writeFile(checksumPath, `${"a".repeat(64)}  ${path.basename(oversizedArchive)}\n`);
-    await assert.rejects(benchmarkHarness.authenticateExactCandidatePackages({
-      exactCandidate: true,
-      exactCandidateStateRoot: await mkdtemp(path.join(root, "state-")),
-      publishedArchive: oversizedArchive,
-      publishedChecksumManifest: checksumPath,
-      publishedChecksumSha256: createHash("sha256").update(await readFile(checksumPath)).digest("hex"),
-      candidatePackageReceipt: receiptPath,
-      candidateReceiptSha256: createHash("sha256").update(await readFile(receiptPath)).digest("hex"),
-    }), /bound/i);
+    await assert.rejects(run(candidate, { candidateCliSha256: "1".repeat(64) }), /external digest/i);
+    await assert.rejects(run(candidate, { publishedChecksumSha256: "2".repeat(64) }), /external digest/i);
+    const runtimeDrift = await makeCandidateSourceCli(root, "candidate-runtime-drift", { runtimeVersion: "0.18.0" });
+    await assert.rejects(run(runtimeDrift), /runtime package_version=0\.18\.0; expected 0\.17\.5/i);
+    const schemaDrift = await makeCandidateSourceCli(root, "candidate-schema-drift", { schema: 4 });
+    await assert.rejects(run(schemaDrift), /runtime schema_version=4; expected 3/i);
+    const pluginDrift = await makeCandidateSourceCli(root, "candidate-plugin-drift", { pluginVersion: "9.9.9" });
+    await assert.rejects(run(pluginDrift), /checked-in plugin\/catalog identity/i);
+    await writeFile(path.join(candidate.sourceRoot, "untracked"), "dirty");
+    await assert.rejects(run(candidate), /clean tracked and untracked worktree/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -750,8 +765,7 @@ test("exact input ingestion makes every caller path irrelevant before parsing ex
   for (const kind of [
     "published_checksum_manifest",
     "published_0_17_4_archive",
-    "candidate_receipt",
-    "candidate_0_18_archive",
+    "candidate_cli",
   ]) {
     const root = await mkdtemp(path.join(os.tmpdir(), `codestory-exact-race-${kind}-`));
     try {
@@ -759,36 +773,21 @@ test("exact input ingestion makes every caller path irrelevant before parsing ex
       const published = await makeExactArchive(root, "published-original", {
         version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
       });
-      const candidate = await makeExactArchive(root, "candidate-original", {
-        version: "0.17.4", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
-      });
+      const candidate = await makeCandidateSourceCli(root, "candidate-original", {});
       const publishedSubstitute = await makeExactArchive(root, "published-substitute", {
         version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
         executionMarker: marker,
       });
-      const candidateSubstitute = await makeExactArchive(root, "candidate-substitute", {
-        version: "0.17.4", schema: 3, source: "d".repeat(40), tree: "e".repeat(40), discovery: "f".repeat(64),
+      const candidateSubstitute = await makeCandidateSourceCli(root, "candidate-substitute", {
         executionMarker: marker,
       });
       const publishedInput = path.join(root, "published-input.tar.gz");
-      const candidateInput = path.join(root, "candidate-input.tar.gz");
+      const candidateInput = path.join(root, "candidate-input-cli");
       await copyFile(published.archivePath, publishedInput);
-      await copyFile(candidate.archivePath, candidateInput);
+      await copyFile(candidate.cliPath, candidateInput);
+      await chmod(candidateInput, 0o755);
       const checksumPath = path.join(root, "SHA256SUMS.txt");
       await writeFile(checksumPath, `${published.sha256}  ${path.basename(publishedInput)}\n`);
-      const receiptPath = path.join(root, "candidate-receipt.json");
-      await writeFile(receiptPath, JSON.stringify({
-        contract: "codestory.agent-benchmark-package/v2",
-        arm: "candidate_0_18",
-        package_version: "0.17.4",
-        archive_path: candidateInput,
-        archive_sha256: candidate.sha256,
-        source_commit: "d".repeat(40),
-        source_tree: "e".repeat(40),
-        schema_version: 3,
-        protocol_revision: "2025-11-25",
-        discovery_contract_sha256: "f".repeat(64),
-      }));
       const state = await mkdtemp(path.join(root, "state-"));
       const result = await benchmarkHarness.authenticateExactCandidatePackages({
         exactCandidate: true,
@@ -796,28 +795,25 @@ test("exact input ingestion makes every caller path irrelevant before parsing ex
         publishedArchive: publishedInput,
         publishedChecksumManifest: checksumPath,
         publishedChecksumSha256: createHash("sha256").update(await readFile(checksumPath)).digest("hex"),
-        candidatePackageReceipt: receiptPath,
-        candidateReceiptSha256: createHash("sha256").update(await readFile(receiptPath)).digest("hex"),
+        candidateSourceRoot: candidate.sourceRoot,
+        candidateCli: candidateInput,
+        candidateCliSha256: candidate.cliSha256,
         exactCandidateAfterInputIngest: async (event) => {
           if (event.kind !== kind) return;
-          if (kind === "published_checksum_manifest" || kind === "candidate_receipt") {
+          if (kind === "published_checksum_manifest") {
             await writeFile(event.source_path, "substituted after ingest");
           } else if (kind === "published_0_17_4_archive") {
             await copyFile(publishedSubstitute.archivePath, event.source_path);
           } else {
-            await copyFile(candidateSubstitute.archivePath, event.source_path);
+            await copyFile(candidateSubstitute.cliPath, event.source_path);
           }
         },
       });
       assert.equal(result.packages.get("published_0_17_4").package_sha256, published.sha256, kind);
-      assert.equal(result.packages.get("candidate_0_18").package_sha256, candidate.sha256, kind);
+      assert.equal(result.packages.get("candidate_0_18").cli_sha256, candidate.cliSha256, kind);
       assert.equal(existsSync(marker), false, `${kind} executed the substituted CLI`);
-      for (const arm of ["published_0_17_4", "candidate_0_18"]) {
-        assert.ok(
-          isPathInside(path.join(state, "authenticated-inputs"), result.packages.get(arm).package_path),
-          `${kind} did not consume its private staged archive`,
-        );
-      }
+      assert.ok(isPathInside(path.join(state, "authenticated-inputs"), result.packages.get("published_0_17_4").package_path));
+      assert.ok(isPathInside(path.join(state, "authenticated-inputs"), result.packages.get("candidate_0_18").cli_path));
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -905,14 +901,14 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
       rows.find((row) => row.arm === "published_0_17_4").transcript_analysis.direct_source_reads[0].authorization = { status: "authorized", reason: "reviewer_said_ok" };
     }, /unauthorized direct source read/i],
     ["identity", (rows) => {
-      rows.find((row) => row.arm === "candidate_0_18").package_identity.cli_sha256 = "0".repeat(64);
-    }, /candidate package identity mismatch/i],
+      rows.find((row) => row.arm === "candidate_0_18").source_cli_identity.cli_sha256 = "0".repeat(64);
+    }, /candidate source\/CLI identity mismatch/i],
     ["fabricated legacy discovery identity", (rows) => {
       rows.find((row) => row.arm === "published_0_17_4").package_identity.discovery_contract_sha256 = "9".repeat(64);
     }, /published package identity mismatch/i],
     ["missing candidate discovery identity", (rows) => {
-      rows.find((row) => row.arm === "candidate_0_18").package_identity.discovery_contract_sha256 = null;
-    }, /candidate package identity mismatch/i],
+      rows.find((row) => row.arm === "candidate_0_18").source_cli_identity.discovery_contract_sha256 = null;
+    }, /candidate source\/CLI identity mismatch/i],
     ["accounting", (rows) => {
       delete rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.tool_categories;
     }, /missing tool categories/i],
@@ -947,7 +943,7 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     }, /baseline has CodeStory visibility/i],
     ["published runtime proof", (rows) => {
       rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_contract_runtime = null;
-    }, /missing per-arm exact-package runtime proof/i],
+    }, /missing per-arm exact runtime proof/i],
     ["candidate cache proof", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance = null;
     }, /missing per-arm cache proof/i],

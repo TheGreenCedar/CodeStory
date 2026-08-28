@@ -2,8 +2,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { chmod, copyFile, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -36,12 +36,6 @@ const benchmarkHarnessPath = fileURLToPath(import.meta.url);
 const benchmarkScorerPath = path.join(scriptDir, "codestory-agent-value-score.mjs");
 const repoRoot = path.resolve(scriptDir, "..");
 const siblingRoot = path.resolve(repoRoot, "..");
-const currentSourcePackageVersion = (() => {
-  const manifest = readFileSync(path.join(repoRoot, "crates", "codestory-cli", "Cargo.toml"), "utf8");
-  const match = /^version\s*=\s*"([^"]+)"\s*$/mu.exec(manifest);
-  if (!match) throw new Error("current CodeStory source package version is missing");
-  return match[1];
-})();
 const defaultTaskRoot = path.join(repoRoot, "benchmarks", "tasks");
 const defaultRepoCacheRoot = path.join(repoRoot, "target", "agent-benchmark", "repos");
 const MANIFEST_REPO_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
@@ -100,9 +94,12 @@ const EXACT_CANDIDATE_TASK_REPOS = Object.freeze({
   "sql-chinook-schema-relations": "lerocha-chinook-database",
 });
 const EXACT_CANDIDATE_PACKAGE_CONTRACT = "codestory.agent-benchmark-package/v2";
+const EXACT_CANDIDATE_SOURCE_CLI_CONTRACT = "codestory.agent-benchmark-source-cli/v1";
 const MAX_EXACT_RECEIPT_BYTES = 64 * 1024;
 const MAX_EXACT_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
 const MAX_EXACT_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024;
+const MAX_EXACT_CLI_BYTES = 1024 * 1024 * 1024;
+const MAX_EXACT_SOURCE_IDENTITY_BYTES = 16 * 1024 * 1024;
 const MAX_EXACT_ARCHIVE_ENTRIES = 16_384;
 const MAX_EXACT_ARCHIVE_LISTING_BYTES = 2 * 1024 * 1024;
 const EXACT_CANDIDATE_TASK_CONTRACT_SHA256 =
@@ -245,7 +242,7 @@ function usage() {
   node scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
   node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite <suite> [--materialize-repos] [--repeats n]
   node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--canary-task-id id] [--shard-count n --shard-index n] [--allow-failures] [--publishable]
-  node scripts/codestory-agent-ab-benchmark.mjs --exact-candidate --task-suite language-expansion-holdout --published-archive <path> --published-checksum-manifest <path> --published-checksum-sha256 <sha256> --candidate-package-receipt <path> --candidate-receipt-sha256 <sha256>
+  node scripts/codestory-agent-ab-benchmark.mjs --exact-candidate --task-suite language-expansion-holdout --published-archive <path> --published-checksum-manifest <path> --published-checksum-sha256 <sha256> --candidate-source-root <path> --candidate-cli <path> --candidate-cli-sha256 <sha256>
 
 Options:
   --list          Print configured benchmark repositories or selected manifest tasks and exit.
@@ -287,10 +284,11 @@ Options:
                   Official published SHA256SUMS.txt containing the selected archive digest.
   --published-checksum-sha256
                   External SHA-256 binding for the official published checksum manifest.
-  --candidate-package-receipt
-                  Immutable archive/source/runtime receipt for the frozen CodeStory 0.18 candidate.
-  --candidate-receipt-sha256
-                  External SHA-256 binding for the frozen candidate receipt.
+  --candidate-source-root
+                  Clean Git root whose checked-in plugin and MCP catalog define the 0.18 candidate.
+  --candidate-cli Exact CodeStory CLI built from the candidate source.
+  --candidate-cli-sha256
+                  External SHA-256 binding for the candidate CLI bytes.
   --prepare-codestory-cache
                   Before timed with-CodeStory runs, refresh stale or semantic-empty local caches and record indexing cost separately.
                   Packet-runtime mode enables this by default because packets require prepared local indexes.
@@ -368,8 +366,9 @@ function parseArgs(argv) {
       "published-archive": { type: "string" },
       "published-checksum-manifest": { type: "string" },
       "published-checksum-sha256": { type: "string" },
-      "candidate-package-receipt": { type: "string" },
-      "candidate-receipt-sha256": { type: "string" },
+      "candidate-source-root": { type: "string" },
+      "candidate-cli": { type: "string" },
+      "candidate-cli-sha256": { type: "string" },
       "prepare-codestory-cache": { type: "boolean" },
       "no-prepare-codestory-cache": { type: "boolean" },
       "prepare-codestory-timeout-ms": { type: "string" },
@@ -413,8 +412,9 @@ function parseArgs(argv) {
     publishedArchive: null,
     publishedChecksumManifest: null,
     publishedChecksumSha256: null,
-    candidatePackageReceipt: null,
-    candidateReceiptSha256: null,
+    candidateSourceRoot: null,
+    candidateCli: null,
+    candidateCliSha256: null,
     exactCandidatePackageByArm: null,
     prepareCodestoryCache: null,
     prepareCodestoryJobs: 2,
@@ -479,8 +479,9 @@ function parseArgs(argv) {
   opts.publishedArchive = values["published-archive"] ?? null;
   opts.publishedChecksumManifest = values["published-checksum-manifest"] ?? null;
   opts.publishedChecksumSha256 = values["published-checksum-sha256"] ?? null;
-  opts.candidatePackageReceipt = values["candidate-package-receipt"] ?? null;
-  opts.candidateReceiptSha256 = values["candidate-receipt-sha256"] ?? null;
+  opts.candidateSourceRoot = values["candidate-source-root"] ?? null;
+  opts.candidateCli = values["candidate-cli"] ?? null;
+  opts.candidateCliSha256 = values["candidate-cli-sha256"] ?? null;
   opts.prepareCodestoryCache = values["prepare-codestory-cache"] === true ? true : null;
   opts.prepareCodestoryTimeoutMs =
     values["prepare-codestory-timeout-ms"] == null
@@ -517,8 +518,9 @@ function parseArgs(argv) {
       "published-archive",
       "published-checksum-manifest",
       "published-checksum-sha256",
-      "candidate-package-receipt",
-      "candidate-receipt-sha256",
+      "candidate-source-root",
+      "candidate-cli",
+      "candidate-cli-sha256",
     ]);
     const forbiddenOptions = [...providedOptions].filter((name) => !exactOptionAllowlist.has(name));
     if (forbiddenOptions.length) {
@@ -547,10 +549,11 @@ function parseArgs(argv) {
       !opts.publishedArchive ||
       !opts.publishedChecksumManifest ||
       !opts.publishedChecksumSha256 ||
-      !opts.candidatePackageReceipt ||
-      !opts.candidateReceiptSha256
+      !opts.candidateSourceRoot ||
+      !opts.candidateCli ||
+      !opts.candidateCliSha256
     ) {
-      throw new Error("exact-candidate mode requires authenticated published and candidate package inputs");
+      throw new Error("exact-candidate mode requires authenticated published archive and candidate source/CLI inputs");
     }
     if (opts.arms && opts.arms.join(",") !== EXACT_CANDIDATE_ARMS.join(",")) {
       throw new Error(`exact-candidate arms are frozen as ${EXACT_CANDIDATE_ARMS.join(",")}`);
@@ -566,9 +569,9 @@ function parseArgs(argv) {
       opts.publishedChecksumSha256,
       "--published-checksum-sha256",
     );
-    opts.candidateReceiptSha256 = normalizeExternalSha256(
-      opts.candidateReceiptSha256,
-      "--candidate-receipt-sha256",
+    opts.candidateCliSha256 = normalizeExternalSha256(
+      opts.candidateCliSha256,
+      "--candidate-cli-sha256",
     );
   }
   opts.arms ??= ["without_codestory", "with_codestory"];
@@ -894,7 +897,7 @@ function selectedBenchmarkChildEnv(opts = {}, arm = null) {
 }
 
 function exactCandidatePackageIdentity(receipt, arm) {
-  if (arm === "without_codestory") {
+  if (arm !== "published_0_17_4") {
     return null;
   }
   const identity = Object.fromEntries([
@@ -905,6 +908,21 @@ function exactCandidatePackageIdentity(receipt, arm) {
   identity.trust_root_kind = receipt?.trust_root?.kind ?? null;
   identity.trust_root_sha256 = receipt?.trust_root?.sha256 ?? null;
   return identity;
+}
+
+function exactCandidateSourceCliIdentity(receipt, arm) {
+  if (arm !== "candidate_0_18") return null;
+  return Object.fromEntries([
+    "contract", "arm", "package_version", "cli_sha256", "source_commit",
+    "source_tree", "schema_version", "protocol_revision",
+    "discovery_contract_sha256", "plugin_manifest_sha256", "catalog_sha256",
+  ].map((field) => [field, receipt?.[field] ?? null]));
+}
+
+function exactCandidateResultIdentity(result) {
+  return result?.arm === "candidate_0_18"
+    ? result?.source_cli_identity
+    : result?.package_identity;
 }
 
 function resolveCodeStoryCliForArm(opts, arm) {
@@ -1358,6 +1376,136 @@ async function authenticateExactArchive({ arm, archivePath, archiveSha256, archi
   };
 }
 
+async function readCandidateTrackedFile(sourceRoot, relativePath, label) {
+  const result = await runProcess(
+    "git",
+    ["-C", sourceRoot, "show", `HEAD:${relativePath}`],
+    { timeoutMs: 10_000, maxOutputBytes: MAX_EXACT_SOURCE_IDENTITY_BYTES },
+  );
+  if (result.status !== "pass") {
+    throw new Error(`candidate source is missing checked-in ${label}: ${trimTail(result.stderr || result.stdout)}`);
+  }
+  const bytes = Buffer.from(result.stdout, "utf8");
+  if (bytes.length > MAX_EXACT_SOURCE_IDENTITY_BYTES) {
+    throw new Error(`candidate checked-in ${label} exceeds the identity byte bound`);
+  }
+  return { bytes, sha256: sha256Bytes(bytes) };
+}
+
+async function candidateSourceSnapshot(sourcePath) {
+  const sourceRoot = realpathSync(path.resolve(sourcePath));
+  const topLevel = await gitCheckedOutput(
+    ["-C", sourceRoot, "rev-parse", "--show-toplevel"],
+    repoRoot,
+    { timeoutMs: 10_000, maxOutputBytes: 1024 * 1024 },
+  );
+  if (realpathSync(topLevel) !== sourceRoot) {
+    throw new Error("--candidate-source-root must name the Git worktree root exactly");
+  }
+  const status = await gitCheckedOutput(
+    ["-C", sourceRoot, "status", "--porcelain=v1", "--untracked-files=all"],
+    repoRoot,
+    { timeoutMs: 10_000, maxOutputBytes: 1024 * 1024 },
+  );
+  if (status) throw new Error("candidate source root must have a clean tracked and untracked worktree");
+  const sourceCommit = await gitCheckedOutput(
+    ["-C", sourceRoot, "rev-parse", "HEAD"],
+    repoRoot,
+    { timeoutMs: 10_000, maxOutputBytes: 1024 },
+  );
+  const sourceTree = await gitCheckedOutput(
+    ["-C", sourceRoot, "rev-parse", "HEAD^{tree}"],
+    repoRoot,
+    { timeoutMs: 10_000, maxOutputBytes: 1024 },
+  );
+  if (
+    !/^[0-9a-f]{40}$/.test(sourceCommit) || /^0{40}$/.test(sourceCommit) ||
+    !/^[0-9a-f]{40}$/.test(sourceTree) || /^0{40}$/.test(sourceTree)
+  ) {
+    throw new Error("candidate source HEAD/tree identity is invalid");
+  }
+  const [cargo, plugin, catalog] = await Promise.all([
+    readCandidateTrackedFile(sourceRoot, "crates/codestory-cli/Cargo.toml", "CLI manifest"),
+    readCandidateTrackedFile(sourceRoot, "plugins/codestory/plugin.json", "plugin manifest"),
+    readCandidateTrackedFile(sourceRoot, "plugins/codestory/generated-mcp-catalog.json", "MCP catalog"),
+  ]);
+  const versionMatch = /^version\s*=\s*"([^"]+)"\s*$/mu.exec(cargo.bytes.toString("utf8"));
+  const pluginJson = JSON.parse(plugin.bytes.toString("utf8"));
+  const catalogJson = JSON.parse(catalog.bytes.toString("utf8"));
+  const wire = catalogJson?.wireContract;
+  const packageVersion = versionMatch?.[1] ?? null;
+  const preferredProtocol = wire?.preferredMcpProtocolVersion ?? null;
+  const discoveryContractSha256 = normalizeExternalSha256(
+    wire?.discoveryContracts?.[preferredProtocol],
+    "candidate catalog preferred discovery contract",
+  );
+  if (
+    pluginJson?.name !== "codestory" || !packageVersion || pluginJson?.version !== packageVersion ||
+    wire?.publicationStampSchemaVersion !== 3 ||
+    wire?.minimumCompatiblePublicationStampSchemaVersion !== 3 ||
+    preferredProtocol !== "2025-11-25" ||
+    !Array.isArray(wire?.supportedMcpProtocolVersions) ||
+    !wire.supportedMcpProtocolVersions.includes(preferredProtocol)
+  ) {
+    throw new Error("candidate checked-in plugin/catalog identity is not the schema-3 preferred-profile source contract");
+  }
+  return {
+    source_root: sourceRoot,
+    source_commit: sourceCommit,
+    source_tree: sourceTree,
+    package_version: packageVersion,
+    schema_version: 3,
+    protocol_revision: preferredProtocol,
+    discovery_contract_sha256: discoveryContractSha256,
+    plugin_manifest_sha256: plugin.sha256,
+    catalog_sha256: catalog.sha256,
+  };
+}
+
+async function authenticateExactCandidateSourceCli(opts) {
+  const before = await candidateSourceSnapshot(opts.candidateSourceRoot);
+  const cliInput = await ingestExactInput(
+    opts,
+    "candidate_cli",
+    opts.candidateCli,
+    MAX_EXACT_CLI_BYTES,
+  );
+  const expectedCliSha256 = normalizeExternalSha256(
+    opts.candidateCliSha256,
+    "candidate CLI external digest",
+  );
+  if (cliInput.sha256 !== expectedCliSha256) {
+    throw new Error("candidate CLI does not match its external digest");
+  }
+  await chmod(cliInput.staged_path, 0o500);
+  const runtime = await probeExactPackageRuntime(cliInput.staged_path, before, selectedBenchmarkChildEnv(opts, "candidate_0_18"));
+  const afterCli = await sha256FileBounded(cliInput.staged_path, MAX_EXACT_CLI_BYTES, "authenticated candidate CLI");
+  if (afterCli.sha256 !== cliInput.sha256 || afterCli.byte_length !== cliInput.byte_length) {
+    throw new Error("authenticated candidate CLI bytes changed during live initialize");
+  }
+  const after = await candidateSourceSnapshot(opts.candidateSourceRoot);
+  for (const field of [
+    "source_root", "source_commit", "source_tree", "package_version", "schema_version",
+    "protocol_revision", "discovery_contract_sha256", "plugin_manifest_sha256", "catalog_sha256",
+  ]) {
+    if (after[field] !== before[field]) throw new Error(`candidate source identity changed during authentication: ${field}`);
+  }
+  return {
+    contract: EXACT_CANDIDATE_SOURCE_CLI_CONTRACT,
+    arm: "candidate_0_18",
+    package_version: before.package_version,
+    cli_path: cliInput.staged_path,
+    cli_sha256: cliInput.sha256,
+    source_commit: before.source_commit,
+    source_tree: before.source_tree,
+    schema_version: runtime.schema_version,
+    protocol_revision: runtime.protocol_revision,
+    discovery_contract_sha256: runtime.discovery_contract_sha256,
+    plugin_manifest_sha256: before.plugin_manifest_sha256,
+    catalog_sha256: before.catalog_sha256,
+  };
+}
+
 async function authenticateExactCandidatePackages(opts) {
   const started = performance.now();
   const publishedManifestInput = await ingestExactInput(
@@ -1387,101 +1535,41 @@ async function authenticateExactCandidatePackages(opts) {
   });
   if (publishedMatches.length !== 1) throw new Error("official checksum data must name the published archive exactly once");
 
-  const candidateReceiptPath = path.resolve(opts.candidatePackageReceipt);
-  const candidateReceiptInput = await ingestExactInput(
-    opts,
-    "candidate_receipt",
-    candidateReceiptPath,
-    MAX_EXACT_RECEIPT_BYTES,
-  );
-  const candidateReceiptRead = await readBoundedFile(
-    candidateReceiptInput.staged_path,
-    MAX_EXACT_RECEIPT_BYTES,
-    "staged candidate receipt",
-  );
-  if (
-    candidateReceiptRead.sha256 !== normalizeExternalSha256(
-      opts.candidateReceiptSha256,
-      "candidate receipt external digest",
-    )
-  ) {
-    throw new Error("candidate receipt does not match its external digest");
-  }
-  const candidate = JSON.parse(candidateReceiptRead.bytes.toString("utf8"));
-  const candidateKeys = new Set([
-    "contract", "arm", "package_version", "archive_path", "archive_sha256",
-    "source_commit", "source_tree", "schema_version", "protocol_revision",
-    "discovery_contract_sha256",
-  ]);
-  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate) ||
-      Object.keys(candidate).some((key) => !candidateKeys.has(key)) ||
-      [...candidateKeys].some((key) => !Object.hasOwn(candidate, key))) {
-    throw new Error("candidate receipt must contain exactly the immutable package identity fields");
-  }
-  if (candidate.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT || candidate.arm !== "candidate_0_18") {
-    throw new Error("candidate receipt identity is not the frozen 0.18 candidate");
-  }
-  if (candidate.package_version !== currentSourcePackageVersion) {
-    throw new Error(
-      `candidate receipt package version ${candidate.package_version ?? "missing"} does not match current source package version ${currentSourcePackageVersion}`,
-    );
-  }
-  const candidateExpected = {
-    package_version: candidate.package_version,
-    source_commit: /^[0-9a-f]{40}$/.test(candidate.source_commit) ? candidate.source_commit : null,
-    source_tree: /^[0-9a-f]{40}$/.test(candidate.source_tree) ? candidate.source_tree : null,
-    schema_version: candidate.schema_version,
-    protocol_revision: candidate.protocol_revision,
-    discovery_contract_sha256: normalizeExternalSha256(
-      candidate.discovery_contract_sha256,
-      "candidate discovery_contract_sha256",
-    ),
-  };
-  if (
-    !candidateExpected.source_commit || /^0{40}$/.test(candidateExpected.source_commit) ||
-    !candidateExpected.source_tree || /^0{40}$/.test(candidateExpected.source_tree) ||
-    candidate.schema_version !== 3 || candidate.protocol_revision !== "2025-11-25"
-  ) {
-    throw new Error("candidate receipt runtime/source identity is invalid");
-  }
   const packageRoot = opts.exactCandidateStateRoot;
   const order = opts.exactCandidatePackageAuthenticationOrder ?? ["published_0_17_4", "candidate_0_18"];
-  const definitions = {
-    published_0_17_4: {
-      arm: "published_0_17_4",
-      sourceArchivePath: publishedArchive,
-      archiveSha256: normalizeExternalSha256(publishedMatches[0], "official published archive sha256"),
-      expected: { package_version: "0.17.4", schema_version: 2, protocol_revision: "2024-11-05" },
-      trustRoot: { kind: "official_published_checksum", sha256: publishedManifest.sha256 },
-    },
-    candidate_0_18: {
-      arm: "candidate_0_18",
-      sourceArchivePath: path.resolve(path.dirname(candidateReceiptPath), candidate.archive_path),
-      archiveSha256: normalizeExternalSha256(candidate.archive_sha256, "candidate archive sha256"),
-      expected: candidateExpected,
-      trustRoot: { kind: "immutable_candidate_receipt", sha256: candidateReceiptRead.sha256 },
-    },
+  const publishedDefinition = {
+    arm: "published_0_17_4",
+    sourceArchivePath: publishedArchive,
+    archiveSha256: normalizeExternalSha256(publishedMatches[0], "official published archive sha256"),
+    expected: { package_version: "0.17.4", schema_version: 2, protocol_revision: "2024-11-05" },
+    trustRoot: { kind: "official_published_checksum", sha256: publishedManifest.sha256 },
   };
   const packages = new Map();
   const armTimings = {};
   for (const arm of order) {
-    if (!definitions[arm] || packages.has(arm)) throw new Error("package authentication order must contain each exact CodeStory arm once");
+    if (!EXACT_CANDIDATE_ARMS.includes(arm) || arm === "without_codestory" || packages.has(arm)) {
+      throw new Error("package authentication order must contain each exact CodeStory arm once");
+    }
     const armStarted = performance.now();
-    const archiveInput = await ingestExactInput(
-      opts,
-      `${arm}_archive`,
-      definitions[arm].sourceArchivePath,
-      MAX_EXACT_ARCHIVE_BYTES,
-    );
-    packages.set(arm, await authenticateExactArchive(
-      {
-        ...definitions[arm],
-        archivePath: archiveInput.staged_path,
-        archiveIdentity: archiveInput,
-      },
-      packageRoot,
-      selectedBenchmarkChildEnv(opts, arm),
-    ));
+    if (arm === "published_0_17_4") {
+      const archiveInput = await ingestExactInput(
+        opts,
+        `${arm}_archive`,
+        publishedDefinition.sourceArchivePath,
+        MAX_EXACT_ARCHIVE_BYTES,
+      );
+      packages.set(arm, await authenticateExactArchive(
+        {
+          ...publishedDefinition,
+          archivePath: archiveInput.staged_path,
+          archiveIdentity: archiveInput,
+        },
+        packageRoot,
+        selectedBenchmarkChildEnv(opts, arm),
+      ));
+    } else {
+      packages.set(arm, await authenticateExactCandidateSourceCli(opts));
+    }
     armTimings[arm] = Math.round((performance.now() - armStarted) * 1000) / 1000;
   }
   if (packages.size !== 2) throw new Error("package authentication order omitted an exact CodeStory arm");
@@ -5712,6 +5800,9 @@ async function runOne(opts, run, outDir) {
     package_identity: opts.exactCandidate
       ? exactCandidatePackageIdentity(opts.exactCandidatePackageByArm?.get(run.arm), run.arm)
       : null,
+    source_cli_identity: opts.exactCandidate
+      ? exactCandidateSourceCliIdentity(opts.exactCandidatePackageByArm?.get(run.arm), run.arm)
+      : null,
     codestory_binary_identity: codestoryBinaryIdentity,
     repo_path: repoConfig.path,
     repo_provenance: provenance,
@@ -6660,7 +6751,7 @@ function cachePreparationCanaryBlockers(preparation, env = process.env) {
   if (!/^[0-9a-f]{64}$/i.test(String(server?.executable_sha256 ?? ""))) {
     blockers.push("embedding server executable digest is missing or malformed");
   }
-  const expectedServerVersion = preparation?.package_identity?.package_version ?? null;
+  const expectedServerVersion = exactCandidateResultIdentity(preparation)?.package_version ?? null;
   if (expectedServerVersion && server?.executable_version !== expectedServerVersion) {
     blockers.push(`embedding server version=${server?.executable_version ?? "missing"}; expected ${expectedServerVersion}`);
   }
@@ -6977,6 +7068,10 @@ async function prepareCodeStoryCaches(opts, tasks) {
       for (const row of rows) {
         row.arm = arm;
         row.package_identity = exactCandidatePackageIdentity(
+          opts.exactCandidatePackageByArm.get(arm),
+          arm,
+        );
+        row.source_cli_identity = exactCandidateSourceCliIdentity(
           opts.exactCandidatePackageByArm.get(arm),
           arm,
         );
@@ -10055,7 +10150,7 @@ function usefulAnchorHitsPer10kContextChars(row) {
 
 function managedCodeStoryRuntimeIdentityBlockers(result) {
   const reasons = [];
-  const expectedVersion = result?.package_identity?.package_version ?? null;
+  const expectedVersion = exactCandidateResultIdentity(result)?.package_version ?? null;
   const analysis = result?.transcript_analysis;
   const started = analysis?.codestory_mcp_tool_calls_observed ?? 0;
   const completed = analysis?.codestory_mcp_completed_calls_observed ?? 0;
@@ -10091,9 +10186,12 @@ function managedCodeStoryRuntimeIdentityBlockers(result) {
 
 function exactPackageRuntimeIdentityBlockers(result) {
   const reasons = [];
-  const packageIdentity = result?.package_identity;
-  if (packageIdentity?.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT) {
-    return ["CodeStory arm has no authenticated exact-package identity"];
+  const packageIdentity = exactCandidateResultIdentity(result);
+  const expectedContract = result?.arm === "candidate_0_18"
+    ? EXACT_CANDIDATE_SOURCE_CLI_CONTRACT
+    : EXACT_CANDIDATE_PACKAGE_CONTRACT;
+  if (packageIdentity?.contract !== expectedContract) {
+    return ["CodeStory arm has no authenticated exact runtime identity"];
   }
   const analysis = result?.transcript_analysis;
   const started = analysis?.codestory_mcp_tool_calls_observed ?? 0;
@@ -10103,14 +10201,14 @@ function exactPackageRuntimeIdentityBlockers(result) {
   const prelude = result?.codestory_harness_prelude;
   const runtime = prelude?.packet_contract_runtime;
   if (prelude?.status !== "pass") {
-    reasons.push("CodeStory exact-package packet prelude did not pass");
+    reasons.push("CodeStory exact runtime packet prelude did not pass");
   }
   if (
     result?.codestory_prelude_cli_sha256 !== packageIdentity.cli_sha256 ||
     result?.codestory_binary_identity?.prelude_cli_sha256 !== packageIdentity.cli_sha256 ||
     !["prelude_only", "exact_match"].includes(result?.codestory_binary_identity?.status)
   ) {
-    reasons.push("CodeStory exact-package CLI is not bound to the authenticated archive");
+    reasons.push("CodeStory CLI is not bound to the authenticated arm identity");
   }
   if (
     runtime?.cli_source !== "direct_cli_launch" ||
@@ -10118,7 +10216,7 @@ function exactPackageRuntimeIdentityBlockers(result) {
     runtime?.known_override_skew_channel !== false
   ) {
     reasons.push(
-      `CodeStory exact-package runtime is not a direct authenticated CLI ${packageIdentity.package_version}: ${JSON.stringify(runtime ?? null)}`,
+      `CodeStory exact runtime is not a direct authenticated CLI ${packageIdentity.package_version}: ${JSON.stringify(runtime ?? null)}`,
     );
   }
   return reasons;
@@ -11240,6 +11338,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     if (row.arm === "without_codestory") {
       if (
         row.package_identity != null ||
+        row.source_cli_identity != null ||
         row.codestory_cache_provenance != null ||
         row.codestory_harness_prelude != null ||
         row.codestory_prelude_cli != null ||
@@ -11261,12 +11360,13 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       }
     }
     if (isCodeStoryArm(row.arm)) {
+      const armIdentity = exactCandidateResultIdentity(row);
       if (row.packet_first_required !== true || row.packet_first_pass !== true) {
         reasons.push(`packet-first contract failed for ${row.task_id}/${row.arm}/${row.repeat}`);
       }
       if (
-        row.codestory_prelude_cli_sha256 !== row.package_identity?.cli_sha256 ||
-        row.codestory_binary_identity?.prelude_cli_sha256 !== row.package_identity?.cli_sha256 ||
+        row.codestory_prelude_cli_sha256 !== armIdentity?.cli_sha256 ||
+        row.codestory_binary_identity?.prelude_cli_sha256 !== armIdentity?.cli_sha256 ||
         !["prelude_only", "exact_match"].includes(row.codestory_binary_identity?.status)
       ) {
         reasons.push(`executed CLI is not bound to the authenticated ${row.arm} archive`);
@@ -11283,10 +11383,10 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
         }
       }
       const runtimeBlockers = exactPackageRuntimeIdentityBlockers(row);
-      if (runtimeBlockers.length) reasons.push(`missing per-arm exact-package runtime proof: ${runtimeBlockers.join("; ")}`);
+      if (runtimeBlockers.length) reasons.push(`missing per-arm exact runtime proof: ${runtimeBlockers.join("; ")}`);
       const cacheBlockers = cacheProvenanceBlockers(row);
       if (cacheBlockers.length) reasons.push(`missing per-arm cache proof: ${cacheBlockers.join("; ")}`);
-      if (row.package_identity?.schema_version === 3) {
+      if (armIdentity?.schema_version === 3) {
         const accountingError = packetV3EvidenceGapAccountingError(
           row.codestory_harness_prelude?.packet_evidence_gap_accounting,
           "exact packet v3 evidence/gaps",
@@ -11347,15 +11447,22 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     }
   }
 
-  const identityFields = [
-    "contract", "arm", "package_version", "package_sha256", "cli_sha256",
-    "source_commit", "source_tree", "schema_version", "protocol_revision",
-    "discovery_contract_sha256", "trust_root_kind", "trust_root_sha256",
-  ];
   for (const arm of ["published_0_17_4", "candidate_0_18"]) {
-    const identities = byArm[arm].map((row) => row.package_identity);
+    const candidateArm = arm === "candidate_0_18";
+    const identityFields = candidateArm
+      ? [
+          "contract", "arm", "package_version", "cli_sha256", "source_commit", "source_tree",
+          "schema_version", "protocol_revision", "discovery_contract_sha256",
+          "plugin_manifest_sha256", "catalog_sha256",
+        ]
+      : [
+          "contract", "arm", "package_version", "package_sha256", "cli_sha256",
+          "source_commit", "source_tree", "schema_version", "protocol_revision",
+          "discovery_contract_sha256", "trust_root_kind", "trust_root_sha256",
+        ];
+    const identities = byArm[arm].map((row) => exactCandidateResultIdentity(row));
     const reference = identities[0];
-    const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : currentSourcePackageVersion;
+    const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : reference?.package_version;
     const expectedSchema = arm === "published_0_17_4" ? 2 : 3;
     const expectedProtocol = arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25";
     const invalidDiscoveryIdentity = arm === "published_0_17_4"
@@ -11363,11 +11470,16 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       : !SHA256_PATTERN.test(String(reference?.discovery_contract_sha256 ?? "")) ||
         /^0{64}$/.test(String(reference?.discovery_contract_sha256 ?? ""));
     const invalidReference =
-      reference?.contract !== EXACT_CANDIDATE_PACKAGE_CONTRACT ||
+      reference?.contract !== (candidateArm
+        ? EXACT_CANDIDATE_SOURCE_CLI_CONTRACT
+        : EXACT_CANDIDATE_PACKAGE_CONTRACT) ||
       reference?.arm !== arm ||
+      typeof reference?.package_version !== "string" || !reference.package_version.trim() ||
       reference?.package_version !== expectedVersion ||
-      !SHA256_PATTERN.test(String(reference?.package_sha256 ?? "")) ||
-      /^0{64}$/.test(String(reference?.package_sha256 ?? "")) ||
+      (!candidateArm && (
+        !SHA256_PATTERN.test(String(reference?.package_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.package_sha256 ?? ""))
+      )) ||
       !SHA256_PATTERN.test(String(reference?.cli_sha256 ?? "")) ||
       /^0{64}$/.test(String(reference?.cli_sha256 ?? "")) ||
       !/^[0-9a-f]{40}$/.test(String(reference?.source_commit ?? "")) ||
@@ -11377,16 +11489,24 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       reference?.schema_version !== expectedSchema ||
       reference?.protocol_revision !== expectedProtocol ||
       invalidDiscoveryIdentity ||
-      reference?.trust_root_kind !== (arm === "published_0_17_4"
-        ? "official_published_checksum"
-        : "immutable_candidate_receipt") ||
-      !SHA256_PATTERN.test(String(reference?.trust_root_sha256 ?? "")) ||
-      /^0{64}$/.test(String(reference?.trust_root_sha256 ?? ""));
+      (!candidateArm && (
+        reference?.trust_root_kind !== "official_published_checksum" ||
+        !SHA256_PATTERN.test(String(reference?.trust_root_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.trust_root_sha256 ?? ""))
+      )) ||
+      (candidateArm && (
+        !SHA256_PATTERN.test(String(reference?.plugin_manifest_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.plugin_manifest_sha256 ?? "")) ||
+        !SHA256_PATTERN.test(String(reference?.catalog_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.catalog_sha256 ?? ""))
+      ));
     const invalid = invalidReference || identities.some((identity) =>
       !identity || identityFields.some((field) => identity[field] !== reference[field])
     );
     if (invalid) {
-      reasons.push(`${arm === "candidate_0_18" ? "candidate" : "published"} package identity mismatch`);
+      reasons.push(arm === "candidate_0_18"
+        ? "candidate source/CLI identity mismatch"
+        : "published package identity mismatch");
     }
   }
 
