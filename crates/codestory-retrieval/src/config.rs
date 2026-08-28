@@ -454,7 +454,7 @@ fn retrieval_runtime_config(
             1,
             2048,
         )
-        .unwrap_or(256),
+        .unwrap_or(1024),
         stream_pending_docs: default_optional_bool(
             defaults,
             "CODESTORY_SEMANTIC_STREAM_PENDING_DOCS",
