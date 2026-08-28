@@ -92,21 +92,54 @@ pub(crate) fn reference_file(source: &Path, destination: &Path) -> Result<bool> 
             }
             Ok(true)
         }
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
-            ) || error.raw_os_error().is_some_and(|code| {
-                matches!(
-                    code,
-                    libc::EXDEV | libc::EPERM | libc::EOPNOTSUPP | libc::EINVAL
-                )
-            }) =>
-        {
-            Ok(false)
-        }
+        Err(error) if hard_link_unavailable(&error) => Ok(false),
         Err(error) => Err(error).context("reference immutable component with a hard link"),
     }
+}
+
+fn hard_link_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::CrossesDevices
+            | std::io::ErrorKind::InvalidInput
+    ) || hard_link_unavailable_raw(error.raw_os_error())
+}
+
+#[cfg(unix)]
+fn hard_link_unavailable_raw(code: Option<i32>) -> bool {
+    code.is_some_and(|code| {
+        matches!(
+            code,
+            libc::EXDEV | libc::EPERM | libc::EOPNOTSUPP | libc::EINVAL
+        )
+    })
+}
+
+#[cfg(windows)]
+fn hard_link_unavailable_raw(code: Option<i32>) -> bool {
+    // Win32 errors are not errno values. In particular, ERROR_NOT_SUPPORTED
+    // currently maps to ErrorKind::Uncategorized, so retain the native codes
+    // required by the complete-build fallback.
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_NOT_SAME_DEVICE: i32 = 17;
+    const ERROR_NOT_SUPPORTED: i32 = 50;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    matches!(
+        code,
+        Some(
+            ERROR_ACCESS_DENIED
+                | ERROR_NOT_SAME_DEVICE
+                | ERROR_NOT_SUPPORTED
+                | ERROR_INVALID_PARAMETER
+        )
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hard_link_unavailable_raw(_code: Option<i32>) -> bool {
+    false
 }
 
 pub(crate) fn make_file_immutable(path: &Path) -> Result<()> {
@@ -358,6 +391,32 @@ mod tests {
                 .permissions()
                 .readonly()
         );
+    }
+
+    #[test]
+    fn hard_link_unavailable_uses_portable_error_kinds() {
+        for kind in [
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::CrossesDevices,
+            std::io::ErrorKind::InvalidInput,
+        ] {
+            assert!(hard_link_unavailable(&std::io::Error::from(kind)));
+        }
+        assert!(!hard_link_unavailable(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hard_link_failures_map_to_portable_error_kinds() {
+        for code in [5, 17, 50, 87] {
+            assert!(
+                hard_link_unavailable(&std::io::Error::from_raw_os_error(code)),
+                "Windows error {code} must retain the complete-build fallback"
+            );
+        }
     }
 
     #[test]
