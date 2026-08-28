@@ -35,6 +35,16 @@ const MAX_PLUGIN_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const PROCESS_TIMEOUT_MS = 10 * 60 * 1000;
 const CODEX_MARKETPLACE = "RoutingCandidate";
 const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+const CODESTORY_MCP_ENV_VARS = Object.freeze([
+  "CODESTORY_PLUGIN_DATA",
+  "PLUGIN_DATA",
+  "CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256",
+  "CODESTORY_EMBED_QUALIFICATION_DIR",
+  "CODESTORY_EMBED_QUALIFICATION_NONCE",
+  "CODESTORY_CACHE_ROOT",
+  "CODESTORY_STDIO_CACHE_ROOT",
+  "CODESTORY_EMBED_MODEL_SOURCE",
+]);
 const PINNED_CODEX_CONFIG = Object.freeze([
   'approval_policy="never"',
   'model_reasoning_effort="xhigh"',
@@ -171,18 +181,28 @@ export function buildRoutingHostCommand({
   executable,
   projectRoot,
   pluginRoot,
+  installedPluginRoot = null,
   codexHome = null,
   model,
   prompt,
 }) {
   if (host === "codex") {
     if (!codexHome) fail("Codex qualification requires an isolated CODEX_HOME");
+    if (!installedPluginRoot) fail("Codex qualification requires the installed plugin root");
     if (!model) fail("Codex qualification requires a pinned model");
+    const codestoryMcpConfig = [
+      `mcp_servers.codestory.command=${JSON.stringify("node")}`,
+      `mcp_servers.codestory.args=${JSON.stringify(["./scripts/codestory-mcp.cjs"])}`,
+      `mcp_servers.codestory.cwd=${JSON.stringify(installedPluginRoot)}`,
+      `mcp_servers.codestory.env_vars=${JSON.stringify(CODESTORY_MCP_ENV_VARS)}`,
+      `mcp_servers.codestory.default_tools_approval_mode=${JSON.stringify("approve")}`,
+    ];
     return {
       command: executable,
       args: [
         "exec", "--json", "--ephemeral",
         ...PINNED_CODEX_CONFIG.flatMap((value) => ["--config", value]),
+        ...codestoryMcpConfig.flatMap((value) => ["--config", value]),
         "--sandbox", "workspace-write", "--cd", projectRoot, "--model", model, "-",
       ],
       stdin: prompt,
@@ -1037,6 +1057,7 @@ async function main(argv) {
         executable: host === "codex" ? (options.codex_command ?? "codex") : (options.cursor_command ?? "cursor-agent"),
         projectRoot,
         pluginRoot: authenticated.pluginRoot,
+        installedPluginRoot,
         codexHome,
         model: host === "codex" ? (options.codex_model ?? DEFAULT_CODEX_MODEL) : options.cursor_model,
         prompt: entry.request.text,

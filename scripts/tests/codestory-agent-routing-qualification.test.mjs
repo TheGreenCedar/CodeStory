@@ -36,6 +36,7 @@ test("qualification host commands use official isolated Codex and Cursor session
     executable: "codex",
     projectRoot: "/fixture/project",
     pluginRoot: "/fixture/plugin",
+    installedPluginRoot: "/fixture/codex-home/plugins/codestory",
     codexHome: "/fixture/codex-home",
     model: "gpt-fixture",
     prompt: "fixture prompt",
@@ -49,10 +50,16 @@ test("qualification host commands use official isolated Codex and Cursor session
     "--config", 'personality="pragmatic"',
     "--config", 'model_verbosity="low"',
     "--config", 'features.remote_plugin=false',
+    "--config", 'mcp_servers.codestory.command="node"',
+    "--config", 'mcp_servers.codestory.args=["./scripts/codestory-mcp.cjs"]',
+    "--config", 'mcp_servers.codestory.cwd="/fixture/codex-home/plugins/codestory"',
+    "--config", 'mcp_servers.codestory.env_vars=["CODESTORY_PLUGIN_DATA","PLUGIN_DATA","CODESTORY_PLUGIN_CANDIDATE_ARCHIVE_SHA256","CODESTORY_EMBED_QUALIFICATION_DIR","CODESTORY_EMBED_QUALIFICATION_NONCE","CODESTORY_CACHE_ROOT","CODESTORY_STDIO_CACHE_ROOT","CODESTORY_EMBED_MODEL_SOURCE"]',
+    "--config", 'mcp_servers.codestory.default_tools_approval_mode="approve"',
     "--sandbox", "workspace-write", "--cd", "/fixture/project", "--model", "gpt-fixture", "-",
   ]);
   assert.equal(codex.stdin, "fixture prompt");
   assert.equal(codex.env.CODEX_HOME, "/fixture/codex-home");
+  assert.equal(codex.args.filter((value) => value.startsWith("mcp_servers.")).length, 5);
 
   const cursorAgent = buildRoutingHostCommand({
     host: "cursor",
@@ -87,6 +94,16 @@ test("qualification host commands use official isolated Codex and Cursor session
     model: "gpt-5.6-sol-high",
     prompt: "fixture prompt",
   }), /Cursor qualification requires a Composer model/u);
+
+  assert.throws(() => buildRoutingHostCommand({
+    host: "codex",
+    executable: "codex",
+    projectRoot: "/fixture/project",
+    pluginRoot: "/fixture/plugin",
+    codexHome: "/fixture/codex-home",
+    model: "gpt-fixture",
+    prompt: "fixture prompt",
+  }), /Codex qualification requires the installed plugin root/u);
 
   assert.deepEqual(buildCodexPluginInstallCommand({
     executable: "codex", codexHome: "/fixture/codex-home", pluginRoot: "/fixture/plugin",
