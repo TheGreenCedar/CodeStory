@@ -13,6 +13,9 @@
   packet fields fail as invalid arguments, and packet no longer accepts
   `include_evidence` or `--no-evidence`.
 - TypeScript and JavaScript config files can now be indexed when they use JSONC comments or trailing commas. Ordinary JSON stays strict, and malformed config changes leave the previous complete index available.
+- Full-coverage cold indexing sends more documents through each bounded
+  embedding request, reducing client/server overhead without changing the
+  model, dense coverage, stored vectors, or search ranking.
 
 ## 0.17.4
 
