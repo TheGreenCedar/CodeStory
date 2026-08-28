@@ -46,10 +46,16 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 thread_local! {
-    static FINALIZE_PHASE_TIMINGS: std::cell::RefCell<Option<(Instant, Vec<FinalizePhaseTiming>)>> =
+    static FINALIZE_PHASE_TIMINGS: std::cell::RefCell<Option<(Instant, Vec<AccumulatedPhaseTiming>)>> =
         const { std::cell::RefCell::new(None) };
     static FINALIZE_COMPONENT_WORK: std::cell::RefCell<Vec<FinalizeComponentWork>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Debug)]
+struct AccumulatedPhaseTiming {
+    phase: String,
+    elapsed: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,14 +150,18 @@ fn finish_finalize_component_work() -> Vec<FinalizeComponentWork> {
     FINALIZE_COMPONENT_WORK.with(|state| std::mem::take(&mut *state.borrow_mut()))
 }
 
-fn record_finalize_phase_timing(phase: &'static str, elapsed: Duration) {
+pub(crate) fn record_finalize_phase_timing(phase: &'static str, elapsed: Duration) {
     let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     FINALIZE_PHASE_TIMINGS.with(|state| {
         if let Some((_, timings)) = state.borrow_mut().as_mut() {
-            timings.push(FinalizePhaseTiming {
-                phase: phase.to_string(),
-                elapsed_ms,
-            });
+            if let Some(timing) = timings.iter_mut().find(|timing| timing.phase == phase) {
+                timing.elapsed = timing.elapsed.saturating_add(elapsed);
+            } else {
+                timings.push(AccumulatedPhaseTiming {
+                    phase: phase.to_string(),
+                    elapsed,
+                });
+            }
         }
     });
     info!(phase, elapsed_ms, "retrieval finalization phase completed");
@@ -159,20 +169,65 @@ fn record_finalize_phase_timing(phase: &'static str, elapsed: Duration) {
 
 fn finish_finalize_phase_timings() -> Vec<FinalizePhaseTiming> {
     FINALIZE_PHASE_TIMINGS.with(|state| {
-        let Some((started, mut timings)) = state.borrow_mut().take() else {
+        let Some((started, mut accumulated)) = state.borrow_mut().take() else {
             return Vec::new();
         };
-        let total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let attributed = timings
+        let vector_total = accumulated
             .iter()
-            .map(|timing| timing.elapsed_ms)
-            .fold(0_u64, u64::saturating_add);
+            .filter(|timing| {
+                matches!(
+                    timing.phase.as_str(),
+                    "embedded vectors" | "incremental embedded vectors"
+                )
+            })
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        let vector_subphases = accumulated
+            .iter()
+            .filter(|timing| timing.phase.starts_with("vector "))
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        if !vector_total.is_zero() {
+            accumulated.push(AccumulatedPhaseTiming {
+                phase: "vector ipc and orchestration".to_string(),
+                elapsed: vector_total.saturating_sub(vector_subphases),
+            });
+        }
+        let attributed = accumulated
+            .iter()
+            .filter(|timing| !timing.phase.starts_with("vector "))
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        let total = started.elapsed();
+        let mut timings = accumulated
+            .into_iter()
+            .map(|timing| FinalizePhaseTiming {
+                phase: timing.phase,
+                elapsed_ms: u64::try_from(timing.elapsed.as_millis()).unwrap_or(u64::MAX),
+            })
+            .collect::<Vec<_>>();
         timings.push(FinalizePhaseTiming {
             phase: "unattributed".to_string(),
-            elapsed_ms: total_ms.saturating_sub(attributed),
+            elapsed_ms: u64::try_from(total.saturating_sub(attributed).as_millis())
+                .unwrap_or(u64::MAX),
         });
         timings
     })
+}
+
+fn record_embedding_vector_timings(timings: crate::per_user_embedding::EmbeddingVectorTimings) {
+    record_finalize_phase_timing(
+        "vector tokenization",
+        Duration::from_nanos(timings.tokenization_ns),
+    );
+    record_finalize_phase_timing(
+        "vector native encode",
+        Duration::from_nanos(timings.native_encode_ns),
+    );
+    record_finalize_phase_timing(
+        "vector normalization",
+        Duration::from_nanos(timings.normalization_ns),
+    );
 }
 
 /// Typed signal that source-derived retrieval input drifted during preparation.
@@ -1471,15 +1526,19 @@ fn ensure_semantic_index(
                             .iter()
                             .map(|anchor| anchor.text.clone())
                             .collect::<Vec<_>>();
-                        let vectors = if texts.is_empty() {
-                            Vec::new()
+                        let (vectors, timings) = if texts.is_empty() {
+                            (
+                                Vec::new(),
+                                crate::per_user_embedding::EmbeddingVectorTimings::default(),
+                            )
                         } else {
                             client
-                                .embed_documents_with_control(&texts, None, &|| {
+                                .embed_documents_with_control_and_timings(&texts, None, &|| {
                                     cancelled.load(Ordering::Acquire)
                                 })
                                 .context("embed pinned dense anchor batch")?
                         };
+                        record_embedding_vector_timings(timings);
                         ensure_retrieval_index_not_cancelled(
                             cancelled,
                             "persisting an embedding batch",
@@ -1491,10 +1550,17 @@ fn ensure_semantic_index(
                                 missing.len()
                             );
                         }
-                        let mut embedded =
-                            missing.into_iter().zip(vectors).map(|(anchor, vector)| {
-                                Ok::<_, anyhow::Error>((anchor.node_id, normalize_vector(vector)?))
-                            });
+                        let mut normalized = Vec::with_capacity(vectors.len());
+                        let normalization_started = Instant::now();
+                        for (anchor, vector) in missing.into_iter().zip(vectors) {
+                            let vector = normalize_vector(vector)?;
+                            normalized.push((anchor.node_id, vector));
+                        }
+                        record_finalize_phase_timing(
+                            "vector normalization",
+                            normalization_started.elapsed(),
+                        );
+                        let mut embedded = normalized.into_iter().map(Ok::<_, anyhow::Error>);
                         let mut next_embedded = embedded.next().transpose()?;
                         for anchor in batch {
                             ensure_retrieval_index_not_cancelled(
@@ -1630,9 +1696,12 @@ fn produce_missing_dense_anchors(
             .iter()
             .map(|anchor| anchor.text.clone())
             .collect::<Vec<_>>();
-        let vectors = client
-            .embed_documents_with_control(&texts, None, &|| cancelled.load(Ordering::Acquire))
+        let (vectors, timings) = client
+            .embed_documents_with_control_and_timings(&texts, None, &|| {
+                cancelled.load(Ordering::Acquire)
+            })
             .context("embed changed dense anchor batch")?;
+        record_embedding_vector_timings(timings);
         ensure_retrieval_index_not_cancelled(
             cancelled,
             "persisting an incremental embedding batch",
@@ -1644,7 +1713,13 @@ fn produce_missing_dense_anchors(
                 batch.len()
             );
         }
-        for (anchor, vector) in batch.iter().zip(vectors) {
+        let normalization_started = Instant::now();
+        let normalized = vectors
+            .into_iter()
+            .map(normalize_vector)
+            .collect::<Result<Vec<_>>>()?;
+        record_finalize_phase_timing("vector normalization", normalization_started.elapsed());
+        for (anchor, vector) in batch.iter().zip(normalized) {
             visit(AttestedSemanticPoint {
                 point: SemanticPoint {
                     display_name: anchor
@@ -1655,7 +1730,7 @@ fn produce_missing_dense_anchors(
                     file_path: anchor.file_path.clone(),
                     file_role: Some(anchor.file_role),
                     dense_reason: Some(anchor.selection_reason.clone()),
-                    vector: normalize_vector(vector)?,
+                    vector,
                 },
                 document_hash: anchor.document_hash.clone(),
             })?;
@@ -2891,6 +2966,87 @@ mod tests {
         assert_eq!(work[0].predecessor_bytes, Some(1_024));
         assert_eq!(work[0].output_bytes, Some(1_100));
         assert_eq!(work[0].attested_bytes, Some(1_100));
+    }
+
+    #[test]
+    fn vector_subphases_reconcile_without_double_counting_the_total() {
+        begin_finalize_phase_timings();
+        record_finalize_phase_timing("embedded vectors", Duration::from_millis(100));
+        record_finalize_phase_timing("vector tokenization", Duration::from_millis(10));
+        record_finalize_phase_timing("vector native encode", Duration::from_millis(40));
+        record_finalize_phase_timing("vector normalization", Duration::from_millis(5));
+        record_finalize_phase_timing("vector sqlite persistence", Duration::from_millis(20));
+        record_finalize_phase_timing("vector hashing", Duration::from_millis(5));
+        record_finalize_phase_timing("vector final validation", Duration::from_millis(10));
+
+        let timings = finish_finalize_phase_timings();
+        let remainder = timings
+            .iter()
+            .find(|timing| timing.phase == "vector ipc and orchestration")
+            .expect("vector timing remainder");
+
+        assert_eq!(remainder.elapsed_ms, 10);
+        assert_eq!(
+            timings
+                .iter()
+                .find(|timing| timing.phase == "unattributed")
+                .expect("top-level remainder")
+                .elapsed_ms,
+            0,
+            "nested vector subphases must not be subtracted from the top-level clock twice"
+        );
+    }
+
+    #[test]
+    fn vector_publication_reports_persistence_hashing_and_validation_subphases() {
+        let directory = TempDir::new().expect("vector timing directory");
+        let layout = SidecarLayout {
+            lexical_data_dir: directory.path().join("lexical"),
+            semantic_data_dir: directory.path().join("semantic"),
+            scip_artifacts_root: directory.path().join("scip"),
+            state_file: directory.path().join("state.json"),
+        };
+        let contract = VectorEvidenceContract::new("backend", 2, "producer", "evidence");
+        let expected = vec![ExpectedVectorAnchor {
+            node_id: "node-1".into(),
+            document_hash: "document-1".into(),
+        }];
+
+        begin_finalize_phase_timings();
+        EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "collection",
+            "generation",
+            "input",
+            &contract,
+            &expected,
+            |visit| {
+                visit(AttestedSemanticPoint {
+                    point: SemanticPoint {
+                        display_name: "symbol".into(),
+                        node_id: "node-1".into(),
+                        file_path: Some("src/lib.rs".into()),
+                        file_role: Some(FileRole::Source),
+                        dense_reason: Some("public_api".into()),
+                        vector: vec![1.0, 0.0],
+                    },
+                    document_hash: "document-1".into(),
+                })
+            },
+        )
+        .expect("publish vector database");
+        let timings = finish_finalize_phase_timings();
+
+        for phase in [
+            "vector sqlite persistence",
+            "vector hashing",
+            "vector final validation",
+        ] {
+            assert!(
+                timings.iter().any(|timing| timing.phase == phase),
+                "missing vector construction phase {phase}: {timings:?}"
+            );
+        }
     }
 
     #[test]

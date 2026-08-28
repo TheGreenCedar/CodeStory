@@ -729,85 +729,8 @@ fn dense_policy_skips_private_trivial_helpers() {
 }
 
 #[test]
-fn dense_policy_does_not_treat_the_generic_src_directory_as_a_public_api() {
-    let path = "src/networking.c";
-    let node = semantic_policy_node(11, NodeKind::FUNCTION, "process_command", 1);
-    let context = semantic_policy_context(path, &node);
-
-    assert!(!semantic_file_is_package_callable_surface(Some(path)));
-    assert_eq!(
-        dense_anchor_reason_for_node(
-            &context,
-            &node,
-            "process_command",
-            Some(path),
-            "semantic_doc_version: 9\nsymbol: process_command\n",
-            None,
-        ),
-        None,
-        "ordinary implementation callables remain available to lexical and graph retrieval"
-    );
-    assert_eq!(
-        dense_anchor_reason_for_node(
-            &context,
-            &node,
-            "process_command",
-            Some(path),
-            "semantic_doc_version: 9\nsymbol: process_command\n",
-            Some(AccessKind::Public),
-        ),
-        None,
-        "access metadata alone does not turn a generic source directory into a package surface"
-    );
-
-    let entrypoint = semantic_policy_node(12, NodeKind::FUNCTION, "main", 1);
-    let entrypoint_context = semantic_policy_context("src/main.c", &entrypoint);
-    assert_eq!(
-        dense_anchor_reason_for_node(
-            &entrypoint_context,
-            &entrypoint,
-            "main",
-            Some("src/main.c"),
-            "semantic_doc_version: 9\nsymbol: main\n",
-            None,
-        ),
-        Some(DenseAnchorReason::Entrypoint),
-        "the entrypoint policy remains independent of package-surface selection"
-    );
-
-    let preprocessor_definition = semantic_policy_node(13, NodeKind::ANNOTATION, "REDIS_STATIC", 1);
-    assert_eq!(
-        dense_anchor_reason_for_node(
-            &context,
-            &preprocessor_definition,
-            "REDIS_STATIC",
-            Some("src/server.h"),
-            "semantic_doc_version: 9\nsymbol: REDIS_STATIC\n",
-            Some(AccessKind::Public),
-        ),
-        None,
-        "C preprocessor definitions are not public APIs merely because C has no private access"
-    );
-
-    let java_annotation = semantic_policy_node(14, NodeKind::ANNOTATION, "StableApi", 1);
-    assert_eq!(
-        dense_anchor_reason_for_node(
-            &context,
-            &java_annotation,
-            "StableApi",
-            Some("app/src/main/java/com/acme/StableApi.java"),
-            "semantic_doc_version: 9\nsymbol: StableApi\n",
-            Some(AccessKind::Public),
-        ),
-        Some(DenseAnchorReason::PublicApi),
-        "annotation declarations on an explicit public package surface remain dense"
-    );
-}
-
-#[test]
 fn package_callable_surfaces_accept_relative_roots_without_admitting_tests() {
-    {
-        let path = "lib/application.js";
+    for path in ["lib/application.js", "src/server.js"] {
         assert!(semantic_file_is_package_callable_surface(Some(path)));
 
         let node = semantic_policy_node(11, NodeKind::FUNCTION, "handle", 1);

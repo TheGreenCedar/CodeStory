@@ -263,9 +263,13 @@ pub(crate) struct CollectedResolutionInputs {
     pub file: Option<CachedResolutionFile>,
 }
 
+// Keep the raw byte hash explicit beside the decoded parser input: combining either
+// with another argument would blur the proof provenance boundary this collector owns.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_call_resolution_inputs(
     tree: &Tree,
     source: &str,
+    raw_source_sha256: &str,
     source_path: &Path,
     language: &str,
     parser_fingerprint: &str,
@@ -280,7 +284,7 @@ pub(crate) fn collect_call_resolution_inputs(
     }
     let complete = !tree.root_node().has_error();
     let mut lookup_input_complete = complete;
-    let source_sha256 = source_content_hash(source.as_bytes());
+    let source_sha256 = raw_source_sha256.to_string();
     let javascript_index = is_javascript_language(language).then(|| {
         JavascriptResolutionIndex::build(tree, source, source_path, language, file_id, nodes)
     });
@@ -4026,19 +4030,24 @@ fn c_cpp_sort_calls_by_span(calls: &mut Vec<IndexedCCppCall<'_>>) {
     }
 }
 
-fn expected_parser_config(path: &Path, language: &str) -> Option<crate::LanguageConfig> {
-    let extension = path.extension()?.to_str()?;
-    let config = crate::get_language_for_ext(extension)?;
-    if config.language_name == language {
-        return Some(config);
+fn parser_config_for_indexed_language(
+    path: &Path,
+    selected_language: &str,
+) -> Option<crate::LanguageConfig> {
+    let extension = crate::normalized_path_extension(path)?;
+    let extension_config = crate::get_language_for_ext(&extension)?;
+    if extension_config.language_name == selected_language {
+        return Some(extension_config);
     }
-    (language == "cpp" && crate::path_is_c_header(path)).then(crate::cpp_language_config)
+
+    (extension == "h" && selected_language == "cpp").then(crate::cpp_language_config)
 }
 
 pub(crate) fn cached_resolution_inputs_are_current(
     artifact: &CachedIndexArtifact,
     language: &str,
     expected_parser_fingerprint: &str,
+    expected_source_sha256: &str,
 ) -> bool {
     !is_installed_language(language)
         || (artifact.resolution_input_schema_version == RESOLUTION_INPUT_SCHEMA_VERSION
@@ -4046,10 +4055,12 @@ pub(crate) fn cached_resolution_inputs_are_current(
                 file.language == language
                     && file.adapter_version == adapter_version(language)
                     && file.parser_fingerprint == expected_parser_fingerprint
+                    && file.source_sha256 == expected_source_sha256
                     && artifact.call_resolution_inputs.iter().all(|call| {
                         call.language == language
                             && call.adapter_version == adapter_version(language)
                             && call.parser_fingerprint == expected_parser_fingerprint
+                            && call.callsite.source_sha256 == expected_source_sha256
                     })
             }))
 }
@@ -13317,7 +13328,7 @@ pub fn rematerialize_proof_resolution_projection(
                     indexed_file.path.display()
                 )
             })?;
-        let expected_parser_config = expected_parser_config(
+        let expected_parser_config = parser_config_for_indexed_language(
             &indexed_file.path,
             &indexed_file.language,
         )
@@ -13416,6 +13427,7 @@ pub fn rematerialize_proof_resolution_projection(
                 let regenerated = collect_call_resolution_inputs(
                     &tree,
                     source,
+                    stored_hash,
                     &indexed_file.path,
                     &indexed_file.language,
                     &expected_parser_fingerprint,

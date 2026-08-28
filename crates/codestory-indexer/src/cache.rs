@@ -863,11 +863,12 @@ mod tests {
                 &decoded,
                 "typescript",
                 &"0".repeat(64),
+                &"0".repeat(64),
             )
         );
         assert!(
             !crate::proof_resolution::cached_resolution_inputs_are_current(
-                &decoded, "go", "unused",
+                &decoded, "go", "unused", "unused",
             ),
             "a legacy cache without proof inputs cannot satisfy the installed Go adapter"
         );

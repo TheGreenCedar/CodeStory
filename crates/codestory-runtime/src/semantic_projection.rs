@@ -2507,6 +2507,7 @@ pub(super) fn dense_anchor_public_kind(kind: codestory_contracts::graph::NodeKin
         codestory_contracts::graph::NodeKind::STRUCT
             | codestory_contracts::graph::NodeKind::CLASS
             | codestory_contracts::graph::NodeKind::INTERFACE
+            | codestory_contracts::graph::NodeKind::ANNOTATION
             | codestory_contracts::graph::NodeKind::UNION
             | codestory_contracts::graph::NodeKind::ENUM
             | codestory_contracts::graph::NodeKind::TYPEDEF
@@ -2549,6 +2550,7 @@ pub(super) fn semantic_file_is_package_callable_surface(path: Option<&str>) -> b
         matches!(
             segment,
             "lib"
+                | "src"
                 | "pkg"
                 | "packages"
                 | "routes"
@@ -2598,11 +2600,6 @@ fn base_dense_anchor_reason_for_node(
     if dense_anchor_public_kind(node.kind)
         && (matches!(access, Some(AccessKind::Public | AccessKind::Protected))
             || semantic_file_is_public_surface(file_path))
-    {
-        return Some(DenseAnchorReason::PublicApi);
-    }
-    if node.kind == codestory_contracts::graph::NodeKind::ANNOTATION
-        && semantic_file_is_public_surface(file_path)
     {
         return Some(DenseAnchorReason::PublicApi);
     }

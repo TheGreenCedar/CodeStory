@@ -9,10 +9,11 @@ use super::{
     EmbeddingCompatibility, EmbeddingConnectIntent, EmbeddingConnectOutcome,
     EmbeddingEngineIdentity, EmbeddingEngineLeaseIdentity, EmbeddingExecutableIdentity,
     EmbeddingOperation, EmbeddingResult, EmbeddingServerSnapshot, EmbeddingServerStream,
-    PerUserEmbeddingError, arm_exchange_deadline, decode_vectors, duration_ms, elapsed_since,
-    embedding_scope_id, exchange, hello, is_server_loss, positive_duration_ms, request,
-    response_result, validate_engine_identity, validate_engine_server_identity,
-    validate_lease_server_identity, validate_same_server, validate_server_snapshot, vectors_result,
+    EmbeddingVectorTimings, PerUserEmbeddingError, arm_exchange_deadline, decode_vectors,
+    duration_ms, elapsed_since, embedding_scope_id, exchange, hello, is_server_loss,
+    positive_duration_ms, request, response_result, validate_engine_identity,
+    validate_engine_server_identity, validate_lease_server_identity, validate_same_server,
+    validate_server_snapshot, vectors_result,
 };
 use crate::config::SidecarRuntimeConfig;
 use crate::embedding_contract::normalize_and_validate_vectors;
@@ -288,7 +289,7 @@ impl PerUserEmbeddingClient {
                 input: text.to_string(),
             },
         )?;
-        let (rows, columns, identity, payload) = vectors_result(result)?;
+        let (rows, columns, identity, _, payload) = vectors_result(result)?;
         if rows != 1 {
             bail!("embedding_vector_row_count_mismatch: expected=1 observed={rows}");
         }
@@ -330,7 +331,7 @@ impl PerUserEmbeddingClient {
                 inputs: texts.to_vec(),
             },
         )?;
-        let (rows, columns, identity, payload) = vectors_result(result)?;
+        let (rows, columns, identity, _, payload) = vectors_result(result)?;
         if rows as usize != texts.len() {
             bail!(
                 "embedding_vector_row_count_mismatch: expected={} observed={rows}",
@@ -352,7 +353,17 @@ impl PerUserEmbeddingClient {
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Vec<Vec<f32>>> {
         self.embed_documents_with_control_and_attempts(texts, maximum_timeout, cancelled)
-            .map(|(vectors, _)| vectors)
+            .map(|(vectors, _, _)| vectors)
+    }
+
+    pub(crate) fn embed_documents_with_control_and_timings(
+        &self,
+        texts: &[String],
+        maximum_timeout: Option<Duration>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(Vec<Vec<f32>>, EmbeddingVectorTimings)> {
+        self.embed_documents_with_control_and_attempts(texts, maximum_timeout, cancelled)
+            .map(|(vectors, _, timings)| (vectors, timings))
     }
 
     pub(super) fn embed_documents_with_qualification_attempts(
@@ -360,6 +371,7 @@ impl PerUserEmbeddingClient {
         texts: &[String],
     ) -> Result<(Vec<Vec<f32>>, Vec<EmbeddingQualificationAttemptResult>)> {
         self.embed_documents_with_control_and_attempts(texts, None, &|| false)
+            .map(|(vectors, attempts, _)| (vectors, attempts))
     }
 
     fn embed_documents_with_control_and_attempts(
@@ -367,9 +379,13 @@ impl PerUserEmbeddingClient {
         texts: &[String],
         maximum_timeout: Option<Duration>,
         cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> Result<(Vec<Vec<f32>>, Vec<EmbeddingQualificationAttemptResult>)> {
+    ) -> Result<(
+        Vec<Vec<f32>>,
+        Vec<EmbeddingQualificationAttemptResult>,
+        EmbeddingVectorTimings,
+    )> {
         if texts.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok((Vec::new(), Vec::new(), EmbeddingVectorTimings::default()));
         }
         validate_raw_inputs(texts)?;
         let budgets = self.transport.budgets();
@@ -385,7 +401,7 @@ impl PerUserEmbeddingClient {
                 inputs: texts.to_vec(),
             },
         )?;
-        let (rows, columns, identity, payload) = vectors_result(result)?;
+        let (rows, columns, identity, mut timings, payload) = vectors_result(result)?;
         if rows as usize != texts.len() {
             bail!(
                 "embedding_vector_row_count_mismatch: expected={} observed={rows}",
@@ -393,10 +409,12 @@ impl PerUserEmbeddingClient {
             );
         }
         validate_engine_identity(&identity, &self.compatibility)?;
-        Ok((
-            normalize_and_validate_vectors(decode_vectors(rows, columns, &payload)?)?,
-            attempts,
-        ))
+        let normalization_started = Instant::now();
+        let vectors = normalize_and_validate_vectors(decode_vectors(rows, columns, &payload)?)?;
+        timings.normalization_ns = timings.normalization_ns.saturating_add(
+            u64::try_from(normalization_started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        );
+        Ok((vectors, attempts, timings))
     }
 
     pub fn ensure_resident(&self) -> Result<EmbeddingEngineIdentity> {
