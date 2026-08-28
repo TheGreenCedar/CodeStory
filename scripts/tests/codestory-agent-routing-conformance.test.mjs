@@ -1841,6 +1841,10 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     join(pluginRoot, "skills", "codestory-grounding", "agents", "openai.yaml"),
     "utf8",
   );
+  const searchReference = await readFile(
+    join(pluginRoot, "skills", "codestory-grounding", "references", "search.md"),
+    "utf8",
+  );
   for (const [label, guidance] of [["skill", skill], ["Cursor rule", cursorRule]]) {
     assert.match(guidance, /discovery leads?.*`search`/isu, label);
     assert.match(guidance, /successful search.*stop.*(?:do not|never).*source/isu, label);
@@ -1857,6 +1861,8 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
   assert.match(openAiMetadata, /unknown.*not absence/isu);
   assert.match(openAiMetadata, /typed `Unavailable`.*terminal/isu);
   assert.match(openAiMetadata, /transport.*tool absence.*source/isu);
+  assert.match(skill, /omit optional numeric bounds.*generated schema/isu);
+  assert.match(searchReference, /limit.*1.*50/isu);
 });
 
 test("static parity rejects substituted bytes invalid or no-op hooks metadata drift and heading-only rules", async () => {

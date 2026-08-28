@@ -32,8 +32,9 @@ CLI flags. Every call requires `project` (absolute repository root).
   MCP `drill` tool.
 - `symbol`, `trail`, and `snippet` require a resolvable graph target. Semantic suggestions and repo-text hits can guide follow-up searches, but they are not promoted into graph targets by those commands.
 
-MCP `search` fields are `query`, `project`, optional `limit`, and optional
-`repo_text` (`auto`/`on`/`off`).
+MCP `search` fields are `query`, `project`, optional `limit` (`1..=50`), and
+optional `repo_text` (`auto`/`on`/`off`). Omit `limit` when the task does not
+require a narrower result page.
 
 ## Output
 

@@ -2454,6 +2454,10 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   const cursorMcp = await readJson(resolve(root, "mcp.cursor.json"), "Cursor MCP manifest");
   const canonicalSkillText = await readFile(resolve(root, "skills/codestory-grounding/SKILL.md"), "utf8");
   const openAiMetadataText = await readFile(resolve(root, "skills/codestory-grounding/agents/openai.yaml"), "utf8");
+  const searchReferenceText = await readFile(
+    resolve(root, "skills/codestory-grounding/references/search.md"),
+    "utf8",
+  );
   const launcherPath = resolve(root, expectedIdentity.launcher.relative_path);
   const launcherSha256 = await fileSha256(launcherPath);
 
@@ -2493,6 +2497,10 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
     fail("Cursor MCP metadata does not bind the canonical launcher resolver");
   }
   validateRoutingGuidance(canonicalSkillText, "canonical grounding skill");
+  if (!/omit optional numeric bounds.*generated schema/isu.test(canonicalSkillText)
+      || !/limit.*1.*50/isu.test(searchReferenceText)) {
+    fail("canonical grounding guidance is missing the bounded optional-argument contract");
+  }
   if (!/search.*context.*packet.*prove_call_path/isu.test(openAiMetadataText)
       || !/host-supplied/iu.test(openAiMetadataText)
       || !/unknown.*not absence/isu.test(openAiMetadataText)

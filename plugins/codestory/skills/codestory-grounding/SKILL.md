@@ -27,6 +27,8 @@ ceremony.
 
 1. Resolve the target repository root.
 2. Call the intended tool with `project=<absolute-root>`.
+   Omit optional numeric bounds unless the task requires one; when supplied,
+   keep them within the generated schema instead of guessing a generic page size.
 3. If the result says `state=preparing` or `state=updating` and includes
    `retry_after_ms`, wait for that delay and retry the same tool with the same
    arguments. The delay tracks observed preparation progress, so honor the
