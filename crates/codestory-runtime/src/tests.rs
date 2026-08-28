@@ -398,7 +398,7 @@ fn llm_doc_embed_batch_size_uses_throughput_default() {
     let _lock = process_env_test_lock();
     let _env = EnvGuard::remove(LLM_DOC_EMBED_BATCH_SIZE_ENV);
 
-    assert_eq!(llm_doc_embed_batch_size(), 128);
+    assert_eq!(llm_doc_embed_batch_size(), 1024);
 }
 
 #[test]

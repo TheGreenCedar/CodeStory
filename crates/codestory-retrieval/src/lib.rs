@@ -14,6 +14,7 @@ mod cache_clean;
 mod candidate;
 mod capabilities;
 mod config;
+mod content_addressed_vector_cache;
 mod copy_on_write;
 mod embedded_vector;
 mod embedding_contract;

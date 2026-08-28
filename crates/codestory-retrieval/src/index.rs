@@ -1,4 +1,5 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
+use crate::content_addressed_vector_cache::{ContentAddressedVectorCache, VectorCacheBatchInput};
 use crate::embedded_vector::{
     AttestedSemanticPoint, CurrentVectorAnchor, EmbeddedVectorIndex, ExpectedVectorAnchor,
     SemanticPoint, VectorEvidenceContract, VectorGenerationManifest,
@@ -1344,6 +1345,26 @@ fn ensure_semantic_index(
             }
         }
     });
+    let mut content_vector_cache = if reusable_point_count.is_none() {
+        match ContentAddressedVectorCache::open(
+            retention.runtime,
+            project_id,
+            &compatibility_identity,
+            dimension,
+        ) {
+            Ok(cache) => Some(cache),
+            Err(error) => {
+                warn!(
+                    project_id = %project_id,
+                    error = %format!("{error:#}"),
+                    "content-addressed vector reuse is unavailable"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let point_count = if let Some(point_count) = reusable_point_count {
         record_finalize_component_work("vectors", "reused", Some(point_count), Some(0), Some(0));
@@ -1388,6 +1409,7 @@ fn ensure_semantic_index(
                             missing,
                             retention.runtime,
                             cancelled,
+                            &mut content_vector_cache,
                             visit,
                         )
                     },
@@ -1496,6 +1518,10 @@ fn ensure_semantic_index(
                 "compatible unchanged vectors retained for candidate generation"
             );
         }
+        let ordered_anchors = canonical_dense_anchor_order(
+            anchors.iter().collect::<Vec<_>>(),
+            &mut content_vector_cache,
+        );
         let attestation = with_finalize_progress(progress, "embedded vectors", || {
             EmbeddedVectorIndex::build_attested_with_points_with_cancel(
                 crate::embedded_vector::AttestedVectorPublication {
@@ -1509,36 +1535,28 @@ fn ensure_semantic_index(
                 || ensure_retrieval_index_not_cancelled(cancelled, "vector database publication"),
                 |visit| {
                     let client = crate::embeddings::ProductEmbeddingClient::new(retention.runtime);
-                    for batch in
-                        anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
+                    for batch in ordered_anchors
+                        .chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
                     {
                         ensure_retrieval_index_not_cancelled(cancelled, "embedding batch")?;
                         let missing = batch
                             .iter()
-                            .filter(|anchor| {
+                            .filter(|cached| {
+                                let anchor = cached.anchor;
                                 !reusable_vectors.contains_key(&(
                                     anchor.node_id.0.to_string(),
                                     anchor.document_hash.clone(),
                                 ))
                             })
+                            .map(|cached| (*cached).clone())
                             .collect::<Vec<_>>();
-                        let texts = missing
-                            .iter()
-                            .map(|anchor| anchor.text.clone())
-                            .collect::<Vec<_>>();
-                        let (vectors, timings) = if texts.is_empty() {
-                            (
-                                Vec::new(),
-                                crate::per_user_embedding::EmbeddingVectorTimings::default(),
-                            )
-                        } else {
-                            client
-                                .embed_documents_with_control_and_timings(&texts, None, &|| {
-                                    cancelled.load(Ordering::Acquire)
-                                })
-                                .context("embed pinned dense anchor batch")?
-                        };
-                        record_embedding_vector_timings(timings);
+                        let vectors = resolve_dense_anchor_batch(
+                            &missing,
+                            &client,
+                            cancelled,
+                            &mut content_vector_cache,
+                            "embed pinned dense anchor batch",
+                        )?;
                         ensure_retrieval_index_not_cancelled(
                             cancelled,
                             "persisting an embedding batch",
@@ -1550,19 +1568,15 @@ fn ensure_semantic_index(
                                 missing.len()
                             );
                         }
-                        let mut normalized = Vec::with_capacity(vectors.len());
-                        let normalization_started = Instant::now();
-                        for (anchor, vector) in missing.into_iter().zip(vectors) {
-                            let vector = normalize_vector(vector)?;
-                            normalized.push((anchor.node_id, vector));
-                        }
-                        record_finalize_phase_timing(
-                            "vector normalization",
-                            normalization_started.elapsed(),
-                        );
+                        let normalized = missing
+                            .into_iter()
+                            .zip(vectors)
+                            .map(|(cached, vector)| (cached.anchor.node_id, vector))
+                            .collect::<Vec<_>>();
                         let mut embedded = normalized.into_iter().map(Ok::<_, anyhow::Error>);
                         let mut next_embedded = embedded.next().transpose()?;
-                        for anchor in batch {
+                        for cached in batch {
+                            let anchor = cached.anchor;
                             ensure_retrieval_index_not_cancelled(
                                 cancelled,
                                 "persisting an embedded vector",
@@ -1645,6 +1659,15 @@ fn ensure_semantic_index(
         )?;
         point_count
     };
+    if let Some(cache) = content_vector_cache.as_ref() {
+        let (hit_batches, miss_batches) = cache.activity();
+        info!(
+            project_id = %project_id,
+            hit_batches,
+            miss_batches,
+            "content-addressed vector batch reuse completed"
+        );
+    }
     snapshot
         .finish()
         .context("finish pinned dense anchor input generation")?;
@@ -1663,11 +1686,98 @@ fn ensure_semantic_index(
     Ok(point_count)
 }
 
+#[derive(Clone)]
+struct CacheableDenseAnchor<'a> {
+    anchor: &'a DenseAnchorInput,
+    identity: String,
+}
+
+fn canonical_dense_anchor_order<'a>(
+    anchors: Vec<&'a DenseAnchorInput>,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+) -> Vec<CacheableDenseAnchor<'a>> {
+    let mut current = anchors
+        .into_iter()
+        .map(|anchor| CacheableDenseAnchor {
+            anchor,
+            identity: stable_dense_anchor_identity(anchor),
+        })
+        .collect::<Vec<_>>();
+    let inputs = current
+        .iter()
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
+        })
+        .collect::<Vec<_>>();
+    let order = match content_vector_cache.as_mut() {
+        Some(cache) => cache.canonical_order(&inputs),
+        None => return current,
+    };
+    let order = match order {
+        Ok(order) => order,
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector corpus planning failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+            return current;
+        }
+    };
+    let mut available = current.drain(..).map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .map(|index| {
+            available
+                .get_mut(index)
+                .and_then(Option::take)
+                .expect("validated vector corpus order")
+        })
+        .collect()
+}
+
+fn stable_dense_anchor_identity(anchor: &DenseAnchorInput) -> String {
+    let mut digest = Sha256::new();
+    hash_part(&mut digest, "codestory-stable-dense-anchor-v2");
+    hash_part(&mut digest, &(anchor.kind as i32).to_string());
+    hash_optional_dense_anchor_part(&mut digest, anchor.file_path.as_deref());
+    hash_optional_dense_anchor_part(
+        &mut digest,
+        anchor
+            .start_line
+            .as_ref()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    hash_optional_dense_anchor_part(
+        &mut digest,
+        anchor
+            .end_line
+            .as_ref()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    format!("{:x}", digest.finalize())
+}
+
+fn hash_optional_dense_anchor_part(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_part(hasher, "some");
+            hash_part(hasher, value);
+        }
+        None => hash_part(hasher, "none"),
+    }
+}
+
 fn produce_missing_dense_anchors(
     anchors: &[DenseAnchorInput],
     missing: &[ExpectedVectorAnchor],
     runtime: &SidecarRuntimeConfig,
     cancelled: &AtomicBool,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
     visit: &mut dyn FnMut(AttestedSemanticPoint) -> Result<()>,
 ) -> Result<()> {
     let anchors_by_node = anchors
@@ -1689,19 +1799,17 @@ fn produce_missing_dense_anchors(
             Ok(*anchor)
         })
         .collect::<Result<Vec<_>>>()?;
+    let missing_anchors = canonical_dense_anchor_order(missing_anchors, content_vector_cache);
     let client = crate::embeddings::ProductEmbeddingClient::new(runtime);
     for batch in missing_anchors.chunks(runtime.retrieval.llm_doc_embed_batch_size.max(1)) {
         ensure_retrieval_index_not_cancelled(cancelled, "incremental embedding batch")?;
-        let texts = batch
-            .iter()
-            .map(|anchor| anchor.text.clone())
-            .collect::<Vec<_>>();
-        let (vectors, timings) = client
-            .embed_documents_with_control_and_timings(&texts, None, &|| {
-                cancelled.load(Ordering::Acquire)
-            })
-            .context("embed changed dense anchor batch")?;
-        record_embedding_vector_timings(timings);
+        let vectors = resolve_dense_anchor_batch(
+            batch,
+            &client,
+            cancelled,
+            content_vector_cache,
+            "embed changed dense anchor batch",
+        )?;
         ensure_retrieval_index_not_cancelled(
             cancelled,
             "persisting an incremental embedding batch",
@@ -1713,13 +1821,8 @@ fn produce_missing_dense_anchors(
                 batch.len()
             );
         }
-        let normalization_started = Instant::now();
-        let normalized = vectors
-            .into_iter()
-            .map(normalize_vector)
-            .collect::<Result<Vec<_>>>()?;
-        record_finalize_phase_timing("vector normalization", normalization_started.elapsed());
-        for (anchor, vector) in batch.iter().zip(normalized) {
+        for (cached, vector) in batch.iter().zip(vectors) {
+            let anchor = cached.anchor;
             visit(AttestedSemanticPoint {
                 point: SemanticPoint {
                     display_name: anchor
@@ -1737,6 +1840,87 @@ fn produce_missing_dense_anchors(
         }
     }
     Ok(())
+}
+
+fn resolve_dense_anchor_batch(
+    batch: &[CacheableDenseAnchor<'_>],
+    client: &crate::embeddings::ProductEmbeddingClient,
+    cancelled: &AtomicBool,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+    embedding_context: &'static str,
+) -> Result<Vec<Vec<f32>>> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cache_batch = batch
+        .iter()
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
+        })
+        .collect::<Vec<_>>();
+    let cache_started = Instant::now();
+    let cached = match content_vector_cache.as_mut() {
+        Some(cache) => cache.load_batch(&cache_batch),
+        None => Ok(None),
+    };
+    record_finalize_phase_timing("vector content cache", cache_started.elapsed());
+    match cached {
+        Ok(Some(vectors)) => return Ok(vectors),
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector cache read failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+        }
+    }
+
+    let texts = batch
+        .iter()
+        .map(|cached| cached.anchor.text.clone())
+        .collect::<Vec<_>>();
+    let (vectors, timings) = client
+        .embed_documents_with_control_and_timings(&texts, None, &|| {
+            cancelled.load(Ordering::Acquire)
+        })
+        .with_context(|| embedding_context)?;
+    record_embedding_vector_timings(timings);
+    ensure_retrieval_index_not_cancelled(cancelled, "normalizing an embedding batch")?;
+    if vectors.len() != batch.len() {
+        bail!(
+            "embedding engine returned {} vectors for {} anchors",
+            vectors.len(),
+            batch.len()
+        );
+    }
+    let normalization_started = Instant::now();
+    let normalized = vectors
+        .into_iter()
+        .map(normalize_vector)
+        .collect::<Result<Vec<_>>>()?;
+    record_finalize_phase_timing("vector normalization", normalization_started.elapsed());
+
+    let cache_started = Instant::now();
+    let canonical = content_vector_cache
+        .as_mut()
+        .map(|cache| cache.publish_batch(&cache_batch, &normalized))
+        .transpose();
+    record_finalize_phase_timing("vector content cache", cache_started.elapsed());
+    match canonical {
+        Ok(Some(vectors)) => Ok(vectors),
+        Ok(None) => Ok(normalized),
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector cache publication failed; using fresh vectors"
+            );
+            *content_vector_cache = None;
+            Ok(normalized)
+        }
+    }
 }
 
 fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
@@ -2975,6 +3159,7 @@ mod tests {
         record_finalize_phase_timing("vector tokenization", Duration::from_millis(10));
         record_finalize_phase_timing("vector native encode", Duration::from_millis(40));
         record_finalize_phase_timing("vector normalization", Duration::from_millis(5));
+        record_finalize_phase_timing("vector content cache", Duration::from_millis(5));
         record_finalize_phase_timing("vector sqlite persistence", Duration::from_millis(20));
         record_finalize_phase_timing("vector hashing", Duration::from_millis(5));
         record_finalize_phase_timing("vector final validation", Duration::from_millis(10));
@@ -2985,7 +3170,7 @@ mod tests {
             .find(|timing| timing.phase == "vector ipc and orchestration")
             .expect("vector timing remainder");
 
-        assert_eq!(remainder.elapsed_ms, 10);
+        assert_eq!(remainder.elapsed_ms, 5);
         assert_eq!(
             timings
                 .iter()
@@ -2995,6 +3180,42 @@ mod tests {
             0,
             "nested vector subphases must not be subtracted from the top-level clock twice"
         );
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_ignores_store_local_publication_identity() {
+        let mut anchor = DenseAnchorInput {
+            node_id: NodeId(1),
+            file_node_id: Some(NodeId(2)),
+            kind: NodeKind::FUNCTION,
+            display_name: "do_work".into(),
+            qualified_name: Some("pkg::do_work".into()),
+            file_path: Some("src/lib.rs".into()),
+            start_line: Some(4),
+            end_line: Some(8),
+            file_role: FileRole::Source,
+            source_provenance: "parser".into(),
+            text: "function do_work semantic document".into(),
+            document_hash: "document-hash".into(),
+            selection_reason: "public_api".into(),
+            policy_version: "graph_first_v3".into(),
+            source_identity: "core:generation-a:run-a".into(),
+            updated_at_epoch_ms: 1,
+        };
+        let expected = stable_dense_anchor_identity(&anchor);
+
+        anchor.node_id = NodeId(99);
+        anchor.file_node_id = Some(NodeId(100));
+        anchor.display_name = "renamed_document_label".into();
+        anchor.qualified_name = Some("other::rendered::label".into());
+        anchor.text = "different exact prepared document".into();
+        anchor.document_hash = "different-document-hash".into();
+        anchor.source_identity = "core:generation-b:run-b".into();
+        anchor.updated_at_epoch_ms = 2;
+        assert_eq!(stable_dense_anchor_identity(&anchor), expected);
+
+        anchor.start_line = Some(5);
+        assert_ne!(stable_dense_anchor_identity(&anchor), expected);
     }
 
     #[test]

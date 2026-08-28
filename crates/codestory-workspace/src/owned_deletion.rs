@@ -49,6 +49,31 @@ impl OwnedDeletionRoot {
             Err(_) => remove_file_entry(&parent, leaf),
         }
     }
+
+    /// Remove one owned directory only when it is empty.
+    ///
+    /// Unlike [`Self::remove`], this never removes children. Callers that
+    /// recognize a closed set of owned files can delete those entries first,
+    /// then use this operation without risking an unknown file that appeared
+    /// between inspection and removal. The final directory identity stays
+    /// pinned below this root handle on every platform.
+    pub fn remove_empty_directory(&self, relative: &Path) -> io::Result<bool> {
+        let parts = relative_owned_parts(relative)?;
+        let (leaf, ancestors) = parts
+            .split_last()
+            .expect("relative_owned_parts rejects an empty path");
+        let mut parent = self.root.try_clone()?;
+        for ancestor in ancestors {
+            parent = open_child_dir(&parent, ancestor)?;
+        }
+        let target = match open_child_dir(&parent, leaf) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        remove_open_directory(&parent, leaf, target)?;
+        Ok(true)
+    }
 }
 
 fn relative_owned_parts(path: &Path) -> io::Result<Vec<OsString>> {
@@ -195,6 +220,46 @@ mod tests {
     #[cfg(windows)]
     use std::process::Command;
     use tempfile::tempdir;
+
+    #[test]
+    fn empty_only_removal_refuses_unknown_children() {
+        let temp = tempdir().expect("create temp root");
+        let owned = temp.path().join("owned");
+        fs::create_dir_all(owned.join("scope")).expect("create owned scope");
+        fs::write(owned.join("scope/unknown"), b"keep").expect("write unknown child");
+        let deletion = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+
+        deletion
+            .remove_empty_directory("scope".as_ref())
+            .expect_err("non-empty scope must be refused");
+        assert_eq!(
+            fs::read(owned.join("scope/unknown")).expect("unknown child survives"),
+            b"keep"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn empty_only_removal_stays_bound_to_the_pinned_root() {
+        let temp = tempdir().expect("create temp root");
+        let owned = temp.path().join("owned");
+        let pinned = temp.path().join("pinned-owned");
+        fs::create_dir_all(owned.join("scope")).expect("create owned scope");
+        let deletion = OwnedDeletionRoot::open(&owned).expect("pin owned root");
+        fs::rename(&owned, &pinned).expect("move ambient owned root");
+        fs::create_dir_all(owned.join("scope")).expect("install replacement scope");
+
+        assert!(
+            deletion
+                .remove_empty_directory("scope".as_ref())
+                .expect("remove pinned empty scope")
+        );
+        assert!(!pinned.join("scope").exists());
+        assert!(
+            owned.join("scope").exists(),
+            "replacement scope was removed"
+        );
+    }
 
     #[cfg(unix)]
     #[test]
