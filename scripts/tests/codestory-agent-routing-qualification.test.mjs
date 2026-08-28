@@ -48,6 +48,7 @@ test("qualification host commands use official isolated Codex and Cursor session
     "--config", 'service_tier="default"',
     "--config", 'personality="pragmatic"',
     "--config", 'model_verbosity="low"',
+    "--config", 'features.remote_plugin=false',
     "--sandbox", "workspace-write", "--cd", "/fixture/project", "--model", "gpt-fixture", "-",
   ]);
   assert.equal(codex.stdin, "fixture prompt");

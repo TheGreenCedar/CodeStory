@@ -689,7 +689,12 @@ function codexJsonl(run) {
         arguments: step.args,
       };
       events.push({ type: "item.started", item });
-      events.push({ type: "item.completed", item: { ...item, status: "completed", result: step.result } });
+      events.push({
+        type: "item.completed",
+        item: step.failed
+          ? { ...item, status: "failed", error: { message: "user cancelled MCP tool call" } }
+          : { ...item, status: "completed", result: step.result },
+      });
     } else if (step.kind === "tool_search") {
       const item = {
         id,
@@ -993,6 +998,23 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
     hostile.steps.unshift({ kind: "shell", command });
     assert.throws(() => validate("codex", hostile), /required action sequence|forbidden tool/u, command);
   }
+});
+
+test("Codex reports a failed expected MCP call before rejecting retry and shell fallback", () => {
+  const failed = baseRun("exact_symbol_search");
+  failed.steps[0].failed = true;
+  failed.steps.push(clone(failed.steps[0]), {
+    kind: "shell",
+    command: "/bin/zsh -lc \"rg -n start src\"",
+  });
+  assert.throws(() => validate("codex", failed), /unexpected failed search action/u);
+
+  const completed = baseRun("exact_symbol_search");
+  completed.steps.push(clone(completed.steps[0]), {
+    kind: "shell",
+    command: "/bin/zsh -lc \"rg -n start src\"",
+  });
+  assert.throws(() => validate("codex", completed), /required action sequence/u);
 });
 
 test("freezes exactly the sixteen accepted routing scenarios", () => {

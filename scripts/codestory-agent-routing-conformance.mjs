@@ -942,6 +942,17 @@ function actionName(action) {
   return action.kind;
 }
 
+function validateExpectedMcpAvailability(scenarioContract, actions) {
+  const expected = new Set(scenarioContract.required_action_sequence.filter((kind) => (
+    ["search", "context", "packet", "prove_call_path"].includes(kind)
+  )));
+  for (const action of actions) {
+    if (expected.has(action.kind) && action.error) {
+      fail(`${scenarioContract.id} has an unexpected failed ${action.tool} action`);
+    }
+  }
+}
+
 function validateActionOrder(scenarioContract, actions) {
   const observedSequence = actions.map(actionName);
   if (!equalJson(observedSequence, scenarioContract.required_action_sequence)) {
@@ -2304,6 +2315,7 @@ export function validateInstalledSession({
     fail(`${scenarioId} Cursor user text does not match the declared request`);
   }
   const actions = productRoutingActions(host, parsed.actions, installedPluginRoot, expectedIdentity);
+  validateExpectedMcpAvailability(scenarioContract, actions);
   validateActionOrder(scenarioContract, actions);
 
   const results = new Map();

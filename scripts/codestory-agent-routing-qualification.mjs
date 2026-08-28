@@ -41,6 +41,7 @@ const PINNED_CODEX_CONFIG = Object.freeze([
   'service_tier="default"',
   'personality="pragmatic"',
   'model_verbosity="low"',
+  'features.remote_plugin=false',
 ]);
 const STATIC_ROSTER_PATHS = [
   "plugin.json",
