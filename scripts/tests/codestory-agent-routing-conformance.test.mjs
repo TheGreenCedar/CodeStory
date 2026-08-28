@@ -892,6 +892,14 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
   }];
   assert.deepEqual(validate("codex", countedRead).actions, ["source_read"]);
 
+  const singleQuotedWrapper = baseRun("named_file_direct_read");
+  singleQuotedWrapper.steps = [{
+    kind: "shell",
+    command: "/bin/zsh -lc 'nl -ba src/named.rs'",
+    output: "     1\tsource fixture\n",
+  }];
+  assert.deepEqual(validate("codex", singleQuotedWrapper).actions, ["source_read"]);
+
   const tampered = baseRun("named_file_direct_read");
   tampered.steps.unshift({
     kind: "host_guidance_read",

@@ -509,8 +509,12 @@ function unwrapCodexShell(command) {
   const text = String(command ?? "").trim();
   const prefix = "/bin/zsh -lc ";
   if (!text.startsWith(prefix)) return text;
+  const wrapper = text.slice(prefix.length);
+  if (wrapper.startsWith("'") && wrapper.endsWith("'") && !wrapper.slice(1, -1).includes("'")) {
+    return wrapper.slice(1, -1).trim();
+  }
   try {
-    const inner = JSON.parse(text.slice(prefix.length));
+    const inner = JSON.parse(wrapper);
     return typeof inner === "string" ? inner.trim() : null;
   } catch {
     return null;
