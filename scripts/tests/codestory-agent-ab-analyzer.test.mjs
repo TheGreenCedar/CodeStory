@@ -4927,7 +4927,10 @@ test("v3 benchmark routing treats projection bounds as descriptive rather than r
   assert.match(instruction, /output_budget_exceeded gap is descriptive/);
   assert.match(instruction, /does not authorize a source read or another repository tool/);
   assert.match(instruction, /at most one declared continuation/);
-  assert.match(instruction, /then stop/);
+  assert.match(instruction, /reassess its returned gaps without another retrieval call/);
+  assert.match(instruction, /exact focused source read/);
+  assert.match(instruction, /Do not use shell search, Git, or free-form repository recovery/);
+  assert.doesNotMatch(instruction, /direct source reads as packet recovery/);
 });
 
 test("publishable benchmark args reject diagnostic packet probes", () => {
@@ -5307,7 +5310,7 @@ test("transcript analysis authorizes source reads only from user-named files or 
       "$CODESTORY_CLI packet --project . --question flow",
       JSON.stringify({
         schema_version: 3,
-        status: "continuation_available",
+        status: "no_useful_evidence",
         gaps: [{ kind: "evidence_missing", message: "Missing evidence for src/v3-gap.ts" }],
       }),
     ),
@@ -5471,6 +5474,49 @@ test("transcript analysis authorizes source reads only from user-named files or 
     task: { prompt: "Explain the flow." },
   });
   assert.equal(baseline.direct_source_reads[0].authorization.status, "baseline_local_exploration");
+});
+
+test("transcript analysis authorizes an exact source read from a continuation's returned material gap", () => {
+  const project = "/tmp/exact-transcript-project";
+  const events = [
+    commandEvent("packet", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      JSON.stringify({
+        schema_version: 3,
+        status: "continuation_available",
+        gaps: [{ kind: "continuation_required", message: "Continue the bounded lookup" }],
+      }),
+    ),
+    commandEvent(
+      "continuation",
+      "item.started",
+      "$CODESTORY_CLI packet --project . --question flow --parent-packet-id continuation-v3",
+    ),
+    commandEvent(
+      "continuation",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow --parent-packet-id continuation-v3",
+      JSON.stringify({
+        schema_version: 3,
+        status: "no_useful_evidence",
+        gaps: [{ kind: "evidence_missing", message: "Missing evidence for src/continued-gap.ts" }],
+      }),
+    ),
+    commandEvent("continued-gap-read", "item.started", "Get-Content src/continued-gap.ts"),
+    commandEvent("continued-gap-read", "item.completed", "Get-Content src/continued-gap.ts", "source"),
+  ];
+
+  const analysis = analyzeTranscript(events, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+
+  assert.equal(analysis.direct_source_reads[0].authorization.status, "authorized");
+  assert.equal(analysis.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
+  assert.equal(analysis.direct_source_reads[0].authorization.evidence_command_id, "continuation");
 });
 
 test("exact telemetry sees malformed JSONL web context and an empty local transcript through the real parser", () => {
