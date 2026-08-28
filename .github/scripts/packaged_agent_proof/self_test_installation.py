@@ -394,6 +394,9 @@ def _hostile_result_tests(query: str) -> None:
         state = deepcopy(preparing)
         state[field] = value
         malformed_preparing.append((label, state))
+    extra_field = deepcopy(preparing)
+    extra_field["unexpected"] = "invalid"
+    malformed_preparing.append(("extra root field", extra_field))
     for label, state in malformed_preparing:
         hostile = ScriptedMcpProcess(
             [

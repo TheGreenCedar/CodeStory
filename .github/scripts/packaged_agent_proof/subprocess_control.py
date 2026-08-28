@@ -596,7 +596,9 @@ class McpProcess:
         deadline: float,
     ) -> None:
         require(
-            (state.get("kind"), state.get("state")) == ("preparing", "preparing")
+            set(state) == {"kind", "state", "retry_after_ms", "operation"}
+            and (state.get("kind"), state.get("state"))
+            == ("preparing", "preparing")
             and isinstance(state.get("operation"), dict),
             f"MCP {name} attempt {attempt} returned a terminal or malformed error envelope: {state!r}",
         )
