@@ -14,14 +14,17 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const CACHE_SCHEMA_VERSION: i64 = 3;
-const CACHE_DIRECTORY: &str = "content-addressed-vectors-v3";
-const CACHE_KEY_DOMAIN: &[u8] = b"codestory-content-addressed-vector-batch-v3\0";
-const CACHE_CORPUS_DOMAIN: &[u8] = b"codestory-content-addressed-vector-corpus-v2\0";
-const CACHE_CONTRACT_DOMAIN: &[u8] = b"codestory-content-addressed-vector-contract-v3\0";
+const CACHE_SCHEMA_VERSION: i64 = 4;
+const CACHE_DIRECTORY: &str = "content-addressed-vectors-v4";
+const CACHE_KEY_DOMAIN: &[u8] = b"codestory-content-addressed-vector-batch-v4\0";
+const CACHE_CORPUS_DOMAIN: &[u8] = b"codestory-content-addressed-vector-corpus-v3\0";
+const CACHE_CONTRACT_DOMAIN: &[u8] = b"codestory-content-addressed-vector-contract-v4\0";
 const CACHE_PACKING_CONTRACT: &str = "ordered-outer-request-native-token-pack-v1";
 const CACHE_TRUNCATION_CONTRACT: &str = "native-tokenize-truncate-max-input-v1";
 const CACHE_NORMALIZATION_CONTRACT: &str = "server-f32-l2-then-index-f64-l2-v1";
+const CACHE_MAX_PAYLOAD_BYTES: u64 = 128 * 1024 * 1024;
+const CACHE_MAX_DATABASE_BYTES: u64 = 160 * 1024 * 1024;
+const CACHE_ROW_ACCOUNTING_BYTES: u64 = 512;
 
 pub(crate) struct VectorCacheBatchInput<'a> {
     pub anchor_identity: &'a str,
@@ -31,9 +34,12 @@ pub(crate) struct VectorCacheBatchInput<'a> {
 
 pub(crate) struct ContentAddressedVectorCache {
     connection: Connection,
+    #[cfg(test)]
+    path: PathBuf,
     artifact_scope_id: String,
     contract_sha256: String,
     embedding_dim: usize,
+    max_payload_bytes: u64,
     hits: u64,
     misses: u64,
 }
@@ -45,16 +51,36 @@ impl ContentAddressedVectorCache {
         producer_compatibility_identity: &str,
         embedding_dim: usize,
     ) -> Result<Self> {
+        Self::open_with_limits(
+            runtime,
+            artifact_scope_id,
+            producer_compatibility_identity,
+            embedding_dim,
+            CACHE_MAX_PAYLOAD_BYTES,
+            CACHE_MAX_DATABASE_BYTES,
+        )
+    }
+
+    fn open_with_limits(
+        runtime: &SidecarRuntimeConfig,
+        artifact_scope_id: &str,
+        producer_compatibility_identity: &str,
+        embedding_dim: usize,
+        max_payload_bytes: u64,
+        max_database_bytes: u64,
+    ) -> Result<Self> {
         if artifact_scope_id.trim().is_empty()
             || producer_compatibility_identity.trim().is_empty()
             || embedding_dim == 0
+            || max_payload_bytes == 0
+            || max_database_bytes <= max_payload_bytes
         {
             bail!("content-addressed vector cache identity is incomplete");
         }
         let contract_sha256 =
             cache_contract_sha256(runtime, producer_compatibility_identity, embedding_dim)?;
         let scope_directory = cache_scope_directory(runtime, artifact_scope_id)?;
-        let path = scope_directory.join(format!("{contract_sha256}.sqlite3"));
+        let path = scope_directory.join("vectors.sqlite3");
         if let Ok(metadata) = std::fs::symlink_metadata(&path)
             && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
         {
@@ -63,6 +89,27 @@ impl ContentAddressedVectorCache {
         let connection = Connection::open(&path)
             .with_context(|| format!("open content-addressed vector cache {}", path.display()))?;
         connection.busy_timeout(Duration::from_secs(30))?;
+        let page_size = u64::try_from(
+            connection.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?,
+        )
+        .context("content-addressed vector cache page size is invalid")?;
+        let max_page_count = max_database_bytes
+            .checked_div(page_size)
+            .context("content-addressed vector cache database limit is below one page")?;
+        connection.pragma_update(
+            None,
+            "max_page_count",
+            i64::try_from(max_page_count).context("cache page count overflow")?,
+        )?;
+        let applied_max_page_count = u64::try_from(connection.pragma_query_value(
+            None,
+            "max_page_count",
+            |row| row.get::<_, i64>(0),
+        )?)
+        .context("content-addressed vector cache maximum page count is invalid")?;
+        if applied_max_page_count > max_page_count {
+            bail!("content-addressed vector cache already exceeds its database limit");
+        }
         connection.execute_batch(
             "PRAGMA journal_mode=DELETE;
              PRAGMA synchronous=FULL;
@@ -72,43 +119,49 @@ impl ContentAddressedVectorCache {
                  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                  schema_version INTEGER NOT NULL,
                  artifact_scope_id TEXT NOT NULL,
-                 contract_sha256 TEXT NOT NULL,
-                 embedding_dim INTEGER NOT NULL
+                 max_payload_bytes INTEGER NOT NULL CHECK(max_payload_bytes > 0),
+                 max_database_bytes INTEGER NOT NULL CHECK(max_database_bytes > max_payload_bytes),
+                 access_sequence INTEGER NOT NULL CHECK(access_sequence >= 0)
              );
              CREATE TABLE IF NOT EXISTS vector_batch_cache (
                  cache_key TEXT PRIMARY KEY,
+                 contract_sha256 TEXT NOT NULL CHECK(length(contract_sha256) = 64),
                  vector_count INTEGER NOT NULL CHECK(vector_count > 0),
                  embedding_dim INTEGER NOT NULL CHECK(embedding_dim > 0),
                  vectors BLOB NOT NULL,
-                 vectors_sha256 TEXT NOT NULL CHECK(length(vectors_sha256) = 64)
+                 vectors_sha256 TEXT NOT NULL CHECK(length(vectors_sha256) = 64),
+                 last_access_sequence INTEGER NOT NULL CHECK(last_access_sequence > 0)
              ) WITHOUT ROWID;
              CREATE TABLE IF NOT EXISTS vector_corpus_plan (
                  corpus_key TEXT PRIMARY KEY,
+                 contract_sha256 TEXT NOT NULL CHECK(length(contract_sha256) = 64),
                  anchor_count INTEGER NOT NULL CHECK(anchor_count > 0),
                  ordered_anchor_identities BLOB NOT NULL,
-                 plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64)
+                 plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64),
+                 last_access_sequence INTEGER NOT NULL CHECK(last_access_sequence > 0)
              ) WITHOUT ROWID;",
         )?;
         connection.execute(
             "INSERT OR IGNORE INTO cache_metadata
-             (singleton, schema_version, artifact_scope_id, contract_sha256, embedding_dim)
-             VALUES (1, ?1, ?2, ?3, ?4)",
+             (singleton, schema_version, artifact_scope_id, max_payload_bytes,
+              max_database_bytes, access_sequence)
+             VALUES (1, ?1, ?2, ?3, ?4, 0)",
             params![
                 CACHE_SCHEMA_VERSION,
                 artifact_scope_id,
-                contract_sha256,
-                i64::try_from(embedding_dim).context("embedding dimension overflow")?,
+                i64::try_from(max_payload_bytes).context("cache payload limit overflow")?,
+                i64::try_from(max_database_bytes).context("cache database limit overflow")?,
             ],
         )?;
         let metadata = connection.query_row(
-            "SELECT schema_version, artifact_scope_id, contract_sha256, embedding_dim
+            "SELECT schema_version, artifact_scope_id, max_payload_bytes, max_database_bytes
              FROM cache_metadata WHERE singleton = 1",
             [],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                 ))
             },
@@ -117,17 +170,20 @@ impl ContentAddressedVectorCache {
             != (
                 CACHE_SCHEMA_VERSION,
                 artifact_scope_id.to_string(),
-                contract_sha256.clone(),
-                i64::try_from(embedding_dim).context("embedding dimension overflow")?,
+                i64::try_from(max_payload_bytes).context("cache payload limit overflow")?,
+                i64::try_from(max_database_bytes).context("cache database limit overflow")?,
             )
         {
             bail!("content-addressed vector cache metadata mismatch");
         }
         Ok(Self {
             connection,
+            #[cfg(test)]
+            path,
             artifact_scope_id: artifact_scope_id.to_string(),
             contract_sha256,
             embedding_dim,
+            max_payload_bytes,
             hits: 0,
             misses: 0,
         })
@@ -153,41 +209,41 @@ impl ContentAddressedVectorCache {
             .iter()
             .map(|input| input.anchor_identity)
             .collect::<Vec<_>>();
-        let encoded_current = encode_identity_plan(&current_plan);
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO vector_corpus_plan
-             (corpus_key, anchor_count, ordered_anchor_identities, plan_sha256)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                corpus_key,
-                i64::try_from(inputs.len()).context("corpus anchor count overflow")?,
-                encoded_current.bytes,
-                encoded_current.sha256,
-            ],
-        )?;
-        let stored = read_corpus_plan(&transaction, &corpus_key)?
-            .context("content-addressed vector cache dropped a corpus plan")?;
-        let canonical = match decode_identity_plan(stored, inputs.len()) {
-            Ok(plan) => plan,
-            Err(_) => {
-                transaction.execute(
-                    "DELETE FROM vector_corpus_plan WHERE corpus_key = ?1",
-                    params![corpus_key],
-                )?;
-                let replacement = encode_identity_plan(&current_plan);
-                transaction.execute(
-                    "INSERT INTO vector_corpus_plan
-                     (corpus_key, anchor_count, ordered_anchor_identities, plan_sha256)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        corpus_key,
-                        i64::try_from(inputs.len()).context("corpus anchor count overflow")?,
-                        replacement.bytes,
-                        replacement.sha256,
-                    ],
+        let canonical = match read_corpus_plan(&transaction, &corpus_key)? {
+            Some(stored) => match decode_identity_plan(stored, inputs.len(), &self.contract_sha256)
+            {
+                Ok(plan) => {
+                    touch_corpus_plan(&transaction, &corpus_key)?;
+                    plan
+                }
+                Err(_) => {
+                    transaction.execute(
+                        "DELETE FROM vector_corpus_plan WHERE corpus_key = ?1",
+                        params![corpus_key],
+                    )?;
+                    insert_corpus_plan(
+                        &transaction,
+                        &corpus_key,
+                        &self.contract_sha256,
+                        &current_plan,
+                        self.max_payload_bytes,
+                    )?;
+                    current_plan
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect()
+                }
+            },
+            None => {
+                insert_corpus_plan(
+                    &transaction,
+                    &corpus_key,
+                    &self.contract_sha256,
+                    &current_plan,
+                    self.max_payload_bytes,
                 )?;
                 current_plan
                     .iter()
@@ -225,21 +281,34 @@ impl ContentAddressedVectorCache {
         batch: &[VectorCacheBatchInput<'_>],
     ) -> Result<Option<Vec<Vec<f32>>>> {
         let cache_key = self.cache_key(batch)?;
-        let row = read_cached_batch(&self.connection, &cache_key)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = read_cached_batch_from_transaction(&transaction, &cache_key)?;
         let Some(row) = row else {
+            transaction.commit()?;
             self.misses = self.misses.saturating_add(1);
             return Ok(None);
         };
-        match decode_cached_vectors(&cache_key, row, batch.len(), self.embedding_dim) {
+        match decode_cached_vectors(
+            &cache_key,
+            row,
+            batch.len(),
+            self.embedding_dim,
+            &self.contract_sha256,
+        ) {
             Ok(vectors) => {
+                touch_vector_batch(&transaction, &cache_key)?;
+                transaction.commit()?;
                 self.hits = self.hits.saturating_add(1);
                 Ok(Some(vectors))
             }
             Err(_) => {
-                self.connection.execute(
+                transaction.execute(
                     "DELETE FROM vector_batch_cache WHERE cache_key = ?1",
                     params![cache_key],
                 )?;
+                transaction.commit()?;
                 self.misses = self.misses.saturating_add(1);
                 Ok(None)
             }
@@ -259,46 +328,47 @@ impl ContentAddressedVectorCache {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO vector_batch_cache
-             (cache_key, vector_count, embedding_dim, vectors, vectors_sha256)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                cache_key,
-                i64::try_from(vectors.len()).context("vector count overflow")?,
-                i64::try_from(self.embedding_dim).context("embedding dimension overflow")?,
-                encoded.bytes,
-                encoded.sha256,
-            ],
-        )?;
         let canonical = match read_cached_batch_from_transaction(&transaction, &cache_key)? {
-            Some(row) => {
-                match decode_cached_vectors(&cache_key, row, batch.len(), self.embedding_dim) {
-                    Ok(vectors) => vectors,
-                    Err(_) => {
-                        transaction.execute(
-                            "DELETE FROM vector_batch_cache WHERE cache_key = ?1",
-                            params![cache_key],
-                        )?;
-                        let replacement = encode_vectors(&cache_key, vectors, self.embedding_dim)?;
-                        transaction.execute(
-                            "INSERT INTO vector_batch_cache
-                         (cache_key, vector_count, embedding_dim, vectors, vectors_sha256)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                            params![
-                                cache_key,
-                                i64::try_from(vectors.len()).context("vector count overflow")?,
-                                i64::try_from(self.embedding_dim)
-                                    .context("embedding dimension overflow")?,
-                                replacement.bytes,
-                                replacement.sha256,
-                            ],
-                        )?;
-                        vectors.to_vec()
-                    }
+            Some(row) => match decode_cached_vectors(
+                &cache_key,
+                row,
+                batch.len(),
+                self.embedding_dim,
+                &self.contract_sha256,
+            ) {
+                Ok(canonical) => {
+                    touch_vector_batch(&transaction, &cache_key)?;
+                    canonical
                 }
+                Err(_) => {
+                    transaction.execute(
+                        "DELETE FROM vector_batch_cache WHERE cache_key = ?1",
+                        params![cache_key],
+                    )?;
+                    insert_vector_batch(
+                        &transaction,
+                        &cache_key,
+                        &self.contract_sha256,
+                        vectors,
+                        encoded,
+                        self.embedding_dim,
+                        self.max_payload_bytes,
+                    )?;
+                    vectors.to_vec()
+                }
+            },
+            None => {
+                insert_vector_batch(
+                    &transaction,
+                    &cache_key,
+                    &self.contract_sha256,
+                    vectors,
+                    encoded,
+                    self.embedding_dim,
+                    self.max_payload_bytes,
+                )?;
+                vectors.to_vec()
             }
-            None => bail!("content-addressed vector cache dropped a published batch"),
         };
         transaction.commit()?;
         Ok(canonical)
@@ -306,6 +376,38 @@ impl ContentAddressedVectorCache {
 
     pub(crate) fn activity(&self) -> (u64, u64) {
         (self.hits, self.misses)
+    }
+
+    #[cfg(test)]
+    fn accounted_payload_bytes(&self) -> Result<u64> {
+        accounted_payload_bytes(&self.connection)
+    }
+
+    #[cfg(test)]
+    fn retained_batch_count(&self) -> Result<u64> {
+        let count = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM vector_batch_cache", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(anyhow::Error::from)?;
+        u64::try_from(count).context("cache row count is negative")
+    }
+
+    #[cfg(test)]
+    fn retained_plan_count(&self) -> Result<u64> {
+        let count = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM vector_corpus_plan", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(anyhow::Error::from)?;
+        u64::try_from(count).context("cache plan count is negative")
+    }
+
+    #[cfg(test)]
+    fn database_bytes(&self) -> Result<u64> {
+        Ok(std::fs::metadata(&self.path)?.len())
     }
 
     fn cache_key(&self, batch: &[VectorCacheBatchInput<'_>]) -> Result<String> {
@@ -359,6 +461,7 @@ struct EncodedVectors {
 }
 
 struct CachedVectorRow {
+    contract_sha256: String,
     vector_count: i64,
     embedding_dim: i64,
     bytes: Vec<u8>,
@@ -371,6 +474,7 @@ struct EncodedIdentityPlan {
 }
 
 struct CachedIdentityPlan {
+    contract_sha256: String,
     anchor_count: i64,
     bytes: Vec<u8>,
     sha256: String,
@@ -398,8 +502,13 @@ fn encode_identity_plan(plan: &[&str]) -> EncodedIdentityPlan {
     }
 }
 
-fn decode_identity_plan(plan: CachedIdentityPlan, expected_count: usize) -> Result<Vec<String>> {
-    if plan.anchor_count != i64::try_from(expected_count).context("anchor count overflow")?
+fn decode_identity_plan(
+    plan: CachedIdentityPlan,
+    expected_count: usize,
+    expected_contract_sha256: &str,
+) -> Result<Vec<String>> {
+    if plan.contract_sha256 != expected_contract_sha256
+        || plan.anchor_count != i64::try_from(expected_count).context("anchor count overflow")?
         || plan.sha256 != hex_digest(Sha256::digest(&plan.bytes))
     {
         bail!("content-addressed vector corpus plan integrity mismatch");
@@ -535,8 +644,10 @@ fn decode_cached_vectors(
     row: CachedVectorRow,
     expected_count: usize,
     embedding_dim: usize,
+    expected_contract_sha256: &str,
 ) -> Result<Vec<Vec<f32>>> {
-    if row.vector_count != i64::try_from(expected_count).context("vector count overflow")?
+    if row.contract_sha256 != expected_contract_sha256
+        || row.vector_count != i64::try_from(expected_count).context("vector count overflow")?
         || row.embedding_dim != i64::try_from(embedding_dim).context("dimension overflow")?
         || row.sha256 != hex_digest(Sha256::digest(&row.bytes))
         || row.bytes.len()
@@ -567,16 +678,183 @@ fn decode_cached_vectors(
     Ok(vectors)
 }
 
-fn read_cached_batch(connection: &Connection, cache_key: &str) -> Result<Option<CachedVectorRow>> {
-    connection
+fn insert_vector_batch(
+    transaction: &Transaction<'_>,
+    cache_key: &str,
+    contract_sha256: &str,
+    vectors: &[Vec<f32>],
+    encoded: EncodedVectors,
+    embedding_dim: usize,
+    max_payload_bytes: u64,
+) -> Result<()> {
+    reserve_payload(
+        transaction,
+        payload_weight(encoded.bytes.len())?,
+        max_payload_bytes,
+    )?;
+    let access_sequence = next_access_sequence(transaction)?;
+    transaction.execute(
+        "INSERT INTO vector_batch_cache
+         (cache_key, contract_sha256, vector_count, embedding_dim, vectors,
+          vectors_sha256, last_access_sequence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            cache_key,
+            contract_sha256,
+            i64::try_from(vectors.len()).context("vector count overflow")?,
+            i64::try_from(embedding_dim).context("embedding dimension overflow")?,
+            encoded.bytes,
+            encoded.sha256,
+            access_sequence,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_corpus_plan(
+    transaction: &Transaction<'_>,
+    corpus_key: &str,
+    contract_sha256: &str,
+    current_plan: &[&str],
+    max_payload_bytes: u64,
+) -> Result<()> {
+    let encoded = encode_identity_plan(current_plan);
+    reserve_payload(
+        transaction,
+        payload_weight(encoded.bytes.len())?,
+        max_payload_bytes,
+    )?;
+    let access_sequence = next_access_sequence(transaction)?;
+    transaction.execute(
+        "INSERT INTO vector_corpus_plan
+         (corpus_key, contract_sha256, anchor_count, ordered_anchor_identities,
+          plan_sha256, last_access_sequence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            corpus_key,
+            contract_sha256,
+            i64::try_from(current_plan.len()).context("corpus anchor count overflow")?,
+            encoded.bytes,
+            encoded.sha256,
+            access_sequence,
+        ],
+    )?;
+    Ok(())
+}
+
+fn touch_vector_batch(transaction: &Transaction<'_>, cache_key: &str) -> Result<()> {
+    let access_sequence = next_access_sequence(transaction)?;
+    transaction.execute(
+        "UPDATE vector_batch_cache SET last_access_sequence = ?2 WHERE cache_key = ?1",
+        params![cache_key, access_sequence],
+    )?;
+    Ok(())
+}
+
+fn touch_corpus_plan(transaction: &Transaction<'_>, corpus_key: &str) -> Result<()> {
+    let access_sequence = next_access_sequence(transaction)?;
+    transaction.execute(
+        "UPDATE vector_corpus_plan SET last_access_sequence = ?2 WHERE corpus_key = ?1",
+        params![corpus_key, access_sequence],
+    )?;
+    Ok(())
+}
+
+fn next_access_sequence(transaction: &Transaction<'_>) -> Result<i64> {
+    let current = transaction.query_row(
+        "SELECT access_sequence FROM cache_metadata WHERE singleton = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let next = current
+        .checked_add(1)
+        .context("content-addressed vector cache access sequence exhausted")?;
+    transaction.execute(
+        "UPDATE cache_metadata SET access_sequence = ?1 WHERE singleton = 1",
+        params![next],
+    )?;
+    Ok(next)
+}
+
+fn reserve_payload(
+    transaction: &Transaction<'_>,
+    incoming_weight: u64,
+    max_payload_bytes: u64,
+) -> Result<()> {
+    if incoming_weight > max_payload_bytes {
+        bail!("content-addressed vector cache row exceeds the project payload limit");
+    }
+    let mut retained = accounted_payload_bytes(transaction)?;
+    while retained.saturating_add(incoming_weight) > max_payload_bytes {
+        let oldest = transaction
+            .query_row(
+                "SELECT entry_kind, entry_key, payload_bytes FROM (
+                     SELECT 0 AS entry_kind, cache_key AS entry_key,
+                            length(vectors) + ?1 AS payload_bytes,
+                            last_access_sequence
+                     FROM vector_batch_cache
+                     UNION ALL
+                     SELECT 1 AS entry_kind, corpus_key AS entry_key,
+                            length(ordered_anchor_identities) + ?1 AS payload_bytes,
+                            last_access_sequence
+                     FROM vector_corpus_plan
+                 )
+                 ORDER BY last_access_sequence, entry_kind, entry_key
+                 LIMIT 1",
+                params![
+                    i64::try_from(CACHE_ROW_ACCOUNTING_BYTES)
+                        .context("cache row accounting overflow")?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("content-addressed vector cache cannot free its accounted payload")?;
+        match oldest.0 {
+            0 => transaction.execute(
+                "DELETE FROM vector_batch_cache WHERE cache_key = ?1",
+                params![oldest.1],
+            )?,
+            1 => transaction.execute(
+                "DELETE FROM vector_corpus_plan WHERE corpus_key = ?1",
+                params![oldest.1],
+            )?,
+            _ => bail!("content-addressed vector cache selected an unknown retention row"),
+        };
+        retained = retained.saturating_sub(
+            u64::try_from(oldest.2).context("cache retention row has a negative payload")?,
+        );
+    }
+    Ok(())
+}
+
+fn payload_weight(blob_len: usize) -> Result<u64> {
+    u64::try_from(blob_len)
+        .context("content-addressed vector cache payload length overflow")?
+        .checked_add(CACHE_ROW_ACCOUNTING_BYTES)
+        .context("content-addressed vector cache payload weight overflow")
+}
+
+fn accounted_payload_bytes(connection: &Connection) -> Result<u64> {
+    let payload = connection
         .query_row(
-            "SELECT vector_count, embedding_dim, vectors, vectors_sha256
-             FROM vector_batch_cache WHERE cache_key = ?1",
-            params![cache_key],
-            cached_vector_row,
+            "SELECT
+                 COALESCE((SELECT SUM(length(vectors) + ?1) FROM vector_batch_cache), 0)
+                 + COALESCE((SELECT SUM(length(ordered_anchor_identities) + ?1)
+                             FROM vector_corpus_plan), 0)",
+            params![
+                i64::try_from(CACHE_ROW_ACCOUNTING_BYTES)
+                    .context("cache row accounting overflow")?
+            ],
+            |row| row.get::<_, i64>(0),
         )
-        .optional()
-        .map_err(Into::into)
+        .map_err(anyhow::Error::from)?;
+    u64::try_from(payload).context("cache accounted payload is negative")
 }
 
 fn read_cached_batch_from_transaction(
@@ -585,7 +863,7 @@ fn read_cached_batch_from_transaction(
 ) -> Result<Option<CachedVectorRow>> {
     transaction
         .query_row(
-            "SELECT vector_count, embedding_dim, vectors, vectors_sha256
+            "SELECT contract_sha256, vector_count, embedding_dim, vectors, vectors_sha256
              FROM vector_batch_cache WHERE cache_key = ?1",
             params![cache_key],
             cached_vector_row,
@@ -600,14 +878,15 @@ fn read_corpus_plan(
 ) -> Result<Option<CachedIdentityPlan>> {
     transaction
         .query_row(
-            "SELECT anchor_count, ordered_anchor_identities, plan_sha256
+            "SELECT contract_sha256, anchor_count, ordered_anchor_identities, plan_sha256
              FROM vector_corpus_plan WHERE corpus_key = ?1",
             params![corpus_key],
             |row| {
                 Ok(CachedIdentityPlan {
-                    anchor_count: row.get(0)?,
-                    bytes: row.get(1)?,
-                    sha256: row.get(2)?,
+                    contract_sha256: row.get(0)?,
+                    anchor_count: row.get(1)?,
+                    bytes: row.get(2)?,
+                    sha256: row.get(3)?,
                 })
             },
         )
@@ -617,10 +896,11 @@ fn read_corpus_plan(
 
 fn cached_vector_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedVectorRow> {
     Ok(CachedVectorRow {
-        vector_count: row.get(0)?,
-        embedding_dim: row.get(1)?,
-        bytes: row.get(2)?,
-        sha256: row.get(3)?,
+        contract_sha256: row.get(0)?,
+        vector_count: row.get(1)?,
+        embedding_dim: row.get(2)?,
+        bytes: row.get(3)?,
+        sha256: row.get(4)?,
     })
 }
 
@@ -914,6 +1194,162 @@ mod tests {
                 .contains("not L2-normalized")
         );
         assert!(owner.load_batch(&batch).expect("lookup").is_none());
+    }
+
+    #[test]
+    fn retention_keeps_recent_exact_batches_and_evicts_the_lru_batch() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let row_weight = CACHE_ROW_ACCOUNTING_BYTES + 8;
+        let mut owner = ContentAddressedVectorCache::open_with_limits(
+            &selected_runtime,
+            "scope-a",
+            "producer-a",
+            2,
+            row_weight * 2,
+            1024 * 1024,
+        )
+        .expect("open bounded cache");
+        let a_rows = [("a", "doc-a", "a")];
+        let b_rows = [("b", "doc-b", "b")];
+        let c_rows = [("c", "doc-c", "c")];
+        let a = inputs(&a_rows);
+        let b = inputs(&b_rows);
+        let c = inputs(&c_rows);
+        owner
+            .publish_batch(&a, &[vec![1.0, 0.0]])
+            .expect("publish a");
+        owner
+            .publish_batch(&b, &[vec![0.0, 1.0]])
+            .expect("publish b");
+        assert!(owner.load_batch(&a).expect("touch a").is_some());
+        owner
+            .publish_batch(&c, &[vec![-1.0, 0.0]])
+            .expect("publish c");
+
+        assert!(owner.load_batch(&a).expect("retained a").is_some());
+        assert!(owner.load_batch(&b).expect("evicted b").is_none());
+        assert!(owner.load_batch(&c).expect("retained c").is_some());
+        assert!(owner.accounted_payload_bytes().expect("payload") <= row_weight * 2);
+    }
+
+    #[test]
+    fn one_project_budget_covers_all_embedding_contracts() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let row_weight = CACHE_ROW_ACCOUNTING_BYTES + 8;
+        let open = |producer: &str| {
+            ContentAddressedVectorCache::open_with_limits(
+                &selected_runtime,
+                "scope-a",
+                producer,
+                2,
+                row_weight * 2,
+                1024 * 1024,
+            )
+            .expect("open bounded cache")
+        };
+        let a_rows = [("a", "doc-a", "a")];
+        let b_rows = [("b", "doc-b", "b")];
+        let c_rows = [("c", "doc-c", "c")];
+        let mut first = open("producer-a");
+        first
+            .publish_batch(&inputs(&a_rows), &[vec![1.0, 0.0]])
+            .expect("publish first contract");
+        first
+            .publish_batch(&inputs(&b_rows), &[vec![0.0, 1.0]])
+            .expect("publish second first-contract row");
+        drop(first);
+        let mut second = open("producer-b");
+        second
+            .publish_batch(&inputs(&c_rows), &[vec![-1.0, 0.0]])
+            .expect("publish second contract");
+
+        assert!(second.accounted_payload_bytes().expect("payload") <= row_weight * 2);
+        assert_eq!(second.retained_batch_count().expect("row count"), 2);
+    }
+
+    #[test]
+    fn corpus_order_plans_share_the_same_project_payload_budget() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let one_plan_weight = CACHE_ROW_ACCOUNTING_BYTES + 8 + "stable-a".len() as u64;
+        let mut owner = ContentAddressedVectorCache::open_with_limits(
+            &selected_runtime,
+            "scope-a",
+            "producer-a",
+            2,
+            one_plan_weight,
+            1024 * 1024,
+        )
+        .expect("open bounded cache");
+        let first_rows = [("stable-a", "doc-a", "a")];
+        let second_rows = [("stable-b", "doc-b", "b")];
+        owner
+            .canonical_order(&inputs(&first_rows))
+            .expect("first plan");
+        owner
+            .canonical_order(&inputs(&second_rows))
+            .expect("second plan");
+
+        assert_eq!(owner.retained_plan_count().expect("plan count"), 1);
+        assert!(owner.accounted_payload_bytes().expect("payload") <= one_plan_weight);
+    }
+
+    #[test]
+    fn database_file_stays_hard_bounded_across_batch_churn() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let row_weight = CACHE_ROW_ACCOUNTING_BYTES + 8;
+        let database_limit = 1024 * 1024;
+        let mut owner = ContentAddressedVectorCache::open_with_limits(
+            &selected_runtime,
+            "scope-a",
+            "producer-a",
+            2,
+            row_weight * 4,
+            database_limit,
+        )
+        .expect("open bounded cache");
+        for index in 0..200 {
+            let identity = format!("node-{index}");
+            let document_hash = format!("doc-{index}");
+            let text = format!("text-{index}");
+            let rows = [(identity.as_str(), document_hash.as_str(), text.as_str())];
+            owner
+                .publish_batch(&inputs(&rows), &[vec![1.0, 0.0]])
+                .expect("publish churn row");
+        }
+
+        assert!(owner.accounted_payload_bytes().expect("payload") <= row_weight * 4);
+        assert_eq!(owner.retained_batch_count().expect("row count"), 4);
+        assert!(owner.database_bytes().expect("database bytes") <= database_limit);
+    }
+
+    #[test]
+    fn concurrent_publishers_share_one_integrity_checked_canonical_row() {
+        use std::sync::{Arc, Barrier};
+
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = [vec![1.0, 0.0], vec![0.0, 1.0]].map(|vector| {
+            let runtime = selected_runtime.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let rows = [("same", "same-doc", "same text")];
+                let batch = inputs(&rows);
+                let mut owner =
+                    ContentAddressedVectorCache::open(&runtime, "scope-a", "producer-a", 2)
+                        .expect("open concurrent cache");
+                barrier.wait();
+                owner
+                    .publish_batch(&batch, &[vector])
+                    .expect("publish concurrent row")
+            })
+        });
+        let [left, right] = handles.map(|handle| handle.join().expect("join publisher"));
+        assert_eq!(left, right);
     }
 
     #[cfg(unix)]
