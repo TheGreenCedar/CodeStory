@@ -3191,6 +3191,7 @@ impl WorkspaceIndexer {
                         &artifact,
                         language_config.language_name,
                         &resolution_parser_fingerprint(&language_config),
+                        &content_hash,
                     ) =>
                 {
                     let mut artifact = rebase_cached_index_artifact(
@@ -3711,6 +3712,7 @@ impl WorkspaceIndexer {
         let index_result = index_file_with_resolution_inputs(
             &prepared_input.full_path,
             &prepared_input.source,
+            &prepared_input.content_hash,
             &prepared_input.language_config,
             prepared_input.compilation_info.clone(),
             Some(Arc::clone(symbol_table)),
@@ -15564,9 +15566,11 @@ pub fn index_file(
     compilation_info: Option<compilation_database::CompilationInfo>,
     symbol_table: Option<Arc<SymbolTable>>,
 ) -> Result<IndexResult> {
+    let source_sha256 = source_content_hash(source.as_bytes());
     index_file_with_resolution_inputs(
         path,
         source,
+        &source_sha256,
         language_config,
         compilation_info,
         symbol_table,
@@ -15577,6 +15581,7 @@ pub fn index_file(
 fn index_file_with_resolution_inputs(
     path: &Path,
     source: &str,
+    raw_source_sha256: &str,
     language_config: &LanguageConfig,
     compilation_info: Option<compilation_database::CompilationInfo>,
     symbol_table: Option<Arc<SymbolTable>>,
@@ -16279,6 +16284,7 @@ fn index_file_with_resolution_inputs(
     let resolution_inputs = proof_resolution::collect_call_resolution_inputs(
         &tree,
         source,
+        raw_source_sha256,
         path,
         language_config.language_name,
         &resolution_parser_fingerprint(language_config),
