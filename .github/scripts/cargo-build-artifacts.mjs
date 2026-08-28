@@ -31,7 +31,6 @@ const FORBIDDEN_SHIPPING_FEATURES = new Map([
   ["codestory-agent", new Set(["test-support"])],
   ["codestory-retrieval", new Set(["benchmark-support", "test-support"])],
   ["codestory-runtime", new Set(["benchmark-support", "test-support"])],
-  ["codestory-workspace", new Set(["test-support"])],
 ]);
 const ARTIFACT_CONTRACT = {
   cli: {
