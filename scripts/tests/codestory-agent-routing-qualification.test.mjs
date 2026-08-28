@@ -58,12 +58,12 @@ test("qualification host commands use official isolated Codex and Cursor session
     executable: "cursor-agent",
     projectRoot: "/fixture/project",
     pluginRoot: "/fixture/plugin",
-    model: "cursor-fixture",
+    model: "composer-2.5",
     prompt: "fixture prompt",
   });
   assert.deepEqual(cursorAgent.args, [
     "--print", "--output-format", "stream-json", "--stream-partial-output",
-    "--mode", "ask", "--approve-mcps", "--trust", "--model", "cursor-fixture",
+    "--mode", "ask", "--approve-mcps", "--trust", "--model", "composer-2.5",
     "--plugin-dir", "/fixture/plugin",
     "fixture prompt",
   ]);
@@ -73,10 +73,19 @@ test("qualification host commands use official isolated Codex and Cursor session
     executable: "cursor",
     projectRoot: "/fixture/project",
     pluginRoot: "/fixture/plugin",
-    model: "cursor-fixture",
+    model: "composer-2.5-fast",
     prompt: "fixture prompt",
   });
   assert.equal(cursor.args[0], "agent");
+
+  assert.throws(() => buildRoutingHostCommand({
+    host: "cursor",
+    executable: "cursor-agent",
+    projectRoot: "/fixture/project",
+    pluginRoot: "/fixture/plugin",
+    model: "gpt-5.6-sol-high",
+    prompt: "fixture prompt",
+  }), /Cursor qualification requires a Composer model/u);
 
   assert.deepEqual(buildCodexPluginInstallCommand({
     executable: "codex", codexHome: "/fixture/codex-home", pluginRoot: "/fixture/plugin",

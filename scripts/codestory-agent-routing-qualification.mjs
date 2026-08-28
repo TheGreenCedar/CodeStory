@@ -190,6 +190,7 @@ export function buildRoutingHostCommand({
   }
   if (host === "cursor") {
     if (!model) fail("Cursor qualification requires a pinned model");
+    if (!/^composer-/iu.test(model)) fail("Cursor qualification requires a Composer model");
     const args = [
       "--print", "--output-format", "stream-json", "--stream-partial-output",
       "--mode", "ask", "--approve-mcps", "--trust", "--model", model,
