@@ -2259,31 +2259,93 @@ test("qualification driver is built once, retained privately, authenticated, and
     }, /private qualification-driver retention must be explicit and off by default/u],
     ["host package repeats Cargo build", packagedFile, workflow => {
       hostBuild(workflow).run += '\ncargo build --release --locked "${cargo_args[@]}"';
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
+    ["host shipping graph admits the qualification driver", packagedFile, workflow => {
+      hostBuild(workflow).run = hostBuild(workflow).run.replace(
+        "--bin codestory-cli-runtime",
+        "--bin codestory-cli-runtime\n            -p codestory-bench\n            --bin codestory_embedding_qualification",
+      );
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
+    ["host shipping graph enables workspace test support", packagedFile, workflow => {
+      hostBuild(workflow).run = hostBuild(workflow).run.replace(
+        "--bin codestory-cli-runtime",
+        "--bin codestory-cli-runtime\n            --features codestory-workspace/test-support",
+      );
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
+    ["Windows qualification driver runs before shipping validation", packagedFile, workflow => {
+      const driverBlock = [
+        '  if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then',
+        "    build_qualification_driver",
+        "  fi",
+      ].join("\n");
+      const withoutDriver = hostBuild(workflow).run.replace(driverBlock, "");
+      hostBuild(workflow).run = withoutDriver.replace(
+        "  node .github/scripts/cargo-build-artifacts.mjs features",
+        `${driverBlock}\n  node .github/scripts/cargo-build-artifacts.mjs features`,
+      );
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
+    ["host package compiles through cargo rustc after validation", packagedFile, workflow => {
+      hostBuild(workflow).run += [
+        "",
+        "cargo rustc --release --locked -p codestory-cli --bin codestory-cli \\",
+        '  --features codestory-workspace/test-support --target "$RELEASE_RUST_TARGET"',
+      ].join("\n");
+    }, /package proof must not compile outside the two mutually exclusive reviewed Cargo build steps/u],
+    ["host package compiles through a toolchain-qualified cargo rustc", packagedFile, workflow => {
+      hostBuild(workflow).run += [
+        "",
+        "cargo +1.95.0 rustc --release --locked -p codestory-cli --bin codestory-cli \\",
+        '  --features codestory-workspace/test-support --target "$RELEASE_RUST_TARGET"',
+      ].join("\n");
+    }, /package proof must not compile outside the two mutually exclusive reviewed Cargo build steps/u],
     ["host package drops runtime", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bin ignored-runtime",
       );
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
     ["host package broadens to all bins", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "--bin codestory-cli-runtime",
         "--bins",
       );
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
     ["host package substitutes calibration driver", packagedFile, workflow => {
       hostBuild(workflow).run = hostBuild(workflow).run.replace(
         "codestory_embedding_qualification",
         "codestory_embedding_constant_calibration",
       );
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
     ["Linux package repeats Cargo build", packagedFile, workflow => {
       linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
         "/sccache/sccache --show-stats",
         'cargo build --release --locked "$@" --target "$RELEASE_RUST_TARGET"\n              /sccache/sccache --show-stats',
       );
-    }, /Linux package must build CLI, runtime, and conditional qualification driver in one exact Cargo invocation/u],
+    }, /Linux package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
+    ["Linux isolated graph script regresses to POSIX sh", packagedFile, workflow => {
+      linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
+        "bash -ceu '",
+        "sh -ceu '",
+      );
+    }, /Linux package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
+    ["Linux shipping graph admits the qualification driver", packagedFile, workflow => {
+      linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
+        "--bin codestory-cli-runtime",
+        "--bin codestory-cli-runtime\n                -p codestory-bench\n                --bin codestory_embedding_qualification",
+      );
+    }, /Linux package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
+    ["Linux shipping graph enables workspace test support", packagedFile, workflow => {
+      linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
+        "--bin codestory-cli-runtime",
+        "--bin codestory-cli-runtime\n                --features codestory-workspace/test-support",
+      );
+    }, /Linux package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
+    ["Linux package compiles through cargo rustc after validation", packagedFile, workflow => {
+      linuxBuild(workflow).run = linuxBuild(workflow).run.replace(
+        "/sccache/sccache --show-stats",
+        'cargo rustc --release --locked -p codestory-cli --bin codestory-cli --features codestory-workspace/test-support --target "$RELEASE_RUST_TARGET"\n              /sccache/sccache --show-stats',
+      );
+    }, /package proof must not compile outside the two mutually exclusive reviewed Cargo build steps/u],
     ["qualification driver cache identity becomes fixed", packagedFile, workflow => {
       draftStep(
         packagedJob(workflow),
@@ -2569,6 +2631,47 @@ test("qualification driver is built once, retained privately, authenticated, and
   }
 });
 
+test("package shipping graph is isolated from the private qualification driver", () => {
+  const workflow = loadWorkflows().get("packaged-platform-proof.yml");
+  const job = workflow.jobs.build;
+  const hostRun = String(
+    draftStep(job, "Build package and qualification driver").run,
+  );
+  const linuxRun = String(
+    draftStep(job, "Build Linux x64 at the glibc 2.31 baseline").run,
+  );
+
+  assert.equal(
+    (hostRun.match(/cargo build --release --locked/gu) ?? []).length,
+    2,
+    "host packaging must compile the shipping bins and private driver in separate Cargo graphs",
+  );
+  assert.match(linuxRun, /codestory-linux-glibc-build[\s\\]*bash -ceu/u);
+  assert.match(hostRun, /shipping_args[\s\S]*-p codestory-cli[\s\S]*build_shipping_graph/u);
+  assert.match(hostRun, /build_qualification_driver[\s\S]*-p codestory-bench/u);
+  assert.ok(
+    hostRun.indexOf("cargo-build-artifacts.mjs features")
+      < hostRun.lastIndexOf("build_qualification_driver"),
+    "host shipping features must be validated before the private driver is compiled",
+  );
+
+  assert.equal(
+    (linuxRun.match(/cargo build --release --locked/gu) ?? []).length,
+    2,
+    "Linux packaging must compile the shipping bins and private driver in separate Cargo graphs",
+  );
+  assert.match(linuxRun, /shipping_args[\s\S]*-p codestory-cli/u);
+  assert.match(linuxRun, /driver_args[\s\S]*-p codestory-bench/u);
+  assert.match(
+    linuxRun,
+    /cargo build --release --locked "\$\{shipping_args\[@\]\}"[\s\S]*> \/workspace\/target\/package-build-contract\/linux-x64\/cargo-messages\.jsonl[\s\S]*cargo build --release --locked "\$\{driver_args\[@\]\}"/u,
+  );
+  assert.match(
+    linuxRun,
+    /cargo-build-artifacts\.mjs features[\s\S]*cargo-messages\.jsonl/u,
+  );
+});
+
 test("qualification driver retention breaks a Cargo source hardlink and rejects retained hardlinks", () => {
   const directory = mkdtempSync(
     path.join(os.tmpdir(), "codestory-qualification-driver-"),
@@ -2645,7 +2748,7 @@ test("qualification driver retention breaks a Cargo source hardlink and rejects 
   }
 });
 
-test("Windows packages one release graph into exact public and private artifacts", async (t) => {
+test("Windows packages isolated public and private graphs into exact artifacts", async (t) => {
   assert.deepEqual(validateWorkflows(loadWorkflows()), []);
   const file = "packaged-platform-proof.yml";
   const job = workflow => workflow.jobs.build;
@@ -2665,10 +2768,10 @@ test("Windows packages one release graph into exact public and private artifacts
         run: "cargo build --release --locked -p codestory-workspace --test windows_path_identity",
       });
     }, /package proof must not compile outside the two mutually exclusive reviewed Cargo build steps/u],
-    ["the one package build invokes Cargo twice", workflow => {
+    ["a third Cargo build appears in the package step", workflow => {
       step(workflow, "Build package and qualification driver").run +=
         "\ncargo build --release --locked -p codestory-cli";
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
     ["the package graph loses release mode", workflow => {
       replaceRun(
         workflow,
@@ -2676,21 +2779,21 @@ test("Windows packages one release graph into exact public and private artifacts
         "cargo build --release --locked",
         "cargo build --locked",
       );
-    }, /host package must build only the production bins and optional qualification driver in one exact Cargo invocation/u],
+    }, /host package must isolate the production bins from the private qualification driver in two exact Cargo invocations/u],
     ["a source-test target contaminates the package graph", workflow => {
       step(workflow, "Build package and qualification driver").run =
         step(workflow, "Build package and qualification driver").run.replace(
           "timing_dir=\"target/windows-package-build-timing\"",
           'cargo_args+=( -p codestory-workspace --test windows_path_identity )\n            timing_dir="target/windows-package-build-timing"',
         );
-    }, /host package must build only the production bins/u],
+    }, /host package must isolate the production bins from the private qualification driver/u],
     ["the host feature contract is removed", workflow => {
       step(workflow, "Build package and qualification driver").run =
         step(workflow, "Build package and qualification driver").run.replace(
           "node .github/scripts/cargo-build-artifacts.mjs features",
           "true",
         );
-    }, /host package must build only the production bins/u],
+    }, /host package must isolate the production bins from the private qualification driver/u],
     ["the Windows runtime probe accepts test support", workflow => {
       step(workflow, "Prove production feature identity on Windows").run =
         step(workflow, "Prove production feature identity on Windows").run.replace(

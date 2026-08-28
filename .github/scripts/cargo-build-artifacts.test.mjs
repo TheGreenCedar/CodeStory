@@ -110,6 +110,7 @@ function fixture({
     "codestory-agent",
     "codestory-retrieval",
     "codestory-runtime",
+    "codestory-workspace",
   ]) {
     const manifest = writePackageManifest(packageName);
     messages.push({
@@ -350,40 +351,53 @@ test("rejects retrieval benchmark or test support in the shipping graph", async 
   }
 });
 
-test("rejects agent test support in the shipping graph", () => {
+test("rejects agent and workspace test support in the shipping graph", async (t) => {
   // `codestory-agent/test-support` compiles the eval/holdout probe hooks that used to ride
   // `#[cfg(test)]` inside codestory-runtime. Product builds never enable it, and the gate is
   // what makes "never" checkable rather than asserted (#1673).
-  const input = fixture();
-  featureMessage(input, "codestory-agent").features = ["test-support"];
-  refreshCargoJson(input);
+  for (const packageName of ["codestory-agent", "codestory-workspace"]) {
+    await t.test(packageName, () => {
+      const input = fixture();
+      featureMessage(input, packageName).features = ["test-support"];
+      refreshCargoJson(input);
 
-  assert.throws(
-    () =>
-      assertShippingFeatureContract({
-        jsonLines: input.jsonLines,
-        workspaceRoot: input.root,
-      }),
-    /forbidden feature codestory-agent\/test-support/u,
-  );
+      assert.throws(
+        () =>
+          assertShippingFeatureContract({
+            jsonLines: input.jsonLines,
+            workspaceRoot: input.root,
+          }),
+        new RegExp(`forbidden feature ${packageName}/test-support`, "u"),
+      );
+    });
+  }
 });
 
-test("refuses a shipping graph that never mentions a gated crate", () => {
+test("refuses a shipping graph that never mentions a gated crate", async (t) => {
   // Absence is the failure the gate has to notice: a crate that vanishes from the graph produces
   // no feature evidence, and "no evidence of the feature" must not read as "feature off".
-  const input = fixture();
-  const agent = featureMessage(input, "codestory-agent");
-  input.messages.splice(input.messages.indexOf(agent), 1);
-  refreshCargoJson(input);
+  for (const packageName of [
+    "codestory-agent",
+    "codestory-retrieval",
+    "codestory-runtime",
+    "codestory-workspace",
+  ]) {
+    await t.test(packageName, () => {
+      const input = fixture();
+      const artifact = featureMessage(input, packageName);
+      input.messages.splice(input.messages.indexOf(artifact), 1);
+      refreshCargoJson(input);
 
-  assert.throws(
-    () =>
-      assertShippingFeatureContract({
-        jsonLines: input.jsonLines,
-        workspaceRoot: input.root,
-      }),
-    /shipping Cargo graph omitted feature evidence for codestory-agent/u,
-  );
+      assert.throws(
+        () =>
+          assertShippingFeatureContract({
+            jsonLines: input.jsonLines,
+            workspaceRoot: input.root,
+          }),
+        new RegExp(`shipping Cargo graph omitted feature evidence for ${packageName}`, "u"),
+      );
+    });
+  }
 });
 
 test("rejects runtime benchmark or test support in the shipping graph", async (t) => {

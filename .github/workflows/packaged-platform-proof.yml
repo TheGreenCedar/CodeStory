@@ -409,22 +409,22 @@ jobs:
           SOURCE_TREE: ${{ steps.source-identity.outputs.tree }}
         run: |
           set -euo pipefail
-          cargo_args=(
+          shipping_args=(
             -p codestory-cli
             --bin codestory-cli
             --bin codestory-cli-runtime
           )
-          if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
-            cargo_args+=(
-              -p codestory-bench
-              --bin codestory_embedding_qualification
-            )
-          fi
-          build_package_graph() {
+          build_shipping_graph() {
             cargo build --release --locked \
-              "${cargo_args[@]}" \
+              "${shipping_args[@]}" \
               --target "$RELEASE_RUST_TARGET" \
               "$@"
+          }
+          build_qualification_driver() {
+            cargo build --release --locked \
+              -p codestory-bench \
+              --bin codestory_embedding_qualification \
+              --target "$RELEASE_RUST_TARGET"
           }
           if [ "$RUNNER_OS" = Windows ]; then
             timing_dir="target/windows-package-build-timing"
@@ -438,7 +438,7 @@ jobs:
             # already closed rather than to an unwaited process substitution
             # that can still be writing when the trace is selected.
             build_status=0
-            build_package_graph \
+            build_shipping_graph \
               --message-format=json-render-diagnostics \
               --timings \
               2> "$linker_log" \
@@ -449,15 +449,9 @@ jobs:
             build_elapsed_ms=$((build_ended_ms - build_started_ms))
             test "$build_elapsed_ms" -ge 0
 
-            expectations=(
-              --expect "cli=codestory-cli:bin:codestory-cli"
-              --expect "runtime=codestory-cli:bin:codestory-cli-runtime"
-            )
-            if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
-              expectations+=(
-                --expect "qualification_driver=codestory-bench:bin:codestory_embedding_qualification"
-              )
-            fi
+            node .github/scripts/cargo-build-artifacts.mjs features \
+              --input "$cargo_json" \
+              --workspace-root "$GITHUB_WORKSPACE"
             node .github/scripts/cargo-build-artifacts.mjs select \
               --input "$cargo_json" \
               --out "$timing_dir/cargo-build-artifacts.json" \
@@ -467,7 +461,8 @@ jobs:
               --source-sha "$SOURCE_SHA" \
               --source-tree "$SOURCE_TREE" \
               --github-output "$GITHUB_OUTPUT" \
-              "${expectations[@]}"
+              --expect "cli=codestory-cli:bin:codestory-cli" \
+              --expect "runtime=codestory-cli:bin:codestory-cli-runtime"
             node --input-type=module -e '
               import fs from "node:fs";
               import path from "node:path";
@@ -490,17 +485,23 @@ jobs:
               --input "$linker_log" \
               --out "$timing_dir/windows-link-timing.json" \
               --build-elapsed-ms "$build_elapsed_ms"
+            if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+              build_qualification_driver
+            fi
           else
             timing_dir="target/package-build-contract/${{ matrix.asset_target }}"
             mkdir -p "$timing_dir"
             cargo_json="$timing_dir/cargo-messages.jsonl"
-            build_package_graph \
+            build_shipping_graph \
               --message-format=json-render-diagnostics \
               > "$cargo_json"
             cat "$cargo_json"
             node .github/scripts/cargo-build-artifacts.mjs features \
               --input "$cargo_json" \
               --workspace-root "$GITHUB_WORKSPACE"
+            if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+              build_qualification_driver
+            fi
           fi
 
       - name: Build Linux x64 at the glibc 2.31 baseline
@@ -546,20 +547,24 @@ jobs:
             --volume "$SCCACHE_DIR:/sccache/cache" \
             --workdir /workspace \
             codestory-linux-glibc-build \
-            sh -ceu '
-              set -- \
+            bash -ceu '
+              shipping_args=( \
                 -p codestory-cli \
                 --bin codestory-cli \
                 --bin codestory-cli-runtime
-              if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
-                set -- "$@" \
-                  -p codestory-bench \
-                  --bin codestory_embedding_qualification
-              fi
-              cargo build --release --locked "$@" \
+              )
+              cargo build --release --locked "${shipping_args[@]}" \
                 --target "$RELEASE_RUST_TARGET" \
                 --message-format=json-render-diagnostics \
                 > /workspace/target/package-build-contract/linux-x64/cargo-messages.jsonl
+              if [ "$INCLUDE_QUALIFICATION_DRIVER" = true ]; then
+                driver_args=( \
+                  -p codestory-bench \
+                  --bin codestory_embedding_qualification
+                )
+                cargo build --release --locked "${driver_args[@]}" \
+                  --target "$RELEASE_RUST_TARGET"
+              fi
               cat /workspace/target/package-build-contract/linux-x64/cargo-messages.jsonl
               /sccache/sccache --show-stats
               /sccache/sccache --stop-server
