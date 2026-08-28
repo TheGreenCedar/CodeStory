@@ -32,8 +32,9 @@ ceremony.
    arguments. The delay tracks observed preparation progress, so honor the
    reported value instead of a fixed poll interval. Do not poll status or ask
    the user to set up CodeStory.
-4. Preserve cited anchors in source claims. Read focused source only for the
-   remaining evidence gaps.
+4. Preserve cited anchors in source claims. Read focused source only when the
+   user named the exact file or a material result gap identified one exact
+   focused path. A search lead is never source-read authorization.
 
 CodeStory prepares its local repository map and shared per-user retrieval server
 automatically. `status` and
@@ -53,7 +54,7 @@ plugin result unless the user explicitly asks.
 | --- | --- |
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
 | Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
-| Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. After a successful search, stop at the returned lead until the user selects one exact target. Do not inspect source or request focused evidence merely to upgrade a discovery result. |
+| Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. After a successful search, stop for that turn at the returned lead until the user selects one exact target in a later turn. Do not inspect source or request focused evidence merely to upgrade a discovery result. Missing excerpts, unavailable diagnostics, and multiple leads do not authorize source inspection. |
 | Get evidence for one selected target | Use `context` with that exact selected target. Do not broaden the target or treat evidence availability as proof. |
 | Follow a call path for navigation | `callers`, `callees`, `trace`, or `trail` can navigate the ordinary graph. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node; none of these tools returns an exact proof disposition. |
 | Verify an already translated exact call-path contract | For a host-supplied or user-supplied complete typed contract, call `prove_call_path` with the unchanged `source_text`, clauses, and exact spec. Do not infer or assemble a typed contract from English. |
@@ -73,6 +74,10 @@ plugin result unless the user explicitly asks.
   claim is true. Cite only the returned evidence rows and state every material
   returned gap. Never turn `available` into authority for a claim the rows do
   not establish.
+- A successful discovery-only `search` is terminal for that turn. Successful
+  `context`, completed `packet`, and `prove_call_path` results are also terminal
+  except for an explicitly returned packet continuation or an exact authorized
+  source fallback. Do not raise authority by adding an unrequested source read.
 - `prove_call_path` is the only surface that returns `contract_proven` or
   `contract_refuted`. It verifies a host-supplied interpretation; it does not
   translate prose. Never call it automatically from a packet, search result,
@@ -88,10 +93,11 @@ plugin result unless the user explicitly asks.
   IDs from `publication`. Then answer from the combined evidence and gaps. Do
   not start a free-form `search` / `context` / `trail` / `snippet` recovery
   loop from packet.
-- `no_useful_evidence` and `unavailable` are terminal CodeStory states. Report
-  the material gap or availability reason. Inspect ordinary source only when
-  the user named the file or the returned gap identifies the exact focused
-  surface; never turn a gap into an unconstrained repository search.
+- `no_useful_evidence` and `unavailable` are terminal CodeStory states. A typed
+  `Unavailable` result is terminal and remains unavailable. Inspect ordinary
+  source only when the user named the file or the returned gap identifies the
+  exact focused surface; that fallback does not erase the unavailable outcome.
+  Never turn a gap into an unconstrained repository search.
 - `affected` is planning evidence, not a guarantee that every runtime effect was
   found.
 - Tagged probes select exact or additional evidence work. They do not choose
@@ -106,8 +112,10 @@ plugin result unless the user explicitly asks.
 - `updating`: the last complete repository map remains usable; retry the same
   tool when current publication evidence is required.
 - `working_locally`: use local navigation while broad search prepares.
-- `unavailable`: use ordinary source inspection and report that CodeStory was
-  unavailable for this task.
+- MCP transport or tool absence authorizes ordinary source inspection when it
+  is needed to continue, with the CodeStory availability gap reported. A
+  successful tool result tagged `unavailable`, including a typed `Unavailable`,
+  follows the terminal result and exact source-authorization rules above.
 
 Maintainer commands such as `doctor`, `ready`, and retrieval status are debug
 transcript tools. They do not prove that the installed plugin is live in the

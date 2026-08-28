@@ -8,7 +8,7 @@
     },
     {
       "id": "exact_symbol_search",
-    "prompt": "Where is the exact symbol start declared? Treat a broad match as a discovery lead rather than proof.",
+      "prompt": "Find discovery candidates only for declarations named start. Do not select or verify one in this turn.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {

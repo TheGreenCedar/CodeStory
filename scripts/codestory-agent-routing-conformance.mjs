@@ -266,7 +266,7 @@ export function validateRoutingRequestCorpus(document = ROUTING_CORPUS_DOCUMENT)
 
 export const ROUTING_REQUEST_CORPUS = deepFreeze(structuredClone(ROUTING_CORPUS_DOCUMENT));
 
-const FINAL_REPORT_INSTRUCTION = `Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read or a supported evidence result, discovery_only for a search lead, and preserve the exact proof result boundary. Use invalid_contract for a rejected typed interpretation. Use refused only when the user requested exact proof without supplying a typed interpretation. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
+const FINAL_REPORT_INSTRUCTION = `Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read unless it follows an unavailable CodeStory result: an authorized fallback read changes evidence authority but preserves an earlier unavailable outcome. Use supported for a supported evidence result, discovery_only for a search lead, and preserve the exact proof result boundary. Use invalid_contract for a rejected typed interpretation. Use refused only when the user requested exact proof without supplying a typed interpretation. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
 
 export function materializeRoutingRequests(projectRoot) {
   const project = realpathSync(projectRoot);
@@ -2379,6 +2379,8 @@ function validateRoutingGuidance(text, label) {
     [/host-supplied.*`prove_call_path`/isu, "host-supplied proof routing"],
     [/`unknown`.*not absence/isu, "unknown boundary"],
     [/runtime execution/iu, "runtime-execution boundary"],
+    [/typed `Unavailable`.*terminal/isu, "typed-unavailable terminal boundary"],
+    [/transport.*tool absence.*source/isu, "transport-unavailable source fallback"],
   ];
   for (const [pattern, requirement] of requirements) {
     if (!pattern.test(text)) fail(`${label} is missing ${requirement}`);
@@ -2439,7 +2441,9 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   validateRoutingGuidance(canonicalSkillText, "canonical grounding skill");
   if (!/search.*context.*packet.*prove_call_path/isu.test(openAiMetadataText)
       || !/host-supplied/iu.test(openAiMetadataText)
-      || !/unknown.*not absence/isu.test(openAiMetadataText)) {
+      || !/unknown.*not absence/isu.test(openAiMetadataText)
+      || !/typed `Unavailable`.*terminal/isu.test(openAiMetadataText)
+      || !/transport.*tool absence.*source/isu.test(openAiMetadataText)) {
     fail("OpenAI skill metadata is missing the canonical routing boundary");
   }
 

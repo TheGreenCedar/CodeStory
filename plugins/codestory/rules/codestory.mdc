@@ -22,9 +22,10 @@ The **codestory-grounding** skill is loaded by the plugin and owns the detailed 
 Routing contract:
 
 - Read an exact user-named file directly when the question is file-local.
-- Discovery leads come from `search`; they identify candidates and do not prove a claim. After a successful search, stop at the returned lead until the user selects an exact target; do not inspect source merely to upgrade the result.
+- Discovery leads come from `search`; they identify candidates and do not prove a claim. After a successful search, stop for that turn at the returned lead until the user selects an exact target in a later turn; missing excerpts or unavailable diagnostics do not authorize source inspection.
 - For one selected target, use `context` for evidence around that target only.
 - For a broad structural question, use `packet`, preserve every returned gap, and follow a bounded continuation at most once.
 - For a complete host-supplied or user-supplied typed contract, call `prove_call_path` unchanged. Never construct that contract from English or from packet, search, or context output.
 - Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable` exactly. `unknown` is not absence, and structural proof does not establish runtime execution.
 - Inspect source after a packet only for a user-named file or an exact focused surface identified by a material gap. Do not start a free-form recovery loop.
+- A typed `Unavailable` result is terminal. MCP transport or tool absence may authorize ordinary source inspection; a successful unavailable result does not, except for an exact user-named file or exact focused gap, and fallback evidence does not erase the unavailable outcome.

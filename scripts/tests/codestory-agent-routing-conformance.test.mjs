@@ -1047,19 +1047,40 @@ test("checked-in request corpus covers the routing matrix exactly once", () => {
 });
 
 test("installed-host prompts close the final claim vocabulary and direct-read identity contract", () => {
-  const prompts = materializeRoutingRequests(repoRoot).map(({ request }) => request.text);
+  const materialized = materializeRoutingRequests(repoRoot);
+  const prompts = materialized.map(({ request }) => request.text);
   assert.equal(prompts.length, SCENARIO_IDS.length);
   for (const prompt of prompts) {
     assert.match(prompt, /authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none/u);
     assert.match(prompt, /outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused/u);
     assert.match(prompt, /For a direct source read, record evidence identity source:<project-relative-path>/u);
-    assert.match(prompt, /Use supported for a direct source read/u);
+    assert.match(prompt, /authorized fallback read changes evidence authority but preserves an earlier unavailable outcome/u);
     assert.match(prompt, /Use refused only when the user requested exact proof without supplying a typed interpretation/u);
     assert.match(prompt, /target_id must be null unless a CodeStory tool result returned a target identity/u);
     assert.match(prompt, /reason_codes may contain only CodeStory tool result codes or typed_contract_required/u);
     assert.match(prompt, /refutation_basis must be null unless a ContractRefuted result supplied the basis/u);
     assert.match(prompt, /runtime_execution_claim and absence_claim must each be false/u);
     assert.match(prompt, /material_omissions contains only unresolved material requested by the user/u);
+  }
+  const discoveryPrompt = materialized.find(({ scenario_id }) => scenario_id === "exact_symbol_search").request.text;
+  assert.match(discoveryPrompt, /discovery candidates only/iu);
+  assert.match(discoveryPrompt, /do not select or verify one in this turn/iu);
+});
+
+test("terminal routing scenarios reject every unauthorized source upgrade", () => {
+  const authorized = new Set([
+    "named_file_direct_read",
+    "packet_gap_to_focused_source",
+    "packet_unavailable_to_source",
+  ]);
+  for (const scenarioId of SCENARIO_IDS.filter((id) => !authorized.has(id))) {
+    const run = baseRun(scenarioId);
+    run.steps.push({ kind: "source_read", path: "src/lib.rs" });
+    assert.throws(
+      () => validate("codex", run),
+      /required action sequence|forbidden tool|source read is not authorized/u,
+      scenarioId,
+    );
   }
 });
 
@@ -1736,10 +1757,14 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     assert.match(guidance, /host-supplied.*`prove_call_path`/isu, label);
     assert.match(guidance, /`unknown`.*not absence/isu, label);
     assert.match(guidance, /runtime execution/iu, label);
+    assert.match(guidance, /typed `Unavailable`.*terminal/isu, label);
+    assert.match(guidance, /transport.*tool absence.*source/isu, label);
   }
   assert.match(openAiMetadata, /search.*context.*packet.*prove_call_path/isu);
   assert.match(openAiMetadata, /host-supplied/iu);
   assert.match(openAiMetadata, /unknown.*not absence/isu);
+  assert.match(openAiMetadata, /typed `Unavailable`.*terminal/isu);
+  assert.match(openAiMetadata, /transport.*tool absence.*source/isu);
 });
 
 test("static parity rejects substituted bytes invalid or no-op hooks metadata drift and heading-only rules", async () => {
@@ -1806,8 +1831,8 @@ Call the CodeStory tool that matches the task. The codestory-grounding skill own
     writeFileSync(
       openAiMetadataPath,
       readFileSync(openAiMetadataPath, "utf8").replace(
-        /Use search for discovery leads and stop after a successful search until the user selects an exact target; do not inspect source merely to upgrade a discovery result\./u,
-        "Call the CodeStory tool that matches the repository task.",
+        /A typed `Unavailable` result is terminal\. MCP transport or tool absence may authorize ordinary source inspection; a successful unavailable result does not unless an exact file or focused gap authorizes it\. /u,
+        "",
       ),
     );
     const incompleteOpenAiMetadata = staticIdentityFor(root);
