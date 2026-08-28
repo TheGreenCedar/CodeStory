@@ -8,11 +8,15 @@
 
 use crate::config::{SidecarRuntimeConfig, private_cache_directory};
 use anyhow::{Context, Result, bail};
+use codestory_contracts::bounded_locks::{self, FileLockKind, LockDeadline};
+use codestory_workspace::owned_deletion::OwnedDeletionRoot;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+use uuid::Uuid;
 
 const CACHE_SCHEMA_VERSION: i64 = 5;
 const CACHE_DIRECTORY: &str = "content-addressed-vectors-v5";
@@ -24,7 +28,35 @@ const CACHE_TRUNCATION_CONTRACT: &str = "native-tokenize-truncate-max-input-v1";
 const CACHE_NORMALIZATION_CONTRACT: &str = "server-f32-l2-then-index-f64-l2-v1";
 const CACHE_MAX_PAYLOAD_BYTES: u64 = 96 * 1024 * 1024;
 const CACHE_MAX_DATABASE_BYTES: u64 = 128 * 1024 * 1024;
+const CACHE_MAX_AGGREGATE_DATABASE_BYTES: u64 = 512 * 1024 * 1024;
 const CACHE_ROW_ACCOUNTING_BYTES: u64 = 512;
+const CACHE_RETENTION_DIRECTORY: &str = "content-addressed-vector-retention-v1";
+const CACHE_RETENTION_REGISTRY: &str = "registry.sqlite3";
+const CACHE_RETENTION_GLOBAL_LOCK: &str = "maintenance.lock";
+const CACHE_RETENTION_SCOPE_LOCKS: &str = "scope-locks";
+const CACHE_RETENTION_REGISTRY_SCHEMA_VERSION: i64 = 2;
+const CACHE_RETENTION_REGISTRY_MAX_BYTES: u64 = 8 * 1024 * 1024;
+const CACHE_SCOPE_OWNERSHIP_MARKER: &str = "ownership-v1";
+
+struct VectorCacheScopeLease {
+    file: File,
+}
+
+impl Drop for VectorCacheScopeLease {
+    fn drop(&mut self) {
+        let _ = bounded_locks::release(&self.file);
+    }
+}
+
+struct VectorCacheMaintenanceLock {
+    file: File,
+}
+
+impl Drop for VectorCacheMaintenanceLock {
+    fn drop(&mut self) {
+        let _ = bounded_locks::release(&self.file);
+    }
+}
 
 pub(crate) struct VectorCacheBatchInput<'a> {
     pub anchor_identity: &'a str,
@@ -34,6 +66,7 @@ pub(crate) struct VectorCacheBatchInput<'a> {
 
 pub(crate) struct ContentAddressedVectorCache {
     connection: Connection,
+    _scope_lease: VectorCacheScopeLease,
     #[cfg(test)]
     path: PathBuf,
     artifact_scope_id: String,
@@ -69,16 +102,53 @@ impl ContentAddressedVectorCache {
         max_payload_bytes: u64,
         max_database_bytes: u64,
     ) -> Result<Self> {
+        Self::open_with_retention_limits(
+            runtime,
+            artifact_scope_id,
+            producer_compatibility_identity,
+            embedding_dim,
+            max_payload_bytes,
+            max_database_bytes,
+            CACHE_MAX_AGGREGATE_DATABASE_BYTES,
+        )
+    }
+
+    fn open_with_retention_limits(
+        runtime: &SidecarRuntimeConfig,
+        artifact_scope_id: &str,
+        producer_compatibility_identity: &str,
+        embedding_dim: usize,
+        max_payload_bytes: u64,
+        max_database_bytes: u64,
+        max_aggregate_database_bytes: u64,
+    ) -> Result<Self> {
         if artifact_scope_id.trim().is_empty()
             || producer_compatibility_identity.trim().is_empty()
             || embedding_dim == 0
             || max_payload_bytes == 0
             || max_database_bytes <= max_payload_bytes
+            || max_aggregate_database_bytes < max_database_bytes
         {
             bail!("content-addressed vector cache identity is incomplete");
         }
         let contract_sha256 =
             cache_contract_sha256(runtime, producer_compatibility_identity, embedding_dim)?;
+        let scope_name = hex_digest(Sha256::digest(artifact_scope_id.as_bytes()));
+        let retention = VectorCacheRetention::open(runtime)?;
+        retention.claim_current_scope(
+            CACHE_DIRECTORY,
+            &scope_name,
+            CACHE_SCHEMA_VERSION,
+            max_database_bytes,
+        )?;
+        let scope_lease = retention.acquire_shared_scope(CACHE_DIRECTORY, &scope_name)?;
+        retention.register_and_enforce(
+            CACHE_DIRECTORY,
+            &scope_name,
+            CACHE_SCHEMA_VERSION,
+            max_database_bytes,
+            max_aggregate_database_bytes,
+        )?;
         let scope_directory = cache_scope_directory(runtime, artifact_scope_id)?;
         let path = scope_directory.join("vectors.sqlite3");
         if let Ok(metadata) = std::fs::symlink_metadata(&path)
@@ -178,6 +248,7 @@ impl ContentAddressedVectorCache {
         }
         Ok(Self {
             connection,
+            _scope_lease: scope_lease,
             #[cfg(test)]
             path,
             artifact_scope_id: artifact_scope_id.to_string(),
@@ -540,6 +611,719 @@ fn decode_identity_plan(
         bail!("content-addressed vector corpus plan coverage mismatch");
     }
     Ok(identities)
+}
+
+struct VectorCacheRetention {
+    cache_root: PathBuf,
+    retention_root: PathBuf,
+    registry: Connection,
+    _maintenance: VectorCacheMaintenanceLock,
+}
+
+#[derive(Clone)]
+struct RegisteredVectorCacheScope {
+    root_name: String,
+    scope_name: String,
+    cache_schema_version: i64,
+    last_access_sequence: i64,
+    max_database_bytes: u64,
+    ownership_token: String,
+}
+
+struct InactiveVectorCacheScope {
+    registered: RegisteredVectorCacheScope,
+    bytes: u64,
+    lock: File,
+}
+
+impl VectorCacheRetention {
+    fn open(runtime: &SidecarRuntimeConfig) -> Result<Self> {
+        let retention_root = runtime.cache_root.join(CACHE_RETENTION_DIRECTORY);
+        private_cache_directory(&retention_root)
+            .context("create content-addressed vector retention root")?;
+        let locks_root = retention_root.join(CACHE_RETENTION_SCOPE_LOCKS);
+        private_cache_directory(&locks_root)
+            .context("create content-addressed vector retention lock root")?;
+        let maintenance_path = retention_root.join(CACHE_RETENTION_GLOBAL_LOCK);
+        let maintenance_file = open_lock_file(&maintenance_path)?;
+        bounded_locks::acquire_with_deadline(
+            &maintenance_file,
+            FileLockKind::Exclusive,
+            LockDeadline::after(bounded_locks::DEFAULT_LOCK_WAIT),
+            None,
+        )
+        .map_err(anyhow::Error::new)
+        .context("acquire content-addressed vector retention maintenance lock")?;
+        let maintenance = VectorCacheMaintenanceLock {
+            file: maintenance_file,
+        };
+
+        let registry_path = retention_root.join(CACHE_RETENTION_REGISTRY);
+        reject_non_regular_file(&registry_path, "vector retention registry")?;
+        let registry = Connection::open(&registry_path).with_context(|| {
+            format!(
+                "open content-addressed vector retention registry {}",
+                registry_path.display()
+            )
+        })?;
+        registry.busy_timeout(Duration::from_secs(30))?;
+        registry.execute_batch(
+            "PRAGMA journal_mode=DELETE;
+             PRAGMA synchronous=FULL;
+             PRAGMA foreign_keys=ON;
+             PRAGMA trusted_schema=OFF;
+             CREATE TABLE IF NOT EXISTS retention_metadata (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                 schema_version INTEGER NOT NULL,
+                 access_sequence INTEGER NOT NULL CHECK(access_sequence >= 0)
+             );
+             CREATE TABLE IF NOT EXISTS owned_vector_cache_scope (
+                 root_name TEXT NOT NULL,
+                 scope_name TEXT NOT NULL,
+                 cache_schema_version INTEGER NOT NULL CHECK(cache_schema_version > 0),
+                 last_access_sequence INTEGER NOT NULL CHECK(last_access_sequence > 0),
+                 max_database_bytes INTEGER NOT NULL CHECK(max_database_bytes > 0),
+                 ownership_token TEXT NOT NULL CHECK(length(ownership_token) = 36),
+                 PRIMARY KEY(root_name, scope_name)
+             ) WITHOUT ROWID;",
+        )?;
+        registry.execute(
+            "INSERT OR IGNORE INTO retention_metadata
+             (singleton, schema_version, access_sequence) VALUES (1, ?1, 0)",
+            params![CACHE_RETENTION_REGISTRY_SCHEMA_VERSION],
+        )?;
+        let schema_version = registry.query_row(
+            "SELECT schema_version FROM retention_metadata WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        if schema_version != CACHE_RETENTION_REGISTRY_SCHEMA_VERSION {
+            bail!("content-addressed vector retention registry schema mismatch");
+        }
+        let page_size = u64::try_from(
+            registry.pragma_query_value(None, "page_size", |row| row.get::<_, i64>(0))?,
+        )
+        .context("content-addressed vector retention page size is invalid")?;
+        let max_page_count = CACHE_RETENTION_REGISTRY_MAX_BYTES
+            .checked_div(page_size)
+            .context("content-addressed vector retention registry page size exceeds its cap")?;
+        registry.pragma_update(
+            None,
+            "max_page_count",
+            i64::try_from(max_page_count).context("vector retention page count overflow")?,
+        )?;
+        let applied_max_page_count =
+            u64::try_from(
+                registry.pragma_query_value(None, "max_page_count", |row| row.get::<_, i64>(0))?,
+            )
+            .context("content-addressed vector retention maximum page count is invalid")?;
+        if applied_max_page_count > max_page_count {
+            bail!("content-addressed vector retention registry exceeds its database limit");
+        }
+
+        Ok(Self {
+            cache_root: runtime.cache_root.clone(),
+            retention_root,
+            registry,
+            _maintenance: maintenance,
+        })
+    }
+
+    fn acquire_shared_scope(
+        &self,
+        root_name: &str,
+        scope_name: &str,
+    ) -> Result<VectorCacheScopeLease> {
+        let (_, file) = self.open_scope_lock(root_name, scope_name)?;
+        bounded_locks::acquire_with_deadline(
+            &file,
+            FileLockKind::Shared,
+            LockDeadline::after(bounded_locks::DEFAULT_LOCK_WAIT),
+            None,
+        )
+        .map_err(anyhow::Error::new)
+        .context("acquire content-addressed vector cache scope lease")?;
+        Ok(VectorCacheScopeLease { file })
+    }
+
+    fn claim_current_scope(
+        &self,
+        root_name: &str,
+        scope_name: &str,
+        cache_schema_version: i64,
+        max_database_bytes: u64,
+    ) -> Result<()> {
+        validate_registered_scope(root_name, scope_name, cache_schema_version)?;
+        let root = self.cache_root.join(root_name);
+        private_cache_directory(&root).context("verify content-addressed vector cache root")?;
+        let scope = root.join(scope_name);
+        let scope_bytes = known_scope_bytes(&scope)?
+            .context("content-addressed vector cache scope contains unknown or unsafe artifacts")?;
+        let registered = self
+            .registry
+            .query_row(
+                "SELECT cache_schema_version, max_database_bytes, ownership_token
+                 FROM owned_vector_cache_scope
+                 WHERE root_name = ?1 AND scope_name = ?2",
+                params![root_name, scope_name],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((registered_schema, registered_max, ownership_token)) = registered {
+            if registered_schema != cache_schema_version
+                || registered_max
+                    != i64::try_from(max_database_bytes)
+                        .context("vector cache database reservation overflow")?
+            {
+                bail!("content-addressed vector cache ownership metadata mismatch");
+            }
+            match read_scope_ownership_token(&scope)? {
+                Some(observed) if observed == ownership_token => return Ok(()),
+                Some(_) => bail!("content-addressed vector cache ownership token mismatch"),
+                None if scope_bytes == 0 => {
+                    private_cache_directory(&scope)
+                        .context("recover registered vector cache scope")?;
+                    write_scope_ownership_token(&scope, &ownership_token)?;
+                    return Ok(());
+                }
+                None => {
+                    bail!(
+                        "registered content-addressed vector cache is missing its ownership token"
+                    )
+                }
+            }
+        }
+
+        if scope_bytes != 0 || read_scope_ownership_token(&scope)?.is_some() {
+            bail!("refuse to claim unregistered content-addressed vector cache artifacts");
+        }
+        let ownership_token = Uuid::new_v4().to_string();
+        self.registry.execute(
+            "UPDATE retention_metadata
+             SET access_sequence = CASE
+                 WHEN access_sequence < 9223372036854775807 THEN access_sequence + 1
+                 ELSE access_sequence
+             END
+             WHERE singleton = 1",
+            [],
+        )?;
+        let access_sequence = self.registry.query_row(
+            "SELECT access_sequence FROM retention_metadata WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.registry.execute(
+            "INSERT INTO owned_vector_cache_scope
+             (root_name, scope_name, cache_schema_version, last_access_sequence,
+              max_database_bytes, ownership_token)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                root_name,
+                scope_name,
+                cache_schema_version,
+                access_sequence,
+                i64::try_from(max_database_bytes)
+                    .context("vector cache database reservation overflow")?,
+                ownership_token,
+            ],
+        )?;
+        private_cache_directory(&scope).context("create registered vector cache scope")?;
+        write_scope_ownership_token(&scope, &ownership_token)?;
+
+        Ok(())
+    }
+
+    fn register_and_enforce(
+        &self,
+        root_name: &str,
+        scope_name: &str,
+        cache_schema_version: i64,
+        max_database_bytes: u64,
+        max_aggregate_database_bytes: u64,
+    ) -> Result<()> {
+        validate_registered_scope(root_name, scope_name, cache_schema_version)?;
+        let current_path = self.cache_root.join(root_name).join(scope_name);
+        known_scope_bytes(&current_path)?
+            .context("content-addressed vector cache scope contains unknown or unsafe artifacts")?;
+
+        let existing = self
+            .registry
+            .query_row(
+                "SELECT cache_schema_version, max_database_bytes
+                 FROM owned_vector_cache_scope
+                 WHERE root_name = ?1 AND scope_name = ?2",
+                params![root_name, scope_name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        if let Some((registered_schema, registered_max)) = existing
+            && (registered_schema != cache_schema_version
+                || registered_max
+                    != i64::try_from(max_database_bytes)
+                        .context("vector cache database reservation overflow")?)
+        {
+            bail!("content-addressed vector cache ownership metadata mismatch");
+        }
+
+        self.registry.execute(
+            "UPDATE retention_metadata
+             SET access_sequence = CASE
+                 WHEN access_sequence < 9223372036854775807 THEN access_sequence + 1
+                 ELSE access_sequence
+             END
+             WHERE singleton = 1",
+            [],
+        )?;
+        let access_sequence = self.registry.query_row(
+            "SELECT access_sequence FROM retention_metadata WHERE singleton = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let touched = self.registry.execute(
+            "UPDATE owned_vector_cache_scope
+             SET last_access_sequence = ?1
+             WHERE root_name = ?2 AND scope_name = ?3",
+            params![access_sequence, root_name, scope_name],
+        )?;
+        if touched != 1 {
+            bail!("content-addressed vector cache ownership registration is missing");
+        }
+
+        (|| {
+            let mut inactive = Vec::new();
+            let mut reserved_or_stored_bytes = 0_u64;
+            for registered in self.registered_scopes()? {
+                validate_registered_scope(
+                    &registered.root_name,
+                    &registered.scope_name,
+                    registered.cache_schema_version,
+                )?;
+                let path = self
+                    .cache_root
+                    .join(&registered.root_name)
+                    .join(&registered.scope_name);
+                let Some(bytes) = known_scope_bytes(&path)? else {
+                    bail!(
+                        "registered content-addressed vector cache contains unknown or unsafe artifacts"
+                    );
+                };
+                let observed_token = read_scope_ownership_token(&path)?;
+                if observed_token.as_deref() != Some(registered.ownership_token.as_str())
+                    && !(observed_token.is_none() && bytes == 0)
+                {
+                    bail!("registered content-addressed vector cache ownership token mismatch");
+                }
+                if registered.root_name == root_name && registered.scope_name == scope_name {
+                    reserved_or_stored_bytes = reserved_or_stored_bytes
+                        .checked_add(registered.max_database_bytes)
+                        .context("aggregate vector cache byte count overflow")?;
+                    continue;
+                }
+
+                let (lock_path, lock) =
+                    self.open_scope_lock(&registered.root_name, &registered.scope_name)?;
+                if bounded_locks::try_acquire(&lock, FileLockKind::Exclusive)
+                    .map_err(anyhow::Error::new)
+                    .context("inspect content-addressed vector cache scope lease")?
+                {
+                    if bytes == 0 || !scope_has_database(&path)? {
+                        self.remove_registered_scope(&registered, lock_path, lock)?;
+                    } else {
+                        reserved_or_stored_bytes = reserved_or_stored_bytes
+                            .checked_add(bytes)
+                            .context("aggregate vector cache byte count overflow")?;
+                        inactive.push(InactiveVectorCacheScope {
+                            registered,
+                            bytes,
+                            lock,
+                        });
+                    }
+                } else {
+                    reserved_or_stored_bytes = reserved_or_stored_bytes
+                        .checked_add(registered.max_database_bytes)
+                        .context("aggregate vector cache byte count overflow")?;
+                }
+            }
+
+            inactive.sort_by(|left, right| {
+                left.registered
+                    .last_access_sequence
+                    .cmp(&right.registered.last_access_sequence)
+                    .then_with(|| left.registered.root_name.cmp(&right.registered.root_name))
+                    .then_with(|| left.registered.scope_name.cmp(&right.registered.scope_name))
+            });
+            let removable_bytes = inactive.iter().try_fold(0_u64, |total, entry| {
+                total
+                    .checked_add(entry.bytes)
+                    .context("aggregate vector cache removable byte count overflow")
+            })?;
+            if reserved_or_stored_bytes.saturating_sub(removable_bytes)
+                > max_aggregate_database_bytes
+            {
+                bail!(
+                    "aggregate vector cache limit cannot reserve the current cache without deleting an active scope"
+                );
+            }
+            for entry in inactive {
+                if reserved_or_stored_bytes <= max_aggregate_database_bytes {
+                    break;
+                }
+                reserved_or_stored_bytes = reserved_or_stored_bytes.saturating_sub(entry.bytes);
+                let lock_path = self
+                    .scope_lock_path(&entry.registered.root_name, &entry.registered.scope_name)?;
+                self.remove_registered_scope(&entry.registered, lock_path, entry.lock)?;
+            }
+            Ok(())
+        })()
+    }
+
+    fn registered_scopes(&self) -> Result<Vec<RegisteredVectorCacheScope>> {
+        let mut statement = self.registry.prepare(
+            "SELECT root_name, scope_name, cache_schema_version,
+                    last_access_sequence, max_database_bytes, ownership_token
+             FROM owned_vector_cache_scope",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (
+                root_name,
+                scope_name,
+                cache_schema_version,
+                last_access_sequence,
+                max_bytes,
+                ownership_token,
+            ) = row?;
+            Ok(RegisteredVectorCacheScope {
+                root_name,
+                scope_name,
+                cache_schema_version,
+                last_access_sequence,
+                max_database_bytes: u64::try_from(max_bytes)
+                    .context("registered vector cache reservation is invalid")?,
+                ownership_token,
+            })
+        })
+        .collect()
+    }
+
+    fn remove_registered_scope(
+        &self,
+        registered: &RegisteredVectorCacheScope,
+        lock_path: PathBuf,
+        lock: File,
+    ) -> Result<()> {
+        remove_owned_scope(
+            &self.cache_root,
+            &registered.root_name,
+            &registered.scope_name,
+            &registered.ownership_token,
+        )?;
+        bounded_locks::release(&lock)
+            .map_err(anyhow::Error::new)
+            .context("release evicted vector cache scope lock")?;
+        drop(lock);
+        match std::fs::remove_file(&lock_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("remove evicted vector cache scope lock"),
+        }
+        self.registry.execute(
+            "DELETE FROM owned_vector_cache_scope
+             WHERE root_name = ?1 AND scope_name = ?2",
+            params![registered.root_name, registered.scope_name],
+        )?;
+        Ok(())
+    }
+
+    fn open_scope_lock(&self, root_name: &str, scope_name: &str) -> Result<(PathBuf, File)> {
+        let path = self.scope_lock_path(root_name, scope_name)?;
+        Ok((path.clone(), open_lock_file(&path)?))
+    }
+
+    fn scope_lock_path(&self, root_name: &str, scope_name: &str) -> Result<PathBuf> {
+        validate_scope_components(root_name, scope_name)?;
+        let mut digest = Sha256::new();
+        digest.update(b"codestory-vector-cache-scope-lock-v1\0");
+        digest.update(root_name.as_bytes());
+        digest.update([0]);
+        digest.update(scope_name.as_bytes());
+        Ok(self
+            .retention_root
+            .join(CACHE_RETENTION_SCOPE_LOCKS)
+            .join(format!("{}.lock", hex_digest(digest.finalize()))))
+    }
+}
+
+fn validate_registered_scope(
+    root_name: &str,
+    scope_name: &str,
+    cache_schema_version: i64,
+) -> Result<()> {
+    validate_scope_components(root_name, scope_name)?;
+    let Some(version) = root_name.strip_prefix("content-addressed-vectors-v") else {
+        bail!("registered vector cache root is invalid");
+    };
+    if version.parse::<i64>().ok() != Some(cache_schema_version) || cache_schema_version <= 0 {
+        bail!("registered vector cache scope is invalid");
+    }
+    Ok(())
+}
+
+fn validate_scope_components(root_name: &str, scope_name: &str) -> Result<()> {
+    let Some(version) = root_name.strip_prefix("content-addressed-vectors-v") else {
+        bail!("registered vector cache root is invalid");
+    };
+    if version.is_empty()
+        || !version.bytes().all(|byte| byte.is_ascii_digit())
+        || scope_name.len() != 64
+        || !scope_name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("registered vector cache scope is invalid");
+    }
+    Ok(())
+}
+
+fn open_lock_file(path: &Path) -> Result<File> {
+    reject_non_regular_file(path, "vector cache lock")?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("open vector cache lock {}", path.display()))
+}
+
+fn reject_non_regular_file(path: &Path, label: &str) -> Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path)
+        && (metadata.file_type().is_symlink() || !metadata.file_type().is_file())
+    {
+        bail!("content-addressed {label} is not a regular file");
+    }
+    Ok(())
+}
+
+fn known_scope_bytes(path: &Path) -> Result<Option<u64>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Some(0)),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(None);
+    }
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("enumerate vector cache scope {}", path.display()))?
+    {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            return Ok(None);
+        };
+        if !matches!(
+            name,
+            "vectors.sqlite3"
+                | "vectors.sqlite3-wal"
+                | "vectors.sqlite3-shm"
+                | "vectors.sqlite3-journal"
+                | CACHE_SCOPE_OWNERSHIP_MARKER
+        ) {
+            return Ok(None);
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() || !file_type.is_file() {
+            return Ok(None);
+        }
+        let metadata = entry.metadata()?;
+        total = total
+            .checked_add(metadata.len())
+            .context("vector cache scope byte count overflow")?;
+    }
+    Ok(Some(total))
+}
+
+fn scope_has_database(scope: &Path) -> Result<bool> {
+    let path = scope.join("vectors.sqlite3");
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => Ok(!metadata.file_type().is_symlink() && metadata.is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("inspect vector cache database identity"),
+    }
+}
+
+fn read_scope_ownership_token(scope: &Path) -> Result<Option<String>> {
+    let path = scope.join(CACHE_SCOPE_OWNERSHIP_MARKER);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("inspect vector cache ownership token"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != 36 {
+        bail!("content-addressed vector cache ownership token is invalid");
+    }
+    let token = std::fs::read_to_string(&path).context("read vector cache ownership token")?;
+    Uuid::parse_str(&token).context("parse vector cache ownership token")?;
+    Ok(Some(token))
+}
+
+fn write_scope_ownership_token(scope: &Path, ownership_token: &str) -> Result<()> {
+    Uuid::parse_str(ownership_token).context("validate vector cache ownership token")?;
+    let path = scope.join(CACHE_SCOPE_OWNERSHIP_MARKER);
+    if path.exists() {
+        bail!("content-addressed vector cache ownership token already exists");
+    }
+    codestory_workspace::atomic_file::publish_new_private_file_atomic(
+        &path,
+        "codestory-vector-cache-ownership",
+        ownership_token.as_bytes(),
+    )
+    .map_err(anyhow::Error::new)
+    .with_context(|| format!("publish vector cache ownership token {}", path.display()))
+}
+
+fn remove_owned_scope(
+    cache_root: &Path,
+    root_name: &str,
+    scope_name: &str,
+    ownership_token: &str,
+) -> Result<()> {
+    validate_scope_components(root_name, scope_name)?;
+    let root = cache_root.join(root_name);
+    let scope = root.join(scope_name);
+    let Some(bytes) = known_scope_bytes(&scope)? else {
+        bail!("refuse to remove vector cache scope containing unknown artifacts");
+    };
+    if !scope.exists() {
+        return Ok(());
+    }
+    let observed_token = read_scope_ownership_token(&scope)?;
+    if observed_token.as_deref() != Some(ownership_token)
+        && !(observed_token.is_none() && bytes == 0)
+    {
+        bail!("refuse to remove vector cache scope with mismatched ownership token");
+    }
+    private_cache_directory(&root).context("verify owned vector cache root")?;
+    let deletion = OwnedDeletionRoot::open(&root).context("pin owned vector cache root")?;
+    for name in [
+        "vectors.sqlite3-journal",
+        "vectors.sqlite3-wal",
+        "vectors.sqlite3-shm",
+        "vectors.sqlite3",
+    ] {
+        deletion
+            .remove(&PathBuf::from(scope_name).join(name))
+            .with_context(|| format!("remove owned vector cache file {scope_name}/{name}"))?;
+    }
+    deletion
+        .remove(&PathBuf::from(scope_name).join(CACHE_SCOPE_OWNERSHIP_MARKER))
+        .context("remove owned vector cache ownership token")?;
+    match deletion.remove_empty_directory(Path::new(scope_name)) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("remove empty owned vector cache scope"),
+    }
+}
+
+#[cfg(test)]
+fn reassign_owned_scope_root_for_test(
+    runtime: &SidecarRuntimeConfig,
+    artifact_scope_id: &str,
+    destination_root_name: &str,
+    destination_schema_version: i64,
+) -> Result<PathBuf> {
+    let scope_name = hex_digest(Sha256::digest(artifact_scope_id.as_bytes()));
+    validate_registered_scope(
+        destination_root_name,
+        &scope_name,
+        destination_schema_version,
+    )?;
+    let retention = VectorCacheRetention::open(runtime)?;
+    let (source_lock_path, source_lock) =
+        retention.open_scope_lock(CACHE_DIRECTORY, &scope_name)?;
+    if !bounded_locks::try_acquire(&source_lock, FileLockKind::Exclusive)
+        .map_err(anyhow::Error::new)?
+    {
+        bail!("test vector cache scope is still active");
+    }
+    let source = runtime.cache_root.join(CACHE_DIRECTORY).join(&scope_name);
+    let destination_root = runtime.cache_root.join(destination_root_name);
+    private_cache_directory(&destination_root)?;
+    let destination = destination_root.join(&scope_name);
+    std::fs::rename(&source, &destination).with_context(|| {
+        format!(
+            "move registered vector cache scope {} to {}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    let changed = retention.registry.execute(
+        "UPDATE owned_vector_cache_scope
+         SET root_name = ?1, cache_schema_version = ?2
+         WHERE root_name = ?3 AND scope_name = ?4",
+        params![
+            destination_root_name,
+            destination_schema_version,
+            CACHE_DIRECTORY,
+            scope_name,
+        ],
+    )?;
+    if changed != 1 {
+        bail!("test vector cache ownership row is missing");
+    }
+    bounded_locks::release(&source_lock).map_err(anyhow::Error::new)?;
+    drop(source_lock);
+    match std::fs::remove_file(source_lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(destination)
+}
+
+#[cfg(test)]
+fn registered_owned_cache_bytes_for_test(runtime: &SidecarRuntimeConfig) -> Result<u64> {
+    let retention = VectorCacheRetention::open(runtime)?;
+    retention
+        .registered_scopes()?
+        .into_iter()
+        .try_fold(0_u64, |total, registered| {
+            let path = runtime
+                .cache_root
+                .join(&registered.root_name)
+                .join(&registered.scope_name);
+            let bytes = known_scope_bytes(&path)?
+                .context("registered test vector cache contains unknown artifacts")?;
+            let (_, lock) =
+                retention.open_scope_lock(&registered.root_name, &registered.scope_name)?;
+            let contribution = if bounded_locks::try_acquire(&lock, FileLockKind::Exclusive)
+                .map_err(anyhow::Error::new)?
+            {
+                bytes
+            } else {
+                registered.max_database_bytes
+            };
+            total
+                .checked_add(contribution)
+                .context("registered test vector cache byte count overflow")
+        })
 }
 
 fn cache_scope_directory(
@@ -1327,6 +2111,335 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_retention_evicts_owned_obsolete_and_project_scopes() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let database_limit = 1024 * 1024;
+        let aggregate_limit = database_limit + 8 * 1024;
+
+        let obsolete = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "obsolete-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .expect("open obsolete scope");
+        drop(obsolete);
+        let obsolete_scope = reassign_owned_scope_root_for_test(
+            &selected_runtime,
+            "obsolete-scope",
+            "content-addressed-vectors-v4",
+            4,
+        )
+        .expect("move registered scope to obsolete root");
+
+        let previous = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "previous-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .expect("open previous scope");
+        let previous_scope = previous.path.parent().expect("scope path").to_path_buf();
+        drop(previous);
+
+        let current = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "current-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .expect("open current scope");
+        assert!(current.path.exists());
+        assert!(
+            !obsolete_scope.exists(),
+            "obsolete registered cache survived"
+        );
+        assert!(
+            !previous_scope.exists(),
+            "oldest inactive project cache survived"
+        );
+        assert!(
+            registered_owned_cache_bytes_for_test(&selected_runtime).expect("aggregate bytes")
+                <= aggregate_limit
+        );
+    }
+
+    #[test]
+    fn aggregate_retention_preserves_active_readers_and_refuses_overcommit() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let database_limit = 1024 * 1024;
+        let aggregate_limit = database_limit * 2;
+        let rows = [("a", "doc-a", "a")];
+        let batch = inputs(&rows);
+
+        let mut active = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "active-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .expect("open active scope");
+        active
+            .publish_batch(&batch, &[vec![1.0, 0.0]])
+            .expect("publish active row");
+
+        let second = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "second-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .expect("open second active scope");
+        assert!(active.load_batch(&batch).expect("active read").is_some());
+
+        let error = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "third-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .err()
+        .expect("third reservation must be refused");
+        assert!(error.to_string().contains("aggregate vector cache limit"));
+        assert!(
+            active
+                .load_batch(&batch)
+                .expect("active survives")
+                .is_some()
+        );
+        drop(second);
+    }
+
+    #[test]
+    fn aggregate_retention_retries_partial_owned_removal_idempotently() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let database_limit = 1024 * 1024;
+        let aggregate_limit = database_limit + 16 * 1024;
+        let stale = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "stale-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .expect("open stale scope");
+        let stale_scope = stale.path.parent().expect("scope path").to_path_buf();
+        drop(stale);
+        std::fs::remove_file(stale_scope.join("vectors.sqlite3"))
+            .expect("simulate interrupted owned removal");
+
+        let current = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "current-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .expect("retry retention");
+        assert!(!stale_scope.exists());
+        assert!(current.path.exists());
+        drop(current);
+
+        ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "current-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            database_limit,
+            aggregate_limit,
+        )
+        .expect("idempotent retry");
+    }
+
+    #[test]
+    fn aggregate_retention_refuses_unregistered_or_unknown_artifacts() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let cache_root = selected_runtime.cache_root.join(CACHE_DIRECTORY);
+        private_cache_directory(&cache_root).expect("cache root");
+        let unknown = cache_root.join("0".repeat(64));
+        private_cache_directory(&unknown).expect("unknown scope");
+        std::fs::write(unknown.join("sentinel"), b"not owned").expect("unknown sentinel");
+
+        ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "current-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 16 * 1024,
+        )
+        .expect("open current scope");
+        assert_eq!(
+            std::fs::read(unknown.join("sentinel")).expect("unknown survives"),
+            b"not owned"
+        );
+    }
+
+    #[test]
+    fn aggregate_retention_refuses_to_claim_or_delete_unknown_registered_contents() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let owned = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "owned-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 16 * 1024,
+        )
+        .expect("open owned scope");
+        let owned_scope = owned.path.parent().expect("owned scope").to_path_buf();
+        drop(owned);
+        std::fs::write(owned_scope.join("future-format"), b"unknown")
+            .expect("inject unknown owned content");
+
+        let error = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "current-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 16 * 1024,
+        )
+        .err()
+        .expect("unknown registered contents must refuse retention");
+        assert!(error.to_string().contains("unknown or unsafe artifacts"));
+        assert_eq!(
+            std::fs::read(owned_scope.join("future-format")).expect("unknown content survives"),
+            b"unknown"
+        );
+    }
+
+    #[test]
+    fn failed_retention_setup_does_not_create_an_unregistered_cache_scope() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        std::fs::write(
+            selected_runtime.cache_root.join(CACHE_RETENTION_DIRECTORY),
+            b"not a retention directory",
+        )
+        .expect("block retention setup");
+        let scope_name = hex_digest(Sha256::digest(b"never-created"));
+
+        ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "never-created",
+            "producer-a",
+            2,
+            64 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 16 * 1024,
+        )
+        .err()
+        .expect("retention setup must fail before cache mutation");
+        assert!(
+            !selected_runtime
+                .cache_root
+                .join(CACHE_DIRECTORY)
+                .join(scope_name)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn requested_scope_collision_is_refused_before_database_creation() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let root = selected_runtime.cache_root.join(CACHE_DIRECTORY);
+        private_cache_directory(&root).expect("cache root");
+        let scope = root.join(hex_digest(Sha256::digest(b"colliding-scope")));
+        private_cache_directory(&scope).expect("colliding scope");
+        std::fs::write(scope.join("sentinel"), b"unowned").expect("collision sentinel");
+
+        ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "colliding-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 16 * 1024,
+        )
+        .err()
+        .expect("colliding unknown scope must be refused");
+        assert!(!scope.join("vectors.sqlite3").exists());
+        assert_eq!(
+            std::fs::read(scope.join("sentinel")).expect("collision survives"),
+            b"unowned"
+        );
+    }
+
+    #[test]
+    fn stale_registration_cannot_delete_replacement_database() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let stale = ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "stale-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 16 * 1024,
+        )
+        .expect("open stale scope");
+        let stale_scope = stale.path.parent().expect("stale scope").to_path_buf();
+        drop(stale);
+        std::fs::remove_dir_all(&stale_scope)
+            .expect("simulate completed deletion before row commit");
+        private_cache_directory(&stale_scope).expect("install replacement scope");
+        std::fs::write(stale_scope.join("vectors.sqlite3"), b"replacement")
+            .expect("install replacement database");
+
+        ContentAddressedVectorCache::open_with_retention_limits(
+            &selected_runtime,
+            "current-scope",
+            "producer-a",
+            2,
+            64 * 1024,
+            1024 * 1024,
+            1024 * 1024 + 16 * 1024,
+        )
+        .err()
+        .expect("stale ownership token must not authorize replacement deletion");
+        assert_eq!(
+            std::fs::read(stale_scope.join("vectors.sqlite3"))
+                .expect("replacement database survives"),
+            b"replacement"
+        );
+    }
+
+    #[test]
     fn concurrent_publishers_share_one_integrity_checked_canonical_row() {
         use std::sync::{Arc, Barrier};
 
@@ -1369,6 +2482,6 @@ mod tests {
             ContentAddressedVectorCache::open(&selected_runtime, "scope-a", "producer-a", 2)
                 .err()
                 .expect("symlink scope must fail");
-        assert!(error.to_string().contains("create vector cache scope"));
+        assert!(error.to_string().contains("unknown or unsafe artifacts"));
     }
 }
