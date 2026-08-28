@@ -1518,6 +1518,10 @@ fn ensure_semantic_index(
                 "compatible unchanged vectors retained for candidate generation"
             );
         }
+        let ordered_anchors = canonical_dense_anchor_order(
+            anchors.iter().collect::<Vec<_>>(),
+            &mut content_vector_cache,
+        );
         let attestation = with_finalize_progress(progress, "embedded vectors", || {
             EmbeddedVectorIndex::build_attested_with_points_with_cancel(
                 crate::embedded_vector::AttestedVectorPublication {
@@ -1531,18 +1535,20 @@ fn ensure_semantic_index(
                 || ensure_retrieval_index_not_cancelled(cancelled, "vector database publication"),
                 |visit| {
                     let client = crate::embeddings::ProductEmbeddingClient::new(retention.runtime);
-                    for batch in
-                        anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
+                    for batch in ordered_anchors
+                        .chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
                     {
                         ensure_retrieval_index_not_cancelled(cancelled, "embedding batch")?;
                         let missing = batch
                             .iter()
-                            .filter(|anchor| {
+                            .filter(|cached| {
+                                let anchor = cached.anchor;
                                 !reusable_vectors.contains_key(&(
                                     anchor.node_id.0.to_string(),
                                     anchor.document_hash.clone(),
                                 ))
                             })
+                            .map(|cached| (*cached).clone())
                             .collect::<Vec<_>>();
                         let vectors = resolve_dense_anchor_batch(
                             &missing,
@@ -1565,11 +1571,12 @@ fn ensure_semantic_index(
                         let normalized = missing
                             .into_iter()
                             .zip(vectors)
-                            .map(|(anchor, vector)| (anchor.node_id, vector))
+                            .map(|(cached, vector)| (cached.anchor.node_id, vector))
                             .collect::<Vec<_>>();
                         let mut embedded = normalized.into_iter().map(Ok::<_, anyhow::Error>);
                         let mut next_embedded = embedded.next().transpose()?;
-                        for anchor in batch {
+                        for cached in batch {
+                            let anchor = cached.anchor;
                             ensure_retrieval_index_not_cancelled(
                                 cancelled,
                                 "persisting an embedded vector",
@@ -1679,6 +1686,92 @@ fn ensure_semantic_index(
     Ok(point_count)
 }
 
+#[derive(Clone)]
+struct CacheableDenseAnchor<'a> {
+    anchor: &'a DenseAnchorInput,
+    identity: String,
+}
+
+fn canonical_dense_anchor_order<'a>(
+    anchors: Vec<&'a DenseAnchorInput>,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+) -> Vec<CacheableDenseAnchor<'a>> {
+    let mut current = anchors
+        .into_iter()
+        .map(|anchor| CacheableDenseAnchor {
+            anchor,
+            identity: stable_dense_anchor_identity(anchor),
+        })
+        .collect::<Vec<_>>();
+    let inputs = current
+        .iter()
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
+        })
+        .collect::<Vec<_>>();
+    let order = match content_vector_cache.as_mut() {
+        Some(cache) => cache.canonical_order(&inputs),
+        None => return current,
+    };
+    let order = match order {
+        Ok(order) => order,
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector corpus planning failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+            return current;
+        }
+    };
+    let mut available = current.drain(..).map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .map(|index| {
+            available
+                .get_mut(index)
+                .and_then(Option::take)
+                .expect("validated vector corpus order")
+        })
+        .collect()
+}
+
+fn stable_dense_anchor_identity(anchor: &DenseAnchorInput) -> String {
+    let mut digest = Sha256::new();
+    hash_part(&mut digest, "codestory-stable-dense-anchor-v2");
+    hash_part(&mut digest, &(anchor.kind as i32).to_string());
+    hash_optional_dense_anchor_part(&mut digest, anchor.file_path.as_deref());
+    hash_optional_dense_anchor_part(
+        &mut digest,
+        anchor
+            .start_line
+            .as_ref()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    hash_optional_dense_anchor_part(
+        &mut digest,
+        anchor
+            .end_line
+            .as_ref()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    format!("{:x}", digest.finalize())
+}
+
+fn hash_optional_dense_anchor_part(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_part(hasher, "some");
+            hash_part(hasher, value);
+        }
+        None => hash_part(hasher, "none"),
+    }
+}
+
 fn produce_missing_dense_anchors(
     anchors: &[DenseAnchorInput],
     missing: &[ExpectedVectorAnchor],
@@ -1706,6 +1799,7 @@ fn produce_missing_dense_anchors(
             Ok(*anchor)
         })
         .collect::<Result<Vec<_>>>()?;
+    let missing_anchors = canonical_dense_anchor_order(missing_anchors, content_vector_cache);
     let client = crate::embeddings::ProductEmbeddingClient::new(runtime);
     for batch in missing_anchors.chunks(runtime.retrieval.llm_doc_embed_batch_size.max(1)) {
         ensure_retrieval_index_not_cancelled(cancelled, "incremental embedding batch")?;
@@ -1727,7 +1821,8 @@ fn produce_missing_dense_anchors(
                 batch.len()
             );
         }
-        for (anchor, vector) in batch.iter().zip(vectors) {
+        for (cached, vector) in batch.iter().zip(vectors) {
+            let anchor = cached.anchor;
             visit(AttestedSemanticPoint {
                 point: SemanticPoint {
                     display_name: anchor
@@ -1748,23 +1843,21 @@ fn produce_missing_dense_anchors(
 }
 
 fn resolve_dense_anchor_batch(
-    batch: &[&DenseAnchorInput],
+    batch: &[CacheableDenseAnchor<'_>],
     client: &crate::embeddings::ProductEmbeddingClient,
     cancelled: &AtomicBool,
     content_vector_cache: &mut Option<ContentAddressedVectorCache>,
     embedding_context: &'static str,
 ) -> Result<Vec<Vec<f32>>> {
-    let node_ids = batch
-        .iter()
-        .map(|anchor| anchor.node_id.0.to_string())
-        .collect::<Vec<_>>();
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
     let cache_batch = batch
         .iter()
-        .zip(&node_ids)
-        .map(|(anchor, node_id)| VectorCacheBatchInput {
-            node_id,
-            document_hash: &anchor.document_hash,
-            text: &anchor.text,
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
         })
         .collect::<Vec<_>>();
     let cache_started = Instant::now();
@@ -1787,7 +1880,7 @@ fn resolve_dense_anchor_batch(
 
     let texts = batch
         .iter()
-        .map(|anchor| anchor.text.clone())
+        .map(|cached| cached.anchor.text.clone())
         .collect::<Vec<_>>();
     let (vectors, timings) = client
         .embed_documents_with_control_and_timings(&texts, None, &|| {
@@ -3087,6 +3180,42 @@ mod tests {
             0,
             "nested vector subphases must not be subtracted from the top-level clock twice"
         );
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_ignores_store_local_publication_identity() {
+        let mut anchor = DenseAnchorInput {
+            node_id: NodeId(1),
+            file_node_id: Some(NodeId(2)),
+            kind: NodeKind::FUNCTION,
+            display_name: "do_work".into(),
+            qualified_name: Some("pkg::do_work".into()),
+            file_path: Some("src/lib.rs".into()),
+            start_line: Some(4),
+            end_line: Some(8),
+            file_role: FileRole::Source,
+            source_provenance: "parser".into(),
+            text: "function do_work semantic document".into(),
+            document_hash: "document-hash".into(),
+            selection_reason: "public_api".into(),
+            policy_version: "graph_first_v3".into(),
+            source_identity: "core:generation-a:run-a".into(),
+            updated_at_epoch_ms: 1,
+        };
+        let expected = stable_dense_anchor_identity(&anchor);
+
+        anchor.node_id = NodeId(99);
+        anchor.file_node_id = Some(NodeId(100));
+        anchor.display_name = "renamed_document_label".into();
+        anchor.qualified_name = Some("other::rendered::label".into());
+        anchor.text = "different exact prepared document".into();
+        anchor.document_hash = "different-document-hash".into();
+        anchor.source_identity = "core:generation-b:run-b".into();
+        anchor.updated_at_epoch_ms = 2;
+        assert_eq!(stable_dense_anchor_identity(&anchor), expected);
+
+        anchor.start_line = Some(5);
+        assert_ne!(stable_dense_anchor_identity(&anchor), expected);
     }
 
     #[test]

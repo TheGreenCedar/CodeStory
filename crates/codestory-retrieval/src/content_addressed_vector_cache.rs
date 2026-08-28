@@ -10,19 +10,21 @@ use crate::config::{SidecarRuntimeConfig, private_cache_directory};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
-const CACHE_SCHEMA_VERSION: i64 = 1;
-const CACHE_DIRECTORY: &str = "content-addressed-vectors-v1";
-const CACHE_KEY_DOMAIN: &[u8] = b"codestory-content-addressed-vector-batch-v1\0";
-const CACHE_CONTRACT_DOMAIN: &[u8] = b"codestory-content-addressed-vector-contract-v1\0";
+const CACHE_SCHEMA_VERSION: i64 = 3;
+const CACHE_DIRECTORY: &str = "content-addressed-vectors-v3";
+const CACHE_KEY_DOMAIN: &[u8] = b"codestory-content-addressed-vector-batch-v3\0";
+const CACHE_CORPUS_DOMAIN: &[u8] = b"codestory-content-addressed-vector-corpus-v2\0";
+const CACHE_CONTRACT_DOMAIN: &[u8] = b"codestory-content-addressed-vector-contract-v3\0";
 const CACHE_PACKING_CONTRACT: &str = "ordered-outer-request-native-token-pack-v1";
 const CACHE_TRUNCATION_CONTRACT: &str = "native-tokenize-truncate-max-input-v1";
 const CACHE_NORMALIZATION_CONTRACT: &str = "server-f32-l2-then-index-f64-l2-v1";
 
 pub(crate) struct VectorCacheBatchInput<'a> {
-    pub node_id: &'a str,
+    pub anchor_identity: &'a str,
     pub document_hash: &'a str,
     pub text: &'a str,
 }
@@ -79,6 +81,12 @@ impl ContentAddressedVectorCache {
                  embedding_dim INTEGER NOT NULL CHECK(embedding_dim > 0),
                  vectors BLOB NOT NULL,
                  vectors_sha256 TEXT NOT NULL CHECK(length(vectors_sha256) = 64)
+             ) WITHOUT ROWID;
+             CREATE TABLE IF NOT EXISTS vector_corpus_plan (
+                 corpus_key TEXT PRIMARY KEY,
+                 anchor_count INTEGER NOT NULL CHECK(anchor_count > 0),
+                 ordered_anchor_identities BLOB NOT NULL,
+                 plan_sha256 TEXT NOT NULL CHECK(length(plan_sha256) = 64)
              ) WITHOUT ROWID;",
         )?;
         connection.execute(
@@ -123,6 +131,93 @@ impl ContentAddressedVectorCache {
             hits: 0,
             misses: 0,
         })
+    }
+
+    /// Return current indices in the exact batch order selected by the first
+    /// complete build of this corpus.
+    ///
+    /// Core node ids are store-local and therefore reorder otherwise identical
+    /// clean builds. Persisting the first complete logical-anchor order keeps
+    /// the initial build's native batch geometry unchanged while letting later
+    /// publications reproduce it exactly.
+    pub(crate) fn canonical_order(
+        &mut self,
+        inputs: &[VectorCacheBatchInput<'_>],
+    ) -> Result<Vec<usize>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        validate_unique_anchor_identities(inputs)?;
+        let corpus_key = self.corpus_key(inputs)?;
+        let current_plan = inputs
+            .iter()
+            .map(|input| input.anchor_identity)
+            .collect::<Vec<_>>();
+        let encoded_current = encode_identity_plan(&current_plan);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO vector_corpus_plan
+             (corpus_key, anchor_count, ordered_anchor_identities, plan_sha256)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                corpus_key,
+                i64::try_from(inputs.len()).context("corpus anchor count overflow")?,
+                encoded_current.bytes,
+                encoded_current.sha256,
+            ],
+        )?;
+        let stored = read_corpus_plan(&transaction, &corpus_key)?
+            .context("content-addressed vector cache dropped a corpus plan")?;
+        let canonical = match decode_identity_plan(stored, inputs.len()) {
+            Ok(plan) => plan,
+            Err(_) => {
+                transaction.execute(
+                    "DELETE FROM vector_corpus_plan WHERE corpus_key = ?1",
+                    params![corpus_key],
+                )?;
+                let replacement = encode_identity_plan(&current_plan);
+                transaction.execute(
+                    "INSERT INTO vector_corpus_plan
+                     (corpus_key, anchor_count, ordered_anchor_identities, plan_sha256)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        corpus_key,
+                        i64::try_from(inputs.len()).context("corpus anchor count overflow")?,
+                        replacement.bytes,
+                        replacement.sha256,
+                    ],
+                )?;
+                current_plan
+                    .iter()
+                    .map(|value| (*value).to_string())
+                    .collect()
+            }
+        };
+        let index_by_identity = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| (input.anchor_identity, index))
+            .collect::<HashMap<_, _>>();
+        let indices = canonical
+            .iter()
+            .map(|identity| {
+                index_by_identity
+                    .get(identity.as_str())
+                    .copied()
+                    .with_context(|| {
+                        format!("cached corpus plan contains foreign anchor identity {identity}")
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if indices.len() != inputs.len()
+            || indices.iter().copied().collect::<HashSet<_>>().len() != inputs.len()
+        {
+            bail!("cached corpus plan does not cover each anchor exactly once");
+        }
+        transaction.commit()?;
+        Ok(indices)
     }
 
     pub(crate) fn load_batch(
@@ -223,19 +318,36 @@ impl ContentAddressedVectorCache {
         hash_part(&mut digest, self.contract_sha256.as_bytes());
         hash_part(&mut digest, &(batch.len() as u64).to_le_bytes());
         for (position, input) in batch.iter().enumerate() {
-            if input.node_id.trim().is_empty()
+            if input.anchor_identity.trim().is_empty()
                 || input.document_hash.trim().is_empty()
                 || input.text.trim().is_empty()
             {
                 bail!("content-addressed vector cache input is incomplete");
             }
             hash_part(&mut digest, &(position as u64).to_le_bytes());
-            hash_part(&mut digest, input.node_id.as_bytes());
+            hash_part(&mut digest, input.anchor_identity.as_bytes());
             hash_part(&mut digest, input.document_hash.as_bytes());
             let prefix = crate::embeddings::CODERANK_DOCUMENT_PREFIX_DEFAULT.as_bytes();
             digest.update((prefix.len().saturating_add(input.text.len()) as u64).to_le_bytes());
             digest.update(prefix);
             digest.update(input.text.as_bytes());
+        }
+        Ok(hex_digest(digest.finalize()))
+    }
+
+    fn corpus_key(&self, inputs: &[VectorCacheBatchInput<'_>]) -> Result<String> {
+        let mut identities = inputs
+            .iter()
+            .map(|input| input.anchor_identity)
+            .collect::<Vec<_>>();
+        identities.sort_unstable();
+        let mut digest = Sha256::new();
+        digest.update(CACHE_CORPUS_DOMAIN);
+        hash_part(&mut digest, self.artifact_scope_id.as_bytes());
+        hash_part(&mut digest, self.contract_sha256.as_bytes());
+        hash_part(&mut digest, &(identities.len() as u64).to_le_bytes());
+        for identity in identities {
+            hash_part(&mut digest, identity.as_bytes());
         }
         Ok(hex_digest(digest.finalize()))
     }
@@ -251,6 +363,74 @@ struct CachedVectorRow {
     embedding_dim: i64,
     bytes: Vec<u8>,
     sha256: String,
+}
+
+struct EncodedIdentityPlan {
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+struct CachedIdentityPlan {
+    anchor_count: i64,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+fn validate_unique_anchor_identities(inputs: &[VectorCacheBatchInput<'_>]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(inputs.len());
+    for input in inputs {
+        if input.anchor_identity.trim().is_empty() || !seen.insert(input.anchor_identity) {
+            bail!("content-addressed vector corpus requires unique logical anchor identities");
+        }
+    }
+    Ok(())
+}
+
+fn encode_identity_plan(plan: &[&str]) -> EncodedIdentityPlan {
+    let mut bytes = Vec::new();
+    for identity in plan {
+        bytes.extend((identity.len() as u64).to_le_bytes());
+        bytes.extend(identity.as_bytes());
+    }
+    EncodedIdentityPlan {
+        sha256: hex_digest(Sha256::digest(&bytes)),
+        bytes,
+    }
+}
+
+fn decode_identity_plan(plan: CachedIdentityPlan, expected_count: usize) -> Result<Vec<String>> {
+    if plan.anchor_count != i64::try_from(expected_count).context("anchor count overflow")?
+        || plan.sha256 != hex_digest(Sha256::digest(&plan.bytes))
+    {
+        bail!("content-addressed vector corpus plan integrity mismatch");
+    }
+    let mut cursor = plan.bytes.as_slice();
+    let mut identities = Vec::with_capacity(expected_count);
+    while !cursor.is_empty() {
+        let length_bytes = cursor
+            .get(..8)
+            .context("content-addressed vector corpus plan truncated length")?;
+        let length = usize::try_from(u64::from_le_bytes(
+            length_bytes.try_into().expect("eight-byte plan length"),
+        ))
+        .context("content-addressed vector corpus identity length overflow")?;
+        cursor = &cursor[8..];
+        let identity = cursor
+            .get(..length)
+            .context("content-addressed vector corpus plan truncated identity")?;
+        identities.push(
+            std::str::from_utf8(identity)
+                .context("content-addressed vector corpus identity is not UTF-8")?
+                .to_string(),
+        );
+        cursor = &cursor[length..];
+    }
+    if identities.len() != expected_count
+        || identities.iter().collect::<HashSet<_>>().len() != expected_count
+    {
+        bail!("content-addressed vector corpus plan coverage mismatch");
+    }
+    Ok(identities)
 }
 
 fn cache_scope_directory(
@@ -414,6 +594,27 @@ fn read_cached_batch_from_transaction(
         .map_err(Into::into)
 }
 
+fn read_corpus_plan(
+    transaction: &Transaction<'_>,
+    corpus_key: &str,
+) -> Result<Option<CachedIdentityPlan>> {
+    transaction
+        .query_row(
+            "SELECT anchor_count, ordered_anchor_identities, plan_sha256
+             FROM vector_corpus_plan WHERE corpus_key = ?1",
+            params![corpus_key],
+            |row| {
+                Ok(CachedIdentityPlan {
+                    anchor_count: row.get(0)?,
+                    bytes: row.get(1)?,
+                    sha256: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn cached_vector_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CachedVectorRow> {
     Ok(CachedVectorRow {
         vector_count: row.get(0)?,
@@ -465,11 +666,13 @@ mod tests {
 
     fn inputs<'a>(rows: &'a [(&'a str, &'a str, &'a str)]) -> Vec<VectorCacheBatchInput<'a>> {
         rows.iter()
-            .map(|(node_id, document_hash, text)| VectorCacheBatchInput {
-                node_id,
-                document_hash,
-                text,
-            })
+            .map(
+                |(anchor_identity, document_hash, text)| VectorCacheBatchInput {
+                    anchor_identity,
+                    document_hash,
+                    text,
+                },
+            )
             .collect()
     }
 
@@ -500,6 +703,53 @@ mod tests {
         assert_eq!(observed, expected);
         assert_eq!(observed[0][0].to_bits(), expected[0][0].to_bits());
         assert_eq!(observed[0][1].to_bits(), expected[0][1].to_bits());
+    }
+
+    #[test]
+    fn first_corpus_order_is_reproduced_when_store_local_order_changes() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let first_rows = [
+            ("stable-a", "doc-a", "first"),
+            ("stable-b", "doc-b", "second"),
+        ];
+        let reversed_rows = [
+            ("stable-b", "changed-doc-b", "changed second"),
+            ("stable-a", "changed-doc-a", "changed first"),
+        ];
+        let first = inputs(&first_rows);
+        let reversed = inputs(&reversed_rows);
+
+        let mut owner =
+            ContentAddressedVectorCache::open(&selected_runtime, "scope-a", "producer-a", 2)
+                .expect("open cache");
+        assert_eq!(owner.canonical_order(&first).expect("first plan"), [0, 1]);
+        assert_eq!(
+            owner.canonical_order(&reversed).expect("reproduced plan"),
+            [1, 0]
+        );
+    }
+
+    #[test]
+    fn ambiguous_logical_anchor_identity_disables_corpus_reuse() {
+        let cache = TempDir::new().expect("cache root");
+        let selected_runtime = runtime(&cache, 128);
+        let rows = [
+            ("stable-a", "doc-a", "first"),
+            ("stable-a", "doc-a", "first"),
+        ];
+        let repeated = inputs(&rows);
+        let mut owner =
+            ContentAddressedVectorCache::open(&selected_runtime, "scope-a", "producer-a", 2)
+                .expect("open cache");
+
+        assert!(
+            owner
+                .canonical_order(&repeated)
+                .expect_err("ambiguous identity")
+                .to_string()
+                .contains("unique logical anchor identities")
+        );
     }
 
     #[cfg(unix)]
