@@ -242,7 +242,7 @@ function usage() {
   node scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
   node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite <suite> [--materialize-repos] [--repeats n]
   node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--canary-task-id id] [--shard-count n --shard-index n] [--allow-failures] [--publishable]
-  node scripts/codestory-agent-ab-benchmark.mjs --exact-candidate --task-suite language-expansion-holdout --published-archive <path> --published-checksum-manifest <path> --published-checksum-sha256 <sha256> --candidate-source-root <path> --candidate-cli <path> --candidate-cli-sha256 <sha256>
+  node scripts/codestory-agent-ab-benchmark.mjs --exact-candidate --task-suite language-expansion-holdout --published-archive <path> --published-checksum-manifest <path> --published-checksum-sha256 <sha256> --candidate-source-root <path>
 
 Options:
   --list          Print configured benchmark repositories or selected manifest tasks and exit.
@@ -285,10 +285,7 @@ Options:
   --published-checksum-sha256
                   External SHA-256 binding for the official published checksum manifest.
   --candidate-source-root
-                  Clean Git root whose checked-in plugin and MCP catalog define the 0.18 candidate.
-  --candidate-cli Exact CodeStory CLI built from the candidate source.
-  --candidate-cli-sha256
-                  External SHA-256 binding for the candidate CLI bytes.
+                  Clean Git root whose checked-in plugin and MCP catalog define the 0.18 candidate. Exact mode builds its CLI with Cargo --locked --release.
   --prepare-codestory-cache
                   Before timed with-CodeStory runs, refresh stale or semantic-empty local caches and record indexing cost separately.
                   Packet-runtime mode enables this by default because packets require prepared local indexes.
@@ -367,8 +364,6 @@ function parseArgs(argv) {
       "published-checksum-manifest": { type: "string" },
       "published-checksum-sha256": { type: "string" },
       "candidate-source-root": { type: "string" },
-      "candidate-cli": { type: "string" },
-      "candidate-cli-sha256": { type: "string" },
       "prepare-codestory-cache": { type: "boolean" },
       "no-prepare-codestory-cache": { type: "boolean" },
       "prepare-codestory-timeout-ms": { type: "string" },
@@ -413,8 +408,6 @@ function parseArgs(argv) {
     publishedChecksumManifest: null,
     publishedChecksumSha256: null,
     candidateSourceRoot: null,
-    candidateCli: null,
-    candidateCliSha256: null,
     exactCandidatePackageByArm: null,
     prepareCodestoryCache: null,
     prepareCodestoryJobs: 2,
@@ -480,8 +473,6 @@ function parseArgs(argv) {
   opts.publishedChecksumManifest = values["published-checksum-manifest"] ?? null;
   opts.publishedChecksumSha256 = values["published-checksum-sha256"] ?? null;
   opts.candidateSourceRoot = values["candidate-source-root"] ?? null;
-  opts.candidateCli = values["candidate-cli"] ?? null;
-  opts.candidateCliSha256 = values["candidate-cli-sha256"] ?? null;
   opts.prepareCodestoryCache = values["prepare-codestory-cache"] === true ? true : null;
   opts.prepareCodestoryTimeoutMs =
     values["prepare-codestory-timeout-ms"] == null
@@ -519,8 +510,6 @@ function parseArgs(argv) {
       "published-checksum-manifest",
       "published-checksum-sha256",
       "candidate-source-root",
-      "candidate-cli",
-      "candidate-cli-sha256",
     ]);
     const forbiddenOptions = [...providedOptions].filter((name) => !exactOptionAllowlist.has(name));
     if (forbiddenOptions.length) {
@@ -549,11 +538,9 @@ function parseArgs(argv) {
       !opts.publishedArchive ||
       !opts.publishedChecksumManifest ||
       !opts.publishedChecksumSha256 ||
-      !opts.candidateSourceRoot ||
-      !opts.candidateCli ||
-      !opts.candidateCliSha256
+      !opts.candidateSourceRoot
     ) {
-      throw new Error("exact-candidate mode requires authenticated published archive and candidate source/CLI inputs");
+      throw new Error("exact-candidate mode requires authenticated published archive and candidate source input");
     }
     if (opts.arms && opts.arms.join(",") !== EXACT_CANDIDATE_ARMS.join(",")) {
       throw new Error(`exact-candidate arms are frozen as ${EXACT_CANDIDATE_ARMS.join(",")}`);
@@ -568,10 +555,6 @@ function parseArgs(argv) {
     opts.publishedChecksumSha256 = normalizeExternalSha256(
       opts.publishedChecksumSha256,
       "--published-checksum-sha256",
-    );
-    opts.candidateCliSha256 = normalizeExternalSha256(
-      opts.candidateCliSha256,
-      "--candidate-cli-sha256",
     );
   }
   opts.arms ??= ["without_codestory", "with_codestory"];
@@ -1462,21 +1445,41 @@ async function candidateSourceSnapshot(sourcePath) {
   };
 }
 
+async function buildExactCandidateCli({ sourceRoot, targetDir, cliPath }) {
+  const result = await runProcess(
+    "cargo",
+    [
+      "build", "--locked", "--release", "-p", "codestory-cli",
+      "--target-dir", targetDir,
+    ],
+    {
+      cwd: sourceRoot,
+      timeoutMs: 30 * 60 * 1000,
+      maxOutputBytes: 16 * 1024 * 1024,
+    },
+  );
+  if (result.status !== "pass") {
+    throw new Error(`candidate locked release CLI build failed: ${trimTail(result.stderr || result.stdout)}`);
+  }
+  if (!existsSync(cliPath)) throw new Error("candidate locked release CLI build did not produce codestory-cli");
+}
+
 async function authenticateExactCandidateSourceCli(opts) {
   const before = await candidateSourceSnapshot(opts.candidateSourceRoot);
+  const targetDir = path.join(before.source_root, "target", "codestory-mission-candidate");
+  const cliPath = path.join(
+    targetDir,
+    "release",
+    process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
+  );
+  const buildCli = opts.exactCandidateBuildCli ?? buildExactCandidateCli;
+  await buildCli({ sourceRoot: before.source_root, targetDir, cliPath });
   const cliInput = await ingestExactInput(
     opts,
     "candidate_cli",
-    opts.candidateCli,
+    cliPath,
     MAX_EXACT_CLI_BYTES,
   );
-  const expectedCliSha256 = normalizeExternalSha256(
-    opts.candidateCliSha256,
-    "candidate CLI external digest",
-  );
-  if (cliInput.sha256 !== expectedCliSha256) {
-    throw new Error("candidate CLI does not match its external digest");
-  }
   await chmod(cliInput.staged_path, 0o500);
   const runtime = await probeExactPackageRuntime(cliInput.staged_path, before, selectedBenchmarkChildEnv(opts, "candidate_0_18"));
   const afterCli = await sha256FileBounded(cliInput.staged_path, MAX_EXACT_CLI_BYTES, "authenticated candidate CLI");

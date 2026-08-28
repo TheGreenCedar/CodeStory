@@ -434,8 +434,6 @@ function exactArgs(extra = []) {
     "--published-checksum-manifest", "/tmp/SHA256SUMS.txt",
     "--published-checksum-sha256", "a".repeat(64),
     "--candidate-source-root", "/tmp/candidate-source",
-    "--candidate-cli", "/tmp/candidate-cli",
-    "--candidate-cli-sha256", "b".repeat(64),
     ...extra,
   ];
 }
@@ -514,13 +512,15 @@ test("exact-candidate mode closes every option that can change freshness oracle 
     ["--shard-index", "0"],
     ["--aggregate-shards", "/tmp/shard"],
     ["--candidate-package-sha256", "c".repeat(64)],
+    ["--candidate-cli", "/tmp/arbitrary-candidate-cli"],
+    ["--candidate-cli-sha256", "c".repeat(64)],
     ["--collect-all-failures"],
     ["--max-source-reads-after-packet", "0"],
   ];
   for (const args of forbidden) {
     assert.throws(
       () => benchmarkHarness.parseArgs(exactArgs(args)),
-      /exact-candidate mode forbids|unsupported|mutually exclusive/i,
+      /exact-candidate mode forbids|unsupported|mutually exclusive|unknown option/i,
       args[0],
     );
   }
@@ -530,18 +530,16 @@ test("exact-candidate mode closes every option that can change freshness oracle 
     "--published-checksum-manifest",
     "--published-checksum-sha256",
     "--candidate-source-root",
-    "--candidate-cli",
-    "--candidate-cli-sha256",
   ]) {
     const args = exactArgs();
     args.splice(args.indexOf(required), 2);
     assert.throws(
       () => benchmarkHarness.parseArgs(args),
-      /requires authenticated published archive and candidate source\/CLI inputs/i,
+      /requires authenticated published archive and candidate source input/i,
       required,
     );
   }
-  for (const digestOption of ["--published-checksum-sha256", "--candidate-cli-sha256"]) {
+  for (const digestOption of ["--published-checksum-sha256"]) {
     const args = exactArgs();
     args[args.indexOf(digestOption) + 1] = "0".repeat(64);
     assert.throws(() => benchmarkHarness.parseArgs(args), /all-zero digest/i, digestOption);
@@ -651,6 +649,7 @@ async function makeCandidateSourceCli(root, name, {
   const sourceRoot = path.join(root, `${name}-source`);
   await mkdir(path.join(sourceRoot, "crates", "codestory-cli"), { recursive: true });
   await mkdir(path.join(sourceRoot, "plugins", "codestory"), { recursive: true });
+  await writeFile(path.join(sourceRoot, ".gitignore"), "target/\n");
   await writeFile(path.join(sourceRoot, "crates", "codestory-cli", "Cargo.toml"), `[package]\nname = "codestory-cli"\nversion = "${version}"\n`);
   const pluginBytes = Buffer.from(`${JSON.stringify({ name: "codestory", version: pluginVersion }, null, 2)}\n`);
   const catalogBytes = Buffer.from(`${JSON.stringify({
@@ -727,8 +726,14 @@ test("exact candidate binds clean source, checked-in identities, immutable CLI b
         publishedChecksumManifest: checksumPath,
         publishedChecksumSha256: checksumSha,
         candidateSourceRoot: candidateInput.sourceRoot,
-        candidateCli: candidateInput.cliPath,
-        candidateCliSha256: candidateInput.cliSha256,
+        exactCandidateBuildCli: async ({ sourceRoot, targetDir, cliPath }) => {
+          assert.equal(sourceRoot, await realpath(candidateInput.sourceRoot));
+          assert.equal(targetDir, path.join(sourceRoot, "target", "codestory-mission-candidate"));
+          assert.equal(cliPath, path.join(targetDir, "release", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli"));
+          await mkdir(path.dirname(cliPath), { recursive: true });
+          await copyFile(candidateInput.cliPath, cliPath);
+          await chmod(cliPath, 0o755);
+        },
         ...overrides,
       });
     };
@@ -746,7 +751,6 @@ test("exact candidate binds clean source, checked-in identities, immutable CLI b
     assert.equal(Object.hasOwn(candidateIdentity, "package_sha256"), false);
     assert.equal(Object.hasOwn(candidateIdentity, "trust_root"), false);
     assert.match(accepted.packages.get("candidate_0_18").cli_path, /state-/);
-    await assert.rejects(run(candidate, { candidateCliSha256: "1".repeat(64) }), /external digest/i);
     await assert.rejects(run(candidate, { publishedChecksumSha256: "2".repeat(64) }), /external digest/i);
     const runtimeDrift = await makeCandidateSourceCli(root, "candidate-runtime-drift", { runtimeVersion: "0.18.0" });
     await assert.rejects(run(runtimeDrift), /runtime package_version=0\.18\.0; expected 0\.17\.5/i);
@@ -796,8 +800,11 @@ test("exact input ingestion makes every caller path irrelevant before parsing ex
         publishedChecksumManifest: checksumPath,
         publishedChecksumSha256: createHash("sha256").update(await readFile(checksumPath)).digest("hex"),
         candidateSourceRoot: candidate.sourceRoot,
-        candidateCli: candidateInput,
-        candidateCliSha256: candidate.cliSha256,
+        exactCandidateBuildCli: async ({ cliPath }) => {
+          await mkdir(path.dirname(cliPath), { recursive: true });
+          await copyFile(candidateInput, cliPath);
+          await chmod(cliPath, 0o755);
+        },
         exactCandidateAfterInputIngest: async (event) => {
           if (event.kind !== kind) return;
           if (kind === "published_checksum_manifest") {
