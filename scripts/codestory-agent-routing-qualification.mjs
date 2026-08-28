@@ -7,6 +7,7 @@ import {
   chmod,
   copyFile,
   cp,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -205,7 +206,7 @@ export function buildRoutingHostCommand({
 
 export function parseRoutingQualificationOptions(argv) {
   const valueOptions = new Set([
-    "--out", "--candidate-source-root", "--candidate-cli", "--candidate-cli-sha256",
+    "--out", "--candidate-source-root",
     "--qualification-nonce", "--fixture-project",
     "--codex-command", "--cursor-command", "--codex-auth", "--codex-model", "--cursor-model",
   ]);
@@ -490,18 +491,20 @@ async function probeSourceCandidateCli({ cli, packageVersion, protocolRevision, 
   }
 }
 
+async function buildCandidateCliFromSource({ sourceRoot, targetDir }) {
+  await successfulProcess("cargo", [
+    "build", "--locked", "--release", "-p", "codestory-cli", "--target-dir", targetDir,
+  ], { cwd: sourceRoot, timeoutMs: PROCESS_TIMEOUT_MS }, "source candidate locked release build");
+}
+
 export async function authenticateSourceCandidateInstallation({
   candidateSourceRoot,
-  candidateCliPath,
-  candidateCliSha256,
   qualificationNonce,
   stageRoot,
+  buildCandidateCli = buildCandidateCliFromSource,
 }) {
-  requiredDigest(candidateCliSha256, "candidate CLI external digest");
   if (!SHA256.test(String(qualificationNonce))) fail("qualification nonce must be a 64-hex value");
   const sourceRoot = realpathSync(candidateSourceRoot);
-  await rm(stageRoot, { recursive: true, force: true });
-  await mkdir(stageRoot, { recursive: true, mode: 0o700 });
   const sourceHead = await gitValue(sourceRoot, ["rev-parse", "HEAD"], "candidate source HEAD");
   const sourceTree = await gitValue(sourceRoot, ["rev-parse", "HEAD^{tree}"], "candidate source tree");
   const sourceStatus = await gitValue(sourceRoot, ["status", "--porcelain=v1", "--untracked-files=all"], "candidate source cleanliness");
@@ -509,11 +512,36 @@ export async function authenticateSourceCandidateInstallation({
       || !COMMIT.test(sourceTree) || /^0{40}$/u.test(sourceTree) || sourceStatus) {
     fail("candidate source root is not a clean HEAD and tree");
   }
+  await rm(stageRoot, { recursive: true, force: true });
+  await mkdir(stageRoot, { recursive: true, mode: 0o700 });
+  const targetDir = join(sourceRoot, "target", "codestory-mission-candidate");
+  if (existsSync(targetDir)) {
+    const targetMetadata = await lstat(targetDir);
+    if (!targetMetadata.isDirectory() || targetMetadata.isSymbolicLink()
+        || realpathSync(targetDir) !== resolve(targetDir)) {
+      fail("source candidate build target must be its exact owned directory");
+    }
+  }
+  const candidateCliPath = join(targetDir, "release", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli");
+  await rm(candidateCliPath, { force: true });
+  await buildCandidateCli({ sourceRoot, targetDir, outputPath: candidateCliPath });
+  let candidateCliMetadata;
+  try {
+    candidateCliMetadata = await lstat(candidateCliPath);
+  } catch (error) {
+    fail(`source candidate locked release build did not produce its owned CLI: ${error.message}`);
+  }
+  if (!candidateCliMetadata.isFile() || candidateCliMetadata.isSymbolicLink()) {
+    fail("source candidate locked release build output must be a regular non-symlink file");
+  }
+  if (inside(targetDir, candidateCliPath, "source candidate locked release build output") !== resolve(candidateCliPath)) {
+    fail("source candidate locked release build output must remain at its exact owned path");
+  }
   const authenticatedCli = await ingestImmutable(
-    realpathSync(candidateCliPath), join(stageRoot, "authenticated-inputs", "codestory-cli"),
+    candidateCliPath, join(stageRoot, "authenticated-inputs", "codestory-cli"),
     MAX_CANDIDATE_CLI_BYTES, "candidate CLI",
   );
-  if (authenticatedCli.sha256 !== candidateCliSha256) fail("candidate CLI digest does not match its immutable staged bytes");
+  const candidateCliSha256 = authenticatedCli.sha256;
 
   const scratchRoot = join(stageRoot, "scratch");
   await mkdir(scratchRoot, { recursive: true, mode: 0o700 });
@@ -562,6 +590,12 @@ export async function authenticateSourceCandidateInstallation({
     protocolRevision,
     discoveryContractSha256,
   });
+  const finalHead = await gitValue(sourceRoot, ["rev-parse", "HEAD"], "candidate source final HEAD");
+  const finalTree = await gitValue(sourceRoot, ["rev-parse", "HEAD^{tree}"], "candidate source final tree");
+  const finalStatus = await gitValue(sourceRoot, ["status", "--porcelain=v1", "--untracked-files=all"], "candidate source final cleanliness");
+  if (finalHead !== sourceHead || finalTree !== sourceTree || finalStatus) {
+    fail("candidate source root changed while its owned CLI was built and authenticated");
+  }
   const target = nativeAssetTarget();
   const candidateTokenSha256 = digestBytes(Buffer.from([
     "codestory-routing-source-candidate-v1", sourceHead, sourceTree,
@@ -940,15 +974,13 @@ async function runSession(command, baseEnv, timeoutMs = PROCESS_TIMEOUT_MS) {
 async function main(argv) {
   const options = parseRoutingQualificationOptions(argv);
   const required = [
-    "out", "candidate_source_root", "candidate_cli", "candidate_cli_sha256",
+    "out", "candidate_source_root",
     "qualification_nonce", "codex_auth", "cursor_model",
   ];
   for (const key of required) if (!options[key]) fail(`--${key.replaceAll("_", "-")} is required`);
   validateRoutingRequestCorpus();
   const authenticated = await authenticateSourceCandidateInstallation({
     candidateSourceRoot: options.candidate_source_root,
-    candidateCliPath: options.candidate_cli,
-    candidateCliSha256: options.candidate_cli_sha256,
     qualificationNonce: options.qualification_nonce,
     stageRoot: join(resolve(options.out), "authenticated-installation"),
   });

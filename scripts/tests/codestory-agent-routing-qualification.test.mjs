@@ -110,14 +110,13 @@ test("qualification CLI has no synthetic transcript input", () => {
 test("qualification CLI accepts only the mission source candidate boundary", () => {
   assert.deepEqual(parseRoutingQualificationOptions([
     "--candidate-source-root", "/candidate/source",
-    "--candidate-cli", "/candidate/codestory-cli",
-    "--candidate-cli-sha256", "a".repeat(64),
   ]), {
     candidate_source_root: "/candidate/source",
-    candidate_cli: "/candidate/codestory-cli",
-    candidate_cli_sha256: "a".repeat(64),
   });
-  for (const option of ["--package-receipt", "--package-receipt-sha256", "--archive", "--source-root"]) {
+  for (const option of [
+    "--candidate-cli", "--candidate-cli-sha256",
+    "--package-receipt", "--package-receipt-sha256", "--archive", "--source-root",
+  ]) {
     assert.throws(() => parseRoutingQualificationOptions([option, "/legacy"]), new RegExp(`unknown option ${option}`, "u"));
   }
 });
@@ -184,6 +183,7 @@ async function sourceCandidateFixture(root, { liveIdentity = {} } = {}) {
   const sourceRoot = join(root, "source");
   await mkdir(join(sourceRoot, "plugins"), { recursive: true });
   await cp(pluginRoot, join(sourceRoot, "plugins", "codestory"), { recursive: true });
+  await writeFile(join(sourceRoot, ".gitignore"), "/target/\n");
   for (const args of [
     ["init", "-q"],
     ["config", "user.email", "routing@example.invalid"],
@@ -205,7 +205,6 @@ async function sourceCandidateFixture(root, { liveIdentity = {} } = {}) {
     protocol: liveIdentity.protocol ?? revision,
     discovery: liveIdentity.discovery ?? catalog.wireContract.discoveryContracts[revision],
   };
-  const candidateCliPath = join(root, "candidate-cli");
   const cliBytes = Buffer.from(`#!/usr/bin/env node
 const frames = [];
 process.stdin.setEncoding("utf8");
@@ -232,14 +231,19 @@ process.stdin.on("end", () => {
   }
 });
 `);
-  await writeFile(candidateCliPath, cliBytes);
-  await chmod(candidateCliPath, 0o700);
+  const buildCalls = [];
+  const buildCandidateCli = async (request) => {
+    buildCalls.push(request);
+    const { outputPath } = request;
+    await mkdir(dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, cliBytes);
+    await chmod(outputPath, 0o700);
+  };
 
   const qualificationNonce = "c".repeat(64);
   return {
     candidateSourceRoot: sourceRoot,
-    candidateCliPath,
-    candidateCliSha256: sha256(cliBytes),
+    buildCandidateCli,
     qualificationNonce,
     stageRoot: join(root, "stage"),
     sourceCommit,
@@ -247,20 +251,27 @@ process.stdin.on("end", () => {
     packageVersion,
     revision,
     discovery: catalog.wireContract.discoveryContracts[revision],
+    cliSha256: sha256(cliBytes),
+    buildCalls,
   };
 }
 
-test("source candidate authentication binds clean source archived plugin bytes, external CLI bytes, and live v3 identity", async () => {
+test("source candidate authentication builds and binds clean source, archived plugin bytes, owned CLI bytes, and live v3 identity", async () => {
   const root = await mkdtemp(join(tmpdir(), "codestory-routing-source-candidate-"));
   try {
     const fixture = await sourceCandidateFixture(root);
     const accepted = await authenticateSourceCandidateInstallation(fixture);
     assert.equal(accepted.expectedIdentity.publication.schema_version, 3);
-    assert.equal(accepted.expectedIdentity.cli.sha256, fixture.candidateCliSha256);
+    assert.equal(accepted.expectedIdentity.cli.sha256, fixture.cliSha256);
     assert.equal(accepted.publicIdentity.source_commit, fixture.sourceCommit);
     assert.equal(accepted.publicIdentity.source_tree, fixture.sourceTree);
     assert.equal(accepted.publicIdentity.protocol_revision, fixture.revision);
     assert.equal(accepted.publicIdentity.discovery_contract_sha256, fixture.discovery);
+    assert.deepEqual(fixture.buildCalls, [{
+      sourceRoot: await realpath(fixture.candidateSourceRoot),
+      targetDir: join(await realpath(fixture.candidateSourceRoot), "target", "codestory-mission-candidate"),
+      outputPath: join(await realpath(fixture.candidateSourceRoot), "target", "codestory-mission-candidate", "release", "codestory-cli"),
+    }]);
     assert.equal(accepted.launcherEnv.CODESTORY_PLUGIN_DATA, await realpath(accepted.pluginData));
     assert.equal(JSON.parse(await readFile(accepted.staged.attestationPath, "utf8")).candidate.producer.kind, "source_candidate");
 
@@ -294,10 +305,25 @@ test("source candidate authentication binds clean source archived plugin bytes, 
 test("source candidate authentication rejects the full input-identity mismatch class", async () => {
   const root = await mkdtemp(join(tmpdir(), "codestory-routing-source-hostile-"));
   try {
-    const wrongHash = await sourceCandidateFixture(join(root, "wrong-hash"));
+    const standalone = await sourceCandidateFixture(join(root, "standalone"));
+    const standalonePath = join(root, "standalone-cli");
+    await standalone.buildCandidateCli({
+      sourceRoot: standalone.candidateSourceRoot,
+      targetDir: join(standalone.candidateSourceRoot, "target", "ignored"),
+      outputPath: standalonePath,
+    });
     await assert.rejects(authenticateSourceCandidateInstallation({
-      ...wrongHash, candidateCliSha256: "d".repeat(64),
-    }), /CLI digest does not match/u);
+      ...standalone,
+      buildCandidateCli: async () => standalonePath,
+    }), /did not produce its owned CLI/u);
+
+    const drifting = await sourceCandidateFixture(join(root, "drifting"));
+    const buildOwnedCli = drifting.buildCandidateCli;
+    drifting.buildCandidateCli = async (request) => {
+      await buildOwnedCli(request);
+      await writeFile(join(drifting.candidateSourceRoot, "source-drift.txt"), "drift\n");
+    };
+    await assert.rejects(authenticateSourceCandidateInstallation(drifting), /changed while/u);
 
     for (const [name, liveIdentity, pattern] of [
       ["schema", { schema: 2 }, /live schema/u],
