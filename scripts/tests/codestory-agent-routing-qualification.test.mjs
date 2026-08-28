@@ -43,7 +43,7 @@ test("qualification host commands use official isolated Codex and Cursor session
   });
   assert.equal(codex.command, "codex");
   assert.deepEqual(codex.args, [
-    "exec", "--json", "--ephemeral",
+    "exec", "--json", "--ephemeral", "--skip-git-repo-check",
     "--config", 'approval_policy="never"',
     "--config", 'model_reasoning_effort="xhigh"',
     "--config", 'service_tier="default"',

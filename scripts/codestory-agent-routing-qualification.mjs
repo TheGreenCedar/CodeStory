@@ -200,7 +200,7 @@ export function buildRoutingHostCommand({
     return {
       command: executable,
       args: [
-        "exec", "--json", "--ephemeral",
+        "exec", "--json", "--ephemeral", "--skip-git-repo-check",
         ...PINNED_CODEX_CONFIG.flatMap((value) => ["--config", value]),
         ...codestoryMcpConfig.flatMap((value) => ["--config", value]),
         "--sandbox", "workspace-write", "--cd", projectRoot, "--model", model, "-",
