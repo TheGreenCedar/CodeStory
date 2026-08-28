@@ -6,7 +6,7 @@ import argparse
 import time
 
 from .contract_primitives import require_nonempty_string
-from .foundation import project_node_resource_uri, require
+from .foundation import project_node_resource_uri, require, resource_uri_matches
 from .installation_support import run_parallel
 from .runtime_bootstrap_types import ColdProof, HostPair, RuntimeSetup
 from .server_cleanup import pin_temporary_package_server
@@ -110,27 +110,39 @@ def _snippet_contract(
     setup: RuntimeSetup, hosts: HostPair, cold: ColdProof
 ) -> tuple[dict, int]:
     search = cold.results["search-b"][0]["result"]["structuredContent"]
-    linked_evidence = next(
+    linked_hit = next(
         (
-            evidence
-            for evidence in search["evidence"]
-            if isinstance(evidence, dict)
-            and isinstance(evidence.get("symbol_id"), str)
-            and bool(evidence["symbol_id"])
+            hit
+            for hit in search["hits"]
+            if isinstance(hit, dict)
+            and isinstance(hit.get("node_id"), str)
+            and isinstance(hit.get("links"), list)
         ),
         None,
     )
     require(
-        isinstance(linked_evidence, dict),
-        f"packaged v3 search omitted evidence with a resolvable symbol identity: {search!r}",
+        isinstance(linked_hit, dict),
+        f"packaged search omitted a resolvable hit with continuation links: {search!r}",
     )
-    linked_node_id = linked_evidence["symbol_id"]
+    linked_node_id = linked_hit["node_id"]
     expected_uri = project_node_resource_uri(
         "codestory://snippet",
         linked_node_id,
         setup.project_b,
     )
-    resource_node = hosts.host_b.resource(expected_uri, "snippet-resource-contract").get(
+    linked_uri = next(
+        (
+            link.get("uri")
+            for link in linked_hit["links"]
+            if isinstance(link, dict) and link.get("rel") == "snippet"
+        ),
+        None,
+    )
+    require(
+        isinstance(linked_uri, str) and resource_uri_matches(expected_uri, linked_uri),
+        "packaged search returned a missing or noncanonical project-bound snippet link",
+    )
+    resource_node = hosts.host_b.resource(linked_uri, "snippet-resource-contract").get(
         "node"
     )
     require(

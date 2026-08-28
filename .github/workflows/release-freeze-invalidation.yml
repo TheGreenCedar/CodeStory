@@ -4,12 +4,10 @@ on:
   pull_request:
     branches:
       - dev/codestory-next
-      - dev/codestory-0.18
     types: [synchronize]
   push:
     branches:
       - dev/codestory-next
-      - dev/codestory-0.18
 
 permissions:
   actions: write

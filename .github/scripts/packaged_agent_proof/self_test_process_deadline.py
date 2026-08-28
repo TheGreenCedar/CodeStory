@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import queue
 from types import SimpleNamespace
@@ -86,62 +85,22 @@ class _ScriptedHost(McpProcess):
                 "id": self.pending.get("id"),
                 "result": {
                     "structuredContent": {
-                        "kind": "preparing",
+                        "code": "codestory_preparing",
                         "state": "preparing",
+                        "retry_tool": params.get("name"),
                         "retry_after_ms": _RETRY_AFTER_MS,
-                        "operation": {"stage": "publication"},
                     },
-                    "isError": False,
                 },
             }
-        query = params.get("arguments", {}).get("query", "")
-        retrieval_state = "full" if step == "ready" else step
-        retrieval_generation = (
-            "retrieval-deadline-self-test" if retrieval_state == "full" else None
-        )
         return {
             "jsonrpc": "2.0",
             "id": self.pending.get("id"),
             "result": {
                 "structuredContent": {
-                    "kind": "complete",
-                    "schema_version": 3,
-                    "identity": {
-                        "packet_id": "packet-deadline-self-test",
-                        "request_id": "request-deadline-self-test",
-                        "question_sha256": hashlib.sha256(
-                            query.encode("utf-8")
-                        ).hexdigest(),
-                    },
-                    "publication": {
-                        "core": {
-                            "project_id": "project-deadline-self-test",
-                            "generation_id": "core-generation-deadline-self-test",
-                            "run_id": "core-run-deadline-self-test",
-                        },
-                        "retrieval": (
-                            {
-                                "core_generation_id": "core-generation-deadline-self-test",
-                                "core_run_id": "core-run-deadline-self-test",
-                                "retrieval_generation": retrieval_generation,
-                                "retrieval_input_sha256": "a" * 64,
-                                "semantic_generation": "semantic-deadline-self-test",
-                            }
-                            if retrieval_generation is not None
-                            else None
-                        ),
-                    },
-                    "status": "available",
-                    "evidence": [],
-                    "gaps": [],
-                    "continuation": None,
-                    "retrieval": {
-                        "state": retrieval_state,
-                        "generation_id": retrieval_generation,
-                    },
-                    "diagnostics": {"availability": "unavailable"},
-                },
-                "isError": False,
+                    "query": params.get("arguments", {}).get("query"),
+                    "hits": [],
+                    "retrieval": {"state": step},
+                }
             },
         }
 
