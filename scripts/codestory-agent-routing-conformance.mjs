@@ -33,6 +33,12 @@ const ROUTING_ACTIONS = Object.freeze([
   "prove_call_path",
   "tool_search",
 ]);
+export const MCP_PROTOCOL_REVISIONS = Object.freeze([
+  "2024-11-05",
+  "2025-03-26",
+  "2025-06-18",
+  "2025-11-25",
+]);
 
 export const INSTALLED_IDENTITY_FIELDS = Object.freeze([
   "installation.root",
@@ -51,6 +57,7 @@ export const INSTALLED_IDENTITY_FIELDS = Object.freeze([
   "publication.schema_version",
   "protocol.revision",
   "protocol.discovery_contract_sha256",
+  ...MCP_PROTOCOL_REVISIONS.map((revision) => `protocol.discovery_contracts.${revision}`),
 ]);
 
 const IDENTITY_REQUIREMENTS = Object.freeze({
@@ -785,7 +792,11 @@ function validateIdentityShape(identity, label) {
     const value = valueAt(identity, field);
     if (value === undefined || value === null || value === "") fail(`${label}.${field} is required`);
   }
-  for (const field of ["receipt.sha256", "package.sha256", "launcher.sha256", "cli.sha256", "protocol.discovery_contract_sha256"]) {
+  for (const field of [
+    "receipt.sha256", "package.sha256", "launcher.sha256", "cli.sha256",
+    "protocol.discovery_contract_sha256",
+    ...MCP_PROTOCOL_REVISIONS.map((revision) => `protocol.discovery_contracts.${revision}`),
+  ]) {
     const value = valueAt(identity, field);
     if (!SHA256.test(String(value)) || /^0{64}$/u.test(String(value))) fail(`${label}.${field} must be a nonzero lowercase SHA-256`);
   }
@@ -799,6 +810,14 @@ function validateIdentityShape(identity, label) {
   }
   if (!Number.isInteger(identity.publication.schema_version) || identity.publication.schema_version < 1) {
     fail(`${label}.publication.schema_version must be a positive integer`);
+  }
+  if (!plainObject(identity.protocol.discovery_contracts)
+      || !equalJson(Object.keys(identity.protocol.discovery_contracts).sort(), [...MCP_PROTOCOL_REVISIONS].sort())) {
+    fail(`${label}.protocol.discovery_contracts must contain the four supported revisions exactly`);
+  }
+  if (identity.protocol.discovery_contracts[identity.protocol.revision]
+      !== identity.protocol.discovery_contract_sha256) {
+    fail(`${label}.protocol.revision and protocol.discovery_contract_sha256 do not match its roster`);
   }
 }
 
@@ -923,20 +942,46 @@ function validateResultIdentity(action, expected) {
   const publication = normalized.meta?.codestory_publication;
   const protocol = normalized.meta?.codestory_protocol;
   const runtime = publication?.contract_runtime;
+  const nativeRevision = normalized.meta?.["com.thegreencedar.codestory/protocolRevision"];
+  const projected = plainObject(protocol);
+  const projectedRevision = projected ? protocol.negotiated : null;
+  if (projected && (!nonemptyString(projectedRevision)
+      || !SHA256.test(String(protocol.discovery_contract_sha256)))) {
+    fail(`${action.tool} result identity projected protocol metadata requires its revision and discovery digest`);
+  }
+  if (nativeRevision != null && projectedRevision != null && nativeRevision !== projectedRevision) {
+    fail(`${action.tool} result identity protocol revision metadata conflicts`);
+  }
+  const negotiatedRevision = nativeRevision ?? projectedRevision;
+  if (!nonemptyString(negotiatedRevision)
+      || !Object.hasOwn(expected.protocol.discovery_contracts, negotiatedRevision)) {
+    fail(`${action.tool} result identity negotiated protocol revision is outside the authenticated roster`);
+  }
+  const negotiatedDiscovery = expected.protocol.discovery_contracts[negotiatedRevision];
+  if (protocol?.preferred != null && protocol.preferred !== expected.protocol.revision) {
+    fail(`${action.tool} result identity preferred protocol revision does not match installed identity`);
+  }
+  if (projected && protocol.discovery_contract_sha256 !== negotiatedDiscovery) {
+    fail(`${action.tool} result identity protocol.discovery_contract_sha256 does not match the negotiated revision`);
+  }
+  if (!plainObject(runtime) && (projected || action.kind !== "prove_call_path")) {
+    fail(`${action.tool} result identity requires runtime identity outside the native proof result contract`);
+  }
   const mismatches = [
-    ["package.version", runtime?.plugin_version, expected.package.version],
-    ["cli.pinned_version", runtime?.plugin_cli_version, expected.cli.version],
-    ["cli.version", runtime?.cli_version, expected.cli.version],
-    ["cli.sha256", runtime?.cli_sha256, expected.cli.sha256],
-    ["cli.source", runtime?.cli_source, expected.cli.source],
     ["publication.schema_version", publication?.schema_version, expected.publication.schema_version],
-    ["protocol.revision", protocol?.negotiated, expected.protocol.revision],
-    ["protocol.discovery_contract_sha256", protocol?.discovery_contract_sha256, expected.protocol.discovery_contract_sha256],
+    ...(plainObject(runtime) ? [
+      ["package.version", runtime.plugin_version, expected.package.version],
+      ["cli.pinned_version", runtime.plugin_cli_version, expected.cli.version],
+      ["cli.version", runtime.cli_version, expected.cli.version],
+      ["cli.sha256", runtime.cli_sha256, expected.cli.sha256],
+      ["cli.source", runtime.cli_source, expected.cli.source],
+    ] : []),
   ];
   for (const [field, observed, wanted] of mismatches) {
     if (observed !== wanted) fail(`${action.tool} result identity ${field} does not match installed identity`);
   }
-  if (runtime?.pinned_pair_matches !== true || runtime?.known_override_skew_channel !== false) {
+  if (plainObject(runtime)
+      && (runtime.pinned_pair_matches !== true || runtime.known_override_skew_channel !== false)) {
     fail(`${action.tool} result identity does not prove one pinned managed runtime`);
   }
   return normalized;
@@ -2325,14 +2370,16 @@ export function validateInstalledSession({
   const results = new Map();
   for (const action of actions) {
     if (!action.completed) fail(`${scenarioId} has an incomplete ${action.tool} action`);
+    const expectedSemanticError = scenarioContract.typed_contract === "malformed"
+      && action.kind === "prove_call_path";
     if (["search", "context", "packet", "prove_call_path"].includes(action.kind)) {
       validateToolInputSchema(action);
-      results.set(action, validateResultIdentity(action, expectedIdentity));
+      results.set(action, expectedSemanticError
+        ? normalizedResult(action)
+        : validateResultIdentity(action, expectedIdentity));
     } else {
       results.set(action, normalizedResult(action));
     }
-    const expectedSemanticError = scenarioContract.typed_contract === "malformed"
-      && action.kind === "prove_call_path";
     if (results.get(action).isError && !expectedSemanticError) {
       fail(`${scenarioId} has an unexpected failed ${action.tool} action`);
     }
@@ -2424,6 +2471,9 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
   if (catalog.wireContract?.discoveryContracts?.[expectedIdentity.protocol.revision]
       !== expectedIdentity.protocol.discovery_contract_sha256) {
     fail("catalog discovery digest does not match expected discovery identity");
+  }
+  if (!equalJson(catalog.wireContract?.discoveryContracts, expectedIdentity.protocol.discovery_contracts)) {
+    fail("catalog discovery roster does not match expected discovery identity");
   }
   const server = mcp.mcpServers?.codestory;
   if (server?.command !== "node"

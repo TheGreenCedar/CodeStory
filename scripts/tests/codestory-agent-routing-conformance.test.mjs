@@ -36,6 +36,12 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..", "..");
 const pluginRoot = join(repoRoot, "plugins", "codestory");
 const SHA_D = "d".repeat(64);
+const PROFILE_DIGESTS = Object.freeze({
+  "2024-11-05": "a".repeat(64),
+  "2025-03-26": "b".repeat(64),
+  "2025-06-18": "c".repeat(64),
+  "2025-11-25": SHA_D,
+});
 const codexControlRoot = realpathSync(mkdtempSync(join(tmpdir(), "codestory-routing-codex-home-")));
 const codexPluginRoot = join(
   codexControlRoot, "plugins", "cache", "RoutingCandidate", "codestory", "0.17.4",
@@ -87,7 +93,11 @@ const installedIdentity = {
     source: "managed",
   },
   publication: { schema_version: 3 },
-  protocol: { revision: "2025-11-25", discovery_contract_sha256: SHA_D },
+  protocol: {
+    revision: "2025-11-25",
+    discovery_contract_sha256: SHA_D,
+    discovery_contracts: PROFILE_DIGESTS,
+  },
 };
 const installedReceipt = join(installedRoot, "installed-receipt.json");
 writeFileSync(installedReceipt, `${JSON.stringify({ schema_version: 1, identity: installedIdentity }, null, 2)}\n`);
@@ -1634,6 +1644,79 @@ test("every installed identity field is exact and every CodeStory result repeats
   assert.throws(() => validate("codex", resultDrift), /result identity.*discovery/u);
 });
 
+test("tool results bind the host-negotiated revision to the authenticated discovery roster", () => {
+  const june = baseRun("exact_symbol_search");
+  const juneMeta = june.steps[0].result._meta;
+  delete juneMeta.codestory_protocol;
+  juneMeta["com.thegreencedar.codestory/protocolRevision"] = "2025-06-18";
+  assert.equal(validate("codex", june).status, "pass");
+
+  const nativeProof = baseRun("typed_proof_contract_proven");
+  nativeProof.steps[0].result._meta = {
+    "com.thegreencedar.codestory/protocolRevision": "2025-06-18",
+    codestory_publication: {
+      schema_version: 3,
+      minimum_compatible_schema_version: 3,
+    },
+    codestory_execution: { semantic_retrieval_activated: false },
+  };
+  assert.equal(validate("codex", nativeProof).status, "pass");
+
+  const nativeSearchWithoutRuntime = baseRun("exact_symbol_search");
+  nativeSearchWithoutRuntime.steps[0].result._meta = {
+    "com.thegreencedar.codestory/protocolRevision": "2025-06-18",
+    codestory_publication: {
+      schema_version: 3,
+      minimum_compatible_schema_version: 3,
+    },
+  };
+  assert.throws(
+    () => validate("codex", nativeSearchWithoutRuntime),
+    /requires runtime identity outside the native proof result contract/u,
+  );
+
+  const projectedMissingDigest = baseRun("exact_symbol_search");
+  delete projectedMissingDigest.steps[0].result._meta.codestory_protocol.discovery_contract_sha256;
+  assert.throws(
+    () => validate("codex", projectedMissingDigest),
+    /projected protocol metadata.*discovery digest/u,
+  );
+
+  const unknown = baseRun("exact_symbol_search");
+  delete unknown.steps[0].result._meta.codestory_protocol;
+  unknown.steps[0].result._meta["com.thegreencedar.codestory/protocolRevision"] = "2099-01-01";
+  assert.throws(() => validate("codex", unknown), /negotiated protocol revision.*authenticated roster/u);
+  for (const inherited of ["toString", "constructor", "__proto__"]) {
+    const hostile = baseRun("exact_symbol_search");
+    delete hostile.steps[0].result._meta.codestory_protocol;
+    hostile.steps[0].result._meta["com.thegreencedar.codestory/protocolRevision"] = inherited;
+    assert.throws(
+      () => validate("codex", hostile),
+      /negotiated protocol revision.*authenticated roster/u,
+      inherited,
+    );
+  }
+
+  const conflict = baseRun("exact_symbol_search");
+  conflict.steps[0].result._meta["com.thegreencedar.codestory/protocolRevision"] = "2025-06-18";
+  assert.throws(() => validate("codex", conflict), /protocol revision metadata conflicts/u);
+
+  const projectedMissingRuntime = baseRun("exact_symbol_search");
+  delete projectedMissingRuntime.steps[0].result._meta.codestory_publication.contract_runtime;
+  assert.throws(
+    () => validate("codex", projectedMissingRuntime),
+    /requires runtime identity outside the native proof result contract/u,
+  );
+});
+
+test("semantic proof tool errors use the explicit error contract without result identity metadata", () => {
+  const malformed = baseRun("malformed_proof_contract");
+  malformed.steps[0].result._meta = {
+    codestory_execution: { semantic_retrieval_activated: false },
+  };
+  assert.equal(validate("codex", malformed).status, "pass");
+});
+
 test("installed receipt authentication rejects substituted package launcher CLI and forged receipt", () => {
   for (const relativePath of [
     "archives/codestory-0.18.tgz",
@@ -1700,6 +1783,7 @@ function staticIdentityFor(root) {
   staticIdentity.protocol.revision = catalog.wireContract.preferredMcpProtocolVersion;
   staticIdentity.protocol.discovery_contract_sha256 =
     catalog.wireContract.discoveryContracts[staticIdentity.protocol.revision];
+  staticIdentity.protocol.discovery_contracts = clone(catalog.wireContract.discoveryContracts);
   const rosterPaths = [
     "plugin.json",
     "cli-version.json",

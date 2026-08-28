@@ -221,27 +221,33 @@ async function sourceCandidateFixture(root, { liveIdentity = {} } = {}) {
     version: liveIdentity.version ?? packageVersion,
     schema: liveIdentity.schema ?? 3,
     protocol: liveIdentity.protocol ?? revision,
-    discovery: liveIdentity.discovery ?? catalog.wireContract.discoveryContracts[revision],
+    discoveryContracts: {
+      ...catalog.wireContract.discoveryContracts,
+      ...(liveIdentity.discoveryContracts ?? {}),
+      ...(liveIdentity.discovery ? { [revision]: liveIdentity.discovery } : {}),
+    },
   };
   const cliBytes = Buffer.from(`#!/usr/bin/env node
 const frames = [];
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => frames.push(chunk));
 process.stdin.on("end", () => {
+  const discoveryContracts = ${JSON.stringify(observed.discoveryContracts)};
   for (const line of frames.join("").split(/\\r?\\n/u).filter(Boolean)) {
     const request = JSON.parse(line);
+    const negotiated = request.params.protocolVersion;
     if (request.method === "initialize") process.stdout.write(JSON.stringify({
       jsonrpc: "2.0", id: request.id, result: {
-        protocolVersion: ${JSON.stringify(observed.protocol)},
+        protocolVersion: negotiated,
         version: ${JSON.stringify(observed.version)},
         serverInfo: { name: "codestory", version: ${JSON.stringify(observed.version)} },
         capabilities: {},
         _meta: {
           codestory_publication: { schema_version: ${JSON.stringify(observed.schema)} },
           codestory_protocol: {
-            negotiated: ${JSON.stringify(observed.protocol)},
+            negotiated,
             preferred: ${JSON.stringify(observed.protocol)},
-            discovery_contract_sha256: ${JSON.stringify(observed.discovery)},
+            discovery_contract_sha256: discoveryContracts[negotiated],
           },
         },
       },
@@ -285,6 +291,10 @@ test("source candidate authentication builds and binds clean source, archived pl
     assert.equal(accepted.publicIdentity.source_tree, fixture.sourceTree);
     assert.equal(accepted.publicIdentity.protocol_revision, fixture.revision);
     assert.equal(accepted.publicIdentity.discovery_contract_sha256, fixture.discovery);
+    assert.deepEqual(
+      accepted.publicIdentity.discovery_contracts,
+      JSON.parse(await readFile(join(accepted.pluginRoot, "generated-mcp-catalog.json"), "utf8")).wireContract.discoveryContracts,
+    );
     assert.deepEqual(fixture.buildCalls, [{
       sourceRoot: await realpath(fixture.candidateSourceRoot),
       targetDir: join(await realpath(fixture.candidateSourceRoot), "target", "codestory-mission-candidate"),
@@ -343,10 +353,33 @@ test("source candidate authentication rejects the full input-identity mismatch c
     };
     await assert.rejects(authenticateSourceCandidateInstallation(drifting), /changed while/u);
 
+    const profileDrift = await sourceCandidateFixture(join(root, "profile-drift"));
+    const profileCatalogPath = join(
+      profileDrift.candidateSourceRoot,
+      "plugins",
+      "codestory",
+      "generated-mcp-catalog.json",
+    );
+    const profileCatalog = JSON.parse(await readFile(profileCatalogPath, "utf8"));
+    profileCatalog.revisionProfiles["2025-06-18"].discoveryContractSha256 = "e".repeat(64);
+    await writeFile(profileCatalogPath, `${JSON.stringify(profileCatalog, null, 2)}\n`);
+    for (const args of [
+      ["add", "plugins/codestory/generated-mcp-catalog.json"],
+      ["commit", "-qm", "drift profile digest"],
+    ]) {
+      const completed = spawnSync("git", ["-C", profileDrift.candidateSourceRoot, ...args]);
+      assert.equal(completed.status, 0, completed.stderr?.toString());
+    }
+    await assert.rejects(
+      authenticateSourceCandidateInstallation(profileDrift),
+      /2025-06-18 revision profile discovery digest/u,
+    );
+
     for (const [name, liveIdentity, pattern] of [
       ["schema", { schema: 2 }, /live schema/u],
-      ["protocol", { protocol: "2025-06-18" }, /live preferred protocol/u],
-      ["discovery", { discovery: "e".repeat(64) }, /live discovery identity/u],
+      ["protocol", { protocol: "2025-06-18" }, /live 2024-11-05 protocol/u],
+      ["discovery", { discovery: "e".repeat(64) }, /live 2025-11-25 discovery identity/u],
+      ["june-discovery", { discoveryContracts: { "2025-06-18": "e".repeat(64) } }, /live 2025-06-18 discovery identity/u],
     ]) {
       const fixture = await sourceCandidateFixture(join(root, name), { liveIdentity });
       await assert.rejects(authenticateSourceCandidateInstallation(fixture), pattern);

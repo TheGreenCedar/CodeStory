@@ -19,6 +19,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 
 import {
+  MCP_PROTOCOL_REVISIONS,
   ROUTING_SCENARIOS,
   materializeRoutingRequests,
   validateInstalledSession,
@@ -473,42 +474,48 @@ function nativeArchiveName(version, target) {
   return `codestory-cli-v${version}-${target}.${extension}`;
 }
 
-async function probeSourceCandidateCli({ cli, packageVersion, protocolRevision, discoveryContractSha256 }) {
-  const id = "source-candidate-authentication";
+async function probeSourceCandidateCli({ cli, packageVersion, protocolRevision, discoveryContracts }) {
+  const requests = MCP_PROTOCOL_REVISIONS.map((revision) => ({
+    jsonrpc: "2.0",
+    id: `source-candidate-authentication-${revision}`,
+    method: "initialize",
+    params: {
+      protocolVersion: revision,
+      capabilities: {},
+      clientInfo: { name: "codestory-routing-qualification", version: "1" },
+    },
+  }));
   const stdout = await successfulProcess(cli, ["serve", "--stdio", "--multi-project", "--refresh", "none"], {
-    stdin: `${JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method: "initialize",
-      params: {
-        protocolVersion: protocolRevision,
-        capabilities: {},
-        clientInfo: { name: "codestory-routing-qualification", version: "1" },
-      },
-    })}\n`,
+    stdin: `${requests.map((request) => JSON.stringify(request)).join("\n")}\n`,
     timeoutMs: 30_000,
   }, "source candidate live initialize");
-  let response;
+  let responses;
   try {
-    response = stdout.split(/\r?\n/u).filter(Boolean).map((line) => JSON.parse(line)).find((frame) => frame.id === id);
+    responses = new Map(stdout.split(/\r?\n/u).filter(Boolean).map((line) => {
+      const frame = JSON.parse(line);
+      return [frame.id, frame];
+    }));
   } catch (error) {
     fail(`source candidate live initialize returned invalid JSON: ${error.message}`);
   }
-  if (!plainObject(response?.result) || response.error) fail("source candidate live initialize did not return a result");
-  const result = response.result;
-  if (result.serverInfo?.version !== packageVersion || result.version !== packageVersion) {
-    fail("source candidate live version does not match the archived plugin and CLI pin");
-  }
-  if (result._meta?.codestory_publication?.schema_version !== 3) {
-    fail("source candidate live schema must be 3");
-  }
-  if (result.protocolVersion !== protocolRevision
-      || result._meta?.codestory_protocol?.negotiated !== protocolRevision
-      || result._meta?.codestory_protocol?.preferred !== protocolRevision) {
-    fail("source candidate live preferred protocol does not match the archived catalog");
-  }
-  if (result._meta?.codestory_protocol?.discovery_contract_sha256 !== discoveryContractSha256) {
-    fail("source candidate live discovery identity does not match the archived catalog");
+  for (const revision of MCP_PROTOCOL_REVISIONS) {
+    const response = responses.get(`source-candidate-authentication-${revision}`);
+    if (!plainObject(response?.result) || response.error) fail(`source candidate live ${revision} initialize did not return a result`);
+    const result = response.result;
+    if (result.serverInfo?.version !== packageVersion || result.version !== packageVersion) {
+      fail("source candidate live version does not match the archived plugin and CLI pin");
+    }
+    if (result._meta?.codestory_publication?.schema_version !== 3) {
+      fail("source candidate live schema must be 3");
+    }
+    if (result.protocolVersion !== revision
+        || result._meta?.codestory_protocol?.negotiated !== revision
+        || result._meta?.codestory_protocol?.preferred !== protocolRevision) {
+      fail(`source candidate live ${revision} protocol does not match the archived catalog`);
+    }
+    if (result._meta?.codestory_protocol?.discovery_contract_sha256 !== discoveryContracts[revision]) {
+      fail(`source candidate live ${revision} discovery identity does not match the archived catalog`);
+    }
   }
 }
 
@@ -589,15 +596,29 @@ export async function authenticateSourceCandidateInstallation({
   const catalog = await readJson(join(pluginRoot, "generated-mcp-catalog.json"), "candidate generated catalog");
   const packageVersion = pluginManifest.version;
   const protocolRevision = catalog.wireContract?.preferredMcpProtocolVersion;
-  const discoveryContractSha256 = catalog.wireContract?.discoveryContracts?.[protocolRevision];
+  const discoveryContracts = catalog.wireContract?.discoveryContracts;
+  const discoveryContractSha256 = discoveryContracts?.[protocolRevision];
   if (pluginManifest.name !== "codestory" || typeof packageVersion !== "string" || !packageVersion
       || cliVersion.cli_version !== packageVersion
       || catalog.wireContract?.publicationStampSchemaVersion !== 3
       || catalog.wireContract?.minimumCompatiblePublicationStampSchemaVersion !== 3
-      || protocolRevision !== "2025-11-25") {
+      || protocolRevision !== "2025-11-25"
+      || !plainObject(discoveryContracts)
+      || JSON.stringify(Object.keys(discoveryContracts).sort())
+        !== JSON.stringify([...MCP_PROTOCOL_REVISIONS].sort())
+      || JSON.stringify([...(catalog.wireContract?.supportedMcpProtocolVersions ?? [])].sort())
+        !== JSON.stringify([...MCP_PROTOCOL_REVISIONS].sort())
+      || !plainObject(catalog.revisionProfiles)
+      || JSON.stringify(Object.keys(catalog.revisionProfiles).sort())
+        !== JSON.stringify([...MCP_PROTOCOL_REVISIONS].sort())) {
     fail("candidate archived plugin/catalog identity is not the required v3 preferred profile");
   }
-  requiredDigest(discoveryContractSha256, "candidate archived catalog discovery digest");
+  for (const revision of MCP_PROTOCOL_REVISIONS) {
+    requiredDigest(discoveryContracts[revision], `candidate archived catalog ${revision} discovery digest`);
+    if (catalog.revisionProfiles[revision]?.discoveryContractSha256 !== discoveryContracts[revision]) {
+      fail(`candidate archived catalog ${revision} revision profile discovery digest does not match its wire contract`);
+    }
+  }
 
   const pluginData = join(stageRoot, "plugin-data");
   const managedRoot = join(pluginData, "codestory-cli", packageVersion);
@@ -609,7 +630,7 @@ export async function authenticateSourceCandidateInstallation({
     cli: managedCli,
     packageVersion,
     protocolRevision,
-    discoveryContractSha256,
+    discoveryContracts,
   });
   const finalHead = await gitValue(sourceRoot, ["rev-parse", "HEAD"], "candidate source final HEAD");
   const finalTree = await gitValue(sourceRoot, ["rev-parse", "HEAD^{tree}"], "candidate source final tree");
@@ -694,6 +715,7 @@ export async function authenticateSourceCandidateInstallation({
     protocol: {
       revision: protocolRevision,
       discovery_contract_sha256: discoveryContractSha256,
+      discovery_contracts: discoveryContracts,
     },
   };
   const installedReceipt = join(installedRoot, "installed-receipt.json");
@@ -722,6 +744,7 @@ export async function authenticateSourceCandidateInstallation({
       schema_version: 3,
       protocol_revision: protocolRevision,
       discovery_contract_sha256: discoveryContractSha256,
+      discovery_contracts: discoveryContracts,
     },
     launcherEnv: {
       CODESTORY_PLUGIN_DATA: realpathSync(pluginData),
