@@ -18,6 +18,12 @@
   `include_evidence` or `--no-evidence`.
 - TypeScript and JavaScript config files can now be indexed when they use JSONC comments or trailing commas. Ordinary JSON stays strict, and malformed config changes leave the previous complete index available.
 
+## 0.17.5
+
+Cursor still dropped `files`, `snippet`, and preparing `packet`/`search`/`context` results: empty `policy_exclusions` were omitted, batched snippets used a ranges document, and the shared `codestory_preparing` envelope was undeclared.
+
+Operators start, inspect, advance, and resume a release with `node scripts/codestory-release.mjs` instead of assembling a receipt by hand. Promotion still needs one recorded combined approval, and `--rehearse` walks the same machine without tagging or publishing.
+
 ## 0.17.4
 
 Cursor marketplace MCP tool results match the schemas Cursor validates. After the server started, Cursor rejected `status`, `packet`, and `files` because the advertised output schema forbade extra compact-status fields, typed packet `support` as an object, and omitted `files.coverage_gaps`.

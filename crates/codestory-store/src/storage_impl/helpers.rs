@@ -190,10 +190,8 @@ fn decode_float32_embedding_blob(blob: &[u8]) -> Result<Vec<f32>, StorageError> 
         ));
     }
 
-    let (chunks, remainder) = blob.as_chunks::<4>();
-    debug_assert!(remainder.is_empty());
-    let mut out = Vec::with_capacity(chunks.len());
-    for bytes in chunks {
+    let mut out = Vec::with_capacity(blob.len() / std::mem::size_of::<f32>());
+    for bytes in blob.as_chunks::<4>().0 {
         out.push(f32::from_le_bytes(*bytes));
     }
     Ok(out)

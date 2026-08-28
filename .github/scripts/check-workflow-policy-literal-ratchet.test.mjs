@@ -338,7 +338,7 @@ const EXPECTED_LITERAL_SITES = {
   validatePackagedProof: { digests: 2, permissionTuples: 2, stepNames: 106, workflowNames: 2 },
   validatePluginAndDraftWorkflows: { stepNames: 32, workflowNames: 13 },
   validatePluginRelease: { permissionTuples: 1, stepNames: 17, workflowNames: 6 },
-  validatePostPublish: { stepNames: 38, workflowNames: 1 },
+  validatePostPublish: { stepNames: 40, workflowNames: 1 },
   validateReleaseArtifactRerunSafety: { workflowNames: 13 },
   validateReleaseCellUploadOwnership: { workflowNames: 18 },
   validateReleaseCoordinator: { stepNames: 24, workflowNames: 11 },

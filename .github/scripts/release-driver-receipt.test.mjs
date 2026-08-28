@@ -52,7 +52,8 @@ function preFreezeReceipt() {
   let receipt = initReceipt("0.17.0");
   receipt = record(receipt, "calibration-source", { commit: C, tree: C_TREE });
   receipt = record(receipt, "pull-requests", {
-    release_pr: 1873,
+    release_pr: null,
+    bind: "next_head",
     integrated_support_prs: [1869, 1871],
   });
   receipt = record(

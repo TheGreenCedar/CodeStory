@@ -1319,7 +1319,7 @@ pub struct IndexedFilesDto {
     pub summary: IndexedFilesSummaryDto,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_gaps: Vec<FileCoverageDiagnosticDto>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub policy_exclusions: Vec<SourcePolicyExclusionDto>,
     pub files: Vec<IndexedFileDto>,
 }

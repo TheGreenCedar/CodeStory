@@ -10,7 +10,7 @@ on:
         type: choice
         options: [package, platform, qualification, calibration, integration]
       pr_number:
-        description: Same-repository pull request. Dispatch PR modes with --ref <same-repository PR head branch>.
+        description: Optional same-repository pull request. Dispatch PR modes with --ref <same-repository PR head branch>. Omit when dev/codestory-next is already the exact expected head and dispatch with --ref dev/codestory-next.
         required: false
         type: string
       expected_head_sha:
@@ -112,6 +112,44 @@ jobs:
           fi
           test "$mode" = "package" || test "$mode" = "platform" || test "$mode" = "qualification" || test "$mode" = "calibration"
           pr_number="${EVENT_PR_NUMBER:-$INPUT_PR_NUMBER}"
+          if [ -z "$pr_number" ]; then
+            test "$GITHUB_EVENT_NAME" = "workflow_dispatch"
+            test -n "$INPUT_HEAD_SHA"
+            test "$GITHUB_REF" = "refs/heads/dev/codestory-next" || {
+              echo "::error::Platform proof without a PR must be dispatched with --ref dev/codestory-next, not $GITHUB_REF."
+              exit 1
+            }
+            test "$GITHUB_SHA" = "$INPUT_HEAD_SHA" || {
+              echo "::error::Workflow SHA $GITHUB_SHA is not accepted next head $INPUT_HEAD_SHA. Dispatch with --ref dev/codestory-next."
+              exit 1
+            }
+            dev_head="$(gh api "repos/$GITHUB_REPOSITORY/branches/dev/codestory-next" --jq '.commit.sha')"
+            test "$INPUT_HEAD_SHA" = "$dev_head" || {
+              echo "::error::Live dev/codestory-next $dev_head is not accepted head $INPUT_HEAD_SHA."
+              exit 1
+            }
+            test "$GITHUB_SHA" = "$dev_head" || {
+              echo "::error::Workflow SHA $GITHUB_SHA is not current dev head $dev_head. Dispatch with --ref dev/codestory-next."
+              exit 1
+            }
+            if [ "$mode" = "calibration" ]; then
+              if [ -n "$INPUT_CALIBRATION_ARTIFACT" ] \
+                || [ -n "$INPUT_CALIBRATION_RUN_ID" ]; then
+                echo "::error::Calibration collection does not consume prior proof artifacts."
+                exit 1
+              fi
+            elif [ "$mode" = "qualification" ]; then
+              test -n "$INPUT_CALIBRATION_ARTIFACT"
+              test -n "$INPUT_CALIBRATION_RUN_ID"
+            fi
+            {
+              echo "head_sha=$dev_head"
+              echo "base_sha=$dev_head"
+              echo "mode=$mode"
+              echo "proof_key=$mode-next-$dev_head"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           test -n "$pr_number"
           pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number")"
           head_repo="$(jq -r '.head.repo.full_name' <<<"$pr")"

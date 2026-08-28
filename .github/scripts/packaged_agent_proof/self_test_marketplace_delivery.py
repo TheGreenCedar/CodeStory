@@ -28,6 +28,7 @@ from types import SimpleNamespace
 
 from .foundation import REPOSITORY_ROOT, ProofFailure, require
 from .installed_identity import installed_plugin_identity
+from .installation_support import directory_contract_sha256
 from .marketplace_installation import (
     DEFERRED_INSTALLATION_SOURCE,
     LIVE_INSTALLATION_SOURCE,
@@ -42,6 +43,21 @@ _RESTORED_REPOSITORY = "local:candidate-pinned-marketplace-restored-fixture"
 _MARKER_FILENAME = ".codestory-marketplace-fixture.json"
 _MARKER_PURPOSE = "codestory-candidate-pinned-marketplace-fixture"
 _PLUGIN_ID = f"codestory@{_MARKETPLACE_NAME}"
+_ORDERING_CONTRACT_DIGEST = (
+    "9c8a732ad11364c4eb6a36b16fd856f5b63e31ab01ad41e5782bdafdbf7dd34d"
+)
+
+
+def _run_directory_contract_ordering_self_test() -> None:
+    with tempfile.TemporaryDirectory(prefix="codestory-directory-contract-") as raw:
+        root = Path(raw)
+        (root / "a").mkdir()
+        (root / "a" / "child.txt").write_text("nested", encoding="utf-8")
+        (root / "a0.txt").write_text("flat", encoding="utf-8")
+        require(
+            directory_contract_sha256(root) == _ORDERING_CONTRACT_DIGEST,
+            "plugin directory digest does not sort normalized paths bytewise",
+        )
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -609,6 +625,7 @@ def _run_shared_identity_self_tests() -> None:
 
 
 def run_marketplace_delivery_self_tests() -> None:
+    _run_directory_contract_ordering_self_test()
     _run_codex_config_serialization_self_test()
     manifest = _manifest()
     with tempfile.TemporaryDirectory(prefix="codestory-marketplace-delivery-") as raw:

@@ -19,8 +19,9 @@ on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: Same-repository pull request accepted by exact-head review. Dispatch with --ref <same-repository PR head branch>.
-        required: true
+        description: Optional same-repository pull request accepted by exact-head review. Dispatch with --ref <same-repository PR head branch>. Omit when dev/codestory-next is already the exact expected head and dispatch with --ref dev/codestory-next.
+        required: false
+        default: ""
         type: string
       expected_head_sha:
         description: Exact reviewed head SHA. The selected --ref, github.sha, and live PR head must match.
@@ -143,6 +144,24 @@ jobs:
               exit 1
             }
             echo "ref=$head_sha" >> "$GITHUB_OUTPUT"
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            test -n "$EXPECTED_HEAD_SHA"
+            test "$GITHUB_REF" = "refs/heads/dev/codestory-next" || {
+              echo "::error::Exact-head proof without a PR must be dispatched with --ref dev/codestory-next, not $GITHUB_REF."
+              exit 1
+            }
+            test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA" || {
+              echo "::error::Workflow SHA $GITHUB_SHA is not reviewed next head $EXPECTED_HEAD_SHA. Dispatch with --ref dev/codestory-next."
+              exit 1
+            }
+            next_head="$(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/dev%2Fcodestory-next" --jq '.object.sha'
+            )"
+            test "$next_head" = "$EXPECTED_HEAD_SHA" || {
+              echo "::error::Live dev/codestory-next $next_head is not reviewed head $EXPECTED_HEAD_SHA."
+              exit 1
+            }
+            echo "ref=$EXPECTED_HEAD_SHA" >> "$GITHUB_OUTPUT"
           else
             test -n "$CALLER_REF"
             test "$GITHUB_SHA" = "$CALLER_REF" || {

@@ -1675,7 +1675,7 @@
         "publisher_step": "Publish executable release freeze",
         "status_creator": "github-actions[bot]",
         "job_manifest": ".github/scripts/release-freeze-acceptance-jobs.json",
-        "job_manifest_sha256": "b1ae13eabcbda9c99f7d0ba17cae97ca292d11fa4b010f87c534f9b7938843c7",
+        "job_manifest_sha256": "7eb0812b601c3f06d5885b741d4dd1775b85c10619b18fc680dbb77a9ccc13b4",
         "phases": {
           "source_stabilization": {
             "known_future_source_changes": [
@@ -1743,7 +1743,7 @@
         "file": "source-proof.yml",
         "job": "resolve",
         "step": "Resolve trusted exact head",
-        "sha256": "2fe869b675010f5db29259aff38d83456c01dbc9885989afbf7c92a2826791af",
+        "sha256": "b6a71101fabf7f21a2d3483132eadbe9062c53b55988946c5a26da46d2719dc2",
         "reason": "The trusted-head resolver authenticates which commit the broad source proof runs against; fragment checks alone cannot prove the authentication logic was not rewritten around them."
       },
       "packaged_platform_pr_resolver": {
@@ -1751,7 +1751,7 @@
         "file": "packaged-platform-pr.yml",
         "job": "route",
         "step": "Resolve trusted exact head",
-        "sha256": "21182e5058df0de35760e22c2dd1f9708fde0dc416cefbec69a60cfd271b74e4",
+        "sha256": "fa1ec1a09cf8588ce2109c25289a0d1c797c63d4b0429ff222d7d549ce67b3f0",
         "reason": "The coordinator's trusted-head resolver authenticates the exact frozen-candidate head for every broad proof mode; its executable text must match the reviewed contract, not merely contain its tokens."
       },
       "marketplace_sync_dispatch_guard": {
@@ -1773,13 +1773,13 @@
       "packaged_platform_proof_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-proof.yml",
-        "sha256": "0888e1f69cae8d79357ea4ff1a005f4fe51a451c46e93752d8c0ab7ea7e3103a",
+        "sha256": "443c65ea54f92260e664bdeaceabb43e57ac1dc9cb5d15f2783690f6102823fa",
         "reason": "This workflow builds release archives on three operating systems and carries state between many shell steps through GITHUB_ENV and GITHUB_PATH. Its parsed executable structure is pinned so an unreviewed earlier step cannot replace an owner binary while leaving the locally digested finalizer unchanged."
       },
       "packaged_platform_pr_workflow": {
         "subject": "parsed_workflow_json",
         "file": "packaged-platform-pr.yml",
-        "sha256": "965ee4bb3e73bbf483816fec614a6193e9fbf1fdfb7913574d95bde2e1542f7e",
+        "sha256": "111a730a2ea35476aa94ee2fdb16d5795b5230e4e6002664ac3ff2d913a23c31",
         "reason": "The frozen-candidate coordinator is a small release-control program, not a loose collection of independently safe fragments. Its complete parsed structure is pinned so a required check cannot be made advisory, parked in dead code, or followed by a payload substitution while leaving the expected tokens in place."
       },
       "frozen_candidate_quality_workflow": {
@@ -1826,7 +1826,7 @@
         "file": "packaged-platform-proof.yml",
         "job": "build",
         "step": "Build Linux x64 at the glibc 2.31 baseline",
-        "sha256": "f2786863913db8ac8309e1c5f7d7e7417e52b3631432fb231f293cb1f062c52f",
+        "sha256": "f101cc525f52f75686acbb1cf240412409f3f388793890993cefae9175685a6f",
         "reason": "Linux owns its compiler server inside Docker while macOS and Windows own one in the host shell; both executable programs are pinned so a swallowed stop or a dead-code copy cannot satisfy the ownership fragments."
       },
       "packaged_compile_clock_stop": {
@@ -3271,7 +3271,7 @@
         "step": "Prove the catalog-resolved published runtime",
         "fragments": [
           "common=(",
-          "python .github/scripts/check-packaged-agent-proof.py",
+          "python \"$PROOF_HELPER\"",
           "--expected-backend \"$EXPECTED_BACKEND\"",
           "\"${common[@]}\" --out-dir \"$proof_root/session-1\"",
           "\"${common[@]}\" --out-dir \"$proof_root/session-2\"",
@@ -3379,8 +3379,7 @@
           "test \"$INPUT_HEAD_SHA\" = \"$current_head\"",
           "test \"$GITHUB_REF\" = \"refs/heads/$head_ref\"",
           "test \"$GITHUB_SHA\" = \"$INPUT_HEAD_SHA\"",
-          "case \"$base_ref\" in",
-          "dev/codestory-next|dev/codestory-0.18) ;;",
+          "test \"$base_ref\" = \"dev/codestory-next\"",
           "test \"$INPUT_HEAD_SHA\" = \"$dev_head\"",
           "test \"$GITHUB_REF\" = \"refs/heads/dev/codestory-next\"",
           "test \"$GITHUB_SHA\" = \"$dev_head\"",
@@ -3389,7 +3388,7 @@
           "test -n \"$INPUT_CALIBRATION_RUN_ID\"",
           "--ref $head_ref"
         ],
-        "reason": "The coordinator may run only for an exact trusted head: same-repository PR heads must match the event and input SHA, integration dispatches must resolve to the live dev/codestory-next head, calibration and qualification may target only dev/codestory-next or the isolated dev/codestory-0.18 lane, and qualification dispatches must name the calibration bundle and its producer run. Each fragment pins one conjunct of that resolution."
+        "reason": "The coordinator may run only for an exact trusted head: same-repository PR heads must match the event and input SHA, branch dispatches must resolve to the live dev/codestory-next head, and qualification dispatches must name the calibration bundle and its producer run. Each fragment pins one conjunct of that resolution."
       },
       "packaged_platform_pr_route_release_freeze": {
         "kind": "require",

@@ -120,6 +120,29 @@ jobs:
           ref: ${{ steps.release.outputs.tag }}
           fetch-depth: 0
 
+      # Product source remains pinned to the published tag. The proof harness comes from the
+      # workflow invocation commit so a post-publication harness repair can re-prove immutable
+      # release bytes without moving the tag or rebuilding the package.
+      - name: Stage caller-bound closeout harness
+        id: closeout-harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          harness_root="$RUNNER_TEMP/codestory-closeout-harness"
+          rm -rf "$RUNNER_TEMP/codestory-closeout-harness"
+          mkdir -p "$harness_root"
+          git archive "$GITHUB_SHA" \
+            .github/scripts/install-codestory-marketplace-proof.mjs \
+            .github/scripts/marketplace-delivery-identity.mjs \
+            .github/scripts/check-packaged-agent-proof.py \
+            .github/scripts/native_binary_contract.py \
+            .github/scripts/packaged_agent_proof \
+            | tar -x -C "$harness_root"
+          echo "helper=$harness_root/.github/scripts/install-codestory-marketplace-proof.mjs" >> "$GITHUB_OUTPUT"
+          echo "proof=$harness_root/.github/scripts/check-packaged-agent-proof.py" >> "$GITHUB_OUTPUT"
+          echo "Closeout harness commit: $GITHUB_SHA." >> "$GITHUB_STEP_SUMMARY"
+
       # The tag is a local name until GitHub agrees it is a published one. Every later step pins
       # the commit resolved here, so the fixture catalog, the Codex resolve, and the byte
       # comparison all name a release GitHub is actually serving -- never merely whatever tree
@@ -582,8 +605,13 @@ jobs:
           LOCAL_FIXTURE: ${{ steps.delivery.outputs.local_fixture }}
           INSTALLATION_SOURCE: ${{ steps.delivery.outputs.installer }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
+          CLOSEOUT_HELPER: ${{ steps.closeout-harness.outputs.helper }}
         run: |
           set -euo pipefail
+          case "$CLOSEOUT_HELPER" in
+            */install-codestory-marketplace-proof.mjs) ;;
+            *) echo "::error::Unexpected closeout helper path"; exit 1 ;;
+          esac
           install_root="$RUNNER_TEMP/codestory-installed-proof"
           codex_package_root="$RUNNER_TEMP/codex-cli-${CODEX_CLI_VERSION}"
           isolated_home="$install_root/isolated-home"
@@ -596,7 +624,7 @@ jobs:
             --no-audit \
             --no-fund \
             "@openai/codex@$CODEX_CLI_VERSION"
-          HOME="$isolated_home" node .github/scripts/install-codestory-marketplace-proof.mjs \
+          HOME="$isolated_home" node "$CLOSEOUT_HELPER" \
             --codex-package-root "$codex_package_root" \
             --codex-home "$install_root/codex-home" \
             --plugin-data "$install_root/codex-home/plugin-data" \
@@ -622,20 +650,26 @@ jobs:
           CATALOG_DELIVERY_STATE: ${{ steps.delivery.outputs.state }}
           DELIVERED_INSTALLER: ${{ steps.delivery.outputs.installer }}
           EXPECTED_BACKEND: ${{ matrix.backend }}
+          PROOF_HELPER: ${{ steps.closeout-harness.outputs.proof }}
         shell: bash
         run: |
           set -euo pipefail
+          case "$PROOF_HELPER" in
+            */check-packaged-agent-proof.py) ;;
+            *) echo "::error::Unexpected packaged proof helper path"; exit 1 ;;
+          esac
           source_sha="$(git rev-parse HEAD)"
           source_tree="$(git rev-parse 'HEAD^{tree}')"
           proof_root=target/post-publish-installed-proof
           rm -rf "$proof_root"
           mkdir -p "$proof_root"
           common=(
-            python .github/scripts/check-packaged-agent-proof.py
+            python "$PROOF_HELPER"
             --archive "$ASSET_ARCHIVE" \
             --checksum-file "$ASSET_CHECKSUM" \
             --expected-version "$RELEASE_VERSION" \
             --project "${{ github.workspace }}" \
+            --measurement-protocol "${{ github.workspace }}/crates/codestory-llama-sys/per-user-embedding-server-measurement-protocol.json" \
             --plugin-root "$INSTALLED_PLUGIN_ROOT" \
             --plugin-handoff \
             --engine-policy accelerated \

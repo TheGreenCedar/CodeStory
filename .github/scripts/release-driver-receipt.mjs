@@ -193,7 +193,13 @@ function validateGroupValue(group, value) {
     sha(row.commit, `${group} commit`);
     sha(row.tree, `${group} tree`);
   } else if (group === "pull-requests") {
-    positiveInteger(row.release_pr, "pull-requests release_pr");
+    if (row.release_pr == null || row.release_pr === 0) {
+      if (row.bind !== "next_head") {
+        fail("pull-requests without release_pr must bind next_head");
+      }
+    } else {
+      positiveInteger(row.release_pr, "pull-requests release_pr");
+    }
     if (
       !Array.isArray(row.integrated_support_prs)
       || !row.integrated_support_prs.every(number =>

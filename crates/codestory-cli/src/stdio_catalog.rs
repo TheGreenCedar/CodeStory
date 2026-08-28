@@ -119,7 +119,10 @@ impl ToolSpec {
             ("annotations".to_string(), self.safety.annotations_json()),
         ]);
         if let Some(output_schema) = self.output_schema {
-            tool.insert("outputSchema".to_string(), output_schema.to_json());
+            tool.insert(
+                "outputSchema".to_string(),
+                attach_stdio_retry_envelope(output_schema.to_json()),
+            );
         }
         Value::Object(tool)
     }
@@ -874,6 +877,44 @@ static STATUS_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
 );
 
+static STDIO_RETRY_NEXT_CALL_SCHEMA: SchemaObject = SchemaObject::object(
+    "Host-executable retry of the same tool after a preparing delay.",
+    &[
+        SchemaProperty::string("method", "JSON-RPC method."),
+        SchemaProperty::string("tool", "Tool to retry."),
+        SchemaProperty::object("arguments", "Original tool arguments."),
+        SchemaProperty::integer("after_ms", "Delay before retry."),
+    ],
+    &["method", "tool"],
+);
+
+static STDIO_RETRY_ENVELOPE_SCHEMA: SchemaObject = SchemaObject::object(
+    "Shared stdio retry or unavailable envelope returned instead of a tool DTO while managed activation is still updating.",
+    &[
+        SchemaProperty::string("code", "Typed stdio retry or unavailable code."),
+        SchemaProperty::string("message", "Human-readable retry or unavailable message."),
+        SchemaProperty::object("details", "Structured API error repair guidance.").nullable(),
+        SchemaProperty::string("cause_code", "Underlying activation or cache cause code."),
+        SchemaProperty::string("tool", "Tool that produced this envelope."),
+        SchemaProperty::string("state", "preparing, unavailable, or cancelled."),
+        SchemaProperty::string(
+            "retry_tool",
+            "Tool to retry when the envelope is preparing.",
+        )
+        .nullable(),
+        SchemaProperty::integer("retry_after_ms", "Retry delay while preparing.").nullable(),
+        SchemaProperty::object("operation", "Current managed preparation operation.").nullable(),
+        SchemaProperty::string("next_action", "Direct next action for the caller."),
+        SchemaProperty::array(
+            "recommended_next_calls",
+            "Host-executable retries of the intended tool.",
+            &STDIO_RETRY_NEXT_CALL_SCHEMA,
+        ),
+        SchemaProperty::string("diagnostics_uri", "Optional full diagnostic resource URI."),
+    ],
+    &["code", "message"],
+);
+
 static RESOURCE_LINK_SCHEMA: SchemaObject = SchemaObject::object(
     "Continuation resource link.",
     &[
@@ -1519,8 +1560,26 @@ static GRAPH_TOOL_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     ],
 );
 
+static SNIPPET_RANGE_SCHEMA: SchemaObject = SchemaObject::object(
+    "One requested source range from a batched snippet.paths call.",
+    &[
+        SchemaProperty::string("path", "Project-relative file path."),
+        SchemaProperty::integer("start_line", "1-based first line."),
+        SchemaProperty::integer("end_line", "1-based last line."),
+        SchemaProperty::string("snippet", "Source snippet text."),
+        SchemaProperty::boolean("snippet_truncated", "Whether this range hit a byte cap."),
+    ],
+    &[
+        "path",
+        "start_line",
+        "end_line",
+        "snippet",
+        "snippet_truncated",
+    ],
+);
+
 static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
-    "CodeStory snippet context DTO.",
+    "CodeStory snippet context DTO, or a batched paths result.",
     &[
         SchemaProperty::object("node", "Node details DTO."),
         SchemaProperty::string("path", "Project-relative file path."),
@@ -1542,7 +1601,19 @@ static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
             "truncation_guidance",
             "Follow-up guidance when the snippet hit its byte cap.",
         ),
+        SchemaProperty::array(
+            "ranges",
+            "Requested source ranges from a batched paths call.",
+            &SNIPPET_RANGE_SCHEMA,
+        ),
+        SchemaProperty::integer(
+            "max_total_bytes",
+            "Total byte cap for a batched paths call.",
+        ),
     ],
+    &[],
+)
+.with_any_of_required(&[
     &[
         "node",
         "path",
@@ -1552,7 +1623,8 @@ static SNIPPET_CONTEXT_SCHEMA: SchemaObject = SchemaObject::object(
         "requested_context",
         "snippet_truncated",
     ],
-);
+    &["ranges", "max_total_bytes"],
+]);
 
 static DEFINITION_OUTPUT_SCHEMA: SchemaObject = SchemaObject::object(
     "CodeStory definition tool output.",
@@ -2504,6 +2576,56 @@ pub(crate) fn tool_input_schema(name: &str) -> Option<&'static Value> {
         .get(name)
 }
 
+fn attach_stdio_retry_envelope(mut schema: Value) -> Value {
+    let retry = STDIO_RETRY_ENVELOPE_SCHEMA.to_json();
+    let retry_properties = retry
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("retry envelope properties")
+        .clone();
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("output schema properties");
+    for (name, property) in retry_properties {
+        properties.entry(name).or_insert(property);
+    }
+    let error_branch = json!({ "required": ["code", "message"] });
+    let has_error_branch = schema
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|branch| {
+            let required = branch
+                .get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            required.contains(&"code") && required.contains(&"message")
+        });
+    if has_error_branch {
+        return schema;
+    }
+    match schema.get_mut("anyOf") {
+        Some(Value::Array(any_of)) => any_of.push(error_branch),
+        _ => {
+            let required = schema.get("required").cloned().unwrap_or_else(|| json!([]));
+            let mut branches = Vec::new();
+            if required.as_array().is_some_and(|items| !items.is_empty()) {
+                branches.push(json!({ "required": required }));
+            }
+            branches.push(error_branch);
+            let object = schema.as_object_mut().expect("output schema object");
+            object.insert("anyOf".to_string(), Value::Array(branches));
+            object.insert("required".to_string(), json!([]));
+        }
+    }
+    schema
+}
+
 /// Build the `tools/list` response.
 #[allow(dead_code)]
 pub(crate) fn tools_list_json() -> Value {
@@ -2738,6 +2860,203 @@ mod tests {
             undeclared.is_empty(),
             "the packet emits {undeclared:?}, which its published output schema \
              forbids: declared = {declared:?}"
+        );
+    }
+
+    const STDIO_RETRY_ENVELOPE_FIELDS: &[&str] = &[
+        "code",
+        "message",
+        "details",
+        "cause_code",
+        "tool",
+        "state",
+        "retry_tool",
+        "retry_after_ms",
+        "operation",
+        "next_action",
+        "recommended_next_calls",
+        "diagnostics_uri",
+    ];
+
+    fn tool_output_schema(name: &str) -> Value {
+        tools_list_json()["result"]["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} tool"))["outputSchema"]
+            .clone()
+    }
+
+    fn schema_required_fields(schema: &Value) -> Vec<&str> {
+        schema
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    }
+
+    fn undeclared_object_keys(schema: &Value, data: &Value) -> Vec<String> {
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        if schema.get("additionalProperties") != Some(&json!(false)) {
+            return Vec::new();
+        }
+        data.as_object()
+            .expect("object payload")
+            .keys()
+            .filter(|key| !properties.contains_key(*key))
+            .cloned()
+            .collect()
+    }
+
+    fn satisfies_required_any_of(schema: &Value, data: &Value) -> bool {
+        let Some(object) = data.as_object() else {
+            return false;
+        };
+        if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
+            return any_of.iter().any(|branch| {
+                schema_required_fields(branch)
+                    .iter()
+                    .all(|field| object.contains_key(*field))
+            });
+        }
+        schema_required_fields(schema)
+            .iter()
+            .all(|field| object.contains_key(*field))
+    }
+
+    fn preparing_envelope(tool: &str) -> Value {
+        json!({
+            "code": "codestory_preparing",
+            "message": "project activation is still Updating at Publication; retry after 250ms",
+            "cause_code": "activation_preparing",
+            "details": null,
+            "tool": tool,
+            "state": "preparing",
+            "retry_tool": tool,
+            "retry_after_ms": 250,
+            "operation": {
+                "state": "updating",
+                "stage": "publication",
+                "progress": 75
+            },
+            "next_action": "retry_intended_tool",
+            "recommended_next_calls": [{
+                "method": "tools/call",
+                "tool": tool,
+                "arguments": {"project": "/repo"},
+                "after_ms": 250
+            }],
+            "diagnostics_uri": "codestory://status?project=%2Frepo"
+        })
+    }
+
+    #[test]
+    fn every_tool_output_schema_declares_the_stdio_retry_envelope() {
+        let catalog = tools_list_json();
+        for tool in catalog["result"]["tools"].as_array().expect("tools") {
+            let name = tool["name"].as_str().expect("tool name");
+            let schema = &tool["outputSchema"];
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} outputSchema properties"));
+            for field in STDIO_RETRY_ENVELOPE_FIELDS {
+                assert!(
+                    properties.contains_key(*field),
+                    "{name} outputSchema must declare retry envelope field {field}"
+                );
+            }
+            let has_error_branch = schema["anyOf"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|branch| {
+                    let required = schema_required_fields(branch);
+                    required.contains(&"code") && required.contains(&"message")
+                });
+            assert!(
+                has_error_branch,
+                "{name} outputSchema must anyOf a code/message retry branch so Cursor can accept preparing envelopes"
+            );
+            let envelope = preparing_envelope(name);
+            let undeclared = undeclared_object_keys(schema, &envelope);
+            assert!(
+                undeclared.is_empty(),
+                "{name} preparing envelope emits undeclared {undeclared:?}"
+            );
+            assert!(
+                satisfies_required_any_of(schema, &envelope),
+                "{name} preparing envelope must satisfy an anyOf required branch: {schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn snippet_output_schema_accepts_a_paths_ranges_payload() {
+        let schema = tool_output_schema("snippet");
+        let payload = json!({
+            "max_total_bytes": 65_536,
+            "ranges": [{
+                "path": "src/lib.rs",
+                "start_line": 10,
+                "end_line": 12,
+                "snippet": "fn run() {}",
+                "snippet_truncated": false
+            }]
+        });
+        let undeclared = undeclared_object_keys(&schema, &payload);
+        assert!(
+            undeclared.is_empty(),
+            "snippet ranges payload emits undeclared {undeclared:?}"
+        );
+        assert!(
+            satisfies_required_any_of(&schema, &payload),
+            "snippet ranges payload must satisfy an anyOf required branch: {schema}"
+        );
+    }
+
+    #[test]
+    fn indexed_files_dto_emits_empty_policy_exclusions() {
+        let files = codestory_contracts::api::IndexedFilesDto {
+            project_root: "/repo".to_string(),
+            usable: true,
+            summary: codestory_contracts::api::IndexedFilesSummaryDto {
+                file_count: 0,
+                indexed_file_count: 0,
+                filtered_file_count: 0,
+                visible_file_count: 0,
+                incomplete_file_count: 0,
+                error_file_count: 0,
+                policy_exclusion_count: 0,
+                incomplete_reason_counts: Vec::new(),
+                truncated: false,
+                language_counts: Vec::new(),
+                framework_route_coverage: Vec::new(),
+                coverage_notes: Vec::new(),
+            },
+            coverage_gaps: Vec::new(),
+            policy_exclusions: Vec::new(),
+            files: Vec::new(),
+        };
+        let payload = serde_json::to_value(&files).expect("serialize indexed files");
+        assert_eq!(
+            payload.get("policy_exclusions"),
+            Some(&json!([])),
+            "Cursor's files anyOf requires policy_exclusions even when empty: {payload}"
+        );
+        let schema = tool_output_schema("files");
+        let undeclared = undeclared_object_keys(&schema, &payload);
+        assert!(
+            undeclared.is_empty(),
+            "files success payload emits undeclared {undeclared:?}"
+        );
+        assert!(
+            satisfies_required_any_of(&schema, &payload),
+            "files success payload must satisfy an anyOf required branch: {schema}"
         );
     }
 }
