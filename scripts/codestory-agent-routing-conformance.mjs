@@ -674,15 +674,41 @@ function cursorText(event, role) {
   return text;
 }
 
-function unwrapCursorToolCall(event) {
+function unwrapCursorToolCall(event, callId) {
   if (!plainObject(event.tool_call)) fail("Cursor tool_call event is missing tool_call");
   const keys = Object.keys(event.tool_call);
-  if (keys.length !== 1 || !/^[A-Za-z][A-Za-z0-9]*ToolCall$/u.test(keys[0])) {
+  const payloadKeys = keys.filter((key) => /^[A-Za-z][A-Za-z0-9]*ToolCall$/u.test(key));
+  if (payloadKeys.length !== 1) {
     fail("Cursor tool_call must contain exactly one *ToolCall payload");
   }
-  const wrapper = event.tool_call[keys[0]];
+  const key = payloadKeys[0];
+  const wrapper = event.tool_call[key];
   if (!plainObject(wrapper)) fail("Cursor tool_call payload is invalid");
-  return { key: keys[0], wrapper };
+  const metadataKeys = keys.filter((candidate) => candidate !== key).sort();
+  if (metadataKeys.length === 0) return { key, wrapper, envelope: null };
+  const expectedKeys = event.subtype === "completed"
+    ? ["completedAtMs", "hookAdditionalContexts", "startedAtMs", "toolCallId"]
+    : ["hookAdditionalContexts", "startedAtMs", "toolCallId"];
+  const metadata = event.tool_call;
+  const validTimestamp = (value) => typeof value === "string" && /^[0-9]+$/u.test(value);
+  if (!equalJson(metadataKeys, expectedKeys)
+      || !Array.isArray(metadata.hookAdditionalContexts) || metadata.hookAdditionalContexts.length !== 0
+      || metadata.toolCallId !== callId || !validTimestamp(metadata.startedAtMs)
+      || !nonemptyString(event.model_call_id)
+      || (event.subtype === "completed"
+        && (!validTimestamp(metadata.completedAtMs)
+          || BigInt(metadata.completedAtMs) < BigInt(metadata.startedAtMs)))) {
+    fail("Cursor tool_call envelope is invalid");
+  }
+  return {
+    key,
+    wrapper,
+    envelope: {
+      toolCallId: metadata.toolCallId,
+      startedAtMs: metadata.startedAtMs,
+      modelCallId: event.model_call_id,
+    },
+  };
 }
 
 function cursorStartedAction(callId, key, args) {
@@ -768,16 +794,17 @@ function parseCursor(events) {
     }
     if (event.type === "tool_call") {
       const callId = String(event.call_id ?? "");
-      const { key, wrapper } = unwrapCursorToolCall(event);
+      const { key, wrapper, envelope } = unwrapCursorToolCall(event, callId);
       if (event.subtype === "started") {
         if (Object.hasOwn(wrapper, "result")) fail("Cursor started tool call must not contain a result");
-        beginAction(state, callId, cursorStartedAction(callId, key, wrapper.args));
+        beginAction(state, callId, { ...cursorStartedAction(callId, key, wrapper.args), cursor_envelope: envelope });
         return;
       }
       if (event.subtype !== "completed") fail(`unsupported Cursor tool_call subtype ${JSON.stringify(event.subtype)}`);
       const action = state.open.get(callId);
       if (!action) fail(`unmatched tool call result ${JSON.stringify(callId)}`);
       if (action.cursor_key !== key
+          || !equalJson(action.cursor_envelope, envelope)
           || (wrapper.args != null && !equalJson(action.cursor_args ?? action.args, wrapper.args))) {
         fail(`Cursor completed tool call ${JSON.stringify(callId)} does not match its start`);
       }

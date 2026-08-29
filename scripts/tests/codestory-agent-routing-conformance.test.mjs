@@ -1424,6 +1424,15 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
     { type: "thinking", subtype: "delta", text: "Reading the named file", session_id: "captured-1", timestamp_ms: 1 },
     { type: "thinking", subtype: "completed", session_id: "captured-1", timestamp_ms: 2 },
   );
+  for (const event of composer.filter((candidate) => candidate.type === "tool_call")) {
+    Object.assign(event.tool_call, {
+      hookAdditionalContexts: [],
+      toolCallId: event.call_id,
+      startedAtMs: "1000",
+      ...(event.subtype === "completed" ? { completedAtMs: "1100" } : {}),
+    });
+    event.model_call_id = "composer-tool-call";
+  }
   const firstAssistant = composer.findIndex((event) => event.type === "assistant");
   const finalText = composer.at(-1).result;
   composer.splice(firstAssistant, 2,
@@ -1432,6 +1441,20 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
     { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: finalText }] }, session_id: "captured-1", model_call_id: "composer-call", timestamp_ms: 5 },
   );
   assert.equal(parseInstalledTranscript("cursor", capturedJsonl(composer)).final, finalText);
+
+  for (const mutate of [
+    (event) => { event.tool_call.opaque = true; },
+    (event) => { event.tool_call.hookAdditionalContexts = [{ hidden: "context" }]; },
+    (event) => { event.tool_call.toolCallId = "different"; },
+    (event) => { event.tool_call.completedAtMs = "999"; },
+  ]) {
+    const invalidEnvelope = clone(composer);
+    mutate(invalidEnvelope.find((event) => event.type === "tool_call" && event.subtype === "completed"));
+    assert.throws(
+      () => parseInstalledTranscript("cursor", capturedJsonl(invalidEnvelope)),
+      /Cursor tool_call envelope/u,
+    );
+  }
 
   const multiTurnComposer = clone(composer);
   const toolStart = multiTurnComposer.findIndex((event) => event.type === "tool_call" && event.subtype === "started");
@@ -1451,7 +1474,7 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
   );
 
   const mismatchedSnapshot = clone(composer);
-  mismatchedSnapshot.find((event) => event.model_call_id).message.content[0].text = "different";
+  mismatchedSnapshot.find((event) => event.type === "assistant" && event.model_call_id).message.content[0].text = "different";
   assert.throws(
     () => parseInstalledTranscript("cursor", capturedJsonl(mismatchedSnapshot)),
     /assistant snapshot does not match streamed deltas/u,
