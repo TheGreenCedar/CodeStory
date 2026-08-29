@@ -1918,8 +1918,16 @@ test("packet continuation and selected-context correlation are exact", () => {
 
   const unresolvedNamedSourceFallback = baseRun("packet_named_fallback_to_source");
   unresolvedNamedSourceFallback.final.outcome = "unknown";
+  unresolvedNamedSourceFallback.final.evidence_ids = ["source:src/fallback.rs"];
   unresolvedNamedSourceFallback.final.material_omissions = ["How the routing catalog works remains unresolved."];
   assert.equal(validate("codex", unresolvedNamedSourceFallback).status, "pass");
+
+  const missingNamedSourceEvidence = baseRun("packet_named_fallback_to_source");
+  missingNamedSourceEvidence.final.evidence_ids = ["evidence-1"];
+  assert.throws(
+    () => validate("codex", missingNamedSourceEvidence),
+    /omit successful source evidence/u,
+  );
 
   const failedContinuedSourceFallback = baseRun("packet_single_continuation");
   failedContinuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs", failed: true });

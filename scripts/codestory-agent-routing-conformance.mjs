@@ -2351,9 +2351,20 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
   }
   const proof = actions.some((action) => action.kind === "prove_call_path");
   const reads = actions.some((action) => action.kind === "source_read" && action.completed && !action.error);
-  if (proof || reads) {
+  if (proof) {
     if (!equalJson(claim.evidence_ids, expected.evidence_ids)) {
       fail(`${scenarioContract.id} final claim evidence_ids does not match result-bound evidence`);
+    }
+  } else if (reads) {
+    const allowedEvidenceIds = new Set(expected.evidence_ids);
+    const sourceEvidenceIds = actions
+      .filter((action) => action.kind === "source_read" && action.completed && !action.error)
+      .map(({ path }) => `source:${path}`);
+    if (claim.evidence_ids.some((evidenceId) => !allowedEvidenceIds.has(evidenceId))) {
+      fail(`${scenarioContract.id} final claim evidence_ids does not match result-bound evidence`);
+    }
+    if (sourceEvidenceIds.some((evidenceId) => !claim.evidence_ids.includes(evidenceId))) {
+      fail(`${scenarioContract.id} final claim evidence_ids omit successful source evidence`);
     }
   } else {
     const allowedEvidenceIds = new Set(expected.evidence_ids);
