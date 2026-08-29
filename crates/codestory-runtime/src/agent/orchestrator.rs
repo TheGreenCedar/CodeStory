@@ -2391,9 +2391,9 @@ fn order_packet_sections(sections: &mut [AgentResponseSectionDto]) {
 const CARRIER_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
 const CARRIER_SOURCE_MAX_SNIPPET_BYTES: usize = 1_536;
 const CARRIER_SOURCE_FOCUSED_SNIPPET_BYTES: usize = CARRIER_SOURCE_MAX_SNIPPET_BYTES / 2;
-const CARRIER_SOURCE_FOCUS_CONTEXT_LINES: usize = 4;
+const CARRIER_SOURCE_FOCUS_CONTEXT_LINES: usize = 5;
 const CARRIER_SOURCE_FILE_FOCUS_CONTEXT_LINES: usize = 17;
-const CARRIER_SOURCE_MAX_FOCUSED_WINDOWS: usize = 2;
+const CARRIER_SOURCE_MAX_FOCUSED_WINDOWS: usize = 3;
 const CARRIER_SOURCE_MAX_FOCUS_FILE_BYTES: u64 = 512 * 1_024;
 const CARRIER_SOURCE_DECLARATION_FALLBACK_LINES: u32 = 24;
 /// R4 anchored windows span the declaration line plus this many lines below
@@ -3116,6 +3116,20 @@ fn append_packet_carrier_source_sections(
             let focused =
                 if citation.kind == NodeKind::FILE && citation_is_lexical_source_range(&citation) {
                     focused_file_source_ranges(controller, &file_focus_text, path)
+                } else if behavioral_source {
+                    controller
+                        .snippet_function_body_context(citation.node_id.clone(), 0)
+                        .ok()
+                        .map(|snippet| {
+                            focused_function_source_ranges(
+                                controller,
+                                &file_focus_text,
+                                &snippet.path,
+                                snippet.line,
+                                snippet.node.end_line,
+                            )
+                        })
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -3170,7 +3184,7 @@ fn append_packet_carrier_source_sections(
                     {
                         let focused = focused_function_source_ranges(
                             controller,
-                            question,
+                            &file_focus_text,
                             &snippet.path,
                             snippet.line,
                             snippet.node.end_line,
@@ -3714,8 +3728,8 @@ fn source_receipt_line_range(markdown: &str, fallback_start: u32) -> (u32, u32) 
     )
 }
 
-/// A long function is rarely best represented by its prologue. Select at most two bounded,
-/// non-overlapping windows whose source words match separate action clauses from the question.
+/// A long function is rarely best represented by its prologue. Select at most three bounded,
+/// distinct windows whose source words match separate action clauses from the question.
 /// The ranges remain exact source receipts for the already selected symbol; this changes only
 /// which verified bytes spend the packet's fixed source budget.
 fn focused_function_source_ranges(
@@ -3810,10 +3824,7 @@ fn focused_function_source_lines(
             continue;
         };
         let focus_line = (center + 1) as u32;
-        let overlaps_existing = selected.iter().any(|selected_line: &u32| {
-            selected_line.abs_diff(focus_line) <= (CARRIER_SOURCE_FOCUS_CONTEXT_LINES * 2) as u32
-        });
-        if !overlaps_existing {
+        if !selected.contains(&focus_line) {
             selected.push(focus_line);
         }
         if selected.len() >= CARRIER_SOURCE_MAX_FOCUSED_WINDOWS {
@@ -3825,12 +3836,48 @@ fn focused_function_source_lines(
 }
 
 fn source_focus_clauses(question: &str) -> Vec<Vec<String>> {
-    question
-        .split([',', ';', '.', '?', '!', '\n', '\r'])
-        .flat_map(|clause| clause.split(" and "))
-        .map(source_focus_terms)
-        .filter(|terms| terms.len() >= 2)
-        .collect()
+    let mut clauses: Vec<Vec<String>> = Vec::new();
+    let mut active_list: Option<Vec<String>> = None;
+    for clause in question.split([',', ';', '.', '?', '!', '\n', '\r']) {
+        let clause = clause.trim();
+        let continuation = clause.strip_prefix("and ").unwrap_or(clause);
+        let combined_terms = source_focus_terms(continuation);
+        if (combined_terms.len() <= 1
+            || (continuation.len() != clause.len() && combined_terms.len() <= 2))
+            && let Some(previous) = clauses.last_mut()
+        {
+            let list = active_list
+                .get_or_insert_with(|| previous.last().cloned().into_iter().collect::<Vec<_>>());
+            for term in combined_terms {
+                if !previous.contains(&term) {
+                    previous.push(term.clone());
+                }
+                if !list.contains(&term) {
+                    list.push(term);
+                }
+            }
+            continue;
+        }
+        if let Some(list) = active_list.take()
+            && list.len() >= 2
+            && !clauses.contains(&list)
+        {
+            clauses.push(list);
+        }
+        for action in continuation.split(" and ") {
+            let terms = source_focus_terms(action);
+            if terms.len() >= 2 && !clauses.contains(&terms) {
+                clauses.push(terms);
+            }
+        }
+    }
+    if let Some(list) = active_list
+        && list.len() >= 2
+        && !clauses.contains(&list)
+    {
+        clauses.push(list);
+    }
+    clauses
 }
 
 fn source_focus_terms(value: &str) -> Vec<String> {
@@ -3885,9 +3932,16 @@ fn source_focus_stem(term: &str) -> &str {
 }
 
 fn source_focus_terms_match(left: &str, right: &str) -> bool {
-    left == right
-        || (left.len().min(right.len()) >= 4
-            && (left.starts_with(right) || right.starts_with(left)))
+    if left == right {
+        return true;
+    }
+    fn role_noun_base(term: &str) -> Option<&str> {
+        term.strip_suffix("er").filter(|base| base.len() >= 4)
+    }
+    if role_noun_base(left) == Some(right) || role_noun_base(right) == Some(left) {
+        return false;
+    }
+    left.len().min(right.len()) >= 4 && (left.starts_with(right) || right.starts_with(left))
 }
 
 fn packet_evidence_ledger_markdown(
@@ -8214,6 +8268,55 @@ mod tests {
                 "Explain how the service enters its event loop.",
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn source_focus_does_not_treat_control_flow_as_a_component_owner() {
+        assert!(!source_focus_terms_match("matcher", "match"));
+        assert!(!source_focus_terms_match("searcher", "search"));
+        assert!(!source_focus_terms_match("printer", "print"));
+        assert!(source_focus_terms_match("matcher", "matcher"));
+    }
+
+    #[test]
+    fn long_function_focus_keeps_component_list_and_parallel_dispatch_together() {
+        let source = [
+            "fn search_parallel(args: &HiArgs) {",
+            "    let started_at = Instant::now();",
+            "    let buffer = args.buffer_writer();",
+            "    let stats = args.stats();",
+            "    let matched = AtomicBool::new(false);",
+            "    let searched = AtomicBool::new(false);",
+            "    let haystack_builder = args.haystack_builder();",
+            "    let mut worker = args.search_worker(",
+            "        args.matcher()?,",
+            "        args.searcher()?,",
+            "        args.printer(),",
+            "    )?;",
+            "    args.walk_builder()?.build_parallel().run(|| {",
+            "        let haystack = haystack_builder.build_from_result(result);",
+            "        worker.search(&haystack);",
+            "    });",
+            "}",
+        ];
+
+        let focus = focused_function_source_lines(
+            &source,
+            1,
+            source.len() as u32,
+            "Explain how the program walks candidate files and executes a search over each haystack through matcher, searcher, and printer components.\nparallel search walk builder",
+        );
+
+        let covers = |line: u32| {
+            focus.iter().any(|focus_line| {
+                focus_line.saturating_sub(CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32) <= line
+                    && focus_line + CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32 >= line
+            })
+        };
+        assert!(
+            covers(8) && covers(13),
+            "the focused ranges must keep both component construction and parallel dispatch: {focus:?}",
         );
     }
 

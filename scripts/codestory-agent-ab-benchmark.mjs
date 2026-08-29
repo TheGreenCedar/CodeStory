@@ -3827,7 +3827,7 @@ function claimTokens(value, { expandQualified = false } = {}) {
   return normalizeSearchText(value)
     .split(/[^a-z0-9_:.]+/)
     .map((token) => token.trim().replace(/^[.:]+|[.:]+$/g, ""))
-    .flatMap((token) => expandQualified ? [token, ...token.split(/(?:::|[.#])/g)] : [token])
+    .flatMap((token) => expandQualified ? [token, ...token.split(/(?:::|[.#_])/g)] : [token])
     .filter((token) => token.length >= 3 && !CLAIM_STOPWORDS.has(token));
 }
 
@@ -3850,6 +3850,10 @@ function positiveClaimTokenVariants(token) {
   }
   if (token.length >= 4 && token.endsWith("s")) {
     variants.add(token.slice(0, -1));
+  }
+  if (token.length >= 6 && token.endsWith("er")) {
+    const roleBase = token.slice(0, -2);
+    if (roleBase.length >= 4) variants.add(roleBase);
   }
   return variants;
 }
@@ -4564,6 +4568,9 @@ function preludePublicFields(prelude) {
     packet_extra_probe_strategy: prelude.packet_extra_probe_strategy ?? null,
     packet_drill_continuation: prelude.packet_drill_continuation === true,
     packet_contract_blockers: prelude.packet_contract_blockers ?? [],
+    ...(prelude.packet_command_failure == null
+      ? {}
+      : { packet_command_failure: prelude.packet_command_failure }),
   };
 }
 
@@ -5712,6 +5719,36 @@ function packetPreludeContractBlockers(packet, stdout, options = {}) {
   return blockers;
 }
 
+function packetCommandFailureEnvelope(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.schema_version !== 1 ||
+    !value.error ||
+    typeof value.error !== "object" ||
+    Array.isArray(value.error) ||
+    !nonemptyString(value.error.code) ||
+    !nonemptyString(value.error.message)
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function packetCommandFailureReason(envelope) {
+  if (!envelope) {
+    return null;
+  }
+  const failedLayer = envelope.error?.details?.failed_layer;
+  const context = envelope.context;
+  return [
+    `${envelope.error.code}: ${envelope.error.message}`,
+    nonemptyString(failedLayer) ? `failed_layer=${failedLayer}` : null,
+    context == null ? null : `context=${JSON.stringify(context)}`,
+  ].filter(Boolean).join("; ");
+}
+
 async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli, env) {
   const args = packetCommandArgs(repoConfig, run.task, opts);
   const extraProbes = packetCommandExtraProbes(run.task, opts);
@@ -5730,15 +5767,18 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   await writeFile(stdoutPath, result.stdout, "utf8");
   await writeFile(stderrPath, result.stderr, "utf8");
 
-  let packet = null;
+  let parsedOutput = null;
   let parseError = null;
-  if (result.status === "pass") {
+  if (result.stdout.trim()) {
     try {
-      packet = JSON.parse(result.stdout);
+      parsedOutput = JSON.parse(result.stdout);
     } catch (error) {
       parseError = error.message;
     }
   }
+  let commandFailure = packetCommandFailureEnvelope(parsedOutput);
+  let commandFailureReason = packetCommandFailureReason(commandFailure);
+  let packet = commandFailure ? null : parsedOutput;
 
   let activeStdoutPath = stdoutPath;
   let activeStderrPath = stderrPath;
@@ -5776,6 +5816,8 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
             activeStderrPath = drillStderrPath;
             drillContinuation = true;
             parseError = null;
+            commandFailure = null;
+            commandFailureReason = null;
           }
         } catch (error) {
           parseError = error.message;
@@ -5788,11 +5830,13 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   const manifestQuality = packetManifestQualitySummary(packet, run.task);
   const contractBlockers = parseError
     ? [`packet JSON parse failed: ${parseError}`]
-    : packetPreludeContractBlockers(packet, result.stdout, {
-        requireSupported: opts.publishable,
-        requireManagedRuntime: opts.publishable,
-        expectedQuestion: run.task?.prompt ?? repoConfig.prompt,
-      });
+    : commandFailureReason
+      ? [commandFailureReason]
+      : packetPreludeContractBlockers(packet, result.stdout, {
+          requireSupported: opts.publishable,
+          requireManagedRuntime: opts.publishable,
+          expectedQuestion: run.task?.prompt ?? repoConfig.prompt,
+        });
   const dispositionTelemetry = packetDispositionTelemetry(packet, manifestQuality);
   const evidenceAvailabilityTelemetry = packetV3EvidenceAvailabilityTelemetry(
     packet,
@@ -5803,11 +5847,13 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   const publicPrelude = preludePublicFields({
     command,
     args: activeArgs,
-    status: result.status === "pass" && !parseError && !contractBlockers.length ? "pass" : "fail",
+    status: result.status === "pass" && !parseError && !commandFailure && !contractBlockers.length
+      ? "pass"
+      : "fail",
     process_status: result.status,
     exit_code: result.exitCode,
     signal: result.signal,
-    error: result.error ?? parseError ?? contractBlockers[0] ?? null,
+    error: result.error ?? parseError ?? commandFailureReason ?? contractBlockers[0] ?? null,
     wall_ms: wallMs,
     stdout_path: activeStdoutPath,
     stderr_path: activeStderrPath,
@@ -5840,6 +5886,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
     packet_drill_continuation: drillContinuation,
     packet_contract_blockers: contractBlockers,
+    packet_command_failure: commandFailure,
   });
   return {
     public: publicPrelude,
@@ -13596,6 +13643,7 @@ export {
   packetCompositionFileScore,
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
+  preludeAllowsAgentRun,
   planAgentRuns,
   exactCandidateAcceptance,
   exactCandidateCostRates,
@@ -13622,6 +13670,7 @@ export {
   taskSnapshotForResult,
   taskShardIndex,
   tasksForShard,
+  runCodeStoryPacketPrelude,
   runAgentBenchmarkPipeline,
   runPlannedAgentRuns,
   runProcess,

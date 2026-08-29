@@ -1807,6 +1807,87 @@ pub fn flow_belongs_to_search(citation: &AgentCitationDto) -> bool {
     )
 }
 
+const SEARCH_FLOW_OWNER_TOKENS: &[&str] = &[
+    "arg", "args", "argv", "flag", "flags", "grep", "query", "queries", "search", "searcher",
+];
+const SEARCH_ARGUMENT_OWNER_TOKENS: &[&str] =
+    &["arg", "args", "argv", "flag", "flags", "option", "options"];
+const SEARCH_ARGUMENT_ACTION_TOKENS: &[&str] = &["parse", "plan"];
+const SEARCH_CANDIDATE_COMPONENT_TOKENS: &[&str] = &["candidate", "walk", "walker"];
+const SEARCH_HAYSTACK_COMPONENT_TOKENS: &[&str] = &["haystack"];
+const SEARCH_MATCHER_COMPONENT_TOKENS: &[&str] = &["matcher"];
+const SEARCH_SEARCHER_COMPONENT_TOKENS: &[&str] = &["searcher"];
+const SEARCH_PRINTER_COMPONENT_TOKENS: &[&str] = &["printer"];
+const SEARCH_WORKER_CONSTRUCTION_TOKENS: &[&str] = &["search", "worker"];
+
+fn callable_owns_search_flow_component(
+    citation: &AgentCitationDto,
+    component_tokens: &[&str],
+) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let terminal_tokens = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    if !has_token(&terminal_tokens, component_tokens) {
+        return false;
+    }
+    let all_tokens = name_tokens(citation);
+    let owner_token_count = all_tokens.len().saturating_sub(terminal_tokens.len());
+    has_token(&all_tokens[..owner_token_count], SEARCH_FLOW_OWNER_TOKENS)
+}
+
+pub fn citation_owns_search_argument_planning(citation: &AgentCitationDto) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let terminal_tokens = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    if !has_token(&terminal_tokens, SEARCH_ARGUMENT_ACTION_TOKENS) {
+        return false;
+    }
+    let all_tokens = name_tokens(citation);
+    let owner_token_count = all_tokens.len().saturating_sub(terminal_tokens.len());
+    has_token(
+        &all_tokens[..owner_token_count],
+        SEARCH_ARGUMENT_OWNER_TOKENS,
+    )
+}
+
+pub fn citation_owns_search_candidate_traversal(citation: &AgentCitationDto) -> bool {
+    callable_owns_search_flow_component(citation, SEARCH_CANDIDATE_COMPONENT_TOKENS)
+}
+
+pub fn citation_owns_search_haystack_construction(citation: &AgentCitationDto) -> bool {
+    callable_owns_search_flow_component(citation, SEARCH_HAYSTACK_COMPONENT_TOKENS)
+}
+
+pub fn citation_owns_search_matcher_setup(citation: &AgentCitationDto) -> bool {
+    callable_owns_search_flow_component(citation, SEARCH_MATCHER_COMPONENT_TOKENS)
+}
+
+pub fn citation_owns_search_searcher_setup(citation: &AgentCitationDto) -> bool {
+    callable_owns_search_flow_component(citation, SEARCH_SEARCHER_COMPONENT_TOKENS)
+}
+
+pub fn citation_owns_search_printer_setup(citation: &AgentCitationDto) -> bool {
+    callable_owns_search_flow_component(citation, SEARCH_PRINTER_COMPONENT_TOKENS)
+}
+
+pub fn citation_owns_search_worker_construction(citation: &AgentCitationDto) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let terminal_tokens = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    if !SEARCH_WORKER_CONSTRUCTION_TOKENS
+        .iter()
+        .all(|token| terminal_tokens.iter().any(|candidate| candidate == token))
+    {
+        return false;
+    }
+    let all_tokens = name_tokens(citation);
+    let owner_token_count = all_tokens.len().saturating_sub(terminal_tokens.len());
+    has_token(&all_tokens[..owner_token_count], SEARCH_FLOW_OWNER_TOKENS)
+}
+
 // ---------------------------------------------------------------------------
 // Search evidence handoff
 //
@@ -1894,6 +1975,15 @@ pub(crate) fn carrier_taxonomy_vocabulary() -> Vec<String> {
         .chain(INDEXING_DIRECT_OBJECT_TOKENS)
         .chain(SHELL_FUNCTION_SUBJECT_TOKENS)
         .chain(SHELL_FUNCTION_ACTION_TOKENS)
+        .chain(SEARCH_FLOW_OWNER_TOKENS)
+        .chain(SEARCH_ARGUMENT_OWNER_TOKENS)
+        .chain(SEARCH_ARGUMENT_ACTION_TOKENS)
+        .chain(SEARCH_CANDIDATE_COMPONENT_TOKENS)
+        .chain(SEARCH_HAYSTACK_COMPONENT_TOKENS)
+        .chain(SEARCH_MATCHER_COMPONENT_TOKENS)
+        .chain(SEARCH_SEARCHER_COMPONENT_TOKENS)
+        .chain(SEARCH_PRINTER_COMPONENT_TOKENS)
+        .chain(SEARCH_WORKER_CONSTRUCTION_TOKENS)
         .chain(SEARCH_EVIDENCE_CONTEXT_TOKENS)
         .chain(SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS)
         .chain(SEARCH_EVIDENCE_OUTPUT_ACTIONS)

@@ -15,21 +15,24 @@ use crate::packet_evidence_carriers::{
     citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
     citation_owns_html_app_shell, citation_owns_log_handler_processing,
     citation_owns_log_record_creation, citation_owns_mapper_configuration,
-    citation_owns_mapper_execution, citation_owns_search_evidence_classification,
-    citation_owns_search_evidence_output, citation_owns_server_request_dispatch,
-    citation_owns_server_request_entrypoint, citation_owns_server_response_terminal,
-    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
-    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
-    citation_owns_site_terminal, citation_owns_string_blank_predicate,
-    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
-    client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
-    client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
-    flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
-    flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
-    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
-    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
-    server_request_dispatch_call_target, server_request_entrypoint_call_target,
-    server_response_terminal_call_target,
+    citation_owns_mapper_execution, citation_owns_search_argument_planning,
+    citation_owns_search_candidate_traversal, citation_owns_search_evidence_classification,
+    citation_owns_search_evidence_output, citation_owns_search_haystack_construction,
+    citation_owns_search_matcher_setup, citation_owns_search_printer_setup,
+    citation_owns_search_searcher_setup, citation_owns_search_worker_construction,
+    citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
+    citation_owns_server_response_terminal, citation_owns_shell_completion,
+    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
+    citation_owns_site_lifecycle, citation_owns_site_terminal,
+    citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
+    citation_owns_string_region_handoff, client_public_facade_successor_call_target,
+    client_request_dispatch_predecessor_call_source, client_request_dispatch_successor_call_target,
+    client_request_entrypoint_call_target, flow_belongs_to_client_request,
+    flow_belongs_to_command_dispatch, flow_belongs_to_command_server, flow_belongs_to_event_loop,
+    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
+    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
+    flow_belongs_to_url_session, server_request_dispatch_call_target,
+    server_request_entrypoint_call_target, server_response_terminal_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -532,7 +535,7 @@ pub fn packet_flow_requirements_for_terms(
         push_string_predicate_requirements_for_terms(terms, &mut requirements);
     }
     if packet_terms_indicate_search_execution_flow(terms) {
-        requirements.extend_from_slice(SEARCH_EXECUTION_FLOW);
+        push_search_execution_requirements_for_terms(terms, &mut requirements);
     }
     let search_evidence_requested = packet_terms_have_any(terms, &["search", "searches"])
         && packet_terms_have_any(terms, &["evidence", "proof", "provenance"]);
@@ -1485,37 +1488,170 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "search_entrypoint",
         role: FlowRole::Entrypoint,
-        query_seeds: &["search entrypoint", "argument planning"],
+        query_seeds: &["main flags parse run"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_search,
-            roles: &[
-                PacketEvidenceRole::SearchDriver,
-                PacketEvidenceRole::ArgumentPlanning,
-                PacketEvidenceRole::CommandEntrypoint,
-            ],
+            roles: &[PacketEvidenceRole::CommandEntrypoint],
         },
+    },
+    FlowRequirement {
+        id: "search_argument_planning",
+        role: FlowRole::Configuration,
+        query_seeds: &["flag parsing"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_argument_planning),
+    },
+    FlowRequirement {
+        id: "search_driver",
+        role: FlowRole::Dispatch,
+        query_seeds: &["parallel search walker"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_search,
+            roles: &[PacketEvidenceRole::SearchDriver],
+        },
+    },
+    FlowRequirement {
+        id: "search_candidate_traversal",
+        role: FlowRole::Dispatch,
+        query_seeds: &["parallel search walk builder"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_candidate_traversal),
+    },
+    FlowRequirement {
+        id: "search_haystack_construction",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["haystack builder"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_haystack_construction),
+    },
+    FlowRequirement {
+        id: "search_matcher_setup",
+        role: FlowRole::Configuration,
+        query_seeds: &["argument matcher"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_matcher_setup),
+    },
+    FlowRequirement {
+        id: "search_searcher_setup",
+        role: FlowRole::Configuration,
+        query_seeds: &["searcher construction"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_searcher_setup),
+    },
+    FlowRequirement {
+        id: "search_printer_setup",
+        role: FlowRole::Configuration,
+        query_seeds: &["result printer construction"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_printer_setup),
+    },
+    FlowRequirement {
+        id: "search_worker_construction",
+        role: FlowRole::Configuration,
+        query_seeds: &["search worker matcher searcher printer"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_worker_construction),
     },
     FlowRequirement {
         id: "search_dispatch",
         role: FlowRole::Dispatch,
-        query_seeds: &[
-            "search execution",
-            "parallel search",
-            "search execution unit",
-        ],
+        query_seeds: &["search execution"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_search,
-            roles: &[
-                PacketEvidenceRole::SearchExecutionUnit,
-                PacketEvidenceRole::CandidateFileConstruction,
-            ],
+            roles: &[PacketEvidenceRole::SearchExecutionUnit],
         },
     },
 ];
+
+fn push_search_execution_requirements_for_terms(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    requirements.push(SEARCH_EXECUTION_FLOW[0]);
+    if packet_terms_have_any(
+        terms,
+        &[
+            "arg",
+            "args",
+            "argument",
+            "arguments",
+            "argv",
+            "flag",
+            "flags",
+            "option",
+            "options",
+        ],
+    ) {
+        requirements.push(SEARCH_EXECUTION_FLOW[1]);
+    }
+    let detailed_driver = packet_terms_have_any(
+        terms,
+        &[
+            "candidate",
+            "candidates",
+            "haystack",
+            "haystacks",
+            "matcher",
+            "matchers",
+            "printer",
+            "printers",
+            "searcher",
+            "searchers",
+            "walk",
+            "walker",
+            "walkers",
+            "walks",
+        ],
+    );
+    if detailed_driver {
+        requirements.push(SEARCH_EXECUTION_FLOW[2]);
+    }
+    if packet_terms_have_any(
+        terms,
+        &[
+            "candidate",
+            "candidates",
+            "walk",
+            "walker",
+            "walkers",
+            "walks",
+        ],
+    ) {
+        requirements.push(SEARCH_EXECUTION_FLOW[3]);
+    }
+    if packet_terms_have_any(terms, &["haystack", "haystacks"]) {
+        requirements.push(SEARCH_EXECUTION_FLOW[4]);
+    }
+    if packet_terms_have_any(terms, &["matcher", "matchers"]) {
+        requirements.push(SEARCH_EXECUTION_FLOW[5]);
+    }
+    if packet_terms_have_any(terms, &["searcher", "searchers"]) {
+        requirements.push(SEARCH_EXECUTION_FLOW[6]);
+    }
+    if packet_terms_have_any(terms, &["printer", "printers"]) {
+        requirements.push(SEARCH_EXECUTION_FLOW[7]);
+    }
+    let worker_construction = packet_terms_have_any(terms, &["matcher", "matchers"])
+        && packet_terms_have_any(terms, &["searcher", "searchers"])
+        && packet_terms_have_any(terms, &["printer", "printers"]);
+    if worker_construction {
+        requirements.push(SEARCH_EXECUTION_FLOW[8]);
+    }
+    requirements.push(SEARCH_EXECUTION_FLOW[9]);
+}
 
 const SEARCH_EVIDENCE_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
@@ -1900,6 +2036,159 @@ mod tests {
     }
 
     #[test]
+    fn search_execution_flow_uses_one_separable_requirement_per_requested_stage() {
+        let prompt = "Explain how ripgrep parses CLI flags, walks candidate files, and executes a search over each haystack through matcher, searcher, and printer components.";
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(prompt),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        let ids = requirements
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "search_entrypoint",
+                "search_argument_planning",
+                "search_driver",
+                "search_candidate_traversal",
+                "search_haystack_construction",
+                "search_matcher_setup",
+                "search_searcher_setup",
+                "search_printer_setup",
+                "search_worker_construction",
+                "search_dispatch",
+            ]
+        );
+
+        let witnesses = [
+            (
+                "search_argument_planning",
+                witness(
+                    "flags::parse",
+                    "crates/core/flags/mod.rs",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                "search_candidate_traversal",
+                witness(
+                    "HiArgs::walk_builder",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_haystack_construction",
+                witness(
+                    "HiArgs::haystack_builder",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_matcher_setup",
+                witness(
+                    "HiArgs::matcher",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_searcher_setup",
+                witness(
+                    "HiArgs::searcher",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_printer_setup",
+                witness(
+                    "HiArgs::printer",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_worker_construction",
+                witness(
+                    "HiArgs::search_worker",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+        ];
+        let component_ids = [
+            "search_argument_planning",
+            "search_candidate_traversal",
+            "search_haystack_construction",
+            "search_matcher_setup",
+            "search_searcher_setup",
+            "search_printer_setup",
+            "search_worker_construction",
+        ];
+        for (expected_id, citation) in witnesses {
+            let proved = requirements
+                .iter()
+                .filter(|requirement| component_ids.contains(&requirement.id))
+                .filter(|requirement| requirement.evidence.citation_proves(&citation))
+                .map(|requirement| requirement.id)
+                .collect::<Vec<_>>();
+            assert_eq!(proved, [expected_id], "{citation:#?}");
+        }
+
+        for unrelated in [
+            witness("matcher", "src/image.rs", NodeKind::FUNCTION),
+            witness("haystack", "src/text.rs", NodeKind::FUNCTION),
+            witness("Formatter::printer", "src/output.rs", NodeKind::METHOD),
+            witness("Database::searcher", "src/storage.rs", NodeKind::METHOD),
+            witness("WalkBuilder::build", "src/files.rs", NodeKind::METHOD),
+            witness("SearchWorker::search", "src/search.rs", NodeKind::METHOD),
+        ] {
+            assert!(
+                requirements
+                    .iter()
+                    .filter(|requirement| component_ids.contains(&requirement.id))
+                    .all(|requirement| !requirement.evidence.citation_proves(&unrelated)),
+                "an unrelated component must not close a search-flow stage: {unrelated:#?}",
+            );
+        }
+
+        let generic_ids = packet_flow_requirements_for_terms(
+            &packet_probe_terms("Explain the search flow."),
+            PacketTaskClassDto::ArchitectureExplanation,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(generic_ids, ["search_entrypoint", "search_dispatch"]);
+
+        let queries = packet_flow_requirement_queries_for_terms(
+            &packet_probe_terms(prompt),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        for expected in [
+            "main flags parse run",
+            "flag parsing",
+            "parallel search walker",
+            "parallel search walk builder",
+            "haystack builder",
+            "argument matcher",
+            "searcher construction",
+            "result printer construction",
+            "search worker matcher searcher printer",
+            "search execution",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "{queries:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn client_request_flow_uses_behavior_owner_probes_without_server_registration() {
         let requirements = packet_flow_requirements_for_terms(
             &packet_probe_terms(
@@ -2174,10 +2463,18 @@ mod tests {
         "request_interceptor_management | dispatch | RequiresResolvedSourceOrGraph",
         "request_terminal | dispatch | RequiresResolvedSourceOrGraph",
         "request_terminal | terminal_boundary | RequiresResolvedSourceOrGraph",
+        "search_argument_planning | configuration | RequiresResolvedSourceOrGraph",
+        "search_candidate_traversal | dispatch | RequiresResolvedSourceOrGraph",
         "search_dispatch | dispatch | RequiresResolvedSourceOrGraph",
+        "search_driver | dispatch | RequiresResolvedSourceOrGraph",
         "search_evidence_classification | transform_or_validate | RequiresResolvedSourceOrGraph",
         "search_evidence_output | terminal_boundary | RequiresResolvedSourceOrGraph",
         "search_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
+        "search_haystack_construction | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "search_matcher_setup | configuration | RequiresResolvedSourceOrGraph",
+        "search_printer_setup | configuration | RequiresResolvedSourceOrGraph",
+        "search_searcher_setup | configuration | RequiresResolvedSourceOrGraph",
+        "search_worker_construction | configuration | RequiresResolvedSourceOrGraph",
         "session_callbacks | dispatch | AllowsSourceRange",
         "client_request_entry | entrypoint | RequiresResolvedSourceOrGraph",
         "shell_completion | terminal_boundary | DiagnosticOnly",
@@ -2514,6 +2811,66 @@ mod tests {
             (
                 ("search_entrypoint", "entrypoint"),
                 witness("main", "crates/core/main.rs", NodeKind::FUNCTION),
+            ),
+            (
+                ("search_argument_planning", "configuration"),
+                witness(
+                    "flags::parse",
+                    "crates/core/flags/mod.rs",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("search_driver", "dispatch"),
+                witness("search_parallel", "crates/core/main.rs", NodeKind::FUNCTION),
+            ),
+            (
+                ("search_candidate_traversal", "dispatch"),
+                witness(
+                    "HiArgs::walk_builder",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_haystack_construction", "transform_or_validate"),
+                witness(
+                    "HiArgs::haystack_builder",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_matcher_setup", "configuration"),
+                witness(
+                    "HiArgs::matcher",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_searcher_setup", "configuration"),
+                witness(
+                    "HiArgs::searcher",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_printer_setup", "configuration"),
+                witness(
+                    "HiArgs::printer",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_worker_construction", "configuration"),
+                witness(
+                    "HiArgs::search_worker",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
             ),
             (
                 ("search_dispatch", "dispatch"),

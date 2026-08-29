@@ -67,6 +67,7 @@ import {
   packetFirstCommandForPrompt,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
+  preludeAllowsAgentRun,
   publicCoreCorpusAudit,
   projectResourceUri,
   reanalysisExactCandidateAcceptance,
@@ -87,6 +88,7 @@ import {
   summarizeCostAccounting,
   summarizePacketObligationAccounting,
   summarizePacketRuntimeRuns,
+  runCodeStoryPacketPrelude,
   runAgentBenchmarkPipeline,
   runPlannedAgentRuns,
   runProcess,
@@ -2155,6 +2157,66 @@ test("drill continuation packets are public only when they keep the advertised b
     packetPreludeContractBlockers(packet, shrunk).join("\n"),
     /max_anchors=8 does not equal public cap=16/,
   );
+});
+
+test("nonzero packet prelude preserves structured retrieval failure and keeps the agent gate closed", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-packet-structured-failure-"));
+  try {
+    const cliPath = path.join(root, "codestory-cli");
+    const failure = {
+      schema_version: 1,
+      error: {
+        code: "retrieval_unavailable",
+        message: "retrieval rejected query: sidecar retrieval trace `stage_deadline` is not eligible for primary results; stages=[stage1_lexical added=0 cancel=stage_deadline; stage1b_semantic added=0 cancel=stage_deadline]",
+        details: {
+          failed_layer: "retrieval_engine",
+          project: root,
+          next_commands: ["codestory-cli retrieval index --project fixture"],
+          minimum_next: ["codestory-cli retrieval index --project fixture"],
+          full_repair: ["codestory-cli retrieval index --project fixture"],
+        },
+      },
+    };
+    await writeFile(
+      cliPath,
+      `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(failure)}\n`)});\nprocess.exitCode = 1;\n`,
+      "utf8",
+    );
+    await chmod(cliPath, 0o755);
+
+    const prelude = await runCodeStoryPacketPrelude(
+      {
+        timeoutMs: 5_000,
+        publishable: false,
+        diagnosticExtraProbesFromManifest: false,
+      },
+      {
+        task: {
+          prompt: "Trace the Redis command loop.",
+          task_class: "route_tracing",
+        },
+      },
+      { path: root, prompt: "Trace the Redis command loop." },
+      root,
+      "redis-structured-failure",
+      cliPath,
+      process.env,
+    );
+
+    assert.equal(prelude.public.process_status, "fail");
+    assert.equal(prelude.public.exit_code, 1);
+    assert.equal(prelude.public.status, "fail");
+    assert.equal(prelude.public.packet_parse_error, null);
+    assert.deepEqual(prelude.public.packet_command_failure, failure);
+    assert.match(prelude.public.error, /^retrieval_unavailable: retrieval rejected query:/);
+    assert.match(prelude.public.error, /stages=\[stage1_lexical/);
+    assert.match(prelude.public.error, /failed_layer=retrieval_engine/);
+    assert.deepEqual(prelude.public.packet_contract_blockers, [prelude.public.error]);
+    assert.equal(preludeAllowsAgentRun(prelude.public), false);
+    assert.equal(prelude.packet, null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("packet obligation accounting preserves the historical material split", () => {
@@ -6413,6 +6475,39 @@ test("scores expected claims without requiring exact wording", () => {
   );
 
   assert.equal(quality.expected_claims.recall, 1);
+});
+
+test("positive claim scoring expands snake-case roles without crediting a partial flow", () => {
+  const task = {
+    id: "identifier-role-flow",
+    task_class: "architecture_explanation",
+    expected_files: [],
+    expected_symbols: [],
+    expected_claims: [
+      "Parallel search uses the walker parallel builder to distribute file work.",
+    ],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0,
+      min_expected_file_recall: 0,
+      min_expected_symbol_recall: 0,
+      min_expected_claim_recall: 1,
+      min_citation_coverage: 0,
+      max_forbidden_claims: 0,
+    },
+  };
+
+  const complete = scoreQuality([
+    agentMessageEvent(
+      "`search_parallel` starts `walk_builder().build_parallel().run(...)`. Traversal supplies parallelism by feeding files to a search worker.",
+    ),
+  ], task);
+  assert.equal(complete.expected_claims.found, 1);
+
+  const partial = scoreQuality([
+    agentMessageEvent("`search_parallel` starts a local worker."),
+  ], task);
+  assert.equal(partial.expected_claims.found, 0);
 });
 
 test("aggregate anchor recall uses fuzzy claim matching", () => {
