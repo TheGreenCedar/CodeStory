@@ -804,18 +804,31 @@ function cursorJsonl(run) {
         completed: { toolSearchToolCall: { args, result: { success: { tools: step.tools } } } },
       };
     } else if (step.kind === "cursor_tool_discovery") {
-      const args = { server: "plugin-codestory-codestory", toolName: step.tool, toolCallId: id };
+      const args = step.pattern
+        ? { server: "plugin-codestory-codestory", pattern: step.pattern, toolCallId: id }
+        : { server: "plugin-codestory-codestory", toolName: step.tool, toolCallId: id };
       const catalog = JSON.parse(readFileSync(join(codexPluginRoot, "generated-mcp-catalog.json"), "utf8"));
-      const tool = catalog.tools.find(({ name }) => name === step.tool);
+      const content = step.pattern
+        ? {
+          mode: "search",
+          pattern: step.pattern,
+          matches: catalog.tools
+            .filter(({ name }) => step.pattern.split("|").some((term) => name.includes(term)))
+            .map(({ name, description }) => ({
+              namespace: "plugin-codestory-codestory",
+              tool: name,
+              description,
+            })),
+        }
+        : (() => {
+          const tool = catalog.tools.find(({ name }) => name === step.tool);
+          return { tool: tool.name, description: tool.description, inputSchema: tool.inputSchema };
+        })();
       wrapper = {
         started: { getMcpToolsToolCall: { args } },
         completed: {
           getMcpToolsToolCall: {
-            result: { success: { content: JSON.stringify({
-              tool: tool.name,
-              description: tool.description,
-              inputSchema: tool.inputSchema,
-            }, null, 2) } },
+            result: { success: { content: JSON.stringify(content, null, 2) } },
           },
         },
       };
@@ -1583,6 +1596,27 @@ test("Cursor excludes only authenticated guidance and catalog discovery around p
     transcript: `${events.map(JSON.stringify).join("\n")}\n`,
   });
   assert.deepEqual(observed.actions, ["search"]);
+
+  const patternRun = baseRun("exact_symbol_search");
+  patternRun.steps.unshift({ kind: "cursor_tool_discovery", pattern: "search|symbol" });
+  assert.deepEqual(validateInstalledSession({
+    host: "cursor", scenarioId: patternRun.scenario_id, request: patternRun.request,
+    installedRoot, installedReceipt, expectedIdentity: EXPECTED_IDENTITY, installedPluginRoot: codexPluginRoot,
+    transcript: cursorJsonl(patternRun),
+  }).actions, ["search"]);
+
+  const tamperedPattern = clone(patternRun);
+  const tamperedPatternEvents = cursorJsonl(tamperedPattern).trim().split("\n").map((line) => JSON.parse(line));
+  const patternDiscovery = tamperedPatternEvents.find((event) => event.type === "tool_call"
+    && event.subtype === "completed" && event.tool_call.getMcpToolsToolCall);
+  const patternContent = JSON.parse(patternDiscovery.tool_call.getMcpToolsToolCall.result.success.content);
+  patternContent.matches[0].description = "substituted";
+  patternDiscovery.tool_call.getMcpToolsToolCall.result.success.content = JSON.stringify(patternContent);
+  assert.throws(() => validateInstalledSession({
+    host: "cursor", scenarioId: tamperedPattern.scenario_id, request: tamperedPattern.request,
+    installedRoot, installedReceipt, expectedIdentity: EXPECTED_IDENTITY, installedPluginRoot: codexPluginRoot,
+    transcript: `${tamperedPatternEvents.map(JSON.stringify).join("\n")}\n`,
+  }), /required action sequence|forbidden tool/u);
 
   const tamperedGuidance = clone(run);
   tamperedGuidance.steps[0].path = join(codexPluginRoot, "skills/codestory-grounding/references/search.md");

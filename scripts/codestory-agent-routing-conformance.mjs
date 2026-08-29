@@ -737,9 +737,13 @@ function cursorStartedAction(callId, key, args) {
     return { kind: "tool_search", tool: "tool_search", args, cursor_key: key, cursor_args: args };
   }
   if (key === "getMcpToolsToolCall") {
-    if (!equalJson(Object.keys(args).sort(), ["server", "toolCallId", "toolName"])
-        || args.server !== "plugin-codestory-codestory" || args.toolCallId !== callId
-        || !nonemptyString(args.toolName)) {
+    const keys = Object.keys(args).sort();
+    const exactTool = equalJson(keys, ["server", "toolCallId", "toolName"])
+      && nonemptyString(args.toolName);
+    const patternSearch = equalJson(keys, ["pattern", "server", "toolCallId"])
+      && nonemptyString(args.pattern);
+    if ((!exactTool && !patternSearch)
+        || args.server !== "plugin-codestory-codestory" || args.toolCallId !== callId) {
       fail("Cursor getMcpToolsToolCall args are invalid");
     }
     return {
@@ -2671,13 +2675,33 @@ function authenticatedCursorToolDiscovery(action, installedPluginRoot, expectedI
   } catch {
     return false;
   }
-  const matches = Array.isArray(catalog.tools)
-    ? catalog.tools.filter(({ name }) => name === action.args.toolName)
-    : [];
-  return matches.length === 1 && equalJson(observed, {
-    tool: matches[0].name,
-    description: matches[0].description,
-    inputSchema: matches[0].inputSchema,
+  if (!Array.isArray(catalog.tools)) return false;
+  if (nonemptyString(action.args.toolName)) {
+    const matches = catalog.tools.filter(({ name }) => name === action.args.toolName);
+    return matches.length === 1 && equalJson(observed, {
+      tool: matches[0].name,
+      description: matches[0].description,
+      inputSchema: matches[0].inputSchema,
+    });
+  }
+  if (!nonemptyString(action.args.pattern)
+      || !equalJson(Object.keys(observed).sort(), ["matches", "mode", "pattern"])
+      || observed.mode !== "search" || observed.pattern !== action.args.pattern
+      || !Array.isArray(observed.matches) || observed.matches.length === 0) {
+    return false;
+  }
+  const catalogByName = new Map(catalog.tools.map((tool) => [tool.name, tool]));
+  const seen = new Set();
+  return observed.matches.every((match) => {
+    if (!plainObject(match)
+        || !equalJson(Object.keys(match).sort(), ["description", "namespace", "tool"])
+        || match.namespace !== "plugin-codestory-codestory"
+        || !nonemptyString(match.tool) || seen.has(match.tool)) {
+      return false;
+    }
+    seen.add(match.tool);
+    const expected = catalogByName.get(match.tool);
+    return expected?.description === match.description;
   });
 }
 
