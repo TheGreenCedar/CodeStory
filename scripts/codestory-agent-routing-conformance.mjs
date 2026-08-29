@@ -3070,13 +3070,13 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
       || !/fallback-only.*initial.*probe/isu.test(packetReferenceText)) {
     fail("canonical packet guidance is missing exact continuation and fallback-only argument rules");
   }
-  if (!/search.*context.*packet.*prove_call_path/isu.test(openAiMetadataText)
-      || !/host-supplied/iu.test(openAiMetadataText)
-      || !/unknown.*not absence/isu.test(openAiMetadataText)
-      || !/successful search.*unless.*exact selection/isu.test(openAiMetadataText)
-      || !/typed `Unavailable`.*terminal/isu.test(openAiMetadataText)
-      || !/transport.*tool absence.*source/isu.test(openAiMetadataText)) {
-    fail("OpenAI skill metadata is missing the canonical routing boundary");
+  if (!/read and follow the loaded codestory-grounding skill/isu.test(openAiMetadataText)
+      || !/sole source of truth/isu.test(openAiMetadataText)
+      || !/adds no parallel instructions/isu.test(openAiMetadataText)) {
+    fail("OpenAI skill metadata is not the canonical skill pointer");
+  }
+  if (/search.*context.*packet.*prove_call_path|unknown.*not absence|typed contract/isu.test(openAiMetadataText)) {
+    fail("OpenAI skill metadata duplicates canonical routing or proof guidance");
   }
 
   const hosts = [];

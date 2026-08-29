@@ -2647,12 +2647,13 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher a
   assert.match(cursorRule, /canonical codestory-grounding skill.*sole source of truth.*adds no parallel instructions/isu);
   assert.doesNotMatch(cursorRule, /Routing contract:|Discovery leads come from|prove_call_path|Inspect source after a packet/u);
   assert.match(skill, /bounded command action.*cat.*sed.*exact authorized file.*before reporting.*unavailable/isu);
-  assert.match(openAiMetadata, /search.*context.*packet.*prove_call_path/isu);
-  assert.match(openAiMetadata, /host-supplied/iu);
-  assert.match(openAiMetadata, /unknown.*not absence/isu);
-  assert.match(openAiMetadata, /successful search.*unless.*exact selection/isu);
-  assert.match(openAiMetadata, /typed `Unavailable`.*terminal/isu);
-  assert.match(openAiMetadata, /transport.*tool absence.*source/isu);
+  assert.match(openAiMetadata, /read and follow the loaded codestory-grounding skill/isu);
+  assert.match(openAiMetadata, /sole source of truth/isu);
+  assert.match(openAiMetadata, /adds no parallel instructions/isu);
+  assert.doesNotMatch(
+    openAiMetadata,
+    /search.*context.*packet.*prove_call_path|unknown.*not absence|typed contract/isu,
+  );
   assert.match(skill, /omit optional numeric bounds.*generated schema/isu);
   assert.match(searchReference, /limit.*1.*50/isu);
   assert.match(contextReference, /bare\s+symbol.*exact\s+path.*evidence\[\]\.symbol_id.*context\.id/isu);
@@ -2728,12 +2729,26 @@ Call the CodeStory tool that matches the task. The codestory-grounding skill own
     writeFileSync(
       openAiMetadataPath,
       readFileSync(openAiMetadataPath, "utf8").replace(
-        /A typed `Unavailable` result is terminal\. MCP transport or tool absence may authorize ordinary source inspection; a successful unavailable result does not unless an exact file or focused gap authorizes it\. /u,
-        "",
+        /sole source of truth/u,
+        "preferred source",
       ),
     );
     const incompleteOpenAiMetadata = staticIdentityFor(root);
-    await assert.rejects(validateStaticHostParity(root, incompleteOpenAiMetadata), /OpenAI skill metadata/u);
+    await assert.rejects(
+      validateStaticHostParity(root, incompleteOpenAiMetadata),
+      /OpenAI skill metadata is not the canonical skill pointer/u,
+    );
+
+    cpSync(pluginRoot, root, { recursive: true, force: true });
+    writeFileSync(
+      openAiMetadataPath,
+      `${readFileSync(openAiMetadataPath, "utf8")}\nRouting contract: search, context, packet, then prove_call_path. Unknown is not absence; supply a typed contract.\n`,
+    );
+    const duplicatedOpenAiGuidance = staticIdentityFor(root);
+    await assert.rejects(
+      validateStaticHostParity(root, duplicatedOpenAiGuidance),
+      /OpenAI skill metadata duplicates canonical routing or proof guidance/u,
+    );
 
     for (const relativePath of [
       ".cursor-plugin/plugin.json",
