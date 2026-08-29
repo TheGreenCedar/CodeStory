@@ -1425,6 +1425,16 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
   );
   assert.equal(parseInstalledTranscript("cursor", capturedJsonl(composer)).final, finalText);
 
+  const multiTurnComposer = clone(composer);
+  const toolStart = multiTurnComposer.findIndex((event) => event.type === "tool_call" && event.subtype === "started");
+  const preamble = "Reading the named file.\n";
+  multiTurnComposer.splice(toolStart, 0,
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: preamble }] }, session_id: "captured-1", timestamp_ms: 2.1 },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: preamble }] }, session_id: "captured-1", model_call_id: "composer-preamble", timestamp_ms: 2.2 },
+  );
+  multiTurnComposer.at(-1).result = `${preamble}${finalText}`;
+  assert.equal(parseInstalledTranscript("cursor", capturedJsonl(multiTurnComposer)).final, finalText);
+
   const invalidThinking = clone(composer);
   invalidThinking[2].subtype = "opaque";
   assert.throws(

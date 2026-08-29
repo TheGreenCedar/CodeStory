@@ -716,6 +716,7 @@ function parseCursor(events) {
   let sessionId = null;
   let assistantDeltas = "";
   let assistantFragments = "";
+  let lastAssistantSnapshot = "";
   let userText = "";
   const snapshotStream = events.some((event) => event.type === "thinking"
     || (event.type === "assistant" && (event.timestamp_ms != null || event.model_call_id != null)));
@@ -754,6 +755,7 @@ function parseCursor(events) {
       if (snapshot) {
         if (assistantFragments !== text) fail("Cursor assistant snapshot does not match streamed deltas");
         assistantDeltas += text;
+        lastAssistantSnapshot = text;
         assistantFragments = "";
       } else {
         assistantFragments += text;
@@ -809,7 +811,7 @@ function parseCursor(events) {
       if (state.open.size > 0) fail(`Cursor terminal result has unmatched tool call ${JSON.stringify([...state.open.keys()][0])}`);
       if (assistantFragments) fail("Cursor terminal result arrived before an assistant snapshot");
       if (assistantDeltas !== event.result) fail("Cursor assistant deltas do not match terminal result");
-      state.final = event.result;
+      state.final = snapshotStream ? lastAssistantSnapshot : event.result;
       return;
     }
     fail(`unsupported Cursor event ${JSON.stringify(event.type ?? null)}`);
