@@ -2339,9 +2339,18 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
   if (!command || !installedPluginRoot) return null;
   const reads = command.split(/\s+&&\s+/u).map((segment) => {
     const sed = segment.match(/^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u);
-    if (sed) return { kind: "sed", endLine: Number(sed[1] ?? sed[2] ?? sed[3]), word: sed[4] };
-    const wc = segment.match(/^wc\s+-l\s+(\S+)$/u);
-    return wc ? { kind: "wc", word: wc[1] } : null;
+    if (sed) return { kind: "sed", endLine: Number(sed[1] ?? sed[2] ?? sed[3]), words: [sed[4]] };
+    const wc = segment.match(/^wc\s+-l\s+(.+)$/u);
+    if (!wc) return null;
+    const words = [];
+    let rest = wc[1].trim();
+    while (rest) {
+      const match = rest.match(/^('[^']*'|"[^"$`\\]*"|\/?[A-Za-z0-9._@+-]+(?:\/[A-Za-z0-9._@+-]+)*)(?:\s+|$)/u);
+      if (!match || !singleShellWord(match[1])) return null;
+      words.push(match[1]);
+      rest = rest.slice(match[0].length).trimStart();
+    }
+    return words.length > 0 ? { kind: "wc", words } : null;
   });
   if (reads.length === 0 || reads.some((read) => read === null)) return null;
   let root;
@@ -2351,37 +2360,48 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
     return null;
   }
   const paths = new Set();
-  const expectedOutput = [];
+  let remainingOutput = action.result;
   for (const read of reads) {
-    const candidate = singleShellWord(read.word);
-    if (!candidate) return null;
-    let actual;
-    try {
-      if (!lstatSync(candidate).isFile()) return null;
-      actual = realpathSync(candidate);
-    } catch {
-      return null;
+    let totalLines = 0;
+    for (const word of read.words) {
+      const candidate = singleShellWord(word);
+      if (!candidate) return null;
+      let actual;
+      try {
+        if (!lstatSync(candidate).isFile()) return null;
+        actual = realpathSync(candidate);
+      } catch {
+        return null;
+      }
+      const rel = relative(root, actual);
+      if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || resolve(root, rel) !== actual) return null;
+      const rosterPath = rel.split(sep).join("/");
+      if (!CODEX_GUIDANCE_PATHS.has(rosterPath)) return null;
+      const expectedDigest = expectedIdentity.static_roster?.[rosterPath];
+      if (!SHA256.test(String(expectedDigest)) || /^0{64}$/u.test(String(expectedDigest))) return null;
+      const bytes = readFileSync(actual);
+      if (sha256Bytes(bytes) !== expectedDigest) return null;
+      paths.add(rosterPath);
+      if (read.kind === "sed") {
+        if (!Number.isSafeInteger(read.endLine) || read.endLine < 1) return null;
+        const output = sedPrefix(bytes.toString("utf8"), read.endLine);
+        if (output === null || !remainingOutput.startsWith(output)) return null;
+        remainingOutput = remainingOutput.slice(output.length);
+      } else {
+        const newlineCount = bytes.reduce((count, byte) => count + Number(byte === 0x0a), 0);
+        totalLines += newlineCount;
+        const line = remainingOutput.match(/^[ \t]*(\d+)[ \t]+([^\n]+)\n/u);
+        if (!line || Number(line[1]) !== newlineCount || line[2] !== candidate) return null;
+        remainingOutput = remainingOutput.slice(line[0].length);
+      }
     }
-    const rel = relative(root, actual);
-    if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || resolve(root, rel) !== actual) return null;
-    const rosterPath = rel.split(sep).join("/");
-    if (!CODEX_GUIDANCE_PATHS.has(rosterPath)) return null;
-    const expectedDigest = expectedIdentity.static_roster?.[rosterPath];
-    if (!SHA256.test(String(expectedDigest)) || /^0{64}$/u.test(String(expectedDigest))) return null;
-    const bytes = readFileSync(actual);
-    if (sha256Bytes(bytes) !== expectedDigest) return null;
-    if (read.kind === "sed") {
-      if (!Number.isSafeInteger(read.endLine) || read.endLine < 1) return null;
-      const output = sedPrefix(bytes.toString("utf8"), read.endLine);
-      if (output === null) return null;
-      expectedOutput.push(output);
-    } else {
-      const newlineCount = bytes.reduce((count, byte) => count + Number(byte === 0x0a), 0);
-      expectedOutput.push(`${newlineCount} ${candidate}\n`);
+    if (read.kind === "wc" && read.words.length > 1) {
+      const total = remainingOutput.match(/^[ \t]*(\d+)[ \t]+total\n/u);
+      if (!total || Number(total[1]) !== totalLines) return null;
+      remainingOutput = remainingOutput.slice(total[0].length);
     }
-    paths.add(rosterPath);
   }
-  if (action.result !== expectedOutput.join("")) return null;
+  if (remainingOutput !== "") return null;
   return [...paths];
 }
 
