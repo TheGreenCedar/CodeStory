@@ -2292,6 +2292,24 @@ test("semantic proof tool errors use the explicit error contract without result 
   };
   plainText.final.reason_codes = [];
   assert.equal(validate("codex", plainText).status, "pass");
+
+  const cursorProjected = baseRun("malformed_proof_contract");
+  cursorProjected.steps[0].result = {
+    content: [{ text: { text: "MissingResolvedMaterialAnchor { field: Start }" } }],
+    isError: false,
+  };
+  cursorProjected.final.reason_codes = [];
+  assert.equal(validate("cursor", cursorProjected).status, "pass");
+
+  const unauthorizedProjection = baseRun("exact_symbol_search");
+  unauthorizedProjection.steps[0].result = {
+    content: [{ text: { text: "search failed" } }],
+    isError: false,
+  };
+  assert.throws(
+    () => validate("cursor", unauthorizedProjection),
+    /search Cursor text-only semantic error projection is not authorized/u,
+  );
 });
 
 test("installed receipt authentication rejects substituted package launcher CLI and forged receipt", () => {

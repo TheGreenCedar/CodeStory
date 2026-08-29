@@ -1073,13 +1073,16 @@ function normalizedResult(action, host) {
       && Array.isArray(raw.content) && raw.content.length === 1
       && plainObject(raw.content[0]) && equalJson(Object.keys(raw.content[0]), ["text"])
       && plainObject(raw.content[0].text) && equalJson(Object.keys(raw.content[0].text), ["text"])
-      && typeof raw.content[0].text.text === "string") {
+      && nonemptyString(raw.content[0].text.text)) {
+    const body = parseJsonText(raw.content[0].text.text);
     return {
       raw,
-      body: parseJsonText(raw.content[0].text.text),
+      body,
       meta: null,
-      isError: false,
-      transport_projection: "cursor_content_text_v1",
+      isError: body === null,
+      transport_projection: body === null
+        ? "cursor_semantic_error_text_v1"
+        : "cursor_content_text_v1",
     };
   }
   const structured = plainObject(raw.structuredContent) ? raw.structuredContent : null;
@@ -1105,6 +1108,12 @@ function validateResultIdentity(action, expected, host) {
     // the negotiated revision and discovery digest before it relays any runtime
     // result; the caller authenticates those launcher bytes before parsing here.
     if (!plainObject(normalized.body)) fail(`${action.tool} Cursor result text is not a JSON object`);
+    return normalized;
+  }
+  if (normalized.transport_projection === "cursor_semantic_error_text_v1") {
+    if (action.tool !== "prove_call_path") {
+      fail(`${action.tool} Cursor text-only semantic error projection is not authorized`);
+    }
     return normalized;
   }
   const publication = normalized.meta?.codestory_publication;
