@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dirname } from "node:path";
@@ -13,10 +13,13 @@ import {
   buildRoutingHostCommand,
   buildCodexPluginInstallCommand,
   authenticateSourceCandidateInstallation,
+  discoverCursorQualificationProviders,
+  installCursorQualificationProvider,
   materializeRoutingFixture,
   parseRoutingQualificationOptions,
   validateRoutingPreflight,
   validateRoutingArtifactMatrix,
+  verifyCursorQualificationProvider,
   verifyStagedCandidateInstallation,
   writeRoutingQualificationArtifacts,
   writeRoutingSessionCapture,
@@ -116,6 +119,91 @@ test("qualification host commands use official isolated Codex and Cursor session
     pluginArgs: ["plugin", "add", "codestory@RoutingCandidate", "--json"],
     env: { CODEX_HOME: "/fixture/codex-home" },
   });
+});
+
+test("Cursor qualification installs one authenticated provider into both private account roots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-routing-cursor-provider-"));
+  try {
+    const home = join(root, "home");
+    const revision = "candidate-revision";
+    const cacheRoot = join(
+      home, ".cursor", "plugins", "cache", "thegreencedar-codestory", "codestory", revision,
+    );
+    const cloneRoot = join(
+      home, ".cursor", "plugins", "marketplaces", "github.com", "thegreencedar", "codestory",
+      revision, "plugins", "codestory",
+    );
+    for (const providerRoot of [cacheRoot, cloneRoot]) {
+      await mkdir(providerRoot, { recursive: true });
+      await writeFile(join(providerRoot, "plugin.json"), '{"name":"codestory"}\n');
+    }
+    const candidateCli = join(root, "candidate", "codestory-cli");
+    await mkdir(dirname(candidateCli), { recursive: true });
+    await writeFile(candidateCli, "candidate-cli\n");
+    await chmod(candidateCli, 0o700);
+
+    assert.deepEqual(await discoverCursorQualificationProviders(home), {
+      cursorHome: await realpath(home),
+      cacheRoot: await realpath(cacheRoot),
+      cloneRoot: await realpath(cloneRoot),
+      dataDir: join(await realpath(home), ".cursor", "plugins", "data", "codestory"),
+    });
+    const installed = await installCursorQualificationProvider({
+      cursorHome: home,
+      candidatePluginRoot: pluginRoot,
+      candidateCli,
+      candidateCliSha256: sha256(await readFile(candidateCli)),
+    });
+    assert.equal(await verifyCursorQualificationProvider(installed), true);
+    assert.equal((await stat(installed.localOverridePath)).mode & 0o777, 0o600);
+    assert.deepEqual(JSON.parse(await readFile(installed.localOverridePath, "utf8")), {
+      schema_version: 1,
+      CODESTORY_CLI: await realpath(candidateCli),
+    });
+    const command = buildRoutingHostCommand({
+      host: "cursor",
+      executable: "cursor-agent",
+      projectRoot: "/fixture/project",
+      pluginRoot: installed.cacheRoot,
+      model: "composer-2.5",
+      prompt: "fixture prompt",
+    });
+    assert.equal(command.args[command.args.indexOf("--plugin-dir") + 1], installed.cacheRoot);
+
+    await writeFile(join(installed.cacheRoot, "generated-mcp-catalog.json"), "drift\n");
+    await assert.rejects(verifyCursorQualificationProvider(installed), /provider bytes drifted/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Cursor qualification rejects duplicate and linked account providers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-routing-cursor-provider-hostile-"));
+  try {
+    const home = join(root, "home");
+    const providerBase = join(
+      home, ".cursor", "plugins", "cache", "thegreencedar-codestory", "codestory",
+    );
+    const cloneRoot = join(
+      home, ".cursor", "plugins", "marketplaces", "github.com", "thegreencedar", "codestory",
+      "one", "plugins", "codestory",
+    );
+    for (const providerRoot of [join(providerBase, "one"), join(providerBase, "two"), cloneRoot]) {
+      await mkdir(providerRoot, { recursive: true });
+      await writeFile(join(providerRoot, "plugin.json"), '{"name":"codestory"}\n');
+    }
+    await assert.rejects(discoverCursorQualificationProviders(home), /exactly one Cursor cache provider/u);
+
+    await rm(join(providerBase, "two"), { recursive: true, force: true });
+    await rm(join(providerBase, "one"), { recursive: true, force: true });
+    const outside = join(root, "outside-provider");
+    await mkdir(outside, { recursive: true });
+    await writeFile(join(outside, "plugin.json"), '{"name":"codestory"}\n');
+    await symlink(outside, join(providerBase, "one"));
+    await assert.rejects(discoverCursorQualificationProviders(home), /symbolic link|escapes/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("qualification CLI has no synthetic transcript input", () => {

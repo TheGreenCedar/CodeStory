@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
 import {
   chmod,
   copyFile,
@@ -13,6 +13,7 @@ import {
   readFile,
   readdir,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -335,8 +336,14 @@ async function walkFiles(root) {
 }
 
 export async function directoryContractSha256(root) {
+  return directoryContractSha256Ignoring(root, new Set());
+}
+
+async function directoryContractSha256Ignoring(root, ignoredRootFiles) {
   const digest = createHash("sha256");
-  const files = await walkFiles(root);
+  const files = (await walkFiles(root)).filter(
+    (path) => !ignoredRootFiles.has(relative(root, path).split(sep).join("/")),
+  );
   if (files.length === 0) fail("plugin package root is empty");
   for (const path of files) {
     const name = Buffer.from(relative(root, path).split(sep).join("/"), "utf8");
@@ -348,6 +355,158 @@ export async function directoryContractSha256(root) {
     digest.update(nameLength).update(name).update(byteLength).update(bytes);
   }
   return digest.digest("hex");
+}
+
+function requireContainedDirectory(root, candidate, label) {
+  const base = realpathSync(root);
+  const relativePath = relative(base, resolve(candidate));
+  if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`)) {
+    fail(`${label} escapes its private Cursor home`);
+  }
+  let current = base;
+  for (const component of relativePath.split(sep)) {
+    current = join(current, component);
+    let metadata;
+    try {
+      metadata = lstatSync(current);
+    } catch (error) {
+      fail(`${label} is missing: ${error.message}`);
+    }
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      fail(`${label} contains a symbolic link or non-directory component`);
+    }
+  }
+  if (inside(base, current, label) !== resolve(current)) {
+    fail(`${label} does not preserve native path identity`);
+  }
+  return current;
+}
+
+async function cursorProviderRoots(parent, resolveProvider, label) {
+  let revisions;
+  try {
+    revisions = await readdir(parent, { withFileTypes: true });
+  } catch (error) {
+    fail(`${label} is unavailable after Composer materialization: ${error.message}`);
+  }
+  const providers = [];
+  for (const revision of revisions) {
+    if (revision.isSymbolicLink()) fail(`${label} contains a symbolic link`);
+    if (!revision.isDirectory()) continue;
+    const providerRoot = resolveProvider(revision.name);
+    let metadata;
+    try {
+      metadata = await lstat(providerRoot);
+    } catch {
+      continue;
+    }
+    if (metadata.isSymbolicLink()) fail(`${label} contains a symbolic link`);
+    if (!metadata.isDirectory()) continue;
+    providers.push({ revision: revision.name, providerRoot });
+  }
+  if (providers.length !== 1) fail(`${label} must contain exactly one Cursor ${label.includes("cache") ? "cache" : "marketplace clone"} provider`);
+  let manifest;
+  try {
+    manifest = JSON.parse(await readFile(join(providers[0].providerRoot, "plugin.json"), "utf8"));
+  } catch (error) {
+    fail(`${label} manifest is invalid: ${error.message}`);
+  }
+  if (manifest?.name !== "codestory") fail(`${label} manifest is not CodeStory`);
+  return providers[0];
+}
+
+export async function discoverCursorQualificationProviders(cursorHome) {
+  const home = realpathSync(cursorHome);
+  const cacheParent = join(
+    home, ".cursor", "plugins", "cache", "thegreencedar-codestory", "codestory",
+  );
+  const cloneParent = join(
+    home, ".cursor", "plugins", "marketplaces", "github.com", "thegreencedar", "codestory",
+  );
+  const cache = await cursorProviderRoots(
+    cacheParent,
+    (revision) => join(cacheParent, revision),
+    "Cursor cache provider",
+  );
+  const clone = await cursorProviderRoots(
+    cloneParent,
+    (revision) => join(cloneParent, revision, "plugins", "codestory"),
+    "Cursor marketplace clone provider",
+  );
+  if (cache.revision !== clone.revision) fail("Cursor account provider revisions disagree");
+  const cacheRoot = requireContainedDirectory(home, cache.providerRoot, "Cursor cache provider");
+  const cloneRoot = requireContainedDirectory(home, clone.providerRoot, "Cursor marketplace clone provider");
+  return {
+    cursorHome: home,
+    cacheRoot,
+    cloneRoot,
+    dataDir: join(home, ".cursor", "plugins", "data", "codestory"),
+  };
+}
+
+export async function verifyCursorQualificationProvider(provider) {
+  const discovered = await discoverCursorQualificationProviders(provider.cursorHome);
+  if (discovered.cacheRoot !== provider.cacheRoot || discovered.cloneRoot !== provider.cloneRoot
+      || discovered.dataDir !== provider.dataDir) {
+    fail("Cursor account provider identity drifted");
+  }
+  const cacheDigest = await directoryContractSha256Ignoring(provider.cacheRoot, new Set([".cache-complete"]));
+  const cloneDigest = await directoryContractSha256(provider.cloneRoot);
+  if (cacheDigest !== provider.candidatePluginSha256 || cloneDigest !== provider.candidatePluginSha256) {
+    fail("Cursor candidate provider bytes drifted");
+  }
+  const cliMetadata = await lstat(provider.candidateCli);
+  if (!cliMetadata.isFile() || cliMetadata.isSymbolicLink()
+      || await digestFile(provider.candidateCli) !== provider.candidateCliSha256) {
+    fail("Cursor candidate CLI bytes drifted");
+  }
+  const overrideMetadata = await lstat(provider.localOverridePath);
+  if (!overrideMetadata.isFile() || overrideMetadata.isSymbolicLink()
+      || (process.platform !== "win32" && (overrideMetadata.mode & 0o077) !== 0)) {
+    fail("Cursor candidate local override is not an owner-only regular file");
+  }
+  const override = await readJson(provider.localOverridePath, "Cursor candidate local override");
+  exactKeys(override, ["schema_version", "CODESTORY_CLI"], "Cursor candidate local override");
+  if (override.schema_version !== 1 || override.CODESTORY_CLI !== provider.candidateCli) {
+    fail("Cursor candidate local override drifted");
+  }
+  return true;
+}
+
+export async function installCursorQualificationProvider({
+  cursorHome,
+  candidatePluginRoot,
+  candidateCli,
+  candidateCliSha256,
+}) {
+  const discovered = await discoverCursorQualificationProviders(cursorHome);
+  const pluginRoot = realpathSync(candidatePluginRoot);
+  const cli = realpathSync(candidateCli);
+  requiredDigest(candidateCliSha256, "Cursor candidate CLI digest");
+  if (await digestFile(cli) !== candidateCliSha256) fail("Cursor candidate CLI digest does not match its bytes");
+  const candidatePluginSha256 = await directoryContractSha256(pluginRoot);
+  for (const providerRoot of [discovered.cacheRoot, discovered.cloneRoot]) {
+    await rm(providerRoot, { recursive: true, force: true });
+    await cp(pluginRoot, providerRoot, { recursive: true, errorOnExist: true });
+  }
+  await writeFile(join(discovered.cacheRoot, ".cache-complete"), "", { mode: 0o600 });
+  await mkdir(discovered.dataDir, { recursive: true, mode: 0o700 });
+  requireContainedDirectory(discovered.cursorHome, discovered.dataDir, "Cursor plugin data directory");
+  const localOverridePath = join(discovered.dataDir, "local-overrides.json");
+  await writeFile(localOverridePath, `${JSON.stringify({
+    schema_version: 1,
+    CODESTORY_CLI: cli,
+  })}\n`, { mode: 0o600 });
+  await chmod(localOverridePath, 0o600);
+  const installed = {
+    ...discovered,
+    candidatePluginSha256,
+    candidateCli: cli,
+    candidateCliSha256,
+    localOverridePath,
+  };
+  await verifyCursorQualificationProvider(installed);
+  return installed;
 }
 
 async function spawnBounded(command, args, options = {}) {
@@ -835,6 +994,58 @@ async function installCodexQualificationPlugin({ executable, codexHome, pluginRo
   return { ...installed, installedPath };
 }
 
+async function cursorHostEnvironment(cursorHome, stateRoot, env) {
+  const paths = {
+    CURSOR_CONFIG_DIR: join(stateRoot, "config"),
+    CURSOR_DATA_DIR: join(stateRoot, "data"),
+    CURSOR_AGENT_STORE_DIR: join(stateRoot, "agent-store"),
+    NODE_COMPILE_CACHE: join(stateRoot, "node-compile-cache"),
+  };
+  for (const path of Object.values(paths)) await mkdir(path, { recursive: true, mode: 0o700 });
+  return { ...env, HOME: cursorHome, ...paths };
+}
+
+async function prepareCursorQualificationProvider({
+  outRoot,
+  authenticated,
+  executable,
+  model,
+  projectRoot,
+  env,
+}) {
+  const root = join(resolve(outRoot), "cursor-provider");
+  await rm(root, { recursive: true, force: true });
+  const cursorHome = join(root, "home");
+  await mkdir(cursorHome, { recursive: true, mode: 0o700 });
+  if (process.platform === "darwin") {
+    const sourceKeychains = join(process.env.HOME || "", "Library", "Keychains");
+    if (isAbsolute(sourceKeychains) && existsSync(sourceKeychains)) {
+      const library = join(cursorHome, "Library");
+      await mkdir(library, { recursive: true, mode: 0o700 });
+      await symlink(realpathSync(sourceKeychains), join(library, "Keychains"));
+    }
+  }
+  const bootstrapEnv = await cursorHostEnvironment(cursorHome, join(root, "bootstrap"), env);
+  const bootstrap = buildRoutingHostCommand({
+    host: "cursor",
+    executable,
+    projectRoot,
+    pluginRoot: authenticated.pluginRoot,
+    model,
+    prompt: "Reply with exactly READY and do not call any tool.",
+  });
+  const session = await runSession(bootstrap, bootstrapEnv);
+  if (session.spawned !== true || session.code !== 0 || session.signal !== null || !session.stdout.trim()) {
+    fail("Cursor Composer provider materialization did not complete");
+  }
+  return installCursorQualificationProvider({
+    cursorHome,
+    candidatePluginRoot: authenticated.pluginRoot,
+    candidateCli: authenticated.staged.managedCli,
+    candidateCliSha256: authenticated.staged.candidateCliSha256,
+  });
+}
+
 export async function materializeRoutingFixture(sourceRoot, destination) {
   await rm(destination, { recursive: true, force: true });
   await cp(sourceRoot, destination, { recursive: true, errorOnExist: true });
@@ -1011,6 +1222,7 @@ async function main(argv) {
   const fixtureSource = resolve(options.fixture_project
     ?? join(repoRoot, "scripts", "fixtures", "codestory-agent-routing-project"));
   const rows = [];
+  let cursorProvider = null;
   for (const host of ["codex", "cursor"]) {
     for (const { id } of ROUTING_SCENARIOS) {
       const sessionRoot = join(resolve(options.out), "sessions", host, id);
@@ -1019,7 +1231,7 @@ async function main(argv) {
         fixtureSource, join(sessionRoot, "project"),
       );
       const entry = materializeRoutingRequests(projectRoot).find((candidate) => candidate.scenario_id === id);
-      const sessionEnv = {
+      let sessionEnv = {
         ...process.env,
         ...authenticated.launcherEnv,
         CODESTORY_CACHE_ROOT: join(sessionRoot, "cache"),
@@ -1043,7 +1255,7 @@ async function main(argv) {
       }
       await preflightRoutingScenario({ cli: authenticated.staged.managedCli, entry, projectRoot, env: sessionEnv });
       let codexHome = null;
-      let installedPluginRoot = host === "cursor" ? authenticated.pluginRoot : null;
+      let installedPluginRoot = null;
       if (host === "codex") {
         codexHome = join(sessionRoot, "codex-home");
         await mkdir(codexHome, { recursive: true, mode: 0o700 });
@@ -1053,12 +1265,30 @@ async function main(argv) {
           pluginRoot: authenticated.pluginRoot, env: sessionEnv,
         });
         installedPluginRoot = installedPlugin.installedPath;
+      } else {
+        if (!cursorProvider) {
+          cursorProvider = await prepareCursorQualificationProvider({
+            outRoot: options.out,
+            authenticated,
+            executable: options.cursor_command ?? "cursor-agent",
+            model: options.cursor_model,
+            projectRoot,
+            env: sessionEnv,
+          });
+        }
+        await verifyCursorQualificationProvider(cursorProvider);
+        sessionEnv = await cursorHostEnvironment(
+          cursorProvider.cursorHome,
+          join(sessionRoot, "cursor-host"),
+          sessionEnv,
+        );
+        installedPluginRoot = cursorProvider.cacheRoot;
       }
       const command = buildRoutingHostCommand({
         host,
         executable: host === "codex" ? (options.codex_command ?? "codex") : (options.cursor_command ?? "cursor-agent"),
         projectRoot,
-        pluginRoot: authenticated.pluginRoot,
+        pluginRoot: host === "cursor" ? cursorProvider.cacheRoot : authenticated.pluginRoot,
         installedPluginRoot,
         codexHome,
         model: host === "codex" ? (options.codex_model ?? DEFAULT_CODEX_MODEL) : options.cursor_model,
@@ -1084,6 +1314,7 @@ async function main(argv) {
       } catch (error) {
         fail(`${error.message}; capture ${capture.metadataPath}`);
       }
+      if (host === "cursor") await verifyCursorQualificationProvider(cursorProvider);
       if (id === "proof_observational") {
         await requireMissingRetrievalProjection({
           cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv,

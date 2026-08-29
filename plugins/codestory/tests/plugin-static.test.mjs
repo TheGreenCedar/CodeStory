@@ -7595,6 +7595,10 @@ test("Cursor plugin-data inference is identity-bound and local overrides use PLU
       launcherTest.readCursorLocalOverrides(pluginRoot, { env: dogfoodEnv, home }),
       { CODESTORY_CLI: cliPath },
     );
+    assert.deepEqual(
+      launcherTest.readCursorLocalOverrides(cachedPlugin, { env: genericEnv, home }),
+      { CODESTORY_CLI: cliPath },
+    );
 
     const probeLauncher = (env) => spawnSync(
       process.execPath,
@@ -7615,6 +7619,36 @@ test("Cursor plugin-data inference is identity-bound and local overrides use PLU
     });
     assert.equal(launcherProbe.status, 0, launcherProbe.stderr);
     assert.deepEqual(JSON.parse(launcherProbe.stdout), { cli: cliPath, data: dataDir });
+
+    for (const invalid of [
+      { schema_version: 1, CODESTORY_CLI: "relative/codestory-cli" },
+      { schema_version: 1, CODESTORY_CLI: cliPath, extra: true },
+    ]) {
+      await writeFile(
+        join(dataDir, launcherTest.cursorLocalOverrideFileName),
+        `${JSON.stringify(invalid)}\n`,
+        "utf8",
+      );
+      assert.equal(
+        launcherTest.readCursorLocalOverrides(cachedPlugin, { env: genericEnv, home }),
+        null,
+      );
+    }
+    const overridePath = join(dataDir, launcherTest.cursorLocalOverrideFileName);
+    const linkedOverride = join(home, "linked-local-overrides.json");
+    await writeFile(linkedOverride, `${JSON.stringify({ schema_version: 1, CODESTORY_CLI: cliPath })}\n`);
+    await rm(overridePath);
+    await symlink(linkedOverride, overridePath);
+    assert.equal(
+      launcherTest.readCursorLocalOverrides(cachedPlugin, { env: genericEnv, home }),
+      null,
+    );
+    await rm(overridePath);
+    await writeFile(
+      overridePath,
+      `${JSON.stringify({ schema_version: 1, CODESTORY_CLI: cliPath })}\n`,
+      "utf8",
+    );
 
     for (const env of [genericEnv, claudeEnv]) {
       const negativeLauncher = probeLauncher({

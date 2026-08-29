@@ -354,9 +354,7 @@ function readCursorLocalOverrides(root = pluginRoot, options = {}) {
     : env.PLUGIN_DATA;
   const dataDir = typeof explicitPluginData === 'string' && path.isAbsolute(explicitPluginData)
     ? explicitPluginData
-    : env[cursorDogfoodMarker] === '1'
-      ? inferredCursorPluginDataDir(root, options.home, { env })
-      : null;
+    : inferredCursorPluginDataDir(root, options.home, { env });
   if (!dataDir) return null;
   const overridePath = path.join(dataDir, cursorLocalOverrideFileName);
   try {
