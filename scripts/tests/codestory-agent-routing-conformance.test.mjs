@@ -1941,6 +1941,17 @@ test("packet continuation and selected-context correlation are exact", () => {
     /cannot call unresolved requested material supported/u,
   );
 
+  const resultBoundPacketReason = baseRun("packet_gap_to_focused_source");
+  resultBoundPacketReason.final.reason_codes = ["evidence_missing"];
+  assert.equal(validate("codex", resultBoundPacketReason).status, "pass");
+
+  const inventedPacketReason = baseRun("packet_gap_to_focused_source");
+  inventedPacketReason.final.reason_codes = ["invented_reason"];
+  assert.throws(
+    () => validate("codex", inventedPacketReason),
+    /reason_codes do not match result-bound codes/u,
+  );
+
   const continuedSourceFallback = baseRun("packet_single_continuation");
   continuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs" });
   continuedSourceFallback.final = finalClaim({

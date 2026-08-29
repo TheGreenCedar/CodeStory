@@ -2318,8 +2318,23 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
   if (claim.material_omissions.length > 0 && claim.outcome === "supported") {
     fail(`${scenarioContract.id} final claim cannot call unresolved requested material supported`);
   }
+  const allowedReasonCodes = new Set(expected.reason_codes);
+  for (const action of actions) {
+    const body = results.get(action)?.body;
+    for (const gap of body?.gaps ?? body?.disposition?.gaps ?? []) {
+      if (nonemptyString(gap?.kind)) allowedReasonCodes.add(gap.kind);
+    }
+    for (const reason of body?.disposition?.reasons ?? []) {
+      if (nonemptyString(reason)) allowedReasonCodes.add(reason);
+    }
+    if (nonemptyString(body?.code)) allowedReasonCodes.add(body.code);
+  }
+  if (claim.reason_codes.some((reason) => !allowedReasonCodes.has(reason))
+      || expected.reason_codes.some((reason) => !claim.reason_codes.includes(reason))) {
+    fail(`${scenarioContract.id} final claim reason_codes do not match result-bound codes`);
+  }
   for (const key of FINAL_CLAIM_KEYS) {
-    if (key === "evidence_ids" || key === "material_omissions") continue;
+    if (["evidence_ids", "reason_codes", "material_omissions"].includes(key)) continue;
     if (!equalJson(claim[key], expected[key])) {
       fail(`${scenarioContract.id} final claim ${key} does not match result-bound evidence`);
     }
