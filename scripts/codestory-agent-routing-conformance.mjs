@@ -574,11 +574,12 @@ function sourceReadPath(command) {
   return normalizePath(path);
 }
 
-function beginAction(state, id, action) {
+function beginAction(state, id, action, allowOverlap = false) {
   if (!id || state.open.has(id) || state.completed.has(id)) fail(`duplicate or missing tool call id ${JSON.stringify(id)}`);
-  if (state.open.size > 0) {
+  if (!allowOverlap && state.open.size > 0) {
     fail(`tool call ${JSON.stringify(id)} started before ${JSON.stringify([...state.open.keys()][0])} completed`);
   }
+  action.overlaps = [...state.open.values()];
   state.open.set(id, action);
   state.actions.push(action);
 }
@@ -618,7 +619,7 @@ function parseCodex(events) {
           tool: tool ?? String(item.tool ?? item.name ?? "unknown"),
           args: item.arguments ?? item.args ?? {},
           server: String(item.server ?? ""),
-        });
+        }, true);
       } else if (itemType === "command_execution") {
         const path = sourceReadPath(item.command);
         beginAction(state, String(item.id ?? ""), {
@@ -626,13 +627,13 @@ function parseCodex(events) {
           tool: path ? "source_read" : "shell",
           path,
           command: String(item.command ?? ""),
-        });
+        }, true);
       } else {
         beginAction(state, String(item.id ?? ""), {
           kind: "external_tool",
           tool: itemType || "unknown",
           args: item.arguments ?? {},
-        });
+        }, true);
       }
       continue;
     }
@@ -2471,6 +2472,10 @@ function productRoutingActions(host, actions, installedPluginRoot, expectedIdent
     } else {
       product.push(action);
     }
+  }
+  const productActions = new Set(product);
+  if (product.some((action) => action.overlaps.some((other) => productActions.has(other)))) {
+    fail("Codex transcript contains overlapping product actions");
   }
   return product;
 }

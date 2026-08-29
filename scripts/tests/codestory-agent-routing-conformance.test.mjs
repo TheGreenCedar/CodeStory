@@ -901,6 +901,24 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
   });
   assert.deepEqual(validate("codex", newlineGuidance).actions, ["search"]);
 
+  const concurrentGuidanceEvents = codexJsonl(linkedGuidance)
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  [concurrentGuidanceEvents[2], concurrentGuidanceEvents[3]] = [
+    concurrentGuidanceEvents[3], concurrentGuidanceEvents[2],
+  ];
+  assert.equal(validateInstalledSession({
+    host: "codex",
+    scenarioId: linkedGuidance.scenario_id,
+    request: linkedGuidance.request,
+    installedRoot,
+    installedReceipt,
+    expectedIdentity: EXPECTED_IDENTITY,
+    installedPluginRoot: codexPluginRoot,
+    transcript: `${concurrentGuidanceEvents.map(JSON.stringify).join("\n")}\n`,
+  }).status, "pass");
+
   const countedGuidance = baseRun("exact_symbol_search");
   const countedPaths = codexGuidancePaths.slice(1, 3).map((path) => join(codexPluginRoot, path));
   countedGuidance.steps.unshift(
@@ -1237,10 +1255,19 @@ test("actual parsers reject malformed, incomplete, and cross-host transcripts", 
     .split("\n")
     .map((line) => JSON.parse(line));
   [overlapping[2], overlapping[3]] = [overlapping[3], overlapping[2]];
-  assert.throws(
-    () => parseInstalledTranscript("codex", `${overlapping.map(JSON.stringify).join("\n")}\n`),
-    /started before .* completed/u,
-  );
+  const overlappingTranscript = `${overlapping.map(JSON.stringify).join("\n")}\n`;
+  assert.equal(parseInstalledTranscript("codex", overlappingTranscript).actions.length, 2);
+  const overlappingRun = baseRun("packet_single_continuation");
+  assert.throws(() => validateInstalledSession({
+    host: "codex",
+    scenarioId: overlappingRun.scenario_id,
+    request: overlappingRun.request,
+    installedRoot,
+    installedReceipt,
+    expectedIdentity: EXPECTED_IDENTITY,
+    installedPluginRoot: codexPluginRoot,
+    transcript: overlappingTranscript,
+  }), /overlapping product actions/u);
 });
 
 const CURSOR_CAPTURED_DIRECT_READ = [
