@@ -2286,8 +2286,33 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
   const claim = parseFinalClaim(final, scenarioContract.id);
   const expected = expectedFinalClaim(scenarioContract, actions, results);
   for (const key of FINAL_CLAIM_KEYS) {
+    if (key === "evidence_ids") continue;
     if (!equalJson(claim[key], expected[key])) {
       fail(`${scenarioContract.id} final claim ${key} does not match result-bound evidence`);
+    }
+  }
+  const proof = actions.some((action) => action.kind === "prove_call_path");
+  const reads = actions.some((action) => action.kind === "source_read");
+  if (proof || reads) {
+    if (!equalJson(claim.evidence_ids, expected.evidence_ids)) {
+      fail(`${scenarioContract.id} final claim evidence_ids does not match result-bound evidence`);
+    }
+  } else {
+    const allowedEvidenceIds = new Set(expected.evidence_ids);
+    if (claim.evidence_ids.some((evidenceId) => !allowedEvidenceIds.has(evidenceId))
+        || (allowedEvidenceIds.size > 0 && claim.evidence_ids.length === 0)) {
+      fail(`${scenarioContract.id} final claim evidence_ids does not match result-bound evidence`);
+    }
+    const context = actions.filter((action) => action.kind === "context").at(-1);
+    if (context) {
+      const body = results.get(context).body;
+      const targetEvidenceIds = new Set(body.evidence
+        .filter(({ symbol_id: symbolId }) => symbolId === body.target.symbol_id)
+        .map(({ identity }) => identity.evidence_id));
+      if (targetEvidenceIds.size > 0
+          && !claim.evidence_ids.some((evidenceId) => targetEvidenceIds.has(evidenceId))) {
+        fail(`${scenarioContract.id} final claim evidence_ids omit the selected target evidence`);
+      }
     }
   }
   if (claim.runtime_execution_claim) fail(`${scenarioContract.id} final claim makes a runtime execution claim`);

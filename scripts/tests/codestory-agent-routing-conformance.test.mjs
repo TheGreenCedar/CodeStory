@@ -1798,6 +1798,17 @@ test("packet continuation and selected-context correlation are exact", () => {
   });
   assert.throws(() => validate("codex", ambiguousPath), /selected target does not identify exactly one/u);
 
+  const focusedEvidence = clone(mappedPath);
+  mutateBody(focusedEvidence, 1, (body) => {
+    body.evidence.push(v3ContextEvidence("other-context", "src/two.rs", "rust:crate::two::Thing"));
+  });
+  focusedEvidence.final.evidence_ids = ["context-1"];
+  assert.equal(validate("codex", focusedEvidence).status, "pass");
+
+  const unrelatedEvidence = clone(focusedEvidence);
+  unrelatedEvidence.final.evidence_ids = ["other-context"];
+  assert.throws(() => validate("codex", unrelatedEvidence), /omit the selected target evidence/u);
+
   const initialProbe = baseRun("packet_gap_to_focused_source");
   initialProbe.steps[0].args.probes = [{ kind: "exact_path", path: "src/gap.rs" }];
   assert.throws(() => validate("codex", initialProbe), /initial packet arguments/u);
