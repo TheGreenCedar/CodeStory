@@ -1187,6 +1187,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /typed proof.*receipt_id.*never copy fact_id or edge_id/u);
     assert.match(prompt, /refutation_basis.*refutation\.kind string.*never the whole refutation object/u);
     assert.match(prompt, /typed proof gap has no gap_id.*disposition\.gaps\[\]\.kind.*reason_codes/u);
+    assert.match(prompt, /diagnostics\.availability.*optional diagnostics artifact.*never copy it into outcome or reason_codes/u);
     assert.match(prompt, /never grep, rg, search, or probe the installed plugin package/u);
   }
   const discoveryPrompt = materialized.find(({ scenario_id }) => scenario_id === "exact_symbol_search").request.text;
@@ -1970,6 +1971,14 @@ test("packet continuation and selected-context correlation are exact", () => {
     /reason_codes do not match result-bound codes/u,
   );
 
+  const diagnosticsOnlyUnavailable = baseRun("selected_target_context");
+  diagnosticsOnlyUnavailable.final.outcome = "unavailable";
+  diagnosticsOnlyUnavailable.final.reason_codes = ["unavailable"];
+  assert.throws(
+    () => validate("codex", diagnosticsOnlyUnavailable),
+    /reason_codes do not match result-bound codes/u,
+  );
+
   const continuedSourceFallback = baseRun("packet_single_continuation");
   continuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs" });
   continuedSourceFallback.final = finalClaim({
@@ -2134,6 +2143,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     assert.match(guidance, /`unknown`.*not absence/isu, label);
     assert.match(guidance, /runtime execution/iu, label);
     assert.match(guidance, /typed `Unavailable`.*terminal/isu, label);
+    assert.match(guidance, /diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu, label);
     assert.match(guidance, /transport.*tool absence.*source/isu, label);
   }
   assert.match(openAiMetadata, /search.*context.*packet.*prove_call_path/isu);

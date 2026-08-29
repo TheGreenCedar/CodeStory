@@ -81,6 +81,9 @@ plugin package to locate a documented field or excerpt.
   returned gap. Never turn `available` into authority for a claim the rows do
   not establish. When a returned gap leaves requested material unresolved, the
   final outcome remains unknown even if the result also contains useful evidence.
+- `diagnostics.availability` describes only the optional diagnostics artifact.
+  It never overrides the result's top-level `status`, creates a gap, or supplies
+  an `unavailable` outcome or reason code.
 - A successful discovery-only `search` is terminal for that turn unless the
   request already supplied one exact selection criterion. That exception may
   map the unique matching non-null `evidence[].symbol_id` into `context.id`;
