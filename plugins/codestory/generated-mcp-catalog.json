@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "e6491ad17e3f77bdd934521985ee28b2b739fcae0b6eb9dab00716b5cd23fd26",
-      "2025-03-26": "7213f725efc783303c76b7704e8c3a495ad9ff4f9f0c1a9baafcc444d5d4e62b",
-      "2025-06-18": "119f6a6be9aac6e231813dd47ae736f51ac835ada3b412ae2dd90a0035faa616",
-      "2025-11-25": "5de232e1a3f031318ad08e5dfbef6dab833a19ca00466f5a166a45c4ae1321f2"
+      "2024-11-05": "5a84ba490ea74bb9eb9fe6afcfdd8f493e2e861a8cb5e378bf644f7fe7238289",
+      "2025-03-26": "947a069f04d533ab74c85782db85ae514ff77688ce26c6a7b92cfc8bfc825111",
+      "2025-06-18": "03bbc62254963de6aa9af39983c5f175637f144685a370d628259436560764d7",
+      "2025-11-25": "fdbf164afa86f84684069ade2304905acca820b6424dacd0aa61346f1dd759b4"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "e6491ad17e3f77bdd934521985ee28b2b739fcae0b6eb9dab00716b5cd23fd26",
+      "discoveryContractSha256": "5a84ba490ea74bb9eb9fe6afcfdd8f493e2e861a8cb5e378bf644f7fe7238289",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -551,7 +551,8 @@
                   "route_tracing",
                   "symbol_ownership",
                   "data_flow",
-                  "edit_planning"
+                  "edit_planning",
+                  null
                 ],
                 "type": [
                   "string",
@@ -2508,7 +2509,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "7213f725efc783303c76b7704e8c3a495ad9ff4f9f0c1a9baafcc444d5d4e62b",
+      "discoveryContractSha256": "947a069f04d533ab74c85782db85ae514ff77688ce26c6a7b92cfc8bfc825111",
       "tools": [
         {
           "annotations": {
@@ -3052,7 +3053,8 @@
                   "route_tracing",
                   "symbol_ownership",
                   "data_flow",
-                  "edit_planning"
+                  "edit_planning",
+                  null
                 ],
                 "type": [
                   "string",
@@ -5105,7 +5107,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "119f6a6be9aac6e231813dd47ae736f51ac835ada3b412ae2dd90a0035faa616",
+      "discoveryContractSha256": "03bbc62254963de6aa9af39983c5f175637f144685a370d628259436560764d7",
       "tools": [
         {
           "_meta": {
@@ -5835,7 +5837,8 @@
                   "route_tracing",
                   "symbol_ownership",
                   "data_flow",
-                  "edit_planning"
+                  "edit_planning",
+                  null
                 ],
                 "type": [
                   "string",
@@ -5860,41 +5863,45 @@
                         "additionalProperties": false,
                         "properties": {
                           "continuation": {
-                            "additionalProperties": false,
-                            "properties": {
-                              "continuation_id": {
-                                "type": "string"
-                              },
-                              "gap_ids": {
-                                "items": {
-                                  "additionalProperties": false,
-                                  "properties": {
-                                    "gap_id": {
-                                      "type": "string"
-                                    }
+                            "anyOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "continuation_id": {
+                                    "type": "string"
                                   },
-                                  "required": [
-                                    "gap_id"
-                                  ],
-                                  "type": "object"
+                                  "gap_ids": {
+                                    "items": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "gap_id": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "gap_id"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "maxItems": 256,
+                                    "type": "array"
+                                  },
+                                  "remaining_rounds": {
+                                    "maximum": 65535,
+                                    "minimum": 1,
+                                    "type": "integer"
+                                  }
                                 },
-                                "maxItems": 256,
-                                "type": "array"
+                                "required": [
+                                  "continuation_id",
+                                  "remaining_rounds",
+                                  "gap_ids"
+                                ],
+                                "type": "object"
                               },
-                              "remaining_rounds": {
-                                "maximum": 65535,
-                                "minimum": 1,
-                                "type": "integer"
+                              {
+                                "type": "null"
                               }
-                            },
-                            "required": [
-                              "continuation_id",
-                              "remaining_rounds",
-                              "gap_ids"
-                            ],
-                            "type": [
-                              "object",
-                              "null"
                             ]
                           },
                           "diagnostics": {
@@ -5970,10 +5977,14 @@
                               "additionalProperties": false,
                               "properties": {
                                 "end_line": {
-                                  "minimum": 0,
-                                  "type": [
-                                    "integer",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "identity": {
@@ -5998,28 +6009,44 @@
                                   "type": "string"
                                 },
                                 "path": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "start_line": {
-                                  "minimum": 0,
-                                  "type": [
-                                    "integer",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "summary": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "symbol_id": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 }
                               },
@@ -6064,9 +6091,13 @@
                                   "type": "string"
                                 },
                                 "message": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 }
                               },
@@ -6132,36 +6163,40 @@
                                 "type": "object"
                               },
                               "retrieval": {
-                                "additionalProperties": false,
-                                "properties": {
-                                  "core_generation_id": {
-                                    "type": "string"
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "core_generation_id": {
+                                        "type": "string"
+                                      },
+                                      "core_run_id": {
+                                        "type": "string"
+                                      },
+                                      "retrieval_generation": {
+                                        "type": "string"
+                                      },
+                                      "retrieval_input_sha256": {
+                                        "maxLength": 64,
+                                        "minLength": 64,
+                                        "type": "string"
+                                      },
+                                      "semantic_generation": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "core_generation_id",
+                                      "core_run_id",
+                                      "retrieval_generation",
+                                      "retrieval_input_sha256",
+                                      "semantic_generation"
+                                    ],
+                                    "type": "object"
                                   },
-                                  "core_run_id": {
-                                    "type": "string"
-                                  },
-                                  "retrieval_generation": {
-                                    "type": "string"
-                                  },
-                                  "retrieval_input_sha256": {
-                                    "maxLength": 64,
-                                    "minLength": 64,
-                                    "type": "string"
-                                  },
-                                  "semantic_generation": {
-                                    "type": "string"
+                                  {
+                                    "type": "null"
                                   }
-                                },
-                                "required": [
-                                  "core_generation_id",
-                                  "core_run_id",
-                                  "retrieval_generation",
-                                  "retrieval_input_sha256",
-                                  "semantic_generation"
-                                ],
-                                "type": [
-                                  "object",
-                                  "null"
                                 ]
                               }
                             },
@@ -6175,9 +6210,13 @@
                             "additionalProperties": false,
                             "properties": {
                               "generation_id": {
-                                "type": [
-                                  "string",
-                                  "null"
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
                                 ]
                               },
                               "state": {
@@ -6319,9 +6358,13 @@
                                   "type": "string"
                                 },
                                 "message": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 }
                               },
@@ -6392,36 +6435,40 @@
                                 "type": "object"
                               },
                               "retrieval": {
-                                "additionalProperties": false,
-                                "properties": {
-                                  "core_generation_id": {
-                                    "type": "string"
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "core_generation_id": {
+                                        "type": "string"
+                                      },
+                                      "core_run_id": {
+                                        "type": "string"
+                                      },
+                                      "retrieval_generation": {
+                                        "type": "string"
+                                      },
+                                      "retrieval_input_sha256": {
+                                        "maxLength": 64,
+                                        "minLength": 64,
+                                        "type": "string"
+                                      },
+                                      "semantic_generation": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "core_generation_id",
+                                      "core_run_id",
+                                      "retrieval_generation",
+                                      "retrieval_input_sha256",
+                                      "semantic_generation"
+                                    ],
+                                    "type": "object"
                                   },
-                                  "core_run_id": {
-                                    "type": "string"
-                                  },
-                                  "retrieval_generation": {
-                                    "type": "string"
-                                  },
-                                  "retrieval_input_sha256": {
-                                    "maxLength": 64,
-                                    "minLength": 64,
-                                    "type": "string"
-                                  },
-                                  "semantic_generation": {
-                                    "type": "string"
+                                  {
+                                    "type": "null"
                                   }
-                                },
-                                "required": [
-                                  "core_generation_id",
-                                  "core_run_id",
-                                  "retrieval_generation",
-                                  "retrieval_input_sha256",
-                                  "semantic_generation"
-                                ],
-                                "type": [
-                                  "object",
-                                  "null"
                                 ]
                               }
                             },
@@ -6439,9 +6486,13 @@
                             "additionalProperties": false,
                             "properties": {
                               "generation_id": {
-                                "type": [
-                                  "string",
-                                  "null"
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
                                 ]
                               },
                               "state": {
@@ -6609,41 +6660,45 @@
                     "additionalProperties": false,
                     "properties": {
                       "continuation": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "continuation_id": {
-                            "type": "string"
-                          },
-                          "gap_ids": {
-                            "items": {
-                              "additionalProperties": false,
-                              "properties": {
-                                "gap_id": {
-                                  "type": "string"
-                                }
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "continuation_id": {
+                                "type": "string"
                               },
-                              "required": [
-                                "gap_id"
-                              ],
-                              "type": "object"
+                              "gap_ids": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "gap_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "gap_id"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 256,
+                                "type": "array"
+                              },
+                              "remaining_rounds": {
+                                "maximum": 65535,
+                                "minimum": 1,
+                                "type": "integer"
+                              }
                             },
-                            "maxItems": 256,
-                            "type": "array"
+                            "required": [
+                              "continuation_id",
+                              "remaining_rounds",
+                              "gap_ids"
+                            ],
+                            "type": "object"
                           },
-                          "remaining_rounds": {
-                            "maximum": 65535,
-                            "minimum": 1,
-                            "type": "integer"
+                          {
+                            "type": "null"
                           }
-                        },
-                        "required": [
-                          "continuation_id",
-                          "remaining_rounds",
-                          "gap_ids"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
                         ]
                       },
                       "diagnostics": {
@@ -6719,16 +6774,24 @@
                           "additionalProperties": false,
                           "properties": {
                             "end_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "excerpt": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "identity": {
@@ -6747,16 +6810,24 @@
                               "type": "string"
                             },
                             "start_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "symbol_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -6800,9 +6871,13 @@
                               "type": "string"
                             },
                             "message": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -6868,36 +6943,40 @@
                             "type": "object"
                           },
                           "retrieval": {
-                            "additionalProperties": false,
-                            "properties": {
-                              "core_generation_id": {
-                                "type": "string"
+                            "anyOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "type": "string"
+                                  },
+                                  "core_run_id": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_generation": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_input_sha256": {
+                                    "maxLength": 64,
+                                    "minLength": 64,
+                                    "type": "string"
+                                  },
+                                  "semantic_generation": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "core_generation_id",
+                                  "core_run_id",
+                                  "retrieval_generation",
+                                  "retrieval_input_sha256",
+                                  "semantic_generation"
+                                ],
+                                "type": "object"
                               },
-                              "core_run_id": {
-                                "type": "string"
-                              },
-                              "retrieval_generation": {
-                                "type": "string"
-                              },
-                              "retrieval_input_sha256": {
-                                "maxLength": 64,
-                                "minLength": 64,
-                                "type": "string"
-                              },
-                              "semantic_generation": {
-                                "type": "string"
+                              {
+                                "type": "null"
                               }
-                            },
-                            "required": [
-                              "core_generation_id",
-                              "core_run_id",
-                              "retrieval_generation",
-                              "retrieval_input_sha256",
-                              "semantic_generation"
-                            ],
-                            "type": [
-                              "object",
-                              "null"
                             ]
                           }
                         },
@@ -6911,9 +6990,13 @@
                         "additionalProperties": false,
                         "properties": {
                           "generation_id": {
-                            "type": [
-                              "string",
-                              "null"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           },
                           "state": {
@@ -8252,7 +8335,8 @@
                                 "renamed",
                                 "copied",
                                 "untracked",
-                                "unknown"
+                                "unknown",
+                                null
                               ],
                               "type": [
                                 "string",
@@ -8455,7 +8539,8 @@
                                 "renamed",
                                 "copied",
                                 "untracked",
-                                "unknown"
+                                "unknown",
+                                null
                               ],
                               "type": [
                                 "string",
@@ -12699,41 +12784,45 @@
                     "additionalProperties": false,
                     "properties": {
                       "continuation": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "continuation_id": {
-                            "type": "string"
-                          },
-                          "gap_ids": {
-                            "items": {
-                              "additionalProperties": false,
-                              "properties": {
-                                "gap_id": {
-                                  "type": "string"
-                                }
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "continuation_id": {
+                                "type": "string"
                               },
-                              "required": [
-                                "gap_id"
-                              ],
-                              "type": "object"
+                              "gap_ids": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "gap_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "gap_id"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 256,
+                                "type": "array"
+                              },
+                              "remaining_rounds": {
+                                "maximum": 65535,
+                                "minimum": 1,
+                                "type": "integer"
+                              }
                             },
-                            "maxItems": 256,
-                            "type": "array"
+                            "required": [
+                              "continuation_id",
+                              "remaining_rounds",
+                              "gap_ids"
+                            ],
+                            "type": "object"
                           },
-                          "remaining_rounds": {
-                            "maximum": 65535,
-                            "minimum": 1,
-                            "type": "integer"
+                          {
+                            "type": "null"
                           }
-                        },
-                        "required": [
-                          "continuation_id",
-                          "remaining_rounds",
-                          "gap_ids"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
                         ]
                       },
                       "diagnostics": {
@@ -12809,16 +12898,24 @@
                           "additionalProperties": false,
                           "properties": {
                             "end_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "excerpt": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "identity": {
@@ -12837,16 +12934,24 @@
                               "type": "string"
                             },
                             "start_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "symbol_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -12890,9 +12995,13 @@
                               "type": "string"
                             },
                             "message": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -12958,36 +13067,40 @@
                             "type": "object"
                           },
                           "retrieval": {
-                            "additionalProperties": false,
-                            "properties": {
-                              "core_generation_id": {
-                                "type": "string"
+                            "anyOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "type": "string"
+                                  },
+                                  "core_run_id": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_generation": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_input_sha256": {
+                                    "maxLength": 64,
+                                    "minLength": 64,
+                                    "type": "string"
+                                  },
+                                  "semantic_generation": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "core_generation_id",
+                                  "core_run_id",
+                                  "retrieval_generation",
+                                  "retrieval_input_sha256",
+                                  "semantic_generation"
+                                ],
+                                "type": "object"
                               },
-                              "core_run_id": {
-                                "type": "string"
-                              },
-                              "retrieval_generation": {
-                                "type": "string"
-                              },
-                              "retrieval_input_sha256": {
-                                "maxLength": 64,
-                                "minLength": 64,
-                                "type": "string"
-                              },
-                              "semantic_generation": {
-                                "type": "string"
+                              {
+                                "type": "null"
                               }
-                            },
-                            "required": [
-                              "core_generation_id",
-                              "core_run_id",
-                              "retrieval_generation",
-                              "retrieval_input_sha256",
-                              "semantic_generation"
-                            ],
-                            "type": [
-                              "object",
-                              "null"
                             ]
                           }
                         },
@@ -13016,15 +13129,23 @@
                         "additionalProperties": false,
                         "properties": {
                           "path": {
-                            "type": [
-                              "string",
-                              "null"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           },
                           "symbol_id": {
-                            "type": [
-                              "string",
-                              "null"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           }
                         },
@@ -13938,29 +14059,37 @@
                           "type": "array"
                         },
                         "non_material_kind": {
-                          "enum": [
-                            "whitespace",
-                            "punctuation",
-                            "connector",
-                            "commentary"
-                          ],
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "enum": [
+                                "whitespace",
+                                "punctuation",
+                                "connector",
+                                "commentary"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "quote": {
                           "type": "string"
                         },
                         "reason": {
-                          "enum": [
-                            "missing_selector_resolution",
-                            "ambiguous_selector_resolution",
-                            "unsupported_interpretation"
-                          ],
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "enum": [
+                                "missing_selector_resolution",
+                                "ambiguous_selector_resolution",
+                                "unsupported_interpretation"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "start": {
@@ -14676,34 +14805,50 @@
                           "additionalProperties": false,
                           "properties": {
                             "file_node_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "indexed_sha256": {
-                              "maxLength": 64,
-                              "minLength": 64,
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "observed_sha256": {
-                              "maxLength": 64,
-                              "minLength": 64,
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "project_file_components": {
-                              "items": {
-                                "type": "string"
-                              },
-                              "type": [
-                                "array",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "items": {
+                                    "type": "string"
+                                  },
+                                  "type": "array"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -14770,25 +14915,37 @@
                           "additionalProperties": false,
                           "properties": {
                             "canonical_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "file": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "node_id": {
                               "type": "string"
                             },
                             "qualified_name": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -15013,13 +15170,17 @@
                                   "type": "string"
                                 },
                                 "project_file_components": {
-                                  "items": {
-                                    "type": "string"
-                                  },
-                                  "minItems": 1,
-                                  "type": [
-                                    "array",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "items": {
+                                        "type": "string"
+                                      },
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "qualified_name": {
@@ -15102,13 +15263,17 @@
                                   "type": "string"
                                 },
                                 "project_file_components": {
-                                  "items": {
-                                    "type": "string"
-                                  },
-                                  "minItems": 1,
-                                  "type": [
-                                    "array",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "items": {
+                                        "type": "string"
+                                      },
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "qualified_name": {
@@ -15190,13 +15355,17 @@
                                 "type": "string"
                               },
                               "project_file_components": {
-                                "items": {
-                                  "type": "string"
-                                },
-                                "minItems": 1,
-                                "type": [
-                                  "array",
-                                  "null"
+                                "anyOf": [
+                                  {
+                                    "items": {
+                                      "type": "string"
+                                    },
+                                    "minItems": 1,
+                                    "type": "array"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
                                 ]
                               },
                               "qualified_name": {
@@ -15353,13 +15522,17 @@
                                       "type": "string"
                                     },
                                     "project_file_components": {
-                                      "items": {
-                                        "type": "string"
-                                      },
-                                      "minItems": 1,
-                                      "type": [
-                                        "array",
-                                        "null"
+                                      "anyOf": [
+                                        {
+                                          "items": {
+                                            "type": "string"
+                                          },
+                                          "minItems": 1,
+                                          "type": "array"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
                                       ]
                                     },
                                     "qualified_name": {
@@ -15469,10 +15642,14 @@
                       "additionalProperties": false,
                       "properties": {
                         "receipt": {
-                          "minimum": 0,
-                          "type": [
-                            "integer",
-                            "null"
+                          "anyOf": [
+                            {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "status": {
@@ -15719,7 +15896,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "5de232e1a3f031318ad08e5dfbef6dab833a19ca00466f5a166a45c4ae1321f2",
+      "discoveryContractSha256": "fdbf164afa86f84684069ade2304905acca820b6424dacd0aa61346f1dd759b4",
       "tools": [
         {
           "_meta": {
@@ -16449,7 +16626,8 @@
                   "route_tracing",
                   "symbol_ownership",
                   "data_flow",
-                  "edit_planning"
+                  "edit_planning",
+                  null
                 ],
                 "type": [
                   "string",
@@ -16474,41 +16652,45 @@
                         "additionalProperties": false,
                         "properties": {
                           "continuation": {
-                            "additionalProperties": false,
-                            "properties": {
-                              "continuation_id": {
-                                "type": "string"
-                              },
-                              "gap_ids": {
-                                "items": {
-                                  "additionalProperties": false,
-                                  "properties": {
-                                    "gap_id": {
-                                      "type": "string"
-                                    }
+                            "anyOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "continuation_id": {
+                                    "type": "string"
                                   },
-                                  "required": [
-                                    "gap_id"
-                                  ],
-                                  "type": "object"
+                                  "gap_ids": {
+                                    "items": {
+                                      "additionalProperties": false,
+                                      "properties": {
+                                        "gap_id": {
+                                          "type": "string"
+                                        }
+                                      },
+                                      "required": [
+                                        "gap_id"
+                                      ],
+                                      "type": "object"
+                                    },
+                                    "maxItems": 256,
+                                    "type": "array"
+                                  },
+                                  "remaining_rounds": {
+                                    "maximum": 65535,
+                                    "minimum": 1,
+                                    "type": "integer"
+                                  }
                                 },
-                                "maxItems": 256,
-                                "type": "array"
+                                "required": [
+                                  "continuation_id",
+                                  "remaining_rounds",
+                                  "gap_ids"
+                                ],
+                                "type": "object"
                               },
-                              "remaining_rounds": {
-                                "maximum": 65535,
-                                "minimum": 1,
-                                "type": "integer"
+                              {
+                                "type": "null"
                               }
-                            },
-                            "required": [
-                              "continuation_id",
-                              "remaining_rounds",
-                              "gap_ids"
-                            ],
-                            "type": [
-                              "object",
-                              "null"
                             ]
                           },
                           "diagnostics": {
@@ -16584,10 +16766,14 @@
                               "additionalProperties": false,
                               "properties": {
                                 "end_line": {
-                                  "minimum": 0,
-                                  "type": [
-                                    "integer",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "identity": {
@@ -16612,28 +16798,44 @@
                                   "type": "string"
                                 },
                                 "path": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "start_line": {
-                                  "minimum": 0,
-                                  "type": [
-                                    "integer",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "summary": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "symbol_id": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 }
                               },
@@ -16678,9 +16880,13 @@
                                   "type": "string"
                                 },
                                 "message": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 }
                               },
@@ -16746,36 +16952,40 @@
                                 "type": "object"
                               },
                               "retrieval": {
-                                "additionalProperties": false,
-                                "properties": {
-                                  "core_generation_id": {
-                                    "type": "string"
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "core_generation_id": {
+                                        "type": "string"
+                                      },
+                                      "core_run_id": {
+                                        "type": "string"
+                                      },
+                                      "retrieval_generation": {
+                                        "type": "string"
+                                      },
+                                      "retrieval_input_sha256": {
+                                        "maxLength": 64,
+                                        "minLength": 64,
+                                        "type": "string"
+                                      },
+                                      "semantic_generation": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "core_generation_id",
+                                      "core_run_id",
+                                      "retrieval_generation",
+                                      "retrieval_input_sha256",
+                                      "semantic_generation"
+                                    ],
+                                    "type": "object"
                                   },
-                                  "core_run_id": {
-                                    "type": "string"
-                                  },
-                                  "retrieval_generation": {
-                                    "type": "string"
-                                  },
-                                  "retrieval_input_sha256": {
-                                    "maxLength": 64,
-                                    "minLength": 64,
-                                    "type": "string"
-                                  },
-                                  "semantic_generation": {
-                                    "type": "string"
+                                  {
+                                    "type": "null"
                                   }
-                                },
-                                "required": [
-                                  "core_generation_id",
-                                  "core_run_id",
-                                  "retrieval_generation",
-                                  "retrieval_input_sha256",
-                                  "semantic_generation"
-                                ],
-                                "type": [
-                                  "object",
-                                  "null"
                                 ]
                               }
                             },
@@ -16789,9 +16999,13 @@
                             "additionalProperties": false,
                             "properties": {
                               "generation_id": {
-                                "type": [
-                                  "string",
-                                  "null"
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
                                 ]
                               },
                               "state": {
@@ -16933,9 +17147,13 @@
                                   "type": "string"
                                 },
                                 "message": {
-                                  "type": [
-                                    "string",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 }
                               },
@@ -17006,36 +17224,40 @@
                                 "type": "object"
                               },
                               "retrieval": {
-                                "additionalProperties": false,
-                                "properties": {
-                                  "core_generation_id": {
-                                    "type": "string"
+                                "anyOf": [
+                                  {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "core_generation_id": {
+                                        "type": "string"
+                                      },
+                                      "core_run_id": {
+                                        "type": "string"
+                                      },
+                                      "retrieval_generation": {
+                                        "type": "string"
+                                      },
+                                      "retrieval_input_sha256": {
+                                        "maxLength": 64,
+                                        "minLength": 64,
+                                        "type": "string"
+                                      },
+                                      "semantic_generation": {
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "core_generation_id",
+                                      "core_run_id",
+                                      "retrieval_generation",
+                                      "retrieval_input_sha256",
+                                      "semantic_generation"
+                                    ],
+                                    "type": "object"
                                   },
-                                  "core_run_id": {
-                                    "type": "string"
-                                  },
-                                  "retrieval_generation": {
-                                    "type": "string"
-                                  },
-                                  "retrieval_input_sha256": {
-                                    "maxLength": 64,
-                                    "minLength": 64,
-                                    "type": "string"
-                                  },
-                                  "semantic_generation": {
-                                    "type": "string"
+                                  {
+                                    "type": "null"
                                   }
-                                },
-                                "required": [
-                                  "core_generation_id",
-                                  "core_run_id",
-                                  "retrieval_generation",
-                                  "retrieval_input_sha256",
-                                  "semantic_generation"
-                                ],
-                                "type": [
-                                  "object",
-                                  "null"
                                 ]
                               }
                             },
@@ -17053,9 +17275,13 @@
                             "additionalProperties": false,
                             "properties": {
                               "generation_id": {
-                                "type": [
-                                  "string",
-                                  "null"
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
                                 ]
                               },
                               "state": {
@@ -17223,41 +17449,45 @@
                     "additionalProperties": false,
                     "properties": {
                       "continuation": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "continuation_id": {
-                            "type": "string"
-                          },
-                          "gap_ids": {
-                            "items": {
-                              "additionalProperties": false,
-                              "properties": {
-                                "gap_id": {
-                                  "type": "string"
-                                }
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "continuation_id": {
+                                "type": "string"
                               },
-                              "required": [
-                                "gap_id"
-                              ],
-                              "type": "object"
+                              "gap_ids": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "gap_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "gap_id"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 256,
+                                "type": "array"
+                              },
+                              "remaining_rounds": {
+                                "maximum": 65535,
+                                "minimum": 1,
+                                "type": "integer"
+                              }
                             },
-                            "maxItems": 256,
-                            "type": "array"
+                            "required": [
+                              "continuation_id",
+                              "remaining_rounds",
+                              "gap_ids"
+                            ],
+                            "type": "object"
                           },
-                          "remaining_rounds": {
-                            "maximum": 65535,
-                            "minimum": 1,
-                            "type": "integer"
+                          {
+                            "type": "null"
                           }
-                        },
-                        "required": [
-                          "continuation_id",
-                          "remaining_rounds",
-                          "gap_ids"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
                         ]
                       },
                       "diagnostics": {
@@ -17333,16 +17563,24 @@
                           "additionalProperties": false,
                           "properties": {
                             "end_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "excerpt": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "identity": {
@@ -17361,16 +17599,24 @@
                               "type": "string"
                             },
                             "start_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "symbol_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -17414,9 +17660,13 @@
                               "type": "string"
                             },
                             "message": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -17482,36 +17732,40 @@
                             "type": "object"
                           },
                           "retrieval": {
-                            "additionalProperties": false,
-                            "properties": {
-                              "core_generation_id": {
-                                "type": "string"
+                            "anyOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "type": "string"
+                                  },
+                                  "core_run_id": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_generation": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_input_sha256": {
+                                    "maxLength": 64,
+                                    "minLength": 64,
+                                    "type": "string"
+                                  },
+                                  "semantic_generation": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "core_generation_id",
+                                  "core_run_id",
+                                  "retrieval_generation",
+                                  "retrieval_input_sha256",
+                                  "semantic_generation"
+                                ],
+                                "type": "object"
                               },
-                              "core_run_id": {
-                                "type": "string"
-                              },
-                              "retrieval_generation": {
-                                "type": "string"
-                              },
-                              "retrieval_input_sha256": {
-                                "maxLength": 64,
-                                "minLength": 64,
-                                "type": "string"
-                              },
-                              "semantic_generation": {
-                                "type": "string"
+                              {
+                                "type": "null"
                               }
-                            },
-                            "required": [
-                              "core_generation_id",
-                              "core_run_id",
-                              "retrieval_generation",
-                              "retrieval_input_sha256",
-                              "semantic_generation"
-                            ],
-                            "type": [
-                              "object",
-                              "null"
                             ]
                           }
                         },
@@ -17525,9 +17779,13 @@
                         "additionalProperties": false,
                         "properties": {
                           "generation_id": {
-                            "type": [
-                              "string",
-                              "null"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           },
                           "state": {
@@ -18866,7 +19124,8 @@
                                 "renamed",
                                 "copied",
                                 "untracked",
-                                "unknown"
+                                "unknown",
+                                null
                               ],
                               "type": [
                                 "string",
@@ -19069,7 +19328,8 @@
                                 "renamed",
                                 "copied",
                                 "untracked",
-                                "unknown"
+                                "unknown",
+                                null
                               ],
                               "type": [
                                 "string",
@@ -23313,41 +23573,45 @@
                     "additionalProperties": false,
                     "properties": {
                       "continuation": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "continuation_id": {
-                            "type": "string"
-                          },
-                          "gap_ids": {
-                            "items": {
-                              "additionalProperties": false,
-                              "properties": {
-                                "gap_id": {
-                                  "type": "string"
-                                }
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "continuation_id": {
+                                "type": "string"
                               },
-                              "required": [
-                                "gap_id"
-                              ],
-                              "type": "object"
+                              "gap_ids": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "gap_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "gap_id"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 256,
+                                "type": "array"
+                              },
+                              "remaining_rounds": {
+                                "maximum": 65535,
+                                "minimum": 1,
+                                "type": "integer"
+                              }
                             },
-                            "maxItems": 256,
-                            "type": "array"
+                            "required": [
+                              "continuation_id",
+                              "remaining_rounds",
+                              "gap_ids"
+                            ],
+                            "type": "object"
                           },
-                          "remaining_rounds": {
-                            "maximum": 65535,
-                            "minimum": 1,
-                            "type": "integer"
+                          {
+                            "type": "null"
                           }
-                        },
-                        "required": [
-                          "continuation_id",
-                          "remaining_rounds",
-                          "gap_ids"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
                         ]
                       },
                       "diagnostics": {
@@ -23423,16 +23687,24 @@
                           "additionalProperties": false,
                           "properties": {
                             "end_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "excerpt": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "identity": {
@@ -23451,16 +23723,24 @@
                               "type": "string"
                             },
                             "start_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "symbol_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -23504,9 +23784,13 @@
                               "type": "string"
                             },
                             "message": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -23572,36 +23856,40 @@
                             "type": "object"
                           },
                           "retrieval": {
-                            "additionalProperties": false,
-                            "properties": {
-                              "core_generation_id": {
-                                "type": "string"
+                            "anyOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "type": "string"
+                                  },
+                                  "core_run_id": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_generation": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_input_sha256": {
+                                    "maxLength": 64,
+                                    "minLength": 64,
+                                    "type": "string"
+                                  },
+                                  "semantic_generation": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "core_generation_id",
+                                  "core_run_id",
+                                  "retrieval_generation",
+                                  "retrieval_input_sha256",
+                                  "semantic_generation"
+                                ],
+                                "type": "object"
                               },
-                              "core_run_id": {
-                                "type": "string"
-                              },
-                              "retrieval_generation": {
-                                "type": "string"
-                              },
-                              "retrieval_input_sha256": {
-                                "maxLength": 64,
-                                "minLength": 64,
-                                "type": "string"
-                              },
-                              "semantic_generation": {
-                                "type": "string"
+                              {
+                                "type": "null"
                               }
-                            },
-                            "required": [
-                              "core_generation_id",
-                              "core_run_id",
-                              "retrieval_generation",
-                              "retrieval_input_sha256",
-                              "semantic_generation"
-                            ],
-                            "type": [
-                              "object",
-                              "null"
                             ]
                           }
                         },
@@ -23630,15 +23918,23 @@
                         "additionalProperties": false,
                         "properties": {
                           "path": {
-                            "type": [
-                              "string",
-                              "null"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           },
                           "symbol_id": {
-                            "type": [
-                              "string",
-                              "null"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           }
                         },
@@ -24552,29 +24848,37 @@
                           "type": "array"
                         },
                         "non_material_kind": {
-                          "enum": [
-                            "whitespace",
-                            "punctuation",
-                            "connector",
-                            "commentary"
-                          ],
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "enum": [
+                                "whitespace",
+                                "punctuation",
+                                "connector",
+                                "commentary"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "quote": {
                           "type": "string"
                         },
                         "reason": {
-                          "enum": [
-                            "missing_selector_resolution",
-                            "ambiguous_selector_resolution",
-                            "unsupported_interpretation"
-                          ],
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "enum": [
+                                "missing_selector_resolution",
+                                "ambiguous_selector_resolution",
+                                "unsupported_interpretation"
+                              ],
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "start": {
@@ -25290,34 +25594,50 @@
                           "additionalProperties": false,
                           "properties": {
                             "file_node_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "indexed_sha256": {
-                              "maxLength": 64,
-                              "minLength": 64,
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "observed_sha256": {
-                              "maxLength": 64,
-                              "minLength": 64,
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "maxLength": 64,
+                                  "minLength": 64,
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "project_file_components": {
-                              "items": {
-                                "type": "string"
-                              },
-                              "type": [
-                                "array",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "items": {
+                                    "type": "string"
+                                  },
+                                  "type": "array"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -25384,25 +25704,37 @@
                           "additionalProperties": false,
                           "properties": {
                             "canonical_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "file": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "node_id": {
                               "type": "string"
                             },
                             "qualified_name": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -25627,13 +25959,17 @@
                                   "type": "string"
                                 },
                                 "project_file_components": {
-                                  "items": {
-                                    "type": "string"
-                                  },
-                                  "minItems": 1,
-                                  "type": [
-                                    "array",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "items": {
+                                        "type": "string"
+                                      },
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "qualified_name": {
@@ -25716,13 +26052,17 @@
                                   "type": "string"
                                 },
                                 "project_file_components": {
-                                  "items": {
-                                    "type": "string"
-                                  },
-                                  "minItems": 1,
-                                  "type": [
-                                    "array",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "items": {
+                                        "type": "string"
+                                      },
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "qualified_name": {
@@ -25804,13 +26144,17 @@
                                 "type": "string"
                               },
                               "project_file_components": {
-                                "items": {
-                                  "type": "string"
-                                },
-                                "minItems": 1,
-                                "type": [
-                                  "array",
-                                  "null"
+                                "anyOf": [
+                                  {
+                                    "items": {
+                                      "type": "string"
+                                    },
+                                    "minItems": 1,
+                                    "type": "array"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
                                 ]
                               },
                               "qualified_name": {
@@ -25967,13 +26311,17 @@
                                       "type": "string"
                                     },
                                     "project_file_components": {
-                                      "items": {
-                                        "type": "string"
-                                      },
-                                      "minItems": 1,
-                                      "type": [
-                                        "array",
-                                        "null"
+                                      "anyOf": [
+                                        {
+                                          "items": {
+                                            "type": "string"
+                                          },
+                                          "minItems": 1,
+                                          "type": "array"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
                                       ]
                                     },
                                     "qualified_name": {
@@ -26083,10 +26431,14 @@
                       "additionalProperties": false,
                       "properties": {
                         "receipt": {
-                          "minimum": 0,
-                          "type": [
-                            "integer",
-                            "null"
+                          "anyOf": [
+                            {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "status": {
@@ -27062,7 +27414,8 @@
               "route_tracing",
               "symbol_ownership",
               "data_flow",
-              "edit_planning"
+              "edit_planning",
+              null
             ],
             "type": [
               "string",
@@ -27087,41 +27440,45 @@
                     "additionalProperties": false,
                     "properties": {
                       "continuation": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "continuation_id": {
-                            "type": "string"
-                          },
-                          "gap_ids": {
-                            "items": {
-                              "additionalProperties": false,
-                              "properties": {
-                                "gap_id": {
-                                  "type": "string"
-                                }
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "continuation_id": {
+                                "type": "string"
                               },
-                              "required": [
-                                "gap_id"
-                              ],
-                              "type": "object"
+                              "gap_ids": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "gap_id": {
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "gap_id"
+                                  ],
+                                  "type": "object"
+                                },
+                                "maxItems": 256,
+                                "type": "array"
+                              },
+                              "remaining_rounds": {
+                                "maximum": 65535,
+                                "minimum": 1,
+                                "type": "integer"
+                              }
                             },
-                            "maxItems": 256,
-                            "type": "array"
+                            "required": [
+                              "continuation_id",
+                              "remaining_rounds",
+                              "gap_ids"
+                            ],
+                            "type": "object"
                           },
-                          "remaining_rounds": {
-                            "maximum": 65535,
-                            "minimum": 1,
-                            "type": "integer"
+                          {
+                            "type": "null"
                           }
-                        },
-                        "required": [
-                          "continuation_id",
-                          "remaining_rounds",
-                          "gap_ids"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
                         ]
                       },
                       "diagnostics": {
@@ -27197,10 +27554,14 @@
                           "additionalProperties": false,
                           "properties": {
                             "end_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "identity": {
@@ -27225,28 +27586,44 @@
                               "type": "string"
                             },
                             "path": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "start_line": {
-                              "minimum": 0,
-                              "type": [
-                                "integer",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "summary": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "symbol_id": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -27291,9 +27668,13 @@
                               "type": "string"
                             },
                             "message": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -27359,36 +27740,40 @@
                             "type": "object"
                           },
                           "retrieval": {
-                            "additionalProperties": false,
-                            "properties": {
-                              "core_generation_id": {
-                                "type": "string"
+                            "anyOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "type": "string"
+                                  },
+                                  "core_run_id": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_generation": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_input_sha256": {
+                                    "maxLength": 64,
+                                    "minLength": 64,
+                                    "type": "string"
+                                  },
+                                  "semantic_generation": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "core_generation_id",
+                                  "core_run_id",
+                                  "retrieval_generation",
+                                  "retrieval_input_sha256",
+                                  "semantic_generation"
+                                ],
+                                "type": "object"
                               },
-                              "core_run_id": {
-                                "type": "string"
-                              },
-                              "retrieval_generation": {
-                                "type": "string"
-                              },
-                              "retrieval_input_sha256": {
-                                "maxLength": 64,
-                                "minLength": 64,
-                                "type": "string"
-                              },
-                              "semantic_generation": {
-                                "type": "string"
+                              {
+                                "type": "null"
                               }
-                            },
-                            "required": [
-                              "core_generation_id",
-                              "core_run_id",
-                              "retrieval_generation",
-                              "retrieval_input_sha256",
-                              "semantic_generation"
-                            ],
-                            "type": [
-                              "object",
-                              "null"
                             ]
                           }
                         },
@@ -27402,9 +27787,13 @@
                         "additionalProperties": false,
                         "properties": {
                           "generation_id": {
-                            "type": [
-                              "string",
-                              "null"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           },
                           "state": {
@@ -27546,9 +27935,13 @@
                               "type": "string"
                             },
                             "message": {
-                              "type": [
-                                "string",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             }
                           },
@@ -27619,36 +28012,40 @@
                             "type": "object"
                           },
                           "retrieval": {
-                            "additionalProperties": false,
-                            "properties": {
-                              "core_generation_id": {
-                                "type": "string"
+                            "anyOf": [
+                              {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "core_generation_id": {
+                                    "type": "string"
+                                  },
+                                  "core_run_id": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_generation": {
+                                    "type": "string"
+                                  },
+                                  "retrieval_input_sha256": {
+                                    "maxLength": 64,
+                                    "minLength": 64,
+                                    "type": "string"
+                                  },
+                                  "semantic_generation": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "core_generation_id",
+                                  "core_run_id",
+                                  "retrieval_generation",
+                                  "retrieval_input_sha256",
+                                  "semantic_generation"
+                                ],
+                                "type": "object"
                               },
-                              "core_run_id": {
-                                "type": "string"
-                              },
-                              "retrieval_generation": {
-                                "type": "string"
-                              },
-                              "retrieval_input_sha256": {
-                                "maxLength": 64,
-                                "minLength": 64,
-                                "type": "string"
-                              },
-                              "semantic_generation": {
-                                "type": "string"
+                              {
+                                "type": "null"
                               }
-                            },
-                            "required": [
-                              "core_generation_id",
-                              "core_run_id",
-                              "retrieval_generation",
-                              "retrieval_input_sha256",
-                              "semantic_generation"
-                            ],
-                            "type": [
-                              "object",
-                              "null"
                             ]
                           }
                         },
@@ -27666,9 +28063,13 @@
                         "additionalProperties": false,
                         "properties": {
                           "generation_id": {
-                            "type": [
-                              "string",
-                              "null"
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           },
                           "state": {
@@ -27836,41 +28237,45 @@
                 "additionalProperties": false,
                 "properties": {
                   "continuation": {
-                    "additionalProperties": false,
-                    "properties": {
-                      "continuation_id": {
-                        "type": "string"
-                      },
-                      "gap_ids": {
-                        "items": {
-                          "additionalProperties": false,
-                          "properties": {
-                            "gap_id": {
-                              "type": "string"
-                            }
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "continuation_id": {
+                            "type": "string"
                           },
-                          "required": [
-                            "gap_id"
-                          ],
-                          "type": "object"
+                          "gap_ids": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "gap_id": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "gap_id"
+                              ],
+                              "type": "object"
+                            },
+                            "maxItems": 256,
+                            "type": "array"
+                          },
+                          "remaining_rounds": {
+                            "maximum": 65535,
+                            "minimum": 1,
+                            "type": "integer"
+                          }
                         },
-                        "maxItems": 256,
-                        "type": "array"
+                        "required": [
+                          "continuation_id",
+                          "remaining_rounds",
+                          "gap_ids"
+                        ],
+                        "type": "object"
                       },
-                      "remaining_rounds": {
-                        "maximum": 65535,
-                        "minimum": 1,
-                        "type": "integer"
+                      {
+                        "type": "null"
                       }
-                    },
-                    "required": [
-                      "continuation_id",
-                      "remaining_rounds",
-                      "gap_ids"
-                    ],
-                    "type": [
-                      "object",
-                      "null"
                     ]
                   },
                   "diagnostics": {
@@ -27946,16 +28351,24 @@
                       "additionalProperties": false,
                       "properties": {
                         "end_line": {
-                          "minimum": 0,
-                          "type": [
-                            "integer",
-                            "null"
+                          "anyOf": [
+                            {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "excerpt": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "identity": {
@@ -27974,16 +28387,24 @@
                           "type": "string"
                         },
                         "start_line": {
-                          "minimum": 0,
-                          "type": [
-                            "integer",
-                            "null"
+                          "anyOf": [
+                            {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "symbol_id": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         }
                       },
@@ -28027,9 +28448,13 @@
                           "type": "string"
                         },
                         "message": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         }
                       },
@@ -28095,36 +28520,40 @@
                         "type": "object"
                       },
                       "retrieval": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "core_generation_id": {
-                            "type": "string"
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "core_generation_id": {
+                                "type": "string"
+                              },
+                              "core_run_id": {
+                                "type": "string"
+                              },
+                              "retrieval_generation": {
+                                "type": "string"
+                              },
+                              "retrieval_input_sha256": {
+                                "maxLength": 64,
+                                "minLength": 64,
+                                "type": "string"
+                              },
+                              "semantic_generation": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "core_generation_id",
+                              "core_run_id",
+                              "retrieval_generation",
+                              "retrieval_input_sha256",
+                              "semantic_generation"
+                            ],
+                            "type": "object"
                           },
-                          "core_run_id": {
-                            "type": "string"
-                          },
-                          "retrieval_generation": {
-                            "type": "string"
-                          },
-                          "retrieval_input_sha256": {
-                            "maxLength": 64,
-                            "minLength": 64,
-                            "type": "string"
-                          },
-                          "semantic_generation": {
-                            "type": "string"
+                          {
+                            "type": "null"
                           }
-                        },
-                        "required": [
-                          "core_generation_id",
-                          "core_run_id",
-                          "retrieval_generation",
-                          "retrieval_input_sha256",
-                          "semantic_generation"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
                         ]
                       }
                     },
@@ -28138,9 +28567,13 @@
                     "additionalProperties": false,
                     "properties": {
                       "generation_id": {
-                        "type": [
-                          "string",
-                          "null"
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
                         ]
                       },
                       "state": {
@@ -29479,7 +29912,8 @@
                             "renamed",
                             "copied",
                             "untracked",
-                            "unknown"
+                            "unknown",
+                            null
                           ],
                           "type": [
                             "string",
@@ -29682,7 +30116,8 @@
                             "renamed",
                             "copied",
                             "untracked",
-                            "unknown"
+                            "unknown",
+                            null
                           ],
                           "type": [
                             "string",
@@ -33926,41 +34361,45 @@
                 "additionalProperties": false,
                 "properties": {
                   "continuation": {
-                    "additionalProperties": false,
-                    "properties": {
-                      "continuation_id": {
-                        "type": "string"
-                      },
-                      "gap_ids": {
-                        "items": {
-                          "additionalProperties": false,
-                          "properties": {
-                            "gap_id": {
-                              "type": "string"
-                            }
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "continuation_id": {
+                            "type": "string"
                           },
-                          "required": [
-                            "gap_id"
-                          ],
-                          "type": "object"
+                          "gap_ids": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "gap_id": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "gap_id"
+                              ],
+                              "type": "object"
+                            },
+                            "maxItems": 256,
+                            "type": "array"
+                          },
+                          "remaining_rounds": {
+                            "maximum": 65535,
+                            "minimum": 1,
+                            "type": "integer"
+                          }
                         },
-                        "maxItems": 256,
-                        "type": "array"
+                        "required": [
+                          "continuation_id",
+                          "remaining_rounds",
+                          "gap_ids"
+                        ],
+                        "type": "object"
                       },
-                      "remaining_rounds": {
-                        "maximum": 65535,
-                        "minimum": 1,
-                        "type": "integer"
+                      {
+                        "type": "null"
                       }
-                    },
-                    "required": [
-                      "continuation_id",
-                      "remaining_rounds",
-                      "gap_ids"
-                    ],
-                    "type": [
-                      "object",
-                      "null"
                     ]
                   },
                   "diagnostics": {
@@ -34036,16 +34475,24 @@
                       "additionalProperties": false,
                       "properties": {
                         "end_line": {
-                          "minimum": 0,
-                          "type": [
-                            "integer",
-                            "null"
+                          "anyOf": [
+                            {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "excerpt": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "identity": {
@@ -34064,16 +34511,24 @@
                           "type": "string"
                         },
                         "start_line": {
-                          "minimum": 0,
-                          "type": [
-                            "integer",
-                            "null"
+                          "anyOf": [
+                            {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "symbol_id": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         }
                       },
@@ -34117,9 +34572,13 @@
                           "type": "string"
                         },
                         "message": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         }
                       },
@@ -34185,36 +34644,40 @@
                         "type": "object"
                       },
                       "retrieval": {
-                        "additionalProperties": false,
-                        "properties": {
-                          "core_generation_id": {
-                            "type": "string"
+                        "anyOf": [
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "core_generation_id": {
+                                "type": "string"
+                              },
+                              "core_run_id": {
+                                "type": "string"
+                              },
+                              "retrieval_generation": {
+                                "type": "string"
+                              },
+                              "retrieval_input_sha256": {
+                                "maxLength": 64,
+                                "minLength": 64,
+                                "type": "string"
+                              },
+                              "semantic_generation": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "core_generation_id",
+                              "core_run_id",
+                              "retrieval_generation",
+                              "retrieval_input_sha256",
+                              "semantic_generation"
+                            ],
+                            "type": "object"
                           },
-                          "core_run_id": {
-                            "type": "string"
-                          },
-                          "retrieval_generation": {
-                            "type": "string"
-                          },
-                          "retrieval_input_sha256": {
-                            "maxLength": 64,
-                            "minLength": 64,
-                            "type": "string"
-                          },
-                          "semantic_generation": {
-                            "type": "string"
+                          {
+                            "type": "null"
                           }
-                        },
-                        "required": [
-                          "core_generation_id",
-                          "core_run_id",
-                          "retrieval_generation",
-                          "retrieval_input_sha256",
-                          "semantic_generation"
-                        ],
-                        "type": [
-                          "object",
-                          "null"
                         ]
                       }
                     },
@@ -34243,15 +34706,23 @@
                     "additionalProperties": false,
                     "properties": {
                       "path": {
-                        "type": [
-                          "string",
-                          "null"
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
                         ]
                       },
                       "symbol_id": {
-                        "type": [
-                          "string",
-                          "null"
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
                         ]
                       }
                     },
@@ -35165,29 +35636,37 @@
                       "type": "array"
                     },
                     "non_material_kind": {
-                      "enum": [
-                        "whitespace",
-                        "punctuation",
-                        "connector",
-                        "commentary"
-                      ],
-                      "type": [
-                        "string",
-                        "null"
+                      "anyOf": [
+                        {
+                          "enum": [
+                            "whitespace",
+                            "punctuation",
+                            "connector",
+                            "commentary"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
                       ]
                     },
                     "quote": {
                       "type": "string"
                     },
                     "reason": {
-                      "enum": [
-                        "missing_selector_resolution",
-                        "ambiguous_selector_resolution",
-                        "unsupported_interpretation"
-                      ],
-                      "type": [
-                        "string",
-                        "null"
+                      "anyOf": [
+                        {
+                          "enum": [
+                            "missing_selector_resolution",
+                            "ambiguous_selector_resolution",
+                            "unsupported_interpretation"
+                          ],
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
                       ]
                     },
                     "start": {
@@ -35903,34 +36382,50 @@
                       "additionalProperties": false,
                       "properties": {
                         "file_node_id": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "indexed_sha256": {
-                          "maxLength": 64,
-                          "minLength": 64,
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "observed_sha256": {
-                          "maxLength": 64,
-                          "minLength": 64,
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "maxLength": 64,
+                              "minLength": 64,
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "project_file_components": {
-                          "items": {
-                            "type": "string"
-                          },
-                          "type": [
-                            "array",
-                            "null"
+                          "anyOf": [
+                            {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         }
                       },
@@ -35997,25 +36492,37 @@
                       "additionalProperties": false,
                       "properties": {
                         "canonical_id": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "file": {
-                          "minimum": 0,
-                          "type": [
-                            "integer",
-                            "null"
+                          "anyOf": [
+                            {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         },
                         "node_id": {
                           "type": "string"
                         },
                         "qualified_name": {
-                          "type": [
-                            "string",
-                            "null"
+                          "anyOf": [
+                            {
+                              "type": "string"
+                            },
+                            {
+                              "type": "null"
+                            }
                           ]
                         }
                       },
@@ -36240,13 +36747,17 @@
                               "type": "string"
                             },
                             "project_file_components": {
-                              "items": {
-                                "type": "string"
-                              },
-                              "minItems": 1,
-                              "type": [
-                                "array",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "items": {
+                                    "type": "string"
+                                  },
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "qualified_name": {
@@ -36329,13 +36840,17 @@
                               "type": "string"
                             },
                             "project_file_components": {
-                              "items": {
-                                "type": "string"
-                              },
-                              "minItems": 1,
-                              "type": [
-                                "array",
-                                "null"
+                              "anyOf": [
+                                {
+                                  "items": {
+                                    "type": "string"
+                                  },
+                                  "minItems": 1,
+                                  "type": "array"
+                                },
+                                {
+                                  "type": "null"
+                                }
                               ]
                             },
                             "qualified_name": {
@@ -36417,13 +36932,17 @@
                             "type": "string"
                           },
                           "project_file_components": {
-                            "items": {
-                              "type": "string"
-                            },
-                            "minItems": 1,
-                            "type": [
-                              "array",
-                              "null"
+                            "anyOf": [
+                              {
+                                "items": {
+                                  "type": "string"
+                                },
+                                "minItems": 1,
+                                "type": "array"
+                              },
+                              {
+                                "type": "null"
+                              }
                             ]
                           },
                           "qualified_name": {
@@ -36580,13 +37099,17 @@
                                   "type": "string"
                                 },
                                 "project_file_components": {
-                                  "items": {
-                                    "type": "string"
-                                  },
-                                  "minItems": 1,
-                                  "type": [
-                                    "array",
-                                    "null"
+                                  "anyOf": [
+                                    {
+                                      "items": {
+                                        "type": "string"
+                                      },
+                                      "minItems": 1,
+                                      "type": "array"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
                                   ]
                                 },
                                 "qualified_name": {
@@ -36696,10 +37219,14 @@
                   "additionalProperties": false,
                   "properties": {
                     "receipt": {
-                      "minimum": 0,
-                      "type": [
-                        "integer",
-                        "null"
+                      "anyOf": [
+                        {
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        {
+                          "type": "null"
+                        }
                       ]
                     },
                     "status": {

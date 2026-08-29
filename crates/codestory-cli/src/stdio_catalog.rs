@@ -561,7 +561,15 @@ impl SchemaProperty {
             schema.insert("description".to_string(), json!(description));
         }
         if !self.enum_values.is_empty() {
-            schema.insert("enum".to_string(), json!(self.enum_values));
+            let mut enum_values = self
+                .enum_values
+                .iter()
+                .map(|value| json!(value))
+                .collect::<Vec<_>>();
+            if self.nullable {
+                enum_values.push(Value::Null);
+            }
+            schema.insert("enum".to_string(), Value::Array(enum_values));
         }
         if let Some(default) = self.default {
             schema.insert("default".to_string(), default.to_json());

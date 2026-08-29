@@ -169,10 +169,6 @@ fn validate_value(schema: &Value, value: &Value, pointer: &str, out: &mut Vec<Ar
             ));
             return;
         }
-        // A declared-nullable member carries no further constraints when null.
-        if value.is_null() {
-            return;
-        }
     }
     validate_const(schema, value, pointer, out);
     validate_enum(schema, value, pointer, out);
@@ -1418,6 +1414,12 @@ mod tests {
 
     #[test]
     fn nullable_members_accept_null_and_non_nullable_members_do_not() {
+        assert!(
+            crate::stdio_catalog::tool_input_schema("packet")
+                .and_then(|schema| schema.pointer("/properties/task_class/enum"))
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.contains(&Value::Null))
+        );
         assert_eq!(
             validate_tool_arguments(
                 "packet",
@@ -1431,6 +1433,15 @@ mod tests {
                 json!({"project": "/repo", "question": "why", "budget": null})
             ),
             vec!["invalid_type"]
+        );
+    }
+
+    #[test]
+    fn nullable_type_does_not_bypass_enum_constraints() {
+        let schema = json!({"type":["string","null"],"enum":["ready"]});
+        assert_eq!(
+            codes_from_output(&schema, Value::Null),
+            vec!["invalid_enum_value"]
         );
     }
 

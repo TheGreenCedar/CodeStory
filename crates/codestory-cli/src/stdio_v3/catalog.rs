@@ -890,20 +890,8 @@ fn bounded_array_schema_v3(items: Value, maximum: usize) -> Value {
     json!({"type":"array","items":items,"maxItems":maximum})
 }
 
-fn nullable_schema_v3(mut schema: Value) -> Value {
-    let object = schema
-        .as_object_mut()
-        .expect("v3 nullable schema must be an object");
-    let declared = object
-        .remove("type")
-        .expect("v3 nullable schema must declare its type");
-    let mut types = declared
-        .as_array()
-        .cloned()
-        .unwrap_or_else(|| vec![declared]);
-    types.push(json!("null"));
-    object.insert("type".to_string(), Value::Array(types));
-    schema
+fn nullable_schema_v3(schema: Value) -> Value {
+    json!({"anyOf":[schema,{"type":"null"}]})
 }
 
 fn enum_schema_v3(values: &[&str]) -> Value {
@@ -1355,6 +1343,18 @@ mod tests {
             "required_complete_size": 65537
         });
         let schema = proof_output_schema_v3();
+        assert_eq!(
+            schema.pointer(
+                "/oneOf/0/properties/clauses/items/properties/reason/anyOf/1/type"
+            ),
+            Some(&json!("null"))
+        );
+        assert_eq!(
+            schema.pointer(
+                "/oneOf/0/properties/clauses/items/properties/non_material_kind/anyOf/1/type"
+            ),
+            Some(&json!("null"))
+        );
         assert!(crate::stdio_arguments::validate_structured_content(&schema, &complete).is_ok());
         assert!(crate::stdio_arguments::validate_structured_content(&schema, &budget).is_ok());
         let mut invalid = complete;

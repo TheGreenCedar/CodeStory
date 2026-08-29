@@ -1518,10 +1518,14 @@ fn assert_schema_enum_values(schema: &Value, pointer: &str, expected: &[&str]) {
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("schema should include enum array at {pointer}: {schema}"))
         .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .unwrap_or_else(|| panic!("enum values should be strings at {pointer}: {schema}"))
+        .filter_map(|value| {
+            if value.is_null() {
+                None
+            } else {
+                Some(value.as_str().unwrap_or_else(|| {
+                    panic!("enum values should be strings or null at {pointer}: {schema}")
+                }))
+            }
         })
         .collect();
     for expected_value in expected {
