@@ -479,13 +479,13 @@ function baseRun(scenarioId) {
       run.final = finalClaim({ authority: "source", evidence_ids: ["source:src/named.rs"] });
       break;
     case "exact_symbol_search":
-      run.steps = [mcp("search", { project: "/workspace/repo", query: "ExactThing" }, v3Search({
-        evidence: [v3SearchEvidence("lead-1", "src/lib.rs", "rust:crate::ExactThing")],
+      run.steps = [mcp("search", { project: "/workspace/repo", query: "start" }, v3Search({
+        evidence: [v3SearchEvidence("lead-1", "src/lib.rs", "rust:crate::start")],
       }))];
       run.final = finalClaim({
         authority: "search_lead",
         outcome: "discovery_only",
-        target_id: "rust:crate::ExactThing",
+        target_id: "rust:crate::start",
         evidence_ids: ["lead-1"],
       });
       break;
@@ -1192,6 +1192,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
   }
   const discoveryPrompt = materialized.find(({ scenario_id }) => scenario_id === "exact_symbol_search").request.text;
   assert.match(discoveryPrompt, /discovery candidates only/iu);
+  assert.match(discoveryPrompt, /pass `start` unchanged as the query/iu);
   assert.match(discoveryPrompt, /do not select or verify one in this turn/iu);
   const ambiguousPrompt = materialized.find(({ scenario_id }) => scenario_id === "ambiguous_symbol_then_context").request.text;
   assert.match(ambiguousPrompt, /candidate list for Thing first/iu);
@@ -1971,6 +1972,15 @@ test("packet continuation and selected-context correlation are exact", () => {
     /reason_codes do not match result-bound codes/u,
   );
 
+  for (const scenarioId of ["exact_symbol_search", "ambiguous_symbol_then_context"]) {
+    const rewrittenSearch = baseRun(scenarioId);
+    rewrittenSearch.steps[0].args.query = `declarations named ${rewrittenSearch.steps[0].args.query}`;
+    assert.throws(
+      () => validate("codex", rewrittenSearch),
+      /search query must preserve the exact supplied symbol name/u,
+    );
+  }
+
   const diagnosticsOnlyUnavailable = baseRun("selected_target_context");
   diagnosticsOnlyUnavailable.final.outcome = "unavailable";
   diagnosticsOnlyUnavailable.final.reason_codes = ["unavailable"];
@@ -2138,6 +2148,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     assert.match(guidance, /successful search.*stop.*unless.*exact selection/isu, label);
     assert.match(guidance, /symbol_id.*context.*(?:`id`|\.id)/isu, label);
     assert.match(guidance, /selected target.*`context`/isu, label);
+    assert.match(guidance, /supplied symbol name.*search\.query.*unchanged/isu, label);
     assert.match(guidance, /broad.*`packet`.*continuation.*once/isu, label);
     assert.match(guidance, /host-supplied.*`prove_call_path`/isu, label);
     assert.match(guidance, /`unknown`.*not absence/isu, label);

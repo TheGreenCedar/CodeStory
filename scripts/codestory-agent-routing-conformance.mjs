@@ -72,6 +72,11 @@ export const ROUTING_PACKET_QUESTIONS = deepFreeze({
   packet_named_fallback_to_source: "Explain how the routing catalog works.",
 });
 
+const ROUTING_SEARCH_QUERIES = deepFreeze({
+  exact_symbol_search: "start",
+  ambiguous_symbol_then_context: "Thing",
+});
+
 function deepFreeze(value) {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     for (const child of Object.values(value)) deepFreeze(child);
@@ -2162,6 +2167,15 @@ function validateSelectedContext(scenarioContract, request, actions, results) {
   }
 }
 
+function validateSearchQueries(scenarioContract, actions) {
+  const expected = ROUTING_SEARCH_QUERIES[scenarioContract.id];
+  if (!expected) return;
+  const searches = actions.filter((action) => action.kind === "search");
+  if (searches.length !== 1 || searches[0].args?.query !== expected) {
+    fail(`${scenarioContract.id} search query must preserve the exact supplied symbol name`);
+  }
+}
+
 function validateHiddenDiscovery(scenarioContract, actions, results) {
   const searches = actions.filter((action) => action.kind === "tool_search");
   if (scenarioContract.id !== "hidden_proof_tool_discovery") {
@@ -2527,6 +2541,7 @@ export function validateInstalledSession({
   const actions = productRoutingActions(host, parsed.actions, installedPluginRoot, expectedIdentity);
   validateExpectedMcpAvailability(scenarioContract, actions);
   validateActionOrder(scenarioContract, actions);
+  validateSearchQueries(scenarioContract, actions);
 
   const results = new Map();
   for (const action of actions) {
@@ -2592,6 +2607,7 @@ function validateRoutingGuidance(text, label) {
     [/successful search.*stop.*unless.*exact selection/isu, "preselected-target search exception"],
     [/symbol_id.*context.*(?:`id`|\.id)/isu, "stable context identity mapping"],
     [/selected target.*`context`/isu, "selected-target context authority"],
+    [/supplied symbol name.*search\.query.*unchanged/isu, "exact search query preservation"],
     [/broad.*`packet`.*continuation.*once/isu, "bounded packet routing"],
     [/host-supplied.*`prove_call_path`/isu, "host-supplied proof routing"],
     [/`unknown`.*not absence/isu, "unknown boundary"],

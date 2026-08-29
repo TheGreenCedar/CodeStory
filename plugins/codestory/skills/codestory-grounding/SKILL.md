@@ -91,6 +91,8 @@ plugin package to locate a documented field or excerpt.
   `context`, completed `packet`, and `prove_call_path` results are also terminal
   except for an explicitly returned packet continuation or an exact authorized
   source fallback. Do not raise authority by adding an unrequested source read.
+- Pass an explicitly supplied symbol name to `search.query` unchanged. Do not
+  add descriptive words such as "declarations named" or rewrite the selector.
 - `prove_call_path` is the only surface that returns `contract_proven` or
   `contract_refuted`. It verifies a host-supplied interpretation; it does not
   translate prose. Never call it automatically from a packet, search result,

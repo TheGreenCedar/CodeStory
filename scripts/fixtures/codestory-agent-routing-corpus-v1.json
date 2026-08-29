@@ -8,7 +8,7 @@
     },
     {
       "id": "exact_symbol_search",
-      "prompt": "Find discovery candidates only for declarations named start. Do not select or verify one in this turn.",
+      "prompt": "Find discovery candidates only for the exact symbol name start. Pass `start` unchanged as the query. Do not select or verify one in this turn.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {
