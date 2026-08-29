@@ -1349,7 +1349,8 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none/u);
     assert.match(prompt, /only one raw JSON object and no markdown fence, explanation, prefix, or suffix/u);
     assert.match(prompt, /outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused/u);
-    assert.match(prompt, /For a direct source read, record evidence identity source:<project-relative-path>/u);
+    assert.match(prompt, /For a successful direct source read, record evidence identity source:<project-relative-path>/u);
+    assert.match(prompt, /failed direct read contributes no source evidence identity.*material_omissions instead/u);
     assert.match(prompt, /authorized fallback read after an unavailable CodeStory result may change evidence authority but preserves the earlier unavailable outcome/u);
     assert.match(prompt, /rejected typed interpretation.*authority none.*outcome invalid_contract.*no proof disposition/u);
     assert.match(prompt, /human-readable validation text.*reason_codes empty.*never derive a code/u);

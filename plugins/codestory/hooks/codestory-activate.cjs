@@ -8,9 +8,10 @@ const {
 const SESSION_CONTEXT = [
   'CODESTORY GROUNDING AVAILABLE',
   '',
-  'For repository work, follow the loaded CodeStory rule or codestory-grounding skill and call the tool that matches the task. Resolve the target repository root and pass that exact absolute path as project on every request; the session cwd is only a starting hint.',
-  'Strict routing: user-named file-local work -> direct read; discovery -> search only; selected target -> context; broad evidence -> packet; supplied complete typed contract -> prove_call_path. Never substitute symbol, symbols, definition, or installed-plugin probing for discovery.',
-  'Call status only for diagnostics. If a tool reports preparing, retry that same tool directly after its reported delay without a shell wait; do not ask the user to configure CodeStory.',
+  'For repository work, follow the loaded CodeStory rule or codestory-grounding skill. Resolve the target repository root; pass its exact absolute path as project. The session cwd is only a starting hint.',
+  'Strict routing: named file-local -> direct read; discovery -> search only; selected target -> context; broad -> packet; supplied complete typed contract -> prove_call_path.',
+  'Evidence boundary: cite a direct read only after success. If fallback leaves packet gaps unresolved, keep packet authority and Unknown; never upgrade it to source authority.',
+  'Call status only for diagnostics. On preparing, retry that same tool after its reported delay; no shell wait or user setup.',
   'If the intended CodeStory tool is hidden and tool_search is available, search only for that tool by name, then call it directly.',
 ].join('\n');
 

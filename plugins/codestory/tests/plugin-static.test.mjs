@@ -7280,6 +7280,8 @@ test("session hooks inject one bounded contract and prompt hooks stay silent", a
       assert.match(context, /target repository root/u);
       assert.match(context, /starting hint/u);
       assert.match(context, /search only for that tool by name/u);
+      assert.match(context, /cite a direct read only after success/u);
+      assert.match(context, /fallback leaves packet gaps unresolved.*keep packet authority and Unknown/u);
       assert.doesNotMatch(context, /status first|poll status/u);
       assert.doesNotMatch(context, /truncated/u);
       assert.equal(context.endsWith("directly."), true);
@@ -7514,6 +7516,8 @@ test("Cursor rules share one grounding core and describe their host surfaces tru
   assert.doesNotMatch(pluginRule, /\]\(\.\.\//u);
   assert.match(dogfoodRule, /\]\(\.\.\/\.\.\/docs\/users\/cursor\.md\)/u);
   assert.match(pluginRule, /codestory-grounding.*loaded by the plugin/u);
+  assert.match(pluginRule, /failed read authorizes no source citation or source-backed claim/u);
+  assert.match(pluginRule, /fallback that does not resolve returned packet gaps.*Keep packet authority.*report `unknown`/u);
   assert.match(dogfoodRule, /provides the rule and MCP adapter only/u);
   assert.doesNotMatch(dogfoodRule, /skill is loaded by the plugin/u);
   assert.doesNotMatch(pluginRule, /plugins\/codestory\/skills/u);

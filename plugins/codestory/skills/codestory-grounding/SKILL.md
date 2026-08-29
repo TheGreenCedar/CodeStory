@@ -82,6 +82,8 @@ plugin package to locate a documented field or excerpt.
 ## Evidence Rules
 
 - Treat CodeStory output as evidence, not omniscience.
+- A failed direct file read produces no source evidence. Do not cite the path as
+  read or make a source-backed claim from it; preserve the unresolved material.
 - An irrelevant CodeStory call adds no evidence. Skipping one for a complete,
   file-local surface is a valid use of this router; do not report that as
   plugin unavailability.
