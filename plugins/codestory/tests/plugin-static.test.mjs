@@ -1491,8 +1491,13 @@ test("plugin metadata maps skill and direct stdio server", async () => {
   assert.match(agentMetadata, /type: "mcp"/u);
   assert.match(agentMetadata, /value: "codestory"/u);
   assert.match(agentMetadata, /allow_implicit_invocation: true/u);
-  assert.match(agentMetadata, /search.*context.*packet.*prove_call_path/isu);
-  assert.match(agentMetadata, /unknown.*not absence/isu);
+  assert.match(agentMetadata, /read and follow the loaded codestory-grounding skill/isu);
+  assert.match(agentMetadata, /sole source of truth/isu);
+  assert.match(agentMetadata, /adds no parallel instructions/isu);
+  assert.doesNotMatch(
+    agentMetadata,
+    /search.*context.*packet.*prove_call_path|unknown.*not absence|typed contract/isu,
+  );
   assert.equal(mcp.mcpServers.codestory.command, "node");
   assert.deepEqual(mcp.mcpServers.codestory.args, [
     "./scripts/codestory-mcp.cjs",

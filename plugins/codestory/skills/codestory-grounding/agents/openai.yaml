@@ -1,7 +1,7 @@
 interface:
   display_name: "CodeStory Grounding"
   short_description: "Ground local repositories through CodeStory MCP before source claims, edits, reviews, or test planning."
-  default_prompt: "Use search for discovery leads and stop for that turn after a successful search unless the request already supplied one exact selection criterion; that exception may copy the unique matching non-null symbol_id into context.id and never authorizes source inspection. Use context for one selected target: a user-supplied name is query, while id is only a symbol_id copied from CodeStory. Use packet for broad evidence with at most one continuation, and prove_call_path only for a complete host-supplied typed contract. Preserve unknown as uncertainty, not absence, and never claim runtime execution from structural proof. A typed `Unavailable` result is terminal. MCP transport or tool absence may authorize ordinary source inspection; a successful unavailable result does not unless an exact file or focused gap authorizes it. Pass the target repository's absolute root as project."
+  default_prompt: "Read and follow the loaded codestory-grounding skill. It is the sole source of truth for CodeStory tool routing and evidence boundaries; this metadata adds no parallel instructions."
 dependencies:
   tools:
     - type: "mcp"
