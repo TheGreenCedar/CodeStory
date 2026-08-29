@@ -2417,8 +2417,18 @@ function authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIde
     const trimmed = segment.trim();
     const sed = trimmed.match(/^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u);
     if (sed) return { kind: "sed", endLine: Number(sed[1] ?? sed[2] ?? sed[3]), words: [sed[4]] };
-    const cat = trimmed.match(/^cat\s+(\S+)$/u);
-    if (cat) return { kind: "cat", words: [cat[1]] };
+    const cat = trimmed.match(/^cat\s+(.+)$/u);
+    if (cat) {
+      const words = [];
+      let rest = cat[1].trim();
+      while (rest) {
+        const match = rest.match(/^('[^']*'|"[^"$`\\]*"|\/?[A-Za-z0-9._@+-]+(?:\/[A-Za-z0-9._@+-]+)*)(?:\s+|$)/u);
+        if (!match || !singleShellWord(match[1])) return null;
+        words.push(match[1]);
+        rest = rest.slice(match[0].length).trimStart();
+      }
+      return words.length > 0 ? { kind: "cat", words } : null;
+    }
     const wc = trimmed.match(/^wc\s+-l\s+(.+)$/u);
     if (!wc) return null;
     const words = [];

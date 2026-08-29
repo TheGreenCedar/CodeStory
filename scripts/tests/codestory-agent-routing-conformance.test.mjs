@@ -975,6 +975,14 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
   });
   assert.deepEqual(validate("codex", directGuidance).actions, ["search"]);
 
+  const multiCatGuidance = baseRun("exact_symbol_search");
+  multiCatGuidance.steps.unshift({
+    kind: "shell",
+    command: `/bin/zsh -lc ${JSON.stringify(`cat ${linkedPaths.map((path) => JSON.stringify(path)).join(" ")}`)}`,
+    output: linkedPaths.map((path) => readFileSync(path, "utf8")).join(""),
+  });
+  assert.deepEqual(validate("codex", multiCatGuidance).actions, ["search"]);
+
   const countedRead = baseRun("named_file_direct_read");
   countedRead.steps = [{
     kind: "shell",
