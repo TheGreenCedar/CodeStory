@@ -2375,7 +2375,7 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
   }
   const command = unwrapCodexShell(action.command);
   if (!command || !installedPluginRoot) return null;
-  const reads = command.split(/(?:[ \t]+&&[ \t]+|\r?\n)/u).map((segment) => {
+  const reads = command.split(/(?:[ \t]+&&[ \t]+|[ \t]*;[ \t]*|\r?\n)/u).map((segment) => {
     const trimmed = segment.trim();
     const sed = trimmed.match(/^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u);
     if (sed) return { kind: "sed", endLine: Number(sed[1] ?? sed[2] ?? sed[3]), words: [sed[4]] };

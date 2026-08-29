@@ -919,6 +919,14 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
     transcript: `${concurrentGuidanceEvents.map(JSON.stringify).join("\n")}\n`,
   }).status, "pass");
 
+  const semicolonGuidance = baseRun("exact_symbol_search");
+  semicolonGuidance.steps.unshift({
+    kind: "shell",
+    command: `/bin/zsh -lc ${JSON.stringify(linkedPaths.map((path) => `sed -n '1,260p' ${path}`).join("; "))}`,
+    output: linkedPaths.map((path) => readFileSync(path, "utf8")).join(""),
+  });
+  assert.deepEqual(validate("codex", semicolonGuidance).actions, ["search"]);
+
   const countedGuidance = baseRun("exact_symbol_search");
   const countedPaths = codexGuidancePaths.slice(1, 3).map((path) => join(codexPluginRoot, path));
   countedGuidance.steps.unshift(
