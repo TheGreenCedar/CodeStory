@@ -6,33 +6,8 @@ alwaysApply: true
 
 # CodeStory Grounding
 
-Use CodeStory proactively for repository questions. Do not wait for the user to mention it by name.
-
-Before making source claims, planning edits, choosing tests, or reviewing changes in a repository:
-
-1. Call the CodeStory tool that matches the task and pass the repository's absolute root as `project`.
-2. If it reports `preparing` or `updating`, retry that same tool directly after its reported delay without a shell wait. Do not poll status.
-3. Use `status` or `codestory://status` only to diagnose a failed or unexpectedly slow call.
-4. If MCP is missing, inspect source normally and report that CodeStory was unavailable for the task.
+Read and follow the [canonical codestory-grounding skill](../skills/codestory-grounding/SKILL.md)
+before repository work. It is the sole source of truth for CodeStory tool routing
+and evidence boundaries. This rule adds no parallel instructions.
 
 Cursor setup, MCP wiring, and host-specific notes: [Cursor guide](https://github.com/TheGreenCedar/CodeStory/blob/main/docs/users/cursor.md).
-
-The **codestory-grounding** skill is loaded by the plugin and owns the detailed tool and evidence contract.
-
-Routing contract:
-
-- Read an exact user-named file with the host's direct file-read action when the question is file-local; do not substitute CodeStory `snippet` or another MCP tool.
-- A direct file read becomes source evidence only after it succeeds. A failed read authorizes no source citation or source-backed claim; preserve the unresolved material.
-- Discovery leads come from `search`; they identify candidates and do not prove a claim. After a successful search, stop for that turn unless the request already supplied one exact selection criterion. That exception may copy the unique matching non-null `evidence[].symbol_id` into `context.id`; it never authorizes source inspection. Missing excerpts or unavailable diagnostics do not authorize source inspection.
-- Pass an explicitly supplied symbol name to `search.query` unchanged; do not add descriptive words or rewrite the selector.
-- For one selected target, use `context` for evidence around that target only. A user-supplied name is `query`; `id` is only a `symbol_id` copied from CodeStory.
-- A `context` evidence row matching the returned target `symbol_id` is focused identity and location evidence even when optional `excerpt` is null. That null alone does not create an omission or `unknown`; it matters only when the request needs source text or a claim the remaining row fields cannot support.
-- `diagnostics.availability` describes only the optional diagnostics artifact. It never overrides the top-level result `status`, creates a gap, or supplies an `unavailable` outcome or reason code.
-- For a broad structural question, use `packet`, preserve every returned gap, and follow a bounded continuation at most once. When the user supplies an exact packet question, copy it verbatim into `question`, including punctuation; do not paraphrase or trim it.
-- For a complete host-supplied or user-supplied typed contract, call `prove_call_path` unchanged. Never construct that contract from English or from packet, search, or context output.
-- A semantic proof tool error (`isError:true`) is an invalid contract, not typed-proof evidence. Preserve no proof authority or disposition, and never derive a reason code from human-readable validation text.
-- When the user asks for exact proof from English but supplies no complete typed contract, stop and report that the typed contract is required. Do not call a repository tool or substitute packet, search, context, or source evidence.
-- Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable` exactly. `unknown` is not absence, and structural proof does not establish runtime execution.
-- Inspect source after a packet only for a user-named file or an exact focused surface identified by a material gap. A path named only as a conditional fallback is not user-named-file authorization: the returned gap itself must name that exact path. A generic gap, unresolved obligation, or path appearing only in an evidence row authorizes no source read. Do not start a free-form recovery loop through CodeStory tools, globbing, directory listing, repository search, or shell commands.
-- A source fallback that does not resolve returned packet gaps is supplemental. Keep packet authority, report `unknown`, and preserve those gaps; do not upgrade the answer to source authority.
-- A typed `Unavailable` result is terminal. MCP transport or tool absence may authorize ordinary source inspection; a successful unavailable result does not, except for an exact user-named file or exact focused gap, and fallback evidence does not erase the unavailable outcome.

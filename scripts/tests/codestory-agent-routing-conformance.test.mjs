@@ -2576,7 +2576,7 @@ function staticIdentityFor(root) {
   return staticIdentity;
 }
 
-test("static Cursor Claude Code and Copilot surfaces bind one package launcher hook and rule core", async () => {
+test("static Cursor Claude Code and Copilot surfaces bind one package launcher and canonical skill", async () => {
   assert.deepEqual(Object.keys(STATIC_PARITY_HOSTS), ["cursor", "claude_code", "copilot_cli", "copilot_editor"]);
   const manifest = JSON.parse(await readFile(join(pluginRoot, "plugin.json"), "utf8"));
   const staticIdentity = staticIdentityFor(pluginRoot);
@@ -2610,24 +2610,24 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     join(pluginRoot, "skills", "codestory-grounding", "references", "packet.md"),
     "utf8",
   );
-  for (const [label, guidance] of [["skill", skill], ["Cursor rule", cursorRule]]) {
-    assert.match(guidance, /discovery leads?.*`search`/isu, label);
-    assert.match(guidance, /successful search.*stop.*(?:do not|never).*source/isu, label);
-    assert.match(guidance, /successful search.*stop.*unless.*exact selection/isu, label);
-    assert.match(guidance, /symbol_id.*context.*(?:`id`|\.id)/isu, label);
-    assert.match(guidance, /selected target.*`context`/isu, label);
-    assert.match(guidance, /supplied symbol name.*search\.query.*unchanged/isu, label);
-    assert.match(guidance, /broad.*`packet`.*continuation.*once/isu, label);
-    assert.match(guidance, /host-supplied.*`prove_call_path`/isu, label);
-    assert.match(guidance, /semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu, label);
-    assert.match(guidance, /exact proof from English.*no complete typed\s+contract.*stop.*do not call a\s+repository tool/isu, label);
-    assert.match(guidance, /`unknown`.*not absence/isu, label);
-    assert.match(guidance, /runtime execution/iu, label);
-    assert.match(guidance, /typed `Unavailable`.*terminal/isu, label);
-    assert.match(guidance, /diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu, label);
-    assert.match(guidance, /transport.*tool absence.*source/isu, label);
-    assert.match(guidance, /context.*symbol_id.*excerpt.*null.*(?:does not|doesn't).*omission/isu, label);
-  }
+  assert.match(skill, /discovery leads?.*`search`/isu);
+  assert.match(skill, /successful search.*stop.*(?:do not|never).*source/isu);
+  assert.match(skill, /successful search.*stop.*unless.*exact selection/isu);
+  assert.match(skill, /symbol_id.*context.*(?:`id`|\.id)/isu);
+  assert.match(skill, /selected target.*`context`/isu);
+  assert.match(skill, /supplied symbol name.*search\.query.*unchanged/isu);
+  assert.match(skill, /broad.*`packet`.*continuation.*once/isu);
+  assert.match(skill, /host-supplied.*`prove_call_path`/isu);
+  assert.match(skill, /semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu);
+  assert.match(skill, /exact proof from English.*no complete typed\s+contract.*stop.*do not call a\s+repository tool/isu);
+  assert.match(skill, /`unknown`.*not absence/isu);
+  assert.match(skill, /runtime execution/iu);
+  assert.match(skill, /typed `Unavailable`.*terminal/isu);
+  assert.match(skill, /diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu);
+  assert.match(skill, /transport.*tool absence.*source/isu);
+  assert.match(skill, /context.*symbol_id.*excerpt.*null.*(?:does not|doesn't).*omission/isu);
+  assert.match(cursorRule, /canonical codestory-grounding skill.*sole source of truth.*adds no parallel instructions/isu);
+  assert.doesNotMatch(cursorRule, /Routing contract:|Discovery leads come from|prove_call_path|Inspect source after a packet/u);
   assert.match(skill, /bounded command action.*cat.*sed.*exact authorized file.*before reporting.*unavailable/isu);
   assert.match(openAiMetadata, /search.*context.*packet.*prove_call_path/isu);
   assert.match(openAiMetadata, /host-supplied/iu);
@@ -2699,8 +2699,11 @@ alwaysApply: true
 
 Call the CodeStory tool that matches the task. The codestory-grounding skill owns the detailed tool and evidence contract.
 `);
-    const delegatedOnlyCursorRule = staticIdentityFor(root);
-    await assert.rejects(validateStaticHostParity(root, delegatedOnlyCursorRule), /search discovery authority/u);
+    const incompleteCursorDelegation = staticIdentityFor(root);
+    await assert.rejects(
+      validateStaticHostParity(root, incompleteCursorDelegation),
+      /cursor rule does not delegate to the complete canonical grounding contract/u,
+    );
 
     cpSync(pluginRoot, root, { recursive: true, force: true });
     const openAiMetadataPath = join(root, "skills", "codestory-grounding", "agents", "openai.yaml");

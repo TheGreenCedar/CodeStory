@@ -3128,12 +3128,14 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
     if (host === "cursor") {
       if (!/^---\ndescription: CodeStory local grounding\./u.test(ruleText)
           || !ruleText.includes("alwaysApply: true")
-          || !ruleText.includes("Call the CodeStory tool that matches the task")
-          || !ruleText.includes("codestory-grounding")
-          || !ruleText.includes("owns the detailed tool and evidence contract")) {
+          || !ruleText.includes("[canonical codestory-grounding skill](../skills/codestory-grounding/SKILL.md)")
+          || !ruleText.includes("sole source of truth")
+          || !ruleText.includes("adds no parallel instructions")) {
         fail("cursor rule does not delegate to the complete canonical grounding contract");
       }
-      validateRoutingGuidance(ruleText, "cursor rule");
+      if (/Routing contract:|Discovery leads come from|prove_call_path|Inspect source after a packet/u.test(ruleText)) {
+        fail("cursor rule duplicates the canonical grounding contract");
+      }
     } else if (!/^---\nname: codestory-grounding\n/iu.test(ruleText)
         || !ruleText.includes("## Direct Tool Loop")
         || !ruleText.includes("## Task Router")

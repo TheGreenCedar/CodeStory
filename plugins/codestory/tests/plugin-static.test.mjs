@@ -1524,7 +1524,8 @@ test("agent-facing guidance keeps embedding lifecycle internal", async () => {
     join(pluginRoot, "rules", "codestory.mdc"),
   ]) {
     const text = await readFile(file, "utf8");
-    assert.match(text, /Call the CodeStory tool that matches the task/u, file);
+    assert.match(text, /canonical codestory-grounding skill.*sole source of truth/isu, file);
+    assert.doesNotMatch(text, /Call the CodeStory tool that matches the task|Routing contract:|prove_call_path/u, file);
     assert.doesNotMatch(text, /read `codestory:\/\/status` first/u, file);
     assert.doesNotMatch(text, /codestory-cli ready/u, file);
   }
@@ -5980,10 +5981,10 @@ test("startup hook records active project without runtime bootstrap", async () =
     const context = output.hookSpecificOutput.additionalContext;
     assert.equal(output.systemMessage, "CODESTORY:BACKGROUND");
     assert.match(context, /CODESTORY GROUNDING AVAILABLE/u);
-    assert.match(context, /loaded CodeStory rule or codestory-grounding skill/u);
-    assert.match(context, /Call status only for diagnostics/u);
-    assert.match(context, /retry that same tool/u);
-    assert.match(context, /tool_search/u);
+    assert.match(context, /read and follow the loaded codestory-grounding skill/u);
+    assert.match(context, /sole source of truth/u);
+    assert.match(context, /adds no parallel instructions/u);
+    assert.doesNotMatch(context, /Strict routing|Call status|tool_search|prove_call_path/u);
     assert.doesNotMatch(context, /HOOK MCP BRIDGE/u);
     assert.doesNotMatch(context, /managed_bootstrap/u);
     assert.doesNotMatch(context, /mcp_resources_exposed/u);
@@ -7277,14 +7278,13 @@ test("session hooks inject one bounded contract and prompt hooks stay silent", a
       }, { PLUGIN_DATA: dataDir, PATH: "" });
       const context = output.hookSpecificOutput.additionalContext;
       assert.ok(context.length <= 900, `hook output was ${context.length} characters`);
-      assert.match(context, /target repository root/u);
-      assert.match(context, /starting hint/u);
-      assert.match(context, /search only for that tool by name/u);
-      assert.match(context, /cite a direct read only after success/u);
-      assert.match(context, /fallback leaves packet gaps unresolved.*keep packet authority and Unknown/u);
+      assert.match(context, /read and follow the loaded codestory-grounding skill/u);
+      assert.match(context, /sole source of truth/u);
+      assert.match(context, /adds no parallel instructions/u);
       assert.doesNotMatch(context, /status first|poll status/u);
       assert.doesNotMatch(context, /truncated/u);
-      assert.equal(context.endsWith("directly."), true);
+      assert.doesNotMatch(context, /Strict routing|tool_search|prove_call_path/u);
+      assert.equal(context.endsWith("instructions."), true);
     }
     const promptOutput = runCodexHook({
       hook_event_name: "UserPromptSubmit",
@@ -7499,7 +7499,7 @@ test("portable plugin core and thin host adapters preserve their own contracts",
   assert.equal(fs.existsSync(join(pluginRoot, ".cursor", "rules", "codestory.mdc")), false);
 });
 
-test("Cursor rules share one grounding core and describe their host surfaces truthfully", async () => {
+test("Cursor rules point to one canonical grounding skill", async () => {
   const pluginRule = await readFile(join(pluginRoot, "rules", "codestory.mdc"), "utf8");
   const dogfoodRule = await readFile(join(repoRoot, ".cursor", "rules", "codestory.mdc"), "utf8");
   const normalize = (text) => text
@@ -7507,20 +7507,22 @@ test("Cursor rules share one grounding core and describe their host surfaces tru
       /Cursor setup, MCP wiring, and host-specific notes: \[[^\n\]]+\]\([^\n)]+\)\./u,
       "Cursor setup, MCP wiring, and host-specific notes: CURSOR_GUIDE.",
     )
-    .replace(/(?:The \*\*codestory-grounding\*\*|This repository-managed setup)[^\n]+/u, "HOST SURFACE NOTE");
+    .replace(
+      /\[canonical codestory-grounding skill\]\([^\n)]+\)/u,
+      "[canonical codestory-grounding skill](CANONICAL_SKILL)",
+    );
   assert.equal(normalize(pluginRule), normalize(dogfoodRule));
   assert.match(
     pluginRule,
     /\]\(https:\/\/github\.com\/TheGreenCedar\/CodeStory\/blob\/main\/docs\/users\/cursor\.md\)/u,
   );
-  assert.doesNotMatch(pluginRule, /\]\(\.\.\//u);
+  assert.match(pluginRule, /\[canonical codestory-grounding skill\]\(\.\.\/skills\/codestory-grounding\/SKILL\.md\)/u);
   assert.match(dogfoodRule, /\]\(\.\.\/\.\.\/docs\/users\/cursor\.md\)/u);
-  assert.match(pluginRule, /codestory-grounding.*loaded by the plugin/u);
-  assert.match(pluginRule, /failed read authorizes no source citation or source-backed claim/u);
-  assert.match(pluginRule, /fallback that does not resolve returned packet gaps.*Keep packet authority.*report `unknown`/u);
-  assert.match(dogfoodRule, /provides the rule and MCP adapter only/u);
-  assert.doesNotMatch(dogfoodRule, /skill is loaded by the plugin/u);
-  assert.doesNotMatch(pluginRule, /plugins\/codestory\/skills/u);
+  assert.match(dogfoodRule, /\[canonical codestory-grounding skill\]\(\.\.\/\.\.\/plugins\/codestory\/skills\/codestory-grounding\/SKILL\.md\)/u);
+  assert.match(pluginRule, /sole source of truth.*adds no parallel instructions/isu);
+  assert.match(dogfoodRule, /sole source of truth.*adds no parallel instructions/isu);
+  assert.doesNotMatch(pluginRule, /Routing contract:|Discovery leads come from|prove_call_path/u);
+  assert.doesNotMatch(dogfoodRule, /Routing contract:|Discovery leads come from|prove_call_path/u);
 });
 
 test("Cursor plugin-data inference is identity-bound and local overrides use PLUGIN_DATA", async () => {
@@ -7738,7 +7740,7 @@ test("Cursor sessionStart emits the Cursor additional_context contract", async (
       );
       assert.deepEqual(Object.keys(output), ["additional_context"]);
       assert.match(output.additional_context, /CODESTORY GROUNDING AVAILABLE/u);
-      assert.match(output.additional_context, /loaded CodeStory rule or codestory-grounding skill/u);
+      assert.match(output.additional_context, /read and follow the loaded codestory-grounding skill/u);
     }
     const state = JSON.parse(await readFile(join(dataDir, ".codestory-active"), "utf8"));
     assert.equal(state.cwd, repoRoot);
