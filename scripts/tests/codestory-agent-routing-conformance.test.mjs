@@ -623,7 +623,7 @@ function baseRun(scenarioId) {
       run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...typed }, proofBody("unknown", typed, {
         gaps: [{ code: "selector_missing" }],
       }))];
-      run.final = finalClaim({ authority: "typed_proof", outcome: "unknown", gap_ids: ["selector_missing"], proof_disposition: "unknown" });
+      run.final = finalClaim({ authority: "typed_proof", outcome: "unknown", reason_codes: ["selector_missing"], proof_disposition: "unknown" });
       break;
     case "typed_proof_unavailable":
       run.request.proof_contract = typed;
@@ -659,7 +659,7 @@ function baseRun(scenarioId) {
       run.final = finalClaim({
         authority: "typed_proof",
         outcome: "unknown",
-        gap_ids: ["direct_call_missing"],
+        reason_codes: ["direct_call_missing"],
         proof_disposition: "unknown",
       });
       break;
@@ -1171,6 +1171,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /material_omissions contains only unresolved material requested by the user/u);
     assert.match(prompt, /typed proof.*receipt_id.*never copy fact_id or edge_id/u);
     assert.match(prompt, /refutation_basis.*refutation\.kind string.*never the whole refutation object/u);
+    assert.match(prompt, /typed proof gap has no gap_id.*disposition\.gaps\[\]\.kind.*reason_codes/u);
     assert.match(prompt, /never grep, rg, search, or probe the installed plugin package/u);
   }
   const discoveryPrompt = materialized.find(({ scenario_id }) => scenario_id === "exact_symbol_search").request.text;
@@ -1721,14 +1722,14 @@ for (const host of ["codex", "cursor"]) {
       mutateBody(boundary, 0, (body) => {
         body.disposition.gaps = [{ kind, [indexField]: validIndex }];
       });
-      boundary.final.gap_ids = [kind];
+      boundary.final.reason_codes = [kind];
       assert.equal(validate(host, boundary).status, "pass", `${kind} accepted boundary`);
 
       const outOfRange = baseRun("typed_proof_unknown");
       mutateBody(outOfRange, 0, (body) => {
         body.disposition.gaps = [{ kind, [indexField]: invalidIndex }];
       });
-      outOfRange.final.gap_ids = [kind];
+      outOfRange.final.reason_codes = [kind];
       try {
         validate(host, outOfRange);
         acceptedOutOfRange.push(kind);

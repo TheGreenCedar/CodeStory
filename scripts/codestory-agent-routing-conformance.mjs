@@ -284,7 +284,7 @@ export function validateRoutingRequestCorpus(document = ROUTING_CORPUS_DOCUMENT)
 
 export const ROUTING_REQUEST_CORPUS = deepFreeze(structuredClone(ROUTING_CORPUS_DOCUMENT));
 
-const FINAL_REPORT_INSTRUCTION = `Read an already named linked installed-guidance file only with a direct file read; never grep, rg, search, or probe the installed plugin package. Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read unless it follows an unavailable CodeStory result: an authorized fallback read changes evidence authority but preserves an earlier unavailable outcome. Use supported only when the selected evidence authority resolves the requested material; if result-bound gaps leave any requested material unresolved, use unknown even when the tool result also returned useful evidence. Use discovery_only for a search lead, and preserve the exact proof result boundary. Use invalid_contract for a rejected typed interpretation. Use refused only when the user requested exact proof without supplying a typed interpretation. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. For typed proof, evidence_ids contains only receipt_id values referenced by the disposition; never copy fact_id or edge_id. reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis; when supplied, copy only the refutation.kind string, never the whole refutation object. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
+const FINAL_REPORT_INSTRUCTION = `Read an already named linked installed-guidance file only with a direct file read; never grep, rg, search, or probe the installed plugin package. Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read unless it follows an unavailable CodeStory result: an authorized fallback read changes evidence authority but preserves an earlier unavailable outcome. Use supported only when the selected evidence authority resolves the requested material; if result-bound gaps leave any requested material unresolved, use unknown even when the tool result also returned useful evidence. Use discovery_only for a search lead, and preserve the exact proof result boundary. Use invalid_contract for a rejected typed interpretation. Use refused only when the user requested exact proof without supplying a typed interpretation. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. For typed proof, evidence_ids contains only receipt_id values referenced by the disposition; never copy fact_id or edge_id. A typed proof gap has no gap_id: keep gap_ids empty and copy each disposition.gaps[].kind into reason_codes. Other reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis; when supplied, copy only the refutation.kind string, never the whole refutation object. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
 
 export function materializeRoutingRequests(projectRoot) {
   const project = realpathSync(projectRoot);
@@ -2285,7 +2285,7 @@ function expectedFinalClaim(scenarioContract, actions, results) {
   }
   if (proof) {
     const disposition = results.get(proof).body?.disposition;
-    if (Array.isArray(disposition?.gaps)) expected.gap_ids.push(...disposition.gaps.map(({ kind }) => kind));
+    if (Array.isArray(disposition?.gaps)) expected.reason_codes.push(...disposition.gaps.map(({ kind }) => kind));
     if (Array.isArray(disposition?.reasons)) expected.reason_codes.push(...disposition.reasons);
     if (results.get(proof).isError && nonemptyString(results.get(proof).body?.code)) {
       expected.reason_codes.push(results.get(proof).body.code);
@@ -2307,12 +2307,17 @@ function expectedFinalClaim(scenarioContract, actions, results) {
 function validateFinalClaims(scenarioContract, final, actions, results) {
   const claim = parseFinalClaim(final, scenarioContract.id);
   const expected = expectedFinalClaim(scenarioContract, actions, results);
+  const proofAction = actions.find((action) => action.kind === "prove_call_path");
+  const proofDisposition = proofAction ? results.get(proofAction)?.body?.disposition : null;
+  const hasResultBoundGap = expected.gap_ids.length > 0
+    || (Array.isArray(proofDisposition?.gaps) && proofDisposition.gaps.length > 0)
+    || (Array.isArray(proofDisposition?.reasons) && proofDisposition.reasons.length > 0);
   if (claim.material_omissions.length > 0
-      && expected.gap_ids.length > 0
+      && hasResultBoundGap
       && expected.outcome === "supported") {
     expected.outcome = "unknown";
   }
-  if (claim.material_omissions.length > 0 && expected.gap_ids.length === 0) {
+  if (claim.material_omissions.length > 0 && !hasResultBoundGap) {
     fail(`${scenarioContract.id} final claim contains omissions without a result-bound gap`);
   }
   if (claim.material_omissions.length > 0 && claim.outcome === "supported") {
