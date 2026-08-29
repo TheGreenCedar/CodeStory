@@ -1364,6 +1364,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /typed proof gap has no gap_id.*disposition\.gaps\[\]\.kind.*reason_codes/u);
     assert.match(prompt, /diagnostics\.availability.*optional diagnostics artifact.*never copy it into outcome or reason_codes/u);
     assert.match(prompt, /never grep, rg, search, or probe the installed plugin package/u);
+    assert.match(prompt, /On Codex, one bounded cat or sed command.*direct-file action.*Never report.*unavailable before attempting/isu);
   }
   const discoveryPrompt = materialized.find(({ scenario_id }) => scenario_id === "exact_symbol_search").request.text;
   assert.match(discoveryPrompt, /discovery candidates only/iu);
@@ -2617,6 +2618,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     assert.match(guidance, /transport.*tool absence.*source/isu, label);
     assert.match(guidance, /context.*symbol_id.*excerpt.*null.*(?:does not|doesn't).*omission/isu, label);
   }
+  assert.match(skill, /bounded command action.*cat.*sed.*exact authorized file.*before reporting.*unavailable/isu);
   assert.match(openAiMetadata, /search.*context.*packet.*prove_call_path/isu);
   assert.match(openAiMetadata, /host-supplied/iu);
   assert.match(openAiMetadata, /unknown.*not absence/isu);

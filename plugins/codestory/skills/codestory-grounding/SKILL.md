@@ -27,6 +27,11 @@ whose evidence extends beyond the file. For those tasks, select the narrowest
 CodeStory tool that can add evidence; do not call broad `ground` as a pre-edit
 ceremony.
 
+On a host whose direct file read is surfaced as a bounded command action, one
+`cat` or `sed` read of the exact authorized file is the direct-read action. It
+does not authorize shell search, directory probing, or a recovery loop. Attempt
+that exact read before reporting the named file unavailable.
+
 1. Resolve the target repository root.
 2. Call the intended tool with `project=<absolute-root>`.
    Omit optional numeric bounds unless the task requires one; when supplied,
