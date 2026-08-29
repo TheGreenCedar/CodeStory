@@ -39,7 +39,8 @@ ceremony.
    focused path. A path named only as a conditional fallback is not a
    user-named file for this purpose: the returned gap itself must name that
    exact path. A generic gap or unresolved obligation authorizes no source
-   read. A search lead is never source-read authorization.
+   read. A path appearing only in an evidence row is also not source-read
+   authorization. A search lead is never source-read authorization.
 
 CodeStory prepares its local repository map and shared per-user retrieval server
 automatically. `status` and

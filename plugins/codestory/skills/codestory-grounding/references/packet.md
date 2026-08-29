@@ -49,7 +49,8 @@ CLI flags. Every call requires `project` (absolute repository root).
   availability, evidence, or gap fields.
 - Judge each claim from the concrete evidence rows: exact source, structural
   source, graph relations, and retrieval excerpts. A bounded negative query is
-  a gap, never proof that something is absent.
+  a gap, never proof that something is absent. A path appearing only in an
+  evidence row is not authorization to read that source file.
 - A parser-partial coverage observation does not invalidate a retained exact
   `source_range` from the same file. That range supports only what its source
   text directly shows; the coverage warning still forbids file-wide absence or
