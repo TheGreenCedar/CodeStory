@@ -2267,8 +2267,11 @@ function expectedFinalClaim(scenarioContract, actions, results) {
     if (disposition?.kind === "contract_refuted") expected.refutation_basis = disposition.refutation.kind;
   }
 
-  for (const action of [...searches, ...packets]) {
+  for (const action of searches) {
     expected.gap_ids.push(...results.get(action).body.gaps.map((gap) => gap.identity.gap_id));
+  }
+  if (packets.length > 0) {
+    expected.gap_ids.push(...results.get(packets.at(-1)).body.gaps.map((gap) => gap.identity.gap_id));
   }
   if (proof) {
     const disposition = results.get(proof).body?.disposition;

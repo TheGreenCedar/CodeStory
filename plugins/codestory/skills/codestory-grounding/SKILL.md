@@ -96,9 +96,11 @@ plugin result unless the user explicitly asks.
   `parent_packet_id=continuation.continuation_id`, use
   `continuation.gap_ids.map((item) => item.gap_id)` as the string `option_ids`,
   and copy the core/retrieval generation
-  IDs from `publication`. Then answer from the combined evidence and gaps. Do
-  not start a free-form `search` / `context` / `trail` / `snippet` recovery
-  loop from packet.
+  IDs from `publication`. Then answer from the combined evidence and the
+  continuation result's remaining gaps. A first-pass continuation-required gap
+  is resolved when it is absent from that result; retain other first-pass gaps
+  only when the continuation still reports them. Do not start a free-form
+  `search` / `context` / `trail` / `snippet` recovery loop from packet.
 - `no_useful_evidence` and `unavailable` are terminal CodeStory states. A typed
   `Unavailable` result is terminal and remains unavailable. Inspect ordinary
   source only when the user named the file or the returned gap identifies the

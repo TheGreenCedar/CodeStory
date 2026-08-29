@@ -579,7 +579,6 @@ function baseRun(scenarioId) {
       run.final = finalClaim({
         authority: "packet_evidence",
         evidence_ids: ["evidence-1", "evidence-2"],
-        gap_ids: ["gap-1"],
       });
       break;
     case "packet_gap_to_focused_source":
