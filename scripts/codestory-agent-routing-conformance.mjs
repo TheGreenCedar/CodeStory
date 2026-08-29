@@ -531,6 +531,10 @@ function unwrapCodexShell(command) {
   if (wrapper.startsWith("'") && wrapper.endsWith("'") && !wrapper.slice(1, -1).includes("'")) {
     return wrapper.slice(1, -1).trim();
   }
+  if (wrapper.startsWith('"') && wrapper.endsWith('"')
+      && !/["$`\\]/u.test(wrapper.slice(1, -1))) {
+    return wrapper.slice(1, -1).trim();
+  }
   const concatenatedLiteral = wrapper.match(/^"([^"$`\\]*)"'([^']*)'"([^"$`\\]*)"$/u);
   if (concatenatedLiteral) {
     return `${concatenatedLiteral[1]}${concatenatedLiteral[2]}${concatenatedLiteral[3]}`.trim();

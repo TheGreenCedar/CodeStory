@@ -904,6 +904,14 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
   });
   assert.deepEqual(validate("codex", newlineGuidance).actions, ["search"]);
 
+  const nativeNewlineGuidance = baseRun("exact_symbol_search");
+  nativeNewlineGuidance.steps.unshift({
+    kind: "shell",
+    command: `/bin/zsh -lc "${linkedPaths.map((path) => `sed -n '1,260p' ${path}`).join("\n")}"`,
+    output: linkedPaths.map((path) => readFileSync(path, "utf8")).join(""),
+  });
+  assert.deepEqual(validate("codex", nativeNewlineGuidance).actions, ["search"]);
+
   const concurrentGuidanceEvents = codexJsonl(linkedGuidance)
     .trim()
     .split("\n")
