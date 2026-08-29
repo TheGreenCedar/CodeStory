@@ -583,14 +583,12 @@ function baseRun(scenarioId) {
       break;
     case "packet_gap_to_focused_source":
       run.request.gap_source_paths = ["src/gap.rs"];
-      run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: ROUTING_PACKET_QUESTIONS.packet_gap_to_focused_source }, v3Packet({
+      run.steps = [mcp("packet", { project: "/workspace/repo", question: ROUTING_PACKET_QUESTIONS.packet_gap_to_focused_source }, v3Packet({
+          evidence: [v3PacketEvidence("evidence-1", "src/catalog.rs")],
           status: "no_useful_evidence",
-          gaps: [v3Gap("gap-1", "evidence_missing", "Missing evidence for src/gap.rs")],
-        })),
-        read("src/gap.rs"),
-      ];
-      run.final = finalClaim({ authority: "source", evidence_ids: ["source:src/gap.rs"], gap_ids: ["gap-1"] });
+          gaps: [v3Gap("gap-1", "evidence_missing", "The missing route remains unresolved.")],
+        }))];
+      run.final = finalClaim({ authority: "packet_evidence", evidence_ids: ["evidence-1"], gap_ids: ["gap-1"] });
       break;
     case "packet_unavailable_to_source":
       run.request.named_files = ["src/fallback.rs"];
@@ -1215,7 +1213,7 @@ test("actual parsers reject malformed, incomplete, and cross-host transcripts", 
   assert.throws(() => parseInstalledTranscript("cursor", codexJsonl(baseRun("broad_packet"))), /Cursor/u);
   assert.throws(() => parseInstalledTranscript("unknown", "{}\n"), /unsupported host/u);
 
-  const overlapping = codexJsonl(baseRun("packet_gap_to_focused_source"))
+  const overlapping = codexJsonl(baseRun("packet_single_continuation"))
     .trim()
     .split("\n")
     .map((line) => JSON.parse(line));
@@ -1325,7 +1323,7 @@ const MUTATIONS = [
     name: "unauthorized source read",
     scenario: "packet_gap_to_focused_source",
     mutate(run) {
-      run.steps[1].path = "src/unrelated.rs";
+      run.steps.push({ kind: "source_read", path: "src/unrelated.rs" });
     },
     error: /source read is not authorized/u,
   },
@@ -1334,7 +1332,7 @@ const MUTATIONS = [
     scenario: "packet_gap_to_focused_source",
     mutate(run) {
       run.request.gap_source_paths = ["src/gap.rs.bak"];
-      run.steps[1].path = "src/gap.rs.bak";
+      run.steps.push({ kind: "source_read", path: "src/gap.rs.bak" });
     },
     error: /source read is not correlated with the packet evidence gap/u,
   },
@@ -1345,6 +1343,7 @@ const MUTATIONS = [
       mutateBody(run, 0, (body) => {
         body.gaps[0].message = "Missing evidence for src/other.rs, cited src/gap.rs";
       });
+      run.steps.push({ kind: "source_read", path: "src/gap.rs" });
     },
     error: /source read is not correlated with the packet evidence gap/u,
   },
@@ -1841,6 +1840,18 @@ test("packet continuation and selected-context correlation are exact", () => {
   const initialProbe = baseRun("packet_gap_to_focused_source");
   initialProbe.steps[0].args.probes = [{ kind: "exact_path", path: "src/gap.rs" }];
   assert.throws(() => validate("codex", initialProbe), /initial packet arguments/u);
+
+  const authorizedGapRead = baseRun("packet_gap_to_focused_source");
+  mutateBody(authorizedGapRead, 0, (body) => {
+    body.gaps[0].message = "Missing evidence for src/gap.rs";
+  });
+  authorizedGapRead.steps.push({ kind: "source_read", path: "src/gap.rs" });
+  authorizedGapRead.final = finalClaim({
+    authority: "source",
+    evidence_ids: ["source:src/gap.rs"],
+    gap_ids: ["gap-1"],
+  });
+  assert.equal(validate("codex", authorizedGapRead).status, "pass");
 
   const disclosedOmission = baseRun("broad_packet");
   mutateBody(disclosedOmission, 0, (body) => {

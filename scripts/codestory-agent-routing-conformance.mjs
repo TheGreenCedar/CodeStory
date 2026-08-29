@@ -84,13 +84,14 @@ function scenario({
   id,
   first,
   followups = [],
+  optionalFollowups = [],
   source = "none",
   required = [],
   forbidden = [],
   disposition = null,
   typedContract = "none",
 }) {
-  const allowed = new Set([first, ...followups].filter((item) => item !== "none"));
+  const allowed = new Set([first, ...followups, ...optionalFollowups].filter((item) => item !== "none"));
   const finalConstraints = {
     named_file_direct_read: { authority: "source", outcome: "supported" },
     exact_symbol_search: { authority: "search_lead", outcome: "discovery_only" },
@@ -98,7 +99,7 @@ function scenario({
     selected_target_context: { authority: "context_evidence", outcome: "supported" },
     broad_packet: { authority: "packet_evidence", outcome: "supported" },
     packet_single_continuation: { authority: "packet_evidence", outcome: "supported" },
-    packet_gap_to_focused_source: { authority: "source", outcome: "supported" },
+    packet_gap_to_focused_source: { authority: "packet_evidence", outcome: "supported" },
     packet_unavailable_to_source: { authority: "source", outcome: "unavailable" },
     typed_proof_contract_proven: { authority: "typed_proof", outcome: "supported", proof_disposition: "contract_proven" },
     typed_proof_contract_refuted: { authority: "typed_proof", outcome: "refuted", proof_disposition: "contract_refuted" },
@@ -113,7 +114,8 @@ function scenario({
     id,
     expected_first_tool: first,
     required_action_sequence: first === "none" ? [] : [first, ...followups],
-    permitted_followups: followups,
+    optional_followups: optionalFollowups,
+    permitted_followups: [...followups, ...optionalFollowups],
     forbidden_tools: ROUTING_ACTIONS.filter((item) => !allowed.has(item)),
     source_read_authorization: { kind: source },
     final_claim_constraints: finalConstraints,
@@ -166,7 +168,7 @@ export const ROUTING_SCENARIOS = deepFreeze([
   scenario({
     id: "packet_gap_to_focused_source",
     first: "packet",
-    followups: ["source_read"],
+    optionalFollowups: ["source_read"],
     source: "packet_evidence_gap",
     required: ["gap-1", "source"],
     forbidden: NO_PROOF_CLAIMS,
@@ -1011,7 +1013,12 @@ function validateExpectedMcpAvailability(scenarioContract, actions) {
 
 function validateActionOrder(scenarioContract, actions) {
   const observedSequence = actions.map(actionName);
-  if (!equalJson(observedSequence, scenarioContract.required_action_sequence)) {
+  const required = scenarioContract.required_action_sequence;
+  const extras = observedSequence.slice(required.length);
+  if (observedSequence.length < required.length
+      || required.some((name, index) => observedSequence[index] !== name)
+      || extras.some((name) => !scenarioContract.optional_followups.includes(name))
+      || new Set(extras).size !== extras.length) {
     fail(`${scenarioContract.id} required action sequence ${JSON.stringify(scenarioContract.required_action_sequence)} but observed ${JSON.stringify(observedSequence)}`);
   }
   if (scenarioContract.expected_first_tool === "none") {
@@ -1041,7 +1048,10 @@ function validateSourceReads(scenarioContract, request, actions, results) {
     if (reads.length > 0) fail(`${scenarioContract.id} source read is not authorized`);
     return;
   }
-  if (reads.length === 0) fail(`${scenarioContract.id} requires one authorized source read`);
+  if (reads.length === 0) {
+    if (kind === "packet_evidence_gap") return;
+    fail(`${scenarioContract.id} requires one authorized source read`);
+  }
   if (kind === "user_named_file") {
     const named = new Set((request.named_files ?? []).map(normalizePath));
     for (const read of reads) {
@@ -2257,7 +2267,10 @@ function expectedFinalClaim(scenarioContract, actions, results) {
   } else if (packets.length > 0) {
     expected.evidence_ids = packets.flatMap((action) => (results.get(action).body.evidence ?? []).map(({ identity }) => identity.evidence_id));
   }
-  if (reads.length > 0) expected.evidence_ids = reads.map(({ path }) => `source:${path}`);
+  if (reads.length > 0) {
+    expected.authority = "source";
+    expected.evidence_ids = reads.map(({ path }) => `source:${path}`);
+  }
   if (proof) {
     const disposition = results.get(proof).body?.disposition;
     if (disposition?.kind === "contract_proven") {
