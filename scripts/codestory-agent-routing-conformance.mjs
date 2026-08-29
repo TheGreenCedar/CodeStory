@@ -841,8 +841,13 @@ function parseCursor(events) {
       }
       if (Object.hasOwn(wrapper.result, "error")) {
         const error = wrapper.result.error;
-        if (key !== "readToolCall" || wrapper.args != null || !plainObject(error)
-            || Object.keys(error).length !== 1 || !nonemptyString(error.errorMessage)) {
+        const readError = key === "readToolCall" && wrapper.args == null && plainObject(error)
+          && equalJson(Object.keys(error), ["errorMessage"])
+          && nonemptyString(error.errorMessage);
+        const mcpError = key === "mcpToolCall" && wrapper.args == null && plainObject(error)
+          && equalJson(Object.keys(error).sort(), ["error", "readToolDefReminder"])
+          && nonemptyString(error.error) && nonemptyString(error.readToolDefReminder);
+        if (!readError && !mcpError) {
           fail(`Cursor failed tool call ${JSON.stringify(callId)} has an invalid error result`);
         }
         completeAction(state, callId, error, true);

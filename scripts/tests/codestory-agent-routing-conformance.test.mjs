@@ -1575,6 +1575,29 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
   const escapedRead = baseRun("named_file_direct_read");
   escapedRead.steps[0].path = "/workspace/other/named.rs";
   assert.throws(() => validate("cursor", escapedRead), /escapes the declared project root/u);
+
+  const failedMcp = baseRun("exact_symbol_search");
+  const failedMcpEvents = cursorJsonl(failedMcp).trim().split("\n").map((line) => JSON.parse(line));
+  const failedMcpCompletion = failedMcpEvents.find((event) => event.type === "tool_call"
+    && event.subtype === "completed" && event.tool_call.mcpToolCall);
+  delete failedMcpCompletion.tool_call.mcpToolCall.args;
+  failedMcpCompletion.tool_call.mcpToolCall.result = { error: {
+    error: "Tool execution error",
+    readToolDefReminder: "MCP error -32602: invalid params",
+  } };
+  const failedMcpTranscript = `${failedMcpEvents.map(JSON.stringify).join("\n")}\n`;
+  const parsedFailedMcp = parseInstalledTranscript("cursor", failedMcpTranscript);
+  assert.equal(parsedFailedMcp.actions.find(({ kind }) => kind === "search")?.error, true);
+  assert.throws(() => validateInstalledSession({
+    host: "cursor", scenarioId: failedMcp.scenario_id, request: failedMcp.request,
+    installedRoot, installedReceipt, expectedIdentity: EXPECTED_IDENTITY, installedPluginRoot: codexPluginRoot,
+    transcript: failedMcpTranscript,
+  }), /unexpected failed search action/u);
+  failedMcpCompletion.tool_call.mcpToolCall.result.error.extra = "unbounded";
+  assert.throws(
+    () => parseInstalledTranscript("cursor", `${failedMcpEvents.map(JSON.stringify).join("\n")}\n`),
+    /invalid error result/u,
+  );
 });
 
 test("Cursor excludes only authenticated guidance and catalog discovery around product routing", () => {
