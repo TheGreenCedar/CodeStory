@@ -571,7 +571,7 @@ function singleFileReadPath(command) {
   }
   const patterns = [
     /^sed\s+-n\s+(?:'\d+,(?:\d+|\$)p'|"\d+,\d+p"|\d+,\d+p)\s+(.+)$/u,
-    /^(?:cat|type|nl)(?:\s+-[A-Za-z]+)*\s+(.+)$/u,
+    /^(?:cat|type|nl)(?:\s+(?:--|-[A-Za-z]+))*\s+(.+)$/u,
     /^Get-Content(?:\s+-(?:LiteralPath|Path))?\s+(.+)$/iu,
   ];
   for (const pattern of patterns) {

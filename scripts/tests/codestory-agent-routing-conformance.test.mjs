@@ -1134,6 +1134,14 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
   }];
   assert.deepEqual(validate("codex", shortFlagWrapper).actions, ["source_read"]);
 
+  const endOfOptionsRead = baseRun("named_file_direct_read");
+  endOfOptionsRead.steps = [{
+    kind: "shell",
+    command: `/bin/zsh -lc ${JSON.stringify("cat -- src/named.rs")}`,
+    output: "source fixture\n",
+  }];
+  assert.deepEqual(validate("codex", endOfOptionsRead).actions, ["source_read"]);
+
   const shortFlagGuidance = baseRun("exact_symbol_search");
   shortFlagGuidance.steps.unshift({
     kind: "shell",
@@ -1247,6 +1255,8 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
     "/bin/zsh -c \"cat src/lib.rs | head\"",
     "/bin/zsh -c \"cat src/lib.rs; pwd\"",
     "/bin/zsh -c \"cat src/lib.rs src/one.rs\"",
+    "/bin/zsh -lc \"cat -- src/lib.rs src/one.rs\"",
+    "/bin/zsh -lc \"cat -- src/lib.rs; pwd\"",
   ]) {
     const hostile = baseRun("named_file_direct_read");
     hostile.steps.unshift({ kind: "shell", command });
