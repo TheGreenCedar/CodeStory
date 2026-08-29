@@ -877,7 +877,7 @@ function validate(host, run, expectedIdentity = EXPECTED_IDENTITY, receipt = ins
   });
 }
 
-test("Codex excludes only roster-authenticated installed guidance read before product routing", () => {
+test("Codex excludes only roster-authenticated installed guidance reads around product routing", () => {
   const run = baseRun("named_file_direct_read");
   run.steps[0].wrapped = true;
   run.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
@@ -976,6 +976,34 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
     output: readFileSync(countedPaths[0], "utf8"),
   });
   assert.deepEqual(validate("codex", directGuidance).actions, ["search"]);
+
+  const lateGuidance = baseRun("exact_symbol_search");
+  lateGuidance.steps.push({
+    kind: "host_guidance_read",
+    path: codexSkillPath,
+  });
+  assert.deepEqual(validate("codex", lateGuidance).actions, ["search"]);
+
+  const overlappingLateEvents = codexJsonl(lateGuidance)
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  [overlappingLateEvents[2], overlappingLateEvents[3]] = [
+    overlappingLateEvents[3], overlappingLateEvents[2],
+  ];
+  assert.throws(
+    () => validateInstalledSession({
+      host: "codex",
+      scenarioId: lateGuidance.scenario_id,
+      request: lateGuidance.request,
+      installedRoot,
+      installedReceipt,
+      expectedIdentity: EXPECTED_IDENTITY,
+      installedPluginRoot: codexPluginRoot,
+      transcript: `${overlappingLateEvents.map(JSON.stringify).join("\n")}\n`,
+    }),
+    /overlaps authenticated installed guidance with a product action/u,
+  );
 
   const multiCatGuidance = baseRun("exact_symbol_search");
   multiCatGuidance.steps.unshift({
@@ -1090,7 +1118,7 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
 
   const late = baseRun("named_file_direct_read");
   late.steps.push({ kind: "host_guidance_read", path: codexSkillPath });
-  assert.throws(() => validate("codex", late), /authenticated installed guidance after the first product action/u);
+  assert.deepEqual(validate("codex", late).actions, ["source_read"]);
 
   const arbitraryShell = baseRun("named_file_direct_read");
   arbitraryShell.steps.unshift({ kind: "shell", command: "/bin/zsh -lc \"pwd\"" });

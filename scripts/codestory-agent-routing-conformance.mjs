@@ -2510,20 +2510,27 @@ function authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIde
 function productRoutingActions(host, actions, installedPluginRoot, expectedIdentity) {
   if (String(host).toLowerCase() !== "codex") return actions;
   const product = [];
+  const guidance = new Set();
   for (const action of actions) {
     const authenticatedRead = authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIdentity);
     if (authenticatedRead) {
-      if (product.length > 0) fail("Codex read authenticated installed guidance after the first product action");
       if (authenticatedRead.sourcePath) {
         action.kind = "source_read";
         action.tool = "source_read";
         action.path = authenticatedRead.sourcePath;
         action.result = authenticatedRead.sourceOutput;
         product.push(action);
+      } else {
+        guidance.add(action);
       }
     } else {
       product.push(action);
     }
+  }
+  if (actions.some((action) => action.overlaps.some((other) => (
+    guidance.has(action) !== guidance.has(other)
+  )))) {
+    fail("Codex transcript overlaps authenticated installed guidance with a product action");
   }
   const productActions = new Set(product);
   if (product.some((action) => action.overlaps.some((other) => productActions.has(other)))) {
