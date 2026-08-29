@@ -461,6 +461,22 @@ test("exact-candidate mode freezes the 18x3x3 shape and rejects baseline reuse",
   );
 });
 
+test("exact-candidate task contract includes the file-local routing field", async () => {
+  const opts = benchmarkHarness.parseArgs(exactArgs());
+  const tasks = await loadTasks(opts);
+  assert.equal(tasks.length, 18);
+  assert.ok(tasks.every((task) => task.file_local === false));
+  assert.doesNotThrow(() => benchmarkHarness.validateExactCandidateShape(opts, tasks));
+
+  const changedTasks = tasks.map((task, index) =>
+    index === 0 ? { ...task, prompt: `${task.prompt} changed` } : task
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateShape(opts, changedTasks),
+    /qualification inputs differ from the pinned task window/i,
+  );
+});
+
 test("exact-candidate cost rates fail before package or repository work", () => {
   assert.throws(
     () => benchmarkHarness.exactCandidateCostRates({}),
