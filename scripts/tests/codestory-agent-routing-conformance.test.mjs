@@ -588,7 +588,12 @@ function baseRun(scenarioId) {
           status: "no_useful_evidence",
           gaps: [v3Gap("gap-1", "evidence_missing", "The missing route remains unresolved.")],
         }))];
-      run.final = finalClaim({ authority: "packet_evidence", evidence_ids: ["evidence-1"], gap_ids: ["gap-1"] });
+      run.final = finalClaim({
+        authority: "packet_evidence",
+        outcome: "unknown",
+        evidence_ids: ["evidence-1"],
+        gap_ids: ["gap-1"],
+      });
       break;
     case "packet_unavailable_to_source":
       run.request.named_files = ["src/fallback.rs"];
