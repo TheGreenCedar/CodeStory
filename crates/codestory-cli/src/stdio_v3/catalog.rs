@@ -1344,9 +1344,7 @@ mod tests {
         });
         let schema = proof_output_schema_v3();
         assert_eq!(
-            schema.pointer(
-                "/oneOf/0/properties/clauses/items/properties/reason/anyOf/1/type"
-            ),
+            schema.pointer("/oneOf/0/properties/clauses/items/properties/reason/anyOf/1/type"),
             Some(&json!("null"))
         );
         assert_eq!(
@@ -1357,6 +1355,42 @@ mod tests {
         );
         assert!(crate::stdio_arguments::validate_structured_content(&schema, &complete).is_ok());
         assert!(crate::stdio_arguments::validate_structured_content(&schema, &budget).is_ok());
+
+        let mut positive_contradiction = complete.clone();
+        positive_contradiction["disposition"] = json!({
+            "kind":"contract_refuted",
+            "contract_digest":"b".repeat(64),
+            "refutation":{
+                "kind":"prohibited_scope_traversal",
+                "step_index":0,
+                "prohibition_index":0,
+                "connected_receipts":[]
+            }
+        });
+        positive_contradiction["steps"][0]["status"] = json!("positive_contradiction");
+        assert!(
+            crate::stdio_arguments::validate_structured_content(&schema, &positive_contradiction)
+                .is_ok()
+        );
+
+        let mut certified_absence = complete.clone();
+        certified_absence["disposition"] = json!({
+            "kind":"contract_refuted",
+            "contract_digest":"b".repeat(64),
+            "refutation":{
+                "kind":"certified_absence",
+                "step_index":0,
+                "extractor_capability_receipt_id":"extractor:fixture",
+                "untruncated_enumeration_receipt_id":"enumeration:fixture",
+                "connected_receipts":[]
+            }
+        });
+        certified_absence["steps"][0]["status"] = json!("certified_absence");
+        assert!(
+            crate::stdio_arguments::validate_structured_content(&schema, &certified_absence)
+                .is_ok()
+        );
+
         let mut invalid = complete;
         invalid["kind"] = json!("supported");
         assert!(crate::stdio_arguments::validate_structured_content(&schema, &invalid).is_err());
