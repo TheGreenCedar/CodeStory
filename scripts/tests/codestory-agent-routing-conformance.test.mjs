@@ -19,8 +19,8 @@ import { fileURLToPath } from "node:url";
 import test, { after } from "node:test";
 
 import {
-  CONTINUATION_PACKET_QUESTION,
   INSTALLED_IDENTITY_FIELDS,
+  ROUTING_PACKET_QUESTIONS,
   ROUTING_REQUEST_CORPUS,
   ROUTING_SCENARIOS,
   STATIC_PARITY_HOSTS,
@@ -547,14 +547,14 @@ function baseRun(scenarioId) {
       });
       break;
     case "broad_packet":
-      run.steps = [mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, v3Packet({
+      run.steps = [mcp("packet", { project: "/workspace/repo", question: ROUTING_PACKET_QUESTIONS.broad_packet }, v3Packet({
         evidence: [v3PacketEvidence("evidence-1", "src/flow.rs")],
       }))];
       run.final = finalClaim({ authority: "packet_evidence", evidence_ids: ["evidence-1"] });
       break;
     case "packet_single_continuation":
       run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: CONTINUATION_PACKET_QUESTION }, v3Packet({
+        mcp("packet", { project: "/workspace/repo", question: ROUTING_PACKET_QUESTIONS.packet_single_continuation }, v3Packet({
           status: "continuation_available",
           continuation: {
             continuation_id: "continuation-1",
@@ -566,7 +566,7 @@ function baseRun(scenarioId) {
         })),
         mcp("packet", {
           project: "/workspace/repo",
-          question: CONTINUATION_PACKET_QUESTION,
+          question: ROUTING_PACKET_QUESTIONS.packet_single_continuation,
           parent_packet_id: "continuation-1",
           option_ids: ["gap-1"],
           core_generation_id: "core-1",
@@ -584,7 +584,7 @@ function baseRun(scenarioId) {
     case "packet_gap_to_focused_source":
       run.request.gap_source_paths = ["src/gap.rs"];
       run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, v3Packet({
+        mcp("packet", { project: "/workspace/repo", question: ROUTING_PACKET_QUESTIONS.packet_gap_to_focused_source }, v3Packet({
           status: "no_useful_evidence",
           gaps: [v3Gap("gap-1", "evidence_missing", "Missing evidence for src/gap.rs")],
         })),
@@ -595,7 +595,7 @@ function baseRun(scenarioId) {
     case "packet_unavailable_to_source":
       run.request.named_files = ["src/fallback.rs"];
       run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: "How does the oversized catalog work?" }, v3PacketBudgetExceeded()),
+        mcp("packet", { project: "/workspace/repo", question: ROUTING_PACKET_QUESTIONS.packet_unavailable_to_source }, v3PacketBudgetExceeded()),
         read("src/fallback.rs"),
       ];
       run.final = finalClaim({

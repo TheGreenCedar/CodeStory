@@ -19,8 +19,8 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 
 import {
-  CONTINUATION_PACKET_QUESTION,
   MCP_PROTOCOL_REVISIONS,
+  ROUTING_PACKET_QUESTIONS,
   ROUTING_SCENARIOS,
   materializeRoutingRequests,
   validateInstalledSession,
@@ -960,9 +960,7 @@ async function preflightRoutingScenario({ cli, entry, projectRoot, env }) {
     return;
   }
   if (["broad_packet", "packet_single_continuation", "packet_gap_to_focused_source", "packet_unavailable_to_source"].includes(entry.scenario_id)) {
-    const question = entry.scenario_id === "packet_single_continuation"
-      ? CONTINUATION_PACKET_QUESTION
-      : entry.request.text;
+    const question = ROUTING_PACKET_QUESTIONS[entry.scenario_id];
     const result = await spawnBounded(cli, ["packet", "--project", projectRoot, "--question", question, "--format", "json"], {
       cwd: projectRoot, env, timeoutMs: PROCESS_TIMEOUT_MS,
     });

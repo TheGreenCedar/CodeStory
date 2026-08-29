@@ -65,7 +65,12 @@ const IDENTITY_REQUIREMENTS = Object.freeze({
   fields: INSTALLED_IDENTITY_FIELDS,
 });
 
-export const CONTINUATION_PACKET_QUESTION = "Trace the complete routing flow and account for src/unread.rs if the index cannot cover it.";
+export const ROUTING_PACKET_QUESTIONS = deepFreeze({
+  broad_packet: "Explain how routing_fixture::start reaches finish across the project. Preserve any evidence gaps.",
+  packet_single_continuation: "Trace the complete routing flow and account for src/unread.rs if the index cannot cover it.",
+  packet_gap_to_focused_source: "Investigate the missing route branch.",
+  packet_unavailable_to_source: "Explain the deliberately oversized routing catalog.",
+});
 
 function deepFreeze(value) {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -2090,9 +2095,9 @@ function validatePacketContinuation(scenarioContract, actions, results) {
       ["project", "question"],
       `${scenarioContract.id} initial packet arguments`,
     );
-    if (scenarioContract.id === "packet_single_continuation"
-        && packets[0].args.question !== CONTINUATION_PACKET_QUESTION) {
-      fail(`${scenarioContract.id} initial packet question does not match the preflighted continuation fixture`);
+    const expectedQuestion = ROUTING_PACKET_QUESTIONS[scenarioContract.id];
+    if (expectedQuestion && packets[0].args.question !== expectedQuestion) {
+      fail(`${scenarioContract.id} initial packet question does not match the preflighted fixture`);
     }
   }
   if (packets.length < 2) return;
