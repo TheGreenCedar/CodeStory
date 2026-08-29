@@ -583,7 +583,8 @@ function singleFileReadPath(command) {
 
 function sourceReadPath(command) {
   const path = singleFileReadPath(command);
-  if (!path || path.startsWith("/") || /^[a-z]:[\\/]/iu.test(path)) return null;
+  if (!path) return null;
+  if (path.startsWith("/") || /^[a-z]:[\\/]/iu.test(path)) return path.replaceAll("\\", "/");
   return normalizePath(path);
 }
 
@@ -2494,8 +2495,26 @@ function authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIde
   }
   const command = unwrapCodexShell(action.command);
   if (!command || !installedPluginRoot) return null;
+  let root;
+  try {
+    root = realpathSync(installedPluginRoot);
+  } catch {
+    return null;
+  }
   const segments = command.split(/(?:[ \t]+&&[ \t]+|[ \t]*;[ \t]*|\r?\n)/u);
-  const trailingSourcePath = segments.length > 1 ? sourceReadPath(segments.at(-1)) : null;
+  const trailingCandidate = segments.length > 1 ? sourceReadPath(segments.at(-1)) : null;
+  let trailingIsGuidance = false;
+  if (trailingCandidate && isAbsolute(trailingCandidate)) {
+    try {
+      const actual = realpathSync(trailingCandidate);
+      const rel = relative(root, actual);
+      trailingIsGuidance = Boolean(rel) && rel !== ".." && !rel.startsWith(`..${sep}`)
+        && resolve(root, rel) === actual && CODEX_GUIDANCE_PATHS.has(rel.split(sep).join("/"));
+    } catch {
+      trailingIsGuidance = false;
+    }
+  }
+  const trailingSourcePath = trailingIsGuidance ? null : trailingCandidate;
   if (trailingSourcePath) segments.pop();
   const reads = segments.map((segment) => {
     const trimmed = segment.trim();
@@ -2526,12 +2545,6 @@ function authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIde
     return words.length > 0 ? { kind: "wc", words } : null;
   });
   if (reads.length === 0 || reads.some((read) => read === null)) return null;
-  let root;
-  try {
-    root = realpathSync(installedPluginRoot);
-  } catch {
-    return null;
-  }
   const paths = new Set();
   let remainingOutput = action.result;
   for (const read of reads) {

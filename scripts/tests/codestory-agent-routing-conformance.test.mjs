@@ -1114,7 +1114,7 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
     path: codexSkillPath,
     content: `${readFileSync(codexSkillPath, "utf8")}tampered\n`,
   });
-  assert.throws(() => validate("codex", tampered), /required action sequence|forbidden tool/u);
+  assert.throws(() => validate("codex", tampered), /required action sequence|forbidden tool|escapes the declared project root/u);
 
   const wrongDigest = clone(EXPECTED_IDENTITY);
   wrongDigest.static_roster["skills/codestory-grounding/SKILL.md"] = "f".repeat(64);
@@ -1122,14 +1122,14 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
   wrongDigestRun.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
   assert.throws(
     () => validate("codex", wrongDigestRun, wrongDigest),
-    /required action sequence|forbidden tool/u,
+    /required action sequence|forbidden tool|escapes the declared project root/u,
   );
 
   const zeroDigest = clone(EXPECTED_IDENTITY);
   zeroDigest.static_roster["skills/codestory-grounding/SKILL.md"] = "0".repeat(64);
   assert.throws(
     () => validate("codex", wrongDigestRun, zeroDigest),
-    /required action sequence|forbidden tool/u,
+    /required action sequence|forbidden tool|escapes the declared project root/u,
   );
 
   const originalSkill = readFileSync(codexSkillPath);
@@ -1139,7 +1139,7 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
     changedInstalledBytes.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
     assert.throws(
       () => validate("codex", changedInstalledBytes),
-      /required action sequence|forbidden tool/u,
+      /required action sequence|forbidden tool|escapes the declared project root/u,
     );
   } finally {
     writeFileSync(codexSkillPath, originalSkill);
@@ -1152,7 +1152,7 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
     symlinkSync(symlinkTarget, codexSkillPath);
     const symlinked = baseRun("named_file_direct_read");
     symlinked.steps.unshift({ kind: "host_guidance_read", path: codexSkillPath });
-    assert.throws(() => validate("codex", symlinked), /required action sequence|forbidden tool/u);
+    assert.throws(() => validate("codex", symlinked), /required action sequence|forbidden tool|escapes the declared project root/u);
   } finally {
     unlinkSync(codexSkillPath);
     writeFileSync(codexSkillPath, originalSkill);
@@ -1163,7 +1163,7 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
     kind: "host_guidance_read",
     path: join(pluginRoot, "skills", "codestory-grounding", "SKILL.md"),
   });
-  assert.throws(() => validate("codex", escaped), /required action sequence|forbidden tool/u);
+  assert.throws(() => validate("codex", escaped), /required action sequence|forbidden tool|escapes the declared project root/u);
 
   const duplicate = baseRun("named_file_direct_read");
   duplicate.steps.unshift(
@@ -1184,7 +1184,7 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
   writeFileSync(unrosteredPath, "unrostered guidance\n");
   const unrostered = baseRun("exact_symbol_search");
   unrostered.steps.unshift({ kind: "host_guidance_read", path: unrosteredPath });
-  assert.throws(() => validate("codex", unrostered), /required action sequence|forbidden tool/u);
+  assert.throws(() => validate("codex", unrostered), /required action sequence|forbidden tool|escapes the declared project root/u);
 
   const nonguidancePath = join(codexPluginRoot, "plugin.json");
   writeFileSync(nonguidancePath, "{}\n");
@@ -1194,7 +1194,7 @@ test("Codex excludes only roster-authenticated installed guidance reads around p
   nonguidance.steps.unshift({ kind: "host_guidance_read", path: nonguidancePath });
   assert.throws(
     () => validate("codex", nonguidance, nonguidanceIdentity),
-    /required action sequence|forbidden tool/u,
+    /required action sequence|forbidden tool|escapes the declared project root/u,
   );
 
   for (const command of [
@@ -2266,6 +2266,18 @@ test("packet continuation and selected-context correlation are exact", () => {
   failedContinuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs", failed: true });
   assert.equal(validate("codex", failedContinuedSourceFallback).status, "pass");
   assert.equal(validate("cursor", failedContinuedSourceFallback).status, "pass");
+
+  const absoluteFailedContinuedSourceFallback = baseRun("packet_single_continuation");
+  absoluteFailedContinuedSourceFallback.steps.push({
+    kind: "source_read", path: "/workspace/repo/src/unread.rs", failed: true,
+  });
+  assert.equal(validate("codex", absoluteFailedContinuedSourceFallback).status, "pass");
+
+  const escapedAbsoluteFallback = baseRun("packet_single_continuation");
+  escapedAbsoluteFallback.steps.push({
+    kind: "source_read", path: "/workspace/other/unread.rs", failed: true,
+  });
+  assert.throws(() => validate("codex", escapedAbsoluteFallback), /escapes the declared project root/u);
 
   const failedRequiredSourceRead = baseRun("named_file_direct_read");
   failedRequiredSourceRead.steps[0].failed = true;
