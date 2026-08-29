@@ -2354,6 +2354,8 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
   const reads = command.split(/\s+&&\s+/u).map((segment) => {
     const sed = segment.match(/^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u);
     if (sed) return { kind: "sed", endLine: Number(sed[1] ?? sed[2] ?? sed[3]), words: [sed[4]] };
+    const cat = segment.match(/^cat\s+(\S+)$/u);
+    if (cat) return { kind: "cat", words: [cat[1]] };
     const wc = segment.match(/^wc\s+-l\s+(.+)$/u);
     if (!wc) return null;
     const words = [];
@@ -2396,9 +2398,11 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
       const bytes = readFileSync(actual);
       if (sha256Bytes(bytes) !== expectedDigest) return null;
       paths.add(rosterPath);
-      if (read.kind === "sed") {
-        if (!Number.isSafeInteger(read.endLine) || read.endLine < 1) return null;
-        const output = sedPrefix(bytes.toString("utf8"), read.endLine);
+      if (read.kind === "sed" || read.kind === "cat") {
+        if (read.kind === "sed" && (!Number.isSafeInteger(read.endLine) || read.endLine < 1)) return null;
+        const output = read.kind === "cat"
+          ? bytes.toString("utf8")
+          : sedPrefix(bytes.toString("utf8"), read.endLine);
         if (output === null || !remainingOutput.startsWith(output)) return null;
         remainingOutput = remainingOutput.slice(output.length);
       } else {
