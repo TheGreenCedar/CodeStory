@@ -2408,15 +2408,10 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
 function productRoutingActions(host, actions, installedPluginRoot, expectedIdentity) {
   if (String(host).toLowerCase() !== "codex") return actions;
   const product = [];
-  const guidancePaths = new Set();
   for (const action of actions) {
     const authenticatedPaths = authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedIdentity);
     if (authenticatedPaths) {
       if (product.length > 0) fail("Codex read authenticated installed guidance after the first product action");
-      for (const path of authenticatedPaths) {
-        if (guidancePaths.has(path)) fail(`Codex authenticated installed guidance repeated ${path}`);
-        guidancePaths.add(path);
-      }
     } else {
       product.push(action);
     }

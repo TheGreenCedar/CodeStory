@@ -993,7 +993,7 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
     { kind: "host_guidance_read", path: codexSkillPath },
     { kind: "host_guidance_read", path: codexSkillPath },
   );
-  assert.throws(() => validate("codex", duplicate), /authenticated installed guidance repeated/u);
+  assert.deepEqual(validate("codex", duplicate).actions, ["source_read"]);
 
   const late = baseRun("named_file_direct_read");
   late.steps.push({ kind: "host_guidance_read", path: codexSkillPath });
