@@ -135,7 +135,7 @@
     },
     {
       "id": "refuse_free_english_proof",
-      "prompt": "Does start call finish? I supplied only this English sentence, not a typed verification contract. Do not invent one.",
+      "prompt": "Does start call finish? I supplied only this English sentence, not a typed verification contract. Do not invent one, and do not call any repository tool as a substitute. Refuse the proof request.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {

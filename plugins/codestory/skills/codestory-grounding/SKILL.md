@@ -107,6 +107,10 @@ plugin package to locate a documented field or excerpt.
   typed-proof evidence. Preserve no proof authority or disposition, copy a
   reason code only when the payload supplies one explicitly, and never derive a
   code from human-readable validation text.
+- When the user asks for exact proof from English but supplies no complete typed
+  contract, stop and report that the typed contract is required. Do not call a
+  repository tool or substitute packet, search, context, or source evidence for
+  the requested proof.
 - Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable`
   exactly. `unknown` is not absence, and `unavailable` is not negative proof.
   Exact structural proof does not establish runtime execution, reachability,

@@ -1219,6 +1219,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /rejected typed interpretation.*authority none.*outcome invalid_contract.*no proof disposition/u);
     assert.match(prompt, /human-readable validation text.*reason_codes empty.*never derive a code/u);
     assert.match(prompt, /Use refused only when the user requested exact proof without supplying a typed interpretation/u);
+    assert.match(prompt, /in that case call no product tool and do not substitute retrieval or source evidence/u);
     assert.match(prompt, /target_id must be null unless a CodeStory tool result returned a target identity/u);
     assert.match(prompt, /reason_codes may contain only CodeStory tool result codes or typed_contract_required/u);
     assert.match(prompt, /refutation_basis must be null unless a ContractRefuted result supplied the basis/u);
@@ -1241,6 +1242,8 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
   const selectedPrompt = materialized.find(({ scenario_id }) => scenario_id === "selected_target_context").request.text;
   assert.match(selectedPrompt, /already selected exact symbol dynamic_start/iu);
   assert.match(selectedPrompt, /use that exact selector without discovering or broadening/iu);
+  const refusalPrompt = materialized.find(({ scenario_id }) => scenario_id === "refuse_free_english_proof").request.text;
+  assert.match(refusalPrompt, /do not call any repository tool as a substitute.*refuse the proof request/iu);
   for (const scenarioId of [
     "packet_single_continuation",
     "packet_gap_to_focused_source",
@@ -2042,6 +2045,10 @@ test("packet continuation and selected-context correlation are exact", () => {
     /reason_codes do not match result-bound codes/u,
   );
 
+  const refusedWithOmission = baseRun("refuse_free_english_proof");
+  refusedWithOmission.final.material_omissions = ["whether start calls finish"];
+  assert.equal(validate("codex", refusedWithOmission).status, "pass");
+
   const continuedSourceFallback = baseRun("packet_single_continuation");
   continuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs" });
   continuedSourceFallback.final = finalClaim({
@@ -2205,6 +2212,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     assert.match(guidance, /broad.*`packet`.*continuation.*once/isu, label);
     assert.match(guidance, /host-supplied.*`prove_call_path`/isu, label);
     assert.match(guidance, /semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu, label);
+    assert.match(guidance, /exact proof from English.*no complete typed\s+contract.*stop.*do not call a\s+repository tool/isu, label);
     assert.match(guidance, /`unknown`.*not absence/isu, label);
     assert.match(guidance, /runtime execution/iu, label);
     assert.match(guidance, /typed `Unavailable`.*terminal/isu, label);
