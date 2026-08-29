@@ -63,6 +63,11 @@ copyFileSync(
   join(pluginRoot, "generated-mcp-catalog.json"),
   join(codexPluginRoot, "generated-mcp-catalog.json"),
 );
+mkdirSync(join(codexPluginRoot, "scripts"), { recursive: true });
+copyFileSync(
+  join(pluginRoot, "scripts", "codestory-mcp.cjs"),
+  join(codexPluginRoot, "scripts", "codestory-mcp.cjs"),
+);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -836,7 +841,7 @@ function cursorJsonl(run) {
       const args = { path: step.path };
       const bytes = readFileSync(step.path);
       const text = bytes.toString("utf8");
-      const totalLines = text.match(/[^\n]*\n|[^\n]+$/gu)?.length ?? 0;
+      const totalLines = text.length === 0 ? 0 : text.split("\n").length;
       wrapper = {
         started: { readToolCall: { args } },
         completed: {
@@ -933,7 +938,7 @@ function validate(host, run, expectedIdentity = EXPECTED_IDENTITY, receipt = ins
     installedRoot: root,
     installedReceipt: receipt,
     expectedIdentity,
-    installedPluginRoot: host === "codex" ? codexPluginRoot : null,
+    installedPluginRoot: codexPluginRoot,
     transcript: transcript(host, run),
   });
 }
@@ -1619,6 +1624,28 @@ test("Cursor excludes only authenticated guidance and catalog discovery around p
     transcript: `${events.map(JSON.stringify).join("\n")}\n`,
   });
   assert.deepEqual(observed.actions, ["search"]);
+
+  const projectedRun = baseRun("exact_symbol_search");
+  const projectedEvents = cursorJsonl(projectedRun).trim().split("\n").map((line) => JSON.parse(line));
+  const projectedCompletion = projectedEvents.find((event) => event.type === "tool_call"
+    && event.subtype === "completed" && event.tool_call.mcpToolCall);
+  const projectedBody = projectedCompletion.tool_call.mcpToolCall.result.success.structuredContent;
+  projectedCompletion.tool_call.mcpToolCall.result.success = {
+    content: [{ text: { text: JSON.stringify(projectedBody) } }],
+    isError: false,
+  };
+  const projectedTranscript = `${projectedEvents.map(JSON.stringify).join("\n")}\n`;
+  assert.deepEqual(validateInstalledSession({
+    host: "cursor", scenarioId: projectedRun.scenario_id, request: projectedRun.request,
+    installedRoot, installedReceipt, expectedIdentity: EXPECTED_IDENTITY, installedPluginRoot: codexPluginRoot,
+    transcript: projectedTranscript,
+  }).actions, ["search"]);
+  projectedCompletion.tool_call.mcpToolCall.result.success.extra = "unbounded";
+  assert.throws(() => validateInstalledSession({
+    host: "cursor", scenarioId: projectedRun.scenario_id, request: projectedRun.request,
+    installedRoot, installedReceipt, expectedIdentity: EXPECTED_IDENTITY, installedPluginRoot: codexPluginRoot,
+    transcript: `${projectedEvents.map(JSON.stringify).join("\n")}\n`,
+  }), /negotiated protocol revision|output schema/u);
 
   const patternRun = baseRun("exact_symbol_search");
   patternRun.steps.unshift({ kind: "cursor_tool_discovery", pattern: "search|symbol" });

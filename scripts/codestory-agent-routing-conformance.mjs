@@ -1010,6 +1010,31 @@ function authenticateInstalledIdentity(installedRoot, installedReceipt, expected
   return installed;
 }
 
+function authenticateCursorInstalledPluginRoot(installedPluginRoot, expected) {
+  if (!installedPluginRoot) fail("Cursor qualification requires the installed plugin root");
+  if (!plainObject(expected.static_roster)
+      || !Object.hasOwn(expected.static_roster, "generated-mcp-catalog.json")) {
+    fail("expected static digest roster is missing the generated MCP catalog");
+  }
+  for (const [path, digest] of Object.entries(expected.static_roster)) {
+    if (!SHA256.test(String(digest)) || /^0{64}$/u.test(String(digest))) {
+      fail(`expected static digest roster ${path} is invalid`);
+    }
+    const bytes = readFileSync(fileInsideInstalledRoot(
+      installedPluginRoot, path, `installed Cursor plugin ${path}`,
+    ));
+    if (sha256Bytes(bytes) !== digest) {
+      fail(`installed Cursor plugin ${path} does not match authenticated package bytes`);
+    }
+  }
+  const launcherBytes = readFileSync(fileInsideInstalledRoot(
+    installedPluginRoot, expected.launcher.relative_path, "installed Cursor plugin launcher",
+  ));
+  if (sha256Bytes(launcherBytes) !== expected.launcher.sha256) {
+    fail("installed Cursor plugin launcher does not match authenticated launcher bytes");
+  }
+}
+
 function parseJsonText(value) {
   if (typeof value !== "string") return null;
   try {
@@ -1031,9 +1056,24 @@ function decodeResultEnvelope(value, depth = 0) {
   return value;
 }
 
-function normalizedResult(action) {
+function normalizedResult(action, host) {
   const raw = decodeResultEnvelope(action.result);
   if (!plainObject(raw)) return { raw, body: parseJsonText(raw), meta: null, isError: action.error };
+  if (host === "cursor"
+      && equalJson(Object.keys(raw).sort(), ["content", "isError"])
+      && raw.isError === false
+      && Array.isArray(raw.content) && raw.content.length === 1
+      && plainObject(raw.content[0]) && equalJson(Object.keys(raw.content[0]), ["text"])
+      && plainObject(raw.content[0].text) && equalJson(Object.keys(raw.content[0].text), ["text"])
+      && typeof raw.content[0].text.text === "string") {
+    return {
+      raw,
+      body: parseJsonText(raw.content[0].text.text),
+      meta: null,
+      isError: false,
+      transport_projection: "cursor_content_text_v1",
+    };
+  }
   const structured = plainObject(raw.structuredContent) ? raw.structuredContent : null;
   const textBlock = Array.isArray(raw.content)
     ? raw.content.find((entry) => entry?.type === "text" && typeof entry.text === "string")
@@ -1050,8 +1090,15 @@ function normalizedResult(action) {
   };
 }
 
-function validateResultIdentity(action, expected) {
-  const normalized = normalizedResult(action);
+function validateResultIdentity(action, expected, host) {
+  const normalized = normalizedResult(action, host);
+  if (normalized.transport_projection === "cursor_content_text_v1") {
+    // Cursor exposes only the MCP text block. The authenticated launcher checks
+    // the negotiated revision and discovery digest before it relays any runtime
+    // result; the caller authenticates those launcher bytes before parsing here.
+    if (!plainObject(normalized.body)) fail(`${action.tool} Cursor result text is not a JSON object`);
+    return normalized;
+  }
   const publication = normalized.meta?.codestory_publication;
   const protocol = normalized.meta?.codestory_protocol;
   const runtime = publication?.contract_runtime;
@@ -2638,7 +2685,7 @@ function authenticatedCursorGuidanceRead(action, installedPluginRoot, expectedId
     "relatedCursorRulePaths", "relatedCursorRules", "totalLines",
   ].sort();
   const text = bytes.toString("utf8");
-  const totalLines = text.match(/[^\n]*\n|[^\n]+$/gu)?.length ?? 0;
+  const totalLines = text.length === 0 ? 0 : text.split("\n").length;
   if (!equalJson(Object.keys(result).sort(), resultKeys)
       || !["content", "contentBlobId"].includes(contentKey)
       || result.exceededLimit !== false || result.isEmpty !== (bytes.length === 0)
@@ -2790,8 +2837,12 @@ export function validateInstalledSession({
   if (!scenarioContract) fail(`unknown routing scenario ${JSON.stringify(scenarioId)}`);
   if (!plainObject(request)) fail(`${scenarioId} request must be an object`);
   authenticateInstalledIdentity(installedRoot, installedReceipt, expectedIdentity);
+  const normalizedHost = String(host).toLowerCase();
+  if (normalizedHost === "cursor") {
+    authenticateCursorInstalledPluginRoot(installedPluginRoot, expectedIdentity);
+  }
   const parsed = parseInstalledTranscript(host, transcript);
-  if (String(host).toLowerCase() === "cursor" && parsed.user_text !== request.text) {
+  if (normalizedHost === "cursor" && parsed.user_text !== request.text) {
     fail(`${scenarioId} Cursor user text does not match the declared request`);
   }
   const actions = productRoutingActions(host, parsed.actions, installedPluginRoot, expectedIdentity);
@@ -2810,10 +2861,10 @@ export function validateInstalledSession({
     if (["search", "context", "packet", "prove_call_path"].includes(action.kind)) {
       validateToolInputSchema(action);
       results.set(action, expectedSemanticError
-        ? normalizedResult(action)
-        : validateResultIdentity(action, expectedIdentity));
+        ? normalizedResult(action, normalizedHost)
+        : validateResultIdentity(action, expectedIdentity, normalizedHost));
     } else {
-      results.set(action, normalizedResult(action));
+      results.set(action, normalizedResult(action, normalizedHost));
     }
     const allowedOptionalSourceFailure = action.kind === "source_read"
       && scenarioContract.optional_followups.includes("source_read")

@@ -994,7 +994,7 @@ async function installCodexQualificationPlugin({ executable, codexHome, pluginRo
   return { ...installed, installedPath };
 }
 
-async function cursorHostEnvironment(cursorHome, stateRoot, env) {
+export async function cursorHostEnvironment(cursorHome, stateRoot, env) {
   const paths = {
     CURSOR_CONFIG_DIR: join(stateRoot, "config"),
     CURSOR_DATA_DIR: join(stateRoot, "data"),
@@ -1002,7 +1002,10 @@ async function cursorHostEnvironment(cursorHome, stateRoot, env) {
     NODE_COMPILE_CACHE: join(stateRoot, "node-compile-cache"),
   };
   for (const path of Object.values(paths)) await mkdir(path, { recursive: true, mode: 0o700 });
-  return { ...env, HOME: cursorHome, ...paths };
+  const inherited = { ...env };
+  delete inherited.CODESTORY_CACHE_ROOT;
+  delete inherited.CODESTORY_STDIO_CACHE_ROOT;
+  return { ...inherited, HOME: cursorHome, ...paths };
 }
 
 async function prepareCursorQualificationProvider({
@@ -1244,16 +1247,6 @@ async function main(argv) {
         "broad_packet", "packet_single_continuation", "packet_gap_to_focused_source",
         "packet_named_fallback_to_source",
       ].includes(id);
-      await prepareRoutingFixture({
-        cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv, includeRetrieval,
-      });
-      if (id === "proof_observational") {
-        await requireMissingRetrievalProjection({
-          cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv,
-          label: "proof observational preflight retrieval status",
-        });
-      }
-      await preflightRoutingScenario({ cli: authenticated.staged.managedCli, entry, projectRoot, env: sessionEnv });
       let codexHome = null;
       let installedPluginRoot = null;
       if (host === "codex") {
@@ -1284,6 +1277,22 @@ async function main(argv) {
         );
         installedPluginRoot = cursorProvider.cacheRoot;
       }
+      await prepareRoutingFixture({
+        cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv, includeRetrieval,
+      });
+      if (id === "proof_observational") {
+        await requireMissingRetrievalProjection({
+          cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv,
+          label: "proof observational preflight retrieval status",
+        });
+      }
+      await preflightRoutingScenario({ cli: authenticated.staged.managedCli, entry, projectRoot, env: sessionEnv });
+      const hostRequest = host === "cursor" ? {
+        ...entry.request,
+        text: `${entry.request.text}\nThe installed CodeStory guidance for this session is linked at ${join(
+          installedPluginRoot, "skills", "codestory-grounding", "SKILL.md",
+        )}. Read that exact file if you need its details; do not locate or probe the installed plugin package.`,
+      } : entry.request;
       const command = buildRoutingHostCommand({
         host,
         executable: host === "codex" ? (options.codex_command ?? "codex") : (options.cursor_command ?? "cursor-agent"),
@@ -1292,7 +1301,7 @@ async function main(argv) {
         installedPluginRoot,
         codexHome,
         model: host === "codex" ? (options.codex_model ?? DEFAULT_CODEX_MODEL) : options.cursor_model,
-        prompt: entry.request.text,
+        prompt: hostRequest.text,
       });
       const session = await runSession(command, sessionEnv);
       const capture = await writeRoutingSessionCapture(resolve(options.out), host, entry.scenario_id, session);
@@ -1304,7 +1313,7 @@ async function main(argv) {
         report = validateInstalledSession({
           host,
           scenarioId: entry.scenario_id,
-          request: entry.request,
+          request: hostRequest,
           installedRoot: authenticated.installedRoot,
           installedReceipt: authenticated.installedReceipt,
           expectedIdentity: authenticated.expectedIdentity,

@@ -13,6 +13,7 @@ import {
   buildRoutingHostCommand,
   buildCodexPluginInstallCommand,
   authenticateSourceCandidateInstallation,
+  cursorHostEnvironment,
   discoverCursorQualificationProviders,
   installCursorQualificationProvider,
   materializeRoutingFixture,
@@ -119,6 +120,26 @@ test("qualification host commands use official isolated Codex and Cursor session
     pluginArgs: ["plugin", "add", "codestory@RoutingCandidate", "--json"],
     env: { CODEX_HOME: "/fixture/codex-home" },
   });
+});
+
+test("Cursor scored sessions prepare and execute against one private default cache", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codestory-routing-cursor-env-"));
+  try {
+    const home = join(root, "home");
+    const state = join(root, "state");
+    const env = await cursorHostEnvironment(home, state, {
+      FIXTURE: "retained",
+      CODESTORY_CACHE_ROOT: join(root, "wrong-cache"),
+      CODESTORY_STDIO_CACHE_ROOT: join(root, "wrong-stdio-cache"),
+    });
+    assert.equal(env.HOME, home);
+    assert.equal(env.FIXTURE, "retained");
+    assert.equal(env.CODESTORY_CACHE_ROOT, undefined);
+    assert.equal(env.CODESTORY_STDIO_CACHE_ROOT, undefined);
+    assert.equal(env.CURSOR_CONFIG_DIR, join(state, "config"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Cursor qualification installs one authenticated provider into both private account roots", async () => {
