@@ -2337,22 +2337,24 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
   }
   const command = unwrapCodexShell(action.command);
   if (!command || !installedPluginRoot) return null;
-  const reads = command.split(/\s+&&\s+/u).map((segment) => segment.match(
-    /^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u,
-  ));
-  if (reads.length === 0 || reads.some((match) => match === null)) return null;
+  const reads = command.split(/\s+&&\s+/u).map((segment) => {
+    const sed = segment.match(/^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u);
+    if (sed) return { kind: "sed", endLine: Number(sed[1] ?? sed[2] ?? sed[3]), word: sed[4] };
+    const wc = segment.match(/^wc\s+-l\s+(\S+)$/u);
+    return wc ? { kind: "wc", word: wc[1] } : null;
+  });
+  if (reads.length === 0 || reads.some((read) => read === null)) return null;
   let root;
   try {
     root = realpathSync(installedPluginRoot);
   } catch {
     return null;
   }
-  const paths = [];
+  const paths = new Set();
   const expectedOutput = [];
-  for (const match of reads) {
-    const endLine = Number(match[1] ?? match[2] ?? match[3]);
-    const candidate = singleShellWord(match[4]);
-    if (!candidate || !Number.isSafeInteger(endLine) || endLine < 1) return null;
+  for (const read of reads) {
+    const candidate = singleShellWord(read.word);
+    if (!candidate) return null;
     let actual;
     try {
       if (!lstatSync(candidate).isFile()) return null;
@@ -2368,13 +2370,19 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
     if (!SHA256.test(String(expectedDigest)) || /^0{64}$/u.test(String(expectedDigest))) return null;
     const bytes = readFileSync(actual);
     if (sha256Bytes(bytes) !== expectedDigest) return null;
-    const output = sedPrefix(bytes.toString("utf8"), endLine);
-    if (output === null) return null;
-    paths.push(rosterPath);
-    expectedOutput.push(output);
+    if (read.kind === "sed") {
+      if (!Number.isSafeInteger(read.endLine) || read.endLine < 1) return null;
+      const output = sedPrefix(bytes.toString("utf8"), read.endLine);
+      if (output === null) return null;
+      expectedOutput.push(output);
+    } else {
+      const newlineCount = bytes.reduce((count, byte) => count + Number(byte === 0x0a), 0);
+      expectedOutput.push(`${newlineCount} ${candidate}\n`);
+    }
+    paths.add(rosterPath);
   }
   if (action.result !== expectedOutput.join("")) return null;
-  return paths;
+  return [...paths];
 }
 
 function productRoutingActions(host, actions, installedPluginRoot, expectedIdentity) {

@@ -894,6 +894,18 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
   );
   assert.deepEqual(validate("codex", linkedGuidance).actions, ["search"]);
 
+  const countedGuidance = baseRun("exact_symbol_search");
+  const countedPaths = codexGuidancePaths.slice(1, 3).map((path) => join(codexPluginRoot, path));
+  countedGuidance.steps.unshift(
+    { kind: "host_guidance_read", path: codexSkillPath },
+    ...countedPaths.map((path) => ({
+      kind: "shell",
+      command: `/bin/zsh -lc ${JSON.stringify(`wc -l ${JSON.stringify(path)} && sed -n '1,260p' ${JSON.stringify(path)}`)}`,
+      output: `${readFileSync(path, "utf8").match(/\n/gu)?.length ?? 0} ${path}\n${readFileSync(path, "utf8")}`,
+    })),
+  );
+  assert.deepEqual(validate("codex", countedGuidance).actions, ["search"]);
+
   const countedRead = baseRun("named_file_direct_read");
   countedRead.steps = [{
     kind: "shell",
