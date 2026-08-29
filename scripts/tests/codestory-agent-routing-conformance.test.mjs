@@ -927,6 +927,25 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
   });
   assert.deepEqual(validate("codex", semicolonGuidance).actions, ["search"]);
 
+  const relativeGuidance = baseRun("exact_symbol_search");
+  const relativeContextPath = join(codexPluginRoot, "skills/codestory-grounding/references/context.md");
+  relativeGuidance.steps.unshift(
+    { kind: "host_guidance_read", path: codexSkillPath },
+    {
+      kind: "shell",
+      command: `/bin/zsh -lc ${JSON.stringify("sed -n '1,260p' references/context.md")}`,
+      output: readFileSync(relativeContextPath, "utf8"),
+    },
+  );
+  assert.deepEqual(validate("codex", relativeGuidance).actions, ["search"]);
+
+  const tamperedRelativeGuidance = clone(relativeGuidance);
+  tamperedRelativeGuidance.steps[1].output += "tampered\n";
+  assert.throws(
+    () => validate("codex", tamperedRelativeGuidance),
+    /required action sequence|forbidden tool/u,
+  );
+
   const countedGuidance = baseRun("exact_symbol_search");
   const countedPaths = codexGuidancePaths.slice(1, 3).map((path) => join(codexPluginRoot, path));
   countedGuidance.steps.unshift(

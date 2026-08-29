@@ -3,7 +3,7 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { relative, resolve, sep } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SHA256 = /^[0-9a-f]{64}$/u;
@@ -2370,7 +2370,8 @@ function sedPrefix(text, endLine) {
 }
 
 function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedIdentity) {
-  if (action.kind !== "shell" || !action.completed || action.error || typeof action.result !== "string") {
+  if (!["shell", "source_read"].includes(action.kind)
+      || !action.completed || action.error || typeof action.result !== "string") {
     return null;
   }
   const command = unwrapCodexShell(action.command);
@@ -2407,10 +2408,15 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
     for (const word of read.words) {
       const candidate = singleShellWord(word);
       if (!candidate) return null;
+      const normalizedCandidate = candidate.replaceAll("\\", "/");
+      const candidatePath = isAbsolute(candidate)
+        ? candidate
+        : resolve(root, "skills/codestory-grounding", normalizedCandidate);
       let actual;
       try {
-        if (!lstatSync(candidate).isFile()) return null;
-        actual = realpathSync(candidate);
+        if (!normalizedCandidate.startsWith("references/") && !isAbsolute(candidate)) return null;
+        if (!lstatSync(candidatePath).isFile()) return null;
+        actual = realpathSync(candidatePath);
       } catch {
         return null;
       }
