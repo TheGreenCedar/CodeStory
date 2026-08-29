@@ -1,5 +1,5 @@
 ---
-description: CodeStory local grounding. Use repo evidence before source claims.
+description: Load the canonical CodeStory grounding skill.
 globs:
 alwaysApply: true
 ---
@@ -9,5 +9,3 @@ alwaysApply: true
 Read and follow the [canonical codestory-grounding skill](../../plugins/codestory/skills/codestory-grounding/SKILL.md)
 before repository work. It is the sole source of truth for CodeStory tool routing
 and evidence boundaries. This rule adds no parallel instructions.
-
-Cursor setup, MCP wiring, and host-specific notes: [docs/users/cursor.md](../../docs/users/cursor.md).

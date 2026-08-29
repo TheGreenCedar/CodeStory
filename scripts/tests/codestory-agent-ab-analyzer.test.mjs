@@ -59,6 +59,7 @@ import {
   packetManifestQualitySummary,
   packetObligationAccounting,
   packetDispositionTelemetry,
+  preludePublicFields,
   packetPreludeContractBlockers,
   publicPacketPreludeContractPasses,
   packetPreludeManifestComplete,
@@ -68,6 +69,8 @@ import {
   packetRuntimeQualityGateRequired,
   publicCoreCorpusAudit,
   projectResourceUri,
+  reanalysisExactCandidateAcceptance,
+  reanalysisPacketProjection,
   planAgentRuns,
   repoProvenance,
   repoProvenanceBlockers,
@@ -1587,11 +1590,8 @@ test("keeps CLI overrides out of both isolated agent arms", () => {
   const baseline = runnerCommand(opts, "/tmp/repo", "prompt", "without_codestory");
   const measured = runnerCommand(opts, "/tmp/repo", "prompt", "with_codestory");
   assert.ok(baseline.args.includes("--ignore-user-config"));
-  assert.ok(!measured.args.includes("--ignore-user-config"));
-  assert.deepEqual(
-    baseline.args.filter((arg) => arg !== "--ignore-user-config"),
-    measured.args,
-  );
+  assert.ok(measured.args.includes("--ignore-user-config"));
+  assert.deepEqual(baseline.args, measured.args);
   for (const setting of [
     'approval_policy="never"',
     'model_reasoning_effort="xhigh"',
@@ -2193,6 +2193,164 @@ test("packet obligation accounting preserves the historical material split", () 
     missing_reason: 1,
     "unclassified_reason:new_reason": 1,
   });
+});
+
+test("packet prelude projection preserves revision-native accounting", () => {
+  const legacyPacket = {
+    plan: {
+      obligations: {
+        claim_obligations: [
+          { material: true, proof_status: "proven" },
+          {
+            material: true,
+            proof_status: "reported",
+            reason: "required_evidence_edge_missing",
+          },
+          { material: false, proof_status: "planned" },
+        ],
+      },
+    },
+    sufficiency: {
+      status: "partial",
+      covered_claims: [],
+      open_next: [],
+      gaps: ["missing edge"],
+      follow_up_commands: [],
+    },
+  };
+  const legacySufficiency = packetSufficiencyTelemetry(legacyPacket, { pass: false });
+  const legacyPrelude = preludePublicFields({
+    command: "codestory-cli packet --project . --question flow",
+    packet_schema_version: 2,
+    packet_sufficiency: legacySufficiency,
+  });
+  assert.deepEqual(legacyPrelude.packet_sufficiency?.obligation_accounting, {
+    total: 3,
+    material: 2,
+    nonmaterial: 1,
+    material_status_buckets: {
+      proven: 1,
+      required_evidence_edge_missing: 1,
+    },
+  });
+
+  const v3Accounting = {
+    contract: "codestory.packet-v3-evidence-gap-accounting/v1",
+    kind: "complete",
+    status: "available",
+    evidence_count: 1,
+    unique_evidence_id_count: 1,
+    evidence_kind_counts: { exact_source: 1 },
+    gap_count: 0,
+    unique_gap_id_count: 0,
+    gap_kind_counts: {},
+    continuation_gap_count: 0,
+    unique_continuation_gap_id_count: 0,
+    continuation_gap_ids_bound: true,
+  };
+  const v3Prelude = preludePublicFields({
+    command: "candidate_cli.bin packet --project . --question flow",
+    packet_schema_version: 3,
+    packet_sufficiency: null,
+    packet_evidence_gap_accounting: v3Accounting,
+  });
+  assert.equal(v3Prelude.packet_sufficiency, null);
+  assert.deepEqual(v3Prelude.packet_evidence_gap_accounting, v3Accounting);
+});
+
+test("saved packet reanalysis rebuilds revision-native accounting and derived acceptance", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-packet-reanalysis-"));
+  const task = {
+    expected_files: [],
+    expected_symbols: [],
+    expected_claims: [],
+    forbidden_claims: [],
+  };
+  try {
+    const legacyPath = path.join(root, "legacy.json");
+    await writeFile(legacyPath, JSON.stringify({
+      plan: {
+        obligations: {
+          claim_obligations: [
+            { material: true, proof_status: "proven" },
+            { material: false, proof_status: "planned" },
+          ],
+        },
+      },
+      sufficiency: {
+        status: "partial",
+        covered_claims: [],
+        open_next: [],
+        gaps: ["missing edge"],
+        follow_up_commands: [],
+      },
+    }));
+    const legacy = await reanalysisPacketProjection({
+      codestory_harness_prelude: {
+        stdout_path: legacyPath,
+        packet_schema_version: 2,
+      },
+    }, root, task);
+    assert.deepEqual(legacy.packet_sufficiency?.obligation_accounting, {
+      total: 2,
+      material: 1,
+      nonmaterial: 1,
+      material_status_buckets: { proven: 1 },
+    });
+    assert.equal(legacy.packet_evidence_gap_accounting, null);
+    const legacyWithoutTask = await reanalysisPacketProjection({
+      codestory_harness_prelude: {
+        stdout_path: legacyPath,
+        packet_schema_version: 2,
+      },
+    }, root, null);
+    assert.deepEqual(
+      legacyWithoutTask.packet_sufficiency?.obligation_accounting,
+      legacy.packet_sufficiency.obligation_accounting,
+    );
+    assert.equal(legacyWithoutTask.packet_manifest_quality, null);
+
+    const v3Path = path.join(root, "v3.json");
+    await writeFile(v3Path, JSON.stringify({
+      schema_version: 3,
+      kind: "complete",
+      status: "available",
+      evidence: [
+        { identity: { evidence_id: "evidence-1" }, kind: "exact_source" },
+      ],
+      gaps: [
+        { identity: { gap_id: "gap-1" }, kind: "evidence_missing" },
+      ],
+      continuation: null,
+    }));
+    const v3 = await reanalysisPacketProjection({
+      codestory_harness_prelude: {
+        stdout_path: v3Path,
+        packet_schema_version: 3,
+      },
+    }, root, task);
+    assert.equal(v3.packet_sufficiency, null);
+    assert.equal(v3.packet_evidence_gap_accounting.evidence_count, 1);
+    assert.equal(v3.packet_evidence_gap_accounting.gap_count, 1);
+    const v3WithoutTask = await reanalysisPacketProjection({
+      codestory_harness_prelude: {
+        stdout_path: v3Path,
+        packet_schema_version: 3,
+      },
+    }, root, null);
+    assert.equal(v3WithoutTask.packet_evidence_gap_accounting.evidence_count, 1);
+    assert.equal(v3WithoutTask.packet_evidence_gap_accounting.gap_count, 1);
+    assert.equal(v3WithoutTask.packet_manifest_quality, null);
+
+    const refreshed = reanalysisExactCandidateAcceptance({
+      exact_candidate_acceptance: { stale: true },
+      exact_candidate_lifecycle: exactLifecycle(),
+    }, exactCandidateRows());
+    assert.equal(refreshed.stale, undefined);
+    assert.equal(refreshed.pass, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("packet obligation accounting rejects unreconciled summaries", () => {
@@ -4932,6 +5090,9 @@ test("v3 benchmark routing treats projection bounds as descriptive rather than r
   assert.match(instruction, /at most one declared continuation/);
   assert.match(instruction, /reassess its returned gaps without another retrieval call/);
   assert.match(instruction, /exact focused source read/);
+  assert.match(instruction, /file-local task/);
+  assert.match(instruction, /broad flow question.*does not authorize/i);
+  assert.match(instruction, /at most one bounded read per authorized path/i);
   assert.match(instruction, /Do not use shell search, Git, or free-form repository recovery/);
   assert.doesNotMatch(instruction, /direct source reads as packet recovery/);
 });
@@ -5288,9 +5449,18 @@ test("transcript analysis authorizes source reads only from user-named files or 
   ];
   const named = analyzeTranscript(namedEvents, project, {
     arm: "candidate_0_18",
-    task: { prompt: "Inspect src/named.ts and explain the call." },
+    task: { prompt: "Inspect src/named.ts and explain the call.", file_local: true },
   });
   assert.equal(named.direct_source_reads[0].authorization.reason, "user_named_file");
+
+  const broadNamed = analyzeTranscript(namedEvents, project, {
+    arm: "candidate_0_18",
+    task: {
+      task_class: "route_tracing",
+      prompt: "Trace the broad flow through src/named.ts and the rest of the subsystem.",
+    },
+  });
+  assert.equal(broadNamed.direct_source_reads[0].authorization.status, "unauthorized");
 
   const gapEvents = [
     commandEvent("packet", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
@@ -5304,6 +5474,53 @@ test("transcript analysis authorizes source reads only from user-named files or 
   });
   assert.equal(gap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
   assert.equal(gap.direct_source_reads[0].authorization.evidence_command_id, "packet");
+
+  const repeatedGapRead = analyzeTranscript([
+    ...gapEvents,
+    commandEvent("gap-read-again", "item.started", "Get-Content src/gap.ts"),
+    commandEvent("gap-read-again", "item.completed", "Get-Content src/gap.ts", "source again"),
+  ], project, {
+    arm: "published_0_17_4",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(repeatedGapRead.direct_source_reads[0].authorization.status, "authorized");
+  assert.equal(repeatedGapRead.direct_source_reads[1].authorization.status, "unauthorized");
+
+  const distinctSuffixReads = analyzeTranscript([
+    commandEvent("vendor-read", "item.started", "Get-Content vendor/src/foo.rs"),
+    commandEvent("vendor-read", "item.completed", "Get-Content vendor/src/foo.rs", "vendor"),
+    commandEvent("source-read", "item.started", "Get-Content src/foo.rs"),
+    commandEvent("source-read", "item.completed", "Get-Content src/foo.rs", "source"),
+  ], project, {
+    arm: "candidate_0_18",
+    task: {
+      file_local: true,
+      prompt: "Compare `vendor/src/foo.rs` with `src/foo.rs`.",
+    },
+  });
+  assert.deepEqual(
+    distinctSuffixReads.direct_source_reads.map((read) => read.authorization.status),
+    ["authorized", "authorized"],
+  );
+
+  if (process.platform !== "win32") {
+    const caseDistinctReads = analyzeTranscript([
+      commandEvent("upper-read", "item.started", "Get-Content src/Foo.rs"),
+      commandEvent("upper-read", "item.completed", "Get-Content src/Foo.rs", "upper"),
+      commandEvent("lower-read", "item.started", "Get-Content src/foo.rs"),
+      commandEvent("lower-read", "item.completed", "Get-Content src/foo.rs", "lower"),
+    ], project, {
+      arm: "candidate_0_18",
+      task: {
+        file_local: true,
+        prompt: "Compare `src/Foo.rs` with `src/foo.rs`.",
+      },
+    });
+    assert.deepEqual(
+      caseDistinctReads.direct_source_reads.map((read) => read.authorization.status),
+      ["authorized", "authorized"],
+    );
+  }
 
   const v3GapEvents = [
     commandEvent("packet-v3", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
@@ -5477,6 +5694,48 @@ test("transcript analysis authorizes source reads only from user-named files or 
     task: { prompt: "Explain the flow." },
   });
   assert.equal(baseline.direct_source_reads[0].authorization.status, "baseline_local_exploration");
+});
+
+test("file-local read authorization survives manifest normalization and result snapshots", async () => {
+  await withManifestFile(
+    manifestFixture({
+      file_local: true,
+      prompt: "Inspect src/main.rs and explain its local behavior.",
+    }),
+    async (manifestPath, dir) => {
+      const [task] = await loadTasks({
+        taskManifest: manifestPath,
+        taskSuite: null,
+        taskIds: null,
+        repoCacheDir: path.join(dir, "repos"),
+      });
+      const snapshot = taskSnapshotForResult(task);
+      assert.equal(task.file_local, true);
+      assert.equal(snapshot.file_local, true);
+
+      const project = path.join(dir, "repos", "fixture-repo");
+      const analysis = analyzeTranscript([
+        commandEvent("named-read", "item.started", "Get-Content src/main.rs"),
+        commandEvent("named-read", "item.completed", "Get-Content src/main.rs", "source"),
+      ], project, { arm: "candidate_0_18", task: snapshot });
+      assert.equal(analysis.direct_source_reads[0].authorization.reason, "user_named_file");
+    },
+  );
+
+  await withManifestFile(
+    manifestFixture({ file_local: "true" }),
+    async (manifestPath, dir) => {
+      await assert.rejects(
+        () => loadTasks({
+          taskManifest: manifestPath,
+          taskSuite: null,
+          taskIds: null,
+          repoCacheDir: path.join(dir, "repos"),
+        }),
+        /file_local must be a boolean/,
+      );
+    },
+  );
 });
 
 test("transcript analysis authorizes an exact source read from a continuation's returned material gap", () => {
@@ -6054,6 +6313,53 @@ test("harness packet prelude counts as the first context command", () => {
   assert.equal(analysis.packet_was_first_context_command, true);
 });
 
+test("typed harness packet preludes preserve semantics independent of executable spelling and prompt text", () => {
+  const command =
+    '/authenticated-inputs/candidate_cli.bin packet --project . --question "Explain the type-erased request flow" --format json';
+  const harnessSemantics = {
+    source: "codestory_packet_prelude_v1",
+    category: "codestory_cli",
+    operation: "packet",
+  };
+  const events = [
+    {
+      type: "harness.command.started",
+      item: {
+        id: "harness_codestory_packet",
+        type: "command_execution",
+        command,
+        harness_semantics: harnessSemantics,
+      },
+    },
+    {
+      type: "harness.command.completed",
+      item: {
+        id: "harness_codestory_packet",
+        type: "command_execution",
+        command,
+        harness_semantics: harnessSemantics,
+        aggregated_output: '{"kind":"complete","schema_version":3}',
+        exit_code: 0,
+        status: "completed",
+      },
+    },
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.codestory_cli, 1);
+  assert.equal(analysis.command_categories.direct_file_read ?? 0, 0);
+  assert.equal(analysis.direct_source_reads_total, 0);
+  assert.equal(analysis.first_successful_packet_command.id, "harness_codestory_packet");
+  assert.equal(analysis.packet_was_first_context_command, true);
+
+  const unmarked = analyzeTranscript([
+    commandEvent("agent_command", "item.completed", command, "ok", 0),
+  ]);
+  assert.equal(unmarked.command_categories.codestory_cli ?? 0, 0);
+  assert.equal(unmarked.first_successful_packet_command, null);
+  assert.equal(unmarked.packet_was_first_context_command, false);
+});
+
 test("codestory cli resolver prefers explicit path, release binary, then fails closed", () => {
   const explicit = resolveCodeStoryCli({ codestoryCli: "C:/custom/codestory-cli.exe" }, () => {
     throw new Error("explicit path should not probe local candidates");
@@ -6144,6 +6450,155 @@ test("quality scoring treats class member separator variants as symbol matches",
 
   assert.equal(quality.expected_symbols.recall, 1);
   assert.equal(quality.pass, true);
+});
+
+test("quality scoring never turns negative or gap sentences into positive symbol and claim credit", () => {
+  const task = {
+    id: "swift-polarity",
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["DataRequest.validate", "RequestTaskMap"],
+    expected_claims: ["DataRequest.validate runs before the response is serialized."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0,
+      min_expected_file_recall: 0,
+      min_expected_symbol_recall: 0,
+      min_expected_claim_recall: 0,
+      min_citation_coverage: 0,
+      max_forbidden_claims: 0,
+    },
+  };
+
+  const negative = scoreQuality([
+    agentMessageEvent(
+      "The packet does not establish `DataRequest.validate`. `RequestTaskMap` remains an evidence gap, so its role is unknown.",
+    ),
+  ], task);
+  assert.equal(negative.expected_symbols.found, 0);
+  assert.equal(negative.expected_claims.found, 0);
+
+  const affirmative = scoreQuality([
+    agentMessageEvent(
+      "`DataRequest.validate` runs before the response is serialized. `RequestTaskMap` owns the concrete task mapping.",
+    ),
+  ], task);
+  assert.equal(affirmative.expected_symbols.found, 2);
+  assert.equal(affirmative.expected_claims.found, 1);
+
+  const mixed = scoreQuality([
+    agentMessageEvent(
+      "The packet does not establish `DataRequest.validate`. `RequestTaskMap` owns the concrete task mapping.",
+    ),
+  ], task);
+  assert.deepEqual(mixed.expected_symbols.found_anchors, ["RequestTaskMap"]);
+  assert.equal(mixed.expected_claims.found, 0);
+});
+
+test("quality scoring keeps affirmative support units intact without combining unrelated bullets", () => {
+  const compoundTask = {
+    id: "compound-support-unit",
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["createApplication"],
+    expected_claims: [
+      "createApplication creates the callable app and mixes in the EventEmitter prototype.",
+    ],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0,
+      min_expected_file_recall: 0,
+      min_expected_symbol_recall: 0,
+      min_expected_claim_recall: 0,
+      min_citation_coverage: 0,
+      max_forbidden_claims: 0,
+    },
+  };
+
+  const oneUnit = scoreQuality([
+    agentMessageEvent(
+      "1. `createApplication` creates the callable app. It then mixes in the EventEmitter prototype.",
+    ),
+  ], compoundTask);
+  assert.equal(oneUnit.expected_claims.found, 1);
+
+  const separateUnits = scoreQuality([
+    agentMessageEvent(
+      "- `createApplication` creates the callable app.\n\n- The EventEmitter prototype is mixed into another object.",
+    ),
+  ], compoundTask);
+  assert.equal(separateUnits.expected_claims.found, 0);
+
+  const subjectTask = {
+    ...compoundTask,
+    id: "subject-bound-support-unit",
+    expected_symbols: ["Engine.addRoute", "RouterGroup.Handle"],
+    expected_claims: ["RouterGroup.Handle registers route handlers."],
+  };
+  const adversative = scoreQuality([
+    agentMessageEvent(
+      "`Engine.addRoute` is established, but `RouterGroup.Handle` is missing. The engine registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.deepEqual(adversative.expected_symbols.found_anchors, ["Engine.addRoute"]);
+  assert.equal(adversative.expected_claims.found, 0);
+
+  const lacksEvidence = scoreQuality([
+    agentMessageEvent(
+      "`RouterGroup.Handle` lacks evidence; `Engine.addRoute` registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.deepEqual(lacksEvidence.expected_symbols.found_anchors, ["Engine.addRoute"]);
+  assert.equal(lacksEvidence.expected_claims.found, 0);
+
+  const noEvidence = scoreQuality([
+    agentMessageEvent(
+      "No evidence establishes `RouterGroup.Handle`; `Engine.addRoute` registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.deepEqual(noEvidence.expected_symbols.found_anchors, ["Engine.addRoute"]);
+  assert.equal(noEvidence.expected_claims.found, 0);
+
+  const differentAffirmativeSubject = scoreQuality([
+    agentMessageEvent(
+      "`RouterGroup.Handle` reports registration errors; `Engine.addRoute` registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.equal(differentAffirmativeSubject.expected_claims.found, 0);
+
+  const linkedWithinOneUnit = scoreQuality([
+    agentMessageEvent(
+      "`Session.send` is the dispatch point. Packet relations show it calls `Session.get_adapter`; the next cited line shows `adapter.send(request)`.",
+    ),
+  ], {
+    ...compoundTask,
+    id: "linked-one-unit",
+    expected_symbols: ["Session.send", "Session.get_adapter", "HTTPAdapter.send"],
+    expected_claims: ["Session.send chooses an adapter and calls the adapter send method."],
+  });
+  assert.equal(linkedWithinOneUnit.expected_claims.found, 1);
+
+  const genericCapitalizedSubject = scoreQuality([
+    agentMessageEvent(
+      "`source/_vars.css` defines shared `:root` variables for `--animate-duration`, `--animate-delay`, and `--animate-repeat`.",
+    ),
+  ], {
+    ...compoundTask,
+    id: "generic-capitalized-subject",
+    expected_symbols: [":root", "--animate-duration", "--animate-delay", "--animate-repeat"],
+    expected_claims: [
+      "Shared CSS custom properties define animation duration, delay, and repeat defaults.",
+    ],
+  });
+  assert.equal(genericCapitalizedSubject.expected_claims.found, 1);
+
+  const gapSection = scoreQuality([
+    agentMessageEvent(
+      "The request reaches `Session.send`.\n\n## Material gaps\n`RouterGroup.Handle` registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.equal(gapSection.expected_symbols.found, 0);
+  assert.equal(gapSection.expected_claims.found, 0);
 });
 
 test("quality scoring treats Ruby instance separator variants as symbol matches", () => {

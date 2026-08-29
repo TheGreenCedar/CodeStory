@@ -210,7 +210,7 @@ const CODESTORY_ARM_INSTRUCTION =
   "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.";
 
 const CODESTORY_V3_ARM_INSTRUCTION =
-  "Use the CodeStory packet supplied by the harness as repository evidence, not as proof or an answer-authority verdict. Answer only from its evidence rows and state every material gap. Follow at most one declared continuation using the packet's continuation and publication identities, then reassess its returned gaps without another retrieval call. An exact focused source read is allowed only when the user named that file or a material evidence-missing, Unknown, or Unavailable boundary authenticates that exact path. An output_budget_exceeded gap is descriptive and does not authorize a source read or another repository tool by itself. A packet-cited path or range alone is not read authorization, and an unrelated gap does not authorize arbitrary files. Do not use shell search, Git, or free-form repository recovery. Do not call search or context as packet recovery in this controlled comparison. Do not turn missing evidence into absence or runtime behavior. Do not repeat the initial packet call or use web search, browser tools, remote URLs, or upstream mirrors.";
+  "Use the CodeStory packet supplied by the harness as repository evidence, not as proof or an answer-authority verdict. Answer only from its evidence rows and state every material gap. Follow at most one declared continuation using the packet's continuation and publication identities, then reassess its returned gaps without another retrieval call. An exact focused source read is allowed only for a file-local task where the user named that exact file, or when a material evidence-missing, Unknown, or Unavailable boundary authenticates that exact path. A file mentioned inside a broad flow question does not authorize a read. Perform at most one bounded read per authorized path. An output_budget_exceeded gap is descriptive and does not authorize a source read or another repository tool by itself. A packet-cited path or range alone is not read authorization, and an unrelated gap does not authorize arbitrary files. Do not use shell search, Git, or free-form repository recovery. Do not call search or context as packet recovery in this controlled comparison. Do not turn missing evidence into absence or runtime behavior. Do not repeat the initial packet call or use web search, browser tools, remote URLs, or upstream mirrors.";
 
 const ARMS = {
   without_codestory:
@@ -925,7 +925,7 @@ function runnerCommand(opts, repoPath, prompt, arm = null) {
   const command = process.platform === "win32" ? "cmd.exe" : "codex";
   const codexArgs = [
     "exec",
-    ...(arm === "without_codestory" ? ["--ignore-user-config"] : []),
+    "--ignore-user-config",
     "--config",
     'approval_policy="never"',
     ...PINNED_CODEX_RUNNER_CONFIG.flatMap((value) => ["--config", value]),
@@ -1849,6 +1849,9 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
   validateQualityThresholds(filePath, qualityThresholds);
   const id = validateManifestTaskId(filePath, taskIdFromManifest(filePath, raw));
   const taskClass = validatePacketTaskClass(filePath, raw.task_class ?? raw.taskClass);
+  if (raw.file_local != null && typeof raw.file_local !== "boolean") {
+    throw new Error(`Task manifest file_local must be a boolean: ${filePath}`);
+  }
 
   return {
     id,
@@ -1857,6 +1860,7 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
     repo,
     repo_metadata: typeof raw.repo === "object" ? raw.repo : null,
     task_class: taskClass,
+    file_local: raw.file_local === true,
     prompt,
     expected_files: expectedFiles,
     expected_verification_files: expectedVerificationFiles,
@@ -1881,6 +1885,7 @@ function taskSnapshotForResult(task) {
       repo: task.repo,
       repo_metadata: task.repo_metadata ?? null,
       task_class: task.task_class,
+      file_local: task.file_local === true,
       prompt: task.prompt,
       expected_files: task.expected_files ?? [],
       expected_verification_files: task.expected_verification_files ?? [],
@@ -2584,7 +2589,7 @@ Run that answer packet before any repository search, direct source read, git com
     isCodeStoryArm(armName)
       ? isPacketProjectionV3(context.codestoryPrelude?.packet)
         ? `
-The packet is an evidence-only projection. Use its evidence rows directly, name every gap, and do not infer proof, completeness, runtime behavior, or absence from availability. If status is \`continuation_available\`, execute exactly the declared one-shot continuation, then reassess its returned gaps without another retrieval call. An exact focused source read is allowed only for a user-named file or when a material \`evidence_missing\`, \`Unknown\`, or \`Unavailable\` boundary authenticates that exact path. An \`output_budget_exceeded\` gap is descriptive and does not authorize a source read or another repository tool by itself. A packet-cited path or range alone is not authorization, and an unrelated gap does not authorize arbitrary files.`
+The packet is an evidence-only projection. Use its evidence rows directly, name every gap, and do not infer proof, completeness, runtime behavior, or absence from availability. If status is \`continuation_available\`, execute exactly the declared one-shot continuation, then reassess its returned gaps without another retrieval call. An exact focused source read is allowed only for a file-local task where the user named that exact file, or when a material \`evidence_missing\`, \`Unknown\`, or \`Unavailable\` boundary authenticates that exact path. A file mentioned inside this broad flow question does not authorize a read. Perform at most one bounded read per authorized path. An \`output_budget_exceeded\` gap is descriptive and does not authorize a source read or another repository tool by itself. A packet-cited path or range alone is not authorization, and an unrelated gap does not authorize arbitrary files.`
         : `
 The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. A \`not_established\` packet can still contain directly useful support: answer those established parts, identify the material gaps, and do not infer the missing links. On \`drill_once\`, execute exactly the declared one-shot packet continuation, apply the same terminal answer rule, and then stop regardless of its result.`
       : "";
@@ -3048,6 +3053,37 @@ function pathMatchesLike(actual, expected) {
   return left === right || left.endsWith(`/${right}`);
 }
 
+function sourceReadPathIdentity(value, projectRoot) {
+  const normalized = normalizePathLike(value);
+  if (!normalized) return null;
+  const normalizedRoot = normalizePathLike(projectRoot);
+  const windowsPath = /^[A-Za-z]:\//.test(normalized) || /^[A-Za-z]:\//.test(normalizedRoot);
+  let relative = normalized;
+  if (isAbsolutePathLike(normalized)) {
+    if (!normalizedRoot || !isAbsolutePathLike(normalizedRoot)) return null;
+    relative = normalizePathLike(
+      windowsPath
+        ? path.win32.relative(normalizedRoot.replaceAll("/", "\\"), normalized.replaceAll("/", "\\"))
+        : path.relative(normalizedRoot, normalized),
+    );
+  }
+  const components = relative.split("/");
+  if (
+    !relative ||
+    isAbsolutePathLike(relative) ||
+    components.some((component) =>
+      !component || component === "." || component === ".." || component.includes("\0")
+    )
+  ) {
+    return null;
+  }
+  const caseInsensitive = windowsPath || process.platform === "win32";
+  return {
+    relative,
+    key: caseInsensitive ? relative.toLowerCase() : relative,
+  };
+}
+
 function isLikelySourcePath(value) {
   const normalized = normalizePathLike(value).toLowerCase();
   return /\.(rs|js|jsx|mjs|cjs|ts|tsx|mts|cts|py|pyi|go|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|hh|hxx|rb|php|swift|dart|sh|bash|html|htm|css|sql|md|toml|json|yaml|yml)$/i.test(normalized);
@@ -3131,6 +3167,7 @@ function extractCommandExecutions(events) {
       status: null,
       started_event_index: null,
       completed_event_index: null,
+      harness_semantics: null,
     };
     if (item.command) {
       existing.command = item.command;
@@ -3144,11 +3181,20 @@ function extractCommandExecutions(events) {
       existing.exit_code = item.exit_code ?? null;
       existing.status = item.status ?? null;
     }
+    if (
+      eventTypeOf(event).startsWith("harness.command.") &&
+      item.harness_semantics?.source === "codestory_packet_prelude_v1" &&
+      item.harness_semantics?.category === "codestory_cli" &&
+      item.harness_semantics?.operation === "packet"
+    ) {
+      existing.harness_semantics = item.harness_semantics;
+    }
     byId.set(id, existing);
   });
 
   for (const command of byId.values()) {
-    command.category = commandCategory(command.command);
+    command.category = command.harness_semantics?.category ?? commandCategory(command.command);
+    command.codestory_operation = command.harness_semantics?.operation ?? null;
     command.pattern = commandPattern(command.command);
     commands.push(command);
   }
@@ -3356,19 +3402,27 @@ function directSourceReadAuthorization(read, commands, events, projectRoot, cont
     return { status: "baseline_local_exploration", reason: "without_codestory" };
   }
   const prompt = String(context.task?.prompt ?? "").replaceAll("\\", "/");
-  const normalizedPath = normalizePathLike(read.path);
-  const relativePath = isAbsolutePathLike(normalizedPath) && projectRoot
-    ? normalizePathLike(path.relative(projectRoot, normalizedPath))
-    : normalizedPath;
-  const pathComponents = relativePath.split("/");
-  if (
-    !relativePath ||
-    isAbsolutePathLike(relativePath) ||
-    pathComponents.some((component) => !component || component === "." || component === ".." || component.includes("\0"))
-  ) {
+  const readIdentity = sourceReadPathIdentity(read.path, projectRoot);
+  if (!readIdentity) {
     return { status: "unauthorized", reason: null };
   }
-  if (relativePath && textMentionsExactPath(prompt, relativePath)) {
+  const relativePath = readIdentity.relative;
+  const readEventIndex = read.event_index ?? -1;
+  const repeatedRead = commands.some((command) =>
+    command.category === "direct_file_read" &&
+    (command.started_event_index ?? command.completed_event_index ?? -1) < readEventIndex &&
+    extractDirectFileReads(command.command).some((candidate) =>
+      sourceReadPathIdentity(candidate, projectRoot)?.key === readIdentity.key
+    )
+  );
+  if (repeatedRead) {
+    return { status: "unauthorized", reason: "repeated_source_read" };
+  }
+  if (
+    context.task?.file_local === true &&
+    relativePath &&
+    textMentionsExactPath(prompt, relativePath)
+  ) {
     return { status: "authorized", reason: "user_named_file" };
   }
   const priorCommand = [...commands].reverse().find((command) =>
@@ -3418,7 +3472,10 @@ function analyzeTranscript(events, projectRoot = null, context = {}) {
   for (const command of commands) {
     bumpCount(commandCategories, command.category);
     bumpCount(outputCharsByCategory, command.category, String(command.aggregated_output ?? "").length);
-    for (const filePath of extractDirectFileReads(command.command)) {
+    const directReads = command.category === "direct_file_read"
+      ? extractDirectFileReads(command.command)
+      : [];
+    for (const filePath of directReads) {
       directFileReads.push({
         path: filePath,
         command_id: command.id,
@@ -3437,7 +3494,7 @@ function analyzeTranscript(events, projectRoot = null, context = {}) {
     (command) =>
       command.category === "codestory_cli" &&
       command.exit_code === 0 &&
-      isCodestoryPacketCommand(command.command),
+      (command.codestory_operation === "packet" || isCodestoryPacketCommand(command.command)),
   );
   const codestoryIndexCommands = commands.filter(
     (command) => command.category === "codestory_cli" && isCodestoryIndexCommand(command.command),
@@ -3726,12 +3783,15 @@ function anchorMatched(haystack, anchor) {
   return variants.some((variant) => normalizedHaystack.includes(variant));
 }
 
-function scoreAnchorSet(anchors, haystack) {
+function scoreAnchorSet(anchors, haystack, opts = {}) {
   const expected = [...new Set((anchors ?? []).map(String).map((value) => value.trim()).filter(Boolean))];
   const found = [];
   const missed = [];
   for (const anchor of expected) {
-    if (anchorMatched(haystack, anchor)) {
+    const matched = opts.affirmative === true
+      ? affirmativeQualityClauses(haystack).some((clause) => anchorMatched(clause, anchor))
+      : anchorMatched(haystack, anchor);
+    if (matched) {
       found.push(anchor);
     } else {
       missed.push(anchor);
@@ -3763,10 +3823,11 @@ const CLAIM_STOPWORDS = new Set([
   "with",
 ]);
 
-function claimTokens(value) {
+function claimTokens(value, { expandQualified = false } = {}) {
   return normalizeSearchText(value)
     .split(/[^a-z0-9_:.]+/)
     .map((token) => token.trim().replace(/^[.:]+|[.:]+$/g, ""))
+    .flatMap((token) => expandQualified ? [token, ...token.split(/(?:::|[.#])/g)] : [token])
     .filter((token) => token.length >= 3 && !CLAIM_STOPWORDS.has(token));
 }
 
@@ -3798,12 +3859,7 @@ function positiveClaimTokenMatched(token, haystackTokens) {
   for (const candidate of haystackTokens) {
     for (const expected of expectedVariants) {
       for (const observed of positiveClaimTokenVariants(candidate)) {
-        if (
-          expected === observed ||
-          (expected.length >= 5 &&
-            observed.length >= 5 &&
-            (observed.includes(expected) || expected.includes(observed)))
-        ) {
+        if (expected === observed) {
           return true;
         }
       }
@@ -3824,15 +3880,15 @@ function claimTokenMatched(token, haystackTokens) {
   return false;
 }
 
-function claimMatched(haystack, claim) {
-  if (anchorMatched(haystack, claim)) {
+function claimMatchedInSupportUnit(unit, claim) {
+  if (anchorMatched(unit, claim)) {
     return true;
   }
   const expectedTokens = [...new Set(claimTokens(claim))];
   if (expectedTokens.length < 3) {
     return false;
   }
-  const haystackTokens = new Set(claimTokens(haystack));
+  const haystackTokens = new Set(claimTokens(unit, { expandQualified: true }));
   const matched = expectedTokens.filter((token) =>
     positiveClaimTokenMatched(token, haystackTokens),
   ).length;
@@ -3842,6 +3898,41 @@ function claimMatched(haystack, claim) {
   // paraphrase while still rejecting a sentence that merely repeats one symbol name. Forbidden
   // claims retain the stricter polarity-aware matcher below.
   return matched >= Math.min(3, expectedTokens.length) && ratio >= 0.6;
+}
+
+function claimMatched(haystack, claim, subjectAnchors = []) {
+  const subject = claimSubjectAnchor(claim, subjectAnchors);
+  return qualitySupportUnits(haystack).some((unit) => {
+    const clauses = qualityClausesInUnit(unit);
+    if (!subject) {
+      const affirmative = clauses.filter(qualityClauseIsAffirmative);
+      return affirmative.length > 0 && claimMatchedInSupportUnit(affirmative.join(" "), claim);
+    }
+    return clauses.some((clause, index) => {
+      if (!qualityClauseIsAffirmative(clause) || !anchorMatched(clause, subject)) {
+        return false;
+      }
+      const candidate = [];
+      if (
+        index > 0 &&
+        qualityClauseIsAffirmative(clauses[index - 1]) &&
+        claimTokens(clauses[index - 1]).length <= 4 &&
+        !leadingClaimSubject(clauses[index - 1], subjectAnchors)
+      ) {
+        candidate.push(clauses[index - 1]);
+      }
+      candidate.push(clause);
+      for (let next = index + 1; next < clauses.length; next += 1) {
+        if (!qualityClauseIsAffirmative(clauses[next])) {
+          break;
+        }
+        const nextSubject = leadingClaimSubject(clauses[next], subjectAnchors);
+        if (nextSubject && nextSubject !== subject) break;
+        candidate.push(clauses[next]);
+      }
+      return claimMatchedInSupportUnit(candidate.join(" "), claim);
+    });
+  });
 }
 
 const FORBIDDEN_POLARITY_TERMS = new Set([
@@ -3872,8 +3963,122 @@ function forbiddenCandidateSentences(haystack) {
     .filter(Boolean);
 }
 
+const NON_AFFIRMATIVE_QUALITY_TEXT =
+  /\b(?:unknown|unavailable|unproven|unsupported|missing|gaps?|not_established|evidence_missing|unresolved|(?:no|without)\s+evidence|(?:lacks?|lacked|lacking)\s+(?:evidence|support)|(?:does|do|did|can|could)\s+not\s+(?:establish|show|support|prove|verify|demonstrate)|(?:cannot|doesn't|didn't|can't|couldn't)\s+(?:establish|show|support|prove|verify|demonstrate)|fails? to (?:establish|show|support|prove|verify|demonstrate))\b/i;
+
+function qualitySupportUnits(haystack) {
+  const units = [];
+  let current = [];
+  let inCodeFence = false;
+  let inGapSection = false;
+  const flush = () => {
+    const unit = current.join(" ").trim();
+    if (unit) units.push(unit);
+    current = [];
+  };
+  for (const rawLine of String(haystack ?? "").replace(/\r\n/g, "\n").split("\n")) {
+    const line = rawLine.trim();
+    if (/^```/.test(line)) {
+      flush();
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) continue;
+
+    const heading = line.match(/^#{1,6}\s+(.+)$/);
+    if (heading) {
+      flush();
+      inGapSection = /\b(?:gaps?|unknown|unavailable|limitations?)\b/i.test(heading[1]);
+      continue;
+    }
+    if (/^(?:material\s+)?gaps?\s*:/i.test(line)) {
+      flush();
+      inGapSection = true;
+      continue;
+    }
+    if (!line) {
+      flush();
+      continue;
+    }
+    if (inGapSection) continue;
+    if (/^(?:supporting|repository evidence) command\s*:/i.test(line)) {
+      flush();
+      continue;
+    }
+
+    const listItem = line.match(/^(?:[-*+]\s+|\d+[.)]\s+)(.*)$/);
+    if (listItem) {
+      flush();
+      current.push(listItem[1]);
+    } else {
+      current.push(line);
+    }
+  }
+  flush();
+  return units;
+}
+
+function qualityClausesInUnit(unit) {
+  return String(unit ?? "")
+    .split(/(?:[.!?](?:["'`)]*)\s+|;\s*|\s+[—–]\s+|\s+(?:but|however|although|though|yet)\b[,:]?\s*)/iu)
+    .map((clause) => normalizeSearchText(clause))
+    .filter(Boolean);
+}
+
+function qualityClauseIsAffirmative(clause) {
+  return !NON_AFFIRMATIVE_QUALITY_TEXT.test(clause);
+}
+
+function affirmativeQualityClausesInUnit(unit) {
+  return qualityClausesInUnit(unit).filter(qualityClauseIsAffirmative);
+}
+
+function affirmativeQualityClauses(haystack) {
+  return qualitySupportUnits(haystack).flatMap(affirmativeQualityClausesInUnit);
+}
+
+function boundedAnchorMatch(haystack, anchor) {
+  const normalized = normalizeSearchText(haystack);
+  return anchorSearchVariants(anchor).some((variant) => {
+    const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|[^a-z0-9_$])${escaped}(?:$|[^a-z0-9_$])`, "i").test(normalized);
+  });
+}
+
+function claimSubjectAnchor(claim, subjectAnchors = []) {
+  const known = [...new Set(subjectAnchors.map(String).filter(Boolean))]
+    .filter((anchor) => boundedAnchorMatch(claim, anchor))
+    .sort((left, right) => right.length - left.length || left.localeCompare(right));
+  if (known.length > 0) return known[0];
+
+  const normalized = String(claim ?? "")
+    .trim()
+    .replace(/^[`*_]+|[`*_]+$/g, "");
+  const subject = normalized.match(
+    /^([A-Za-z_$][A-Za-z0-9_$]*(?:(?:::|[.#])[A-Za-z_$][A-Za-z0-9_$]*)*)\b/,
+  )?.[1] ?? null;
+  if (!subject || /^(?:a|an|the|this|these|those)$/i.test(subject)) return null;
+  return /(?:::|[.#])/.test(subject) || /[A-Z_]/.test(subject.slice(1)) ? subject : null;
+}
+
+function leadingClaimSubject(clause, subjectAnchors) {
+  const normalized = normalizeSearchText(clause)
+    .replace(/^[^a-z0-9_$]+/i, "")
+    .replace(/^(?:a|an|the)\s+/i, "");
+  return [...new Set(subjectAnchors.map(String).filter(Boolean))]
+    .sort((left, right) => right.length - left.length || left.localeCompare(right))
+    .find((anchor) => anchorSearchVariants(anchor).some((variant) => {
+      if (!normalized.startsWith(variant)) return false;
+      const next = normalized[variant.length];
+      return next == null || !/[a-z0-9_$]/i.test(next);
+    })) ?? null;
+}
+
 function hasContradictingNegation(sentence) {
-  const tokens = claimTokens(sentence);
+  const tokens = normalizeSearchText(sentence)
+    .split(/[^a-z0-9_:.]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
   return tokens.some((token) => FORBIDDEN_CONTRADICTION_TERMS.has(token));
 }
 
@@ -3911,7 +4116,9 @@ function scoreClaimSet(claims, haystack, opts = {}) {
   const found = [];
   const missed = [];
   for (const claim of expected) {
-    const matched = opts.forbidden ? forbiddenClaimMatched(haystack, claim) : claimMatched(haystack, claim);
+    const matched = opts.forbidden
+      ? forbiddenClaimMatched(haystack, claim)
+      : claimMatched(haystack, claim, opts.subjectAnchors ?? []);
     if (matched) {
       found.push(claim);
     } else {
@@ -4005,10 +4212,14 @@ function scoreQualityFromText(finalAnswer, transcript, task) {
   const finalAndTranscript = `${finalAnswer}\n${transcript}`;
 
   const observedFiles = scoreAnchorSet(task.expected_files, finalAndTranscript);
-  const observedSymbols = scoreAnchorSet(task.expected_symbols, finalAndTranscript);
+  const observedSymbols = scoreAnchorSet(task.expected_symbols, finalAndTranscript, {
+    affirmative: true,
+  });
   const files = scoreAnchorSet(task.expected_files, finalAnswer);
-  const symbols = scoreAnchorSet(task.expected_symbols, finalAnswer);
-  const claims = scoreClaimSet(task.expected_claims, finalAnswer);
+  const symbols = scoreAnchorSet(task.expected_symbols, finalAnswer, { affirmative: true });
+  const claims = scoreClaimSet(task.expected_claims, finalAnswer, {
+    subjectAnchors: task.expected_symbols ?? [],
+  });
   const citations = scoreAnchorSet(task.expected_files, finalAnswer);
   const verificationFiles = scoreAnchorSet(task.expected_verification_files ?? [], finalAnswer);
   const forbidden = scoreClaimSet(task.forbidden_claims, finalAnswer, { forbidden: true });
@@ -4169,9 +4380,13 @@ function extractUsage(events) {
   };
 }
 
-function estimateCost(usage) {
-  const inputCost = Number.parseFloat(process.env.CODESTORY_BENCH_INPUT_COST_PER_MTOK ?? "");
-  const outputCost = Number.parseFloat(process.env.CODESTORY_BENCH_OUTPUT_COST_PER_MTOK ?? "");
+function estimateCost(usage, rates = null) {
+  const inputCost = Number.parseFloat(
+    rates?.input_per_mtok ?? process.env.CODESTORY_BENCH_INPUT_COST_PER_MTOK ?? "",
+  );
+  const outputCost = Number.parseFloat(
+    rates?.output_per_mtok ?? process.env.CODESTORY_BENCH_OUTPUT_COST_PER_MTOK ?? "",
+  );
   if (
     !Number.isFinite(inputCost) ||
     !Number.isFinite(outputCost) ||
@@ -4335,6 +4550,8 @@ function preludePublicFields(prelude) {
     packet_gap_count: prelude.packet_gap_count ?? null,
     packet_disposition_kind: prelude.packet_disposition_kind ?? null,
     packet_disposition: prelude.packet_disposition ?? null,
+    packet_sufficiency_status: prelude.packet_sufficiency_status ?? null,
+    packet_sufficiency: prelude.packet_sufficiency ?? null,
     packet_support_count: prelude.packet_support_count ?? null,
     packet_support_kind_counts: prelude.packet_support_kind_counts ?? null,
     packet_citation_count: prelude.packet_citation_count,
@@ -4356,6 +4573,11 @@ function harnessPacketPreludeEvents(prelude, stdout = "") {
   }
   const command = prelude.command ?? "";
   const id = "harness_codestory_packet";
+  const harnessSemantics = {
+    source: "codestory_packet_prelude_v1",
+    category: "codestory_cli",
+    operation: "packet",
+  };
   return [
     {
       type: "harness.command.started",
@@ -4363,6 +4585,7 @@ function harnessPacketPreludeEvents(prelude, stdout = "") {
         id,
         type: "command_execution",
         command,
+        harness_semantics: harnessSemantics,
       },
     },
     {
@@ -4371,6 +4594,7 @@ function harnessPacketPreludeEvents(prelude, stdout = "") {
         id,
         type: "command_execution",
         command,
+        harness_semantics: harnessSemantics,
         aggregated_output: stdout,
         exit_code: prelude.exit_code,
         status: prelude.status,
@@ -5575,6 +5799,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     manifestQuality,
   );
   const evidenceGapAccounting = packetV3EvidenceGapAccounting(packet);
+  const sufficiencyTelemetry = packetSufficiencyTelemetry(packet, manifestQuality);
   const publicPrelude = preludePublicFields({
     command,
     args: activeArgs,
@@ -5599,6 +5824,8 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
       ? null
       : dispositionTelemetry?.kind ?? null,
     packet_disposition: isPacketProjectionV3(packet) ? null : dispositionTelemetry,
+    packet_sufficiency_status: sufficiencyTelemetry?.status ?? null,
+    packet_sufficiency: sufficiencyTelemetry,
     packet_support_count: dispositionTelemetry?.support_count ?? null,
     packet_support_kind_counts: dispositionTelemetry?.support_kind_counts ?? null,
     packet_citation_count: Array.isArray(packet?.answer?.citations)
@@ -7538,9 +7765,9 @@ async function resolveReanalysisStdoutPath(result, runDir) {
   return null;
 }
 
-async function reanalysisPacketManifestQuality(result, runDir, task) {
+async function reanalysisPacketProjection(result, runDir, task) {
   const packetPath = result.codestory_harness_prelude?.stdout_path;
-  if (!packetPath || !task) {
+  if (!packetPath) {
     return null;
   }
   const resolved = path.isAbsolute(packetPath) ? packetPath : path.resolve(runDir, packetPath);
@@ -7548,7 +7775,24 @@ async function reanalysisPacketManifestQuality(result, runDir, task) {
     return null;
   }
   const packet = JSON.parse(await readFile(resolved, "utf8"));
-  return packetManifestQualitySummary(packet, task);
+  const manifestQuality = task ? packetManifestQualitySummary(packet, task) : null;
+  const evidenceGapAccounting = packetV3EvidenceGapAccounting(packet);
+  const sufficiency = packetSufficiencyTelemetry(packet, manifestQuality);
+  return {
+    packet_schema_version:
+      packet?.schema_version ?? result.codestory_harness_prelude?.packet_schema_version ?? null,
+    packet_projection_kind: isPacketProjectionV3(packet) ? packet?.kind ?? null : null,
+    packet_evidence_availability: packetV3EvidenceAvailabilityTelemetry(
+      packet,
+      manifestQuality,
+    ),
+    packet_evidence_gap_accounting: evidenceGapAccounting,
+    packet_evidence_count: evidenceGapAccounting?.evidence_count ?? null,
+    packet_gap_count: evidenceGapAccounting?.gap_count ?? null,
+    packet_sufficiency_status: sufficiency?.status ?? null,
+    packet_sufficiency: sufficiency,
+    packet_manifest_quality: manifestQuality,
+  };
 }
 
 async function createDurableJsonlAppender(filePath, dependencies = {}) {
@@ -7606,7 +7850,7 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     ...parsed,
   ];
   const task = await loadTaskForResult(result, opts, taskCache);
-  const packetManifestQuality = await reanalysisPacketManifestQuality(result, runDir, task);
+  const packetProjection = await reanalysisPacketProjection(result, runDir, task);
   const repoConfig = ALL_REPOS[result.repo] ?? null;
   const usage = extractUsage(parsed);
   const analysis = analyzeTranscript(
@@ -7632,14 +7876,13 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     codestory_harness_prelude: result.codestory_harness_prelude
       ? {
           ...result.codestory_harness_prelude,
-          packet_manifest_quality:
-            packetManifestQuality ?? result.codestory_harness_prelude.packet_manifest_quality,
+          ...(packetProjection ?? {}),
         }
       : null,
     repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
     codestory_cache_provenance: cacheProvenance,
     usage,
-    estimated_cost_usd: estimateCost(usage),
+    estimated_cost_usd: estimateCost(usage, opts.exactCandidateCostRates),
     tool_calls_observed: analysisEvents.filter(isToolCallStartEvent).length,
     codex_tool_calls_observed: parsed.filter(isToolCallStartEvent).length,
     transcript_analysis: analysis,
@@ -7660,6 +7903,15 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
   };
 }
 
+function reanalysisExactCandidateAcceptance(originalSummary, rows) {
+  return originalSummary.exact_candidate_acceptance == null
+    ? null
+    : exactCandidateAcceptance(
+        rows,
+        originalSummary.exact_candidate_lifecycle ?? null,
+      );
+}
+
 async function reanalyzeAgentRunDirectory(opts) {
   const runDir = path.resolve(opts.reanalyzeDir);
   const runsPath = path.join(runDir, "runs.jsonl");
@@ -7670,6 +7922,10 @@ async function reanalyzeAgentRunDirectory(opts) {
   const originalSummary = existsSync(originalSummaryPath)
     ? JSON.parse(await readFile(originalSummaryPath, "utf8"))
     : {};
+  const reanalysisOpts = {
+    ...opts,
+    exactCandidateCostRates: originalSummary.cost_rates ?? null,
+  };
   const rows = (await readFile(runsPath, "utf8"))
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -7679,7 +7935,7 @@ async function reanalyzeAgentRunDirectory(opts) {
   const taskCache = new Map();
   const reanalyzed = [];
   for (const row of rows) {
-    reanalyzed.push(await recomputeRunAnalysis(row, opts, runDir, taskCache));
+    reanalyzed.push(await recomputeRunAnalysis(row, reanalysisOpts, runDir, taskCache));
   }
 
   const summary = summarizeRuns(reanalyzed);
@@ -7704,6 +7960,10 @@ async function reanalyzeAgentRunDirectory(opts) {
     packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
+    exact_candidate_acceptance: reanalysisExactCandidateAcceptance(
+      originalSummary,
+      reanalyzed,
+    ),
   };
   await writeFile(
     path.join(runDir, "reanalyzed-runs.jsonl"),
@@ -13313,6 +13573,9 @@ export {
   packetManifestQualitySummary,
   packetObligationAccounting,
   packetDispositionTelemetry,
+  preludePublicFields,
+  reanalysisExactCandidateAcceptance,
+  reanalysisPacketProjection,
   packetPreludeContractBlockers,
   publicPacketPreludeContractPasses,
   packetPreludeManifestComplete,

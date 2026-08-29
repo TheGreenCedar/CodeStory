@@ -1094,6 +1094,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn modern_packet_compaction_keeps_the_relevance_prefix_and_all_sixteen_identities() {
+        let evidence = (0..16)
+            .map(|index| {
+                let id = format!("packet-evidence-{index:03}");
+                let summary = format!("relevance-ranked flow evidence {index}");
+                packet_evidence(&id, Some(&summary))
+            })
+            .collect::<Vec<_>>();
+        let record = record_fixture_with(
+            "retain the relevance-ranked prefix",
+            PacketBudgetModeDto::Compact,
+            PacketProfileV3::Callflow,
+            evidence,
+            Vec::new(),
+            None,
+            RetrievalStateDescriptorV3Dto {
+                state: RetrievalStateV3Dto::Full,
+                generation_id: Some(identity("retrieval-generation-1")),
+            },
+            Vec::new(),
+            true,
+        );
+        let diagnostics = diagnostics_capability_fixture();
+        let four_detail_shape =
+            build_packet_projection_v3(&record, diagnostics.clone(), |candidate| match candidate {
+                PacketProjectionV3Dto::Complete { evidence, .. }
+                    if evidence
+                        .as_slice()
+                        .iter()
+                        .filter(|row| row.summary.is_some())
+                        .count()
+                        > 4 =>
+                {
+                    Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1)
+                }
+                PacketProjectionV3Dto::Complete { .. } => Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3),
+                PacketProjectionV3Dto::BudgetExceeded { .. } => {
+                    Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3)
+                }
+            })
+            .expect("four-detail fixture");
+        let fixed_envelope_bytes = PACKET_PUBLIC_RESULT_MAX_BYTES_V3
+            - planned_transport_size(PlannedTransportShape::June2025, &four_detail_shape);
+
+        let projection = build_packet_projection_v3(&record, diagnostics, |candidate| {
+            Ok(
+                planned_transport_size(PlannedTransportShape::June2025, candidate)
+                    + fixed_envelope_bytes,
+            )
+        })
+        .expect("modern mirrored projection should compact to a complete result");
+        let PacketProjectionV3Dto::Complete { evidence, .. } = projection else {
+            panic!("the sixteen-identity envelope should fit after optional compaction");
+        };
+
+        assert_eq!(evidence.as_slice().len(), 16);
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.summary.is_some())
+                .count(),
+            4
+        );
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .take(4)
+                .map(|row| row.identity.evidence_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "packet-evidence-000",
+                "packet-evidence-001",
+                "packet-evidence-002",
+                "packet-evidence-003",
+            ]
+        );
+        assert!(
+            evidence
+                .as_slice()
+                .iter()
+                .skip(4)
+                .all(|row| row.summary.is_none())
+        );
+    }
+
     #[derive(Clone, Copy)]
     enum PlannedTransportShape {
         November2024,

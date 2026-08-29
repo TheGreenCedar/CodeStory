@@ -46,6 +46,10 @@
         "edit_planning"
       ]
     },
+    "file_local": {
+      "type": "boolean",
+      "description": "Whether the task is confined to one exact user-named file and may authorize that bounded direct read."
+    },
     "repo": {
       "type": "object",
       "additionalProperties": false,

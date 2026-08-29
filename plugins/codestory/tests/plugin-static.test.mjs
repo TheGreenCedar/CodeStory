@@ -7504,25 +7504,16 @@ test("Cursor rules point to one canonical grounding skill", async () => {
   const dogfoodRule = await readFile(join(repoRoot, ".cursor", "rules", "codestory.mdc"), "utf8");
   const normalize = (text) => text
     .replace(
-      /Cursor setup, MCP wiring, and host-specific notes: \[[^\n\]]+\]\([^\n)]+\)\./u,
-      "Cursor setup, MCP wiring, and host-specific notes: CURSOR_GUIDE.",
-    )
-    .replace(
       /\[canonical codestory-grounding skill\]\([^\n)]+\)/u,
       "[canonical codestory-grounding skill](CANONICAL_SKILL)",
     );
   assert.equal(normalize(pluginRule), normalize(dogfoodRule));
-  assert.match(
-    pluginRule,
-    /\]\(https:\/\/github\.com\/TheGreenCedar\/CodeStory\/blob\/main\/docs\/users\/cursor\.md\)/u,
-  );
   assert.match(pluginRule, /\[canonical codestory-grounding skill\]\(\.\.\/skills\/codestory-grounding\/SKILL\.md\)/u);
-  assert.match(dogfoodRule, /\]\(\.\.\/\.\.\/docs\/users\/cursor\.md\)/u);
   assert.match(dogfoodRule, /\[canonical codestory-grounding skill\]\(\.\.\/\.\.\/plugins\/codestory\/skills\/codestory-grounding\/SKILL\.md\)/u);
   assert.match(pluginRule, /sole source of truth.*adds no parallel instructions/isu);
   assert.match(dogfoodRule, /sole source of truth.*adds no parallel instructions/isu);
-  assert.doesNotMatch(pluginRule, /Routing contract:|Discovery leads come from|prove_call_path/u);
-  assert.doesNotMatch(dogfoodRule, /Routing contract:|Discovery leads come from|prove_call_path/u);
+  assert.doesNotMatch(pluginRule, /Routing contract:|Discovery leads come from|prove_call_path|docs\/users\/cursor/u);
+  assert.doesNotMatch(dogfoodRule, /Routing contract:|Discovery leads come from|prove_call_path|docs\/users\/cursor/u);
 });
 
 test("Cursor plugin-data inference is identity-bound and local overrides use PLUGIN_DATA", async () => {
