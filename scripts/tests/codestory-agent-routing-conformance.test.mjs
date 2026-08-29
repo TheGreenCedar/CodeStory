@@ -464,6 +464,7 @@ function baseRun(scenarioId) {
       named_files: [],
       selected_target: null,
       proof_contract: null,
+      project_root: "/workspace/repo",
     },
     steps: [],
     final: finalClaim(),
@@ -1214,6 +1215,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
   assert.equal(prompts.length, SCENARIO_IDS.length);
   for (const prompt of prompts) {
     assert.match(prompt, /authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none/u);
+    assert.match(prompt, /only one raw JSON object and no markdown fence, explanation, prefix, or suffix/u);
     assert.match(prompt, /outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused/u);
     assert.match(prompt, /For a direct source read, record evidence identity source:<project-relative-path>/u);
     assert.match(prompt, /authorized fallback read changes evidence authority but preserves an earlier unavailable outcome/u);
@@ -1409,6 +1411,34 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
   const mcp = parseInstalledTranscript("cursor", capturedJsonl(CURSOR_CAPTURED_MCP));
   assert.deepEqual(mcp.actions.map(({ kind }) => kind), ["search"]);
 
+  const composer = clone(CURSOR_CAPTURED_DIRECT_READ);
+  composer.splice(2, 0,
+    { type: "thinking", subtype: "delta", text: "Reading the named file", session_id: "captured-1", timestamp_ms: 1 },
+    { type: "thinking", subtype: "completed", session_id: "captured-1", timestamp_ms: 2 },
+  );
+  const firstAssistant = composer.findIndex((event) => event.type === "assistant");
+  const finalText = composer.at(-1).result;
+  composer.splice(firstAssistant, 2,
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: finalText.slice(0, 24) }] }, session_id: "captured-1", timestamp_ms: 3 },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: finalText.slice(24) }] }, session_id: "captured-1", timestamp_ms: 4 },
+    { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: finalText }] }, session_id: "captured-1", model_call_id: "composer-call", timestamp_ms: 5 },
+  );
+  assert.equal(parseInstalledTranscript("cursor", capturedJsonl(composer)).final, finalText);
+
+  const invalidThinking = clone(composer);
+  invalidThinking[2].subtype = "opaque";
+  assert.throws(
+    () => parseInstalledTranscript("cursor", capturedJsonl(invalidThinking)),
+    /unsupported Cursor thinking event/u,
+  );
+
+  const mismatchedSnapshot = clone(composer);
+  mismatchedSnapshot.find((event) => event.model_call_id).message.content[0].text = "different";
+  assert.throws(
+    () => parseInstalledTranscript("cursor", capturedJsonl(mismatchedSnapshot)),
+    /assistant snapshot does not match streamed deltas/u,
+  );
+
   const failure = clone(CURSOR_CAPTURED_DIRECT_READ);
   failure.at(-1).subtype = "error";
   failure.at(-1).is_error = true;
@@ -1431,6 +1461,14 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
   const terminalMismatch = clone(CURSOR_CAPTURED_DIRECT_READ);
   terminalMismatch.at(-1).result = "different";
   assert.throws(() => parseInstalledTranscript("cursor", capturedJsonl(terminalMismatch)), /assistant deltas.*terminal result/u);
+
+  const absoluteRead = baseRun("named_file_direct_read");
+  absoluteRead.steps[0].path = "/workspace/repo/src/named.rs";
+  assert.equal(validate("cursor", absoluteRead).status, "pass");
+
+  const escapedRead = baseRun("named_file_direct_read");
+  escapedRead.steps[0].path = "/workspace/other/named.rs";
+  assert.throws(() => validate("cursor", escapedRead), /escapes the declared project root/u);
 });
 
 function mutateBody(run, index, mutate) {

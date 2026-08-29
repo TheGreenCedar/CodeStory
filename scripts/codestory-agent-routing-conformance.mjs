@@ -292,7 +292,7 @@ export function validateRoutingRequestCorpus(document = ROUTING_CORPUS_DOCUMENT)
 
 export const ROUTING_REQUEST_CORPUS = deepFreeze(structuredClone(ROUTING_CORPUS_DOCUMENT));
 
-const FINAL_REPORT_INSTRUCTION = `Read an already named linked installed-guidance file only with a direct file read; never grep, rg, search, or probe the installed plugin package. Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read unless it follows an unavailable CodeStory result: an authorized fallback read changes evidence authority but preserves an earlier unavailable outcome. Use supported only when the selected evidence authority resolves the requested material; if result-bound gaps leave any requested material unresolved, use unknown even when the tool result also returned useful evidence. Use discovery_only for a search lead, and preserve the exact proof result boundary. For a rejected typed interpretation, use authority none, outcome invalid_contract, and no proof disposition. Copy its reason code only when the tool payload supplies a machine-readable code explicitly; when it returns only human-readable validation text, keep reason_codes empty and never derive a code from that text. Use refused only when the user requested exact proof without supplying a typed interpretation; in that case call no product tool and do not substitute retrieval or source evidence. diagnostics.availability describes only the optional diagnostics artifact: never copy it into outcome or reason_codes, and determine result availability from top-level status and result-bound gaps. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. For typed proof, evidence_ids contains only receipt_id values referenced by the disposition; never copy fact_id or edge_id. A typed proof gap has no gap_id: keep gap_ids empty and copy each disposition.gaps[].kind into reason_codes. Other reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis; when supplied, copy only the refutation.kind string, never the whole refutation object. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
+const FINAL_REPORT_INSTRUCTION = `Read an already named linked installed-guidance file only with a direct file read; never grep, rg, search, or probe the installed plugin package. Finish with only one raw JSON object and no markdown fence, explanation, prefix, or suffix, using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read unless it follows an unavailable CodeStory result: an authorized fallback read changes evidence authority but preserves an earlier unavailable outcome. Use supported only when the selected evidence authority resolves the requested material; if result-bound gaps leave any requested material unresolved, use unknown even when the tool result also returned useful evidence. Use discovery_only for a search lead, and preserve the exact proof result boundary. For a rejected typed interpretation, use authority none, outcome invalid_contract, and no proof disposition. Copy its reason code only when the tool payload supplies a machine-readable code explicitly; when it returns only human-readable validation text, keep reason_codes empty and never derive a code from that text. Use refused only when the user requested exact proof without supplying a typed interpretation; in that case call no product tool and do not substitute retrieval or source evidence. diagnostics.availability describes only the optional diagnostics artifact: never copy it into outcome or reason_codes, and determine result availability from top-level status and result-bound gaps. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. For typed proof, evidence_ids contains only receipt_id values referenced by the disposition; never copy fact_id or edge_id. A typed proof gap has no gap_id: keep gap_ids empty and copy each disposition.gaps[].kind into reason_codes. Other reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis; when supplied, copy only the refutation.kind string, never the whole refutation object. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
 
 export function materializeRoutingRequests(projectRoot) {
   const project = realpathSync(projectRoot);
@@ -304,6 +304,7 @@ export function materializeRoutingRequests(projectRoot) {
       scenario_id: entry.id,
       request: {
         ...structuredClone(entry.request),
+        project_root: project,
         text: `${entry.prompt}\nThe exact project root for repository work is ${project}.${proofInstruction}\n${FINAL_REPORT_INSTRUCTION}`,
       },
     };
@@ -683,7 +684,7 @@ function unwrapCursorToolCall(event) {
 function cursorStartedAction(callId, key, args) {
   if (!plainObject(args)) fail("Cursor started tool call is missing args");
   if (key === "readToolCall") {
-    return { kind: "source_read", tool: "source_read", path: normalizePath(args.path), args, cursor_key: key };
+    return { kind: "source_read", tool: "source_read", path: String(args.path ?? ""), args, cursor_key: key };
   }
   if (key === "mcpToolCall") {
     if (args.toolCallId !== callId || typeof args.providerIdentifier !== "string"
@@ -714,7 +715,10 @@ function parseCursor(events) {
   let terminalSeen = false;
   let sessionId = null;
   let assistantDeltas = "";
+  let assistantFragments = "";
   let userText = "";
+  const snapshotStream = events.some((event) => event.type === "thinking"
+    || (event.type === "assistant" && (event.timestamp_ms != null || event.model_call_id != null)));
   events.forEach((event, index) => {
     if (terminalSeen) fail("Cursor terminal result must be the final stream event");
     if (typeof event.session_id !== "string" || !event.session_id) fail("Cursor event is missing session_id");
@@ -735,8 +739,25 @@ function parseCursor(events) {
       return;
     }
     if (!userSeen) fail("Cursor stream is missing user input before agent activity");
+    if (event.type === "thinking") {
+      if (event.subtype === "delta" && nonemptyString(event.text)) return;
+      if (["started", "completed"].includes(event.subtype) && event.text == null) return;
+      fail(`unsupported Cursor thinking event ${JSON.stringify(event.subtype ?? null)}`);
+    }
     if (event.type === "assistant") {
-      assistantDeltas += cursorText(event, "assistant");
+      const text = cursorText(event, "assistant");
+      if (!snapshotStream) {
+        assistantDeltas += text;
+        return;
+      }
+      const snapshot = event.model_call_id != null || event.timestamp_ms == null;
+      if (snapshot) {
+        if (assistantFragments !== text) fail("Cursor assistant snapshot does not match streamed deltas");
+        assistantDeltas += text;
+        assistantFragments = "";
+      } else {
+        assistantFragments += text;
+      }
       return;
     }
     if (event.type === "tool_call") {
@@ -786,6 +807,7 @@ function parseCursor(events) {
         fail("Cursor terminal result must have subtype success and is_error false");
       }
       if (state.open.size > 0) fail(`Cursor terminal result has unmatched tool call ${JSON.stringify([...state.open.keys()][0])}`);
+      if (assistantFragments) fail("Cursor terminal result arrived before an assistant snapshot");
       if (assistantDeltas !== event.result) fail("Cursor assistant deltas do not match terminal result");
       state.final = event.result;
       return;
@@ -2547,6 +2569,19 @@ function productRoutingActions(host, actions, installedPluginRoot, expectedIdent
   return product;
 }
 
+function normalizeSourceReadPath(path, projectRoot) {
+  const raw = String(path ?? "").trim().replace(/^['"]+|['"]+$/gu, "").replaceAll("\\", "/");
+  if (!isAbsolute(raw)) return normalizePath(raw);
+  if (!nonemptyString(projectRoot)) fail("absolute source read path requires the declared project root");
+  const root = resolve(projectRoot);
+  const candidate = resolve(raw);
+  const rel = relative(root, candidate);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`)) {
+    fail(`source read path escapes the declared project root: ${JSON.stringify(path)}`);
+  }
+  return normalizePath(rel.split(sep).join("/"));
+}
+
 export function validateInstalledSession({
   host,
   scenarioId,
@@ -2566,6 +2601,9 @@ export function validateInstalledSession({
     fail(`${scenarioId} Cursor user text does not match the declared request`);
   }
   const actions = productRoutingActions(host, parsed.actions, installedPluginRoot, expectedIdentity);
+  for (const action of actions) {
+    if (action.kind === "source_read") action.path = normalizeSourceReadPath(action.path, request.project_root);
+  }
   validateExpectedMcpAvailability(scenarioContract, actions);
   validateActionOrder(scenarioContract, actions);
   validateSearchQueries(scenarioContract, actions);
