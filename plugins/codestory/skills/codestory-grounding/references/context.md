@@ -35,8 +35,11 @@ CLI flags. Every call requires `project` (absolute repository root).
 - Use `symbol`, `trail`, or `snippet` for local navigation when retrieval is
   degraded.
 - Treat `context` output as incomplete when it reports weak hits, semantic
-  stale/partial/failed states, missing snippets, no citations, or unresolved
-  graph edges.
+  stale/partial/failed states, no citations, unresolved graph edges, or a
+  material result gap. An evidence row matching the returned target
+  `symbol_id` remains focused identity and location evidence when its optional
+  `excerpt` is null. That null matters only when the request needs source text
+  or a claim the remaining row fields cannot support.
 - Evidence line bounds are nullable when the producer supplied only a path.
   `symbol_id` is present only for a resolvable citation; null values preserve
   uncertainty and must not be interpreted as line 1 or a followable symbol.

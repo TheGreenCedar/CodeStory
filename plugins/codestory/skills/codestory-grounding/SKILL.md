@@ -87,6 +87,11 @@ plugin package to locate a documented field or excerpt.
   returned gap. Never turn `available` into authority for a claim the rows do
   not establish. When a returned gap leaves requested material unresolved, the
   final outcome remains unknown even if the result also contains useful evidence.
+- A `context` evidence row matching the returned target `symbol_id` is focused
+  identity and location evidence even when its optional `excerpt` is null.
+  That null does not itself create an omission or an `unknown` outcome unless
+  the request asked for source text or a claim that the remaining row fields
+  cannot support.
 - `diagnostics.availability` describes only the optional diagnostics artifact.
   It never overrides the result's top-level `status`, creates a gap, or supplies
   an `unavailable` outcome or reason code.

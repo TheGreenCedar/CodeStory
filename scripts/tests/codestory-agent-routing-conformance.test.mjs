@@ -2615,6 +2615,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     assert.match(guidance, /typed `Unavailable`.*terminal/isu, label);
     assert.match(guidance, /diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu, label);
     assert.match(guidance, /transport.*tool absence.*source/isu, label);
+    assert.match(guidance, /context.*symbol_id.*excerpt.*null.*(?:does not|doesn't).*omission/isu, label);
   }
   assert.match(openAiMetadata, /search.*context.*packet.*prove_call_path/isu);
   assert.match(openAiMetadata, /host-supplied/iu);
