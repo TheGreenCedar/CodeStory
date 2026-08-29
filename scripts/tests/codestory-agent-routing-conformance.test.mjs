@@ -1350,7 +1350,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /only one raw JSON object and no markdown fence, explanation, prefix, or suffix/u);
     assert.match(prompt, /outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused/u);
     assert.match(prompt, /For a direct source read, record evidence identity source:<project-relative-path>/u);
-    assert.match(prompt, /authorized fallback read changes evidence authority but preserves an earlier unavailable outcome/u);
+    assert.match(prompt, /authorized fallback read after an unavailable CodeStory result may change evidence authority but preserves the earlier unavailable outcome/u);
     assert.match(prompt, /rejected typed interpretation.*authority none.*outcome invalid_contract.*no proof disposition/u);
     assert.match(prompt, /human-readable validation text.*reason_codes empty.*never derive a code/u);
     assert.match(prompt, /Use refused only when the user requested exact proof without supplying a typed interpretation/u);
@@ -1364,6 +1364,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /refutation_basis.*refutation\.kind string.*never the whole refutation object/u);
     assert.match(prompt, /typed proof gap has no gap_id.*disposition\.gaps\[\]\.kind.*reason_codes/u);
     assert.match(prompt, /diagnostics\.availability.*optional diagnostics artifact.*never copy it into outcome or reason_codes/u);
+    assert.match(prompt, /supplemental read after packet.*keeps authority packet_evidence.*uses outcome unknown.*preserves the packet gap identities/u);
     assert.match(prompt, /never grep, rg, search, or probe the installed plugin package/u);
     assert.match(prompt, /On Codex, one bounded cat or sed command.*direct-file action.*Never report.*unavailable before attempting/isu);
   }
