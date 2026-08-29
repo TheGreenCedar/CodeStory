@@ -525,9 +525,9 @@ function materialGapMessageAuthorizesPath(value, normalizedPath) {
 
 function unwrapCodexShell(command) {
   const text = String(command ?? "").trim();
-  const prefix = "/bin/zsh -lc ";
-  if (!text.startsWith(prefix)) return text;
-  const wrapper = text.slice(prefix.length);
+  const wrapped = text.match(/^\/bin\/zsh -(?:l)?c (.+)$/su);
+  if (!wrapped) return text;
+  const wrapper = wrapped[1];
   if (wrapper.startsWith("'") && wrapper.endsWith("'") && !wrapper.slice(1, -1).includes("'")) {
     return wrapper.slice(1, -1).trim();
   }
