@@ -103,6 +103,10 @@ plugin package to locate a documented field or excerpt.
   that scalar with the entire refutation object. Typed proof gaps have a `kind`
   and selector or step index, not a packet-style `gap_id`; preserve the kind as
   a reason code instead of inventing a gap identity.
+- A semantic proof tool error (`isError:true`) is an invalid contract, not
+  typed-proof evidence. Preserve no proof authority or disposition, copy a
+  reason code only when the payload supplies one explicitly, and never derive a
+  code from human-readable validation text.
 - Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable`
   exactly. `unknown` is not absence, and `unavailable` is not negative proof.
   Exact structural proof does not establish runtime execution, reachability,

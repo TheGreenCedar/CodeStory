@@ -694,7 +694,9 @@ function codexJsonl(run) {
       events.push({ type: "item.started", item });
       events.push({
         type: "item.completed",
-        item: step.failed
+        item: step.hostFailed
+          ? { ...item, status: "failed", result: step.result }
+          : step.failed
           ? { ...item, status: "failed", error: { message: "user cancelled MCP tool call" } }
           : { ...item, status: "completed", result: step.result },
       });
@@ -1186,6 +1188,8 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused/u);
     assert.match(prompt, /For a direct source read, record evidence identity source:<project-relative-path>/u);
     assert.match(prompt, /authorized fallback read changes evidence authority but preserves an earlier unavailable outcome/u);
+    assert.match(prompt, /rejected typed interpretation.*authority none.*outcome invalid_contract.*no proof disposition/u);
+    assert.match(prompt, /human-readable validation text.*reason_codes empty.*never derive a code/u);
     assert.match(prompt, /Use refused only when the user requested exact proof without supplying a typed interpretation/u);
     assert.match(prompt, /target_id must be null unless a CodeStory tool result returned a target identity/u);
     assert.match(prompt, /reason_codes may contain only CodeStory tool result codes or typed_contract_required/u);
@@ -1866,6 +1870,19 @@ test("semantic proof tool errors use the explicit error contract without result 
     codestory_execution: { semantic_retrieval_activated: false },
   };
   assert.equal(validate("codex", malformed).status, "pass");
+
+  const hostFailed = baseRun("malformed_proof_contract");
+  hostFailed.steps[0].hostFailed = true;
+  assert.equal(validate("codex", hostFailed).status, "pass");
+
+  const plainText = baseRun("malformed_proof_contract");
+  plainText.steps[0].hostFailed = true;
+  plainText.steps[0].result = {
+    content: [{ type: "text", text: "MissingResolvedMaterialAnchor { field: Start }" }],
+    isError: true,
+  };
+  plainText.final.reason_codes = [];
+  assert.equal(validate("codex", plainText).status, "pass");
 });
 
 test("installed receipt authentication rejects substituted package launcher CLI and forged receipt", () => {
@@ -2159,6 +2176,7 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher h
     assert.match(guidance, /supplied symbol name.*search\.query.*unchanged/isu, label);
     assert.match(guidance, /broad.*`packet`.*continuation.*once/isu, label);
     assert.match(guidance, /host-supplied.*`prove_call_path`/isu, label);
+    assert.match(guidance, /semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu, label);
     assert.match(guidance, /`unknown`.*not absence/isu, label);
     assert.match(guidance, /runtime execution/iu, label);
     assert.match(guidance, /typed `Unavailable`.*terminal/isu, label);

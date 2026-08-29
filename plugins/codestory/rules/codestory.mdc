@@ -28,6 +28,7 @@ Routing contract:
 - `diagnostics.availability` describes only the optional diagnostics artifact. It never overrides the top-level result `status`, creates a gap, or supplies an `unavailable` outcome or reason code.
 - For a broad structural question, use `packet`, preserve every returned gap, and follow a bounded continuation at most once.
 - For a complete host-supplied or user-supplied typed contract, call `prove_call_path` unchanged. Never construct that contract from English or from packet, search, or context output.
+- A semantic proof tool error (`isError:true`) is an invalid contract, not typed-proof evidence. Preserve no proof authority or disposition, and never derive a reason code from human-readable validation text.
 - Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable` exactly. `unknown` is not absence, and structural proof does not establish runtime execution.
 - Inspect source after a packet only for a user-named file or an exact focused surface identified by a material gap. Do not start a free-form recovery loop.
 - A typed `Unavailable` result is terminal. MCP transport or tool absence may authorize ordinary source inspection; a successful unavailable result does not, except for an exact user-named file or exact focused gap, and fallback evidence does not erase the unavailable outcome.
