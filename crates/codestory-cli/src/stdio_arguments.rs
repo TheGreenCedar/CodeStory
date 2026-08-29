@@ -156,19 +156,19 @@ fn validate_value(schema: &Value, value: &Value, pointer: &str, out: &mut Vec<Ar
     let Some(schema) = schema.as_object() else {
         return;
     };
-    if let Some(declared) = schema.get("type") {
-        if !type_matches(declared, value) {
-            out.push(ArgumentViolation::new(
-                "invalid_type",
-                pointer,
-                format!(
-                    "expected type {}, received {}",
-                    render_type(declared),
-                    json_type_name(value)
-                ),
-            ));
-            return;
-        }
+    if let Some(declared) = schema.get("type")
+        && !type_matches(declared, value)
+    {
+        out.push(ArgumentViolation::new(
+            "invalid_type",
+            pointer,
+            format!(
+                "expected type {}, received {}",
+                render_type(declared),
+                json_type_name(value)
+            ),
+        ));
+        return;
     }
     validate_const(schema, value, pointer, out);
     validate_enum(schema, value, pointer, out);
