@@ -18,7 +18,7 @@
     },
     {
       "id": "selected_target_context",
-      "prompt": "Give me focused evidence for the already selected exact symbol dynamic_start. Use that exact selector without discovering or broadening.",
+      "prompt": "Give me focused evidence for the already selected exact symbol dynamic_start. Use that exact selector without discovering or broadening. This selected value is a name, not a returned stable identity: use it as query, never as id.",
       "request": { "named_files": [], "selected_target": "dynamic_start", "gap_source_paths": [], "proof_contract": null }
     },
     {

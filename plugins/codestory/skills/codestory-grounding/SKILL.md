@@ -50,6 +50,9 @@ it directly. If the plugin MCP is unavailable, use ordinary source inspection
 and report the visibility gap. Do not substitute CLI diagnostics for a live
 plugin result unless the user explicitly asks.
 
+Read linked installed guidance files directly. Do not grep, search, or otherwise
+probe the installed plugin package to locate a documented field.
+
 ## Task Router
 
 | Situation | Route |
@@ -57,7 +60,7 @@ plugin result unless the user explicitly asks.
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
 | Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
 | Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. After a successful search, stop for that turn unless the current request already supplied an exact selection criterion such as one project-relative path and asked for focused evidence after disambiguation. In that case only, choose the unique typed evidence row with a non-null `symbol_id` that matches the exact path, then call `context` with that `symbol_id` as `id`. Do not inspect source merely to upgrade a discovery result. Missing excerpts, unavailable diagnostics, and multiple leads do not authorize source inspection. |
-| Get evidence for one selected target | Use `context` with that exact selected target. Do not broaden the target or treat evidence availability as proof. |
+| Get evidence for one selected target | Use `context` with that exact selected target. A user-supplied name is `query`; `id` is only an opaque `symbol_id` copied unchanged from a CodeStory result. Never guess an ID, broaden the target, or treat evidence availability as proof. |
 | Follow a call path for navigation | `callers`, `callees`, `trace`, or `trail` can navigate the ordinary graph. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node; none of these tools returns an exact proof disposition. |
 | Verify an already translated exact call-path contract | For a host-supplied or user-supplied complete typed contract, call `prove_call_path` with the unchanged `source_text`, clauses, and exact spec. Do not infer or assemble a typed contract from English. |
 | Review change impact | `affected` with explicit Git-changed `paths` (or `changed_paths` / `change_records`). Never omit the path source. |

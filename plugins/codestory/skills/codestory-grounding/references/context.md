@@ -14,7 +14,7 @@ CLI flags. Every call requires `project` (absolute repository root).
 
 | Path | Command | Expected result |
 |------|---------|-----------------|
-| Normal path | MCP `context` with `query` or `id` | Context for that one target. |
+| Normal path | MCP `context` with a user-supplied selected name as `query`, or with an opaque CodeStory-returned `symbol_id` as `id` | Context for that one target. |
 | Failure path | If the target is ambiguous, `search` then retry `context` with `id`. If `preparing`, wait `retry_after_ms` and retry. | Keeps context tied to a resolvable target. |
 
 ## Notes
@@ -22,6 +22,9 @@ CLI flags. Every call requires `project` (absolute repository root).
 - Do not pass broad questions to `context`. Use `packet` with `question` for
   broad tasks, `search` for candidate discovery, then `context` with `id` for
   selected anchors.
+- A user-supplied exact name, file name, literal, API path, module, or behavior
+  term is a `query`. Use `id` only for an opaque `symbol_id` copied unchanged
+  from a CodeStory result. Never guess an ID from a display name.
 - When a name is ambiguous and the user supplies an exact path, search the bare
   symbol, ignore rows whose `symbol_id` is null, normalize typed result paths
   under the project root, and choose the unique typed candidate at that exact
