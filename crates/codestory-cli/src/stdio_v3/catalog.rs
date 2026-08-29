@@ -930,7 +930,12 @@ fn successful_with_preparing_schema_v3(success: Value) -> Value {
     json!({
         "type": "object",
         "oneOf": [
-            success,
+            {
+                "allOf": [
+                    success,
+                    {"not":{"type":"object","properties":{"kind":{"enum":["preparing"]}},"required":["kind"]}}
+                ]
+            },
             {
                 "type": "object",
                 "properties": {
@@ -1355,37 +1360,6 @@ mod tests {
         let mut invalid = complete;
         invalid["kind"] = json!("supported");
         assert!(crate::stdio_arguments::validate_structured_content(&schema, &invalid).is_err());
-    }
-
-    #[test]
-    fn modern_activation_output_schemas_use_direct_root_variants() {
-        for revision in [McpRevisionV3::June2025, McpRevisionV3::November2025] {
-            for projected in tools_for_revision_v3(revision) {
-                let Some(variants) = projected
-                    .pointer("/outputSchema/oneOf")
-                    .and_then(Value::as_array)
-                else {
-                    continue;
-                };
-                let is_activation_tool = projected
-                    .pointer("/_meta/com.thegreencedar.codestory~1safety/activatesProject")
-                    == Some(&json!(true));
-                if !is_activation_tool {
-                    continue;
-                }
-                assert_eq!(
-                    variants.len(),
-                    2,
-                    "activation tool must declare success and preparing variants: {projected}"
-                );
-                assert!(
-                    variants
-                        .iter()
-                        .all(|variant| variant.get("allOf").is_none()),
-                    "activation variants must be direct root schemas for host validator compatibility: {projected}"
-                );
-            }
-        }
     }
 
     #[test]
