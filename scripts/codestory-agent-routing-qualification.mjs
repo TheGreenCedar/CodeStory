@@ -1291,7 +1291,7 @@ async function main(argv) {
         ...entry.request,
         text: `${entry.request.text}\nThe installed CodeStory guidance for this session is linked at ${join(
           installedPluginRoot, "skills", "codestory-grounding", "SKILL.md",
-        )}. Read that exact file to completion before starting any CodeStory product call; do not run the guidance read in parallel with a product action, and do not locate or probe the installed plugin package.`,
+        )}. Read that exact file to completion before any scored repository action, including a source read, product-tool discovery, or CodeStory call; do not run the guidance read in parallel with another action, and do not locate or probe the installed plugin package.`,
       } : entry.request;
       const command = buildRoutingHostCommand({
         host,
