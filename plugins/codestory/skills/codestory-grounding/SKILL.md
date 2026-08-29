@@ -36,7 +36,10 @@ ceremony.
    shell wait. Do not poll status or ask the user to set up CodeStory.
 4. Preserve cited anchors in source claims. Read focused source only when the
    user named the exact file or a material result gap identified one exact
-   focused path. A search lead is never source-read authorization.
+   focused path. A path named only as a conditional fallback is not a
+   user-named file for this purpose: the returned gap itself must name that
+   exact path. A generic gap or unresolved obligation authorizes no source
+   read. A search lead is never source-read authorization.
 
 CodeStory prepares its local repository map and shared per-user retrieval server
 automatically. `status` and
@@ -136,7 +139,9 @@ plugin package to locate a documented field or excerpt.
   route order or replace the packet availability and gap fields.
 - A path named only for a conditional continuation or source fallback is
   fallback-only. Do not send it as an initial packet probe or synthesize
-  continuation pins before the first result explicitly returns them.
+  continuation pins before the first result explicitly returns them. It may be
+  read only when a returned material gap itself names that exact path; a
+  generic gap does not combine with the conditional path to authorize a read.
 - Do not paste empty grounding output as context. If a repository truly has no
   supported files, fall back to ordinary inspection or resolve the intended
   root when it is ambiguous.

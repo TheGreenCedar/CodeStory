@@ -16,7 +16,7 @@ CLI flags. Every call requires `project` (absolute repository root).
 | Normal path | MCP `packet` with `question` and optional `budget` / tagged `probes`. | Schema-3 evidence rows, gaps, retrieval state, diagnostics capability, and optional continuation. |
 | `available` | Answer only what the returned evidence rows establish and name material gaps. | Terminal. Do not search to strengthen the answer. |
 | `continuation_available` | Repeat the question with `parent_packet_id=continuation.continuation_id`, `option_ids=continuation.gap_ids.map((item) => item.gap_id)`, and the core/retrieval generation IDs from `publication.core.generation_id` and `publication.retrieval.retrieval_generation`. | One bounded continuation, then answer from the combined evidence and the continuation result's remaining gaps. |
-| `no_useful_evidence` / `unavailable` | State the evidence gap. Use focused source inspection when CodeStory could not serve broad retrieval. | Terminal. |
+| `no_useful_evidence` / `unavailable` | State the evidence gap. Inspect source only for an exact user-named file or a material gap that itself names one exact path. | Terminal. |
 | User-named exact target | `search`, `context`, `trail`, or `snippet` only when the user named that target. | Not packet recovery. |
 | Integration edge | Use JSON/MCP structured content. Preserve exact paths, symbol IDs, ranges, evidence IDs, and gap IDs. | The public result carries no proof disposition. |
 
@@ -34,7 +34,9 @@ CLI flags. Every call requires `project` (absolute repository root).
 - A path named only for a conditional continuation or source fallback is
   fallback-only. The initial broad request uses only `project` and `question`;
   do not send that path as an initial probe or invent continuation pins unless
-  the user explicitly requested a probe.
+  the user explicitly requested a probe. A generic gap does not combine with
+  the conditional path to authorize a source read; the returned material gap
+  must itself name that exact path.
 - Exact path, symbol-ID, file-symbol, and symbol-bound continuation probes add
   exact citations keyed by path or stable node ID. They are not converted back
   into display-name searches.
@@ -60,7 +62,8 @@ CLI flags. Every call requires `project` (absolute repository root).
   is not this agent path.
 - `no_useful_evidence` is terminal even when retrieval itself was healthy.
   State the exact gaps, then stop. `unavailable` means the requested evidence
-  surface could not serve the request; use focused source inspection and say so.
+  surface could not serve the request. Preserve it unless an exact user-named
+  file or exact path identified by a material gap authorizes a focused read.
 - Packet JSON is a closed root object. It contains no internal plan,
   obligations, score, eligibility, or proof-disposition fields.
 - The complete MCP ToolResult is limited to 16 KiB. If the mandatory envelope
