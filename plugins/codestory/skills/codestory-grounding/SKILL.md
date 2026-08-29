@@ -122,7 +122,9 @@ plugin package to locate a documented field or excerpt.
   Exact structural proof does not establish runtime execution, reachability,
   temporal order, ownership, data flow, or subsystem non-participation.
 - When `packet.status=continuation_available`, execute only the returned bounded
-  continuation, once, against its pinned publication: repeat the question with
+  continuation, once, against its pinned publication. When the user supplies
+  an exact packet question, copy it verbatim into `question`, including its
+  punctuation; do not paraphrase or trim it. Repeat that same question with
   `parent_packet_id=continuation.continuation_id`, use
   `continuation.gap_ids.map((item) => item.gap_id)` as the string `option_ids`,
   and copy the core/retrieval generation

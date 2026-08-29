@@ -23,22 +23,22 @@
     },
     {
       "id": "broad_packet",
-      "prompt": "Use the broad evidence route first with this exact question: Explain how routing_fixture::start reaches finish across the project. Preserve every returned evidence gap in the response.",
+      "prompt": "Use the broad evidence route first. Set its `question` argument to exactly this JSON string, including punctuation: \"Explain how routing_fixture::start reaches finish across the project.\" Preserve every returned evidence gap in the response.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {
       "id": "packet_single_continuation",
-      "prompt": "Use the broad evidence route first with this exact question: Trace the complete routing flow and account for src/unread.rs if the index cannot cover it. The path is fallback-only: on the initial broad request, do not add probes or continuation pins. If the evidence surface offers one bounded continuation, follow that exact offer once.",
+      "prompt": "Use the broad evidence route first. Set its `question` argument to exactly this JSON string, including punctuation: \"Trace the complete routing flow and account for src/unread.rs if the index cannot cover it.\" The path is fallback-only: on the initial broad request, do not add probes or continuation pins. If the evidence surface offers one bounded continuation, follow that exact offer once.",
       "request": { "named_files": ["src/unread.rs"], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {
       "id": "packet_gap_to_focused_source",
-      "prompt": "Use the broad evidence route first with this exact question: Investigate the missing route branch. Treat src/gap.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. Read it only if the broad project evidence identifies a gap that authorizes that focused read. If no exact path-authorized read succeeds, preserve the missing branch as unknown rather than calling partial evidence supported.",
+      "prompt": "Use the broad evidence route first. Set its `question` argument to exactly this JSON string, including punctuation: \"Investigate the missing route branch.\" Treat src/gap.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. Read it only if the broad project evidence identifies a gap that authorizes that focused read. If no exact path-authorized read succeeds, preserve the missing branch as unknown rather than calling partial evidence supported.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": ["src/gap.rs"], "proof_contract": null }
     },
     {
       "id": "packet_named_fallback_to_source",
-      "prompt": "Use the broad evidence route first with this exact question: Explain how the routing catalog works. Treat src/fallback.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. If the completed broad result does not establish that exact file, read it once and preserve every returned gap.",
+      "prompt": "Use the broad evidence route first. Set its `question` argument to exactly this JSON string, including punctuation: \"Explain how the routing catalog works.\" Treat src/fallback.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. If the completed broad result does not establish that exact file, read it once and preserve every returned gap.",
       "request": { "named_files": ["src/fallback.rs"], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {

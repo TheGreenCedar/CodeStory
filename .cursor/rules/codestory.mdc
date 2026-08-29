@@ -26,7 +26,7 @@ Routing contract:
 - Pass an explicitly supplied symbol name to `search.query` unchanged; do not add descriptive words or rewrite the selector.
 - For one selected target, use `context` for evidence around that target only. A user-supplied name is `query`; `id` is only a `symbol_id` copied from CodeStory.
 - `diagnostics.availability` describes only the optional diagnostics artifact. It never overrides the top-level result `status`, creates a gap, or supplies an `unavailable` outcome or reason code.
-- For a broad structural question, use `packet`, preserve every returned gap, and follow a bounded continuation at most once.
+- For a broad structural question, use `packet`, preserve every returned gap, and follow a bounded continuation at most once. When the user supplies an exact packet question, copy it verbatim into `question`, including punctuation; do not paraphrase or trim it.
 - For a complete host-supplied or user-supplied typed contract, call `prove_call_path` unchanged. Never construct that contract from English or from packet, search, or context output.
 - A semantic proof tool error (`isError:true`) is an invalid contract, not typed-proof evidence. Preserve no proof authority or disposition, and never derive a reason code from human-readable validation text.
 - When the user asks for exact proof from English but supplies no complete typed contract, stop and report that the typed contract is required. Do not call a repository tool or substitute packet, search, context, or source evidence.

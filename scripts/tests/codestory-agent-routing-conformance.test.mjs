@@ -1299,6 +1299,11 @@ test("checked-in request corpus covers the routing matrix exactly once", () => {
   for (const entry of ROUTING_REQUEST_CORPUS.scenarios) {
     assert.doesNotMatch(entry.prompt, /\b(search|context|packet|prove_call_path)\b/iu, entry.id);
   }
+  for (const [scenarioId, question] of Object.entries(ROUTING_PACKET_QUESTIONS)) {
+    const entry = ROUTING_REQUEST_CORPUS.scenarios.find(({ id }) => id === scenarioId);
+    assert.match(entry.prompt, /including punctuation/u, scenarioId);
+    assert.ok(entry.prompt.includes(JSON.stringify(question)), scenarioId);
+  }
 });
 
 test("installed-host prompts close the final claim vocabulary and direct-read identity contract", () => {

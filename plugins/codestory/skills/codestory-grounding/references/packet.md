@@ -23,6 +23,9 @@ CLI flags. Every call requires `project` (absolute repository root).
 ## Notes
 
 - `packet` is for broad questions; `context` is for one concrete target.
+- When the user supplies an exact packet question, copy it verbatim into
+  `question`, including its punctuation. Do not paraphrase or trim it, and use
+  the same bytes for an offered continuation.
 - Prefer the default standard packet before manually opening source files for a
   broad explanation or plan. Select `compact` explicitly when minimizing
   context is more important than retaining the fuller evidence set.
