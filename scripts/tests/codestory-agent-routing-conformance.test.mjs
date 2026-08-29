@@ -595,7 +595,7 @@ function baseRun(scenarioId) {
       ];
       run.final = finalClaim({
         authority: "source",
-        evidence_ids: ["source:src/fallback.rs"],
+        evidence_ids: ["evidence-1", "source:src/fallback.rs"],
         gap_ids: ["gap-1"],
       });
       break;
@@ -938,6 +938,14 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
   }];
   assert.deepEqual(validate("codex", countedRead).actions, ["source_read"]);
 
+  const shellConcatenatedRange = baseRun("named_file_direct_read");
+  shellConcatenatedRange.steps = [{
+    kind: "shell",
+    command: "/bin/zsh -lc \"sed -n '1,\"'$p'\"' src/named.rs\"",
+    output: "source fixture\n",
+  }];
+  assert.deepEqual(validate("codex", shellConcatenatedRange).actions, ["source_read"]);
+
   const singleQuotedWrapper = baseRun("named_file_direct_read");
   singleQuotedWrapper.steps = [{
     kind: "shell",
@@ -1045,6 +1053,7 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
     "/bin/zsh -lc \"cat src/lib.rs src/one.rs\"",
     "/bin/zsh -lc \"wc -l src/lib.rs && sed -n '1,240p' src/one.rs\"",
     "/bin/zsh -lc \"wc -l src/lib.rs; sed -n '1,240p' src/lib.rs\"",
+    "/bin/zsh -lc \"sed -n '1,\"'$p'\"' src/lib.rs; pwd\"",
     "/bin/zsh -lc \"cat ~/secret\"",
     "/bin/zsh -lc \"cat =ls\"",
   ]) {
@@ -1858,7 +1867,7 @@ test("packet continuation and selected-context correlation are exact", () => {
   authorizedGapRead.steps.push({ kind: "source_read", path: "src/gap.rs" });
   authorizedGapRead.final = finalClaim({
     authority: "source",
-    evidence_ids: ["source:src/gap.rs"],
+    evidence_ids: ["evidence-1", "source:src/gap.rs"],
     gap_ids: ["gap-1"],
   });
   assert.equal(validate("codex", authorizedGapRead).status, "pass");
@@ -1875,10 +1884,15 @@ test("packet continuation and selected-context correlation are exact", () => {
   continuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs" });
   continuedSourceFallback.final = finalClaim({
     authority: "source",
-    evidence_ids: ["source:src/unread.rs"],
+    evidence_ids: ["evidence-1", "evidence-2", "source:src/unread.rs"],
   });
   assert.equal(validate("codex", continuedSourceFallback).status, "pass");
   assert.equal(validate("cursor", continuedSourceFallback).status, "pass");
+
+  const unresolvedNamedSourceFallback = baseRun("packet_named_fallback_to_source");
+  unresolvedNamedSourceFallback.final.outcome = "unknown";
+  unresolvedNamedSourceFallback.final.material_omissions = ["How the routing catalog works remains unresolved."];
+  assert.equal(validate("codex", unresolvedNamedSourceFallback).status, "pass");
 
   const failedContinuedSourceFallback = baseRun("packet_single_continuation");
   failedContinuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs", failed: true });

@@ -522,6 +522,10 @@ function unwrapCodexShell(command) {
   if (wrapper.startsWith("'") && wrapper.endsWith("'") && !wrapper.slice(1, -1).includes("'")) {
     return wrapper.slice(1, -1).trim();
   }
+  const concatenatedLiteral = wrapper.match(/^"([^"$`\\]*)"'([^']*)'"([^"$`\\]*)"$/u);
+  if (concatenatedLiteral) {
+    return `${concatenatedLiteral[1]}${concatenatedLiteral[2]}${concatenatedLiteral[3]}`.trim();
+  }
   try {
     const inner = JSON.parse(wrapper);
     return typeof inner === "string" ? inner.trim() : null;
@@ -553,7 +557,7 @@ function singleFileReadPath(command) {
     return countedPath && countedPath === readPath ? readPath : null;
   }
   const patterns = [
-    /^sed\s+-n\s+(?:'\d+,\d+p'|"\d+,\d+p"|\d+,\d+p)\s+(.+)$/u,
+    /^sed\s+-n\s+(?:'\d+,(?:\d+|\$)p'|"\d+,\d+p"|\d+,\d+p)\s+(.+)$/u,
     /^(?:cat|type|nl)(?:\s+-[A-Za-z]+)*\s+(.+)$/u,
     /^Get-Content(?:\s+-(?:LiteralPath|Path))?\s+(.+)$/iu,
   ];
@@ -2281,7 +2285,7 @@ function expectedFinalClaim(scenarioContract, actions, results) {
   if (reads.length > 0) {
     expected.authority = "source";
     if (scenarioContract.id === "packet_gap_to_focused_source") expected.outcome = "supported";
-    expected.evidence_ids = reads.map(({ path }) => `source:${path}`);
+    expected.evidence_ids.push(...reads.map(({ path }) => `source:${path}`));
   }
   if (proof) {
     const disposition = results.get(proof).body?.disposition;
@@ -2329,7 +2333,7 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
   const expected = expectedFinalClaim(scenarioContract, actions, results);
   if (claim.material_omissions.length > 0
       && expected.gap_ids.length > 0
-      && expected.authority === "packet_evidence") {
+      && expected.outcome === "supported") {
     expected.outcome = "unknown";
   }
   if (claim.material_omissions.length > 0 && expected.gap_ids.length === 0) {
