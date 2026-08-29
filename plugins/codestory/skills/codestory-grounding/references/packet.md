@@ -60,7 +60,8 @@ CLI flags. Every call requires `project` (absolute repository root).
   search system. A first-pass continuation-required gap is resolved when it is
   absent from the continuation result; retain other first-pass gaps only when
   that result still reports them. CLI `drill` remains a maintainer report and
-  is not this agent path.
+  is not this agent path. Globbing, directory listing, repository search, and
+  shell commands are also not packet-recovery paths.
 - `no_useful_evidence` is terminal even when retrieval itself was healthy.
   State the exact gaps, then stop. `unavailable` means the requested evidence
   surface could not serve the request. Preserve it unless an exact user-named

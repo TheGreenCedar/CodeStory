@@ -128,7 +128,9 @@ plugin package to locate a documented field or excerpt.
   continuation result's remaining gaps. A first-pass continuation-required gap
   is resolved when it is absent from that result; retain other first-pass gaps
   only when the continuation still reports them. Do not start a free-form
-  `search` / `context` / `trail` / `snippet` recovery loop from packet.
+  `search` / `context` / `trail` / `snippet` recovery loop from packet. Do not
+  substitute globbing, directory listing, repository search, or shell commands
+  for that forbidden recovery loop.
 - `no_useful_evidence` and `unavailable` are terminal CodeStory states. A typed
   `Unavailable` result is terminal and remains unavailable. Inspect ordinary
   source only when the user named the file or the returned gap identifies the
