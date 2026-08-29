@@ -1812,6 +1812,18 @@ test("packet continuation and selected-context correlation are exact", () => {
   const initialProbe = baseRun("packet_gap_to_focused_source");
   initialProbe.steps[0].args.probes = [{ kind: "exact_path", path: "src/gap.rs" }];
   assert.throws(() => validate("codex", initialProbe), /initial packet arguments/u);
+
+  const disclosedOmission = baseRun("broad_packet");
+  mutateBody(disclosedOmission, 0, (body) => {
+    body.gaps.push(v3Gap("material-gap", "evidence_missing", "A requested route remains unproven."));
+  });
+  disclosedOmission.final.gap_ids = ["material-gap"];
+  disclosedOmission.final.material_omissions = ["The requested route remains unproven."];
+  assert.equal(validate("codex", disclosedOmission).status, "pass");
+
+  const inventedOmission = baseRun("broad_packet");
+  inventedOmission.final.material_omissions = ["An unsupported limitation."];
+  assert.throws(() => validate("codex", inventedOmission), /omissions without a result-bound gap/u);
 });
 
 function staticIdentityFor(root) {

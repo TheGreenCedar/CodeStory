@@ -2209,7 +2209,10 @@ function parseFinalClaim(final, scenarioId) {
   uniqueStrings(claim.evidence_ids, `${scenarioId} final claim evidence_ids`);
   uniqueStrings(claim.gap_ids, `${scenarioId} final claim gap_ids`);
   uniqueStrings(claim.reason_codes, `${scenarioId} final claim reason_codes`);
-  if (!Array.isArray(claim.material_omissions)) fail(`${scenarioId} final claim material_omissions must be an array`);
+  if (!Array.isArray(claim.material_omissions)
+      || !claim.material_omissions.every(nonemptyString)) {
+    fail(`${scenarioId} final claim material_omissions must be an array of nonempty strings`);
+  }
   return claim;
 }
 
@@ -2286,7 +2289,7 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
   const claim = parseFinalClaim(final, scenarioContract.id);
   const expected = expectedFinalClaim(scenarioContract, actions, results);
   for (const key of FINAL_CLAIM_KEYS) {
-    if (key === "evidence_ids") continue;
+    if (key === "evidence_ids" || key === "material_omissions") continue;
     if (!equalJson(claim[key], expected[key])) {
       fail(`${scenarioContract.id} final claim ${key} does not match result-bound evidence`);
     }
@@ -2315,9 +2318,11 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
       }
     }
   }
+  if (claim.material_omissions.length > 0 && expected.gap_ids.length === 0) {
+    fail(`${scenarioContract.id} final claim contains omissions without a result-bound gap`);
+  }
   if (claim.runtime_execution_claim) fail(`${scenarioContract.id} final claim makes a runtime execution claim`);
   if (claim.absence_claim) fail(`${scenarioContract.id} final claim absence_claim contradicts Unknown or retrieval authority`);
-  if (claim.material_omissions.length > 0) fail(`${scenarioContract.id} final claim contains material omissions`);
 }
 
 function sedPrefix(text, endLine) {
