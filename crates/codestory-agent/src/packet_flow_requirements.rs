@@ -21,18 +21,21 @@ use crate::packet_evidence_carriers::{
     citation_owns_search_matcher_setup, citation_owns_search_printer_setup,
     citation_owns_search_searcher_setup, citation_owns_search_worker_construction,
     citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
-    citation_owns_server_response_terminal, citation_owns_shell_completion,
-    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
-    citation_owns_site_lifecycle, citation_owns_site_terminal,
-    citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
-    citation_owns_string_region_handoff, client_public_facade_successor_call_target,
-    client_request_dispatch_predecessor_call_source, client_request_dispatch_successor_call_target,
-    client_request_entrypoint_call_target, flow_belongs_to_client_request,
-    flow_belongs_to_command_dispatch, flow_belongs_to_command_server, flow_belongs_to_event_loop,
-    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
-    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
-    flow_belongs_to_url_session, server_request_dispatch_call_target,
+    citation_owns_server_request_handler_entrypoint, citation_owns_server_response_terminal,
+    citation_owns_server_route_match_dispatch, citation_owns_server_route_registration,
+    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
+    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
+    citation_owns_site_reader, citation_owns_site_terminal, citation_owns_string_blank_predicate,
+    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
+    client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
+    client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
+    flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
+    flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
+    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
+    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
+    server_handler_chain_call_target, server_request_dispatch_call_target,
     server_request_entrypoint_call_target, server_response_terminal_call_target,
+    server_route_insertion_call_target, server_route_lookup_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -479,7 +482,11 @@ pub fn packet_flow_requirements_for_terms(
                     requirement.role != FlowRole::TerminalBoundary || response_terminal_requested
                 }),
         );
-    } else if client_request_dispatch {
+    }
+    if server_route_dispatch {
+        requirements.extend_from_slice(SERVER_ROUTE_DISPATCH_DETAIL_FLOW);
+    }
+    if !server_request_dispatch && !server_route_dispatch && client_request_dispatch {
         if full_outbound_request {
             push_full_client_outbound_request_flow(terms, &mut requirements);
         } else {
@@ -940,6 +947,65 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     },
 ];
 
+/// The ordered structural links inside an inbound route-dispatch flow. These sit beside the
+/// established registration/dispatch/terminal requirements: they narrow broad route questions to
+/// the handoffs needed to explain how a registered method reaches storage, how a server request
+/// enters the dispatcher, and how a match reaches the handler chain.
+const SERVER_ROUTE_DISPATCH_DETAIL_FLOW: &[FlowRequirement] = &[
+    FlowRequirement {
+        id: "server_route_insertion_handoff",
+        role: FlowRole::Dispatch,
+        query_seeds: &["route registration insertion", "router route storage"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[],
+            carrier: citation_owns_server_route_registration,
+            call_target: Some(server_route_insertion_call_target),
+        },
+    },
+    FlowRequirement {
+        id: "server_request_handler_handoff",
+        role: FlowRole::Entrypoint,
+        query_seeds: &["server request handler", "serve http request dispatch"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[],
+            carrier: citation_owns_server_request_handler_entrypoint,
+            call_target: Some(server_request_dispatch_call_target),
+        },
+    },
+    FlowRequirement {
+        id: "server_route_match_lookup",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["route tree lookup", "find matched route"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[],
+            carrier: citation_owns_server_route_match_dispatch,
+            call_target: Some(server_route_lookup_call_target),
+        },
+    },
+    FlowRequirement {
+        id: "server_handler_chain_handoff",
+        role: FlowRole::TerminalBoundary,
+        query_seeds: &["matched handlers context chain", "handler chain next"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[],
+            carrier: citation_owns_server_route_match_dispatch,
+            call_target: Some(server_handler_chain_call_target),
+        },
+    },
+];
+
 const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_entrypoint",
@@ -1359,10 +1425,24 @@ const SITE_BUILD_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "site_lifecycle",
         role: FlowRole::Entrypoint,
-        query_seeds: &["site build lifecycle", "site process phases"],
+        query_seeds: &[
+            "site build lifecycle",
+            "Site.process reset read generate render cleanup write",
+        ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_site_lifecycle),
+    },
+    FlowRequirement {
+        id: "site_reader",
+        role: FlowRole::StateOrStorage,
+        query_seeds: &[
+            "Reader.read site content layouts collections pages data",
+            "static site content reader",
+        ],
+        coverage_mode: CoverageMode::AllowsSourceRange,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_site_reader),
     },
     FlowRequirement {
         id: "site_terminal",
@@ -1685,6 +1765,10 @@ pub fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)
             "server_request_dispatch",
             SERVER_REQUEST_DISPATCH_FLOW.to_vec(),
         ),
+        (
+            "server_route_dispatch_detail",
+            SERVER_ROUTE_DISPATCH_DETAIL_FLOW.to_vec(),
+        ),
         ("client_request_dispatch", client_dispatch),
         ("url_session", URL_SESSION_FLOW.to_vec()),
         (
@@ -1750,7 +1834,7 @@ mod tests {
 
     /// Contract rev 5 scope table: exactly six requirement ids carry real
     /// proof formulas, each referencing its stage-1 const formula group;
-    /// everything else — both `SITE_BUILD_FLOW` ids explicitly included — is
+    /// everything else — all `SITE_BUILD_FLOW` ids explicitly included — is
     /// `FlowProofSpec::Legacy`.
     #[test]
     fn only_the_six_shard_requirements_carry_atom_proof_formulas() {
@@ -2365,12 +2449,30 @@ mod tests {
             .flat_map(|requirement| requirement.query_seeds.iter().copied())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, ["request_entrypoint", "request_dispatch"]);
+        assert_eq!(
+            ids,
+            [
+                "request_entrypoint",
+                "request_dispatch",
+                "server_route_insertion_handoff",
+                "server_request_handler_handoff",
+                "server_route_match_lookup",
+                "server_handler_chain_handoff",
+            ]
+        );
         for expected in [
             "application use",
             "route registration",
             "application handle",
             "request dispatch",
+            "route registration insertion",
+            "router route storage",
+            "server request handler",
+            "serve http request dispatch",
+            "route tree lookup",
+            "find matched route",
+            "matched handlers context chain",
+            "handler chain next",
         ] {
             assert!(
                 queries.contains(&expected),
@@ -2409,7 +2511,15 @@ mod tests {
 
         assert_eq!(
             ids,
-            ["request_entrypoint", "request_dispatch", "request_terminal"]
+            [
+                "request_entrypoint",
+                "request_dispatch",
+                "request_terminal",
+                "server_route_insertion_handoff",
+                "server_request_handler_handoff",
+                "server_route_match_lookup",
+                "server_handler_chain_handoff",
+            ]
         );
         for expected in ["response send", "response finalization"] {
             assert!(
@@ -2475,12 +2585,17 @@ mod tests {
         "search_printer_setup | configuration | RequiresResolvedSourceOrGraph",
         "search_searcher_setup | configuration | RequiresResolvedSourceOrGraph",
         "search_worker_construction | configuration | RequiresResolvedSourceOrGraph",
+        "server_handler_chain_handoff | terminal_boundary | RequiresResolvedSourceOrGraph",
+        "server_request_handler_handoff | entrypoint | RequiresResolvedSourceOrGraph",
+        "server_route_insertion_handoff | dispatch | RequiresResolvedSourceOrGraph",
+        "server_route_match_lookup | transform_or_validate | RequiresResolvedSourceOrGraph",
         "session_callbacks | dispatch | AllowsSourceRange",
         "client_request_entry | entrypoint | RequiresResolvedSourceOrGraph",
         "shell_completion | terminal_boundary | DiagnosticOnly",
         "shell_function_dispatch | dispatch | AllowsLexicalSource",
         "shell_installer_bootstrap | entrypoint | AllowsLexicalSource",
         "site_lifecycle | entrypoint | RequiresResolvedSourceOrGraph",
+        "site_reader | state_or_storage | AllowsSourceRange",
         "site_terminal | terminal_boundary | AllowsSourceRange",
         "sql_relationships | configuration | AllowsLexicalSource",
         "sql_tables | state_or_storage | AllowsLexicalSource",
@@ -2564,6 +2679,34 @@ mod tests {
                     "dispatchRequest",
                     "lib/core/dispatchRequest.js",
                     NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("server_route_insertion_handoff", "dispatch"),
+                witness(
+                    "RouterGroup.handle",
+                    "src/http/router_group.go",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("server_request_handler_handoff", "entrypoint"),
+                witness("Server.ServeHTTP", "src/http/server.go", NodeKind::METHOD),
+            ),
+            (
+                ("server_route_match_lookup", "transform_or_validate"),
+                witness(
+                    "Engine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("server_handler_chain_handoff", "terminal_boundary"),
+                witness(
+                    "Engine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
                 ),
             ),
             (
@@ -2776,6 +2919,19 @@ mod tests {
                 ("site_lifecycle", "entrypoint"),
                 witness("Site.process", "lib/site/site.rb", NodeKind::METHOD),
             ),
+            (("site_reader", "state_or_storage"), {
+                let mut reader = witness(
+                    "Generator::Reader.read",
+                    "lib/site/reader.rb",
+                    NodeKind::METHOD,
+                );
+                reader.source_excerpt = Some(
+                    "def read\n  @site.layouts = LayoutReader.new(site).read\n  \
+                         CollectionReader.new(site).read\n  read_data\nend"
+                        .to_string(),
+                );
+                reader
+            }),
             (
                 ("site_terminal", "terminal_boundary"),
                 witness("Site.write", "lib/site/renderer.rb", NodeKind::METHOD),
@@ -3249,6 +3405,100 @@ mod tests {
             &self_loop,
             NodeKind::METHOD,
         ));
+    }
+
+    #[test]
+    fn server_route_detail_requires_each_exact_ordered_handoff() {
+        let requirement = |id: &str| {
+            SERVER_ROUTE_DISPATCH_DETAIL_FLOW
+                .iter()
+                .copied()
+                .find(|requirement| requirement.id == id)
+                .unwrap_or_else(|| panic!("missing route requirement {id}"))
+        };
+        let receipt = |id: &str, source: NodeId, target: NodeId| GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source,
+            target,
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".to_string()),
+            callsite_identity: Some("src/http/router.rs:1".to_string()),
+            candidate_targets: Vec::new(),
+        };
+        let cases = [
+            (
+                "server_route_insertion_handoff",
+                witness(
+                    "RouterGroup.handle",
+                    "src/http/router_group.go",
+                    NodeKind::METHOD,
+                ),
+                "Engine.addRoute",
+                "SegmentTree.add",
+            ),
+            (
+                "server_request_handler_handoff",
+                witness("Server.ServeHTTP", "src/http/server.go", NodeKind::METHOD),
+                "Engine.handleHTTPRequest",
+                "SearchEngine.handleRequest",
+            ),
+            (
+                "server_route_match_lookup",
+                witness(
+                    "Engine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                ),
+                "node.getValue",
+                "Config.getValue",
+            ),
+            (
+                "server_handler_chain_handoff",
+                witness(
+                    "Engine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                ),
+                "Context.Next",
+                "RenderContext.Next",
+            ),
+        ];
+
+        for (id, carrier, lawful_target, hostile_target) in cases {
+            let requirement = requirement(id);
+            assert!(requirement.evidence.citation_proves(&carrier), "{id}");
+            let lawful = receipt(
+                id,
+                carrier.node_id.clone(),
+                NodeId(lawful_target.to_string()),
+            );
+            assert!(
+                flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &carrier,
+                    &lawful,
+                    lawful_target,
+                    NodeKind::METHOD,
+                ),
+                "{id} should retain its exact next stage"
+            );
+            let hostile = receipt(
+                hostile_target,
+                carrier.node_id.clone(),
+                NodeId(hostile_target.to_string()),
+            );
+            assert!(
+                !flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &carrier,
+                    &hostile,
+                    hostile_target,
+                    NodeKind::METHOD,
+                ),
+                "{id} must reject unrelated {hostile_target}"
+            );
+        }
     }
 
     #[test]
@@ -3742,9 +3992,13 @@ mod tests {
             "routes",
             "router",
             "routing",
+            "tree",
+            "node",
             "controller",
             "handler",
             "handlers",
+            "next",
+            "proceed",
             "endpoint",
             "server",
             "middleware",
@@ -3757,6 +4011,9 @@ mod tests {
             "rack",
             "servlet",
             "gateway",
+            "ui",
+            "view",
+            "widget",
             "client",
             "clients",
             "instance",
@@ -4034,6 +4291,7 @@ mod tests {
             "collections",
             "themes",
             "assets",
+            "data",
             "file",
             "files",
             "html",
@@ -4744,7 +5002,7 @@ mod tests {
                         NodeKind::METHOD,
                     ),
                 ],
-                expected_missing: &["site_lifecycle", "site_terminal"],
+                expected_missing: &["site_lifecycle", "site_reader", "site_terminal"],
             },
             Case {
                 flow: "logger record + handler",
@@ -4859,6 +5117,97 @@ mod tests {
         }
     }
 
+    /// A command helper and the terminal write/render surfaces do not establish the build's own
+    /// ordered lifecycle or the reader that populates it. Those two sources must remain separate
+    /// requirements so bounded projection cannot spend the whole site-build budget on the wrapper
+    /// and terminal phases.
+    #[test]
+    fn site_build_requires_its_phase_owner_and_a_credible_content_reader() {
+        let prompt = "Trace how the static site build command creates a site and runs the read, \
+                      generate, render, and write phases.";
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(prompt),
+            PacketTaskClassDto::DataFlow,
+        );
+        let lifecycle = requirements
+            .iter()
+            .find(|requirement| requirement.id == "site_lifecycle")
+            .expect("the prompt raises the site lifecycle");
+        let reader = requirements
+            .iter()
+            .find(|requirement| requirement.id == "site_reader")
+            .expect("the prompt raises the site content reader");
+        assert!(
+            lifecycle
+                .query_seeds
+                .iter()
+                .any(|query| query.contains("Site.process")),
+            "the lifecycle must probe its phase-owning callable rather than a command wrapper"
+        );
+        assert!(
+            reader
+                .query_seeds
+                .iter()
+                .any(|query| query.contains("Reader.read")),
+            "the reader requirement must probe a source-bearing reader callable"
+        );
+
+        let wrapper = witness(
+            "Command.process_site",
+            "lib/commands/build.rb",
+            NodeKind::METHOD,
+        );
+        let write = witness("Site.write", "lib/site.rb", NodeKind::METHOD);
+        let renderer = witness(
+            "Renderer.render_document",
+            "lib/renderer.rb",
+            NodeKind::METHOD,
+        );
+        assert!(
+            !lifecycle.evidence.citation_proves(&wrapper),
+            "a wrapper that delegates to the site cannot stand in for the site's phase owner"
+        );
+        assert!(lifecycle.evidence.citation_proves(&witness(
+            "Site.process",
+            "lib/site.rb",
+            NodeKind::METHOD,
+        )));
+        for citation in [&wrapper, &write, &renderer] {
+            assert!(
+                !reader.evidence.citation_proves(citation),
+                "{} is not the source that reads site content",
+                citation.display_name
+            );
+        }
+
+        for generic in [
+            witness("Reader.read", "src/io/reader.rb", NodeKind::METHOD),
+            witness("HttpReader.read", "src/web/reader.rb", NodeKind::METHOD),
+            witness("PageReader.read", "src/web/pages.rb", NodeKind::METHOD),
+        ] {
+            assert!(
+                !reader.evidence.citation_proves(&generic),
+                "{} names generic or web reading without static-site content evidence",
+                generic.display_name
+            );
+        }
+
+        let mut site_reader = witness(
+            "Generator::Reader.read",
+            "lib/generator/reader.rb",
+            NodeKind::METHOD,
+        );
+        site_reader.source_excerpt = Some(
+            "def read\n  @site.layouts = LayoutReader.new(site).read\n  \
+             CollectionReader.new(site).read\n  read_data\nend"
+                .to_string(),
+        );
+        assert!(
+            reader.evidence.citation_proves(&site_reader),
+            "a Reader method that demonstrably populates static-site content must remain reachable"
+        );
+    }
+
     /// The packets that reached a fully-closed *Sufficient* verdict on evidence that proved none of
     /// the flow they answered, named one by one so they cannot come back quietly.
     ///
@@ -4883,7 +5232,7 @@ mod tests {
                     witness("AssetPipeline.run", "lib/site/assets.rb", NodeKind::METHOD),
                     witness("Layout.render", "lib/site/layout.tsx", NodeKind::METHOD),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             (
                 "a build pipeline and a render pipeline in the site folder",
@@ -4893,7 +5242,7 @@ mod tests {
                     witness("RenderPipeline.run", "lib/site/gen.rb", NodeKind::METHOD),
                     witness("Pipeline.run", "lib/site/gen.rb", NodeKind::METHOD),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             // `public/static/` was the second spelling of the site root, and bundled vendor
             // JavaScript is what actually lives there.
@@ -4908,7 +5257,7 @@ mod tests {
                     ),
                     witness("Layout.render", "public/static/vendor.ts", NodeKind::METHOD),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             (
                 "a generator directory in a server-rendered application",
@@ -4917,7 +5266,7 @@ mod tests {
                     witness("Pages.generate", "src/generator/pages.rb", NodeKind::METHOD),
                     witness("Pages.render", "src/generator/pages.rb", NodeKind::METHOD),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             // Two different generic web nouns, which is what survived taking the directory away.
             (
@@ -4937,7 +5286,7 @@ mod tests {
                         NodeKind::METHOD,
                     ),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             // A single-file component was a markup document, so its `forms/` folder answered the
             // form question for every symbol in the file. `validityWindow` still closes one step,
@@ -5347,9 +5696,10 @@ mod tests {
         );
     }
 
-    /// Stronger than the same-role test above: inside one flow, *no* requirement may be closed by
-    /// another requirement's evidence, whatever roles the two wear. Roles were never the thing that
-    /// separated requirements; their evidence is.
+    /// Stronger than the same-role test above: inside one flow, *no citation-edge receipt* may close
+    /// two requirements, whatever roles the requirements wear. Roles were never the thing that
+    /// separated requirements; their evidence is. One dispatcher citation may lawfully own two
+    /// outgoing boundaries only when the target predicates keep those edges disjoint.
     #[test]
     fn no_requirement_in_a_flow_is_closed_by_another_requirements_witness() {
         let witnesses = requirement_witnesses();
@@ -5372,20 +5722,40 @@ mod tests {
                     checked_pairs += 1;
                     let left_witness = witness_for(left);
                     let right_witness = witness_for(right);
-                    assert!(
-                        !right.evidence.citation_proves(&left_witness),
-                        "in flow {group}, the anchor proving {} also closes {}: one anchor must \
-                         not close two requirements",
-                        left.id,
-                        right.id
-                    );
-                    assert!(
-                        !left.evidence.citation_proves(&right_witness),
-                        "in flow {group}, the anchor proving {} also closes {}: one anchor must \
-                         not close two requirements",
-                        right.id,
-                        left.id
-                    );
+                    let assert_receipts_disjoint =
+                        |owner: &FlowRequirement,
+                         owner_witness: &AgentCitationDto,
+                         other: &FlowRequirement| {
+                            if !other.evidence.citation_proves(owner_witness) {
+                                return;
+                            }
+                            let target_witness = match owner.id {
+                                "server_route_match_lookup" => "node.getValue",
+                                "server_handler_chain_handoff" => "Context.Next",
+                                _ => panic!(
+                                    "in flow {group}, the anchor proving {} also closes {}: one \
+                                     anchor may span requirements only through declared disjoint \
+                                     call boundaries",
+                                    owner.id, other.id
+                                ),
+                            };
+                            let owner_target = owner
+                                .evidence
+                                .call_boundary_target(owner_witness)
+                                .unwrap_or_else(|| panic!("{} lacks its call boundary", owner.id));
+                            let other_target = other
+                                .evidence
+                                .call_boundary_target(owner_witness)
+                                .unwrap_or_else(|| panic!("{} lacks its call boundary", other.id));
+                            assert!(
+                                owner_target(target_witness) && !other_target(target_witness),
+                                "in flow {group}, one citation-edge receipt closes both {} and {}",
+                                owner.id,
+                                other.id
+                            );
+                        };
+                    assert_receipts_disjoint(left, &left_witness, right);
+                    assert_receipts_disjoint(right, &right_witness, left);
                 }
             }
         }

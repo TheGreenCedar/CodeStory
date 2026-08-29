@@ -4020,7 +4020,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(plan.binding_terms.is_empty(), "{plan:#?}");
-        assert_eq!(material_ids, ["request_entrypoint", "request_dispatch"]);
+        assert_eq!(
+            material_ids,
+            [
+                "request_entrypoint",
+                "request_dispatch",
+                "server_route_insertion_handoff",
+                "server_request_handler_handoff",
+                "server_route_match_lookup",
+                "server_handler_chain_handoff",
+            ]
+        );
         assert!(
             plan.claim_obligations
                 .iter()

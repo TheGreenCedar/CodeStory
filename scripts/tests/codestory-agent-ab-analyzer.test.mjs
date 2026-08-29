@@ -6703,6 +6703,34 @@ test("quality scoring keeps affirmative support units intact without combining u
   });
   assert.equal(genericCapitalizedSubject.expected_claims.found, 1);
 
+  const nestedListRelation = scoreQuality([
+    agentMessageEvent(
+      "- Named animation classes connect to same-named keyframes through `animation-name`:\n  - `@keyframes bounce`; `.bounce { animation-name: bounce; }`",
+    ),
+  ], {
+    ...compoundTask,
+    id: "nested-list-relation",
+    expected_symbols: ["@keyframes bounce", ".bounce"],
+    expected_claims: [
+      "Named classes such as .bounce set animation-name to matching keyframes.",
+    ],
+  });
+  assert.equal(nestedListRelation.expected_claims.found, 1);
+
+  const unrelatedSibling = scoreQuality([
+    agentMessageEvent(
+      "- Named animation classes connect to same-named keyframes through `animation-name`:\n- `.bounce` is listed in an unrelated selector inventory.",
+    ),
+  ], {
+    ...compoundTask,
+    id: "unrelated-list-sibling",
+    expected_symbols: ["@keyframes bounce", ".bounce"],
+    expected_claims: [
+      "Named classes such as .bounce set animation-name to matching keyframes.",
+    ],
+  });
+  assert.equal(unrelatedSibling.expected_claims.found, 0);
+
   const gapSection = scoreQuality([
     agentMessageEvent(
       "The request reaches `Session.send`.\n\n## Material gaps\n`RouterGroup.Handle` registers route handlers.",
@@ -6710,6 +6738,87 @@ test("quality scoring keeps affirmative support units intact without combining u
   ], subjectTask);
   assert.equal(gapSection.expected_symbols.found, 0);
   assert.equal(gapSection.expected_claims.found, 0);
+});
+
+test("positive claim normalization is closed over qualified tokens and call relations", () => {
+  const zeroThresholds = {
+    min_expected_anchor_recall: 0,
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    max_forbidden_claims: 0,
+  };
+  const dartTask = {
+    id: "dart-qualified-call-relations",
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["Client", "BaseClient", "BaseRequest.finalize", "IOClient.send"],
+    expected_claims: [
+      "Top-level package:http helpers delegate to a Client.",
+      "BaseClient implements convenience methods in terms of send.",
+      "BaseRequest.finalize prepares the request body for sending.",
+      "IOClient.send is the dart:io transport implementation.",
+    ],
+    forbidden_claims: ["Top-level package:http helpers bypass Client."],
+    quality_thresholds: zeroThresholds,
+  };
+
+  const dartQuality = scoreQuality([
+    agentMessageEvent(
+      "- The top-level API in `http.dart` exposes `get`, which calls `_withClient`; its callback invokes `client.get`.\n" +
+      "- `BaseClient` convenience methods forward through `_sendUnstreamed`, which calls `send`.\n" +
+      "- `BaseRequest.finalize` marks the request finalized, but the evidence does not establish body preparation.\n" +
+      "- `IOClient.send` owns the I/O transport in `io_client`; it opens the platform request with `openUrl`.",
+    ),
+  ], dartTask);
+  assert.deepEqual(dartQuality.expected_claims.found_anchors, [
+    "Top-level package:http helpers delegate to a Client.",
+    "BaseClient implements convenience methods in terms of send.",
+    "IOClient.send is the dart:io transport implementation.",
+  ]);
+  assert.equal(dartQuality.forbidden_claims.found, 0);
+
+  const relationTask = (relation) => ({
+    id: `closed-call-relation-${relation}`,
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["Session.send", "Adapter.send"],
+    expected_claims: [`Session.send ${relation} payload via Adapter.send.`],
+    forbidden_claims: ["Session.send bypasses Adapter.send."],
+    quality_thresholds: zeroThresholds,
+  });
+  for (const [expected, observed] of [
+    ["delegates", "calls"],
+    ["invokes", "forwards"],
+    ["calls", "delegates"],
+    ["forwards", "invokes"],
+  ]) {
+    const quality = scoreQuality([
+      agentMessageEvent(`\`Session.send\` ${observed} bytes through \`Adapter.send\`.`),
+    ], relationTask(expected));
+    assert.equal(quality.expected_claims.found, 1, `${expected} should match ${observed}`);
+    assert.equal(quality.forbidden_claims.found, 0);
+  }
+
+  const wrongSubject = scoreQuality([
+    agentMessageEvent(
+      "`BrowserClient.send` calls bytes through `Adapter.send`. `Session.send` is listed separately.",
+    ),
+  ], relationTask("delegates"));
+  assert.equal(wrongSubject.expected_claims.found, 0);
+
+  const negative = scoreQuality([
+    agentMessageEvent("`Session.send` does not call bytes through `Adapter.send`."),
+  ], relationTask("delegates"));
+  assert.equal(negative.expected_claims.found, 0);
+
+  const splitFlow = scoreQuality([
+    agentMessageEvent(
+      "- `Session.send` is present.\n- `Adapter.send` receives the payload.\n- `Router.forward` invokes telemetry.",
+    ),
+  ], relationTask("delegates"));
+  assert.equal(splitFlow.expected_claims.found, 0);
 });
 
 test("quality scoring treats Ruby instance separator variants as symbol matches", () => {

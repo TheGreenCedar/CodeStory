@@ -478,6 +478,27 @@ pub fn citation_owns_server_request_entrypoint(citation: &AgentCitationDto) -> b
         )
 }
 
+/// A callable that registers a route or method on an application/router surface. The route
+/// subject must be present in the callable's own name; a generic handler or group in a routing
+/// directory is not registration evidence.
+pub fn citation_owns_server_route_registration(citation: &AgentCitationDto) -> bool {
+    callable_has_exact_owner_and_terminal_action(
+        citation,
+        &["app"],
+        &[
+            "route", "use", "handle", "register", "get", "post", "put", "patch", "delete", "head",
+            "options",
+        ],
+    ) || callable_owns_terminal_action_for_subject(
+        citation,
+        &[
+            "route", "use", "handle", "register", "get", "post", "put", "patch", "delete", "head",
+            "options",
+        ],
+        &["route", "router"],
+    )
+}
+
 /// The callable that selects or invokes an inbound request handler.
 pub fn citation_owns_server_request_dispatch(citation: &AgentCitationDto) -> bool {
     callable_has_exact_owner_and_terminal_action(citation, &["app"], &["handle"])
@@ -494,6 +515,29 @@ pub fn citation_owns_server_request_dispatch(citation: &AgentCitationDto) -> boo
             ],
         )
         || citation_owns_http_request_handle(citation)
+}
+
+/// The concrete request dispatcher from which route lookup and handler-chain calls originate.
+/// Route-group `handle` methods are registration helpers and intentionally stay outside this
+/// narrower carrier.
+pub fn citation_owns_server_route_match_dispatch(citation: &AgentCitationDto) -> bool {
+    citation_owns_http_request_handle(citation)
+        || callable_owns_terminal_action_for_subject(
+            citation,
+            &["dispatch", "handle", "process"],
+            &["http", "request"],
+        )
+        || callable_has_exact_owner_and_terminal_action(
+            citation,
+            &["app", "server"],
+            &["dispatch", "handle"],
+        )
+        || callable_has_exact_owner_and_terminal_action(citation, &["router"], &["dispatch"])
+}
+
+/// The server/application callable immediately before inbound handler dispatch.
+pub fn citation_owns_server_request_handler_entrypoint(citation: &AgentCitationDto) -> bool {
+    owns_callable_behavior(citation) && server_request_handler_call_source(&citation.display_name)
 }
 
 /// Prefer a cited inbound dispatch callable when the question is about routing
@@ -618,6 +662,65 @@ pub fn server_request_entrypoint_call_target(display_name: &str) -> bool {
         &["router"],
         &["route", "routes", "use", "listen"],
     ) || display_terminal_owner_action_matches(display_name, &["server"], &["listen"])
+}
+
+/// The stage that inserts a route into a router-owned or route-named store/tree.
+pub fn server_route_insertion_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    let terminal = identifier_tokens(terminal_segment_raw(display_name));
+    ((has_token(&terminal, &["add", "insert", "register", "store"])
+        && has_token(&tokens, &["route", "routes", "router", "routing"]))
+        || display_terminal_owner_action_matches(display_name, &["router"], &["route"]))
+        && !has_token(
+            &tokens,
+            &["metrics", "telemetry", "monitoring", "observability"],
+        )
+}
+
+/// The inbound server callable that owns the edge into request dispatch.
+pub fn server_request_handler_call_source(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    let terminal = identifier_tokens(terminal_segment_raw(display_name));
+    let excluded = has_token(
+        &tokens,
+        &[
+            "cache",
+            "client",
+            "metrics",
+            "monitoring",
+            "observability",
+            "search",
+            "session",
+            "telemetry",
+        ],
+    );
+    let server_owner = has_token(
+        &tokens[..tokens.len().saturating_sub(terminal.len())],
+        &["app", "asgi", "server", "servlet", "wsgi"],
+    );
+    !excluded
+        && ((has_token(&terminal, &["serve"]) && has_token(&terminal, &["http"]))
+            || (server_owner && has_token(&terminal, &["dispatch", "handle", "invoke", "process"])))
+}
+
+/// The exact route-lookup target reached from an inbound request dispatcher.
+pub fn server_route_lookup_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    let terminal = identifier_tokens(terminal_segment_raw(display_name));
+    let get_value = terminal.as_slice() == ["get", "value"];
+    let route_lookup = has_token(&terminal, &["find", "lookup", "match", "resolve", "select"])
+        && has_token(&tokens, &["route", "router", "tree"]);
+    (get_value && has_token(&tokens, &["node", "route", "router", "tree"])) || route_lookup
+}
+
+/// The context/handler-chain continuation reached after a request route matches.
+pub fn server_handler_chain_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    let terminal = identifier_tokens(terminal_segment_raw(display_name));
+    !has_token(&tokens, &["render", "template", "ui", "view", "widget"])
+        && ((has_token(&tokens, &["context"]) && has_token(&terminal, &["next", "proceed", "run"]))
+            || (has_token(&tokens, &["handler", "handlers", "middleware"])
+                && has_token(&terminal, &["dispatch", "execute", "invoke", "next", "run"])))
 }
 
 /// Typed CALL targets that select or invoke the inbound handler.
@@ -1194,9 +1297,9 @@ fn names_a_sitemap(citation: &AgentCitationDto) -> bool {
 ///
 /// What is left is narrower than the corpus's full anchor set, and deliberately: a site generator's
 /// helper classes are named `Renderer` and `Reader`, and those no longer close a step on their own.
-/// The build's phases hang off the site object, which does say it, so both requirements stay
-/// reachable — and a false negative on a helper is the safe direction, while the fallback above was
-/// the unsafe one.
+/// The build's phases hang off the site object, which does say it. Reader evidence has its own
+/// source-backed carrier below, so the lifecycle can stay narrow without losing the content-loading
+/// phase.
 fn belongs_to_site_build(citation: &AgentCitationDto) -> bool {
     names_token(citation, SITE_BUILD_SUBJECT_WORDS) && !names_a_sitemap(citation)
 }
@@ -1208,14 +1311,46 @@ fn belongs_to_site_build(citation: &AgentCitationDto) -> bool {
 /// in that list, so every name `belongs_to_site_build` accepts satisfies it. Leaving it in would
 /// read as a second factor and be none.
 pub fn citation_owns_site_lifecycle(citation: &AgentCitationDto) -> bool {
-    owns_behavior(citation) && belongs_to_site_build(citation) && {
-        let tokens = name_tokens(citation);
-        has_token(
-            &tokens,
-            &["process", "run", "start", "execute", "generate", "phases"],
-        ) && !has_token(&tokens, &["render", "write", "read"])
-            && !any_token_starts_with(&tokens, &["render", "writ", "read"])
+    callable_has_exact_owner_and_terminal_action(citation, &["site"], &["process"])
+}
+
+/// The source that turns project files into static-site content.
+///
+/// `Reader.read` alone is deliberately insufficient: that spelling appears in IO, HTTP, database,
+/// and document libraries. A bare helper becomes a site-build carrier only when its pinned source
+/// names the site it populates and at least two independent static-site content families. The
+/// source condition keeps `HttpReader.read`, `PageReader.read`, and an opaque generic reader from
+/// becoming requirement-bearing merely because a site-build question asked for reading.
+pub fn citation_owns_site_reader(citation: &AgentCitationDto) -> bool {
+    if !callable_has_exact_owner_and_terminal_action(citation, &["reader"], &["read"]) {
+        return false;
     }
+    let Some(source_excerpt) = citation.source_excerpt.as_deref() else {
+        return false;
+    };
+    let tokens = identifier_tokens(source_excerpt);
+    if !has_token(&tokens, &["site", "sites"]) {
+        return false;
+    }
+    [
+        &["layout", "layouts", "template", "templates"][..],
+        &[
+            "collection",
+            "collections",
+            "document",
+            "documents",
+            "post",
+            "posts",
+        ][..],
+        &["page", "pages"][..],
+        &["asset", "assets", "static"][..],
+        &["data"][..],
+    ]
+    .iter()
+    .filter(|family| has_token(&tokens, family))
+    .take(2)
+    .count()
+        == 2
 }
 
 pub fn citation_owns_site_terminal(citation: &AgentCitationDto) -> bool {
@@ -1818,7 +1953,7 @@ const SEARCH_HAYSTACK_COMPONENT_TOKENS: &[&str] = &["haystack"];
 const SEARCH_MATCHER_COMPONENT_TOKENS: &[&str] = &["matcher"];
 const SEARCH_SEARCHER_COMPONENT_TOKENS: &[&str] = &["searcher"];
 const SEARCH_PRINTER_COMPONENT_TOKENS: &[&str] = &["printer"];
-const SEARCH_WORKER_CONSTRUCTION_TOKENS: &[&str] = &["search", "worker"];
+const WORKER_COMPONENT_TOKENS: &[&str] = &["worker"];
 
 fn callable_owns_search_flow_component(
     citation: &AgentCitationDto,
@@ -1877,9 +2012,8 @@ pub fn citation_owns_search_worker_construction(citation: &AgentCitationDto) -> 
         return false;
     }
     let terminal_tokens = identifier_tokens(terminal_segment_raw(&citation.display_name));
-    if !SEARCH_WORKER_CONSTRUCTION_TOKENS
-        .iter()
-        .all(|token| terminal_tokens.iter().any(|candidate| candidate == token))
+    if !has_token(&terminal_tokens, WORKER_COMPONENT_TOKENS)
+        || !has_token(&terminal_tokens, SEARCH_FLOW_OWNER_TOKENS)
     {
         return false;
     }
@@ -1983,7 +2117,7 @@ pub(crate) fn carrier_taxonomy_vocabulary() -> Vec<String> {
         .chain(SEARCH_MATCHER_COMPONENT_TOKENS)
         .chain(SEARCH_SEARCHER_COMPONENT_TOKENS)
         .chain(SEARCH_PRINTER_COMPONENT_TOKENS)
-        .chain(SEARCH_WORKER_CONSTRUCTION_TOKENS)
+        .chain(WORKER_COMPONENT_TOKENS)
         .chain(SEARCH_EVIDENCE_CONTEXT_TOKENS)
         .chain(SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS)
         .chain(SEARCH_EVIDENCE_OUTPUT_ACTIONS)
@@ -2517,6 +2651,46 @@ mod tests {
                 "lib/application.js",
                 NodeKind::FUNCTION,
             )));
+        }
+
+        for positive in ["RouterGroup.Handle", "RouteGroup.register"] {
+            assert!(citation_owns_server_route_registration(&citation(
+                positive,
+                "lib/application.js",
+                NodeKind::METHOD,
+            )));
+        }
+        for negative in [
+            "EventHandler.Handle",
+            "Tree.Handle",
+            "UiGroup.register",
+            "RouteGroup.inspect",
+        ] {
+            assert!(!citation_owns_server_route_registration(&citation(
+                negative,
+                "lib/application.js",
+                NodeKind::METHOD,
+            )));
+        }
+
+        assert!(server_route_insertion_call_target("Engine.addRoute"));
+        assert!(server_request_handler_call_source("Engine.ServeHTTP"));
+        assert!(server_route_lookup_call_target("node.getValue"));
+        assert!(server_handler_chain_call_target("Context.Next"));
+        for negative in [
+            "EventHandler.handle",
+            "SegmentTree.add",
+            "SearchEngine.handleRequest",
+            "Config.getValue",
+            "RenderContext.Next",
+        ] {
+            assert!(
+                !server_route_insertion_call_target(negative)
+                    && !server_request_handler_call_source(negative)
+                    && !server_route_lookup_call_target(negative)
+                    && !server_handler_chain_call_target(negative),
+                "{negative} must not close a server-route boundary"
+            );
         }
 
         for positive in [

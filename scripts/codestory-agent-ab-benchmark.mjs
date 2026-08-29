@@ -3831,29 +3831,48 @@ function claimTokens(value, { expandQualified = false } = {}) {
     .filter((token) => token.length >= 3 && !CLAIM_STOPWORDS.has(token));
 }
 
+const POSITIVE_CLAIM_RELATION_BASES = new Set([
+  "call",
+  "delegate",
+  "forward",
+  "invoke",
+]);
+
 function positiveClaimTokenVariants(token) {
-  const variants = new Set([token]);
-  if (token.length >= 5 && token.endsWith("ies")) {
-    variants.add(`${token.slice(0, -3)}y`);
+  const variants = new Set();
+  const splitComponents = token.split(/(?:::|[.:#_])/g);
+  const alternatives = token.includes(":") ? splitComponents.slice(-1) : splitComponents;
+  const components = [token, ...alternatives]
+    .filter((component, index) =>
+      component.length >= (index === 0 ? 3 : 2) && !CLAIM_STOPWORDS.has(component)
+    );
+  for (const component of components) {
+    variants.add(component);
+    if (component.length >= 5 && component.endsWith("ies")) {
+      variants.add(`${component.slice(0, -3)}y`);
+    }
+    if (component.length >= 5 && component.endsWith("ing")) {
+      variants.add(component.slice(0, -3));
+      variants.add(`${component.slice(0, -3)}e`);
+    }
+    if (component.length >= 4 && component.endsWith("ed")) {
+      variants.add(component.slice(0, -2));
+      variants.add(component.slice(0, -1));
+    }
+    if (component.length >= 4 && component.endsWith("es")) {
+      variants.add(component.slice(0, -2));
+      variants.add(component.slice(0, -1));
+    }
+    if (component.length >= 4 && component.endsWith("s")) {
+      variants.add(component.slice(0, -1));
+    }
+    if (component.length >= 6 && component.endsWith("er")) {
+      const roleBase = component.slice(0, -2);
+      if (roleBase.length >= 4) variants.add(roleBase);
+    }
   }
-  if (token.length >= 5 && token.endsWith("ing")) {
-    variants.add(token.slice(0, -3));
-    variants.add(`${token.slice(0, -3)}e`);
-  }
-  if (token.length >= 4 && token.endsWith("ed")) {
-    variants.add(token.slice(0, -2));
-    variants.add(token.slice(0, -1));
-  }
-  if (token.length >= 4 && token.endsWith("es")) {
-    variants.add(token.slice(0, -2));
-    variants.add(token.slice(0, -1));
-  }
-  if (token.length >= 4 && token.endsWith("s")) {
-    variants.add(token.slice(0, -1));
-  }
-  if (token.length >= 6 && token.endsWith("er")) {
-    const roleBase = token.slice(0, -2);
-    if (roleBase.length >= 4) variants.add(roleBase);
+  if ([...variants].some((variant) => POSITIVE_CLAIM_RELATION_BASES.has(variant))) {
+    for (const relation of POSITIVE_CLAIM_RELATION_BASES) variants.add(relation);
   }
   return variants;
 }
@@ -3968,17 +3987,22 @@ function forbiddenCandidateSentences(haystack) {
 }
 
 const NON_AFFIRMATIVE_QUALITY_TEXT =
-  /\b(?:unknown|unavailable|unproven|unsupported|missing|gaps?|not_established|evidence_missing|unresolved|(?:no|without)\s+evidence|(?:lacks?|lacked|lacking)\s+(?:evidence|support)|(?:does|do|did|can|could)\s+not\s+(?:establish|show|support|prove|verify|demonstrate)|(?:cannot|doesn't|didn't|can't|couldn't)\s+(?:establish|show|support|prove|verify|demonstrate)|fails? to (?:establish|show|support|prove|verify|demonstrate))\b/i;
+  /\b(?:unknown|unavailable|unproven|unsupported|missing|gaps?|not_established|evidence_missing|unresolved|(?:no|without)\s+evidence|(?:lacks?|lacked|lacking)\s+(?:evidence|support)|(?:does|do|did|can|could)\s+not\s+(?:establish|show|support|prove|verify|demonstrate)|(?:cannot|doesn't|didn't|can't|couldn't)\s+(?:establish|show|support|prove|verify|demonstrate)|(?:never|(?:does|do|did|can|could)\s+not|doesn't|don't|didn't|can't|couldn't)\s+(?:calls?|called|calling|invokes?|invoked|invoking|delegates?|delegated|delegating|forwards?|forwarded|forwarding)|fails? to (?:establish|show|support|prove|verify|demonstrate))\b/i;
 
 function qualitySupportUnits(haystack) {
   const units = [];
   let current = [];
+  let currentListIndent = null;
+  const listParents = [];
   let inCodeFence = false;
   let inGapSection = false;
   const flush = () => {
     const unit = current.join(" ").trim();
     if (unit) units.push(unit);
     current = [];
+    const listIndent = currentListIndent;
+    currentListIndent = null;
+    return unit ? { unit, listIndent } : null;
   };
   for (const rawLine of String(haystack ?? "").replace(/\r\n/g, "\n").split("\n")) {
     const line = rawLine.trim();
@@ -3992,16 +4016,19 @@ function qualitySupportUnits(haystack) {
     const heading = line.match(/^#{1,6}\s+(.+)$/);
     if (heading) {
       flush();
+      listParents.length = 0;
       inGapSection = /\b(?:gaps?|unknown|unavailable|limitations?)\b/i.test(heading[1]);
       continue;
     }
     if (/^(?:material\s+)?gaps?\s*:/i.test(line)) {
       flush();
+      listParents.length = 0;
       inGapSection = true;
       continue;
     }
     if (!line) {
       flush();
+      listParents.length = 0;
       continue;
     }
     if (inGapSection) continue;
@@ -4012,8 +4039,23 @@ function qualitySupportUnits(haystack) {
 
     const listItem = line.match(/^(?:[-*+]\s+|\d+[.)]\s+)(.*)$/);
     if (listItem) {
-      flush();
-      current.push(listItem[1]);
+      const indent = rawLine.match(/^\s*/u)?.[0].replace(/\t/gu, "  ").length ?? 0;
+      const previous = flush();
+      while (listParents.at(-1)?.listIndent >= indent) listParents.pop();
+      if (
+        previous?.listIndent != null &&
+        previous.listIndent < indent &&
+        previous.unit.endsWith(":")
+      ) {
+        listParents.push(previous);
+      }
+      const parent = listParents.at(-1);
+      current.push(
+        parent && parent.listIndent < indent
+          ? `${parent.unit.replace(/:\s*$/u, "")} ${listItem[1]}`
+          : listItem[1],
+      );
+      currentListIndent = indent;
     } else {
       current.push(line);
     }
@@ -4041,19 +4083,9 @@ function affirmativeQualityClauses(haystack) {
   return qualitySupportUnits(haystack).flatMap(affirmativeQualityClausesInUnit);
 }
 
-function boundedAnchorMatch(haystack, anchor) {
-  const normalized = normalizeSearchText(haystack);
-  return anchorSearchVariants(anchor).some((variant) => {
-    const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return new RegExp(`(?:^|[^a-z0-9_$])${escaped}(?:$|[^a-z0-9_$])`, "i").test(normalized);
-  });
-}
-
 function claimSubjectAnchor(claim, subjectAnchors = []) {
-  const known = [...new Set(subjectAnchors.map(String).filter(Boolean))]
-    .filter((anchor) => boundedAnchorMatch(claim, anchor))
-    .sort((left, right) => right.length - left.length || left.localeCompare(right));
-  if (known.length > 0) return known[0];
+  const leadingKnown = leadingClaimSubject(claim, subjectAnchors);
+  if (leadingKnown) return leadingKnown;
 
   const normalized = String(claim ?? "")
     .trim()
