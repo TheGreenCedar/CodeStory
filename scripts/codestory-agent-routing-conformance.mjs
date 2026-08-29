@@ -162,6 +162,8 @@ export const ROUTING_SCENARIOS = deepFreeze([
     id: "packet_single_continuation",
     first: "packet",
     followups: ["packet"],
+    optionalFollowups: ["source_read"],
+    source: "user_named_file",
     required: ["one bounded continuation", "gap-1"],
     forbidden: NO_PROOF_CLAIMS,
   }),
@@ -495,30 +497,21 @@ function normalizePath(path) {
   return parts.join("/");
 }
 
-function textMentionsExactPath(value, normalizedPath) {
-  const text = String(value ?? "").replaceAll("\\", "/");
-  let offset = text.indexOf(normalizedPath);
-  while (offset >= 0) {
-    const before = offset === 0 ? "" : text[offset - 1];
-    const afterOffset = offset + normalizedPath.length;
-    const after = afterOffset >= text.length ? "" : text[afterOffset];
-    const pathCharacter = /[A-Za-z0-9._~:/-]/;
-    if ((!before || !pathCharacter.test(before)) && (!after || !pathCharacter.test(after))) return true;
-    offset = text.indexOf(normalizedPath, offset + 1);
-  }
-  return false;
-}
-
 function materialGapMessageAuthorizesPath(value, normalizedPath) {
   const materialGap = /\b(?:unknown|unavailable|not_established|evidence gap|material gap|missing evidence|evidence_missing|retrieval_unavailable|source_unavailable)\b/iu;
   const text = String(value ?? "").replaceAll("\\", "/");
-  if (!materialGap.test(text) || !textMentionsExactPath(text, normalizedPath)) return false;
-  const paths = new Set(
-    (text.match(/(?:[A-Za-z0-9_@+.-]+\/)+[A-Za-z0-9_@+.-]*[A-Za-z0-9_@+-]|[A-Za-z0-9_@+-]+\.[A-Za-z0-9_@+.-]*[A-Za-z0-9_@+-]/gu) ?? [])
-      .map((entry) => entry.replaceAll("\\", "/")),
-  );
-  paths.add(normalizedPath);
-  return paths.size === 1;
+  if (!materialGap.test(text)) return false;
+  const quoted = [...text.matchAll(/`([^`\r\n]+)`/gu)];
+  if (quoted.length !== 1) return false;
+  let candidate;
+  try {
+    candidate = normalizePath(quoted[0][1]);
+  } catch {
+    return false;
+  }
+  if (candidate !== normalizedPath) return false;
+  const remainder = `${text.slice(0, quoted[0].index)}${text.slice(quoted[0].index + quoted[0][0].length)}`;
+  return !/\S+\/\S+/u.test(remainder);
 }
 
 function unwrapCodexShell(command) {
@@ -670,11 +663,12 @@ function unwrapCursorToolCall(event) {
     fail("Cursor tool_call must contain exactly one *ToolCall payload");
   }
   const wrapper = event.tool_call[keys[0]];
-  if (!plainObject(wrapper) || !plainObject(wrapper.args)) fail("Cursor tool_call payload is missing args");
+  if (!plainObject(wrapper)) fail("Cursor tool_call payload is invalid");
   return { key: keys[0], wrapper };
 }
 
 function cursorStartedAction(callId, key, args) {
+  if (!plainObject(args)) fail("Cursor started tool call is missing args");
   if (key === "readToolCall") {
     return { kind: "source_read", tool: "source_read", path: normalizePath(args.path), args, cursor_key: key };
   }
@@ -743,17 +737,30 @@ function parseCursor(events) {
       if (event.subtype !== "completed") fail(`unsupported Cursor tool_call subtype ${JSON.stringify(event.subtype)}`);
       const action = state.open.get(callId);
       if (!action) fail(`unmatched tool call result ${JSON.stringify(callId)}`);
-      if (action.cursor_key !== key || !equalJson(action.cursor_args ?? action.args, wrapper.args)) {
+      if (action.cursor_key !== key
+          || (wrapper.args != null && !equalJson(action.cursor_args ?? action.args, wrapper.args))) {
         fail(`Cursor completed tool call ${JSON.stringify(callId)} does not match its start`);
       }
       if (!plainObject(wrapper.result) || Object.keys(wrapper.result).length !== 1
-          || !Object.hasOwn(wrapper.result, "success")) {
-        fail(`Cursor completed tool call ${JSON.stringify(callId)} must contain exactly one success result`);
+          || (!Object.hasOwn(wrapper.result, "success") && !Object.hasOwn(wrapper.result, "error"))) {
+        fail(`Cursor completed tool call ${JSON.stringify(callId)} must contain exactly one success or error result`);
       }
       if (event.truncated != null || wrapper.result.truncated != null) {
         fail(`Cursor completed tool call ${JSON.stringify(callId)} is partial`);
       }
+      if (Object.hasOwn(wrapper.result, "error")) {
+        const error = wrapper.result.error;
+        if (key !== "readToolCall" || wrapper.args != null || !plainObject(error)
+            || Object.keys(error).length !== 1 || !nonemptyString(error.errorMessage)) {
+          fail(`Cursor failed tool call ${JSON.stringify(callId)} has an invalid error result`);
+        }
+        completeAction(state, callId, error, true);
+        return;
+      }
       const success = wrapper.result.success;
+      if (!plainObject(wrapper.args)) {
+        fail(`Cursor completed tool call ${JSON.stringify(callId)} is missing args`);
+      }
       if (key === "readToolCall" && (!plainObject(success) || success.exceededLimit !== false)) {
         fail(`Cursor completed tool call ${JSON.stringify(callId)} contains a partial read`);
       }
@@ -1043,14 +1050,18 @@ function validateActionOrder(scenarioContract, actions) {
 
 function validateSourceReads(scenarioContract, request, actions, results) {
   const reads = actions.filter((action) => action.kind === "source_read");
+  const successfulReads = reads.filter((action) => action.completed && !action.error);
   const kind = scenarioContract.source_read_authorization.kind;
   if (kind === "none") {
     if (reads.length > 0) fail(`${scenarioContract.id} source read is not authorized`);
     return;
   }
   if (reads.length === 0) {
-    if (kind === "packet_evidence_gap") return;
+    if (scenarioContract.optional_followups.includes("source_read")) return;
     fail(`${scenarioContract.id} requires one authorized source read`);
+  }
+  if (!scenarioContract.optional_followups.includes("source_read") && successfulReads.length === 0) {
+    fail(`${scenarioContract.id} requires one successful authorized source read`);
   }
   if (kind === "user_named_file") {
     const named = new Set((request.named_files ?? []).map(normalizePath));
@@ -2254,7 +2265,7 @@ function expectedFinalClaim(scenarioContract, actions, results) {
   const packets = actions.filter((action) => action.kind === "packet");
   const searches = actions.filter((action) => action.kind === "search");
   const proof = actions.find((action) => action.kind === "prove_call_path");
-  const reads = actions.filter((action) => action.kind === "source_read");
+  const reads = actions.filter((action) => action.kind === "source_read" && action.completed && !action.error);
 
   if (contexts.length > 0) {
     const body = results.get(contexts.at(-1)).body;
@@ -2323,7 +2334,7 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
     }
   }
   const proof = actions.some((action) => action.kind === "prove_call_path");
-  const reads = actions.some((action) => action.kind === "source_read");
+  const reads = actions.some((action) => action.kind === "source_read" && action.completed && !action.error);
   if (proof || reads) {
     if (!equalJson(claim.evidence_ids, expected.evidence_ids)) {
       fail(`${scenarioContract.id} final claim evidence_ids does not match result-bound evidence`);
@@ -2486,7 +2497,10 @@ export function validateInstalledSession({
     } else {
       results.set(action, normalizedResult(action));
     }
-    if (results.get(action).isError && !expectedSemanticError) {
+    const allowedOptionalSourceFailure = action.kind === "source_read"
+      && scenarioContract.optional_followups.includes("source_read")
+      && action.error;
+    if (results.get(action).isError && !expectedSemanticError && !allowedOptionalSourceFailure) {
       fail(`${scenarioId} has an unexpected failed ${action.tool} action`);
     }
     if (!expectedSemanticError && ["search", "context", "packet", "prove_call_path"].includes(action.kind)) {

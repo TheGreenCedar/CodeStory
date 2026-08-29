@@ -553,6 +553,7 @@ function baseRun(scenarioId) {
       run.final = finalClaim({ authority: "packet_evidence", evidence_ids: ["evidence-1"] });
       break;
     case "packet_single_continuation":
+      run.request.named_files = ["src/unread.rs"];
       run.steps = [
         mcp("packet", { project: "/workspace/repo", question: ROUTING_PACKET_QUESTIONS.packet_single_continuation }, v3Packet({
           status: "continuation_available",
@@ -728,7 +729,9 @@ function codexJsonl(run) {
       events.push({ type: "item.started", item });
       events.push({
         type: "item.completed",
-        item: { ...item, status: "completed", exit_code: 0, aggregated_output: "source fixture\n" },
+        item: step.failed
+          ? { ...item, status: "failed", exit_code: 1, aggregated_output: "source fixture unavailable\n" }
+          : { ...item, status: "completed", exit_code: 0, aggregated_output: "source fixture\n" },
       });
     } else if (step.kind === "host_guidance_read") {
       const item = {
@@ -807,7 +810,11 @@ function cursorJsonl(run) {
       const args = { path: step.path };
       wrapper = {
         started: { readToolCall: { args } },
-        completed: {
+        completed: step.failed ? {
+          readToolCall: {
+            result: { error: { errorMessage: "File not found" } },
+          },
+        } : {
           readToolCall: {
             args,
             result: {
@@ -1135,6 +1142,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
 test("terminal routing scenarios reject every unauthorized source upgrade", () => {
   const authorized = new Set([
     "named_file_direct_read",
+    "packet_single_continuation",
     "packet_gap_to_focused_source",
     "packet_unavailable_to_source",
   ]);
@@ -1848,7 +1856,7 @@ test("packet continuation and selected-context correlation are exact", () => {
 
   const authorizedGapRead = baseRun("packet_gap_to_focused_source");
   mutateBody(authorizedGapRead, 0, (body) => {
-    body.gaps[0].message = "Missing evidence for src/gap.rs";
+    body.gaps[0].message = "Missing evidence for `src/gap.rs`";
   });
   authorizedGapRead.steps.push({ kind: "source_read", path: "src/gap.rs" });
   authorizedGapRead.final = finalClaim({
@@ -1857,6 +1865,49 @@ test("packet continuation and selected-context correlation are exact", () => {
     gap_ids: ["gap-1"],
   });
   assert.equal(validate("codex", authorizedGapRead).status, "pass");
+
+  const continuedSourceFallback = baseRun("packet_single_continuation");
+  continuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs" });
+  continuedSourceFallback.final = finalClaim({
+    authority: "source",
+    evidence_ids: ["source:src/unread.rs"],
+  });
+  assert.equal(validate("codex", continuedSourceFallback).status, "pass");
+  assert.equal(validate("cursor", continuedSourceFallback).status, "pass");
+
+  const failedContinuedSourceFallback = baseRun("packet_single_continuation");
+  failedContinuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs", failed: true });
+  assert.equal(validate("codex", failedContinuedSourceFallback).status, "pass");
+  assert.equal(validate("cursor", failedContinuedSourceFallback).status, "pass");
+
+  const failedRequiredSourceRead = baseRun("named_file_direct_read");
+  failedRequiredSourceRead.steps[0].failed = true;
+  assert.throws(
+    () => validate("codex", failedRequiredSourceRead),
+    /unexpected failed source_read action/u,
+  );
+
+  const unrelatedContinuedSourceFallback = baseRun("packet_single_continuation");
+  unrelatedContinuedSourceFallback.steps.push({ kind: "source_read", path: "src/other.rs" });
+  assert.throws(
+    () => validate("codex", unrelatedContinuedSourceFallback),
+    /source read is not authorized by a user-named file/u,
+  );
+
+  for (const message of [
+    "Missing evidence for `src/gap.rs#copy`",
+    "Missing evidence for `src/gap.rsé`",
+    "Missing evidence for `src/gap.rs` and src/β.rs",
+  ]) {
+    const inexactGapRead = baseRun("packet_gap_to_focused_source");
+    mutateBody(inexactGapRead, 0, (body) => { body.gaps[0].message = message; });
+    inexactGapRead.steps.push({ kind: "source_read", path: "src/gap.rs" });
+    assert.throws(
+      () => validate("codex", inexactGapRead),
+      /source read is not correlated with the packet evidence gap/u,
+      message,
+    );
+  }
 
   const disclosedOmission = baseRun("broad_packet");
   mutateBody(disclosedOmission, 0, (body) => {

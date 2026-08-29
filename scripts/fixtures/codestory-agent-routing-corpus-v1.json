@@ -29,7 +29,7 @@
     {
       "id": "packet_single_continuation",
       "prompt": "Use the broad evidence route first with this exact question: Trace the complete routing flow and account for src/unread.rs if the index cannot cover it. The path is fallback-only: on the initial broad request, do not add probes or continuation pins. If the evidence surface offers one bounded continuation, follow that exact offer once.",
-      "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
+      "request": { "named_files": ["src/unread.rs"], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {
       "id": "packet_gap_to_focused_source",
