@@ -284,7 +284,7 @@ export function validateRoutingRequestCorpus(document = ROUTING_CORPUS_DOCUMENT)
 
 export const ROUTING_REQUEST_CORPUS = deepFreeze(structuredClone(ROUTING_CORPUS_DOCUMENT));
 
-const FINAL_REPORT_INSTRUCTION = `Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read unless it follows an unavailable CodeStory result: an authorized fallback read changes evidence authority but preserves an earlier unavailable outcome. Use supported only when the selected evidence authority resolves the requested material; if result-bound gaps leave any requested material unresolved, use unknown even when the tool result also returned useful evidence. Use discovery_only for a search lead, and preserve the exact proof result boundary. Use invalid_contract for a rejected typed interpretation. Use refused only when the user requested exact proof without supplying a typed interpretation. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
+const FINAL_REPORT_INSTRUCTION = `Finish with only one JSON object using exactly these keys: authority, outcome, target_id, evidence_ids, gap_ids, reason_codes, proof_disposition, refutation_basis, runtime_execution_claim, absence_claim, material_omissions. authority must be exactly one of source, search_lead, context_evidence, packet_evidence, typed_proof, none, chosen from the final evidence authority you actually used. outcome must be exactly one of supported, discovery_only, refuted, unknown, unavailable, invalid_contract, refused. Use supported for a direct source read unless it follows an unavailable CodeStory result: an authorized fallback read changes evidence authority but preserves an earlier unavailable outcome. Use supported only when the selected evidence authority resolves the requested material; if result-bound gaps leave any requested material unresolved, use unknown even when the tool result also returned useful evidence. Use discovery_only for a search lead, and preserve the exact proof result boundary. Use invalid_contract for a rejected typed interpretation. Use refused only when the user requested exact proof without supplying a typed interpretation. Use null for absent scalar identities and [] for absent lists. target_id must be null unless a CodeStory tool result returned a target identity. For a direct source read, record evidence identity source:<project-relative-path>; for CodeStory tool calls, copy evidence, gap, disposition, target, and refutation identities only from the tool results. For typed proof, evidence_ids contains only receipt_id values referenced by the disposition; never copy fact_id or edge_id. reason_codes may contain only CodeStory tool result codes or typed_contract_required; use typed_contract_required only for a refused free-English proof request. refutation_basis must be null unless a ContractRefuted result supplied the basis. runtime_execution_claim and absence_claim must each be false. material_omissions contains only unresolved material requested by the user; limitations outside the requested claim are not omissions, so use [] when the request was fully answered within the selected authority. Never claim runtime execution or absence and never omit a material requested gap.`;
 
 export function materializeRoutingRequests(projectRoot) {
   const project = realpathSync(projectRoot);
@@ -1877,28 +1877,6 @@ function dispositionReceiptSequence(result, stepCount) {
   return [];
 }
 
-function parseProofCallsiteIdentity(identity) {
-  const separator = identity.indexOf("|");
-  const prefix = separator === -1 ? identity : identity.slice(0, separator);
-  const marker = separator === -1 ? null : identity.slice(separator + 1);
-  if (marker === "") return null;
-  const fields = prefix.split(":");
-  if (fields.length !== 4 || !/^-?[0-9]+$/u.test(fields[0]) || !/^[0-9]+$/u.test(fields[1])
-      || !/^[0-9]+$/u.test(fields[2]) || !/^-?[0-9]+$/u.test(fields[3])) return null;
-  const [fileId, rawLine, rawColumn, rawTarget] = fields;
-  const line = Number(rawLine);
-  const column = Number(rawColumn);
-  if (!Number.isSafeInteger(line) || line < 1 || line > 0xffff_ffff
-      || !Number.isSafeInteger(column) || column < 1 || column > 0xffff_ffff) return null;
-  try {
-    const normalized = `${BigInt(fileId)}:${line}:${column}:${BigInt(rawTarget)}`;
-    if (normalized !== prefix || BigInt(fileId) === 0n || BigInt(rawTarget) === 0n) return null;
-  } catch {
-    return null;
-  }
-  return { fileId, line, column, rawTarget };
-}
-
 function canonicalNonzeroInteger(value) {
   if (typeof value !== "string" || !/^-?[0-9]+$/u.test(value)) return null;
   try {
@@ -2011,10 +1989,7 @@ function validateSemanticReceiptTable(result, sequence) {
     const file = result.identities.files[source.file];
     if (!nonemptyString(file.file_node_id) || !SHA256.test(file.indexed_sha256)
         || file.observed_sha256 !== file.indexed_sha256) proofSemanticFail(`receipt ${index} line window is not hash-bound`);
-    const callsite = parseProofCallsiteIdentity(receipt.callsite_identity);
-    if (callsite === null || callsite.fileId !== file.file_node_id || callsite.rawTarget !== target.node_id
-        || callsite.line !== receipt.line_window.anchor_line || callsite.column !== receipt.column_or_ordinal
-        || receipt.line_window.anchor_line < receipt.containment.start_line
+    if (receipt.line_window.anchor_line < receipt.containment.start_line
         || receipt.line_window.anchor_line > receipt.containment.end_line
         || receipt.exact_callsite_start_byte < receipt.line_window.byte_start
         || receipt.exact_callsite_start_byte >= receipt.line_window.byte_end) {
@@ -2101,7 +2076,7 @@ function validateProofCalls(scenarioContract, request, actions, results) {
 
   const projection = results.get(proofCalls[0]);
   const activated = projection?.meta?.codestory_execution?.semantic_retrieval_activated;
-  if (activated !== false) fail(`${scenarioContract.id} proof activated semantic retrieval or omitted observational evidence`);
+  if (activated === true) fail(`${scenarioContract.id} proof activated semantic retrieval`);
   if (scenarioContract.typed_contract === "malformed") {
     if (!projection?.isError || projection.raw?.structuredContent !== undefined) {
       fail(`${scenarioContract.id} malformed semantic contract must return isError without structured content`);

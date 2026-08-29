@@ -90,7 +90,9 @@ probe the installed plugin package to locate a documented field.
 - `prove_call_path` is the only surface that returns `contract_proven` or
   `contract_refuted`. It verifies a host-supplied interpretation; it does not
   translate prose. Never call it automatically from a packet, search result,
-  context result, or guessed natural-language contract.
+  context result, or guessed natural-language contract. Cite only the
+  `receipt_id` values selected by its disposition; a proof `fact_id` or
+  `edge_id` is not an authoritative receipt identity.
 - Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable`
   exactly. `unknown` is not absence, and `unavailable` is not negative proof.
   Exact structural proof does not establish runtime execution, reachability,

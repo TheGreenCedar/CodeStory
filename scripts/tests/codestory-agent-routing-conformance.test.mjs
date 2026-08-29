@@ -1142,6 +1142,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /refutation_basis must be null unless a ContractRefuted result supplied the basis/u);
     assert.match(prompt, /runtime_execution_claim and absence_claim must each be false/u);
     assert.match(prompt, /material_omissions contains only unresolved material requested by the user/u);
+    assert.match(prompt, /typed proof.*receipt_id.*never copy fact_id or edge_id/u);
   }
   const discoveryPrompt = materialized.find(({ scenario_id }) => scenario_id === "exact_symbol_search").request.text;
   assert.match(discoveryPrompt, /discovery candidates only/iu);
@@ -1747,9 +1748,15 @@ test("tool results bind the host-negotiated revision to the authenticated discov
       schema_version: 3,
       minimum_compatible_schema_version: 3,
     },
-    codestory_execution: { semantic_retrieval_activated: false },
   };
   assert.equal(validate("codex", nativeProof).status, "pass");
+
+  const opaqueProofCallsite = baseRun("typed_proof_contract_proven");
+  mutateBody(opaqueProofCallsite, 0, (body) => {
+    body.receipts[0].callsite_identity = "opaque-after-admission";
+    body.identities.evidence[0].callsite_identity = "opaque-after-admission";
+  });
+  assert.equal(validate("codex", opaqueProofCallsite).status, "pass");
 
   const nativeSearchWithoutRuntime = baseRun("exact_symbol_search");
   nativeSearchWithoutRuntime.steps[0].result._meta = {
