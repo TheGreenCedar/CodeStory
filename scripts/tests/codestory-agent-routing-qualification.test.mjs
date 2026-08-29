@@ -71,7 +71,7 @@ test("qualification host commands use official isolated Codex and Cursor session
   });
   assert.deepEqual(cursorAgent.args, [
     "--print", "--output-format", "stream-json", "--stream-partial-output",
-    "--mode", "ask", "--approve-mcps", "--trust", "--model", "composer-2.5",
+    "--mode", "ask", "--approve-mcps", "--trust", "--force", "--model", "composer-2.5",
     "--plugin-dir", "/fixture/plugin",
     "fixture prompt",
   ]);

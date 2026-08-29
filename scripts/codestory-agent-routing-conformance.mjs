@@ -489,7 +489,7 @@ function normalizeToolName(name, server = "") {
   if (lower.startsWith("mcp__codestory__")) return lower.slice("mcp__codestory__".length);
   const cursorMcp = lower.match(/^mcp[_-]codestory[_-](.+)$/u);
   if (cursorMcp) return cursorMcp[1];
-  if (String(server).toLowerCase() === "codestory") return lower;
+  if (["codestory", "plugin-codestory-codestory"].includes(String(server).toLowerCase())) return lower;
   if (lower === "tool_search" || lower.endsWith("__tool_search")) return "tool_search";
   return null;
 }
@@ -735,6 +735,20 @@ function cursorStartedAction(callId, key, args) {
     if (typeof args.query !== "string" || !args.query) fail("Cursor toolSearchToolCall is missing query");
     return { kind: "tool_search", tool: "tool_search", args, cursor_key: key, cursor_args: args };
   }
+  if (key === "getMcpToolsToolCall") {
+    if (!equalJson(Object.keys(args).sort(), ["server", "toolCallId", "toolName"])
+        || args.server !== "plugin-codestory-codestory" || args.toolCallId !== callId
+        || !nonemptyString(args.toolName)) {
+      fail("Cursor getMcpToolsToolCall args are invalid");
+    }
+    return {
+      kind: "cursor_tool_discovery",
+      tool: "cursor_tool_discovery",
+      args,
+      cursor_key: key,
+      cursor_args: args,
+    };
+  }
   return { kind: "external_tool", tool: key, args, cursor_key: key, cursor_args: args };
 }
 
@@ -797,7 +811,12 @@ function parseCursor(events) {
       const { key, wrapper, envelope } = unwrapCursorToolCall(event, callId);
       if (event.subtype === "started") {
         if (Object.hasOwn(wrapper, "result")) fail("Cursor started tool call must not contain a result");
-        beginAction(state, callId, { ...cursorStartedAction(callId, key, wrapper.args), cursor_envelope: envelope });
+        beginAction(
+          state,
+          callId,
+          { ...cursorStartedAction(callId, key, wrapper.args), cursor_envelope: envelope },
+          true,
+        );
         return;
       }
       if (event.subtype !== "completed") fail(`unsupported Cursor tool_call subtype ${JSON.stringify(event.subtype)}`);
@@ -825,7 +844,7 @@ function parseCursor(events) {
         return;
       }
       const success = wrapper.result.success;
-      if (!plainObject(wrapper.args)) {
+      if (!plainObject(wrapper.args) && !["getMcpToolsToolCall", "mcpToolCall"].includes(key)) {
         fail(`Cursor completed tool call ${JSON.stringify(callId)} is missing args`);
       }
       if (key === "readToolCall" && (!plainObject(success) || success.exceededLimit !== false)) {
@@ -2570,8 +2589,108 @@ function authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIde
   };
 }
 
+function authenticatedCursorGuidanceRead(action, installedPluginRoot, expectedIdentity) {
+  if (action.kind !== "source_read" || !action.completed || action.error
+      || !plainObject(action.result) || !isAbsolute(action.path) || !installedPluginRoot) {
+    return false;
+  }
+  let root;
+  let actual;
+  try {
+    root = realpathSync(installedPluginRoot);
+    actual = realpathSync(action.path);
+  } catch {
+    return false;
+  }
+  const rel = relative(root, actual);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || resolve(root, rel) !== actual) return false;
+  const rosterPath = rel.split(sep).join("/");
+  if (!CODEX_GUIDANCE_PATHS.has(rosterPath)) return false;
+  const expectedDigest = expectedIdentity.static_roster?.[rosterPath];
+  const bytes = readFileSync(actual);
+  if (!SHA256.test(String(expectedDigest)) || sha256Bytes(bytes) !== expectedDigest) return false;
+  const result = action.result;
+  const contentKey = Object.hasOwn(result, "content") ? "content" : "contentBlobId";
+  const resultKeys = [
+    contentKey, "exceededLimit", "fileSize", "isEmpty", "path", "readRange",
+    "relatedCursorRulePaths", "relatedCursorRules", "totalLines",
+  ].sort();
+  const text = bytes.toString("utf8");
+  const totalLines = text.match(/[^\n]*\n|[^\n]+$/gu)?.length ?? 0;
+  if (!equalJson(Object.keys(result).sort(), resultKeys)
+      || !["content", "contentBlobId"].includes(contentKey)
+      || result.exceededLimit !== false || result.isEmpty !== (bytes.length === 0)
+      || result.fileSize !== bytes.length || result.path !== action.path
+      || !equalJson(result.readRange, { startLine: 1, endLine: totalLines })
+      || result.totalLines !== totalLines
+      || !equalJson(result.relatedCursorRulePaths, []) || !equalJson(result.relatedCursorRules, [])) {
+    return false;
+  }
+  if (contentKey === "content") return result.content === text;
+  return result.contentBlobId === createHash("sha256").update(bytes).digest("base64");
+}
+
+function authenticatedCursorToolDiscovery(action, installedPluginRoot, expectedIdentity) {
+  if (action.kind !== "cursor_tool_discovery" || !action.completed || action.error
+      || !plainObject(action.result) || !nonemptyString(action.result.content) || !installedPluginRoot) {
+    return false;
+  }
+  let root;
+  let catalogPath;
+  try {
+    root = realpathSync(installedPluginRoot);
+    catalogPath = realpathSync(resolve(root, "generated-mcp-catalog.json"));
+  } catch {
+    return false;
+  }
+  if (relative(root, catalogPath) !== "generated-mcp-catalog.json") return false;
+  const bytes = readFileSync(catalogPath);
+  const expectedDigest = expectedIdentity.static_roster?.["generated-mcp-catalog.json"];
+  if (!SHA256.test(String(expectedDigest)) || sha256Bytes(bytes) !== expectedDigest
+      || !equalJson(Object.keys(action.result), ["content"])) {
+    return false;
+  }
+  let catalog;
+  let observed;
+  try {
+    catalog = JSON.parse(bytes.toString("utf8"));
+    observed = JSON.parse(action.result.content);
+  } catch {
+    return false;
+  }
+  const matches = Array.isArray(catalog.tools)
+    ? catalog.tools.filter(({ name }) => name === action.args.toolName)
+    : [];
+  return matches.length === 1 && equalJson(observed, {
+    tool: matches[0].name,
+    description: matches[0].description,
+    inputSchema: matches[0].inputSchema,
+  });
+}
+
 function productRoutingActions(host, actions, installedPluginRoot, expectedIdentity) {
-  if (String(host).toLowerCase() !== "codex") return actions;
+  const normalizedHost = String(host).toLowerCase();
+  if (normalizedHost === "cursor") {
+    const product = [];
+    const metadata = new Set();
+    for (const action of actions) {
+      if (authenticatedCursorGuidanceRead(action, installedPluginRoot, expectedIdentity)
+          || authenticatedCursorToolDiscovery(action, installedPluginRoot, expectedIdentity)) {
+        metadata.add(action);
+      } else {
+        product.push(action);
+      }
+    }
+    if (actions.some((action) => action.overlaps.some((other) => metadata.has(action) !== metadata.has(other)))) {
+      fail("Cursor transcript overlaps authenticated metadata with a product action");
+    }
+    const productActions = new Set(product);
+    if (product.some((action) => action.overlaps.some((other) => productActions.has(other)))) {
+      fail("Cursor transcript contains overlapping product actions");
+    }
+    return product;
+  }
+  if (normalizedHost !== "codex") return actions;
   const product = [];
   const guidance = new Set();
   for (const action of actions) {

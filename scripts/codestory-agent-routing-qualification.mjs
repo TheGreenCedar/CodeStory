@@ -217,7 +217,7 @@ export function buildRoutingHostCommand({
     if (!/^composer-/iu.test(model)) fail("Cursor qualification requires a Composer model");
     const args = [
       "--print", "--output-format", "stream-json", "--stream-partial-output",
-      "--mode", "ask", "--approve-mcps", "--trust", "--model", model,
+      "--mode", "ask", "--approve-mcps", "--trust", "--force", "--model", model,
       "--plugin-dir", pluginRoot,
       prompt,
     ];
@@ -1043,7 +1043,7 @@ async function main(argv) {
       }
       await preflightRoutingScenario({ cli: authenticated.staged.managedCli, entry, projectRoot, env: sessionEnv });
       let codexHome = null;
-      let installedPluginRoot = null;
+      let installedPluginRoot = host === "cursor" ? authenticated.pluginRoot : null;
       if (host === "codex") {
         codexHome = join(sessionRoot, "codex-home");
         await mkdir(codexHome, { recursive: true, mode: 0o700 });

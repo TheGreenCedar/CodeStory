@@ -59,6 +59,10 @@ for (const path of codexGuidancePaths) {
   mkdirSync(dirname(destination), { recursive: true });
   copyFileSync(join(pluginRoot, path), destination);
 }
+copyFileSync(
+  join(pluginRoot, "generated-mcp-catalog.json"),
+  join(codexPluginRoot, "generated-mcp-catalog.json"),
+);
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -113,6 +117,7 @@ const EXPECTED_IDENTITY = Object.freeze({
       path,
       sha256(readFileSync(join(codexPluginRoot, path))),
     ])),
+    "generated-mcp-catalog.json": sha256(readFileSync(join(codexPluginRoot, "generated-mcp-catalog.json"))),
   }),
 });
 
@@ -797,6 +802,48 @@ function cursorJsonl(run) {
       wrapper = {
         started: { toolSearchToolCall: { args } },
         completed: { toolSearchToolCall: { args, result: { success: { tools: step.tools } } } },
+      };
+    } else if (step.kind === "cursor_tool_discovery") {
+      const args = { server: "plugin-codestory-codestory", toolName: step.tool, toolCallId: id };
+      const catalog = JSON.parse(readFileSync(join(codexPluginRoot, "generated-mcp-catalog.json"), "utf8"));
+      const tool = catalog.tools.find(({ name }) => name === step.tool);
+      wrapper = {
+        started: { getMcpToolsToolCall: { args } },
+        completed: {
+          getMcpToolsToolCall: {
+            result: { success: { content: JSON.stringify({
+              tool: tool.name,
+              description: tool.description,
+              inputSchema: tool.inputSchema,
+            }, null, 2) } },
+          },
+        },
+      };
+    } else if (step.kind === "cursor_guidance_read") {
+      const args = { path: step.path };
+      const bytes = readFileSync(step.path);
+      const text = bytes.toString("utf8");
+      const totalLines = text.match(/[^\n]*\n|[^\n]+$/gu)?.length ?? 0;
+      wrapper = {
+        started: { readToolCall: { args } },
+        completed: {
+          readToolCall: {
+            args,
+            result: {
+              success: {
+                contentBlobId: createHash("sha256").update(bytes).digest("base64"),
+                isEmpty: bytes.length === 0,
+                exceededLimit: false,
+                totalLines,
+                fileSize: bytes.length,
+                path: step.path,
+                readRange: { startLine: 1, endLine: totalLines },
+                relatedCursorRulePaths: [],
+                relatedCursorRules: [],
+              },
+            },
+          },
+        },
       };
     } else {
       const args = { path: step.path };
@@ -1494,10 +1541,15 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
   delete partial[3].tool_call.readToolCall.result;
   assert.throws(() => parseInstalledTranscript("cursor", capturedJsonl(partial)), /completed tool call.*success/u);
 
-  const overlap = clone(CURSOR_CAPTURED_DIRECT_READ);
-  overlap.splice(3, 0, clone(CURSOR_CAPTURED_MCP[2]));
-  overlap[3].session_id = "captured-1";
-  assert.throws(() => parseInstalledTranscript("cursor", capturedJsonl(overlap)), /started before .* completed/u);
+  const overlap = baseRun("named_file_direct_read");
+  overlap.steps.push(clone(baseRun("exact_symbol_search").steps[0]));
+  const overlapEvents = cursorJsonl(overlap).trim().split("\n").map((line) => JSON.parse(line));
+  [overlapEvents[3], overlapEvents[4]] = [overlapEvents[4], overlapEvents[3]];
+  assert.throws(() => validateInstalledSession({
+    host: "cursor", scenarioId: overlap.scenario_id, request: overlap.request,
+    installedRoot, installedReceipt, expectedIdentity: EXPECTED_IDENTITY, installedPluginRoot: codexPluginRoot,
+    transcript: `${overlapEvents.map(JSON.stringify).join("\n")}\n`,
+  }), /overlapping product actions/u);
 
   const terminalMismatch = clone(CURSOR_CAPTURED_DIRECT_READ);
   terminalMismatch.at(-1).result = "different";
@@ -1510,6 +1562,50 @@ test("Cursor official stream-json captured shapes are correlated and terminal", 
   const escapedRead = baseRun("named_file_direct_read");
   escapedRead.steps[0].path = "/workspace/other/named.rs";
   assert.throws(() => validate("cursor", escapedRead), /escapes the declared project root/u);
+});
+
+test("Cursor excludes only authenticated guidance and catalog discovery around product routing", () => {
+  const run = baseRun("exact_symbol_search");
+  run.steps.unshift(
+    { kind: "cursor_guidance_read", path: codexSkillPath },
+    { kind: "cursor_tool_discovery", tool: "search" },
+  );
+  const events = cursorJsonl(run).trim().split("\n").map((line) => JSON.parse(line));
+  [events[3], events[4], events[5]] = [events[4], events[5], events[3]];
+  const observed = validateInstalledSession({
+    host: "cursor",
+    scenarioId: run.scenario_id,
+    request: run.request,
+    installedRoot,
+    installedReceipt,
+    expectedIdentity: EXPECTED_IDENTITY,
+    installedPluginRoot: codexPluginRoot,
+    transcript: `${events.map(JSON.stringify).join("\n")}\n`,
+  });
+  assert.deepEqual(observed.actions, ["search"]);
+
+  const tamperedGuidance = clone(run);
+  tamperedGuidance.steps[0].path = join(codexPluginRoot, "skills/codestory-grounding/references/search.md");
+  const tamperedEvents = cursorJsonl(tamperedGuidance).trim().split("\n").map((line) => JSON.parse(line));
+  tamperedEvents[3].tool_call.readToolCall.result.success.contentBlobId = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  assert.throws(() => validateInstalledSession({
+    host: "cursor", scenarioId: tamperedGuidance.scenario_id, request: tamperedGuidance.request,
+    installedRoot, installedReceipt, expectedIdentity: EXPECTED_IDENTITY, installedPluginRoot: codexPluginRoot,
+    transcript: `${tamperedEvents.map(JSON.stringify).join("\n")}\n`,
+  }), /required action sequence|forbidden tool|escapes the declared project root/u);
+
+  const tamperedCatalog = clone(run);
+  const catalogEvents = cursorJsonl(tamperedCatalog).trim().split("\n").map((line) => JSON.parse(line));
+  const discovery = catalogEvents.find((event) => event.type === "tool_call"
+    && event.subtype === "completed" && event.tool_call.getMcpToolsToolCall);
+  discovery.tool_call.getMcpToolsToolCall.result.success.content = JSON.stringify({
+    tool: "search", description: "substituted", inputSchema: {},
+  });
+  assert.throws(() => validateInstalledSession({
+    host: "cursor", scenarioId: tamperedCatalog.scenario_id, request: tamperedCatalog.request,
+    installedRoot, installedReceipt, expectedIdentity: EXPECTED_IDENTITY, installedPluginRoot: codexPluginRoot,
+    transcript: `${catalogEvents.map(JSON.stringify).join("\n")}\n`,
+  }), /required action sequence|forbidden tool/u);
 });
 
 function mutateBody(run, index, mutate) {
