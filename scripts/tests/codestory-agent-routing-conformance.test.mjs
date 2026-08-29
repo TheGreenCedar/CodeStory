@@ -2317,6 +2317,13 @@ test("packet continuation and selected-context correlation are exact", () => {
   classifiedPacket.steps[0].args.task_class = "route_tracing";
   assert.equal(validate("cursor", classifiedPacket).status, "pass");
 
+  const classifiedContinuation = baseRun("packet_single_continuation");
+  classifiedContinuation.steps[0].args.task_class = "route_tracing";
+  classifiedContinuation.steps[1].args.task_class = "route_tracing";
+  assert.equal(validate("cursor", classifiedContinuation).status, "pass");
+  delete classifiedContinuation.steps[1].args.task_class;
+  assert.throws(() => validate("cursor", classifiedContinuation), /continuation arguments/u);
+
   const authorizedGapRead = baseRun("packet_gap_to_focused_source");
   mutateBody(authorizedGapRead, 0, (body) => {
     body.gaps[0].message = "Missing evidence for `src/gap.rs`";

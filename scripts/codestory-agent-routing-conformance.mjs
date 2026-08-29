@@ -2293,6 +2293,9 @@ function validatePacketContinuation(scenarioContract, actions, results) {
     core_generation_id: first?.publication?.core?.generation_id,
     retrieval_generation: first?.publication?.retrieval?.retrieval_generation,
   };
+  for (const key of ["budget", "task_class", "latency_budget_ms"]) {
+    if (Object.hasOwn(packets[0].args, key)) expected[key] = packets[0].args[key];
+  }
   if (!equalJson(packets[1].args, expected)) fail(`${scenarioContract.id} packet continuation arguments do not match the pinned offer`);
 }
 
