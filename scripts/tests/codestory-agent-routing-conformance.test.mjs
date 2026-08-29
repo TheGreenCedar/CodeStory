@@ -2708,7 +2708,7 @@ test("static parity rejects substituted bytes invalid or no-op hooks metadata dr
 
     cpSync(pluginRoot, root, { recursive: true, force: true });
     writeFileSync(join(root, "rules", "codestory.mdc"), `---
-description: CodeStory local grounding. Use repo evidence before source claims.
+description: Load the canonical CodeStory grounding skill.
 globs:
 alwaysApply: true
 ---
@@ -2720,7 +2720,7 @@ Call the CodeStory tool that matches the task. The codestory-grounding skill own
     const incompleteCursorDelegation = staticIdentityFor(root);
     await assert.rejects(
       validateStaticHostParity(root, incompleteCursorDelegation),
-      /cursor rule does not delegate to the complete canonical grounding contract/u,
+      /cursor rule is not the canonical skill pointer/u,
     );
 
     cpSync(pluginRoot, root, { recursive: true, force: true });

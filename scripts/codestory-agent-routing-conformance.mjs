@@ -3135,12 +3135,12 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
           || command.timeoutSec !== 300) fail(`${host} hook command is not the canonical launcher`);
     }
     if (host === "cursor") {
-      if (!/^---\ndescription: CodeStory local grounding\./u.test(ruleText)
+      if (!/^---\ndescription: Load the canonical CodeStory grounding skill\.\n/u.test(ruleText)
           || !ruleText.includes("alwaysApply: true")
           || !ruleText.includes("[canonical codestory-grounding skill](../skills/codestory-grounding/SKILL.md)")
           || !ruleText.includes("sole source of truth")
           || !ruleText.includes("adds no parallel instructions")) {
-        fail("cursor rule does not delegate to the complete canonical grounding contract");
+        fail("cursor rule is not the canonical skill pointer");
       }
       if (/Routing contract:|Discovery leads come from|prove_call_path|Inspect source after a packet/u.test(ruleText)) {
         fail("cursor rule duplicates the canonical grounding contract");
