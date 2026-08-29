@@ -2313,6 +2313,10 @@ test("packet continuation and selected-context correlation are exact", () => {
   initialProbe.steps[0].args.probes = [{ kind: "exact_path", path: "src/gap.rs" }];
   assert.throws(() => validate("codex", initialProbe), /initial packet arguments/u);
 
+  const classifiedPacket = baseRun("broad_packet");
+  classifiedPacket.steps[0].args.task_class = "route_tracing";
+  assert.equal(validate("cursor", classifiedPacket).status, "pass");
+
   const authorizedGapRead = baseRun("packet_gap_to_focused_source");
   mutateBody(authorizedGapRead, 0, (body) => {
     body.gaps[0].message = "Missing evidence for `src/gap.rs`";

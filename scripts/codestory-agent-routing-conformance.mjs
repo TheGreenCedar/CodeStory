@@ -2268,11 +2268,15 @@ function validatePacketContinuation(scenarioContract, actions, results) {
   const packets = actions.filter((action) => action.kind === "packet");
   if (packets.length > 2) fail(`${scenarioContract.id} allows at most one packet continuation`);
   if (packets.length > 0) {
-    requireExactKeys(
-      packets[0].args,
-      ["project", "question"],
-      `${scenarioContract.id} initial packet arguments`,
-    );
+    const allowedInitialKeys = new Set([
+      "project", "question", "budget", "task_class", "latency_budget_ms",
+    ]);
+    if (!plainObject(packets[0].args)
+        || !nonemptyString(packets[0].args.project)
+        || !nonemptyString(packets[0].args.question)
+        || Object.keys(packets[0].args).some((key) => !allowedInitialKeys.has(key))) {
+      fail(`${scenarioContract.id} initial packet arguments does not match its required schema`);
+    }
     const expectedQuestion = ROUTING_PACKET_QUESTIONS[scenarioContract.id];
     if (expectedQuestion && packets[0].args.question !== expectedQuestion) {
       fail(`${scenarioContract.id} initial packet question does not match the preflighted fixture`);
