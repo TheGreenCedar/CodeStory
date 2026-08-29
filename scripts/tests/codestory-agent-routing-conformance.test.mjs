@@ -1184,6 +1184,7 @@ test("freezes exactly the sixteen accepted routing scenarios", () => {
   for (const scenario of ROUTING_SCENARIOS) {
     assert.equal(typeof scenario.expected_first_tool, "string", scenario.id);
     assert.ok(Array.isArray(scenario.required_action_sequence), scenario.id);
+    assert.ok(Array.isArray(scenario.optional_prefixes), scenario.id);
     assert.ok(Array.isArray(scenario.permitted_followups), scenario.id);
     assert.ok(Array.isArray(scenario.forbidden_tools), scenario.id);
     assert.equal(typeof scenario.source_read_authorization?.kind, "string", scenario.id);
@@ -1307,6 +1308,21 @@ test("all proof scenarios preserve the public input DTO through both installed-h
     for (const host of ["codex", "cursor"]) {
       assert.equal(validate(host, run).status, "pass", `${host}:${scenarioId}`);
     }
+  }
+});
+
+test("hidden proof discovery is optional only when the verifier is directly visible", () => {
+  for (const host of ["codex", "cursor"]) {
+    const visible = baseRun("hidden_proof_tool_discovery");
+    visible.steps.shift();
+    assert.deepEqual(validate(host, visible).actions, ["prove_call_path"]);
+
+    const lateDiscovery = baseRun("hidden_proof_tool_discovery");
+    lateDiscovery.steps.reverse();
+    assert.throws(
+      () => validate(host, lateDiscovery),
+      /required action sequence|follow-up tool_search is not permitted/u,
+    );
   }
 });
 

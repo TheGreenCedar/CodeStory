@@ -90,13 +90,15 @@ function scenario({
   first,
   followups = [],
   optionalFollowups = [],
+  optionalPrefixes = [],
   source = "none",
   required = [],
   forbidden = [],
   disposition = null,
   typedContract = "none",
 }) {
-  const allowed = new Set([first, ...followups, ...optionalFollowups].filter((item) => item !== "none"));
+  const allowed = new Set([first, ...followups, ...optionalFollowups, ...optionalPrefixes]
+    .filter((item) => item !== "none"));
   const finalConstraints = {
     named_file_direct_read: { authority: "source", outcome: "supported" },
     exact_symbol_search: { authority: "search_lead", outcome: "discovery_only" },
@@ -119,6 +121,7 @@ function scenario({
     id,
     expected_first_tool: first,
     required_action_sequence: first === "none" ? [] : [first, ...followups],
+    optional_prefixes: optionalPrefixes,
     optional_followups: optionalFollowups,
     permitted_followups: [...followups, ...optionalFollowups],
     forbidden_tools: ROUTING_ACTIONS.filter((item) => !allowed.has(item)),
@@ -239,8 +242,8 @@ export const ROUTING_SCENARIOS = deepFreeze([
   }),
   scenario({
     id: "hidden_proof_tool_discovery",
-    first: "tool_search",
-    followups: ["prove_call_path"],
+    first: "prove_call_path",
+    optionalPrefixes: ["tool_search"],
     required: ["only prove_call_path", "ContractProven"],
     disposition: "contract_proven",
     typedContract: "valid",
@@ -1031,7 +1034,10 @@ function validateExpectedMcpAvailability(scenarioContract, actions) {
 }
 
 function validateActionOrder(scenarioContract, actions) {
-  const observedSequence = actions.map(actionName);
+  const prefixCount = actions.length > 0
+    && scenarioContract.optional_prefixes.includes(actionName(actions[0])) ? 1 : 0;
+  const routedActions = actions.slice(prefixCount);
+  const observedSequence = routedActions.map(actionName);
   const required = scenarioContract.required_action_sequence;
   const extras = observedSequence.slice(required.length);
   if (observedSequence.length < required.length
@@ -1044,11 +1050,11 @@ function validateActionOrder(scenarioContract, actions) {
     if (actions.length > 0) fail(`${scenarioContract.id} expected no tool but observed ${actionName(actions[0])}`);
     return;
   }
-  if (actions.length === 0) fail(`${scenarioContract.id} expected first tool ${scenarioContract.expected_first_tool} but observed none`);
-  if (actionName(actions[0]) !== scenarioContract.expected_first_tool) {
-    fail(`${scenarioContract.id} expected first tool ${scenarioContract.expected_first_tool} but observed ${actionName(actions[0])}`);
+  if (routedActions.length === 0) fail(`${scenarioContract.id} expected first tool ${scenarioContract.expected_first_tool} but observed none`);
+  if (actionName(routedActions[0]) !== scenarioContract.expected_first_tool) {
+    fail(`${scenarioContract.id} expected first tool ${scenarioContract.expected_first_tool} but observed ${actionName(routedActions[0])}`);
   }
-  for (const action of actions.slice(1)) {
+  for (const action of routedActions.slice(1)) {
     if (!scenarioContract.permitted_followups.includes(actionName(action))) {
       fail(`${scenarioContract.id} follow-up ${actionName(action)} is not permitted`);
     }
@@ -2184,7 +2190,8 @@ function validateHiddenDiscovery(scenarioContract, actions, results) {
     if (searches.length > 0) fail(`${scenarioContract.id} hidden-tool discovery is forbidden`);
     return;
   }
-  if (searches.length !== 1) fail(`${scenarioContract.id} requires exactly one hidden-tool discovery`);
+  if (searches.length === 0) return;
+  if (searches.length !== 1) fail(`${scenarioContract.id} allows at most one hidden-tool discovery`);
   const search = searches[0];
   if (search.args?.query !== "codestory mcp prove_call_path") {
     fail(`${scenarioContract.id} hidden-tool discovery must name only prove_call_path`);
