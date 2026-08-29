@@ -107,7 +107,7 @@ function scenario({
     broad_packet: { authority: "packet_evidence", outcome: "supported" },
     packet_single_continuation: { authority: "packet_evidence", outcome: "supported" },
     packet_gap_to_focused_source: { authority: "packet_evidence", outcome: "unknown" },
-    packet_named_fallback_to_source: { authority: "source", outcome: "supported" },
+    packet_named_fallback_to_source: { authority: "packet_evidence", outcome: "unknown" },
     typed_proof_contract_proven: { authority: "typed_proof", outcome: "supported", proof_disposition: "contract_proven" },
     typed_proof_contract_refuted: { authority: "typed_proof", outcome: "refuted", proof_disposition: "contract_refuted" },
     typed_proof_unknown: { authority: "typed_proof", outcome: "unknown", proof_disposition: "unknown" },
@@ -2461,7 +2461,7 @@ function expectedFinalClaim(scenarioContract, actions, results) {
     expected.evidence_ids = packets.flatMap((action) => (results.get(action).body.evidence ?? []).map(({ identity }) => identity.evidence_id));
   }
   if (reads.length > 0) {
-    expected.authority = "source";
+    if (scenarioContract.id !== "packet_named_fallback_to_source") expected.authority = "source";
     if (scenarioContract.id === "packet_gap_to_focused_source") expected.outcome = "supported";
     expected.evidence_ids.push(...reads.map(({ path }) => `source:${path}`));
   }

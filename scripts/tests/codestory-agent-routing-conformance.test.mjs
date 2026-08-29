@@ -605,7 +605,8 @@ function baseRun(scenarioId) {
         read("src/fallback.rs"),
       ];
       run.final = finalClaim({
-        authority: "source",
+        authority: "packet_evidence",
+        outcome: "unknown",
         evidence_ids: ["evidence-1", "source:src/fallback.rs"],
         gap_ids: ["gap-1"],
       });
@@ -2445,10 +2446,17 @@ test("packet continuation and selected-context correlation are exact", () => {
   assert.equal(validate("cursor", continuedSourceFallback).status, "pass");
 
   const unresolvedNamedSourceFallback = baseRun("packet_named_fallback_to_source");
-  unresolvedNamedSourceFallback.final.outcome = "unknown";
   unresolvedNamedSourceFallback.final.evidence_ids = ["source:src/fallback.rs"];
   unresolvedNamedSourceFallback.final.material_omissions = ["How the routing catalog works remains unresolved."];
   assert.equal(validate("codex", unresolvedNamedSourceFallback).status, "pass");
+
+  const namedSourceFallbackEscalation = baseRun("packet_named_fallback_to_source");
+  namedSourceFallbackEscalation.final.authority = "source";
+  namedSourceFallbackEscalation.final.outcome = "supported";
+  assert.throws(
+    () => validate("codex", namedSourceFallbackEscalation),
+    /final claim authority does not match result-bound evidence/u,
+  );
 
   const missingNamedSourceEvidence = baseRun("packet_named_fallback_to_source");
   missingNamedSourceEvidence.final.evidence_ids = ["evidence-1"];
