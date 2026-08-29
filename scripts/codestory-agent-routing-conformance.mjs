@@ -65,6 +65,8 @@ const IDENTITY_REQUIREMENTS = Object.freeze({
   fields: INSTALLED_IDENTITY_FIELDS,
 });
 
+export const CONTINUATION_PACKET_QUESTION = "Trace the complete routing flow and account for src/unread.rs if the index cannot cover it.";
+
 function deepFreeze(value) {
   if (value && typeof value === "object" && !Object.isFrozen(value)) {
     for (const child of Object.values(value)) deepFreeze(child);
@@ -2088,6 +2090,10 @@ function validatePacketContinuation(scenarioContract, actions, results) {
       ["project", "question"],
       `${scenarioContract.id} initial packet arguments`,
     );
+    if (scenarioContract.id === "packet_single_continuation"
+        && packets[0].args.question !== CONTINUATION_PACKET_QUESTION) {
+      fail(`${scenarioContract.id} initial packet question does not match the preflighted continuation fixture`);
+    }
   }
   if (packets.length < 2) return;
   const first = results.get(packets[0])?.body;

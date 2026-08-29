@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 import test, { after } from "node:test";
 
 import {
+  CONTINUATION_PACKET_QUESTION,
   INSTALLED_IDENTITY_FIELDS,
   ROUTING_REQUEST_CORPUS,
   ROUTING_SCENARIOS,
@@ -553,7 +554,7 @@ function baseRun(scenarioId) {
       break;
     case "packet_single_continuation":
       run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: "How does the flow work?" }, v3Packet({
+        mcp("packet", { project: "/workspace/repo", question: CONTINUATION_PACKET_QUESTION }, v3Packet({
           status: "continuation_available",
           continuation: {
             continuation_id: "continuation-1",
@@ -565,7 +566,7 @@ function baseRun(scenarioId) {
         })),
         mcp("packet", {
           project: "/workspace/repo",
-          question: "How does the flow work?",
+          question: CONTINUATION_PACKET_QUESTION,
           parent_packet_id: "continuation-1",
           option_ids: ["gap-1"],
           core_generation_id: "core-1",

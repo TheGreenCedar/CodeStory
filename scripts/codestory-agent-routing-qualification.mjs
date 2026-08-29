@@ -19,6 +19,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 
 import {
+  CONTINUATION_PACKET_QUESTION,
   MCP_PROTOCOL_REVISIONS,
   ROUTING_SCENARIOS,
   materializeRoutingRequests,
@@ -960,7 +961,7 @@ async function preflightRoutingScenario({ cli, entry, projectRoot, env }) {
   }
   if (["broad_packet", "packet_single_continuation", "packet_gap_to_focused_source", "packet_unavailable_to_source"].includes(entry.scenario_id)) {
     const question = entry.scenario_id === "packet_single_continuation"
-      ? "Trace the complete routing flow and account for `src/unread.rs` if the index cannot cover it."
+      ? CONTINUATION_PACKET_QUESTION
       : entry.request.text;
     const result = await spawnBounded(cli, ["packet", "--project", projectRoot, "--question", question, "--format", "json"], {
       cwd: projectRoot, env, timeoutMs: PROCESS_TIMEOUT_MS,
