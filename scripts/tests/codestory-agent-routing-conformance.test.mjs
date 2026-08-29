@@ -452,7 +452,7 @@ function finalClaim(overrides = {}) {
   return {
     authority: "none",
     outcome: "supported",
-    target_id: null,
+    target_symbol_id: null,
     evidence_ids: [],
     gap_ids: [],
     reason_codes: [],
@@ -496,7 +496,7 @@ function baseRun(scenarioId) {
       run.final = finalClaim({
         authority: "search_lead",
         outcome: "discovery_only",
-        target_id: "rust:crate::start",
+        target_symbol_id: "rust:crate::start",
         evidence_ids: ["lead-1"],
       });
       break;
@@ -522,7 +522,7 @@ function baseRun(scenarioId) {
       ];
       run.final = finalClaim({
         authority: "context_evidence",
-        target_id: "rust:crate::one::Thing",
+        target_symbol_id: "rust:crate::one::Thing",
         evidence_ids: ["context-1"],
         gap_ids: ["selector_ambiguous"],
       });
@@ -538,7 +538,7 @@ function baseRun(scenarioId) {
       }))];
       run.final = finalClaim({
         authority: "context_evidence",
-        target_id: "rust:crate::ExactThing",
+        target_symbol_id: "rust:crate::ExactThing",
         evidence_ids: ["context-1"],
       });
       break;
@@ -1354,7 +1354,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /human-readable validation text.*reason_codes empty.*never derive a code/u);
     assert.match(prompt, /Use refused only when the user requested exact proof without supplying a typed interpretation/u);
     assert.match(prompt, /in that case call no product tool and do not substitute retrieval or source evidence/u);
-    assert.match(prompt, /target_id must be null unless a CodeStory tool result returned a target identity/u);
+    assert.match(prompt, /target_symbol_id must equal the final context result's target\.symbol_id.*otherwise it must be null/u);
     assert.match(prompt, /reason_codes may contain only CodeStory tool result codes or typed_contract_required/u);
     assert.match(prompt, /refutation_basis must be null unless a ContractRefuted result supplied the basis/u);
     assert.match(prompt, /runtime_execution_claim and absence_claim must each be false/u);
