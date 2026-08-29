@@ -50,8 +50,9 @@ it directly. If the plugin MCP is unavailable, use ordinary source inspection
 and report the visibility gap. Do not substitute CLI diagnostics for a live
 plugin result unless the user explicitly asks.
 
-Read linked installed guidance files directly. Do not grep, search, or otherwise
-probe the installed plugin package to locate a documented field.
+Read linked installed guidance files directly. Once a linked path is known, do
+not use `grep`, `rg`, or another search/probe command against the installed
+plugin package to locate a documented field or excerpt.
 
 ## Task Router
 
