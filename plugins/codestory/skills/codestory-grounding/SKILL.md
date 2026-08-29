@@ -32,8 +32,8 @@ ceremony.
 3. If the result says `state=preparing` or `state=updating` and includes
    `retry_after_ms`, wait for that delay and retry the same tool with the same
    arguments. The delay tracks observed preparation progress, so honor the
-   reported value instead of a fixed poll interval. Do not poll status or ask
-   the user to set up CodeStory.
+   reported value instead of a fixed poll interval. Retry directly without a
+   shell wait. Do not poll status or ask the user to set up CodeStory.
 4. Preserve cited anchors in source claims. Read focused source only when the
    user named the exact file or a material result gap identified one exact
    focused path. A search lead is never source-read authorization.

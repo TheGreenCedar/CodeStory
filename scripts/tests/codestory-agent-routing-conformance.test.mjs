@@ -1692,6 +1692,47 @@ test("Cursor excludes only authenticated guidance and catalog discovery around p
   }), /required action sequence|forbidden tool/u);
 });
 
+test("installed hosts collapse only bounded identical preparing retries", () => {
+  const preparingBody = {
+    kind: "preparing",
+    state: "preparing",
+    retry_after_ms: 250,
+    operation: { operation_id: "activation-fixture", stage: "dense_preparation" },
+  };
+  for (const host of ["codex", "cursor"]) {
+    const run = baseRun("exact_symbol_search");
+    const preparing = clone(run.steps[0]);
+    preparing.result = result(preparingBody);
+    run.steps.unshift(preparing);
+    assert.deepEqual(validate(host, run).actions, ["search"]);
+
+    const changed = clone(run);
+    changed.steps[1].args.query = "changed";
+    assert.throws(
+      () => validate(host, changed),
+      /followed directly by the same tool and arguments/u,
+    );
+
+    const failed = baseRun("exact_symbol_search");
+    const failedPreparing = clone(failed.steps[0]);
+    failedPreparing.result = result(preparingBody, { isError: true });
+    failed.steps.unshift(failedPreparing);
+    assert.throws(
+      () => validate(host, failed),
+      /required action sequence|unexpected failed search action/u,
+    );
+
+    const unbounded = baseRun("exact_symbol_search");
+    const repeats = Array.from({ length: 4 }, () => {
+      const step = clone(unbounded.steps[0]);
+      step.result = result(preparingBody);
+      return step;
+    });
+    unbounded.steps.unshift(...repeats);
+    assert.throws(() => validate(host, unbounded), /bounded preparing retry limit/u);
+  }
+});
+
 function mutateBody(run, index, mutate) {
   const body = run.steps[index].result.structuredContent;
   mutate(body);

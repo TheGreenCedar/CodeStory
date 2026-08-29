@@ -1164,6 +1164,39 @@ function validateExpectedMcpAvailability(scenarioContract, actions) {
   }
 }
 
+function collapsePreparingRetries(actions, expectedIdentity, host) {
+  const collapsed = [];
+  let consecutivePreparing = 0;
+  for (let index = 0; index < actions.length; index += 1) {
+    const action = actions[index];
+    if (!["search", "context", "packet"].includes(action.kind)) {
+      consecutivePreparing = 0;
+      collapsed.push(action);
+      continue;
+    }
+    const observed = normalizedResult(action, host);
+    if (action.error || observed.isError || observed.body?.kind !== "preparing") {
+      consecutivePreparing = 0;
+      collapsed.push(action);
+      continue;
+    }
+    const normalized = validateResultIdentity(action, expectedIdentity, host);
+    validateToolInputSchema(action);
+    const outputSchema = GENERATED_TOOL_SCHEMAS.get(action.kind)?.outputSchema;
+    if (!plainObject(outputSchema) || !matchesJsonSchema(normalized.body, outputSchema)) {
+      fail(`${action.tool} preparing result does not match the generated catalog output schema`);
+    }
+    consecutivePreparing += 1;
+    if (consecutivePreparing > 3) fail(`${action.tool} exceeded the bounded preparing retry limit`);
+    const retry = actions[index + 1];
+    if (!retry || retry.kind !== action.kind || retry.tool !== action.tool
+        || !equalJson(retry.args, action.args)) {
+      fail(`${action.tool} preparing result must be followed directly by the same tool and arguments`);
+    }
+  }
+  return collapsed;
+}
+
 function validateActionOrder(scenarioContract, actions) {
   const prefixCount = actions.length > 0
     && scenarioContract.optional_prefixes.includes(actionName(actions[0])) ? 1 : 0;
@@ -2845,7 +2878,8 @@ export function validateInstalledSession({
   if (normalizedHost === "cursor" && parsed.user_text !== request.text) {
     fail(`${scenarioId} Cursor user text does not match the declared request`);
   }
-  const actions = productRoutingActions(host, parsed.actions, installedPluginRoot, expectedIdentity);
+  const productActions = productRoutingActions(host, parsed.actions, installedPluginRoot, expectedIdentity);
+  const actions = collapsePreparingRetries(productActions, expectedIdentity, normalizedHost);
   for (const action of actions) {
     if (action.kind === "source_read") action.path = normalizeSourceReadPath(action.path, request.project_root);
   }

@@ -10,7 +10,7 @@ const SESSION_CONTEXT = [
   '',
   'For repository work, follow the loaded CodeStory rule or codestory-grounding skill and call the tool that matches the task. Resolve the target repository root and pass that exact absolute path as project on every request; the session cwd is only a starting hint.',
   'Strict routing: user-named file-local work -> direct read; discovery -> search only; selected target -> context; broad evidence -> packet; supplied complete typed contract -> prove_call_path. Never substitute symbol, symbols, definition, or installed-plugin probing for discovery.',
-  'Call status only for diagnostics. If a tool reports preparing, retry that same tool after its reported delay; do not ask the user to configure CodeStory.',
+  'Call status only for diagnostics. If a tool reports preparing, retry that same tool directly after its reported delay without a shell wait; do not ask the user to configure CodeStory.',
   'If the intended CodeStory tool is hidden and tool_search is available, search only for that tool by name, then call it directly.',
 ].join('\n');
 
