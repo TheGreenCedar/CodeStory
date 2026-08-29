@@ -66,7 +66,7 @@ const IDENTITY_REQUIREMENTS = Object.freeze({
 });
 
 export const ROUTING_PACKET_QUESTIONS = deepFreeze({
-  broad_packet: "Explain how routing_fixture::start reaches finish across the project. Preserve any evidence gaps.",
+  broad_packet: "Explain how routing_fixture::start reaches finish across the project.",
   packet_single_continuation: "Trace the complete routing flow and account for src/unread.rs if the index cannot cover it.",
   packet_gap_to_focused_source: "Investigate the missing route branch.",
   packet_unavailable_to_source: "Explain the deliberately oversized routing catalog.",

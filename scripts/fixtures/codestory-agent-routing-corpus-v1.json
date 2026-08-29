@@ -23,7 +23,7 @@
     },
     {
       "id": "broad_packet",
-      "prompt": "Use the broad evidence route first with this exact question: Explain how routing_fixture::start reaches finish across the project. Preserve any evidence gaps.",
+      "prompt": "Use the broad evidence route first with this exact question: Explain how routing_fixture::start reaches finish across the project. Preserve every returned evidence gap in the response.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {
