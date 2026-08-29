@@ -298,6 +298,8 @@ test("qualification retains owner-only bounded host bytes before validation", as
 
 test("qualification static roster authenticates every linked routing reference", async () => {
   const source = await readFile(join(repoRoot, "scripts", "codestory-agent-routing-qualification.mjs"), "utf8");
+  assert.match(source, /Your first response may contain exactly one action: read that exact file/u);
+  assert.match(source, /Wait for that read to complete before requesting tool discovery or starting another action/u);
   for (const reference of [
     "generated-mcp-syntax.md", "status-contract.md", "ground.md", "files.md", "affected.md",
     "packet.md", "search.md", "context.md", "symbol.md", "trail.md", "snippet.md",
