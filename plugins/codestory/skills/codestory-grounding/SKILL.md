@@ -92,7 +92,9 @@ probe the installed plugin package to locate a documented field.
   translate prose. Never call it automatically from a packet, search result,
   context result, or guessed natural-language contract. Cite only the
   `receipt_id` values selected by its disposition; a proof `fact_id` or
-  `edge_id` is not an authoritative receipt identity.
+  `edge_id` is not an authoritative receipt identity. When summarizing a
+  refutation basis in a scalar field, copy its `refutation.kind`; do not replace
+  that scalar with the entire refutation object.
 - Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable`
   exactly. `unknown` is not absence, and `unavailable` is not negative proof.
   Exact structural proof does not establish runtime execution, reachability,

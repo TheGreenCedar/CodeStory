@@ -1170,6 +1170,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
     assert.match(prompt, /runtime_execution_claim and absence_claim must each be false/u);
     assert.match(prompt, /material_omissions contains only unresolved material requested by the user/u);
     assert.match(prompt, /typed proof.*receipt_id.*never copy fact_id or edge_id/u);
+    assert.match(prompt, /refutation_basis.*refutation\.kind string.*never the whole refutation object/u);
   }
   const discoveryPrompt = materialized.find(({ scenario_id }) => scenario_id === "exact_symbol_search").request.text;
   assert.match(discoveryPrompt, /discovery candidates only/iu);
