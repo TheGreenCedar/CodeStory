@@ -983,6 +983,21 @@ test("Codex excludes only roster-authenticated installed guidance read before pr
   }];
   assert.deepEqual(validate("codex", countedRead).actions, ["source_read"]);
 
+  const guidanceThenSource = baseRun("named_file_direct_read");
+  guidanceThenSource.steps = [{
+    kind: "shell",
+    command: `/bin/zsh -lc ${JSON.stringify(`sed -n '1,240p' ${codexSkillPath} && sed -n '1,240p' src/named.rs`)}`,
+    output: `${readFileSync(codexSkillPath, "utf8")}source fixture\n`,
+  }];
+  assert.deepEqual(validate("codex", guidanceThenSource).actions, ["source_read"]);
+
+  const tamperedGuidanceThenSource = clone(guidanceThenSource);
+  tamperedGuidanceThenSource.steps[0].output = `tampered\n${tamperedGuidanceThenSource.steps[0].output}`;
+  assert.throws(
+    () => validate("codex", tamperedGuidanceThenSource),
+    /required action sequence|forbidden tool/u,
+  );
+
   const shellConcatenatedRange = baseRun("named_file_direct_read");
   shellConcatenatedRange.steps = [{
     kind: "shell",

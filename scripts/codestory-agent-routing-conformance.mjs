@@ -2389,14 +2389,17 @@ function sedPrefix(text, endLine) {
   return lines.join("");
 }
 
-function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedIdentity) {
+function authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIdentity) {
   if (!["shell", "source_read"].includes(action.kind)
       || !action.completed || action.error || typeof action.result !== "string") {
     return null;
   }
   const command = unwrapCodexShell(action.command);
   if (!command || !installedPluginRoot) return null;
-  const reads = command.split(/(?:[ \t]+&&[ \t]+|[ \t]*;[ \t]*|\r?\n)/u).map((segment) => {
+  const segments = command.split(/(?:[ \t]+&&[ \t]+|[ \t]*;[ \t]*|\r?\n)/u);
+  const trailingSourcePath = segments.length > 1 ? sourceReadPath(segments.at(-1)) : null;
+  if (trailingSourcePath) segments.pop();
+  const reads = segments.map((segment) => {
     const trimmed = segment.trim();
     const sed = trimmed.match(/^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u);
     if (sed) return { kind: "sed", endLine: Number(sed[1] ?? sed[2] ?? sed[3]), words: [sed[4]] };
@@ -2470,17 +2473,28 @@ function authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedId
       remainingOutput = remainingOutput.slice(total[0].length);
     }
   }
-  if (remainingOutput !== "") return null;
-  return [...paths];
+  if (!trailingSourcePath && remainingOutput !== "") return null;
+  return {
+    paths: [...paths],
+    sourcePath: trailingSourcePath,
+    sourceOutput: trailingSourcePath ? remainingOutput : null,
+  };
 }
 
 function productRoutingActions(host, actions, installedPluginRoot, expectedIdentity) {
   if (String(host).toLowerCase() !== "codex") return actions;
   const product = [];
   for (const action of actions) {
-    const authenticatedPaths = authenticatedCodexGuidancePaths(action, installedPluginRoot, expectedIdentity);
-    if (authenticatedPaths) {
+    const authenticatedRead = authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIdentity);
+    if (authenticatedRead) {
       if (product.length > 0) fail("Codex read authenticated installed guidance after the first product action");
+      if (authenticatedRead.sourcePath) {
+        action.kind = "source_read";
+        action.tool = "source_read";
+        action.path = authenticatedRead.sourcePath;
+        action.result = authenticatedRead.sourceOutput;
+        product.push(action);
+      }
     } else {
       product.push(action);
     }
