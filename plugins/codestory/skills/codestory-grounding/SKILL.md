@@ -78,7 +78,8 @@ probe the installed plugin package to locate a documented field.
 - `packet`, `context`, and `search` report evidence availability, not whether a
   claim is true. Cite only the returned evidence rows and state every material
   returned gap. Never turn `available` into authority for a claim the rows do
-  not establish.
+  not establish. When a returned gap leaves requested material unresolved, the
+  final outcome remains unknown even if the result also contains useful evidence.
 - A successful discovery-only `search` is terminal for that turn unless the
   request already supplied one exact selection criterion. That exception may
   map the unique matching non-null `evidence[].symbol_id` into `context.id`;

@@ -33,7 +33,7 @@
     },
     {
       "id": "packet_gap_to_focused_source",
-      "prompt": "Use the broad evidence route first with this exact question: Investigate the missing route branch. Treat src/gap.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. Read it only if the broad project evidence identifies a gap that authorizes that focused read.",
+      "prompt": "Use the broad evidence route first with this exact question: Investigate the missing route branch. Treat src/gap.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. Read it only if the broad project evidence identifies a gap that authorizes that focused read. If no exact path-authorized read succeeds, preserve the missing branch as unknown rather than calling partial evidence supported.",
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": ["src/gap.rs"], "proof_contract": null }
     },
     {

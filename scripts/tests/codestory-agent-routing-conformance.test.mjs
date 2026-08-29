@@ -1855,6 +1855,14 @@ test("packet continuation and selected-context correlation are exact", () => {
   });
   assert.equal(validate("codex", authorizedGapRead).status, "pass");
 
+  const supportedUnresolvedGap = baseRun("packet_gap_to_focused_source");
+  supportedUnresolvedGap.final.outcome = "supported";
+  supportedUnresolvedGap.final.material_omissions = ["The missing route branch remains unresolved."];
+  assert.throws(
+    () => validate("codex", supportedUnresolvedGap),
+    /cannot call unresolved requested material supported/u,
+  );
+
   const continuedSourceFallback = baseRun("packet_single_continuation");
   continuedSourceFallback.steps.push({ kind: "source_read", path: "src/unread.rs" });
   continuedSourceFallback.final = finalClaim({
@@ -1903,6 +1911,7 @@ test("packet continuation and selected-context correlation are exact", () => {
     body.gaps.push(v3Gap("material-gap", "evidence_missing", "A requested route remains unproven."));
   });
   disclosedOmission.final.gap_ids = ["material-gap"];
+  disclosedOmission.final.outcome = "unknown";
   disclosedOmission.final.material_omissions = ["The requested route remains unproven."];
   assert.equal(validate("codex", disclosedOmission).status, "pass");
 
