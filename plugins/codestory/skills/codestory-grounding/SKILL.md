@@ -18,7 +18,9 @@ Call the tool that matches the task. Do not call `status` first.
 
 Using this skill does not require an MCP call when the requested work is fully
 local to an already named evidence surface—for example, inspecting or editing
-the content of `assets/desk.svg`. Inspect that surface directly. Naming a path
+the content of `assets/desk.svg`. Inspect that surface with the host's direct
+file-read action; do not substitute CodeStory `snippet` or another MCP tool.
+Naming a path
 does not make the evidence surface complete when the task asks about ownership,
 dependencies, runtime behavior, architecture, change impact, or another claim
 whose evidence extends beyond the file. For those tasks, select the narrowest
@@ -63,7 +65,7 @@ plugin package to locate a documented field or excerpt.
 | Situation | Route |
 | --- | --- |
 | Repository orientation | `ground`; use `files` for language mix or coverage gaps. |
-| Exact named file, path, or static asset with file-local evidence | Inspect it directly. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
+| Exact named file, path, or static asset with file-local evidence | Use the host's direct file-read action, not CodeStory `snippet` or another MCP tool. When adding it to a packet, use an `exact_path` tagged probe; do not run broad grounding merely to rediscover the path. If the task asks about relationships, ownership, or impact, use the corresponding narrow tool. |
 | Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. After a successful search, stop for that turn unless the current request already supplied an exact selection criterion such as one project-relative path and asked for focused evidence after disambiguation. In that case only, choose the unique typed evidence row with a non-null `symbol_id` that matches the exact path, then call `context` with that `symbol_id` as `id`. Do not inspect source merely to upgrade a discovery result. Missing excerpts, unavailable diagnostics, and multiple leads do not authorize source inspection. |
 | Get evidence for one selected target | Use `context` with that exact selected target. A user-supplied name is `query`; `id` is only an opaque `symbol_id` copied unchanged from a CodeStory result. Never guess an ID, broaden the target, or treat evidence availability as proof. |
 | Follow a call path for navigation | `callers`, `callees`, `trace`, or `trail` can navigate the ordinary graph. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node; none of these tools returns an exact proof disposition. |

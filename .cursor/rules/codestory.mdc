@@ -21,7 +21,7 @@ This repository-managed setup provides the rule and MCP adapter only. Install th
 
 Routing contract:
 
-- Read an exact user-named file directly when the question is file-local.
+- Read an exact user-named file with the host's direct file-read action when the question is file-local; do not substitute CodeStory `snippet` or another MCP tool.
 - Discovery leads come from `search`; they identify candidates and do not prove a claim. After a successful search, stop for that turn unless the request already supplied one exact selection criterion. That exception may copy the unique matching non-null `evidence[].symbol_id` into `context.id`; it never authorizes source inspection. Missing excerpts or unavailable diagnostics do not authorize source inspection.
 - Pass an explicitly supplied symbol name to `search.query` unchanged; do not add descriptive words or rewrite the selector.
 - For one selected target, use `context` for evidence around that target only. A user-supplied name is `query`; `id` is only a `symbol_id` copied from CodeStory.

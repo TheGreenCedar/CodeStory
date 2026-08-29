@@ -2,6 +2,9 @@
 
 Resolves a symbol and returns its source code with surrounding context lines. Useful for reading the actual implementation without opening the full file.
 
+This is not a substitute for the host's direct file-read action when the user
+named one exact file and the requested evidence is file-local.
+
 Markdown output uses ANSI syntax highlighting when stdout is an interactive terminal. Output files, pipes, and JSON output stay uncolored for automation.
 
 ## Syntax
