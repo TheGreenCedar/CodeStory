@@ -562,7 +562,7 @@ function singleFileReadPath(command) {
   const text = unwrapCodexShell(command);
   if (!text) return null;
   const countedRead = text.match(
-    /^wc\s+-l\s+(\S+)\s+&&\s+sed\s+-n\s+(?:'\d+,\d+p'|"\d+,\d+p"|\d+,\d+p)\s+(\S+)$/u,
+    /^(?:(?:\/usr)?\/bin\/)?wc\s+-l\s+(\S+)\s+&&\s+(?:(?:\/usr)?\/bin\/)?sed\s+-n\s+(?:'\d+,\d+p'|"\d+,\d+p"|\d+,\d+p)\s+(\S+)$/u,
   );
   if (countedRead) {
     const countedPath = singleShellWord(countedRead[1]);
@@ -570,8 +570,8 @@ function singleFileReadPath(command) {
     return countedPath && countedPath === readPath ? readPath : null;
   }
   const patterns = [
-    /^sed\s+-n\s+(?:'\d+,(?:\d+|\$)p'|"\d+,\d+p"|\d+,\d+p)\s+(.+)$/u,
-    /^(?:cat|type|nl)(?:\s+(?:--|-[A-Za-z]+))*\s+(.+)$/u,
+    /^(?:(?:\/usr)?\/bin\/)?sed\s+-n\s+(?:'\d+,(?:\d+|\$)p'|"\d+,\d+p"|\d+,\d+p)\s+(.+)$/u,
+    /^(?:(?:(?:\/usr)?\/bin\/)?(?:cat|nl)|type)(?:\s+(?:--|-[A-Za-z]+))*\s+(.+)$/u,
     /^Get-Content(?:\s+-(?:LiteralPath|Path))?\s+(.+)$/iu,
   ];
   for (const pattern of patterns) {
@@ -2614,9 +2614,9 @@ function authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIde
   if (trailingSourcePath) segments.pop();
   const reads = segments.map((segment) => {
     const trimmed = segment.trim();
-    const sed = trimmed.match(/^sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u);
+    const sed = trimmed.match(/^(?:(?:\/usr)?\/bin\/)?sed\s+-n\s+(?:'1,(\d+)p'|"1,(\d+)p"|1,(\d+)p)\s+(\S+)$/u);
     if (sed) return { kind: "sed", endLine: Number(sed[1] ?? sed[2] ?? sed[3]), words: [sed[4]] };
-    const cat = trimmed.match(/^cat\s+(.+)$/u);
+    const cat = trimmed.match(/^(?:(?:\/usr)?\/bin\/)?cat\s+(.+)$/u);
     if (cat) {
       const words = [];
       let rest = cat[1].trim();
@@ -2628,7 +2628,7 @@ function authenticatedCodexGuidanceRead(action, installedPluginRoot, expectedIde
       }
       return words.length > 0 ? { kind: "cat", words } : null;
     }
-    const wc = trimmed.match(/^wc\s+-l\s+(.+)$/u);
+    const wc = trimmed.match(/^(?:(?:\/usr)?\/bin\/)?wc\s+-l\s+(.+)$/u);
     if (!wc) return null;
     const words = [];
     let rest = wc[1].trim();
