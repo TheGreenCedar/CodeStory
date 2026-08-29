@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmod, cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { dirname } from "node:path";
@@ -389,7 +389,7 @@ test("source candidate authentication rejects the full input-identity mismatch c
   }
 });
 
-test("routing state preflight fails closed for missing continuation disposition and budget fallback", () => {
+test("routing state preflight fails closed for missing continuation fallback and proof disposition", () => {
   assert.equal(validateRoutingPreflight("packet_single_continuation", {
     kind: "complete", status: "continuation_available",
     continuation: { continuation_id: "next", gap_ids: [{ gap_id: "gap" }] },
@@ -397,12 +397,13 @@ test("routing state preflight fails closed for missing continuation disposition 
   assert.throws(() => validateRoutingPreflight("packet_single_continuation", {
     kind: "complete", status: "available", continuation: null,
   }), /real continuation/u);
-  assert.equal(validateRoutingPreflight("packet_unavailable_to_source", {
-    kind: "budget_exceeded", status: "unavailable", gaps: [{ kind: "output_budget_exceeded" }],
+  assert.equal(validateRoutingPreflight("packet_named_fallback_to_source", {
+    kind: "complete", status: "available", evidence: [], gaps: [{ kind: "evidence_missing" }],
   }), true);
-  assert.throws(() => validateRoutingPreflight("packet_unavailable_to_source", {
-    kind: "complete", status: "unavailable", gaps: [{ kind: "retrieval_unavailable" }],
-  }), /16 KiB output budget fallback/u);
+  assert.throws(() => validateRoutingPreflight("packet_named_fallback_to_source", {
+    kind: "complete", status: "available",
+    evidence: [{ path: "src/fallback.rs" }], gaps: [{ kind: "evidence_missing" }],
+  }), /exact fallback unresolved/u);
   assert.equal(validateRoutingPreflight("typed_proof_contract_proven", {
     kind: "complete", disposition: { kind: "contract_proven" },
   }), true);
@@ -417,14 +418,7 @@ test("routing fixture materialization expands deterministic state per isolated s
     const ordinary = await materializeRoutingFixture(
       join(repoRoot, "scripts", "fixtures", "codestory-agent-routing-project"), join(root, "ordinary"),
     );
-    const oversized = await materializeRoutingFixture(
-      join(repoRoot, "scripts", "fixtures", "codestory-agent-routing-project"), join(root, "oversized"), { oversized: true },
-    );
     assert.match(await readFile(join(ordinary, "src", "catalog.rs"), "utf8"), /documented_route_0095/u);
-    const oversizedFiles = (await readdir(join(oversized, "src"), { recursive: true }))
-      .filter((path) => path.includes("oversized_routing_catalog_evidence_"));
-    assert.equal(oversizedFiles.length, 32);
-    assert.equal(Math.max(...oversizedFiles.map((path) => Buffer.byteLength(path))) > 800, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

@@ -69,7 +69,7 @@ export const ROUTING_PACKET_QUESTIONS = deepFreeze({
   broad_packet: "Explain how routing_fixture::start reaches finish across the project.",
   packet_single_continuation: "Trace the complete routing flow and account for src/unread.rs if the index cannot cover it.",
   packet_gap_to_focused_source: "Investigate the missing route branch.",
-  packet_unavailable_to_source: "Explain the deliberately oversized routing catalog.",
+  packet_named_fallback_to_source: "Explain how the routing catalog works.",
 });
 
 function deepFreeze(value) {
@@ -100,7 +100,7 @@ function scenario({
     broad_packet: { authority: "packet_evidence", outcome: "supported" },
     packet_single_continuation: { authority: "packet_evidence", outcome: "supported" },
     packet_gap_to_focused_source: { authority: "packet_evidence", outcome: "unknown" },
-    packet_unavailable_to_source: { authority: "source", outcome: "unavailable" },
+    packet_named_fallback_to_source: { authority: "source", outcome: "supported" },
     typed_proof_contract_proven: { authority: "typed_proof", outcome: "supported", proof_disposition: "contract_proven" },
     typed_proof_contract_refuted: { authority: "typed_proof", outcome: "refuted", proof_disposition: "contract_refuted" },
     typed_proof_unknown: { authority: "typed_proof", outcome: "unknown", proof_disposition: "unknown" },
@@ -176,11 +176,11 @@ export const ROUTING_SCENARIOS = deepFreeze([
     forbidden: NO_PROOF_CLAIMS,
   }),
   scenario({
-    id: "packet_unavailable_to_source",
+    id: "packet_named_fallback_to_source",
     first: "packet",
     followups: ["source_read"],
     source: "user_named_file",
-    required: ["output_budget_exceeded", "source"],
+    required: ["packet", "source"],
     forbidden: NO_PROOF_CLAIMS,
   }),
   scenario({

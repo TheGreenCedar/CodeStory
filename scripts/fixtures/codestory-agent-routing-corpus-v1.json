@@ -37,8 +37,8 @@
       "request": { "named_files": [], "selected_target": null, "gap_source_paths": ["src/gap.rs"], "proof_contract": null }
     },
     {
-      "id": "packet_unavailable_to_source",
-      "prompt": "Use the broad evidence route first with this exact question: Explain the deliberately oversized routing catalog. Treat src/fallback.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. If the complete evidence response is unavailable because of its output budget, read that file and preserve the reason.",
+      "id": "packet_named_fallback_to_source",
+      "prompt": "Use the broad evidence route first with this exact question: Explain how the routing catalog works. Treat src/fallback.rs as fallback-only: on the initial broad request, do not add probes or continuation pins. If the completed broad result does not establish that exact file, read it once and preserve every returned gap.",
       "request": { "named_files": ["src/fallback.rs"], "selected_target": null, "gap_source_paths": [], "proof_contract": null }
     },
     {

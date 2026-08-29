@@ -137,7 +137,7 @@ const SCENARIO_IDS = [
   "broad_packet",
   "packet_single_continuation",
   "packet_gap_to_focused_source",
-  "packet_unavailable_to_source",
+  "packet_named_fallback_to_source",
   "typed_proof_contract_proven",
   "typed_proof_contract_refuted",
   "typed_proof_unknown",
@@ -329,21 +329,6 @@ function v3Packet({
     gaps,
     continuation,
     diagnostics: { availability: "unavailable" },
-  };
-}
-
-function v3PacketBudgetExceeded() {
-  return {
-    kind: "budget_exceeded",
-    schema_version: 3,
-    identity: v3Identity("packet-budget"),
-    publication: v3Publication(),
-    status: "unavailable",
-    retrieval: { state: "full", generation_id: "retrieval-1" },
-    diagnostics: { availability: "unavailable" },
-    gaps: [v3Gap("output-budget", "output_budget_exceeded")],
-    maximum_bytes: 16_384,
-    required_complete_bytes: 16_385,
   };
 }
 
@@ -596,18 +581,22 @@ function baseRun(scenarioId) {
         gap_ids: ["gap-1"],
       });
       break;
-    case "packet_unavailable_to_source":
+    case "packet_named_fallback_to_source":
       run.request.named_files = ["src/fallback.rs"];
       run.steps = [
-        mcp("packet", { project: "/workspace/repo", question: ROUTING_PACKET_QUESTIONS.packet_unavailable_to_source }, v3PacketBudgetExceeded()),
+        mcp("packet", {
+          project: "/workspace/repo",
+          question: ROUTING_PACKET_QUESTIONS.packet_named_fallback_to_source,
+        }, v3Packet({
+          evidence: [v3PacketEvidence("evidence-1", "src/catalog.rs")],
+          gaps: [v3Gap("gap-1", "evidence_missing", "The named fallback remains unresolved.")],
+        })),
         read("src/fallback.rs"),
       ];
       run.final = finalClaim({
         authority: "source",
-        outcome: "unavailable",
         evidence_ids: ["source:src/fallback.rs"],
-        gap_ids: ["output-budget"],
-        reason_codes: ["output_budget_exceeded"],
+        gap_ids: ["gap-1"],
       });
       break;
     case "typed_proof_contract_proven":
@@ -1132,7 +1121,7 @@ test("installed-host prompts close the final claim vocabulary and direct-read id
   for (const scenarioId of [
     "packet_single_continuation",
     "packet_gap_to_focused_source",
-    "packet_unavailable_to_source",
+    "packet_named_fallback_to_source",
   ]) {
     const prompt = materialized.find(({ scenario_id }) => scenario_id === scenarioId).request.text;
     assert.match(prompt, /fallback-only.*initial broad request.*do not add probes or continuation pins/isu, scenarioId);
@@ -1144,7 +1133,7 @@ test("terminal routing scenarios reject every unauthorized source upgrade", () =
     "named_file_direct_read",
     "packet_single_continuation",
     "packet_gap_to_focused_source",
-    "packet_unavailable_to_source",
+    "packet_named_fallback_to_source",
   ]);
   for (const scenarioId of SCENARIO_IDS.filter((id) => !authorized.has(id))) {
     const run = baseRun(scenarioId);
@@ -1361,8 +1350,8 @@ const MUTATIONS = [
     error: /source read is not correlated with the packet evidence gap/u,
   },
   {
-    name: "output budget packet does not authorize an unnamed source read",
-    scenario: "packet_unavailable_to_source",
+    name: "named packet fallback does not authorize an unnamed source read",
+    scenario: "packet_named_fallback_to_source",
     mutate(run) {
       run.request.named_files = [];
     },

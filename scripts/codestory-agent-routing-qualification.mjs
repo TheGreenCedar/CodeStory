@@ -835,7 +835,7 @@ async function installCodexQualificationPlugin({ executable, codexHome, pluginRo
   return { ...installed, installedPath };
 }
 
-export async function materializeRoutingFixture(sourceRoot, destination, { oversized = false } = {}) {
+export async function materializeRoutingFixture(sourceRoot, destination) {
   await rm(destination, { recursive: true, force: true });
   await cp(sourceRoot, destination, { recursive: true, errorOnExist: true });
   const catalog = [];
@@ -846,22 +846,6 @@ export async function materializeRoutingFixture(sourceRoot, destination, { overs
     catalog.push(`pub fn documented_route_${suffix}() -> usize { ${index} }`);
   }
   await writeFile(join(destination, "src", "catalog.rs"), `${catalog.join("\n")}\n`, "utf8");
-  if (oversized) {
-    const longDirectory = join(
-      destination,
-      "src",
-      ...["alpha", "beta", "gamma", "delta"].map((prefix) => `${prefix}_${"x".repeat(188)}`),
-    );
-    await mkdir(longDirectory, { recursive: true, mode: 0o700 });
-    for (let index = 0; index < 32; index += 1) {
-      const suffix = String(index).padStart(4, "0");
-      await writeFile(
-        join(longDirectory, `oversized_routing_catalog_evidence_${suffix}.rs`),
-        `/// Deliberately oversized routing catalog evidence ${suffix}.\npub fn oversized_routing_catalog_evidence_${suffix}() -> usize { ${index} }\n`,
-        "utf8",
-      );
-    }
-  }
   const libPath = join(destination, "src", "lib.rs");
   const lib = await readFile(libPath, "utf8");
   if (!lib.includes("pub mod catalog;")) await writeFile(libPath, `pub mod catalog;\n${lib}`, "utf8");
@@ -895,18 +879,14 @@ export function validateRoutingPreflight(scenarioId, body, { exitCode = 0 } = {}
     }
     return true;
   }
-  if (scenarioId === "packet_unavailable_to_source") {
-    const reasons = body?.gaps?.map((gap) => gap?.kind) ?? [];
-    if (exitCode !== 0 || body?.kind !== "budget_exceeded" || body?.status !== "unavailable"
-        || !reasons.includes("output_budget_exceeded")) {
-      fail("packet unavailable preflight did not materialize the 16 KiB output budget fallback");
-    }
-    return true;
-  }
-  if (["broad_packet", "packet_gap_to_focused_source"].includes(scenarioId)) {
+  if (["broad_packet", "packet_gap_to_focused_source", "packet_named_fallback_to_source"].includes(scenarioId)) {
     if (exitCode !== 0 || body?.kind !== "complete") fail(`${scenarioId} preflight did not materialize a complete packet`);
     if (scenarioId === "packet_gap_to_focused_source" && !body.gaps?.length) {
       fail("packet gap preflight did not materialize an evidence gap");
+    }
+    if (scenarioId === "packet_named_fallback_to_source"
+        && (!body.gaps?.length || body.evidence?.some((entry) => entry?.path === "src/fallback.rs"))) {
+      fail("named packet fallback preflight did not leave the exact fallback unresolved");
     }
   }
   return true;
@@ -959,7 +939,7 @@ async function preflightRoutingScenario({ cli, entry, projectRoot, env }) {
     validateRoutingPreflight(entry.scenario_id, body, { exitCode: result.code });
     return;
   }
-  if (["broad_packet", "packet_single_continuation", "packet_gap_to_focused_source", "packet_unavailable_to_source"].includes(entry.scenario_id)) {
+  if (["broad_packet", "packet_single_continuation", "packet_gap_to_focused_source", "packet_named_fallback_to_source"].includes(entry.scenario_id)) {
     const question = ROUTING_PACKET_QUESTIONS[entry.scenario_id];
     const result = await spawnBounded(cli, ["packet", "--project", projectRoot, "--question", question, "--format", "json"], {
       cwd: projectRoot, env, timeoutMs: PROCESS_TIMEOUT_MS,
@@ -1036,7 +1016,7 @@ async function main(argv) {
       const sessionRoot = join(resolve(options.out), "sessions", host, id);
       await mkdir(sessionRoot, { recursive: true, mode: 0o700 });
       const projectRoot = await materializeRoutingFixture(
-        fixtureSource, join(sessionRoot, "project"), { oversized: id === "packet_unavailable_to_source" },
+        fixtureSource, join(sessionRoot, "project"),
       );
       const entry = materializeRoutingRequests(projectRoot).find((candidate) => candidate.scenario_id === id);
       const sessionEnv = {
@@ -1050,7 +1030,7 @@ async function main(argv) {
       const includeRetrieval = [
         "exact_symbol_search", "ambiguous_symbol_then_context", "selected_target_context",
         "broad_packet", "packet_single_continuation", "packet_gap_to_focused_source",
-        "packet_unavailable_to_source",
+        "packet_named_fallback_to_source",
       ].includes(id);
       await prepareRoutingFixture({
         cli: authenticated.staged.managedCli, projectRoot, env: sessionEnv, includeRetrieval,
