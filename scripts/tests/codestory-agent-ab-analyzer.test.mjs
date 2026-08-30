@@ -575,6 +575,30 @@ test("exact-candidate mode closes every option that can change freshness oracle 
   assert.equal(permitted.materializeRepos, true);
   assert.equal(permitted.diagnosticExtraProbesFromManifest, false);
   assert.equal(permitted.resumePrefixFrom, "/tmp/exact-prefix");
+
+  const comparatorReuse = benchmarkHarness.parseArgs(exactArgs([
+    "--reuse-comparators-from", "/tmp/exact-comparators",
+    "--reuse-comparators-ledger-sha256", "b".repeat(64),
+    "--reuse-comparators-artifacts-sha256", "c".repeat(64),
+  ]));
+  assert.equal(comparatorReuse.reuseComparatorsFrom, "/tmp/exact-comparators");
+  assert.equal(comparatorReuse.reuseComparatorsLedgerSha256, "b".repeat(64));
+  assert.equal(comparatorReuse.reuseComparatorsArtifactsSha256, "c".repeat(64));
+  assert.throws(
+    () => benchmarkHarness.parseArgs(exactArgs([
+      "--reuse-comparators-from", "/tmp/exact-comparators",
+    ])),
+    /requires --reuse-comparators-from.*ledger.*artifacts/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.parseArgs(exactArgs([
+      "--resume-prefix-from", "/tmp/exact-prefix",
+      "--reuse-comparators-from", "/tmp/exact-comparators",
+      "--reuse-comparators-ledger-sha256", "b".repeat(64),
+      "--reuse-comparators-artifacts-sha256", "c".repeat(64),
+    ])),
+    /mutually exclusive/i,
+  );
 });
 
 test("exact-candidate planning balances deterministic arm position across 162 fresh rows", () => {
@@ -698,6 +722,179 @@ test("exact-candidate resume accepts only an authenticated whole-task contiguous
     ),
     /candidate CLI or public contract identity changed/i,
   );
+});
+
+test("exact comparator reuse accepts only complete ordered comparator triplets and never candidates", () => {
+  const tasks = [
+    { id: "task-1", repo: "repo-1" },
+    { id: "task-2", repo: "repo-2" },
+  ];
+  const candidate = {
+    contract: "codestory.agent-benchmark-source-cli/v1",
+    arm: "candidate_0_18",
+    package_version: "0.17.5",
+    cli_sha256: "1".repeat(64),
+    source_commit: "2".repeat(40),
+    source_tree: "3".repeat(40),
+    schema_version: 3,
+    protocol_revision: "2025-11-25",
+    discovery_contract_sha256: "4".repeat(64),
+    plugin_manifest_sha256: "5".repeat(64),
+    catalog_sha256: "6".repeat(64),
+    cli_path: "/new/candidate",
+  };
+  const published = {
+    contract: "codestory.agent-benchmark-package/v2",
+    arm: "published_0_17_4",
+    package_version: "0.17.4",
+    package_sha256: "7".repeat(64),
+    cli_sha256: "8".repeat(64),
+    source_commit: "9".repeat(40),
+    source_tree: "a".repeat(40),
+    schema_version: 2,
+    protocol_revision: "2024-11-05",
+    discovery_contract_sha256: null,
+    trust_root: { kind: "official_published_checksum", sha256: "b".repeat(64) },
+    cli_path: "/new/published",
+  };
+  const opts = {
+    exactCandidate: true,
+    arms: EXACT_CANDIDATE_ARMS,
+    repeats: 3,
+    repos: null,
+    runner: "codex",
+    model: "gpt-5.6-sol",
+    sandbox: "workspace-write",
+    taskSuite: "language-expansion-holdout",
+    exactCandidatePackageByArm: new Map([
+      ["candidate_0_18", candidate],
+      ["published_0_17_4", published],
+    ]),
+  };
+  const planned = benchmarkHarness.planAgentRuns(opts, tasks);
+  const publishedIdentity = {
+    contract: published.contract,
+    arm: published.arm,
+    package_version: published.package_version,
+    package_sha256: published.package_sha256,
+    cli_sha256: published.cli_sha256,
+    source_commit: published.source_commit,
+    source_tree: published.source_tree,
+    schema_version: published.schema_version,
+    protocol_revision: published.protocol_revision,
+    discovery_contract_sha256: null,
+    trust_root_kind: published.trust_root.kind,
+    trust_root_sha256: published.trust_root.sha256,
+  };
+  const rows = planned.slice(0, 9).map((run) => ({
+    repo: run.repo,
+    task_id: run.task.id,
+    arm: run.arm,
+    repeat: run.repeat,
+    status: "pass",
+    task_manifest_snapshot: benchmarkHarness.taskSnapshotForResult(run.task),
+    benchmark_contract: benchmarkHarness.benchmarkContractForRun(opts, run),
+    package_identity: run.arm === "published_0_17_4" ? publishedIdentity : null,
+    source_cli_identity: run.arm === "candidate_0_18"
+      ? { ...candidate, cli_sha256: "c".repeat(64), source_commit: "d".repeat(40) }
+      : null,
+  }));
+
+  const accepted = benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+    rows,
+    planned,
+    opts,
+  );
+  assert.equal(accepted.completedTaskCount, 1);
+  assert.equal(accepted.comparatorRows.length, 6);
+  assert.equal(accepted.comparatorRows.some((row) => row.arm === "candidate_0_18"), false);
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+      rows.filter((row) => !(row.arm === "published_0_17_4" && row.repeat === 3)),
+      planned,
+      opts,
+    ),
+    /complete task boundary|comparator triplets/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+      [rows[1], rows[0], ...rows.slice(2)],
+      planned,
+      opts,
+    ),
+    /planned contiguous prefix/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+      rows.map((row) => row.arm === "published_0_17_4"
+        ? { ...row, package_identity: { ...row.package_identity, cli_sha256: "e".repeat(64) } }
+        : row),
+      planned,
+      opts,
+    ),
+    /published package identity/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+      rows.map((row) => row.arm === "without_codestory"
+        ? { ...row, benchmark_contract: { ...row.benchmark_contract, model: "drifted" } }
+        : row),
+      planned,
+      opts,
+    ),
+    /benchmark contract/i,
+  );
+});
+
+test("exact comparator reuse binds both ledger and referenced artifact bytes", async () => {
+  const runDir = await mkdtemp(path.join(os.tmpdir(), "codestory-comparator-source-"));
+  const outDir = await mkdtemp(path.join(os.tmpdir(), "codestory-comparator-copy-"));
+  try {
+    const ledgerBytes = Buffer.from('{"row":1}\n', "utf8");
+    await writeFile(path.join(runDir, "runs.jsonl"), ledgerBytes);
+    await writeFile(path.join(runDir, "row.stdout.jsonl"), '{"type":"done"}\n');
+    await writeFile(path.join(runDir, "row.stderr.txt"), "");
+    const artifactPaths = ["row.stdout.jsonl", "row.stderr.txt"];
+    const artifactSha = await benchmarkHarness.exactComparatorArtifactBundleSha256(
+      runDir,
+      artifactPaths,
+    );
+    const ledgerSha = createHash("sha256").update(ledgerBytes).digest("hex");
+    await benchmarkHarness.copyAuthenticatedComparatorArtifacts(
+      runDir,
+      outDir,
+      artifactPaths,
+      artifactSha,
+    );
+    assert.equal(
+      await readFile(path.join(outDir, "row.stdout.jsonl"), "utf8"),
+      '{"type":"done"}\n',
+    );
+    assert.doesNotThrow(() =>
+      benchmarkHarness.validateExactComparatorLedgerSha256(ledgerBytes, ledgerSha)
+    );
+
+    await writeFile(path.join(runDir, "row.stdout.jsonl"), '{"type":"tampered"}\n');
+    await assert.rejects(
+      benchmarkHarness.copyAuthenticatedComparatorArtifacts(
+        runDir,
+        outDir,
+        artifactPaths,
+        artifactSha,
+      ),
+      /artifact bundle digest/i,
+    );
+    assert.throws(
+      () => benchmarkHarness.validateExactComparatorLedgerSha256(
+        Buffer.from('{"row":2}\n', "utf8"),
+        ledgerSha,
+      ),
+      /ledger digest/i,
+    );
+  } finally {
+    await rm(runDir, { recursive: true, force: true });
+    await rm(outDir, { recursive: true, force: true });
+  }
 });
 
 async function makeExactArchive(root, name, {

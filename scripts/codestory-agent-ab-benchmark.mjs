@@ -118,6 +118,9 @@ const PINNED_CODEX_RUNNER_CONFIG = [
 ];
 const REUSABLE_BASELINE_ARTIFACT_NAME_PATTERN =
   /(?:\.stdout\.jsonl|\.stderr\.txt|\.baseline-context\.json|\.baseline-context\.stderr\.txt)$/;
+const EXACT_COMPARATOR_ARTIFACT_NAME_PATTERN =
+  /(?:\.stdout\.jsonl|\.stderr\.txt|\.baseline-context\.json|\.baseline-context\.stderr\.txt|\.codestory-packet(?:-drill)?\.stdout\.json|\.codestory-packet(?:-drill)?\.stderr\.txt)$/;
+const MAX_EXACT_COMPARATOR_LEDGER_BYTES = 64 * 1024 * 1024;
 const PACKET_TASK_CLASSES = new Set([
   "architecture_explanation",
   "bug_localization",
@@ -278,6 +281,12 @@ Options:
                   Reuse matching without-CodeStory rows from an earlier run directory when the task snapshot is unchanged.
   --resume-prefix-from
                   Exact-candidate only: authenticate and reanalyze one complete-task prefix, then run only the remaining tasks.
+  --reuse-comparators-from
+                  Exact-candidate only: reuse authenticated no-CodeStory and published-0.17.4 triplets while rerunning every candidate row.
+  --reuse-comparators-ledger-sha256
+                  External SHA-256 binding for the comparator source runs.jsonl.
+  --reuse-comparators-artifacts-sha256
+                  External SHA-256 binding for the comparator source artifact bundle.
   --exact-candidate
                   Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.4, and the frozen 0.18 candidate.
   --published-archive
@@ -362,6 +371,9 @@ function parseArgs(argv) {
       jobs: { type: "string" },
       "reuse-baseline-from": { type: "string" },
       "resume-prefix-from": { type: "string" },
+      "reuse-comparators-from": { type: "string" },
+      "reuse-comparators-ledger-sha256": { type: "string" },
+      "reuse-comparators-artifacts-sha256": { type: "string" },
       "exact-candidate": { type: "boolean" },
       "published-archive": { type: "string" },
       "published-checksum-manifest": { type: "string" },
@@ -407,6 +419,9 @@ function parseArgs(argv) {
     jobs: 1,
     reuseBaselineFrom: null,
     resumePrefixFrom: null,
+    reuseComparatorsFrom: null,
+    reuseComparatorsLedgerSha256: null,
+    reuseComparatorsArtifactsSha256: null,
     exactCandidate: false,
     publishedArchive: null,
     publishedChecksumManifest: null,
@@ -473,6 +488,9 @@ function parseArgs(argv) {
   opts.jobs = values.jobs == null ? opts.jobs : Number.parseInt(values.jobs, 10);
   opts.reuseBaselineFrom = values["reuse-baseline-from"] ?? null;
   opts.resumePrefixFrom = values["resume-prefix-from"] ?? null;
+  opts.reuseComparatorsFrom = values["reuse-comparators-from"] ?? null;
+  opts.reuseComparatorsLedgerSha256 = values["reuse-comparators-ledger-sha256"] ?? null;
+  opts.reuseComparatorsArtifactsSha256 = values["reuse-comparators-artifacts-sha256"] ?? null;
   opts.exactCandidate = values["exact-candidate"] === true;
   opts.publishedArchive = values["published-archive"] ?? null;
   opts.publishedChecksumManifest = values["published-checksum-manifest"] ?? null;
@@ -516,6 +534,9 @@ function parseArgs(argv) {
       "published-checksum-sha256",
       "candidate-source-root",
       "resume-prefix-from",
+      "reuse-comparators-from",
+      "reuse-comparators-ledger-sha256",
+      "reuse-comparators-artifacts-sha256",
     ]);
     const forbiddenOptions = [...providedOptions].filter((name) => !exactOptionAllowlist.has(name));
     if (forbiddenOptions.length) {
@@ -641,6 +662,33 @@ function parseArgs(argv) {
       throw new Error("--resume-prefix-from is available only in exact-candidate mode");
     }
     opts.resumePrefixFrom = path.resolve(opts.resumePrefixFrom);
+  }
+  const comparatorReuseInputs = [
+    opts.reuseComparatorsFrom,
+    opts.reuseComparatorsLedgerSha256,
+    opts.reuseComparatorsArtifactsSha256,
+  ];
+  if (comparatorReuseInputs.some(Boolean)) {
+    if (!opts.exactCandidate) {
+      throw new Error("--reuse-comparators-from is available only in exact-candidate mode");
+    }
+    if (!comparatorReuseInputs.every(Boolean)) {
+      throw new Error(
+        "comparator reuse requires --reuse-comparators-from, --reuse-comparators-ledger-sha256, and --reuse-comparators-artifacts-sha256",
+      );
+    }
+    if (opts.resumePrefixFrom) {
+      throw new Error("--reuse-comparators-from and --resume-prefix-from are mutually exclusive");
+    }
+    opts.reuseComparatorsFrom = path.resolve(opts.reuseComparatorsFrom);
+    opts.reuseComparatorsLedgerSha256 = normalizeExternalSha256(
+      opts.reuseComparatorsLedgerSha256,
+      "--reuse-comparators-ledger-sha256",
+    );
+    opts.reuseComparatorsArtifactsSha256 = normalizeExternalSha256(
+      opts.reuseComparatorsArtifactsSha256,
+      "--reuse-comparators-artifacts-sha256",
+    );
   }
   if (opts.repos) {
     for (const name of opts.repos) {
@@ -12336,6 +12384,332 @@ function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
   return rows.length / runsPerTask;
 }
 
+const EXACT_COMPARATOR_ARMS = new Set(["without_codestory", "published_0_17_4"]);
+const EXACT_COMPARATOR_CONTRACT_KEYS = [
+  "contract_version",
+  "task_id",
+  "task_manifest_hash",
+  "scorer_hash",
+  "runner",
+  "model",
+  "sandbox",
+  "retrieval_contract",
+  "retrieval_env",
+  "packet_threshold_config",
+];
+
+function exactComparatorContractMismatch(current, previous) {
+  const integrityError = benchmarkContractIntegrityError(previous, "comparator source row");
+  if (integrityError) return integrityError;
+  const mismatches = EXACT_COMPARATOR_CONTRACT_KEYS.filter(
+    (key) => stableJsonForHash(current?.[key] ?? null) !== stableJsonForHash(previous?.[key] ?? null),
+  );
+  return mismatches.length
+    ? `comparator benchmark contract differs in ${mismatches.join(", ")}`
+    : null;
+}
+
+function validateExactCandidateComparatorPrefixRows(rows, plannedRuns, opts) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length > plannedRuns.length) {
+    throw new Error("exact comparator source must contain a non-empty planned prefix");
+  }
+  const runsPerTask = opts.repeats * opts.arms.length;
+  if (rows.length % runsPerTask !== 0) {
+    throw new Error("exact comparator source must end at a complete task boundary with comparator triplets");
+  }
+  const currentPublished = exactCandidatePackageIdentity(
+    opts.exactCandidatePackageByArm?.get("published_0_17_4"),
+    "published_0_17_4",
+  );
+  for (const [index, row] of rows.entries()) {
+    const planned = plannedRuns[index];
+    if (agentRunKey(row) !== agentRunKey(planned) || !taskSnapshotMatches(planned.task, row)) {
+      throw new Error(`exact comparator row ${index + 1} is not the planned contiguous prefix`);
+    }
+    if (row.status !== "pass" || row.reanalysis_error) {
+      throw new Error(`exact comparator row ${agentRunKey(row)} is not a complete passing row`);
+    }
+    const contractMismatch = exactComparatorContractMismatch(
+      benchmarkContractForRun(opts, planned),
+      row.benchmark_contract,
+    );
+    if (contractMismatch) throw new Error(contractMismatch);
+    if (row.arm === "published_0_17_4") {
+      if (stableJsonForHash(row.package_identity) !== stableJsonForHash(currentPublished)) {
+        throw new Error("exact comparator published package identity does not match the authenticated package");
+      }
+      if (row.source_cli_identity != null) {
+        throw new Error("exact comparator published row contains a candidate source identity");
+      }
+    } else if (row.arm === "without_codestory") {
+      if (row.package_identity != null || row.source_cli_identity != null) {
+        throw new Error("exact comparator baseline row contains a CodeStory identity");
+      }
+    } else if (row.arm !== "candidate_0_18") {
+      throw new Error(`exact comparator source contains unexpected arm ${row.arm}`);
+    }
+  }
+  const completedTaskCount = rows.length / runsPerTask;
+  const comparatorRows = rows.filter((row) => EXACT_COMPARATOR_ARMS.has(row.arm));
+  if (comparatorRows.length !== completedTaskCount * opts.repeats * EXACT_COMPARATOR_ARMS.size) {
+    throw new Error("exact comparator source does not contain complete comparator triplets");
+  }
+  if (comparatorRows.some((row) => row.arm === "candidate_0_18")) {
+    throw new Error("exact comparator source attempted candidate-row reuse");
+  }
+  return { completedTaskCount, comparatorRows };
+}
+
+function validateExactComparatorLedgerSha256(bytes, expectedSha256) {
+  const observed = sha256Bytes(bytes);
+  if (observed !== normalizeExternalSha256(expectedSha256, "comparator ledger digest")) {
+    throw new Error(`comparator ledger digest mismatch: expected ${expectedSha256}, observed ${observed}`);
+  }
+  return observed;
+}
+
+function exactComparatorArtifact(sourceRunDir, artifactPath) {
+  if (!artifactPath) return null;
+  if (!EXACT_COMPARATOR_ARTIFACT_NAME_PATTERN.test(path.basename(String(artifactPath)))) {
+    throw new Error(`comparator artifact name is outside the closed artifact set: ${artifactPath}`);
+  }
+  const sourceRoot = realpathSync(sourceRunDir);
+  const unresolved = path.isAbsolute(artifactPath)
+    ? path.resolve(artifactPath)
+    : path.resolve(sourceRoot, artifactPath);
+  if (!isPathInside(sourceRoot, unresolved) || !existsSync(unresolved)) {
+    throw new Error(`comparator artifact is missing or escapes its source run: ${artifactPath}`);
+  }
+  const source = realpathSync(unresolved);
+  if (!isPathInside(sourceRoot, source) || !statSync(source).isFile()) {
+    throw new Error(`comparator artifact is not a regular source-run file: ${artifactPath}`);
+  }
+  const relative = path.relative(sourceRoot, source);
+  if (!relative || path.isAbsolute(relative) || relative.startsWith("..")) {
+    throw new Error(`comparator artifact has an invalid source-run path: ${artifactPath}`);
+  }
+  return { source, relative };
+}
+
+async function exactComparatorArtifactDescriptors(sourceRunDir, artifactPaths) {
+  const byRelativePath = new Map();
+  for (const artifactPath of artifactPaths) {
+    const artifact = exactComparatorArtifact(sourceRunDir, artifactPath);
+    if (!artifact || byRelativePath.has(artifact.relative)) continue;
+    const bytes = await readBoundedFile(
+      artifact.source,
+      MAX_REUSED_ARTIFACT_BYTES,
+      `comparator artifact ${artifact.relative}`,
+    );
+    byRelativePath.set(artifact.relative, {
+      ...artifact,
+      bytes: bytes.bytes,
+      sha256: bytes.sha256,
+      byte_length: bytes.bytes.length,
+    });
+  }
+  return [...byRelativePath.values()].sort((left, right) =>
+    left.relative.localeCompare(right.relative)
+  );
+}
+
+async function exactComparatorArtifactBundleSha256(sourceRunDir, artifactPaths) {
+  const descriptors = await exactComparatorArtifactDescriptors(sourceRunDir, artifactPaths);
+  return sha256Bytes(stableJsonForHash(descriptors.map((descriptor) => ({
+    path: descriptor.relative,
+    sha256: descriptor.sha256,
+    byte_length: descriptor.byte_length,
+  }))));
+}
+
+async function copyAuthenticatedComparatorArtifacts(
+  sourceRunDir,
+  outDir,
+  artifactPaths,
+  expectedBundleSha256,
+) {
+  const descriptors = await exactComparatorArtifactDescriptors(sourceRunDir, artifactPaths);
+  const observedBundleSha256 = sha256Bytes(stableJsonForHash(descriptors.map((descriptor) => ({
+    path: descriptor.relative,
+    sha256: descriptor.sha256,
+    byte_length: descriptor.byte_length,
+  }))));
+  const expected = normalizeExternalSha256(
+    expectedBundleSha256,
+    "comparator artifact bundle digest",
+  );
+  if (observedBundleSha256 !== expected) {
+    throw new Error(
+      `comparator artifact bundle digest mismatch: expected ${expected}, observed ${observedBundleSha256}`,
+    );
+  }
+  const copied = new Map();
+  for (const descriptor of descriptors) {
+    const destination = path.resolve(outDir, descriptor.relative);
+    assertPathInside(outDir, destination, "comparator artifact destination");
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, descriptor.bytes);
+    const copiedBytes = await readBoundedFile(
+      destination,
+      MAX_REUSED_ARTIFACT_BYTES,
+      `copied comparator artifact ${descriptor.relative}`,
+    );
+    if (copiedBytes.sha256 !== descriptor.sha256 || copiedBytes.bytes.length !== descriptor.byte_length) {
+      throw new Error(`copied comparator artifact failed integrity validation: ${descriptor.relative}`);
+    }
+    copied.set(descriptor.relative, destination);
+  }
+  return copied;
+}
+
+function exactComparatorRowArtifactPaths(row) {
+  return [
+    row.stdout_path,
+    row.stderr_path,
+    row.baseline_harness_prelude?.context_path,
+    row.baseline_harness_prelude?.stderr_path,
+    row.codestory_harness_prelude?.stdout_path,
+    row.codestory_harness_prelude?.stderr_path,
+  ].filter(Boolean);
+}
+
+function copiedExactComparatorArtifactPath(sourceRunDir, copiedArtifacts, artifactPath) {
+  if (!artifactPath) return artifactPath ?? null;
+  const artifact = exactComparatorArtifact(sourceRunDir, artifactPath);
+  const copied = copiedArtifacts.get(artifact.relative);
+  if (!copied) throw new Error(`authenticated comparator artifact was not copied: ${artifact.relative}`);
+  return copied;
+}
+
+function rewriteExactComparatorRowArtifacts(row, sourceRunDir, copiedArtifacts) {
+  const rewritten = {
+    ...row,
+    stdout_path: copiedExactComparatorArtifactPath(sourceRunDir, copiedArtifacts, row.stdout_path),
+    stderr_path: copiedExactComparatorArtifactPath(sourceRunDir, copiedArtifacts, row.stderr_path),
+  };
+  if (row.baseline_harness_prelude) {
+    rewritten.baseline_harness_prelude = {
+      ...row.baseline_harness_prelude,
+      context_path: copiedExactComparatorArtifactPath(
+        sourceRunDir,
+        copiedArtifacts,
+        row.baseline_harness_prelude.context_path,
+      ),
+      stderr_path: copiedExactComparatorArtifactPath(
+        sourceRunDir,
+        copiedArtifacts,
+        row.baseline_harness_prelude.stderr_path,
+      ),
+    };
+  }
+  if (row.codestory_harness_prelude) {
+    rewritten.codestory_harness_prelude = {
+      ...row.codestory_harness_prelude,
+      stdout_path: copiedExactComparatorArtifactPath(
+        sourceRunDir,
+        copiedArtifacts,
+        row.codestory_harness_prelude.stdout_path,
+      ),
+      stderr_path: copiedExactComparatorArtifactPath(
+        sourceRunDir,
+        copiedArtifacts,
+        row.codestory_harness_prelude.stderr_path,
+      ),
+    };
+  }
+  return rewritten;
+}
+
+async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
+  if (!opts.reuseComparatorsFrom) {
+    return { rows: new Map(), completedTaskCount: 0, provenance: null };
+  }
+  const sourceRunDir = opts.reuseComparatorsFrom;
+  const sourceLedgerPath = path.join(sourceRunDir, "runs.jsonl");
+  if (!existsSync(sourceLedgerPath)) {
+    throw new Error(`--reuse-comparators-from must contain runs.jsonl: ${sourceRunDir}`);
+  }
+  const ledger = await readBoundedFile(
+    sourceLedgerPath,
+    MAX_EXACT_COMPARATOR_LEDGER_BYTES,
+    "comparator source ledger",
+  );
+  const sourceLedgerSha256 = validateExactComparatorLedgerSha256(
+    ledger.bytes,
+    opts.reuseComparatorsLedgerSha256,
+  );
+  const sourceRows = ledger.bytes.toString("utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const validated = validateExactCandidateComparatorPrefixRows(sourceRows, plannedRuns, opts);
+  const artifactPaths = validated.comparatorRows.flatMap(exactComparatorRowArtifactPaths);
+  const copiedArtifacts = await copyAuthenticatedComparatorArtifacts(
+    sourceRunDir,
+    outDir,
+    artifactPaths,
+    opts.reuseComparatorsArtifactsSha256,
+  );
+  const taskCache = new Map();
+  const reusable = new Map();
+  for (const sourceRow of validated.comparatorRows) {
+    const key = agentRunKey(sourceRow);
+    const planned = plannedRuns.find((run) => agentRunKey(run) === key);
+    if (!planned || !EXACT_COMPARATOR_ARMS.has(planned.arm)) {
+      throw new Error(`comparator row cannot be mapped to a planned comparator: ${key}`);
+    }
+    const copied = rewriteExactComparatorRowArtifacts(sourceRow, sourceRunDir, copiedArtifacts);
+    const reanalyzed = await recomputeRunAnalysis(copied, opts, outDir, taskCache);
+    if (reanalyzed.reanalysis_error) {
+      throw new Error(`comparator row reanalysis failed for ${key}: ${reanalyzed.reanalysis_error}`);
+    }
+    const currentContract = benchmarkContractForRun(opts, planned);
+    const currentPublished = opts.exactCandidatePackageByArm.get("published_0_17_4");
+    const result = {
+      ...reanalyzed,
+      ...(planned.arm === "published_0_17_4" ? {
+        codestory_prelude_cli: currentPublished.cli_path,
+      } : {}),
+      benchmark_contract: currentContract,
+      promotion_eligible: true,
+      comparator_reuse_provenance: {
+        contract: "codestory.agent-benchmark-exact-comparator-reuse/v1",
+        source_run_dir: sourceRunDir,
+        source_ledger_sha256: sourceLedgerSha256,
+        source_artifacts_sha256: opts.reuseComparatorsArtifactsSha256,
+        original_benchmark_run_id: sourceRow.benchmark_run_id ?? null,
+        original_benchmark_contract: sourceRow.benchmark_contract,
+        current_benchmark_contract: currentContract,
+        original_identity: sourceRow.package_identity ?? null,
+        authenticated_current_identity: planned.arm === "published_0_17_4"
+          ? exactCandidatePackageIdentity(currentPublished, "published_0_17_4")
+          : null,
+        reanalyzed_with_current_scorer: true,
+      },
+    };
+    reusable.set(key, {
+      ...result,
+      resource_accounting: resourceAccountingForResult(result),
+    });
+  }
+  if ([...reusable.values()].some((row) => row.arm === "candidate_0_18")) {
+    throw new Error("comparator reuse attempted to import a candidate row");
+  }
+  return {
+    rows: reusable,
+    completedTaskCount: validated.completedTaskCount,
+    provenance: {
+      contract: "codestory.agent-benchmark-exact-comparator-reuse/v1",
+      source_run_dir: sourceRunDir,
+      source_ledger_sha256: sourceLedgerSha256,
+      source_artifacts_sha256: opts.reuseComparatorsArtifactsSha256,
+      completed_task_count: validated.completedTaskCount,
+      reused_row_count: reusable.size,
+    },
+  };
+}
+
 async function copyExactResumeRowArtifacts(row, sourceRunDir, outDir) {
   const runId = row.benchmark_run_id;
   const resumeArtifact = (artifactPath) => {
@@ -12510,7 +12884,8 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
 async function runPlannedAgentRun(opts, run, outDir, reusableBaselines) {
   const reusable = reusableBaselines.get(agentRunKey(run));
   if (reusable) {
-    console.log(`reusing ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats} from ${opts.reuseBaselineFrom}`);
+    const source = reusable.comparator_reuse_provenance?.source_run_dir ?? opts.reuseBaselineFrom;
+    console.log(`reusing ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats} from ${source}`);
     return reusable;
   }
   console.log(`running ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats}`);
@@ -13117,6 +13492,7 @@ async function runExactCandidatePipeline({
   recordPreparation,
   recordPreparationState,
   recordFirstFailure,
+  reusableBaselines,
 }) {
   const cachePreparation = [];
   opts.cachePreparationByRepo ??= new Map();
@@ -13188,7 +13564,7 @@ async function runExactCandidatePipeline({
   const outcome = await runPlannedAgentRuns(
     { ...opts, jobs: 1 },
     plannedRuns,
-    new Map(),
+    reusableBaselines,
     outDir,
     {
       runOne: executeRun,
@@ -13242,6 +13618,7 @@ async function runAgentBenchmarkPipeline({
       recordPreparation,
       recordPreparationState,
       recordFirstFailure,
+      reusableBaselines,
     });
   }
   const results = [];
@@ -13663,6 +14040,7 @@ async function main() {
   const reusableBaselines = await loadReusableBaselines(opts, plannedRuns, outDir);
   opts.cachePreparationByRepo = new Map();
   let resumedPrefix = { rows: [], preparations: [], completedTaskCount: 0 };
+  let comparatorReuse = { rows: new Map(), completedTaskCount: 0, provenance: null };
   let agentCodexIsolation = null;
   let pipeline = null;
   let pipelineError = null;
@@ -13674,6 +14052,11 @@ async function main() {
       resumedPrefix = await loadExactCandidateResumePrefix(
         opts,
         tasks,
+        plannedRuns,
+        outDir,
+      );
+      comparatorReuse = await loadExactCandidateComparatorReuse(
+        opts,
         plannedRuns,
         outDir,
       );
@@ -13692,7 +14075,7 @@ async function main() {
       opts,
       tasks: tasks.slice(resumedPrefix.completedTaskCount),
       plannedRuns: plannedRuns.slice(resumedPrefix.rows.length),
-      reusableBaselines,
+      reusableBaselines: comparatorReuse.rows.size ? comparatorReuse.rows : reusableBaselines,
       outDir,
       materializeGroup: async (group, signal) => {
         if (opts.materializeRepos) {
@@ -13836,6 +14219,9 @@ async function main() {
     reused_baseline_runs: canonicalResults.filter((row) => row.reused_from).length,
     resume_prefix_from: opts.resumePrefixFrom,
     resumed_prefix_runs: canonicalResults.filter((row) => row.resume_provenance).length,
+    reuse_comparators_from: opts.reuseComparatorsFrom,
+    reused_comparator_runs: canonicalResults.filter((row) => row.comparator_reuse_provenance).length,
+    comparator_reuse: comparatorReuse.provenance,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
     sandbox: opts.sandbox,
@@ -13920,6 +14306,7 @@ export {
   buildPacketQualityDeltas,
   buildQualityDebugPayload,
   copyResultArtifact,
+  copyAuthenticatedComparatorArtifacts,
   qualityFailureReasons,
   commandCategory,
   codeStoryBinaryIdentity,
@@ -13992,6 +14379,7 @@ export {
   planAgentRuns,
   exactCandidateAcceptance,
   exactCandidateCostRates,
+  exactComparatorArtifactBundleSha256,
   authenticateExactCandidatePackages,
   exactCandidateArmEnv,
   exactCandidateBaselineEnv,
@@ -14002,6 +14390,8 @@ export {
   withExactSourceMutation,
   validateExactCandidateShape,
   validateExactCandidateResumePrefixRows,
+  validateExactCandidateComparatorPrefixRows,
+  validateExactComparatorLedgerSha256,
   repoProvenanceBlockers,
   repoProvenance,
   runnerCommand,
