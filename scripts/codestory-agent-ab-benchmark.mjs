@@ -3824,19 +3824,22 @@ const CLAIM_STOPWORDS = new Set([
 ]);
 
 function claimTokens(value, { expandQualified = false } = {}) {
-  return normalizeSearchText(value)
-    .split(/[^a-z0-9_:.]+/)
+  const raw = String(value ?? "");
+  const inputs = expandQualified
+    ? [raw, raw.replace(/([a-z0-9])([A-Z])/g, "$1 $2")]
+    : [raw];
+  return inputs
+    .flatMap((input) => normalizeSearchText(input).split(/[^a-z0-9_:.]+/))
     .map((token) => token.trim().replace(/^[.:]+|[.:]+$/g, ""))
     .flatMap((token) => expandQualified ? [token, ...token.split(/(?:::|[.#_])/g)] : [token])
     .filter((token) => token.length >= 3 && !CLAIM_STOPWORDS.has(token));
 }
 
-const POSITIVE_CLAIM_RELATION_BASES = new Set([
-  "call",
-  "delegate",
-  "forward",
-  "invoke",
-]);
+const POSITIVE_CLAIM_EQUIVALENCE_CLASSES = [
+  new Set(["call", "delegate", "forward", "invoke"]),
+  new Set(["choose", "determine", "dispatch", "route", "select"]),
+  new Set(["admission", "admit", "check", "guard", "reject", "validate"]),
+];
 
 function positiveClaimTokenVariants(token) {
   const variants = new Set();
@@ -3871,8 +3874,10 @@ function positiveClaimTokenVariants(token) {
       if (roleBase.length >= 4) variants.add(roleBase);
     }
   }
-  if ([...variants].some((variant) => POSITIVE_CLAIM_RELATION_BASES.has(variant))) {
-    for (const relation of POSITIVE_CLAIM_RELATION_BASES) variants.add(relation);
+  for (const equivalents of POSITIVE_CLAIM_EQUIVALENCE_CLASSES) {
+    if ([...variants].some((variant) => equivalents.has(variant))) {
+      for (const equivalent of equivalents) variants.add(equivalent);
+    }
   }
   return variants;
 }
@@ -3987,7 +3992,7 @@ function forbiddenCandidateSentences(haystack) {
 }
 
 const NON_AFFIRMATIVE_QUALITY_TEXT =
-  /\b(?:unknown|unavailable|unproven|unsupported|missing|gaps?|not_established|evidence_missing|unresolved|(?:no|without)\s+evidence|(?:lacks?|lacked|lacking)\s+(?:evidence|support)|(?:does|do|did|can|could)\s+not\s+(?:establish|show|support|prove|verify|demonstrate)|(?:cannot|doesn't|didn't|can't|couldn't)\s+(?:establish|show|support|prove|verify|demonstrate)|(?:never|(?:does|do|did|can|could)\s+not|doesn't|don't|didn't|can't|couldn't)\s+(?:calls?|called|calling|invokes?|invoked|invoking|delegates?|delegated|delegating|forwards?|forwarded|forwarding)|fails? to (?:establish|show|support|prove|verify|demonstrate))\b/i;
+  /\b(?:unknown|unavailable|unproven|unsupported|missing|gaps?|not_established|evidence_missing|unresolved|(?:no|without)\s+evidence|(?:lacks?|lacked|lacking)\s+(?:evidence|support)|(?:does|do|did|can|could)\s+not\b|cannot\b|doesn't\b|don't\b|didn't\b|can't\b|couldn't\b|never\b|fails? to (?:establish|show|support|prove|verify|demonstrate))\b/i;
 
 function qualitySupportUnits(haystack) {
   const units = [];
@@ -4067,7 +4072,7 @@ function qualitySupportUnits(haystack) {
 function qualityClausesInUnit(unit) {
   return String(unit ?? "")
     .split(/(?:[.!?](?:["'`)]*)\s+|;\s*|\s+[—–]\s+|\s+(?:but|however|although|though|yet)\b[,:]?\s*)/iu)
-    .map((clause) => normalizeSearchText(clause))
+    .map((clause) => clause.trim())
     .filter(Boolean);
 }
 

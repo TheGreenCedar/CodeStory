@@ -6794,6 +6794,42 @@ test("quality scoring keeps affirmative support units intact without combining u
   assert.equal(gapSection.expected_claims.found, 0);
 });
 
+test("quality scoring accepts bounded routing and check paraphrases for the same subject", () => {
+  const task = {
+    id: "routing-check-paraphrases",
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["processCommand"],
+    expected_claims: ["processCommand performs command routing and execution checks."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0,
+      min_expected_file_recall: 0,
+      min_expected_symbol_recall: 0,
+      min_expected_claim_recall: 0,
+      min_citation_coverage: 0,
+      max_forbidden_claims: 0,
+    },
+  };
+
+  for (const answer of [
+    "`processCommand` determines a cluster target; an absent or non-local result rejects the command.",
+    "`processCommand` selects a destination and rejects commands that fail its admission checks.",
+  ]) {
+    const quality = scoreQuality([agentMessageEvent(answer)], task);
+    assert.equal(quality.expected_claims.found, 1, answer);
+  }
+
+  for (const answer of [
+    "`processCommand` does not select a destination or reject invalid commands.",
+    "`prepareCommand` selects a destination and rejects invalid commands; `processCommand` remains unknown.",
+    "`processCommand` selects only metrics; it does not route or check commands.",
+  ]) {
+    const quality = scoreQuality([agentMessageEvent(answer)], task);
+    assert.equal(quality.expected_claims.found, 0, answer);
+  }
+});
+
 test("positive claim normalization is closed over qualified tokens and call relations", () => {
   const zeroThresholds = {
     min_expected_anchor_recall: 0,
