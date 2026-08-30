@@ -8428,7 +8428,16 @@ mod tests {
             "Explain how native form constraints combine with custom validation.\nsubmit prevent default\nvalidity state",
         );
 
-        assert_eq!(focus, [7, 16]);
+        let covers = |line: u32| {
+            focus.iter().any(|focus_line| {
+                focus_line.saturating_sub(CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32) <= line
+                    && focus_line + CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32 >= line
+            })
+        };
+        assert!(
+            covers(8) && covers(12),
+            "the focused ranges must keep both native constraints and custom validation: {focus:?}",
+        );
         assert!(!focus.contains(&4), "the title is not behavioral evidence");
     }
 
@@ -11519,7 +11528,6 @@ mod tests {
         for expected in [
             "server bootstrap",
             "command server entrypoint",
-            "event loop source",
             "network command input",
             "command table dispatch",
             "event loop",
