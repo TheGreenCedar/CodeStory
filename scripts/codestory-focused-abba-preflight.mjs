@@ -182,35 +182,23 @@ async function cliIdentity(cliPath, arm) {
   };
 }
 
-async function runFocusedAbba(opts) {
-  const plan = abbaRunPlan();
-  if (opts.listPlan) {
-    process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
-    return null;
-  }
-  if (existsSync(path.join(opts.outDir, "summary.json"))) {
-    throw new Error(`refusing to overwrite focused ABBA receipt: ${opts.outDir}`);
-  }
-  await mkdir(opts.outDir, { recursive: true });
-  await mkdir(opts.stateRoot, { recursive: true });
-  const executionWindowId = opts.executionWindowId
-    ?? `${new Date().toISOString()}:${process.pid}:${opts.outDir}`;
-  const identities = {
-    published_0_17_5: await cliIdentity(opts.publishedCli, "published_0_17_5"),
-    candidate_0_18: await cliIdentity(opts.candidateCli, "candidate_0_18"),
-  };
-  const rows = [];
-  for (const [sequence, planned] of plan.entries()) {
-    const rowDir = path.join(
-      opts.outDir,
-      "raw",
-      planned.task_id,
-      `${String(sequence + 1).padStart(2, "0")}-${planned.arm}-${planned.repeat}`,
-    );
-    const cli = identities[planned.arm].path;
-    process.stdout.write(
-      `running ${planned.task_id} ${planned.arm} repeat ${planned.repeat}/5 (${sequence + 1}/${plan.length})\n`,
-    );
+function transientEmbeddingServerTransition(summary) {
+  const failure = summary?.first_failure;
+  return summary?.completed_rows === 0
+    && failure?.kind === "preparation_failed"
+    && String(failure?.error ?? "").includes("embedding_server_draining");
+}
+
+async function runRawRow(opts, planned, sequence, cli) {
+  const rowRoot = path.join(
+    opts.outDir,
+    "raw",
+    planned.task_id,
+    `${String(sequence + 1).padStart(2, "0")}-${planned.arm}-${planned.repeat}`,
+  );
+  const transitionAttempts = [];
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const rowDir = path.join(rowRoot, `attempt-${attempt}`);
     const run = await runProcess(
       process.execPath,
       [
@@ -232,12 +220,55 @@ async function runFocusedAbba(opts) {
         maxOutputBytes: 4 * 1024 * 1024,
       },
     );
-    if (run.status !== "pass") {
+    if (run.status === "pass") {
+      return { rowDir, transitionAttempts };
+    }
+    const summaryPath = path.join(rowDir, "summary.json");
+    const summary = existsSync(summaryPath)
+      ? JSON.parse(await readFile(summaryPath, "utf8"))
+      : null;
+    const transient = transientEmbeddingServerTransition(summary);
+    transitionAttempts.push({
+      attempt,
+      raw_directory: path.relative(opts.outDir, rowDir),
+      transient_embedding_server_transition: transient,
+      error: summary?.first_failure?.error ?? run.stderr ?? run.stdout,
+    });
+    if (!transient || attempt === 3) {
       throw new Error(
         `focused ABBA raw row failed for ${planned.task_id}/${planned.arm}/${planned.repeat}: `
-        + `${run.stderr || run.stdout}`,
+        + `${summary?.first_failure?.error ?? run.stderr ?? run.stdout}`,
       );
     }
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+  }
+  throw new Error("focused ABBA transition retry exhausted without a receipt");
+}
+
+async function runFocusedAbba(opts) {
+  const plan = abbaRunPlan();
+  if (opts.listPlan) {
+    process.stdout.write(`${JSON.stringify(plan, null, 2)}\n`);
+    return null;
+  }
+  if (existsSync(path.join(opts.outDir, "summary.json"))) {
+    throw new Error(`refusing to overwrite focused ABBA receipt: ${opts.outDir}`);
+  }
+  await mkdir(opts.outDir, { recursive: true });
+  await mkdir(opts.stateRoot, { recursive: true });
+  const executionWindowId = opts.executionWindowId
+    ?? `${new Date().toISOString()}:${process.pid}:${opts.outDir}`;
+  const identities = {
+    published_0_17_5: await cliIdentity(opts.publishedCli, "published_0_17_5"),
+    candidate_0_18: await cliIdentity(opts.candidateCli, "candidate_0_18"),
+  };
+  const rows = [];
+  for (const [sequence, planned] of plan.entries()) {
+    const cli = identities[planned.arm].path;
+    process.stdout.write(
+      `running ${planned.task_id} ${planned.arm} repeat ${planned.repeat}/5 (${sequence + 1}/${plan.length})\n`,
+    );
+    const { rowDir, transitionAttempts } = await runRawRow(opts, planned, sequence, cli);
     const rawRow = await readSingleJsonlRow(path.join(rowDir, "runs.jsonl"));
     const rawSummary = JSON.parse(await readFile(path.join(rowDir, "summary.json"), "utf8"));
     const host = rawSummary?.shard?.attestation?.host_class;
@@ -256,6 +287,7 @@ async function runFocusedAbba(opts) {
       arm: planned.arm,
       repeat: planned.repeat,
       raw_directory: path.relative(opts.outDir, rowDir),
+      transition_attempts: transitionAttempts,
       raw_benchmark_run_id: rawRow.benchmark_run_id,
       raw_inner_timing_cohort_id: rawRow.installed_agent_timing?.timing_cohort_id ?? null,
       installed_agent_timing: timing,
@@ -309,6 +341,7 @@ export {
   focusedAbbaTiming,
   parseArgs,
   runFocusedAbba,
+  transientEmbeddingServerTransition,
 };
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {

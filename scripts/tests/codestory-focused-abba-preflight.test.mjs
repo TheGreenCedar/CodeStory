@@ -6,6 +6,7 @@ import {
   REQUIRED_TASK_IDS,
   abbaRunPlan,
   focusedAbbaTiming,
+  transientEmbeddingServerTransition,
 } from "../codestory-focused-abba-preflight.mjs";
 
 test("focused timing preflight schedules five paired ABBA rows per arm and task", () => {
@@ -82,4 +83,26 @@ test("focused timing preflight gives paired arms the same cohort id", () => {
     time_to_final_packet_ms: 25,
     whole_task_wall_ms: 125,
   });
+});
+
+test("focused timing preflight retries only a zero-row embedding-server transition", () => {
+  const transition = {
+    completed_rows: 0,
+    first_failure: {
+      kind: "preparation_failed",
+      error: "embedding_server_draining: incompatible engine contract",
+    },
+  };
+  assert.equal(transientEmbeddingServerTransition(transition), true);
+  assert.equal(
+    transientEmbeddingServerTransition({ ...transition, completed_rows: 1 }),
+    false,
+  );
+  assert.equal(
+    transientEmbeddingServerTransition({
+      ...transition,
+      first_failure: { kind: "preparation_failed", error: "retrieval unavailable" },
+    }),
+    false,
+  );
 });
