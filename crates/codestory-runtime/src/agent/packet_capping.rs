@@ -2200,6 +2200,24 @@ mod tests {
     }
 
     #[test]
+    fn type_declaration_probe_promotes_the_type_over_same_file_members() {
+        let mut member = citation("Client.send", "src/network/client.dart", 100.0);
+        member.kind = NodeKind::METHOD;
+        let mut client_type = citation("Client", "src/network/client.dart", 1.0);
+        client_type.kind = NodeKind::CLASS;
+        let mut unrelated_type = citation("Response", "src/network/client.dart", 50.0);
+        unrelated_type.kind = NodeKind::CLASS;
+        let client_type_key = packet_citation_key(&client_type);
+        let mut answer = answer_fixture(vec![member, unrelated_type, client_type]);
+
+        let protected =
+            promote_required_probe_citations(&mut answer, &["client type declaration".to_string()]);
+
+        assert_eq!(answer.citations[0].display_name, "Client");
+        assert_eq!(protected, HashSet::from([client_type_key]));
+    }
+
+    #[test]
     fn request_method_probe_prefers_implementation_over_declaration() {
         let mut declaration = citation("request", "index.d.ts", 100.0);
         declaration.kind = NodeKind::METHOD;

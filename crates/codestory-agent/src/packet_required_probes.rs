@@ -1039,6 +1039,9 @@ pub fn packet_probe_query_is_cited(query: &str, answer: &AgentAnswerDto) -> bool
 }
 
 pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCitationDto) -> bool {
+    if packet_type_declaration_probe_subject_tokens(query).is_some() {
+        return packet_citation_matches_type_declaration_probe(query, citation);
+    }
     if packet_citation_matches_required_coverage_role(query, citation) {
         return true;
     }
@@ -1141,6 +1144,9 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
     if normalized_query.is_empty() {
         return Some(0);
     }
+    if packet_type_declaration_probe_subject_tokens(query).is_some() {
+        return packet_citation_matches_type_declaration_probe(query, citation).then_some(6);
+    }
     if packet_citation_matches_required_coverage_role(query, citation) {
         return Some(6);
     }
@@ -1197,6 +1203,42 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
     } else {
         None
     }
+}
+
+fn packet_type_declaration_probe_subject_tokens(query: &str) -> Option<Vec<String>> {
+    let mut tokens = crate::text::symbol_query_tokens(query);
+    if tokens.len() < 3
+        || tokens.get(tokens.len() - 2).map(String::as_str) != Some("type")
+        || tokens.last().map(String::as_str) != Some("declaration")
+    {
+        return None;
+    }
+    tokens.truncate(tokens.len() - 2);
+    Some(tokens)
+}
+
+fn packet_citation_matches_type_declaration_probe(
+    query: &str,
+    citation: &AgentCitationDto,
+) -> bool {
+    let Some(subject_tokens) = packet_type_declaration_probe_subject_tokens(query) else {
+        return false;
+    };
+    if !matches!(
+        citation.kind,
+        NodeKind::STRUCT
+            | NodeKind::CLASS
+            | NodeKind::INTERFACE
+            | NodeKind::UNION
+            | NodeKind::ENUM
+            | NodeKind::TYPEDEF
+    ) {
+        return false;
+    }
+    let display_tokens = crate::text::symbol_query_tokens(&citation.display_name);
+    subject_tokens
+        .iter()
+        .all(|subject| display_tokens.iter().any(|display| display == subject))
 }
 
 fn packet_citation_is_exact_primary_file_probe_match(
@@ -2481,6 +2523,49 @@ mod tests {
             packet_citation_probe_token_coverage("jsonl event output", &citation),
             3
         );
+    }
+
+    #[test]
+    fn type_declaration_required_probe_preserves_evidence_kind() {
+        for (display_name, kind) in [
+            ("Client", NodeKind::CLASS),
+            ("HttpClient", NodeKind::INTERFACE),
+            ("ClientAdapter", NodeKind::STRUCT),
+            ("ClientResult", NodeKind::UNION),
+            ("ClientMode", NodeKind::ENUM),
+            ("ClientAlias", NodeKind::TYPEDEF),
+        ] {
+            let mut citation = test_packet_citation(display_name, "src/client.dart", 0.1);
+            citation.kind = kind;
+            assert!(
+                packet_citation_satisfies_required_probe("client type declaration", &citation),
+                "{kind:?} {display_name} should satisfy a client type-declaration probe"
+            );
+            assert_eq!(
+                packet_citation_probe_match_rank("client type declaration", &citation),
+                Some(6),
+                "{kind:?} {display_name} should receive exact typed-probe rank"
+            );
+        }
+
+        for (display_name, kind, path) in [
+            ("Client.send", NodeKind::METHOD, "src/client.dart"),
+            ("createClient", NodeKind::FUNCTION, "src/client.dart"),
+            ("client", NodeKind::FILE, "src/client.dart"),
+            ("Response", NodeKind::CLASS, "src/client.dart"),
+        ] {
+            let mut citation = test_packet_citation(display_name, path, 100.0);
+            citation.kind = kind;
+            assert!(
+                !packet_citation_satisfies_required_probe("client type declaration", &citation),
+                "{kind:?} {display_name} must not satisfy a client type-declaration probe through its file path"
+            );
+            assert_eq!(
+                packet_citation_probe_match_rank("client type declaration", &citation),
+                None,
+                "{kind:?} {display_name} must not rank for a client type-declaration probe"
+            );
+        }
     }
 
     #[test]
