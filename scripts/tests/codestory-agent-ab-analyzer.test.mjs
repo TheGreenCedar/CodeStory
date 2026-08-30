@@ -5224,6 +5224,8 @@ test("v3 benchmark routing treats projection bounds as descriptive rather than r
   assert.match(instruction, /before describing.*gaps/iu);
   assert.match(instruction, /heading.*symbol inventory.*partial observation/iu);
   assert.match(instruction, /claim.*no broader than.*evidence row/iu);
+  assert.match(instruction, /higher-level action.*mechanism.*same evidence rows/iu);
+  assert.match(instruction, /participates.*calls/iu);
   assert.doesNotMatch(instruction, /direct source reads as packet recovery/);
 });
 

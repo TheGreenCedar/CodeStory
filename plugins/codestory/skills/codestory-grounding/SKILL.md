@@ -100,7 +100,11 @@ plugin package to locate a documented field or excerpt.
   state a direct subject-verb claim naming the subject and its established
   action before discussing any gap. Do not substitute a heading, symbol
   inventory, or adjacent partial observation for that supported claim, and do
-  not make the claim broader than the cited row. Then scope gaps only to the
+  not make the claim broader than the cited row. When a higher-level action and
+  its mechanism are established by the same evidence rows, name both: `Subject`
+  performs, drives, or handles the action by calling the mechanism. Avoid weak
+  role labels such as `is the ... symbol` or `participates in`; do not report
+  only that the subject `calls` a downstream target. Then scope gaps only to the
   requested stages or links the rows do not establish. A gap does not erase a
   supported stage and does not authorize a source read unless it identifies the
   exact focused path required by the direct-tool rule above.
