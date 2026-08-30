@@ -145,7 +145,7 @@ Chinook schema failed in both arms.
 
 This sheet is a Codex harness sample used as a quality budget, not the product
 ICP and not a host-agnostic result. Cursor and Claude sheets are not in yet. It
-is a development comparison, not a publishable promotion run: dirty tree, no
+is historical, non-current evidence and not a publishable promotion run: dirty tree, no
 `summary.json`, not `--publishable`, and the without-arm was reused from an
 earlier window. A later publishable `summary.json` can replace the table.
 

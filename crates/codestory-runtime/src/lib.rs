@@ -65,14 +65,23 @@ use uuid::Uuid;
 
 mod affected;
 mod agent;
+mod evidence_projection_v3;
 mod index_commit;
 mod index_coverage;
 mod index_freshness;
 mod index_full;
 mod index_incremental;
 mod index_timings;
-#[cfg(any(test, feature = "test-support"))]
+#[allow(unused_imports)]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "proof-qualification-support"
+))]
 mod indexed_source_call_path_v1;
+#[cfg(feature = "proof-qualification-support")]
+#[doc(hidden)]
+pub mod proof_qualification_support;
 mod publication;
 mod repo_text;
 mod root_rank;
@@ -89,11 +98,19 @@ mod semantic_projection;
 mod semantic_republish;
 mod snippets;
 mod source_coverage;
+#[cfg(feature = "v3-evidence-separation-support")]
+#[doc(hidden)]
+pub mod v3_evidence_qualification_support;
 mod workspace_state;
 use affected::{AffectedOperationIdentityIndex, IndexFreshnessObservation};
 pub use agent::{
     bind_packet_follow_up_program, enforce_packet_output_budget_for_representation,
     packet_step_trace_json, plan_packet,
+};
+pub use evidence_projection_v3::{
+    PacketDiagnosticProjectionV3, PacketEvidenceProductV3,
+    finalize_packet_projection_v3_for_representation, project_context_v3, project_packet_v3,
+    project_search_v3,
 };
 
 #[cfg(feature = "test-support")]
@@ -350,14 +367,15 @@ pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
 };
 pub use retrieval_boundary::{
-    CacheCleanPlan, CacheCleanReport, FinalizeIndexOutcome, GenerationRetentionApplyReport,
-    GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
-    RetainedRollbackObservation, RetrievalIndexManifest, RetrievalProcessDefaults,
-    RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, RetrievalStatusReport,
-    RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
-    RuntimeRetrievalConfig, RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarGcReport, SidecarInventoryReport, apply_cache_clean,
-    ensure_product_embedding_backend_for_runtime, plan_cache_clean, retrieval_process_defaults,
+    CacheCleanPlan, CacheCleanReport, FinalizeComponentWork, FinalizeIndexOutcome,
+    FinalizePhaseTiming, GenerationRetentionApplyReport, GenerationRetentionPlan,
+    ProcessOwnerState, ProcessStartProbe, QueryResult, RetainedRollbackObservation,
+    RetrievalIndexManifest, RetrievalProcessDefaults, RetrievalRuntimeDefaults,
+    RetrievalRuntimeOverrides, RetrievalStatusReport, RollbackActivationError,
+    RollbackActivationOutcome, RollbackActivationRefusal, RuntimeRetrievalConfig,
+    RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarGcReport,
+    SidecarInventoryReport, apply_cache_clean, ensure_product_embedding_backend_for_runtime,
+    plan_cache_clean, retrieval_process_defaults,
 };
 pub(crate) use search_runtime::SearchEngine;
 
@@ -613,6 +631,12 @@ pub struct AppController {
     pub(crate) canonical_symbol_names:
         Arc<Mutex<crate::agent::retrieval_primary::CanonicalSymbolNamesState>>,
     source_observer: Arc<Mutex<SourceObserverState>>,
+    #[cfg(any(
+        test,
+        feature = "test-support",
+        feature = "proof-qualification-support"
+    ))]
+    proof_validation_cache: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>>,
     events_tx: Sender<AppEventPayload>,
     events_rx: Receiver<AppEventPayload>,
     runtime_config: Arc<codestory_retrieval::SidecarRuntimeConfig>,

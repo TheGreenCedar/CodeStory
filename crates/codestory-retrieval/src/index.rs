@@ -1,8 +1,9 @@
 use crate::config::{SidecarLayout, SidecarRuntimeConfig, dir_size_bytes};
+use crate::content_addressed_vector_cache::{ContentAddressedVectorCache, VectorCacheBatchInput};
 use crate::embedded_vector::{
-    AttestedSemanticPoint, EmbeddedVectorIndex, ExpectedVectorAnchor, SemanticPoint,
-    VectorEvidenceContract, VectorGenerationManifest, build_vector_producer_evidence,
-    producer_evidence_mismatches, vector_compatibility_identity,
+    AttestedSemanticPoint, CurrentVectorAnchor, EmbeddedVectorIndex, ExpectedVectorAnchor,
+    SemanticPoint, VectorEvidenceContract, VectorGenerationManifest,
+    build_vector_producer_evidence, producer_evidence_mismatches, vector_compatibility_identity,
     vector_producer_compatibility_identity,
 };
 use crate::generation::{
@@ -11,8 +12,9 @@ use crate::generation::{
 };
 use crate::health::probe_sidecar_health_for_runtime;
 use crate::lexical_index::{
-    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, build_lexical_shard,
-    finish_lexical_input_for_store, lexical_source_input,
+    LEXICAL_INDEX_VERSION, LexicalInputFingerprint, PreparedLexicalInput,
+    build_prepared_lexical_shard, finish_lexical_input_for_store, lexical_source_input,
+    prepare_lexical_input_for_store,
 };
 use crate::retention::{
     FsGenerationRemover, GLOBAL_GENERATION_GC_LOCK_SCOPE, GenerationRetentionApplyReport,
@@ -21,7 +23,7 @@ use crate::retention::{
     scan_retention_protection, write_retention_marker,
 };
 use crate::scip_index::{
-    SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store,
+    SCIP_PRECISE_SEMANTIC_IMPORT_DIR, emit_scip_artifacts_from_store_incremental,
     import_precise_semantic_scip_artifact,
 };
 use anyhow::{Context, Result, bail};
@@ -41,9 +43,40 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(any(not(feature = "test-support"), test))]
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+
+thread_local! {
+    static FINALIZE_PHASE_TIMINGS: std::cell::RefCell<Option<(Instant, Vec<AccumulatedPhaseTiming>)>> =
+        const { std::cell::RefCell::new(None) };
+    static FINALIZE_COMPONENT_WORK: std::cell::RefCell<Vec<FinalizeComponentWork>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Debug)]
+struct AccumulatedPhaseTiming {
+    phase: String,
+    elapsed: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizePhaseTiming {
+    pub phase: String,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizeComponentWork {
+    pub component: String,
+    pub mode: String,
+    pub retained: Option<u64>,
+    pub inserted: Option<u64>,
+    pub removed: Option<u64>,
+    pub reordered: Option<u64>,
+    pub predecessor_bytes: Option<u64>,
+    pub output_bytes: Option<u64>,
+    pub attested_bytes: Option<u64>,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FinalizeIndexOutcome {
@@ -53,6 +86,149 @@ pub struct FinalizeIndexOutcome {
     pub scip_stubbed: bool,
     pub generation_retention_plan: GenerationRetentionPlan,
     pub generation_retention: GenerationRetentionApplyReport,
+    #[serde(skip)]
+    pub phase_timings: Vec<FinalizePhaseTiming>,
+    #[serde(skip)]
+    pub component_work: Vec<FinalizeComponentWork>,
+}
+
+fn begin_finalize_phase_timings() {
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        *state.borrow_mut() = Some((Instant::now(), Vec::new()));
+    });
+    FINALIZE_COMPONENT_WORK.with(|state| state.borrow_mut().clear());
+}
+
+fn record_finalize_component_work(
+    component: &'static str,
+    mode: &'static str,
+    retained: Option<u64>,
+    inserted: Option<u64>,
+    removed: Option<u64>,
+) {
+    FINALIZE_COMPONENT_WORK.with(|state| {
+        state.borrow_mut().push(FinalizeComponentWork {
+            component: component.to_string(),
+            mode: mode.to_string(),
+            retained,
+            inserted,
+            removed,
+            reordered: None,
+            predecessor_bytes: None,
+            output_bytes: None,
+            attested_bytes: None,
+        });
+    });
+}
+
+fn record_finalize_component_details(
+    component: &'static str,
+    reordered: Option<u64>,
+    predecessor_bytes: Option<u64>,
+    output_bytes: Option<u64>,
+    attested_bytes: Option<u64>,
+) {
+    FINALIZE_COMPONENT_WORK.with(|state| {
+        if let Some(work) = state
+            .borrow_mut()
+            .iter_mut()
+            .rev()
+            .find(|work| work.component == component)
+        {
+            work.reordered = reordered;
+            work.predecessor_bytes = predecessor_bytes;
+            work.output_bytes = output_bytes;
+            work.attested_bytes = attested_bytes;
+        }
+    });
+}
+
+fn component_size(path: &Path) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|metadata| metadata.len())
+}
+
+fn finish_finalize_component_work() -> Vec<FinalizeComponentWork> {
+    FINALIZE_COMPONENT_WORK.with(|state| std::mem::take(&mut *state.borrow_mut()))
+}
+
+pub(crate) fn record_finalize_phase_timing(phase: &'static str, elapsed: Duration) {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        if let Some((_, timings)) = state.borrow_mut().as_mut() {
+            if let Some(timing) = timings.iter_mut().find(|timing| timing.phase == phase) {
+                timing.elapsed = timing.elapsed.saturating_add(elapsed);
+            } else {
+                timings.push(AccumulatedPhaseTiming {
+                    phase: phase.to_string(),
+                    elapsed,
+                });
+            }
+        }
+    });
+    info!(phase, elapsed_ms, "retrieval finalization phase completed");
+}
+
+fn finish_finalize_phase_timings() -> Vec<FinalizePhaseTiming> {
+    FINALIZE_PHASE_TIMINGS.with(|state| {
+        let Some((started, mut accumulated)) = state.borrow_mut().take() else {
+            return Vec::new();
+        };
+        let vector_total = accumulated
+            .iter()
+            .filter(|timing| {
+                matches!(
+                    timing.phase.as_str(),
+                    "embedded vectors" | "incremental embedded vectors"
+                )
+            })
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        let vector_subphases = accumulated
+            .iter()
+            .filter(|timing| timing.phase.starts_with("vector "))
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        if !vector_total.is_zero() {
+            accumulated.push(AccumulatedPhaseTiming {
+                phase: "vector ipc and orchestration".to_string(),
+                elapsed: vector_total.saturating_sub(vector_subphases),
+            });
+        }
+        let attributed = accumulated
+            .iter()
+            .filter(|timing| !timing.phase.starts_with("vector "))
+            .map(|timing| timing.elapsed)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        let total = started.elapsed();
+        let mut timings = accumulated
+            .into_iter()
+            .map(|timing| FinalizePhaseTiming {
+                phase: timing.phase,
+                elapsed_ms: u64::try_from(timing.elapsed.as_millis()).unwrap_or(u64::MAX),
+            })
+            .collect::<Vec<_>>();
+        timings.push(FinalizePhaseTiming {
+            phase: "unattributed".to_string(),
+            elapsed_ms: u64::try_from(total.saturating_sub(attributed).as_millis())
+                .unwrap_or(u64::MAX),
+        });
+        timings
+    })
+}
+
+fn record_embedding_vector_timings(timings: crate::per_user_embedding::EmbeddingVectorTimings) {
+    record_finalize_phase_timing(
+        "vector tokenization",
+        Duration::from_nanos(timings.tokenization_ns),
+    );
+    record_finalize_phase_timing(
+        "vector native encode",
+        Duration::from_nanos(timings.native_encode_ns),
+    );
+    record_finalize_phase_timing(
+        "vector normalization",
+        Duration::from_nanos(timings.normalization_ns),
+    );
 }
 
 /// Typed signal that source-derived retrieval input drifted during preparation.
@@ -542,6 +718,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     cancelled: &AtomicBool,
     mut progress: impl FnMut(&'static str),
 ) -> Result<FinalizeIndexOutcome> {
+    begin_finalize_phase_timings();
     ensure_retrieval_index_not_cancelled(cancelled, "preflight")?;
     let layout = runtime.layout.clone();
     let project_identity = runtime.validated_project_identity(project_root)?;
@@ -582,6 +759,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         u32::try_from(embedding_dim).context("negative embedding dimension")?,
     )?;
 
+    let fingerprint_started = Instant::now();
     let storage = Store::open(storage_path).context("open storage for retrieval sidecar input")?;
     let lexical_source =
         lexical_source_input(project_root, storage_path).context("hash lexical source input")?;
@@ -593,21 +771,25 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
         dimension: embedding_dim,
         producer_compatibility_identity: &producer_compatibility_identity,
     };
-    let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_source(
+    let prepared_lexical =
+        prepare_lexical_input_for_store(lexical_source, project_root, input_snapshot.storage())
+            .context("prepare pinned lexical input")?;
+    let sidecar_input = compute_sidecar_input_fingerprint_with_lexical_fingerprint(
         input_snapshot.storage(),
         project_root,
         &project_id,
         &embedding_contract,
-        lexical_source,
+        prepared_lexical.fingerprint.clone(),
     )?;
     input_snapshot
         .finish()
         .context("finish coherent sidecar input snapshot")?;
-    let previous_manifest = storage
-        .get_retrieval_index_manifest(&project_id)
-        .context("load previous retrieval_index_manifest")?;
-    let mut previous_manifest_unavailable_reason =
-        previous_manifest.as_ref().and_then(|manifest| {
+    record_finalize_phase_timing("input fingerprint", fingerprint_started.elapsed());
+    let previous_manifest = physical_predecessor_manifest(&storage, &project_id)?;
+    let mut previous_manifest_unavailable_reason = previous_manifest
+        .as_ref()
+        .filter(|manifest| manifest.project_id == project_id)
+        .and_then(|manifest| {
             manifest_unavailable_reason_for_runtime(&project_id, &storage, manifest, runtime)
         });
     if previous_manifest_unavailable_reason.is_none()
@@ -682,14 +864,61 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             };
             let semantic_point_count = semantic_ready_point_count(&previous_semantic);
             if unchanged_generation_is_reusable(&status, semantic_point_count) {
+                record_finalize_component_work(
+                    "lexical",
+                    "reused",
+                    Some(prepared_lexical.document_count()),
+                    Some(0),
+                    Some(0),
+                );
+                record_finalize_component_work(
+                    "vectors",
+                    "reused",
+                    semantic_point_count,
+                    Some(0),
+                    Some(0),
+                );
+                let vector_bytes = component_size(&crate::embedded_vector::index_path(
+                    &layout,
+                    &previous.semantic_generation,
+                ));
+                record_finalize_component_details(
+                    "vectors",
+                    None,
+                    None,
+                    vector_bytes,
+                    vector_bytes,
+                );
+                record_finalize_component_work("graph", "reused", None, Some(0), Some(0));
                 let mut manifest = previous.clone();
                 if let Some(generation) = manifest.sidecar_generation.clone() {
                     let scip_dir = layout.scip_project_dir(&generation);
+                    let lexical_bytes = component_size(
+                        &crate::lexical_index::shard_dir_for(&layout.lexical_data_dir, &generation)
+                            .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+                    );
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        None,
+                        lexical_bytes,
+                        lexical_bytes,
+                    );
+                    let graph_bytes =
+                        component_size(&crate::scip_index::scip_symbols_component_path(&scip_dir));
+                    record_finalize_component_details(
+                        "graph",
+                        Some(0),
+                        None,
+                        graph_bytes,
+                        graph_bytes,
+                    );
                     if update_precise_semantic_import_status(&scip_dir, &generation, &mut manifest)?
                     {
                         return persist_finalized_manifest(
                             project_root,
                             storage_path,
+                            &prepared_lexical,
                             &retention_context,
                             cancelled,
                             &sidecar_input,
@@ -711,6 +940,7 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
                 return persist_finalized_manifest(
                     project_root,
                     storage_path,
+                    &prepared_lexical,
                     &retention_context,
                     cancelled,
                     &sidecar_input,
@@ -776,16 +1006,14 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
 
     let lexical_outcome = with_finalize_progress(&mut progress, "lexical sidecar", || {
         ensure_lexical_generation(
-            project_root,
-            storage_path,
             &layout,
             &generation,
-            &LexicalInputFingerprint {
-                file_count: sidecar_input.lexical_file_count,
-                hash: sidecar_input.lexical_hash.clone(),
-                coverage: sidecar_input.lexical_coverage.clone(),
-            },
+            &prepared_lexical,
             &sidecar_input.hash,
+            previous_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sidecar_generation.as_deref()),
+            cancelled,
             lexical_ready,
         )
     })?;
@@ -806,6 +1034,11 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
             &scip_dir,
             &project_id,
             &generation,
+            previous_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.sidecar_generation.as_deref())
+                .map(|previous| layout.scip_project_dir(previous)),
+            cancelled,
             scip_ready,
             &mut manifest,
         )
@@ -816,19 +1049,41 @@ pub fn finalize_index_for_runtime_with_progress_and_cancel(
     manifest.scip_revision = read_scip_revision(&scip_dir).or(manifest.scip_revision);
     manifest.disk_bytes = sidecar_disk_bytes(&layout, &generation, &collection, &scip_dir);
 
-    with_finalize_progress(&mut progress, "manifest write", || {
-        persist_finalized_manifest(
-            project_root,
-            storage_path,
-            &retention_context,
-            cancelled,
-            &sidecar_input,
-            project_id,
-            manifest,
-            degraded_modes,
-            SidecarStubFlags { scip_stubbed },
-        )
-    })
+    progress("manifest write");
+    persist_finalized_manifest(
+        project_root,
+        storage_path,
+        &prepared_lexical,
+        &retention_context,
+        cancelled,
+        &sidecar_input,
+        project_id,
+        manifest,
+        degraded_modes,
+        SidecarStubFlags { scip_stubbed },
+    )
+}
+
+fn physical_predecessor_manifest(
+    storage: &Store,
+    project_id: &str,
+) -> Result<Option<RetrievalIndexManifest>> {
+    if let Some(manifest) = storage
+        .get_retrieval_index_manifest(project_id)
+        .context("load previous retrieval_index_manifest")?
+    {
+        return Ok(Some(manifest));
+    }
+    Ok(storage
+        .list_retrieval_index_manifests()
+        .context("load physical predecessor retrieval manifests")?
+        .into_iter()
+        .filter(|manifest| manifest_has_current_sidecar_contract(&manifest.project_id, manifest))
+        .max_by(|left, right| {
+            left.built_at_epoch_ms
+                .cmp(&right.built_at_epoch_ms)
+                .then_with(|| left.project_id.cmp(&right.project_id))
+        }))
 }
 
 fn with_finalize_progress<T>(
@@ -837,32 +1092,107 @@ fn with_finalize_progress<T>(
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     progress(phase);
-    action()
+    let started = Instant::now();
+    let result = action();
+    record_finalize_phase_timing(phase, started.elapsed());
+    result
 }
 
 fn ensure_lexical_generation(
-    project_root: &Path,
-    storage_path: &Path,
     layout: &SidecarLayout,
     generation: &str,
-    expected: &LexicalInputFingerprint,
+    expected: &PreparedLexicalInput,
     sidecar_input_hash: &str,
+    previous_generation: Option<&str>,
+    cancelled: &AtomicBool,
     mut lexical_ready: bool,
 ) -> Result<LexicalGenerationOutcome> {
+    let output_path = crate::lexical_index::shard_dir_for(&layout.lexical_data_dir, generation)
+        .join(crate::lexical_index::LEXICAL_INDEX_FILE);
     if lexical_ready {
         info!(sidecar_generation = %generation, "SQLite lexical shard reused");
+        record_finalize_component_work(
+            "lexical",
+            "reused",
+            Some(expected.document_count()),
+            Some(0),
+            Some(0),
+        );
+        let output_bytes = component_size(&output_path);
+        record_finalize_component_details("lexical", None, None, output_bytes, output_bytes);
     } else {
-        match build_lexical_shard(
-            project_root,
-            Some(storage_path),
+        match build_prepared_lexical_shard(
             &layout.lexical_data_dir,
             generation,
             expected,
             sidecar_input_hash,
+            previous_generation,
+            || ensure_retrieval_index_not_cancelled(cancelled, "lexical shard publication"),
         ) {
-            Ok(_) => {
+            Ok((_, work)) => {
                 lexical_ready = true;
-                info!(sidecar_generation = %generation, "SQLite lexical shard built");
+                if let Some(work) = work {
+                    record_finalize_component_work(
+                        "lexical",
+                        if work.direct_reference {
+                            "reused"
+                        } else {
+                            "copy_on_write"
+                        },
+                        Some(work.retained),
+                        Some(work.inserted),
+                        Some(work.removed),
+                    );
+                    let predecessor_bytes = previous_generation.and_then(|previous| {
+                        component_size(
+                            &crate::lexical_index::shard_dir_for(
+                                &layout.lexical_data_dir,
+                                previous,
+                            )
+                            .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+                        )
+                    });
+                    let output_bytes = component_size(&output_path);
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        predecessor_bytes,
+                        output_bytes,
+                        output_bytes,
+                    );
+                    info!(
+                        sidecar_generation = %generation,
+                        retained_document_count = work.retained,
+                        inserted_document_count = work.inserted,
+                        removed_document_count = work.removed,
+                        "SQLite lexical shard reconciled from immutable predecessor"
+                    );
+                } else {
+                    record_finalize_component_work(
+                        "lexical",
+                        "complete",
+                        Some(0),
+                        Some(expected.document_count()),
+                        Some(0),
+                    );
+                    let output_bytes = component_size(&output_path);
+                    record_finalize_component_details(
+                        "lexical",
+                        None,
+                        previous_generation.and_then(|previous| {
+                            component_size(
+                                &crate::lexical_index::shard_dir_for(
+                                    &layout.lexical_data_dir,
+                                    previous,
+                                )
+                                .join(crate::lexical_index::LEXICAL_INDEX_FILE),
+                            )
+                        }),
+                        output_bytes,
+                        output_bytes,
+                    );
+                    info!(sidecar_generation = %generation, "SQLite lexical shard built");
+                }
             }
             Err(error) => {
                 bail!("mandatory SQLite lexical shard build failed for {generation}: {error}")
@@ -873,8 +1203,8 @@ fn ensure_lexical_generation(
         || !crate::lexical_index::shard_matches_lexical_input(
             &layout.lexical_data_dir,
             generation,
-            expected.file_count,
-            &expected.hash,
+            expected.fingerprint.file_count,
+            &expected.fingerprint.hash,
             sidecar_input_hash,
         )
     {
@@ -964,6 +1294,20 @@ fn ensure_semantic_index(
             document_hash: anchor.document_hash.clone(),
         })
         .collect::<Vec<_>>();
+    let current_vector_anchors = anchors
+        .iter()
+        .map(|anchor| CurrentVectorAnchor {
+            node_id: anchor.node_id.0.to_string(),
+            document_hash: anchor.document_hash.clone(),
+            display_name: anchor
+                .qualified_name
+                .clone()
+                .unwrap_or_else(|| anchor.display_name.clone()),
+            file_path: anchor.file_path.clone(),
+            file_role: Some(anchor.file_role),
+            dense_reason: Some(anchor.selection_reason.clone()),
+        })
+        .collect::<Vec<_>>();
 
     let reusable_point_count = semantic_ready_points.and_then(|point_count| {
         let validation = (|| {
@@ -1001,14 +1345,139 @@ fn ensure_semantic_index(
             }
         }
     });
+    let mut content_vector_cache = if reusable_point_count.is_none() {
+        match ContentAddressedVectorCache::open(
+            retention.runtime,
+            project_id,
+            &compatibility_identity,
+            dimension,
+        ) {
+            Ok(cache) => Some(cache),
+            Err(error) => {
+                warn!(
+                    project_id = %project_id,
+                    error = %format!("{error:#}"),
+                    "content-addressed vector reuse is unavailable"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let point_count = if let Some(point_count) = reusable_point_count {
+        record_finalize_component_work("vectors", "reused", Some(point_count), Some(0), Some(0));
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        record_finalize_component_details("vectors", None, None, output_bytes, output_bytes);
         info!(
             project_id = %project_id,
             sidecar_generation = %semantic.generation,
             point_count,
             "attested vector generation reused"
         );
+        point_count
+    } else if let Some((attestation, work)) = retention
+        .previous_manifest
+        .filter(|previous| previous.semantic_generation != semantic.collection)
+        .map(|previous| {
+            with_finalize_progress(progress, "incremental embedded vectors", || {
+                EmbeddedVectorIndex::try_build_incremental_with_cancel(
+                    crate::embedded_vector::AttestedVectorPublication {
+                        layout: semantic.layout,
+                        collection: semantic.collection,
+                        generation: semantic.generation,
+                        input_hash: semantic.input_hash,
+                        contract: &contract,
+                        expected_anchors: &expected_anchors,
+                    },
+                    &previous.semantic_generation,
+                    &evidence,
+                    &current_vector_anchors,
+                    || {
+                        ensure_retrieval_index_not_cancelled(
+                            cancelled,
+                            "incremental vector database publication",
+                        )
+                    },
+                    |missing, visit| {
+                        produce_missing_dense_anchors(
+                            &anchors,
+                            missing,
+                            retention.runtime,
+                            cancelled,
+                            &mut content_vector_cache,
+                            visit,
+                        )
+                    },
+                )
+            })
+        })
+        .transpose()?
+        .flatten()
+    {
+        record_finalize_component_work(
+            "vectors",
+            if work.direct_reference {
+                "reused"
+            } else {
+                "copy_on_write"
+            },
+            Some(work.retained),
+            Some(work.inserted),
+            Some(work.removed),
+        );
+        let predecessor_bytes = retention.previous_manifest.and_then(|previous| {
+            component_size(&crate::embedded_vector::index_path(
+                semantic.layout,
+                &previous.semantic_generation,
+            ))
+        });
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        record_finalize_component_details(
+            "vectors",
+            None,
+            predecessor_bytes,
+            output_bytes,
+            output_bytes,
+        );
+        info!(
+            project_id = %project_id,
+            sidecar_generation = %semantic.generation,
+            retained_point_count = work.retained,
+            embedded_point_count = work.inserted,
+            removed_point_count = work.removed,
+            "vector generation reconciled from immutable predecessor"
+        );
+        let point_count = attestation.point_count;
+        let generation_manifest =
+            VectorGenerationManifest::new(evidence.clone(), attestation.clone())?;
+        EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
+            semantic.layout,
+            semantic.collection,
+            &generation_manifest,
+            || {
+                ensure_retrieval_index_not_cancelled(
+                    cancelled,
+                    "producer-evidence manifest publication",
+                )
+            },
+        )?;
+        EmbeddedVectorIndex::validate_published_attestation(
+            semantic.layout,
+            semantic.collection,
+            semantic.generation,
+            semantic.input_hash,
+            &contract,
+            &expected_anchors,
+            &attestation,
+        )?;
         point_count
     } else {
         let reusable_vectors = retention
@@ -1049,6 +1518,10 @@ fn ensure_semantic_index(
                 "compatible unchanged vectors retained for candidate generation"
             );
         }
+        let ordered_anchors = canonical_dense_anchor_order(
+            anchors.iter().collect::<Vec<_>>(),
+            &mut content_vector_cache,
+        );
         let attestation = with_finalize_progress(progress, "embedded vectors", || {
             EmbeddedVectorIndex::build_attested_with_points_with_cancel(
                 crate::embedded_vector::AttestedVectorPublication {
@@ -1062,32 +1535,28 @@ fn ensure_semantic_index(
                 || ensure_retrieval_index_not_cancelled(cancelled, "vector database publication"),
                 |visit| {
                     let client = crate::embeddings::ProductEmbeddingClient::new(retention.runtime);
-                    for batch in
-                        anchors.chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
+                    for batch in ordered_anchors
+                        .chunks(retention.runtime.retrieval.llm_doc_embed_batch_size.max(1))
                     {
                         ensure_retrieval_index_not_cancelled(cancelled, "embedding batch")?;
                         let missing = batch
                             .iter()
-                            .filter(|anchor| {
+                            .filter(|cached| {
+                                let anchor = cached.anchor;
                                 !reusable_vectors.contains_key(&(
                                     anchor.node_id.0.to_string(),
                                     anchor.document_hash.clone(),
                                 ))
                             })
+                            .map(|cached| (*cached).clone())
                             .collect::<Vec<_>>();
-                        let texts = missing
-                            .iter()
-                            .map(|anchor| anchor.text.clone())
-                            .collect::<Vec<_>>();
-                        let vectors = if texts.is_empty() {
-                            Vec::new()
-                        } else {
-                            client
-                                .embed_documents_with_control(&texts, None, &|| {
-                                    cancelled.load(Ordering::Acquire)
-                                })
-                                .context("embed pinned dense anchor batch")?
-                        };
+                        let vectors = resolve_dense_anchor_batch(
+                            &missing,
+                            &client,
+                            cancelled,
+                            &mut content_vector_cache,
+                            "embed pinned dense anchor batch",
+                        )?;
                         ensure_retrieval_index_not_cancelled(
                             cancelled,
                             "persisting an embedding batch",
@@ -1099,12 +1568,15 @@ fn ensure_semantic_index(
                                 missing.len()
                             );
                         }
-                        let mut embedded =
-                            missing.into_iter().zip(vectors).map(|(anchor, vector)| {
-                                Ok::<_, anyhow::Error>((anchor.node_id, normalize_vector(vector)?))
-                            });
+                        let normalized = missing
+                            .into_iter()
+                            .zip(vectors)
+                            .map(|(cached, vector)| (cached.anchor.node_id, vector))
+                            .collect::<Vec<_>>();
+                        let mut embedded = normalized.into_iter().map(Ok::<_, anyhow::Error>);
                         let mut next_embedded = embedded.next().transpose()?;
-                        for anchor in batch {
+                        for cached in batch {
+                            let anchor = cached.anchor;
                             ensure_retrieval_index_not_cancelled(
                                 cancelled,
                                 "persisting an embedded vector",
@@ -1146,6 +1618,24 @@ fn ensure_semantic_index(
             )
         })?;
         let point_count = attestation.point_count;
+        record_finalize_component_work("vectors", "complete", Some(0), Some(point_count), Some(0));
+        let output_bytes = component_size(&crate::embedded_vector::index_path(
+            semantic.layout,
+            semantic.collection,
+        ));
+        let predecessor_bytes = retention.previous_manifest.and_then(|previous| {
+            component_size(&crate::embedded_vector::index_path(
+                semantic.layout,
+                &previous.semantic_generation,
+            ))
+        });
+        record_finalize_component_details(
+            "vectors",
+            None,
+            predecessor_bytes,
+            output_bytes,
+            output_bytes,
+        );
         let generation_manifest = VectorGenerationManifest::new(evidence, attestation.clone())?;
         EmbeddedVectorIndex::publish_generation_manifest_with_cancel(
             semantic.layout,
@@ -1169,6 +1659,15 @@ fn ensure_semantic_index(
         )?;
         point_count
     };
+    if let Some(cache) = content_vector_cache.as_ref() {
+        let (hit_batches, miss_batches) = cache.activity();
+        info!(
+            project_id = %project_id,
+            hit_batches,
+            miss_batches,
+            "content-addressed vector batch reuse completed"
+        );
+    }
     snapshot
         .finish()
         .context("finish pinned dense anchor input generation")?;
@@ -1185,6 +1684,243 @@ fn ensure_semantic_index(
         "embedded SQLite vector generation published"
     );
     Ok(point_count)
+}
+
+#[derive(Clone)]
+struct CacheableDenseAnchor<'a> {
+    anchor: &'a DenseAnchorInput,
+    identity: String,
+}
+
+fn canonical_dense_anchor_order<'a>(
+    anchors: Vec<&'a DenseAnchorInput>,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+) -> Vec<CacheableDenseAnchor<'a>> {
+    let mut current = anchors
+        .into_iter()
+        .map(|anchor| CacheableDenseAnchor {
+            anchor,
+            identity: stable_dense_anchor_identity(anchor),
+        })
+        .collect::<Vec<_>>();
+    let inputs = current
+        .iter()
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
+        })
+        .collect::<Vec<_>>();
+    let order = match content_vector_cache.as_mut() {
+        Some(cache) => cache.canonical_order(&inputs),
+        None => return current,
+    };
+    let order = match order {
+        Ok(order) => order,
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector corpus planning failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+            return current;
+        }
+    };
+    let mut available = current.drain(..).map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .map(|index| {
+            available
+                .get_mut(index)
+                .and_then(Option::take)
+                .expect("validated vector corpus order")
+        })
+        .collect()
+}
+
+fn stable_dense_anchor_identity(anchor: &DenseAnchorInput) -> String {
+    let mut digest = Sha256::new();
+    hash_part(&mut digest, "codestory-stable-dense-anchor-v2");
+    hash_part(&mut digest, &(anchor.kind as i32).to_string());
+    hash_optional_dense_anchor_part(&mut digest, anchor.file_path.as_deref());
+    hash_optional_dense_anchor_part(
+        &mut digest,
+        anchor
+            .start_line
+            .as_ref()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    hash_optional_dense_anchor_part(
+        &mut digest,
+        anchor
+            .end_line
+            .as_ref()
+            .map(|value| value.to_string())
+            .as_deref(),
+    );
+    format!("{:x}", digest.finalize())
+}
+
+fn hash_optional_dense_anchor_part(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hash_part(hasher, "some");
+            hash_part(hasher, value);
+        }
+        None => hash_part(hasher, "none"),
+    }
+}
+
+fn produce_missing_dense_anchors(
+    anchors: &[DenseAnchorInput],
+    missing: &[ExpectedVectorAnchor],
+    runtime: &SidecarRuntimeConfig,
+    cancelled: &AtomicBool,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+    visit: &mut dyn FnMut(AttestedSemanticPoint) -> Result<()>,
+) -> Result<()> {
+    let anchors_by_node = anchors
+        .iter()
+        .map(|anchor| (anchor.node_id.0.to_string(), anchor))
+        .collect::<BTreeMap<_, _>>();
+    let missing_anchors = missing
+        .iter()
+        .map(|expected| {
+            let anchor = anchors_by_node
+                .get(&expected.node_id)
+                .with_context(|| format!("missing dense anchor {}", expected.node_id))?;
+            if anchor.document_hash != expected.document_hash {
+                bail!(
+                    "dense anchor document hash changed for {}",
+                    expected.node_id
+                );
+            }
+            Ok(*anchor)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let missing_anchors = canonical_dense_anchor_order(missing_anchors, content_vector_cache);
+    let client = crate::embeddings::ProductEmbeddingClient::new(runtime);
+    for batch in missing_anchors.chunks(runtime.retrieval.llm_doc_embed_batch_size.max(1)) {
+        ensure_retrieval_index_not_cancelled(cancelled, "incremental embedding batch")?;
+        let vectors = resolve_dense_anchor_batch(
+            batch,
+            &client,
+            cancelled,
+            content_vector_cache,
+            "embed changed dense anchor batch",
+        )?;
+        ensure_retrieval_index_not_cancelled(
+            cancelled,
+            "persisting an incremental embedding batch",
+        )?;
+        if vectors.len() != batch.len() {
+            bail!(
+                "embedding engine returned {} vectors for {} changed anchors",
+                vectors.len(),
+                batch.len()
+            );
+        }
+        for (cached, vector) in batch.iter().zip(vectors) {
+            let anchor = cached.anchor;
+            visit(AttestedSemanticPoint {
+                point: SemanticPoint {
+                    display_name: anchor
+                        .qualified_name
+                        .clone()
+                        .unwrap_or_else(|| anchor.display_name.clone()),
+                    node_id: anchor.node_id.0.to_string(),
+                    file_path: anchor.file_path.clone(),
+                    file_role: Some(anchor.file_role),
+                    dense_reason: Some(anchor.selection_reason.clone()),
+                    vector,
+                },
+                document_hash: anchor.document_hash.clone(),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_dense_anchor_batch(
+    batch: &[CacheableDenseAnchor<'_>],
+    client: &crate::embeddings::ProductEmbeddingClient,
+    cancelled: &AtomicBool,
+    content_vector_cache: &mut Option<ContentAddressedVectorCache>,
+    embedding_context: &'static str,
+) -> Result<Vec<Vec<f32>>> {
+    if batch.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cache_batch = batch
+        .iter()
+        .map(|cached| VectorCacheBatchInput {
+            anchor_identity: &cached.identity,
+            document_hash: &cached.anchor.document_hash,
+            text: &cached.anchor.text,
+        })
+        .collect::<Vec<_>>();
+    let cache_started = Instant::now();
+    let cached = match content_vector_cache.as_mut() {
+        Some(cache) => cache.load_batch(&cache_batch),
+        None => Ok(None),
+    };
+    record_finalize_phase_timing("vector content cache", cache_started.elapsed());
+    match cached {
+        Ok(Some(vectors)) => return Ok(vectors),
+        Ok(None) => {}
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector cache read failed; continuing without reuse"
+            );
+            *content_vector_cache = None;
+        }
+    }
+
+    let texts = batch
+        .iter()
+        .map(|cached| cached.anchor.text.clone())
+        .collect::<Vec<_>>();
+    let (vectors, timings) = client
+        .embed_documents_with_control_and_timings(&texts, None, &|| {
+            cancelled.load(Ordering::Acquire)
+        })
+        .with_context(|| embedding_context)?;
+    record_embedding_vector_timings(timings);
+    ensure_retrieval_index_not_cancelled(cancelled, "normalizing an embedding batch")?;
+    if vectors.len() != batch.len() {
+        bail!(
+            "embedding engine returned {} vectors for {} anchors",
+            vectors.len(),
+            batch.len()
+        );
+    }
+    let normalization_started = Instant::now();
+    let normalized = vectors
+        .into_iter()
+        .map(normalize_vector)
+        .collect::<Result<Vec<_>>>()?;
+    record_finalize_phase_timing("vector normalization", normalization_started.elapsed());
+
+    let cache_started = Instant::now();
+    let canonical = content_vector_cache
+        .as_mut()
+        .map(|cache| cache.publish_batch(&cache_batch, &normalized))
+        .transpose();
+    record_finalize_phase_timing("vector content cache", cache_started.elapsed());
+    match canonical {
+        Ok(Some(vectors)) => Ok(vectors),
+        Ok(None) => Ok(normalized),
+        Err(error) => {
+            warn!(
+                error = %format!("{error:#}"),
+                "content-addressed vector cache publication failed; using fresh vectors"
+            );
+            *content_vector_cache = None;
+            Ok(normalized)
+        }
+    }
 }
 
 fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
@@ -1205,25 +1941,74 @@ fn normalize_vector(mut vector: Vec<f32>) -> Result<Vec<f32>> {
     Ok(vector)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ensure_scip_artifacts(
     storage_path: &Path,
     scip_dir: &Path,
     project_id: &str,
     generation: &str,
+    previous_project_dir: Option<PathBuf>,
+    cancelled: &AtomicBool,
     scip_ready: bool,
     manifest: &mut RetrievalIndexManifest,
 ) -> Result<()> {
     if scip_ready {
         info!(project_id = %project_id, sidecar_generation = %generation, "SCIP graph artifacts reused");
+        record_finalize_component_work("graph", "reused", None, Some(0), Some(0));
+        let output_bytes =
+            component_size(&crate::scip_index::scip_symbols_component_path(scip_dir));
+        record_finalize_component_details("graph", Some(0), None, output_bytes, output_bytes);
         return Ok(());
     }
-    match emit_scip_artifacts_from_store(storage_path, scip_dir, generation) {
-        Ok(Some(revision)) => {
+    match emit_scip_artifacts_from_store_incremental(
+        storage_path,
+        scip_dir,
+        generation,
+        previous_project_dir.as_deref(),
+        || ensure_retrieval_index_not_cancelled(cancelled, "SCIP component publication"),
+    ) {
+        Ok(outcome) if outcome.revision.is_some() => {
+            record_finalize_component_work(
+                "graph",
+                if outcome.direct_reference {
+                    "reused"
+                } else if outcome.cloned {
+                    "copy_on_write"
+                } else {
+                    "complete"
+                },
+                Some(outcome.retained_records),
+                Some(outcome.inserted_records),
+                Some(outcome.removed_records),
+            );
+            let predecessor_bytes = previous_project_dir.as_deref().and_then(|previous| {
+                component_size(&crate::scip_index::scip_symbols_component_path(previous))
+            });
+            let output_bytes =
+                component_size(&crate::scip_index::scip_symbols_component_path(scip_dir));
+            record_finalize_component_details(
+                "graph",
+                Some(outcome.reordered_records),
+                predecessor_bytes,
+                output_bytes,
+                output_bytes,
+            );
+            let revision = outcome.revision.expect("matched present revision");
             manifest.scip_revision = Some(revision.clone());
-            info!(project_id = %project_id, sidecar_generation = %generation, %revision, "SCIP graph artifacts emitted from store");
+            info!(
+                project_id = %project_id,
+                sidecar_generation = %generation,
+                %revision,
+                retained_record_count = outcome.retained_records,
+                inserted_record_count = outcome.inserted_records,
+                removed_record_count = outcome.removed_records,
+                reordered_record_count = outcome.reordered_records,
+                cloned = outcome.cloned,
+                "SCIP graph artifacts emitted from store"
+            );
             Ok(())
         }
-        Ok(None) => {
+        Ok(_) => {
             bail!("mandatory SCIP graph artifacts unavailable for {project_id}");
         }
         Err(error) => {
@@ -1388,6 +2173,7 @@ fn with_embedding_publication_residency<T>(
 fn persist_finalized_manifest(
     project_root: &Path,
     storage_path: &Path,
+    prepared_lexical: &PreparedLexicalInput,
     retention_context: &GenerationRetentionContext<'_>,
     cancelled: &AtomicBool,
     sidecar_input: &SidecarInputFingerprint,
@@ -1396,6 +2182,7 @@ fn persist_finalized_manifest(
     degraded_modes: Vec<String>,
     stub_flags: SidecarStubFlags,
 ) -> Result<FinalizeIndexOutcome> {
+    let manifest_started = Instant::now();
     manifest.built_at_epoch_ms = Utc::now().timestamp_millis();
     manifest.degraded_modes_json =
         serde_json::to_string(&degraded_modes).unwrap_or_else(|_| "[]".into());
@@ -1414,20 +2201,21 @@ fn persist_finalized_manifest(
                 sidecar_input,
                 &manifest,
                 |storage| {
-                    let lexical_source = lexical_source_input(project_root, storage_path)
-                        .context("rescan lexical source at publication fence")?;
+                    prepared_lexical
+                        .revalidate_source_seals(project_root, storage_path)
+                        .context("revalidate lexical source identities at publication fence")?;
                     let embedding_contract = SidecarEmbeddingContract {
                         backend: &embedding_backend,
                         dimension: embedding_dim,
                         producer_compatibility_identity: &retention_context
                             .producer_compatibility_identity,
                     };
-                    let current_input = compute_sidecar_input_fingerprint_with_lexical_source(
+                    let current_input = compute_sidecar_input_fingerprint_with_lexical_fingerprint(
                         storage,
                         project_root,
                         &project_id,
                         &embedding_contract,
-                        lexical_source,
+                        prepared_lexical.fingerprint.clone(),
                     )?;
                     if let Some(reason) = manifest_unavailable_reason_for_runtime(
                         &project_id,
@@ -1544,6 +2332,7 @@ fn persist_finalized_manifest(
         "retrieval index manifest persisted"
     );
 
+    record_finalize_phase_timing("manifest write", manifest_started.elapsed());
     Ok(FinalizeIndexOutcome {
         project_id,
         manifest,
@@ -1551,6 +2340,8 @@ fn persist_finalized_manifest(
         scip_stubbed: stub_flags.scip_stubbed,
         generation_retention_plan,
         generation_retention,
+        phase_timings: finish_finalize_phase_timings(),
+        component_work: finish_finalize_component_work(),
     })
 }
 
@@ -2081,6 +2872,22 @@ fn compute_sidecar_input_fingerprint_with_lexical_source(
 ) -> Result<SidecarInputFingerprint> {
     let lexical = finish_lexical_input_for_store(lexical_source, project_root, storage)
         .context("hash lexical symbol input")?;
+    compute_sidecar_input_fingerprint_with_lexical_fingerprint(
+        storage,
+        project_root,
+        project_id,
+        embedding,
+        lexical,
+    )
+}
+
+fn compute_sidecar_input_fingerprint_with_lexical_fingerprint(
+    storage: &Store,
+    project_root: &Path,
+    project_id: &str,
+    embedding: &SidecarEmbeddingContract<'_>,
+    lexical: LexicalInputFingerprint,
+) -> Result<SidecarInputFingerprint> {
     let mut hasher = Sha256::new();
     let mut graph_hasher = Sha256::new();
     hash_part(&mut hasher, "codestory-sidecar-input-v10");
@@ -2322,6 +3129,145 @@ mod tests {
         serde_json::to_writer(&mut file, value).expect("write private control");
         file.write_all(b"\n").expect("terminate private control");
         file.sync_all().expect("sync private control");
+    }
+
+    #[test]
+    fn finalization_receipt_includes_manifest_time_and_component_bytes() {
+        begin_finalize_phase_timings();
+        record_finalize_phase_timing("input fingerprint", Duration::from_millis(2));
+        record_finalize_component_work("vectors", "copy_on_write", Some(4), Some(1), Some(1));
+        record_finalize_component_details("vectors", None, Some(1_024), Some(1_100), Some(1_100));
+        record_finalize_phase_timing("manifest write", Duration::from_millis(3));
+
+        let timings = finish_finalize_phase_timings();
+        let work = finish_finalize_component_work();
+
+        assert!(
+            timings
+                .iter()
+                .any(|timing| timing.phase == "manifest write" && timing.elapsed_ms == 3)
+        );
+        assert_eq!(work[0].predecessor_bytes, Some(1_024));
+        assert_eq!(work[0].output_bytes, Some(1_100));
+        assert_eq!(work[0].attested_bytes, Some(1_100));
+    }
+
+    #[test]
+    fn vector_subphases_reconcile_without_double_counting_the_total() {
+        begin_finalize_phase_timings();
+        record_finalize_phase_timing("embedded vectors", Duration::from_millis(100));
+        record_finalize_phase_timing("vector tokenization", Duration::from_millis(10));
+        record_finalize_phase_timing("vector native encode", Duration::from_millis(40));
+        record_finalize_phase_timing("vector normalization", Duration::from_millis(5));
+        record_finalize_phase_timing("vector content cache", Duration::from_millis(5));
+        record_finalize_phase_timing("vector sqlite persistence", Duration::from_millis(20));
+        record_finalize_phase_timing("vector hashing", Duration::from_millis(5));
+        record_finalize_phase_timing("vector final validation", Duration::from_millis(10));
+
+        let timings = finish_finalize_phase_timings();
+        let remainder = timings
+            .iter()
+            .find(|timing| timing.phase == "vector ipc and orchestration")
+            .expect("vector timing remainder");
+
+        assert_eq!(remainder.elapsed_ms, 5);
+        assert_eq!(
+            timings
+                .iter()
+                .find(|timing| timing.phase == "unattributed")
+                .expect("top-level remainder")
+                .elapsed_ms,
+            0,
+            "nested vector subphases must not be subtracted from the top-level clock twice"
+        );
+    }
+
+    #[test]
+    fn dense_anchor_cache_identity_ignores_store_local_publication_identity() {
+        let mut anchor = DenseAnchorInput {
+            node_id: NodeId(1),
+            file_node_id: Some(NodeId(2)),
+            kind: NodeKind::FUNCTION,
+            display_name: "do_work".into(),
+            qualified_name: Some("pkg::do_work".into()),
+            file_path: Some("src/lib.rs".into()),
+            start_line: Some(4),
+            end_line: Some(8),
+            file_role: FileRole::Source,
+            source_provenance: "parser".into(),
+            text: "function do_work semantic document".into(),
+            document_hash: "document-hash".into(),
+            selection_reason: "public_api".into(),
+            policy_version: "graph_first_v3".into(),
+            source_identity: "core:generation-a:run-a".into(),
+            updated_at_epoch_ms: 1,
+        };
+        let expected = stable_dense_anchor_identity(&anchor);
+
+        anchor.node_id = NodeId(99);
+        anchor.file_node_id = Some(NodeId(100));
+        anchor.display_name = "renamed_document_label".into();
+        anchor.qualified_name = Some("other::rendered::label".into());
+        anchor.text = "different exact prepared document".into();
+        anchor.document_hash = "different-document-hash".into();
+        anchor.source_identity = "core:generation-b:run-b".into();
+        anchor.updated_at_epoch_ms = 2;
+        assert_eq!(stable_dense_anchor_identity(&anchor), expected);
+
+        anchor.start_line = Some(5);
+        assert_ne!(stable_dense_anchor_identity(&anchor), expected);
+    }
+
+    #[test]
+    fn vector_publication_reports_persistence_hashing_and_validation_subphases() {
+        let directory = TempDir::new().expect("vector timing directory");
+        let layout = SidecarLayout {
+            lexical_data_dir: directory.path().join("lexical"),
+            semantic_data_dir: directory.path().join("semantic"),
+            scip_artifacts_root: directory.path().join("scip"),
+            state_file: directory.path().join("state.json"),
+        };
+        let contract = VectorEvidenceContract::new("backend", 2, "producer", "evidence");
+        let expected = vec![ExpectedVectorAnchor {
+            node_id: "node-1".into(),
+            document_hash: "document-1".into(),
+        }];
+
+        begin_finalize_phase_timings();
+        EmbeddedVectorIndex::build_attested_with_points(
+            &layout,
+            "collection",
+            "generation",
+            "input",
+            &contract,
+            &expected,
+            |visit| {
+                visit(AttestedSemanticPoint {
+                    point: SemanticPoint {
+                        display_name: "symbol".into(),
+                        node_id: "node-1".into(),
+                        file_path: Some("src/lib.rs".into()),
+                        file_role: Some(FileRole::Source),
+                        dense_reason: Some("public_api".into()),
+                        vector: vec![1.0, 0.0],
+                    },
+                    document_hash: "document-1".into(),
+                })
+            },
+        )
+        .expect("publish vector database");
+        let timings = finish_finalize_phase_timings();
+
+        for phase in [
+            "vector sqlite persistence",
+            "vector hashing",
+            "vector final validation",
+        ] {
+            assert!(
+                timings.iter().any(|timing| timing.phase == phase),
+                "missing vector construction phase {phase}: {timings:?}"
+            );
+        }
     }
 
     #[test]
@@ -3353,6 +4299,36 @@ mod tests {
     }
 
     #[test]
+    fn dirty_identity_reuses_the_latest_valid_physical_predecessor() {
+        let storage_dir = TempDir::new().expect("storage dir");
+        let mut storage = Store::open(storage_dir.path().join("codestory.db"))
+            .expect("open retrieval manifest store");
+        let mut canonical =
+            crate::test_support::retrieval_manifest_fixture("repo-v2-clean", "canonical-input");
+        canonical.built_at_epoch_ms = 7;
+        storage
+            .upsert_retrieval_index_manifest(&canonical)
+            .expect("publish canonical manifest");
+
+        let selected = physical_predecessor_manifest(&storage, "workspace-dirty")
+            .expect("select physical predecessor")
+            .expect("canonical predecessor");
+        assert_eq!(selected, canonical);
+
+        let mut dirty =
+            crate::test_support::retrieval_manifest_fixture("workspace-dirty", "dirty-input");
+        dirty.built_at_epoch_ms = 1;
+        storage
+            .upsert_retrieval_index_manifest(&dirty)
+            .expect("publish dirty manifest");
+
+        let selected = physical_predecessor_manifest(&storage, "workspace-dirty")
+            .expect("select current identity manifest")
+            .expect("dirty predecessor");
+        assert_eq!(selected, dirty, "the exact identity must win over recency");
+    }
+
+    #[test]
     fn manifest_promotion_rejects_same_count_content_drift_and_preserves_current() {
         let _env = crate::test_support::env_lock();
         let project = TempDir::new().expect("project dir");
@@ -4001,6 +4977,8 @@ mod tests {
         );
         let vector_path =
             crate::embedded_vector::index_path(&runtime.layout, &previous.semantic_generation);
+        crate::copy_on_write::make_file_owner_writable(&vector_path)
+            .expect("make rollback vector database writable for corruption");
         std::fs::OpenOptions::new()
             .append(true)
             .open(&vector_path)

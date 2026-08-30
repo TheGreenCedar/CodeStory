@@ -2,34 +2,42 @@
 
 use crate::packet_evidence_carriers::{
     SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
-    citation_owns_buffer_read_write, citation_owns_buffer_storage,
-    citation_owns_client_adapter_selection, citation_owns_client_public_facade_helper,
-    citation_owns_client_request_dispatch, citation_owns_client_request_entrypoint,
-    citation_owns_client_request_finalization, citation_owns_client_request_method,
-    citation_owns_client_response_materialization, citation_owns_client_transport_send,
-    citation_owns_css_animation_entrypoint, citation_owns_css_animation_structure,
-    citation_owns_css_structure, citation_owns_form_custom_validation,
-    citation_owns_form_native_constraint, citation_owns_form_submit_guard,
-    citation_owns_format_arguments, citation_owns_formatter_fallback,
-    citation_owns_hook_cache_helper, citation_owns_hook_key_serialization,
-    citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
-    citation_owns_html_app_shell, citation_owns_log_handler_processing,
-    citation_owns_log_record_creation, citation_owns_mapper_configuration,
-    citation_owns_mapper_execution, citation_owns_search_evidence_classification,
-    citation_owns_search_evidence_output, citation_owns_server_request_dispatch,
-    citation_owns_server_request_entrypoint, citation_owns_server_response_terminal,
-    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
-    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
-    citation_owns_site_terminal, citation_owns_string_blank_predicate,
-    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
-    client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
-    client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
-    flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
-    flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
-    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
-    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
+    citation_may_start_command_event_loop_exact_boundary, citation_owns_buffer_read_write,
+    citation_owns_buffer_storage, citation_owns_client_adapter_selection,
+    citation_owns_client_public_facade_helper, citation_owns_client_request_dispatch,
+    citation_owns_client_request_entrypoint, citation_owns_client_request_finalization,
+    citation_owns_client_request_method, citation_owns_client_response_materialization,
+    citation_owns_client_transport_send, citation_owns_command_event_loop_driver,
+    citation_owns_command_router, citation_owns_css_animation_entrypoint,
+    citation_owns_css_animation_structure, citation_owns_css_structure,
+    citation_owns_form_custom_validation, citation_owns_form_native_constraint,
+    citation_owns_form_submit_guard, citation_owns_format_arguments,
+    citation_owns_formatter_fallback, citation_owns_hook_cache_helper,
+    citation_owns_hook_key_serialization, citation_owns_hook_mutation_flow,
+    citation_owns_hook_public_export, citation_owns_html_app_shell,
+    citation_owns_log_handler_processing, citation_owns_log_record_creation,
+    citation_owns_mapper_configuration, citation_owns_mapper_execution,
+    citation_owns_search_argument_planning, citation_owns_search_candidate_traversal,
+    citation_owns_search_evidence_classification, citation_owns_search_evidence_output,
+    citation_owns_search_haystack_construction, citation_owns_search_matcher_setup,
+    citation_owns_search_printer_setup, citation_owns_search_searcher_setup,
+    citation_owns_search_worker_construction, citation_owns_server_request_dispatch,
+    citation_owns_server_request_entrypoint, citation_owns_server_request_handler_entrypoint,
+    citation_owns_server_response_terminal, citation_owns_server_route_match_dispatch,
+    citation_owns_server_route_registration, citation_owns_shell_completion,
+    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
+    citation_owns_site_lifecycle, citation_owns_site_reader, citation_owns_site_terminal,
+    citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
+    citation_owns_string_region_handoff, client_public_facade_successor_call_target,
+    client_request_dispatch_predecessor_call_source, client_request_dispatch_successor_call_target,
+    client_request_entrypoint_call_target, command_event_loop_driver_call_target,
+    command_router_call_target, flow_belongs_to_client_request, flow_belongs_to_command_server,
+    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
+    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
+    flow_belongs_to_url_session, server_handler_chain_call_target,
     server_request_dispatch_call_target, server_request_entrypoint_call_target,
-    server_response_terminal_call_target,
+    server_response_terminal_call_target, server_route_insertion_call_target,
+    server_route_lookup_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -290,6 +298,25 @@ pub fn ordinary_incident_call_receipt_is_valid(
         }
 }
 
+/// Whether the exact-boundary hydrator may inspect raw CALL rows for this citation. This does not
+/// make the citation evidence: discovery-only candidates still need a valid exact receipt before
+/// obligation finalization can retain them.
+pub fn flow_requirement_call_boundary_is_discoverable(
+    requirement: &FlowRequirement,
+    citation: &AgentCitationDto,
+) -> bool {
+    requirement
+        .evidence
+        .call_boundary_target(citation)
+        .is_some()
+        || requirement
+            .evidence
+            .ordered_call_boundary(citation)
+            .is_some()
+        || (requirement.id == "command_event_loop"
+            && citation_may_start_command_event_loop_exact_boundary(citation))
+}
+
 pub fn flow_requirement_call_receipt_is_valid(
     requirement: &FlowRequirement,
     citation: &AgentCitationDto,
@@ -315,6 +342,13 @@ pub fn flow_requirement_call_receipt_is_valid(
             return false;
         }
         Some(outgoing_target)
+    } else if requirement.id == "command_event_loop"
+        && citation_may_start_command_event_loop_exact_boundary(citation)
+    {
+        if edge.source != citation.node_id {
+            return false;
+        }
+        Some(command_event_loop_driver_call_target as SymbolPredicate)
     } else {
         if !requirement
             .evidence
@@ -476,7 +510,11 @@ pub fn packet_flow_requirements_for_terms(
                     requirement.role != FlowRole::TerminalBoundary || response_terminal_requested
                 }),
         );
-    } else if client_request_dispatch {
+    }
+    if server_route_dispatch {
+        requirements.extend_from_slice(SERVER_ROUTE_DISPATCH_DETAIL_FLOW);
+    }
+    if !server_request_dispatch && !server_route_dispatch && client_request_dispatch {
         if full_outbound_request {
             push_full_client_outbound_request_flow(terms, &mut requirements);
         } else {
@@ -532,7 +570,7 @@ pub fn packet_flow_requirements_for_terms(
         push_string_predicate_requirements_for_terms(terms, &mut requirements);
     }
     if packet_terms_indicate_search_execution_flow(terms) {
-        requirements.extend_from_slice(SEARCH_EXECUTION_FLOW);
+        push_search_execution_requirements_for_terms(terms, &mut requirements);
     }
     let search_evidence_requested = packet_terms_have_any(terms, &["search", "searches"])
         && packet_terms_have_any(terms, &["evidence", "proof", "provenance"]);
@@ -937,6 +975,65 @@ const SERVER_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     },
 ];
 
+/// The ordered structural links inside an inbound route-dispatch flow. These sit beside the
+/// established registration/dispatch/terminal requirements: they narrow broad route questions to
+/// the handoffs needed to explain how a registered method reaches storage, how a server request
+/// enters the dispatcher, and how a match reaches the handler chain.
+const SERVER_ROUTE_DISPATCH_DETAIL_FLOW: &[FlowRequirement] = &[
+    FlowRequirement {
+        id: "server_route_insertion_handoff",
+        role: FlowRole::Dispatch,
+        query_seeds: &["route registration insertion", "router route storage"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[],
+            carrier: citation_owns_server_route_registration,
+            call_target: Some(server_route_insertion_call_target),
+        },
+    },
+    FlowRequirement {
+        id: "server_request_handler_handoff",
+        role: FlowRole::Entrypoint,
+        query_seeds: &["server request handler", "serve http request dispatch"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[],
+            carrier: citation_owns_server_request_handler_entrypoint,
+            call_target: Some(server_request_dispatch_call_target),
+        },
+    },
+    FlowRequirement {
+        id: "server_route_match_lookup",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["route tree lookup", "find matched route"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[],
+            carrier: citation_owns_server_route_match_dispatch,
+            call_target: Some(server_route_lookup_call_target),
+        },
+    },
+    FlowRequirement {
+        id: "server_handler_chain_handoff",
+        role: FlowRole::TerminalBoundary,
+        query_seeds: &["matched handlers context chain", "handler chain next"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+            subsystem: flow_belongs_to_server_request,
+            roles: &[],
+            carrier: citation_owns_server_route_match_dispatch,
+            call_target: Some(server_handler_chain_call_target),
+        },
+    },
+];
+
 const CLIENT_REQUEST_DISPATCH_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "request_entrypoint",
@@ -1145,12 +1242,19 @@ const COMMAND_SERVER_BOOTSTRAP_REQUIREMENT: FlowRequirement = FlowRequirement {
 const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "command_event_loop",
     role: FlowRole::Dispatch,
-    query_seeds: &["event loop", "event loop source"],
+    query_seeds: &[
+        "event loop",
+        "event loop driver",
+        "process events callbacks",
+        "main event loop process events",
+    ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
-    evidence: EvidencePredicate::CitedRoles {
-        subsystem: flow_belongs_to_event_loop,
-        roles: &[PacketEvidenceRole::EventLoop],
+    evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+        subsystem: flow_belongs_to_command_server,
+        roles: &[],
+        carrier: citation_owns_command_event_loop_driver,
+        call_target: Some(command_event_loop_driver_call_target),
     },
 };
 
@@ -1169,15 +1273,19 @@ const COMMAND_NETWORK_INPUT_REQUIREMENT: FlowRequirement = FlowRequirement {
 const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "command_dispatch",
     role: FlowRole::Dispatch,
-    query_seeds: &["command dispatch", "command table dispatch"],
+    query_seeds: &[
+        "command dispatch",
+        "command table dispatch",
+        "command routing checks",
+        "process command routing checks",
+    ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
-    evidence: EvidencePredicate::CitedRoles {
-        subsystem: flow_belongs_to_command_dispatch,
-        roles: &[
-            PacketEvidenceRole::CommandDispatch,
-            PacketEvidenceRole::RequestDispatch,
-        ],
+    evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+        subsystem: flow_belongs_to_command_server,
+        roles: &[],
+        carrier: citation_owns_command_router,
+        call_target: Some(command_router_call_target),
     },
 };
 
@@ -1356,10 +1464,24 @@ const SITE_BUILD_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "site_lifecycle",
         role: FlowRole::Entrypoint,
-        query_seeds: &["site build lifecycle", "site process phases"],
+        query_seeds: &[
+            "site build lifecycle",
+            "Site.process reset read generate render cleanup write",
+        ],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedCarrier(citation_owns_site_lifecycle),
+    },
+    FlowRequirement {
+        id: "site_reader",
+        role: FlowRole::StateOrStorage,
+        query_seeds: &[
+            "Reader.read site content layouts collections pages data",
+            "static site content reader",
+        ],
+        coverage_mode: CoverageMode::AllowsSourceRange,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_site_reader),
     },
     FlowRequirement {
         id: "site_terminal",
@@ -1485,37 +1607,170 @@ const SEARCH_EXECUTION_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
         id: "search_entrypoint",
         role: FlowRole::Entrypoint,
-        query_seeds: &["search entrypoint", "argument planning"],
+        query_seeds: &["main flags parse run"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_search,
-            roles: &[
-                PacketEvidenceRole::SearchDriver,
-                PacketEvidenceRole::ArgumentPlanning,
-                PacketEvidenceRole::CommandEntrypoint,
-            ],
+            roles: &[PacketEvidenceRole::CommandEntrypoint],
         },
+    },
+    FlowRequirement {
+        id: "search_argument_planning",
+        role: FlowRole::Configuration,
+        query_seeds: &["flag parsing"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_argument_planning),
+    },
+    FlowRequirement {
+        id: "search_driver",
+        role: FlowRole::Dispatch,
+        query_seeds: &["parallel search walker"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedRoles {
+            subsystem: flow_belongs_to_search,
+            roles: &[PacketEvidenceRole::SearchDriver],
+        },
+    },
+    FlowRequirement {
+        id: "search_candidate_traversal",
+        role: FlowRole::Dispatch,
+        query_seeds: &["parallel search walk builder"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_candidate_traversal),
+    },
+    FlowRequirement {
+        id: "search_haystack_construction",
+        role: FlowRole::TransformOrValidate,
+        query_seeds: &["haystack builder"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_haystack_construction),
+    },
+    FlowRequirement {
+        id: "search_matcher_setup",
+        role: FlowRole::Configuration,
+        query_seeds: &["argument matcher"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_matcher_setup),
+    },
+    FlowRequirement {
+        id: "search_searcher_setup",
+        role: FlowRole::Configuration,
+        query_seeds: &["searcher construction"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_searcher_setup),
+    },
+    FlowRequirement {
+        id: "search_printer_setup",
+        role: FlowRole::Configuration,
+        query_seeds: &["result printer construction"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_printer_setup),
+    },
+    FlowRequirement {
+        id: "search_worker_construction",
+        role: FlowRole::Configuration,
+        query_seeds: &["search worker matcher searcher printer"],
+        coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+        proof: FlowProofSpec::Legacy,
+        evidence: EvidencePredicate::CitedCarrier(citation_owns_search_worker_construction),
     },
     FlowRequirement {
         id: "search_dispatch",
         role: FlowRole::Dispatch,
-        query_seeds: &[
-            "search execution",
-            "parallel search",
-            "search execution unit",
-        ],
+        query_seeds: &["search execution"],
         coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
         proof: FlowProofSpec::Legacy,
         evidence: EvidencePredicate::CitedRoles {
             subsystem: flow_belongs_to_search,
-            roles: &[
-                PacketEvidenceRole::SearchExecutionUnit,
-                PacketEvidenceRole::CandidateFileConstruction,
-            ],
+            roles: &[PacketEvidenceRole::SearchExecutionUnit],
         },
     },
 ];
+
+fn push_search_execution_requirements_for_terms(
+    terms: &[String],
+    requirements: &mut Vec<FlowRequirement>,
+) {
+    requirements.push(SEARCH_EXECUTION_FLOW[0]);
+    if packet_terms_have_any(
+        terms,
+        &[
+            "arg",
+            "args",
+            "argument",
+            "arguments",
+            "argv",
+            "flag",
+            "flags",
+            "option",
+            "options",
+        ],
+    ) {
+        requirements.push(SEARCH_EXECUTION_FLOW[1]);
+    }
+    let detailed_driver = packet_terms_have_any(
+        terms,
+        &[
+            "candidate",
+            "candidates",
+            "haystack",
+            "haystacks",
+            "matcher",
+            "matchers",
+            "printer",
+            "printers",
+            "searcher",
+            "searchers",
+            "walk",
+            "walker",
+            "walkers",
+            "walks",
+        ],
+    );
+    if detailed_driver {
+        requirements.push(SEARCH_EXECUTION_FLOW[2]);
+    }
+    if packet_terms_have_any(
+        terms,
+        &[
+            "candidate",
+            "candidates",
+            "walk",
+            "walker",
+            "walkers",
+            "walks",
+        ],
+    ) {
+        requirements.push(SEARCH_EXECUTION_FLOW[3]);
+    }
+    if packet_terms_have_any(terms, &["haystack", "haystacks"]) {
+        requirements.push(SEARCH_EXECUTION_FLOW[4]);
+    }
+    if packet_terms_have_any(terms, &["matcher", "matchers"]) {
+        requirements.push(SEARCH_EXECUTION_FLOW[5]);
+    }
+    if packet_terms_have_any(terms, &["searcher", "searchers"]) {
+        requirements.push(SEARCH_EXECUTION_FLOW[6]);
+    }
+    if packet_terms_have_any(terms, &["printer", "printers"]) {
+        requirements.push(SEARCH_EXECUTION_FLOW[7]);
+    }
+    let worker_construction = packet_terms_have_any(terms, &["matcher", "matchers"])
+        && packet_terms_have_any(terms, &["searcher", "searchers"])
+        && packet_terms_have_any(terms, &["printer", "printers"]);
+    if worker_construction {
+        requirements.push(SEARCH_EXECUTION_FLOW[8]);
+    }
+    requirements.push(SEARCH_EXECUTION_FLOW[9]);
+}
 
 const SEARCH_EVIDENCE_FLOW: &[FlowRequirement] = &[
     FlowRequirement {
@@ -1548,6 +1803,10 @@ pub fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)
         (
             "server_request_dispatch",
             SERVER_REQUEST_DISPATCH_FLOW.to_vec(),
+        ),
+        (
+            "server_route_dispatch_detail",
+            SERVER_ROUTE_DISPATCH_DETAIL_FLOW.to_vec(),
         ),
         ("client_request_dispatch", client_dispatch),
         ("url_session", URL_SESSION_FLOW.to_vec()),
@@ -1614,7 +1873,7 @@ mod tests {
 
     /// Contract rev 5 scope table: exactly six requirement ids carry real
     /// proof formulas, each referencing its stage-1 const formula group;
-    /// everything else — both `SITE_BUILD_FLOW` ids explicitly included — is
+    /// everything else — all `SITE_BUILD_FLOW` ids explicitly included — is
     /// `FlowProofSpec::Legacy`.
     #[test]
     fn only_the_six_shard_requirements_carry_atom_proof_formulas() {
@@ -1900,6 +2159,159 @@ mod tests {
     }
 
     #[test]
+    fn search_execution_flow_uses_one_separable_requirement_per_requested_stage() {
+        let prompt = "Explain how ripgrep parses CLI flags, walks candidate files, and executes a search over each haystack through matcher, searcher, and printer components.";
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(prompt),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        let ids = requirements
+            .iter()
+            .map(|requirement| requirement.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "search_entrypoint",
+                "search_argument_planning",
+                "search_driver",
+                "search_candidate_traversal",
+                "search_haystack_construction",
+                "search_matcher_setup",
+                "search_searcher_setup",
+                "search_printer_setup",
+                "search_worker_construction",
+                "search_dispatch",
+            ]
+        );
+
+        let witnesses = [
+            (
+                "search_argument_planning",
+                witness(
+                    "flags::parse",
+                    "crates/core/flags/mod.rs",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                "search_candidate_traversal",
+                witness(
+                    "HiArgs::walk_builder",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_haystack_construction",
+                witness(
+                    "HiArgs::haystack_builder",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_matcher_setup",
+                witness(
+                    "HiArgs::matcher",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_searcher_setup",
+                witness(
+                    "HiArgs::searcher",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_printer_setup",
+                witness(
+                    "HiArgs::printer",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                "search_worker_construction",
+                witness(
+                    "HiArgs::search_worker",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+        ];
+        let component_ids = [
+            "search_argument_planning",
+            "search_candidate_traversal",
+            "search_haystack_construction",
+            "search_matcher_setup",
+            "search_searcher_setup",
+            "search_printer_setup",
+            "search_worker_construction",
+        ];
+        for (expected_id, citation) in witnesses {
+            let proved = requirements
+                .iter()
+                .filter(|requirement| component_ids.contains(&requirement.id))
+                .filter(|requirement| requirement.evidence.citation_proves(&citation))
+                .map(|requirement| requirement.id)
+                .collect::<Vec<_>>();
+            assert_eq!(proved, [expected_id], "{citation:#?}");
+        }
+
+        for unrelated in [
+            witness("matcher", "src/image.rs", NodeKind::FUNCTION),
+            witness("haystack", "src/text.rs", NodeKind::FUNCTION),
+            witness("Formatter::printer", "src/output.rs", NodeKind::METHOD),
+            witness("Database::searcher", "src/storage.rs", NodeKind::METHOD),
+            witness("WalkBuilder::build", "src/files.rs", NodeKind::METHOD),
+            witness("SearchWorker::search", "src/search.rs", NodeKind::METHOD),
+        ] {
+            assert!(
+                requirements
+                    .iter()
+                    .filter(|requirement| component_ids.contains(&requirement.id))
+                    .all(|requirement| !requirement.evidence.citation_proves(&unrelated)),
+                "an unrelated component must not close a search-flow stage: {unrelated:#?}",
+            );
+        }
+
+        let generic_ids = packet_flow_requirements_for_terms(
+            &packet_probe_terms("Explain the search flow."),
+            PacketTaskClassDto::ArchitectureExplanation,
+        )
+        .into_iter()
+        .map(|requirement| requirement.id)
+        .collect::<Vec<_>>();
+        assert_eq!(generic_ids, ["search_entrypoint", "search_dispatch"]);
+
+        let queries = packet_flow_requirement_queries_for_terms(
+            &packet_probe_terms(prompt),
+            PacketTaskClassDto::ArchitectureExplanation,
+        );
+        for expected in [
+            "main flags parse run",
+            "flag parsing",
+            "parallel search walker",
+            "parallel search walk builder",
+            "haystack builder",
+            "argument matcher",
+            "searcher construction",
+            "result printer construction",
+            "search worker matcher searcher printer",
+            "search execution",
+        ] {
+            assert!(
+                queries.iter().any(|query| query == expected),
+                "{queries:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn client_request_flow_uses_behavior_owner_probes_without_server_registration() {
         let requirements = packet_flow_requirements_for_terms(
             &packet_probe_terms(
@@ -2076,12 +2488,30 @@ mod tests {
             .flat_map(|requirement| requirement.query_seeds.iter().copied())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, ["request_entrypoint", "request_dispatch"]);
+        assert_eq!(
+            ids,
+            [
+                "request_entrypoint",
+                "request_dispatch",
+                "server_route_insertion_handoff",
+                "server_request_handler_handoff",
+                "server_route_match_lookup",
+                "server_handler_chain_handoff",
+            ]
+        );
         for expected in [
             "application use",
             "route registration",
             "application handle",
             "request dispatch",
+            "route registration insertion",
+            "router route storage",
+            "server request handler",
+            "serve http request dispatch",
+            "route tree lookup",
+            "find matched route",
+            "matched handlers context chain",
+            "handler chain next",
         ] {
             assert!(
                 queries.contains(&expected),
@@ -2120,7 +2550,15 @@ mod tests {
 
         assert_eq!(
             ids,
-            ["request_entrypoint", "request_dispatch", "request_terminal"]
+            [
+                "request_entrypoint",
+                "request_dispatch",
+                "request_terminal",
+                "server_route_insertion_handoff",
+                "server_request_handler_handoff",
+                "server_route_match_lookup",
+                "server_handler_chain_handoff",
+            ]
         );
         for expected in ["response send", "response finalization"] {
             assert!(
@@ -2174,16 +2612,29 @@ mod tests {
         "request_interceptor_management | dispatch | RequiresResolvedSourceOrGraph",
         "request_terminal | dispatch | RequiresResolvedSourceOrGraph",
         "request_terminal | terminal_boundary | RequiresResolvedSourceOrGraph",
+        "search_argument_planning | configuration | RequiresResolvedSourceOrGraph",
+        "search_candidate_traversal | dispatch | RequiresResolvedSourceOrGraph",
         "search_dispatch | dispatch | RequiresResolvedSourceOrGraph",
+        "search_driver | dispatch | RequiresResolvedSourceOrGraph",
         "search_evidence_classification | transform_or_validate | RequiresResolvedSourceOrGraph",
         "search_evidence_output | terminal_boundary | RequiresResolvedSourceOrGraph",
         "search_entrypoint | entrypoint | RequiresResolvedSourceOrGraph",
+        "search_haystack_construction | transform_or_validate | RequiresResolvedSourceOrGraph",
+        "search_matcher_setup | configuration | RequiresResolvedSourceOrGraph",
+        "search_printer_setup | configuration | RequiresResolvedSourceOrGraph",
+        "search_searcher_setup | configuration | RequiresResolvedSourceOrGraph",
+        "search_worker_construction | configuration | RequiresResolvedSourceOrGraph",
+        "server_handler_chain_handoff | terminal_boundary | RequiresResolvedSourceOrGraph",
+        "server_request_handler_handoff | entrypoint | RequiresResolvedSourceOrGraph",
+        "server_route_insertion_handoff | dispatch | RequiresResolvedSourceOrGraph",
+        "server_route_match_lookup | transform_or_validate | RequiresResolvedSourceOrGraph",
         "session_callbacks | dispatch | AllowsSourceRange",
         "client_request_entry | entrypoint | RequiresResolvedSourceOrGraph",
         "shell_completion | terminal_boundary | DiagnosticOnly",
         "shell_function_dispatch | dispatch | AllowsLexicalSource",
         "shell_installer_bootstrap | entrypoint | AllowsLexicalSource",
         "site_lifecycle | entrypoint | RequiresResolvedSourceOrGraph",
+        "site_reader | state_or_storage | AllowsSourceRange",
         "site_terminal | terminal_boundary | AllowsSourceRange",
         "sql_relationships | configuration | AllowsLexicalSource",
         "sql_tables | state_or_storage | AllowsLexicalSource",
@@ -2267,6 +2718,34 @@ mod tests {
                     "dispatchRequest",
                     "lib/core/dispatchRequest.js",
                     NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("server_route_insertion_handoff", "dispatch"),
+                witness(
+                    "RouterGroup.handle",
+                    "src/http/router_group.go",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("server_request_handler_handoff", "entrypoint"),
+                witness("Server.ServeHTTP", "src/http/server.go", NodeKind::METHOD),
+            ),
+            (
+                ("server_route_match_lookup", "transform_or_validate"),
+                witness(
+                    "Engine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("server_handler_chain_handoff", "terminal_boundary"),
+                witness(
+                    "Engine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
                 ),
             ),
             (
@@ -2479,6 +2958,19 @@ mod tests {
                 ("site_lifecycle", "entrypoint"),
                 witness("Site.process", "lib/site/site.rb", NodeKind::METHOD),
             ),
+            (("site_reader", "state_or_storage"), {
+                let mut reader = witness(
+                    "Generator::Reader.read",
+                    "lib/site/reader.rb",
+                    NodeKind::METHOD,
+                );
+                reader.source_excerpt = Some(
+                    "def read\n  @site.layouts = LayoutReader.new(site).read\n  \
+                         CollectionReader.new(site).read\n  read_data\nend"
+                        .to_string(),
+                );
+                reader
+            }),
             (
                 ("site_terminal", "terminal_boundary"),
                 witness("Site.write", "lib/site/renderer.rb", NodeKind::METHOD),
@@ -2514,6 +3006,66 @@ mod tests {
             (
                 ("search_entrypoint", "entrypoint"),
                 witness("main", "crates/core/main.rs", NodeKind::FUNCTION),
+            ),
+            (
+                ("search_argument_planning", "configuration"),
+                witness(
+                    "flags::parse",
+                    "crates/core/flags/mod.rs",
+                    NodeKind::FUNCTION,
+                ),
+            ),
+            (
+                ("search_driver", "dispatch"),
+                witness("search_parallel", "crates/core/main.rs", NodeKind::FUNCTION),
+            ),
+            (
+                ("search_candidate_traversal", "dispatch"),
+                witness(
+                    "HiArgs::walk_builder",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_haystack_construction", "transform_or_validate"),
+                witness(
+                    "HiArgs::haystack_builder",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_matcher_setup", "configuration"),
+                witness(
+                    "HiArgs::matcher",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_searcher_setup", "configuration"),
+                witness(
+                    "HiArgs::searcher",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_printer_setup", "configuration"),
+                witness(
+                    "HiArgs::printer",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
+            ),
+            (
+                ("search_worker_construction", "configuration"),
+                witness(
+                    "HiArgs::search_worker",
+                    "crates/core/flags/hiargs.rs",
+                    NodeKind::METHOD,
+                ),
             ),
             (
                 ("search_dispatch", "dispatch"),
@@ -2892,6 +3444,211 @@ mod tests {
             &self_loop,
             NodeKind::METHOD,
         ));
+    }
+
+    #[test]
+    fn command_loop_requirements_reject_role_shaped_helpers_and_require_exact_handoffs() {
+        let receipt = |id: &str, source: NodeId, target: NodeId| GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source,
+            target,
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".to_string()),
+            callsite_identity: Some("src/runtime.c:1".to_string()),
+            candidate_targets: Vec::new(),
+        };
+
+        let loop_driver = witness("EventLoop.run", "src/runtime.c", NodeKind::FUNCTION);
+        let loop_call = receipt(
+            "loop-driver",
+            loop_driver.node_id.clone(),
+            NodeId("EventLoop.processEvents".to_string()),
+        );
+        assert!(flow_requirement_call_receipt_is_valid(
+            &COMMAND_EVENT_LOOP_REQUIREMENT,
+            &loop_driver,
+            &loop_call,
+            "EventLoop.processEvents",
+            NodeKind::FUNCTION,
+        ));
+        let main_driver = witness("aeMain", "src/runtime.c", NodeKind::FUNCTION);
+        assert!(
+            !COMMAND_EVENT_LOOP_REQUIREMENT
+                .evidence
+                .citation_proves(&main_driver),
+            "a main-shaped entrypoint is outside the ordinary carrier vocabulary"
+        );
+        assert!(
+            !COMMAND_EVENT_LOOP_REQUIREMENT
+                .evidence
+                .citation_proves_without_call_boundary(&main_driver),
+            "a main-shaped entrypoint is never direct proof"
+        );
+        let main_loop_call = receipt(
+            "main-loop-driver",
+            main_driver.node_id.clone(),
+            NodeId("aeProcessEvents".to_string()),
+        );
+        assert!(flow_requirement_call_receipt_is_valid(
+            &COMMAND_EVENT_LOOP_REQUIREMENT,
+            &main_driver,
+            &main_loop_call,
+            "aeProcessEvents",
+            NodeKind::FUNCTION,
+        ));
+        let unrelated_main_call = receipt(
+            "unrelated-main-call",
+            main_driver.node_id.clone(),
+            NodeId("loadConfiguration".to_string()),
+        );
+        assert!(!flow_requirement_call_receipt_is_valid(
+            &COMMAND_EVENT_LOOP_REQUIREMENT,
+            &main_driver,
+            &unrelated_main_call,
+            "loadConfiguration",
+            NodeKind::FUNCTION,
+        ));
+        let rebind = witness(
+            "Connection.rebindEventLoop",
+            "src/runtime.c",
+            NodeKind::FUNCTION,
+        );
+        assert!(
+            !COMMAND_EVENT_LOOP_REQUIREMENT
+                .evidence
+                .citation_proves(&rebind)
+        );
+
+        let command_router = witness("processCommand", "src/server.c", NodeKind::FUNCTION);
+        let routing_call = receipt(
+            "command-router",
+            command_router.node_id.clone(),
+            NodeId("rejectCommand".to_string()),
+        );
+        assert!(flow_requirement_call_receipt_is_valid(
+            &COMMAND_DISPATCH_REQUIREMENT,
+            &command_router,
+            &routing_call,
+            "rejectCommand",
+            NodeKind::FUNCTION,
+        ));
+        for helper in ["processCommandAndResetClient", "ModuleCommandDispatcher"] {
+            assert!(
+                !COMMAND_DISPATCH_REQUIREMENT
+                    .evidence
+                    .citation_proves(&witness(helper, "src/server.c", NodeKind::FUNCTION)),
+                "{helper} must not close central command routing"
+            );
+        }
+    }
+
+    #[test]
+    fn command_loop_queries_name_the_carrier_action_and_exact_boundary() {
+        assert!(
+            COMMAND_EVENT_LOOP_REQUIREMENT
+                .query_seeds
+                .contains(&"main event loop process events")
+        );
+        assert!(
+            COMMAND_DISPATCH_REQUIREMENT
+                .query_seeds
+                .contains(&"process command routing checks")
+        );
+    }
+
+    #[test]
+    fn server_route_detail_requires_each_exact_ordered_handoff() {
+        let requirement = |id: &str| {
+            SERVER_ROUTE_DISPATCH_DETAIL_FLOW
+                .iter()
+                .copied()
+                .find(|requirement| requirement.id == id)
+                .unwrap_or_else(|| panic!("missing route requirement {id}"))
+        };
+        let receipt = |id: &str, source: NodeId, target: NodeId| GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source,
+            target,
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".to_string()),
+            callsite_identity: Some("src/http/router.rs:1".to_string()),
+            candidate_targets: Vec::new(),
+        };
+        let cases = [
+            (
+                "server_route_insertion_handoff",
+                witness(
+                    "RouterGroup.handle",
+                    "src/http/router_group.go",
+                    NodeKind::METHOD,
+                ),
+                "Engine.addRoute",
+                "SegmentTree.add",
+            ),
+            (
+                "server_request_handler_handoff",
+                witness("Server.ServeHTTP", "src/http/server.go", NodeKind::METHOD),
+                "Engine.handleHTTPRequest",
+                "SearchEngine.handleRequest",
+            ),
+            (
+                "server_route_match_lookup",
+                witness(
+                    "Engine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                ),
+                "node.getValue",
+                "Config.getValue",
+            ),
+            (
+                "server_handler_chain_handoff",
+                witness(
+                    "Engine.handleHTTPRequest",
+                    "src/http/server.go",
+                    NodeKind::METHOD,
+                ),
+                "Context.Next",
+                "RenderContext.Next",
+            ),
+        ];
+
+        for (id, carrier, lawful_target, hostile_target) in cases {
+            let requirement = requirement(id);
+            assert!(requirement.evidence.citation_proves(&carrier), "{id}");
+            let lawful = receipt(
+                id,
+                carrier.node_id.clone(),
+                NodeId(lawful_target.to_string()),
+            );
+            assert!(
+                flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &carrier,
+                    &lawful,
+                    lawful_target,
+                    NodeKind::METHOD,
+                ),
+                "{id} should retain its exact next stage"
+            );
+            let hostile = receipt(
+                hostile_target,
+                carrier.node_id.clone(),
+                NodeId(hostile_target.to_string()),
+            );
+            assert!(
+                !flow_requirement_call_receipt_is_valid(
+                    &requirement,
+                    &carrier,
+                    &hostile,
+                    hostile_target,
+                    NodeKind::METHOD,
+                ),
+                "{id} must reject unrelated {hostile_target}"
+            );
+        }
     }
 
     #[test]
@@ -3385,9 +4142,13 @@ mod tests {
             "routes",
             "router",
             "routing",
+            "tree",
+            "node",
             "controller",
             "handler",
             "handlers",
+            "next",
+            "proceed",
             "endpoint",
             "server",
             "middleware",
@@ -3400,6 +4161,9 @@ mod tests {
             "rack",
             "servlet",
             "gateway",
+            "ui",
+            "view",
+            "widget",
             "client",
             "clients",
             "instance",
@@ -3677,6 +4441,7 @@ mod tests {
             "collections",
             "themes",
             "assets",
+            "data",
             "file",
             "files",
             "html",
@@ -4387,7 +5152,7 @@ mod tests {
                         NodeKind::METHOD,
                     ),
                 ],
-                expected_missing: &["site_lifecycle", "site_terminal"],
+                expected_missing: &["site_lifecycle", "site_reader", "site_terminal"],
             },
             Case {
                 flow: "logger record + handler",
@@ -4502,6 +5267,97 @@ mod tests {
         }
     }
 
+    /// A command helper and the terminal write/render surfaces do not establish the build's own
+    /// ordered lifecycle or the reader that populates it. Those two sources must remain separate
+    /// requirements so bounded projection cannot spend the whole site-build budget on the wrapper
+    /// and terminal phases.
+    #[test]
+    fn site_build_requires_its_phase_owner_and_a_credible_content_reader() {
+        let prompt = "Trace how the static site build command creates a site and runs the read, \
+                      generate, render, and write phases.";
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(prompt),
+            PacketTaskClassDto::DataFlow,
+        );
+        let lifecycle = requirements
+            .iter()
+            .find(|requirement| requirement.id == "site_lifecycle")
+            .expect("the prompt raises the site lifecycle");
+        let reader = requirements
+            .iter()
+            .find(|requirement| requirement.id == "site_reader")
+            .expect("the prompt raises the site content reader");
+        assert!(
+            lifecycle
+                .query_seeds
+                .iter()
+                .any(|query| query.contains("Site.process")),
+            "the lifecycle must probe its phase-owning callable rather than a command wrapper"
+        );
+        assert!(
+            reader
+                .query_seeds
+                .iter()
+                .any(|query| query.contains("Reader.read")),
+            "the reader requirement must probe a source-bearing reader callable"
+        );
+
+        let wrapper = witness(
+            "Command.process_site",
+            "lib/commands/build.rb",
+            NodeKind::METHOD,
+        );
+        let write = witness("Site.write", "lib/site.rb", NodeKind::METHOD);
+        let renderer = witness(
+            "Renderer.render_document",
+            "lib/renderer.rb",
+            NodeKind::METHOD,
+        );
+        assert!(
+            !lifecycle.evidence.citation_proves(&wrapper),
+            "a wrapper that delegates to the site cannot stand in for the site's phase owner"
+        );
+        assert!(lifecycle.evidence.citation_proves(&witness(
+            "Site.process",
+            "lib/site.rb",
+            NodeKind::METHOD,
+        )));
+        for citation in [&wrapper, &write, &renderer] {
+            assert!(
+                !reader.evidence.citation_proves(citation),
+                "{} is not the source that reads site content",
+                citation.display_name
+            );
+        }
+
+        for generic in [
+            witness("Reader.read", "src/io/reader.rb", NodeKind::METHOD),
+            witness("HttpReader.read", "src/web/reader.rb", NodeKind::METHOD),
+            witness("PageReader.read", "src/web/pages.rb", NodeKind::METHOD),
+        ] {
+            assert!(
+                !reader.evidence.citation_proves(&generic),
+                "{} names generic or web reading without static-site content evidence",
+                generic.display_name
+            );
+        }
+
+        let mut site_reader = witness(
+            "Generator::Reader.read",
+            "lib/generator/reader.rb",
+            NodeKind::METHOD,
+        );
+        site_reader.source_excerpt = Some(
+            "def read\n  @site.layouts = LayoutReader.new(site).read\n  \
+             CollectionReader.new(site).read\n  read_data\nend"
+                .to_string(),
+        );
+        assert!(
+            reader.evidence.citation_proves(&site_reader),
+            "a Reader method that demonstrably populates static-site content must remain reachable"
+        );
+    }
+
     /// The packets that reached a fully-closed *Sufficient* verdict on evidence that proved none of
     /// the flow they answered, named one by one so they cannot come back quietly.
     ///
@@ -4526,7 +5382,7 @@ mod tests {
                     witness("AssetPipeline.run", "lib/site/assets.rb", NodeKind::METHOD),
                     witness("Layout.render", "lib/site/layout.tsx", NodeKind::METHOD),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             (
                 "a build pipeline and a render pipeline in the site folder",
@@ -4536,7 +5392,7 @@ mod tests {
                     witness("RenderPipeline.run", "lib/site/gen.rb", NodeKind::METHOD),
                     witness("Pipeline.run", "lib/site/gen.rb", NodeKind::METHOD),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             // `public/static/` was the second spelling of the site root, and bundled vendor
             // JavaScript is what actually lives there.
@@ -4551,7 +5407,7 @@ mod tests {
                     ),
                     witness("Layout.render", "public/static/vendor.ts", NodeKind::METHOD),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             (
                 "a generator directory in a server-rendered application",
@@ -4560,7 +5416,7 @@ mod tests {
                     witness("Pages.generate", "src/generator/pages.rb", NodeKind::METHOD),
                     witness("Pages.render", "src/generator/pages.rb", NodeKind::METHOD),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             // Two different generic web nouns, which is what survived taking the directory away.
             (
@@ -4580,7 +5436,7 @@ mod tests {
                         NodeKind::METHOD,
                     ),
                 ],
-                &["site_lifecycle", "site_terminal"],
+                &["site_lifecycle", "site_reader", "site_terminal"],
             ),
             // A single-file component was a markup document, so its `forms/` folder answered the
             // form question for every symbol in the file. `validityWindow` still closes one step,
@@ -4990,9 +5846,10 @@ mod tests {
         );
     }
 
-    /// Stronger than the same-role test above: inside one flow, *no* requirement may be closed by
-    /// another requirement's evidence, whatever roles the two wear. Roles were never the thing that
-    /// separated requirements; their evidence is.
+    /// Stronger than the same-role test above: inside one flow, *no citation-edge receipt* may close
+    /// two requirements, whatever roles the requirements wear. Roles were never the thing that
+    /// separated requirements; their evidence is. One dispatcher citation may lawfully own two
+    /// outgoing boundaries only when the target predicates keep those edges disjoint.
     #[test]
     fn no_requirement_in_a_flow_is_closed_by_another_requirements_witness() {
         let witnesses = requirement_witnesses();
@@ -5015,20 +5872,40 @@ mod tests {
                     checked_pairs += 1;
                     let left_witness = witness_for(left);
                     let right_witness = witness_for(right);
-                    assert!(
-                        !right.evidence.citation_proves(&left_witness),
-                        "in flow {group}, the anchor proving {} also closes {}: one anchor must \
-                         not close two requirements",
-                        left.id,
-                        right.id
-                    );
-                    assert!(
-                        !left.evidence.citation_proves(&right_witness),
-                        "in flow {group}, the anchor proving {} also closes {}: one anchor must \
-                         not close two requirements",
-                        right.id,
-                        left.id
-                    );
+                    let assert_receipts_disjoint =
+                        |owner: &FlowRequirement,
+                         owner_witness: &AgentCitationDto,
+                         other: &FlowRequirement| {
+                            if !other.evidence.citation_proves(owner_witness) {
+                                return;
+                            }
+                            let target_witness = match owner.id {
+                                "server_route_match_lookup" => "node.getValue",
+                                "server_handler_chain_handoff" => "Context.Next",
+                                _ => panic!(
+                                    "in flow {group}, the anchor proving {} also closes {}: one \
+                                     anchor may span requirements only through declared disjoint \
+                                     call boundaries",
+                                    owner.id, other.id
+                                ),
+                            };
+                            let owner_target = owner
+                                .evidence
+                                .call_boundary_target(owner_witness)
+                                .unwrap_or_else(|| panic!("{} lacks its call boundary", owner.id));
+                            let other_target = other
+                                .evidence
+                                .call_boundary_target(owner_witness)
+                                .unwrap_or_else(|| panic!("{} lacks its call boundary", other.id));
+                            assert!(
+                                owner_target(target_witness) && !other_target(target_witness),
+                                "in flow {group}, one citation-edge receipt closes both {} and {}",
+                                owner.id,
+                                other.id
+                            );
+                        };
+                    assert_receipts_disjoint(left, &left_witness, right);
+                    assert_receipts_disjoint(right, &right_witness, left);
                 }
             }
         }

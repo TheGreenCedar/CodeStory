@@ -5,32 +5,50 @@
 //! complete core snapshot used for every Store read below.
 
 // The complete adapter stays dark until the atomic v3 surface cut. Building
-// `codestory-runtime` as a dependency with `test-support` must not turn that
+// `codestory-runtime` with either sealed support feature must not turn that
 // deliberate lack of production callers into warning noise.
 #![allow(dead_code)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use codestory_agent::indexed_source_call_path_v1::{
-    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence, ExactScopeSelector,
-    ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
-    InternalCorePublicationIdentity, InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity,
-    ProofHashes, RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
-    ValidatedCallPathContract, ValidatedContractRendering, VerifiedDirectCallFact,
-    VerifiedProofFact, admit_raw_call_edge, check_built_call_path_integration,
-    project_internal_call_path_result,
+#[cfg(all(
+    not(any(test, feature = "test-support")),
+    feature = "proof-qualification-support"
+))]
+use codestory_agent::proof_qualification_support::{
+    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+    CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure, ReceiptRef,
+    ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract, ValidatedContractRendering,
+    VerifiedDirectCallFact, VerifiedProofFact, check_built_call_path_integration,
+    diagnose_raw_call_edge, project_internal_call_path_result,
+};
+#[cfg(any(test, feature = "test-support"))]
+use codestory_agent::proof_qualification_test_support::{
+    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+    CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure, RawCallEdgeAdmission,
+    ReceiptRef, ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract,
+    ValidatedContractRendering, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
+    check_built_call_path_integration, diagnose_raw_call_edge, project_internal_call_path_result,
 };
 use codestory_contracts::api::ApiError;
-use codestory_contracts::graph::{Node, NodeId, NodeKind, ResolutionCertainty};
-use codestory_store::{FileInfo, IndexPublicationRecord, Store};
+use codestory_contracts::graph::{Node, NodeId, NodeKind};
+use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
+use codestory_indexer::current_proof_resolution_adapter_roster;
+use codestory_store::{
+    FileInfo, IndexPublicationRecord, ProofResolutionPublication, Store, seal_call_resolution_fact,
+};
 use codestory_workspace::{
     ProjectRelativePathResolution, WorkspacePathIdentity, project_identity_v3,
-    resolve_project_relative_path, workspace_relative_path,
+    resolve_project_relative_path, workspace_path_identity_token, workspace_relative_path,
 };
 use sha2::{Digest, Sha256};
 
@@ -40,20 +58,691 @@ use crate::services::{PublicOperation, PublicOperationService};
 
 const INDEXED_LINE_KIND: &str = "indexed_line_v1";
 const MAX_LINE_WINDOW_BYTES: usize = 8_192;
+pub const MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP: u32 = 128;
+pub const MAX_QUALIFICATION_OBSERVED_RECEIPTS_PER_CASE: usize =
+    MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize * 6;
 const RECEIPT_DOMAIN: &[u8] = b"codestory.indexed-call-edge-receipt.v1\0";
 const CALLABLE_KINDS: [NodeKind; 3] = [NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
+
+#[cfg(test)]
+thread_local! {
+    static FULL_PROOF_PUBLICATION_VALIDATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[inline]
+fn count_full_proof_publication_validation() {
+    #[cfg(test)]
+    FULL_PROOF_PUBLICATION_VALIDATIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_full_proof_publication_validations() {
+    FULL_PROOF_PUBLICATION_VALIDATIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn full_proof_publication_validation_count() -> usize {
+    FULL_PROOF_PUBLICATION_VALIDATIONS.with(std::cell::Cell::get)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProofPublicationValidationToken {
+    project_root: PathBuf,
+    project_id: String,
+    storage_path: PathBuf,
+    native_storage_identity: String,
+    core_publication: IndexPublicationRecord,
+    manifest: ProofResolutionPublication,
+    data_version: i64,
+}
+
+struct ProofPublicationValidationCacheEntry {
+    token: ProofPublicationValidationToken,
+    observer: Store,
+}
+
+enum PreparedProofPublicationValidation {
+    Unavailable,
+    Warm(Box<ProofPublicationValidationToken>),
+    Cold(Box<ColdPreparedProofPublicationValidation>),
+}
+
+struct ColdPreparedProofPublicationValidation {
+    project_root: PathBuf,
+    project_id: String,
+    storage_path: PathBuf,
+    native_storage_identity: String,
+    observed: ObservedProofPublicationIdentity,
+    observer: Store,
+}
+
+pub(crate) enum ProofPublicationValidationUse {
+    Direct { proof_projection_available: bool },
+    Unavailable,
+    Warm(Box<ProofPublicationValidationToken>),
+    Cold(Box<ColdProofPublicationValidationUse>),
+}
+
+pub(crate) struct ColdProofPublicationValidationUse {
+    token: ProofPublicationValidationToken,
+    observer: Store,
+}
+
+impl ProofPublicationValidationUse {
+    fn proof_projection_available(&self) -> bool {
+        !matches!(self, Self::Unavailable)
+            && match self {
+                Self::Direct {
+                    proof_projection_available,
+                } => *proof_projection_available,
+                Self::Unavailable => false,
+                Self::Warm(_) | Self::Cold { .. } => true,
+            }
+    }
+}
+
+/// One controller-local proof-only validation receipt.
+///
+/// The observer is deliberately a persistent, nonmutating SQLite connection:
+/// `data_version` is meaningful only when the same connection observes both
+/// the full validation and a later warm proof.
+#[derive(Default)]
+struct ProofPublicationValidationCache {
+    entry: Option<ProofPublicationValidationCacheEntry>,
+    prepared: Option<PreparedProofPublicationValidation>,
+    armed: bool,
+}
+
+fn proof_validation_cache(
+    slot: &mut Option<Box<dyn std::any::Any + Send>>,
+) -> &mut ProofPublicationValidationCache {
+    slot.get_or_insert_with(|| Box::new(ProofPublicationValidationCache::default()))
+        .downcast_mut::<ProofPublicationValidationCache>()
+        .expect("the dark proof cache slot only stores proof validation state")
+}
+
+#[derive(PartialEq, Eq)]
+struct ObservedProofPublicationIdentity {
+    data_version: i64,
+    core_publication: Option<IndexPublicationRecord>,
+    manifest: Option<ProofResolutionPublication>,
+}
+
+fn count_and_validate_complete_proof_publication(
+    store: &Store,
+    publication: &IndexPublicationRecord,
+) -> Result<ProofResolutionPublication, codestory_store::StorageError> {
+    count_full_proof_publication_validation();
+    store.validate_proof_resolution_publication(publication)
+}
+
+fn observe_proof_publication_identity(
+    observer: &Store,
+) -> Result<ObservedProofPublicationIdentity, codestory_store::StorageError> {
+    let snapshot = observer.read_snapshot()?;
+    let storage = snapshot.storage();
+    let observed = ObservedProofPublicationIdentity {
+        data_version: storage.sqlite_data_version()?,
+        core_publication: storage.get_complete_index_publication()?,
+        manifest: storage.get_proof_resolution_publication()?,
+    };
+    snapshot.finish()?;
+    Ok(observed)
+}
+
+fn storage_native_identity(storage_path: &Path) -> Result<String, ApiError> {
+    workspace_path_identity_token(storage_path)
+        .map_err(|error| {
+            ApiError::new(
+                "project_unavailable",
+                format!(
+                    "failed to observe native proof storage identity for {}: {error}",
+                    storage_path.display()
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            ApiError::new(
+                "project_unavailable",
+                format!(
+                    "proof storage disappeared while observing {}",
+                    storage_path.display()
+                ),
+            )
+        })
+}
+
+fn publication_changed(message: impl Into<String>) -> ApiError {
+    ApiError::new("publication_changed", message.into())
+}
+
+fn proof_validation_fence_matches(
+    token: &ProofPublicationValidationToken,
+    project_root: &Path,
+    project_id: &str,
+    storage_path: &Path,
+    native_storage_identity: &str,
+    active_publication: &IndexPublicationRecord,
+    observer: &Store,
+) -> bool {
+    token.project_root == project_root
+        && token.project_id == project_id
+        && token.storage_path == storage_path
+        && token.native_storage_identity == native_storage_identity
+        && token.core_publication == *active_publication
+        && observe_proof_publication_identity(observer)
+            .ok()
+            .is_some_and(|observed| {
+                observed.data_version == token.data_version
+                    && observed.core_publication.as_ref() == Some(active_publication)
+                    && observed.manifest.as_ref() == Some(&token.manifest)
+            })
+}
+
+impl ProofPublicationValidationCache {
+    fn clear(&mut self) {
+        self.entry = None;
+        self.prepared = None;
+    }
+
+    fn finish_operation(&mut self) {
+        self.prepared = None;
+        self.armed = false;
+    }
+}
+
+impl AppController {
+    pub(crate) fn clear_proof_publication_validation_cache(&self) {
+        proof_validation_cache(&mut self.proof_validation_cache.lock()).clear();
+    }
+
+    pub(crate) fn arm_proof_publication_validation(&self) {
+        let mut cache_slot = self.proof_validation_cache.lock();
+        let cache = proof_validation_cache(&mut cache_slot);
+        cache.prepared = None;
+        cache.armed = true;
+    }
+
+    pub(crate) fn prepare_armed_proof_publication_validation(&self) -> Result<(), ApiError> {
+        let mut cache_slot = self.proof_validation_cache.lock();
+        let cache = proof_validation_cache(&mut cache_slot);
+        if !cache.armed {
+            return Ok(());
+        }
+        cache.prepared = None;
+        let project_root = self.require_project_root()?;
+        let project_id = project_identity_v3(&project_root).project_id;
+        let storage_path = self.require_storage_path()?;
+        let native_storage_identity = storage_native_identity(&storage_path)?;
+
+        if let Some(entry) = cache.entry.as_ref() {
+            let scope_matches = entry.token.project_root == project_root
+                && entry.token.project_id == project_id
+                && entry.token.storage_path == storage_path
+                && entry.token.native_storage_identity == native_storage_identity;
+            let observer_matches = observe_proof_publication_identity(&entry.observer)
+                .ok()
+                .is_some_and(|observed| {
+                    observed.data_version == entry.token.data_version
+                        && observed.core_publication.as_ref() == Some(&entry.token.core_publication)
+                        && observed.manifest.as_ref() == Some(&entry.token.manifest)
+                });
+            if scope_matches && observer_matches {
+                cache.prepared = Some(PreparedProofPublicationValidation::Warm(Box::new(
+                    entry.token.clone(),
+                )));
+                return Ok(());
+            }
+            cache.clear();
+        }
+
+        let observer = match Store::open_proof_validation_observer(&storage_path) {
+            Ok(observer) => observer,
+            Err(_) => {
+                cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
+                return Ok(());
+            }
+        };
+        let observed = match observe_proof_publication_identity(&observer) {
+            Ok(observed) => observed,
+            Err(_) => {
+                cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
+                return Ok(());
+            }
+        };
+        let native_after = storage_native_identity(&storage_path)?;
+        if native_after != native_storage_identity {
+            cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
+            return Ok(());
+        }
+        cache.prepared = Some(PreparedProofPublicationValidation::Cold(Box::new(
+            ColdPreparedProofPublicationValidation {
+                project_root,
+                project_id,
+                storage_path,
+                native_storage_identity,
+                observed,
+                observer,
+            },
+        )));
+        Ok(())
+    }
+
+    fn validate_proof_publication_for_active_snapshot(
+        &self,
+        active_publication: &IndexPublicationRecord,
+        active_storage: &Store,
+    ) -> Result<ProofPublicationValidationUse, ApiError> {
+        let mut cache_slot = self.proof_validation_cache.lock();
+        let cache = proof_validation_cache(&mut cache_slot);
+        let Some(prepared) = cache.prepared.take() else {
+            let proof_projection_available = matches!(
+                count_and_validate_complete_proof_publication(active_storage, active_publication),
+                Ok(manifest) if manifest.adapter_roster == current_proof_resolution_adapter_roster()
+            );
+            return Ok(ProofPublicationValidationUse::Direct {
+                proof_projection_available,
+            });
+        };
+        match prepared {
+            PreparedProofPublicationValidation::Unavailable => {
+                Ok(ProofPublicationValidationUse::Unavailable)
+            }
+            PreparedProofPublicationValidation::Warm(token) => {
+                let manifest = active_storage
+                    .get_proof_resolution_publication()
+                    .map_err(store_error)?;
+                if token.core_publication != *active_publication
+                    || manifest.as_ref() != Some(&token.manifest)
+                {
+                    cache.clear();
+                    return Err(publication_changed(
+                        "the active proof snapshot differs from the warm validation receipt",
+                    ));
+                }
+                Ok(ProofPublicationValidationUse::Warm(token))
+            }
+            PreparedProofPublicationValidation::Cold(cold) => {
+                let ColdPreparedProofPublicationValidation {
+                    project_root,
+                    project_id,
+                    storage_path,
+                    native_storage_identity,
+                    observed,
+                    observer,
+                } = *cold;
+                let manifest = match count_and_validate_complete_proof_publication(
+                    active_storage,
+                    active_publication,
+                ) {
+                    Ok(manifest)
+                        if manifest.adapter_roster == current_proof_resolution_adapter_roster() =>
+                    {
+                        manifest
+                    }
+                    Ok(_) | Err(_) => return Ok(ProofPublicationValidationUse::Unavailable),
+                };
+                if observed.core_publication.as_ref() != Some(active_publication)
+                    || observed.manifest.as_ref() != Some(&manifest)
+                {
+                    return Err(publication_changed(
+                        "the observer differs from the active proof-validation snapshot",
+                    ));
+                }
+                Ok(ProofPublicationValidationUse::Cold(Box::new(
+                    ColdProofPublicationValidationUse {
+                        token: ProofPublicationValidationToken {
+                            project_root,
+                            project_id,
+                            storage_path,
+                            native_storage_identity,
+                            core_publication: active_publication.clone(),
+                            manifest,
+                            data_version: observed.data_version,
+                        },
+                        observer,
+                    },
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn finish_proof_publication_validation(
+        &self,
+        validation: ProofPublicationValidationUse,
+    ) -> Result<(), ApiError> {
+        let active_publication = self.active_core_publication().ok_or_else(|| {
+            publication_changed("the active core publication disappeared during proof execution")
+        })?;
+        let project_root = self.require_project_root()?;
+        let project_id = project_identity_v3(&project_root).project_id;
+        let storage_path = self.require_storage_path()?;
+        let native_storage_identity = storage_native_identity(&storage_path)?;
+        let mut cache_slot = self.proof_validation_cache.lock();
+        let cache = proof_validation_cache(&mut cache_slot);
+        let matches = match validation {
+            ProofPublicationValidationUse::Direct { .. }
+            | ProofPublicationValidationUse::Unavailable => return Ok(()),
+            ProofPublicationValidationUse::Warm(token) => {
+                cache.entry.as_ref().is_some_and(|entry| {
+                    entry.token == *token
+                        && proof_validation_fence_matches(
+                            &token,
+                            &project_root,
+                            &project_id,
+                            &storage_path,
+                            &native_storage_identity,
+                            &active_publication,
+                            &entry.observer,
+                        )
+                })
+            }
+            ProofPublicationValidationUse::Cold(cold) => {
+                let ColdProofPublicationValidationUse { token, observer } = *cold;
+                if proof_validation_fence_matches(
+                    &token,
+                    &project_root,
+                    &project_id,
+                    &storage_path,
+                    &native_storage_identity,
+                    &active_publication,
+                    &observer,
+                ) {
+                    cache.entry = Some(ProofPublicationValidationCacheEntry { token, observer });
+                    return Ok(());
+                }
+                false
+            }
+        };
+        if matches {
+            return Ok(());
+        }
+        cache.clear();
+        Err(publication_changed(
+            "the proof validation publication changed during proof execution",
+        ))
+    }
+
+    pub(crate) fn finish_proof_publication_validation_operation(&self) {
+        proof_validation_cache(&mut self.proof_validation_cache.lock()).finish_operation();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SelectorFailure {
+    Missing,
+    Ambiguous,
+    NonCallable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorGateOutcome {
+    Resolved { node_id: NodeId },
+    Failed(SelectorFailure),
+    Unavailable(UnavailableReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectorQualificationTrace {
+    pub selector_index: usize,
+    pub outcome: SelectorGateOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContainmentFailure {
+    EdgeSourceFileMismatch,
+    Missing,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SourceBindingFailure {
+    FileIncomplete,
+    StoredHashAbsent,
+    WorkingTreeReadFailed,
+    WorkingTreeHashMismatch,
+    InvalidUtf8,
+    ExactCallsiteMismatch,
+    LineMissing,
+    LineOverLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CandidateFailure {
+    RawAdmission(RawAdmissionFailure),
+    ResolutionFact(ResolutionFactFailure),
+    Containment(ContainmentFailure),
+    SourceBinding(SourceBindingFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResolutionFactFailure {
+    Missing,
+    Inconsistent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateFailureHistogram {
+    pub reason: CandidateFailure,
+    pub edge_ids: Vec<codestory_contracts::graph::EdgeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateGate {
+    RawAdmission,
+    ResolutionFact,
+    Containment,
+    SourceBinding,
+    Line,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepQualificationOutcome {
+    SelectorBlocked {
+        selector_index: usize,
+        outcome: SelectorGateOutcome,
+    },
+    Admitted {
+        edge_ids: Vec<codestory_contracts::graph::EdgeId>,
+    },
+    FirstZeroSurvivor {
+        gate: CandidateGate,
+        histogram: Vec<CandidateFailureHistogram>,
+    },
+    CandidateLimitExceeded {
+        maximum_candidate_edges: u32,
+        observed_candidate_edges_at_least: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepQualificationTrace {
+    pub step_index: usize,
+    pub candidate_edge_ids: Vec<codestory_contracts::graph::EdgeId>,
+    pub outcome: StepQualificationOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizationFailure {
+    ReceiptIntegration,
+    ReceiptBudget,
+    ProjectionBudget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinalizationTrace {
+    NotRun,
+    Complete { projection_bytes: usize },
+    Failed(FinalizationFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofQualificationTrace {
+    pub selectors: Vec<SelectorQualificationTrace>,
+    pub selector_early_return: bool,
+    pub steps: Vec<StepQualificationTrace>,
+    pub finalization: FinalizationTrace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedBuiltCallPathFacts {
+    pub built: BuiltCallPathFacts,
+    pub trace: ProofQualificationTrace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedIntegratedProjectedCallPathResult {
+    pub result: Result<IntegratedProjectedCallPathResult, ApiError>,
+    pub trace: ProofQualificationTrace,
+}
+
+#[derive(Default)]
+struct StepTraceAccumulator {
+    candidate_edge_ids: Vec<codestory_contracts::graph::EdgeId>,
+    raw_survivors: Vec<codestory_contracts::graph::EdgeId>,
+    resolution_fact_survivors: Vec<codestory_contracts::graph::EdgeId>,
+    containment_survivors: Vec<codestory_contracts::graph::EdgeId>,
+    source_survivors: Vec<codestory_contracts::graph::EdgeId>,
+    admitted: Vec<codestory_contracts::graph::EdgeId>,
+    raw_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+    resolution_fact_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+    containment_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+    source_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+    line_failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+}
+
+impl StepTraceAccumulator {
+    fn reject_raw(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: RawAdmissionFailure,
+    ) {
+        self.raw_failures
+            .entry(CandidateFailure::RawAdmission(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn reject_containment(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: ContainmentFailure,
+    ) {
+        self.containment_failures
+            .entry(CandidateFailure::Containment(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn reject_resolution_fact(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: ResolutionFactFailure,
+    ) {
+        self.resolution_fact_failures
+            .entry(CandidateFailure::ResolutionFact(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn reject_source(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: SourceBindingFailure,
+    ) {
+        self.source_failures
+            .entry(CandidateFailure::SourceBinding(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn reject_line(
+        &mut self,
+        edge_id: codestory_contracts::graph::EdgeId,
+        reason: SourceBindingFailure,
+    ) {
+        self.line_failures
+            .entry(CandidateFailure::SourceBinding(reason))
+            .or_default()
+            .push(edge_id);
+    }
+
+    fn finish(mut self, step_index: usize) -> StepQualificationTrace {
+        self.candidate_edge_ids.sort();
+        self.candidate_edge_ids.dedup();
+        self.admitted.sort();
+        self.admitted.dedup();
+        let outcome = if self.raw_survivors.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::RawAdmission,
+                histogram: failure_histogram(self.raw_failures),
+            }
+        } else if self.resolution_fact_survivors.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::ResolutionFact,
+                histogram: failure_histogram(self.resolution_fact_failures),
+            }
+        } else if self.containment_survivors.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Containment,
+                histogram: failure_histogram(self.containment_failures),
+            }
+        } else if self.source_survivors.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::SourceBinding,
+                histogram: failure_histogram(self.source_failures),
+            }
+        } else if self.admitted.is_empty() {
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Line,
+                histogram: failure_histogram(self.line_failures),
+            }
+        } else {
+            StepQualificationOutcome::Admitted {
+                edge_ids: self.admitted,
+            }
+        };
+        StepQualificationTrace {
+            step_index,
+            candidate_edge_ids: self.candidate_edge_ids,
+            outcome,
+        }
+    }
+}
+
+fn failure_histogram(
+    failures: BTreeMap<CandidateFailure, Vec<codestory_contracts::graph::EdgeId>>,
+) -> Vec<CandidateFailureHistogram> {
+    failures
+        .into_iter()
+        .map(|(reason, mut edge_ids)| {
+            edge_ids.sort();
+            edge_ids.dedup();
+            CandidateFailureHistogram { reason, edge_ids }
+        })
+        .collect()
+}
 
 pub(crate) fn build_indexed_source_call_path_facts(
     controller: &AppController,
     contract: &ValidatedCallPathContract,
 ) -> Result<BuiltCallPathFacts, ApiError> {
+    Ok(build_observed_indexed_source_call_path_facts(controller, contract)?.built)
+}
+
+pub(crate) fn build_observed_indexed_source_call_path_facts(
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+) -> Result<ObservedBuiltCallPathFacts, ApiError> {
     let publication = controller.active_core_publication().ok_or_else(|| {
         ApiError::internal("indexed call-path proof requires an active core publication")
     })?;
     let project_root = controller.require_project_root()?;
     let project_id = project_identity_v3(&project_root).project_id;
     let storage = controller.open_storage_read_only()?;
-    build_from_store(
+    build_from_store_observed(
         &storage,
         &project_root,
         &project_id,
@@ -63,14 +752,117 @@ pub(crate) fn build_indexed_source_call_path_facts(
     )
 }
 
+pub(crate) fn build_observed_indexed_source_call_path_facts_with_prepared_validation(
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+) -> Result<(ObservedBuiltCallPathFacts, ProofPublicationValidationUse), ApiError> {
+    let publication = controller.active_core_publication().ok_or_else(|| {
+        ApiError::internal("indexed call-path proof requires an active core publication")
+    })?;
+    let project_root = controller.require_project_root()?;
+    let project_id = project_identity_v3(&project_root).project_id;
+    let storage = controller.open_storage_read_only()?;
+    let validation =
+        controller.validate_proof_publication_for_active_snapshot(&publication, &storage)?;
+    let observed = build_from_store_observed_with_validation(
+        &storage,
+        &project_root,
+        &project_id,
+        &publication,
+        contract,
+        validation.proof_projection_available(),
+        |path| fs::read(path),
+    )?;
+    Ok((observed, validation))
+}
+
+fn build_indexed_source_call_path_facts_after_validation(
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+) -> Result<BuiltCallPathFacts, ApiError> {
+    build_indexed_source_call_path_facts_with_validation_outcome(controller, contract, true)
+}
+
+fn build_indexed_source_call_path_facts_with_validation_outcome(
+    controller: &AppController,
+    contract: &ValidatedCallPathContract,
+    proof_projection_available: bool,
+) -> Result<BuiltCallPathFacts, ApiError> {
+    let publication = controller.active_core_publication().ok_or_else(|| {
+        ApiError::internal("indexed call-path proof requires an active core publication")
+    })?;
+    let project_root = controller.require_project_root()?;
+    let project_id = project_identity_v3(&project_root).project_id;
+    let storage = controller.open_storage_read_only()?;
+    Ok(build_from_store_observed_with_validation(
+        &storage,
+        &project_root,
+        &project_id,
+        &publication,
+        contract,
+        proof_projection_available,
+        |path| fs::read(path),
+    )?
+    .built)
+}
+
 fn build_from_store<R>(
     store: &Store,
     project_root: &Path,
     project_id: &str,
     publication: &IndexPublicationRecord,
     contract: &ValidatedCallPathContract,
-    mut read_source: R,
+    read_source: R,
 ) -> Result<BuiltCallPathFacts, ApiError>
+where
+    R: FnMut(&Path) -> io::Result<Vec<u8>>,
+{
+    Ok(build_from_store_observed(
+        store,
+        project_root,
+        project_id,
+        publication,
+        contract,
+        read_source,
+    )?
+    .built)
+}
+
+fn build_from_store_observed<R>(
+    store: &Store,
+    project_root: &Path,
+    project_id: &str,
+    publication: &IndexPublicationRecord,
+    contract: &ValidatedCallPathContract,
+    read_source: R,
+) -> Result<ObservedBuiltCallPathFacts, ApiError>
+where
+    R: FnMut(&Path) -> io::Result<Vec<u8>>,
+{
+    let proof_projection_available = matches!(
+        count_and_validate_complete_proof_publication(store, publication),
+        Ok(manifest) if manifest.adapter_roster == current_proof_resolution_adapter_roster()
+    );
+    build_from_store_observed_with_validation(
+        store,
+        project_root,
+        project_id,
+        publication,
+        contract,
+        proof_projection_available,
+        read_source,
+    )
+}
+
+fn build_from_store_observed_with_validation<R>(
+    store: &Store,
+    project_root: &Path,
+    project_id: &str,
+    publication: &IndexPublicationRecord,
+    contract: &ValidatedCallPathContract,
+    proof_projection_available: bool,
+    mut read_source: R,
+) -> Result<ObservedBuiltCallPathFacts, ApiError>
 where
     R: FnMut(&Path) -> io::Result<Vec<u8>>,
 {
@@ -79,18 +871,39 @@ where
         generation_id: publication.generation_id.clone(),
         run_id: publication.run_id.clone(),
     };
+    if !proof_projection_available {
+        return Ok(ObservedBuiltCallPathFacts {
+            built: BuiltCallPathFacts {
+                publication: proof_publication,
+                facts: Vec::new(),
+                receipts: Vec::new(),
+                gaps: Vec::new(),
+                unavailable: vec![UnavailableReason::ProofSemanticProjectionUnavailable],
+            },
+            trace: ProofQualificationTrace {
+                selectors: Vec::new(),
+                selector_early_return: true,
+                steps: Vec::new(),
+                finalization: FinalizationTrace::NotRun,
+            },
+        });
+    }
     let files = store.files().inventory().map_err(store_error)?;
     let file_rows = store.files().get_files().map_err(store_error)?;
     let mut path_identities = OperationPathIdentityResolver::native();
+    let canonical_index =
+        CanonicalSelectorIndex::prepare(project_root, &file_rows, &mut path_identities);
     let mut resolved = Vec::with_capacity(contract.spec().steps().len() + 1);
     let mut gaps = Vec::new();
     let mut unavailable = Vec::new();
+    let mut selectors = Vec::new();
     let selector_context = SelectorContext {
         store,
         project_root,
         project_id,
         publication,
         files: &file_rows,
+        canonical_index: &canonical_index,
     };
 
     for (selector_index, selector) in std::iter::once(contract.spec().start())
@@ -98,17 +911,46 @@ where
         .enumerate()
     {
         match resolve_symbol_selector(&selector_context, selector, &mut path_identities)? {
-            SelectorResolution::Resolved(node) => resolved.push(node),
+            SelectorResolution::Resolved(node) => {
+                let node_id = parse_pinned_node_id(&node.pinned).ok_or_else(|| {
+                    ApiError::internal(
+                        "resolved call-path selector lost its numeric publication pin",
+                    )
+                })?;
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Resolved { node_id },
+                });
+                resolved.push(node);
+            }
             SelectorResolution::Missing => {
-                gaps.push(FactBuildGap::SelectorMissing { selector_index })
+                gaps.push(FactBuildGap::SelectorMissing { selector_index });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::Missing),
+                });
             }
             SelectorResolution::Ambiguous => {
-                gaps.push(FactBuildGap::SelectorAmbiguous { selector_index })
+                gaps.push(FactBuildGap::SelectorAmbiguous { selector_index });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::Ambiguous),
+                });
             }
             SelectorResolution::NonCallable => {
-                gaps.push(FactBuildGap::NonCallableSelector { selector_index })
+                gaps.push(FactBuildGap::NonCallableSelector { selector_index });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::NonCallable),
+                });
             }
-            SelectorResolution::Unavailable(reason) => unavailable.push(reason),
+            SelectorResolution::Unavailable(reason) => {
+                unavailable.push(reason.clone());
+                selectors.push(SelectorQualificationTrace {
+                    selector_index,
+                    outcome: SelectorGateOutcome::Unavailable(reason),
+                });
+            }
         }
     }
 
@@ -120,17 +962,49 @@ where
             .chain(contract.spec().projection_exclusions()),
     ) {
         match resolve_scope_selector(&selector_context, selector, &mut path_identities)? {
-            SelectorResolution::Resolved(_) => {}
-            SelectorResolution::Missing => gaps.push(FactBuildGap::SelectorMissing {
-                selector_index: scope_index,
-            }),
-            SelectorResolution::Ambiguous => gaps.push(FactBuildGap::SelectorAmbiguous {
-                selector_index: scope_index,
-            }),
-            SelectorResolution::NonCallable => gaps.push(FactBuildGap::NonCallableSelector {
-                selector_index: scope_index,
-            }),
-            SelectorResolution::Unavailable(reason) => unavailable.push(reason),
+            SelectorResolution::Resolved(node) => {
+                let node_id = parse_pinned_node_id(&node.pinned).ok_or_else(|| {
+                    ApiError::internal("resolved call-path scope lost its numeric publication pin")
+                })?;
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Resolved { node_id },
+                });
+            }
+            SelectorResolution::Missing => {
+                gaps.push(FactBuildGap::SelectorMissing {
+                    selector_index: scope_index,
+                });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::Missing),
+                });
+            }
+            SelectorResolution::Ambiguous => {
+                gaps.push(FactBuildGap::SelectorAmbiguous {
+                    selector_index: scope_index,
+                });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::Ambiguous),
+                });
+            }
+            SelectorResolution::NonCallable => {
+                gaps.push(FactBuildGap::NonCallableSelector {
+                    selector_index: scope_index,
+                });
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Failed(SelectorFailure::NonCallable),
+                });
+            }
+            SelectorResolution::Unavailable(reason) => {
+                unavailable.push(reason.clone());
+                selectors.push(SelectorQualificationTrace {
+                    selector_index: scope_index,
+                    outcome: SelectorGateOutcome::Unavailable(reason),
+                });
+            }
         }
     }
 
@@ -142,12 +1016,34 @@ where
     {
         gaps.sort();
         gaps.dedup();
-        return Ok(BuiltCallPathFacts {
-            publication: proof_publication,
-            facts: Vec::new(),
-            receipts: Vec::new(),
-            gaps,
-            unavailable,
+        let blocking_selector = selectors
+            .iter()
+            .find(|selector| !matches!(selector.outcome, SelectorGateOutcome::Resolved { .. }))
+            .expect("selector early return has a blocking selector");
+        let steps = (0..contract.spec().steps().len())
+            .map(|step_index| StepQualificationTrace {
+                step_index,
+                candidate_edge_ids: Vec::new(),
+                outcome: StepQualificationOutcome::SelectorBlocked {
+                    selector_index: blocking_selector.selector_index,
+                    outcome: blocking_selector.outcome.clone(),
+                },
+            })
+            .collect();
+        return Ok(ObservedBuiltCallPathFacts {
+            built: BuiltCallPathFacts {
+                publication: proof_publication,
+                facts: Vec::new(),
+                receipts: Vec::new(),
+                gaps,
+                unavailable,
+            },
+            trace: ProofQualificationTrace {
+                selectors,
+                selector_early_return: true,
+                steps,
+                finalization: FinalizationTrace::NotRun,
+            },
         });
     }
 
@@ -162,6 +1058,7 @@ where
     let mut source_cache = HashMap::<WorkspacePathIdentity, SourceObservation>::new();
     let mut facts = Vec::new();
     let mut receipts = Vec::new();
+    let mut steps = Vec::with_capacity(contract.spec().steps().len());
 
     for (step_index, pair) in resolved.windows(2).enumerate() {
         let source = &pair[0];
@@ -190,50 +1087,117 @@ where
         let mut step_unavailable = Vec::new();
         let mut step_gaps = Vec::new();
         let mut containment_failed = false;
-        for edge in store
-            .get_raw_call_edges_by_effective_source(source_id)
-            .map_err(store_error)?
-        {
-            let RawCallEdgeAdmission::Admitted(admitted) =
-                admit_raw_call_edge(&edge, source_id, target_id)
+        let bounded_edges = store
+            .get_bounded_raw_call_edges_by_effective_source(
+                source_id,
+                MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP,
+            )
+            .map_err(store_error)?;
+        let edges = bounded_edges.edges;
+        if bounded_edges.truncated {
+            steps.push(StepQualificationTrace {
+                step_index,
+                candidate_edge_ids: edges.iter().map(|edge| edge.id).collect(),
+                outcome: StepQualificationOutcome::CandidateLimitExceeded {
+                    maximum_candidate_edges: MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP,
+                    observed_candidate_edges_at_least: MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP
+                        + 1,
+                },
+            });
+            unavailable.push(UnavailableReason::ProofFactsUnavailable);
+            continue;
+        }
+        let mut step_trace = StepTraceAccumulator {
+            candidate_edge_ids: edges.iter().map(|edge| edge.id).collect(),
+            ..StepTraceAccumulator::default()
+        };
+        for edge in edges {
+            let admitted = match diagnose_raw_call_edge(&edge, source_id, target_id) {
+                Ok(admitted) => {
+                    step_trace.raw_survivors.push(edge.id);
+                    admitted
+                }
+                Err(reason) => {
+                    step_trace.reject_raw(edge.id, reason);
+                    continue;
+                }
+            };
+            let Some(resolution_fact) = store
+                .get_exact_proof_resolution_fact_by_edge(edge.id)
+                .map_err(store_error)?
             else {
+                step_trace.reject_resolution_fact(edge.id, ResolutionFactFailure::Missing);
                 continue;
             };
+            if seal_call_resolution_fact(resolution_fact.clone())
+                .ok()
+                .as_ref()
+                != Some(&resolution_fact)
+                || !resolution_fact_matches_raw_edge(
+                    &resolution_fact,
+                    &admitted,
+                    source_id,
+                    target_id,
+                )
+            {
+                step_unavailable.push(UnavailableReason::ProofSemanticProjectionUnavailable);
+                step_trace.reject_resolution_fact(edge.id, ResolutionFactFailure::Inconsistent);
+                continue;
+            }
+            step_trace.resolution_fact_survivors.push(edge.id);
             if !is_callable(source_node.kind) || !is_callable(target_node.kind) {
+                step_trace.reject_containment(edge.id, ContainmentFailure::Missing);
                 continue;
             }
             let Some(source_file_id) = source_node.file_node_id else {
+                step_trace.reject_containment(edge.id, ContainmentFailure::EdgeSourceFileMismatch);
                 continue;
             };
             if admitted.file_node_id != source_file_id {
+                step_trace.reject_containment(edge.id, ContainmentFailure::EdgeSourceFileMismatch);
                 continue;
             }
-            let Some(containment) = authenticate_containment(
+            let containment = match authenticate_containment(
                 store,
                 &source_node,
                 admitted.file_node_id,
                 admitted.line,
-            )?
-            else {
-                containment_failed = true;
-                continue;
+            )? {
+                Ok(containment) => {
+                    step_trace.containment_survivors.push(edge.id);
+                    containment
+                }
+                Err(reason) => {
+                    containment_failed = true;
+                    step_trace.reject_containment(edge.id, reason);
+                    continue;
+                }
             };
             let Some(file) = files_by_id.get(&admitted.file_node_id.0) else {
                 step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                step_trace.reject_source(edge.id, SourceBindingFailure::FileIncomplete);
                 continue;
             };
             if !file.indexed || !file.complete {
                 step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                step_trace.reject_source(edge.id, SourceBindingFailure::FileIncomplete);
                 continue;
             }
             let Some(file_row) = rows_by_id.get(&file.id) else {
                 step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                step_trace.reject_source(edge.id, SourceBindingFailure::FileIncomplete);
                 continue;
             };
             let Some(indexed_hash) = file.content_hash.as_deref() else {
                 step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                step_trace.reject_source(edge.id, SourceBindingFailure::StoredHashAbsent);
                 continue;
             };
+            if resolution_fact.callsite.source_sha256 != indexed_hash {
+                step_unavailable.push(UnavailableReason::ProofSemanticProjectionUnavailable);
+                step_trace.reject_source(edge.id, SourceBindingFailure::StoredHashAbsent);
+                continue;
+            }
             let bound = match bind_source_once(
                 project_root,
                 file_row,
@@ -243,22 +1207,45 @@ where
                 &mut read_source,
             ) {
                 Ok(bound) => bound,
-                Err(BindSourceError::Unavailable) => {
-                    step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
-                    continue;
-                }
-                Err(BindSourceError::InvalidUtf8) => {
-                    step_gaps.push(FactBuildGap::InvalidUtf8 { step_index });
+                Err(reason) => {
+                    step_trace.reject_source(edge.id, reason);
+                    if reason == SourceBindingFailure::InvalidUtf8 {
+                        step_gaps.push(FactBuildGap::InvalidUtf8 { step_index });
+                    } else {
+                        step_unavailable.push(UnavailableReason::SourceNotBoundToPublication);
+                    }
                     continue;
                 }
             };
+            step_trace.source_survivors.push(edge.id);
             let Some((byte_start, byte_end, text)) = complete_line(&bound.bytes, admitted.line)
             else {
                 step_gaps.push(FactBuildGap::SourceLineOutOfRange { step_index });
+                step_trace.reject_line(edge.id, SourceBindingFailure::LineMissing);
                 continue;
             };
+            let exact_start = usize::try_from(resolution_fact.callsite.start_byte).ok();
+            let exact_end = usize::try_from(resolution_fact.callsite.end_byte_exclusive).ok();
+            let expected_exact_start = resolution_fact
+                .callsite
+                .column
+                .checked_sub(1)
+                .and_then(|column| usize::try_from(column).ok())
+                .and_then(|column| byte_start.checked_add(column));
+            if exact_start != expected_exact_start
+                || exact_end.is_none_or(|end| end > byte_end)
+                || exact_start
+                    .zip(exact_end)
+                    .and_then(|(start, end)| bound.bytes.get(start..end))
+                    != Some(resolution_fact.callsite.raw_target.as_bytes())
+            {
+                step_unavailable.push(UnavailableReason::ProofSemanticProjectionUnavailable);
+                step_trace.reject_line(edge.id, SourceBindingFailure::ExactCallsiteMismatch);
+                continue;
+            }
             if byte_end - byte_start > MAX_LINE_WINDOW_BYTES {
                 step_gaps.push(FactBuildGap::SourceWindowTooLarge { step_index });
+                step_trace.reject_line(edge.id, SourceBindingFailure::LineOverLimit);
                 continue;
             }
             let line_window = IndexedLineWindow {
@@ -278,6 +1265,7 @@ where
                 source_id.0,
                 target_id.0,
                 indexed_hash,
+                &resolution_fact,
             );
             let receipt_ref = ReceiptRef {
                 receipt_id,
@@ -287,8 +1275,13 @@ where
                 receipt: receipt_ref.clone(),
                 source: source.clone(),
                 target: target.clone(),
-                certainty: ResolutionCertainty::Certain,
+                resolution_fact_id: resolution_fact.fact_id,
+                resolution_evidence_sha256: resolution_fact.provenance.evidence_sha256.clone(),
+                resolution_evidence_chain: resolution_fact.evidence_chain,
+                resolution_provenance: resolution_fact.provenance,
+                exact_callsite_start_byte: resolution_fact.callsite.start_byte,
                 callsite_identity: admitted.callsite_identity,
+                column_or_ordinal: admitted.column_or_ordinal,
                 containment,
                 line_window,
             });
@@ -298,7 +1291,9 @@ where
                 target: target.clone(),
             }));
             admitted_any = true;
+            step_trace.admitted.push(edge.id);
         }
+        steps.push(step_trace.finish(step_index));
         if admitted_any {
             continue;
         }
@@ -319,19 +1314,77 @@ where
     gaps.dedup();
     unavailable.sort();
     unavailable.dedup();
-    Ok(BuiltCallPathFacts {
-        publication: proof_publication,
-        facts,
-        receipts,
-        gaps,
-        unavailable,
+    Ok(ObservedBuiltCallPathFacts {
+        built: BuiltCallPathFacts {
+            publication: proof_publication,
+            facts,
+            receipts,
+            gaps,
+            unavailable,
+        },
+        trace: ProofQualificationTrace {
+            selectors,
+            selector_early_return: false,
+            steps,
+            finalization: FinalizationTrace::NotRun,
+        },
     })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct IntegratedProjectedCallPathResult {
-    pub integration: codestory_agent::indexed_source_call_path_v1::CheckedBuiltCallPathIntegration,
+pub struct IntegratedProjectedCallPathResult {
+    pub integration: CheckedBuiltCallPathIntegration,
     pub projection: InternalProjection,
+}
+
+pub(crate) fn finalize_observed_call_path(
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    observed: ObservedBuiltCallPathFacts,
+) -> ObservedIntegratedProjectedCallPathResult {
+    let ObservedBuiltCallPathFacts { built, mut trace } = observed;
+    let integration = match check_built_call_path_integration(contract, hashes, rendering, built) {
+        Ok(integration) => integration,
+        Err(error) => {
+            trace.finalization = FinalizationTrace::Failed(FinalizationFailure::ReceiptIntegration);
+            return ObservedIntegratedProjectedCallPathResult {
+                result: Err(ApiError::internal(format!(
+                    "indexed call-path checked integration failed: {error:?}"
+                ))),
+                trace,
+            };
+        }
+    };
+    let projection = match project_internal_call_path_result(&integration) {
+        Ok(projection) => projection,
+        Err(error) => {
+            trace.finalization = FinalizationTrace::Failed(FinalizationFailure::ProjectionBudget);
+            return ObservedIntegratedProjectedCallPathResult {
+                result: Err(ApiError::internal(format!(
+                    "indexed call-path projection construction failed: {error:?}"
+                ))),
+                trace,
+            };
+        }
+    };
+    trace.finalization = match &projection {
+        InternalProjection::Complete {
+            serialized_size, ..
+        } => FinalizationTrace::Complete {
+            projection_bytes: *serialized_size,
+        },
+        InternalProjection::BudgetExceeded { .. } => {
+            FinalizationTrace::Failed(FinalizationFailure::ReceiptBudget)
+        }
+    };
+    ObservedIntegratedProjectedCallPathResult {
+        result: Ok(IntegratedProjectedCallPathResult {
+            integration,
+            projection,
+        }),
+        trace,
+    }
 }
 
 pub(crate) fn run_integrated_projected_public_operation(
@@ -342,8 +1395,13 @@ pub(crate) fn run_integrated_projected_public_operation(
     rendering: &ValidatedContractRendering,
     cancelled: Arc<AtomicBool>,
 ) -> Result<PublicOperation<IntegratedProjectedCallPathResult>, ApiError> {
-    service.run_with_cancel(PROOF_DOMAIN, cancelled, || {
-        let built = build_indexed_source_call_path_facts(controller, contract)?;
+    controller.arm_proof_publication_validation();
+    let result = service.run_with_cancel(PROOF_DOMAIN, cancelled, || {
+        let (observed, validation) =
+            build_observed_indexed_source_call_path_facts_with_prepared_validation(
+                controller, contract,
+            )?;
+        let built = observed.built;
         let integration = check_built_call_path_integration(contract, hashes, rendering, built)
             .map_err(|error| {
                 ApiError::internal(format!(
@@ -355,11 +1413,15 @@ pub(crate) fn run_integrated_projected_public_operation(
                 "indexed call-path projection construction failed: {error:?}"
             ))
         })?;
-        Ok(IntegratedProjectedCallPathResult {
+        let result = IntegratedProjectedCallPathResult {
             integration,
             projection,
-        })
-    })
+        };
+        controller.finish_proof_publication_validation(validation)?;
+        Ok(result)
+    });
+    controller.finish_proof_publication_validation_operation();
+    result
 }
 
 struct CheckedIntegrationInputs<'a> {
@@ -375,7 +1437,7 @@ fn evaluate_from_store<R>(
     publication: &IndexPublicationRecord,
     inputs: CheckedIntegrationInputs<'_>,
     read_source: R,
-) -> Result<codestory_agent::indexed_source_call_path_v1::CheckedBuiltCallPathIntegration, ApiError>
+) -> Result<CheckedBuiltCallPathIntegration, ApiError>
 where
     R: FnMut(&Path) -> io::Result<Vec<u8>>,
 {
@@ -410,6 +1472,108 @@ struct SelectorContext<'a> {
     project_id: &'a str,
     publication: &'a IndexPublicationRecord,
     files: &'a [FileInfo],
+    canonical_index: &'a CanonicalSelectorIndex,
+}
+
+#[derive(Default)]
+struct CanonicalSelectorIndex {
+    stored_prefixes_by_relative: BTreeMap<String, Vec<String>>,
+    unavailable: bool,
+}
+
+impl CanonicalSelectorIndex {
+    fn prepare(
+        project_root: &Path,
+        files: &[FileInfo],
+        identities: &mut OperationPathIdentityResolver,
+    ) -> Self {
+        let mut index = Self::default();
+        let mut relative_by_identity = HashMap::<WorkspacePathIdentity, String>::new();
+        for file in files {
+            let Some(stored_prefix) = file.path.to_str().map(str::to_owned) else {
+                index.unavailable = true;
+                continue;
+            };
+            let Some(absolute) = stored_absolute(project_root, &file.path) else {
+                index.unavailable = true;
+                continue;
+            };
+            let Ok(native_identity) = identities.resolve(&absolute) else {
+                index.unavailable = true;
+                continue;
+            };
+            let Some(relative) = workspace_relative_path(project_root, &absolute) else {
+                index.unavailable = true;
+                continue;
+            };
+            let Some(relative) = normalized_project_relative_text(&relative) else {
+                index.unavailable = true;
+                continue;
+            };
+            if relative_by_identity
+                .insert(native_identity, relative.clone())
+                .is_some_and(|existing| existing != relative)
+            {
+                index.unavailable = true;
+                continue;
+            }
+            index
+                .stored_prefixes_by_relative
+                .entry(format!("{relative}:"))
+                .or_default()
+                .push(stored_prefix);
+        }
+        for prefixes in index.stored_prefixes_by_relative.values_mut() {
+            prefixes.sort();
+            prefixes.dedup();
+        }
+        index
+    }
+
+    fn reconstruct(&self, canonical_id: &str) -> Result<Vec<String>, ()> {
+        if self.unavailable {
+            return Err(());
+        }
+        let Some((relative_prefix, stored_prefixes)) = self
+            .stored_prefixes_by_relative
+            .range(..=canonical_id.to_owned())
+            .next_back()
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(suffix) = canonical_id.strip_prefix(relative_prefix) else {
+            return Ok(Vec::new());
+        };
+        if suffix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reconstructed = stored_prefixes
+            .iter()
+            .map(|stored| format!("{stored}:{suffix}"))
+            .collect::<Vec<_>>();
+        reconstructed.sort();
+        reconstructed.dedup();
+        Ok(reconstructed)
+    }
+}
+
+fn normalized_project_relative_text(path: &Path) -> Option<String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return None;
+        };
+        let component = component.to_str()?;
+        if component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.contains(['/', '\\', '\0'])
+        {
+            return None;
+        }
+        components.push(component);
+    }
+    (!components.is_empty()).then(|| components.join("/"))
 }
 
 fn resolve_scope_selector(
@@ -479,13 +1643,103 @@ fn resolve_canonical(
     canonical_id: &str,
     identities: &mut OperationPathIdentityResolver,
 ) -> Result<SelectorResolution, ApiError> {
-    let matches = context
+    let mut matched_canonical = canonical_id.to_owned();
+    let mut matches = context
         .store
         .node_ids_by_canonical_ids(&[canonical_id.to_owned()])
         .map_err(store_error)?
         .remove(canonical_id)
         .unwrap_or_default();
-    resolve_unique_node(context, matches, identities)
+    if matches.is_empty() {
+        let reconstructed = match context.canonical_index.reconstruct(canonical_id) {
+            Ok(reconstructed) => reconstructed,
+            Err(()) => {
+                return Ok(SelectorResolution::Unavailable(
+                    UnavailableReason::SourceNotBoundToPublication,
+                ));
+            }
+        };
+        if reconstructed.len() > 1 {
+            return Ok(SelectorResolution::Ambiguous);
+        }
+        if let Some(reconstructed) = reconstructed.first() {
+            matched_canonical.clone_from(reconstructed);
+            matches = context
+                .store
+                .node_ids_by_canonical_ids(std::slice::from_ref(reconstructed))
+                .map_err(store_error)?
+                .remove(reconstructed)
+                .unwrap_or_default();
+        }
+    }
+    if !matches.is_empty()
+        && !canonical_id_authenticates_selected_files(
+            context,
+            &matched_canonical,
+            &matches,
+            identities,
+        )
+    {
+        return Ok(SelectorResolution::Unavailable(
+            UnavailableReason::SourceNotBoundToPublication,
+        ));
+    }
+    let resolved = resolve_unique_node(context, matches, identities)?;
+    Ok(match resolved {
+        SelectorResolution::Resolved(mut identity) => {
+            identity.canonical_id = canonical_id.to_owned();
+            SelectorResolution::Resolved(identity)
+        }
+        other => other,
+    })
+}
+
+fn canonical_id_authenticates_selected_files(
+    context: &SelectorContext<'_>,
+    canonical_id: &str,
+    node_ids: &[NodeId],
+    identities: &mut OperationPathIdentityResolver,
+) -> bool {
+    if !canonical_id.contains('#') {
+        return true;
+    }
+    node_ids.iter().all(|node_id| {
+        let Ok(Some(node)) = context.store.get_node(*node_id) else {
+            return false;
+        };
+        let Some(file_id) = node.file_node_id else {
+            return false;
+        };
+        let Some(file) = context.files.iter().find(|file| file.id == file_id.0) else {
+            return false;
+        };
+        let Some(stored_path) = stored_absolute(context.project_root, &file.path) else {
+            return false;
+        };
+        let Ok(stored_identity) = identities.resolve(&stored_path) else {
+            return false;
+        };
+        let mut matching_prefixes = 0usize;
+        for (index, character) in canonical_id.char_indices() {
+            if character != ':' || index == 0 {
+                continue;
+            }
+            let candidate = Path::new(&canonical_id[..index]);
+            let Some(candidate) = stored_absolute(context.project_root, candidate) else {
+                continue;
+            };
+            if workspace_relative_path(context.project_root, &candidate).is_none() {
+                continue;
+            }
+            if identities
+                .resolve(&candidate)
+                .is_ok_and(|identity| identity == stored_identity)
+            {
+                matching_prefixes += 1;
+            }
+        }
+        matching_prefixes == 1
+    })
 }
 
 fn resolve_qualified(
@@ -617,6 +1871,7 @@ fn resolved_node(
             .canonical_id
             .unwrap_or_else(|| format!("node:{}", node.id.0)),
         qualified_name: node.qualified_name.unwrap_or(node.serialized_name),
+        file_node_id: NodeId(file.id),
         project_file_components: components,
     }))
 }
@@ -626,7 +1881,7 @@ fn authenticate_containment(
     selected_source: &Node,
     file_node_id: NodeId,
     line: u32,
-) -> Result<Option<CallableContainmentEvidence>, ApiError> {
+) -> Result<Result<CallableContainmentEvidence, ContainmentFailure>, ApiError> {
     let projections = store
         .get_callable_projection_states_for_file(file_node_id.0)
         .map_err(store_error)?;
@@ -654,7 +1909,7 @@ fn authenticate_containment(
         )
     });
     let Some(smallest) = candidates.first() else {
-        return Ok(None);
+        return Ok(Err(ContainmentFailure::Missing));
     };
     let smallest_span = smallest.end_line.saturating_sub(smallest.start_line);
     if candidates
@@ -666,9 +1921,9 @@ fn authenticate_containment(
         != 1
         || smallest.node_id != selected_source.id
     {
-        return Ok(None);
+        return Ok(Err(ContainmentFailure::Ambiguous));
     }
-    Ok(Some(CallableContainmentEvidence {
+    Ok(Ok(CallableContainmentEvidence {
         file_node_id,
         owner_node_id: smallest.node_id,
         start_line: smallest.start_line,
@@ -684,13 +1939,8 @@ struct BoundSource {
 
 enum SourceObservation {
     Bound(BoundSource),
-    Unavailable,
+    ReadFailed,
     InvalidUtf8 { observed_sha256: String },
-}
-
-enum BindSourceError {
-    Unavailable,
-    InvalidUtf8,
 }
 
 fn bind_source_once<'a, R>(
@@ -700,23 +1950,24 @@ fn bind_source_once<'a, R>(
     identities: &mut OperationPathIdentityResolver,
     cache: &'a mut HashMap<WorkspacePathIdentity, SourceObservation>,
     read_source: &mut R,
-) -> Result<&'a BoundSource, BindSourceError>
+) -> Result<&'a BoundSource, SourceBindingFailure>
 where
     R: FnMut(&Path) -> io::Result<Vec<u8>>,
 {
-    let absolute = stored_absolute(project_root, &file.path).ok_or(BindSourceError::Unavailable)?;
+    let absolute = stored_absolute(project_root, &file.path)
+        .ok_or(SourceBindingFailure::WorkingTreeReadFailed)?;
     let ProjectRelativePathResolution::Existing { absolute, relative } =
         resolve_project_relative_path(project_root, &absolute)
-            .map_err(|_| BindSourceError::Unavailable)?
+            .map_err(|_| SourceBindingFailure::WorkingTreeReadFailed)?
     else {
-        return Err(BindSourceError::Unavailable);
+        return Err(SourceBindingFailure::WorkingTreeReadFailed);
     };
     let identity = identities
         .resolve(&absolute)
-        .map_err(|_| BindSourceError::Unavailable)?;
+        .map_err(|_| SourceBindingFailure::WorkingTreeReadFailed)?;
     if !cache.contains_key(&identity) {
         let observation = match read_source(&absolute) {
-            Err(_) => SourceObservation::Unavailable,
+            Err(_) => SourceObservation::ReadFailed,
             Ok(bytes) => {
                 let observed_sha256 = sha256_hex(&bytes);
                 if std::str::from_utf8(&bytes).is_err() {
@@ -727,8 +1978,8 @@ where
                         .map(|part| part.to_str().map(str::to_owned))
                         .collect::<Option<Vec<_>>>()
                     else {
-                        cache.insert(identity.clone(), SourceObservation::Unavailable);
-                        return Err(BindSourceError::Unavailable);
+                        cache.insert(identity.clone(), SourceObservation::ReadFailed);
+                        return Err(SourceBindingFailure::WorkingTreeReadFailed);
                     };
                     SourceObservation::Bound(BoundSource {
                         bytes,
@@ -741,17 +1992,16 @@ where
         cache.insert(identity.clone(), observation);
     }
     let Some(observation) = cache.get(&identity) else {
-        return Err(BindSourceError::Unavailable);
+        return Err(SourceBindingFailure::WorkingTreeReadFailed);
     };
     match observation {
         SourceObservation::Bound(bound) if bound.observed_sha256 == indexed_hash => Ok(bound),
-        SourceObservation::Bound(_) | SourceObservation::Unavailable => {
-            Err(BindSourceError::Unavailable)
-        }
+        SourceObservation::Bound(_) => Err(SourceBindingFailure::WorkingTreeHashMismatch),
+        SourceObservation::ReadFailed => Err(SourceBindingFailure::WorkingTreeReadFailed),
         SourceObservation::InvalidUtf8 { observed_sha256 } if observed_sha256 != indexed_hash => {
-            Err(BindSourceError::Unavailable)
+            Err(SourceBindingFailure::WorkingTreeHashMismatch)
         }
-        SourceObservation::InvalidUtf8 { .. } => Err(BindSourceError::InvalidUtf8),
+        SourceObservation::InvalidUtf8 { .. } => Err(SourceBindingFailure::InvalidUtf8),
     }
 }
 
@@ -792,6 +2042,7 @@ fn receipt_id(
     source_id: i64,
     target_id: i64,
     indexed_hash: &str,
+    resolution_fact: &CallResolutionFact,
 ) -> String {
     let mut digest = Sha256::new();
     digest.update(RECEIPT_DOMAIN);
@@ -806,11 +2057,31 @@ fn receipt_id(
         indexed_hash.as_bytes(),
         &admitted.line.to_le_bytes(),
         admitted.callsite_identity.as_bytes(),
+        resolution_fact.fact_id.as_bytes(),
+        resolution_fact.provenance.evidence_sha256.as_bytes(),
+        &resolution_fact.callsite.start_byte.to_le_bytes(),
     ] {
         digest.update((part.len() as u64).to_le_bytes());
         digest.update(part);
     }
     format!("indexed-call-edge:{:x}", digest.finalize())
+}
+
+fn resolution_fact_matches_raw_edge(
+    fact: &CallResolutionFact,
+    admitted: &AdmittedRawCallEdge,
+    source: NodeId,
+    target: NodeId,
+) -> bool {
+    fact.status == ProofResolutionStatus::Exact
+        && fact.edge_id == Some(admitted.edge_id)
+        && fact.caller == source
+        && fact.target == Some(target)
+        && fact.raw_edge_target == Some(admitted.raw_target)
+        && fact.raw_callsite_identity.as_deref() == Some(admitted.callsite_identity.as_str())
+        && fact.callsite.file_id.0 == admitted.file_node_id.0
+        && fact.callsite.line == admitted.line
+        && fact.lookup_domain_complete
 }
 
 fn stored_absolute(project_root: &Path, stored: &Path) -> Option<PathBuf> {
@@ -850,19 +2121,24 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use codestory_agent::indexed_source_call_path_v1::{
-        ClauseAnchor, ClauseClassification, ProofContractField, ProofDisposition,
-        UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
-        UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedContractRendering,
-        ValidationOutcome, check_call_path, validate_contract,
+    use codestory_agent::proof_qualification_test_support::{
+        ClauseAnchor, ClauseClassification, ProofContractField, ProofDisposition, ProofGap,
+        Refutation, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
+        UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector,
+        ValidatedContractRendering, ValidationOutcome, check_call_path, validate_contract,
     };
     use codestory_contracts::api::IndexMode;
     use codestory_contracts::events::EventBus;
-    use codestory_contracts::graph::{
-        CallableProjectionState, Edge, EdgeId, EdgeKind, Node, ResolutionCertainty,
+    use codestory_contracts::graph::{CallableProjectionState, Edge, EdgeId, EdgeKind, Node};
+    use codestory_contracts::proof_resolution::{
+        CallResolutionFact, CalleeForm, DependencyFileHash, EXACT_CALL_RESOLUTION_ALGORITHM,
+        ExactCallsite, FileId, INTERNAL_RESOLUTION_PRODUCER, PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+        ProofResolutionProjection, ProofResolutionReason, ResolutionEvidence, ResolutionProvenance,
     };
-    use codestory_indexer::WorkspaceIndexer;
-    use codestory_store::{FileInfo, FileRole, IndexPublicationMode};
+    use codestory_indexer::{
+        WorkspaceIndexer, build_proof_resolution_funnel, rematerialize_proof_resolution_projection,
+    };
+    use codestory_store::{FileInfo, FileRole, IndexPublicationMode, seal_call_resolution_fact};
     use codestory_workspace::{BuildMode, RefreshInfo};
     use serde_json::json;
     use tempfile::TempDir;
@@ -1072,20 +2348,42 @@ mod tests {
         store
             .insert_node(&node(3, NodeKind::FUNCTION, "target", "target-id", 1, 2, 2))
             .unwrap();
+        let target_column = bytes
+            .split(|byte| *byte == b'\n')
+            .next()
+            .and_then(|line| {
+                line.windows("target".len())
+                    .position(|window| window == b"target")
+            })
+            .and_then(|column| u32::try_from(column + 1).ok())
+            .unwrap_or(1);
+        store
+            .insert_node(&Node {
+                id: NodeId(30),
+                kind: NodeKind::UNKNOWN,
+                serialized_name: "target".to_owned(),
+                qualified_name: None,
+                canonical_id: None,
+                file_node_id: Some(NodeId(1)),
+                start_line: Some(1),
+                start_col: Some(target_column),
+                end_line: Some(1),
+                end_col: target_column.checked_add(6),
+            })
+            .unwrap();
         store
             .insert_edge(&Edge {
                 id: EdgeId(10),
                 source: NodeId(2),
-                target: NodeId(3),
+                target: NodeId(30),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
-                callsite_identity: Some("1:1:0:3|rust".to_owned()),
+                callsite_identity: Some("1:1:1:30|rust".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         store
@@ -1102,6 +2400,7 @@ mod tests {
             mode: IndexPublicationMode::Full,
             published_at_epoch_ms: 1,
         };
+        publish_manual_resolution_facts(&mut store, &publication, &[EdgeId(10)]);
         let project_id = project_identity_v3(&root).project_id;
         Fixture {
             _root: temp,
@@ -1111,6 +2410,144 @@ mod tests {
             project_id,
             contract: contract("source-id", &["target-id"]),
             source_path,
+        }
+    }
+
+    fn publish_manual_resolution_facts(
+        store: &mut Store,
+        publication: &IndexPublicationRecord,
+        edge_ids: &[EdgeId],
+    ) {
+        let adapter_roster = current_proof_resolution_adapter_roster();
+        let rust_adapter_version = adapter_roster
+            .iter()
+            .find(|adapter| adapter.language == "rust")
+            .expect("compiled roster includes Rust")
+            .adapter_version
+            .clone();
+        let nodes = store
+            .get_nodes()
+            .unwrap()
+            .into_iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let facts: Vec<CallResolutionFact> = store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .filter(|edge| edge_ids.contains(&edge.id))
+            .map(|edge| {
+                let file_id = edge.file_node_id.unwrap();
+                let source_sha256 = store.get_file_content_hash(file_id.0).unwrap().unwrap();
+                let caller = edge.effective_source();
+                let target = edge.effective_target();
+                let column_or_ordinal: u32 = edge
+                    .callsite_identity
+                    .as_deref()
+                    .and_then(|identity| identity.split(':').nth(2))
+                    .and_then(|column| column.parse().ok())
+                    .unwrap();
+                let column = store
+                    .get_node(edge.target)
+                    .unwrap()
+                    .and_then(|node| node.start_col)
+                    .unwrap_or(column_or_ordinal);
+                let raw_target = nodes
+                    .get(&edge.target)
+                    .map(|node| node.serialized_name.clone())
+                    .unwrap_or_else(|| "target".to_owned());
+                let file_path = store
+                    .get_files()
+                    .unwrap()
+                    .into_iter()
+                    .find(|file| file.id == file_id.0)
+                    .unwrap()
+                    .path;
+                let source = fs::read(file_path).unwrap();
+                let call_line = edge.line.unwrap();
+                let line_start = if call_line == 1 {
+                    0
+                } else {
+                    source
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, byte)| **byte == b'\n')
+                        .nth(call_line.saturating_sub(2) as usize)
+                        .map_or(0, |(index, _)| index + 1)
+                };
+                let expected_start = line_start + column.saturating_sub(1) as usize;
+                let start_byte = expected_start as u64;
+                seal_call_resolution_fact(CallResolutionFact {
+                    fact_id: String::new(),
+                    edge_id: Some(edge.id),
+                    raw_edge_target: Some(edge.target),
+                    raw_callsite_identity: edge.callsite_identity.clone(),
+                    callsite: ExactCallsite {
+                        file_id: FileId(file_id.0),
+                        source_sha256: source_sha256.clone(),
+                        start_byte,
+                        end_byte_exclusive: start_byte + raw_target.len() as u64,
+                        line: edge.line.unwrap(),
+                        column,
+                        callee_form: CalleeForm::Identifier,
+                        raw_target,
+                    },
+                    caller,
+                    target: Some(target),
+                    status: ProofResolutionStatus::Exact,
+                    reason: ProofResolutionReason::ExactResolution,
+                    evidence_chain: vec![ResolutionEvidence::SameFileDeclaration {
+                        declaration: target,
+                    }],
+                    lookup_domain_complete: true,
+                    provenance: ResolutionProvenance {
+                        producer: INTERNAL_RESOLUTION_PRODUCER.to_owned(),
+                        fact_schema_version: PROOF_RESOLUTION_FACT_SCHEMA_VERSION,
+                        algorithm: EXACT_CALL_RESOLUTION_ALGORITHM.to_owned(),
+                        language_adapter: "rust".to_owned(),
+                        language_adapter_version: rust_adapter_version.clone(),
+                        parser_fingerprint: "2".repeat(64),
+                        dependency_file_hashes: vec![DependencyFileHash {
+                            file_id: FileId(file_id.0),
+                            source_sha256,
+                        }],
+                        evidence_sha256: String::new(),
+                    },
+                })
+                .unwrap()
+            })
+            .collect();
+        let funnel = build_proof_resolution_funnel(&facts);
+        store
+            .replace_proof_resolution_projection(
+                publication,
+                &ProofResolutionProjection {
+                    adapter_roster,
+                    facts,
+                    funnel,
+                },
+            )
+            .unwrap();
+    }
+
+    fn add_duplicate_call_edges(fixture: &mut Fixture, count: u32) {
+        for offset in 0..count {
+            fixture
+                .store
+                .insert_edge(&Edge {
+                    id: EdgeId(100 + i64::from(offset)),
+                    source: NodeId(2),
+                    target: NodeId(3),
+                    kind: EdgeKind::CALL,
+                    file_node_id: Some(NodeId(1)),
+                    line: Some(2),
+                    resolved_source: Some(NodeId(2)),
+                    resolved_target: Some(NodeId(3)),
+                    callsite_identity: Some(format!("1:2:{}:3|rust", offset + 1)),
+                    candidate_targets: Vec::new(),
+                    ..Default::default()
+                })
+                .unwrap();
         }
     }
 
@@ -1124,9 +2561,13 @@ mod tests {
     }
 
     fn source_built_fixture(source: &str) -> SourceBuiltFixture {
+        source_built_fixture_with_extension("rs", source)
+    }
+
+    fn source_built_fixture_with_extension(extension: &str, source: &str) -> SourceBuiltFixture {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().to_path_buf();
-        let source_path = root.join("src/lib.rs");
+        let source_path = root.join(format!("src/lib.{extension}"));
         fs::create_dir_all(source_path.parent().unwrap()).unwrap();
         fs::write(&source_path, source).unwrap();
         let mut store = Store::new_in_memory().unwrap();
@@ -1143,18 +2584,20 @@ mod tests {
                 None,
             )
             .unwrap();
+        let publication = IndexPublicationRecord {
+            generation: 1,
+            generation_id: "source-built-generation-1".to_owned(),
+            run_id: "source-built-run-1".to_owned(),
+            mode: IndexPublicationMode::Full,
+            published_at_epoch_ms: 1,
+        };
+        rematerialize_proof_resolution_projection(&mut store, &publication).unwrap();
         SourceBuiltFixture {
             _root: temp,
             root: root.clone(),
             source_path,
             store,
-            publication: IndexPublicationRecord {
-                generation: 1,
-                generation_id: "source-built-generation-1".to_owned(),
-                run_id: "source-built-run-1".to_owned(),
-                mode: IndexPublicationMode::Full,
-                published_at_epoch_ms: 1,
-            },
+            publication,
             project_id: project_identity_v3(&root).project_id,
         }
     }
@@ -1203,6 +2646,473 @@ mod tests {
             })
             .count();
         (call_rows.len(), admitted)
+    }
+
+    #[test]
+    fn observed_runtime_builder_preserves_source_built_product_results_and_prefixes() {
+        let fixture = source_built_fixture(
+            "pub fn step0() { step1(); }\npub fn step1() {}\npub fn step2() {}\n",
+        );
+        let step0 = source_callable(&fixture.store, "step0");
+        let step1 = source_callable(&fixture.store, "step1");
+        let step2 = source_callable(&fixture.store, "step2");
+        let (contract, hashes, rendering) = validated_contract(
+            canonical_id(&step0),
+            &[canonical_id(&step1), canonical_id(&step2)],
+        );
+
+        let product_built = build_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(observed.built, product_built);
+        assert!(!observed.trace.selector_early_return);
+        assert_eq!(observed.trace.steps.len(), 2);
+        assert!(matches!(
+            &observed.trace.steps[0].outcome,
+            StepQualificationOutcome::Admitted { edge_ids } if edge_ids.len() == 1
+        ));
+        assert_eq!(
+            observed.trace.steps[1].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::RawAdmission,
+                histogram: Vec::new(),
+            }
+        );
+
+        let product_integration =
+            check_built_call_path_integration(&contract, &hashes, &rendering, product_built)
+                .unwrap();
+        let product_projection = project_internal_call_path_result(&product_integration).unwrap();
+        let finalized = finalize_observed_call_path(&contract, &hashes, &rendering, observed);
+        assert_eq!(
+            finalized.trace.finalization,
+            FinalizationTrace::Complete {
+                projection_bytes: match &product_projection {
+                    InternalProjection::Complete {
+                        serialized_size, ..
+                    } => *serialized_size,
+                    other => panic!("partial fixture must fit: {other:?}"),
+                },
+            }
+        );
+        let observed_result = finalized.result.unwrap();
+        assert_eq!(observed_result.integration, product_integration);
+        assert_eq!(observed_result.projection, product_projection);
+        assert!(matches!(
+            observed_result.integration.disposition(),
+            ProofDisposition::Unknown {
+                connected_receipts,
+                gaps,
+                ..
+            } if connected_receipts.len() == 1
+                && gaps == &[ProofGap::FactBuild(FactBuildGap::DirectCallMissing {
+                    step_index: 1,
+                })]
+        ));
+    }
+
+    #[test]
+    fn observed_runtime_builder_bounds_candidate_queries_without_partial_proof() {
+        let mut exact = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        add_duplicate_call_edges(&mut exact, MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP - 1);
+        let exact_observed = build_from_store_observed(
+            &exact.store,
+            &exact.root,
+            &exact.project_id,
+            &exact.publication,
+            &exact.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(
+            exact_observed.trace.steps[0].candidate_edge_ids.len(),
+            MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
+        );
+        assert_eq!(exact_observed.built.receipts.len(), 1);
+        assert!(matches!(
+            &exact_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::Admitted { edge_ids }
+                if edge_ids == &[EdgeId(10)]
+        ));
+
+        let mut over = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        add_duplicate_call_edges(&mut over, MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP);
+        let over_observed = build_from_store_observed(
+            &over.store,
+            &over.root,
+            &over.project_id,
+            &over.publication,
+            &over.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(
+            over_observed.trace.steps[0].candidate_edge_ids.len(),
+            MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP as usize
+        );
+        assert_eq!(
+            over_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::CandidateLimitExceeded {
+                maximum_candidate_edges: MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP,
+                observed_candidate_edges_at_least: MAX_QUALIFICATION_CANDIDATE_EDGES_PER_STEP + 1,
+            }
+        );
+        assert!(over_observed.built.receipts.is_empty());
+        assert!(over_observed.built.facts.is_empty());
+        assert_eq!(
+            over_observed.built.unavailable,
+            vec![UnavailableReason::ProofFactsUnavailable]
+        );
+    }
+
+    #[test]
+    fn observed_runtime_trace_reports_selector_and_first_zero_survivor_gates() {
+        let selector_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let selector_contract = contract("missing-id", &["target-id"]);
+        let selector_product = build_from_store(
+            &selector_fixture.store,
+            &selector_fixture.root,
+            &selector_fixture.project_id,
+            &selector_fixture.publication,
+            &selector_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let selector_observed = build_from_store_observed(
+            &selector_fixture.store,
+            &selector_fixture.root,
+            &selector_fixture.project_id,
+            &selector_fixture.publication,
+            &selector_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(selector_observed.built, selector_product);
+        assert!(selector_observed.trace.selector_early_return);
+        assert_eq!(
+            selector_observed.trace.selectors[0].outcome,
+            SelectorGateOutcome::Failed(SelectorFailure::Missing)
+        );
+        assert_eq!(
+            selector_observed.trace.steps.len(),
+            selector_contract.spec().steps().len(),
+            "selector early returns must classify every attempted positive step"
+        );
+        assert_eq!(
+            selector_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::SelectorBlocked {
+                selector_index: 0,
+                outcome: SelectorGateOutcome::Failed(SelectorFailure::Missing),
+            }
+        );
+
+        let mut raw_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        raw_fixture
+            .store
+            .insert_node(&node(4, NodeKind::FUNCTION, "other", "other-id", 1, 2, 2))
+            .unwrap();
+        raw_fixture
+            .store
+            .upsert_callable_projection_states(&[projection(1, 4, 2, 2)])
+            .unwrap();
+        for edge in [
+            Edge {
+                id: EdgeId(30),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(1),
+                resolved_source: Some(NodeId(2)),
+                resolved_target: Some(NodeId(4)),
+                callsite_identity: Some("1:1:1:4|alternatives".to_owned()),
+                candidate_targets: vec![NodeId(3)],
+                ..Default::default()
+            },
+            Edge {
+                id: EdgeId(20),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(1),
+                resolved_source: Some(NodeId(2)),
+                resolved_target: Some(NodeId(4)),
+                callsite_identity: Some("1:1:1:4|probable".to_owned()),
+                candidate_targets: Vec::new(),
+                ..Default::default()
+            },
+        ] {
+            raw_fixture.store.insert_edge(&edge).unwrap();
+        }
+        let raw_contract = contract("source-id", &["other-id"]);
+        let raw_product = build_from_store(
+            &raw_fixture.store,
+            &raw_fixture.root,
+            &raw_fixture.project_id,
+            &raw_fixture.publication,
+            &raw_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let raw_observed = build_from_store_observed(
+            &raw_fixture.store,
+            &raw_fixture.root,
+            &raw_fixture.project_id,
+            &raw_fixture.publication,
+            &raw_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(raw_observed.built, raw_product);
+        assert_eq!(
+            raw_observed.trace.steps[0],
+            StepQualificationTrace {
+                step_index: 0,
+                candidate_edge_ids: vec![EdgeId(10), EdgeId(20), EdgeId(30)],
+                outcome: StepQualificationOutcome::FirstZeroSurvivor {
+                    gate: CandidateGate::ResolutionFact,
+                    histogram: vec![CandidateFailureHistogram {
+                        reason: CandidateFailure::ResolutionFact(ResolutionFactFailure::Missing,),
+                        edge_ids: vec![EdgeId(20)],
+                    }],
+                },
+            }
+        );
+
+        let mut containment_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        containment_fixture
+            .store
+            .insert_node(&node(4, NodeKind::METHOD, "inner", "inner-id", 1, 1, 1))
+            .unwrap();
+        containment_fixture
+            .store
+            .upsert_callable_projection_states(&[projection(1, 2, 1, 1), projection(1, 4, 1, 1)])
+            .unwrap();
+        let containment_product = build_from_store(
+            &containment_fixture.store,
+            &containment_fixture.root,
+            &containment_fixture.project_id,
+            &containment_fixture.publication,
+            &containment_fixture.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let containment_observed = build_from_store_observed(
+            &containment_fixture.store,
+            &containment_fixture.root,
+            &containment_fixture.project_id,
+            &containment_fixture.publication,
+            &containment_fixture.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(containment_observed.built, containment_product);
+        assert_eq!(
+            containment_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Containment,
+                histogram: vec![CandidateFailureHistogram {
+                    reason: CandidateFailure::Containment(ContainmentFailure::Ambiguous),
+                    edge_ids: vec![EdgeId(10)],
+                }],
+            }
+        );
+
+        let source_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let file = source_fixture.store.files().get_files().unwrap().remove(0);
+        source_fixture
+            .store
+            .update_file_metadata(&file, None)
+            .unwrap();
+        let source_product = build_from_store(
+            &source_fixture.store,
+            &source_fixture.root,
+            &source_fixture.project_id,
+            &source_fixture.publication,
+            &source_fixture.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let source_observed = build_from_store_observed(
+            &source_fixture.store,
+            &source_fixture.root,
+            &source_fixture.project_id,
+            &source_fixture.publication,
+            &source_fixture.contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(source_observed.built, source_product);
+        assert!(source_observed.trace.selector_early_return);
+        assert!(source_observed.trace.steps.is_empty());
+        assert_eq!(
+            source_observed.built.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
+        );
+
+        let mut line_fixture = fixture(b"fn source() { target(); }\nfn target() {}");
+        line_fixture
+            .store
+            .insert_node(&node(4, NodeKind::FUNCTION, "other", "other-id", 1, 2, 2))
+            .unwrap();
+        line_fixture
+            .store
+            .insert_edge(&Edge {
+                id: EdgeId(14),
+                source: NodeId(2),
+                target: NodeId(4),
+                kind: EdgeKind::CALL,
+                file_node_id: Some(NodeId(1)),
+                line: Some(3),
+                resolved_source: Some(NodeId(2)),
+                resolved_target: Some(NodeId(4)),
+                callsite_identity: Some("1:3:1:4|out-of-range".to_owned()),
+                candidate_targets: Vec::new(),
+                ..Default::default()
+            })
+            .unwrap();
+        line_fixture
+            .store
+            .upsert_callable_projection_states(&[projection(1, 2, 1, 3), projection(1, 4, 2, 2)])
+            .unwrap();
+        let line_contract = contract("source-id", &["other-id"]);
+        let line_product = build_from_store(
+            &line_fixture.store,
+            &line_fixture.root,
+            &line_fixture.project_id,
+            &line_fixture.publication,
+            &line_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let line_observed = build_from_store_observed(
+            &line_fixture.store,
+            &line_fixture.root,
+            &line_fixture.project_id,
+            &line_fixture.publication,
+            &line_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert_eq!(line_observed.built, line_product);
+        assert_eq!(
+            line_observed.trace.steps[0].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::ResolutionFact,
+                histogram: vec![CandidateFailureHistogram {
+                    reason: CandidateFailure::ResolutionFact(ResolutionFactFailure::Missing),
+                    edge_ids: vec![EdgeId(14)],
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn observed_runtime_trace_keeps_oversized_complete_roots_for_transport() {
+        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let (contract, hashes, rendering) = validated_contract("source-id", &["target-id"]);
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        let mut receipt_integration = observed.clone();
+        receipt_integration.built.receipts[0].receipt.edge_id = "hostile-edge".to_owned();
+        assert!(
+            check_built_call_path_integration(
+                &contract,
+                &hashes,
+                &rendering,
+                receipt_integration.built.clone(),
+            )
+            .is_err()
+        );
+        let receipt_integration =
+            finalize_observed_call_path(&contract, &hashes, &rendering, receipt_integration);
+        assert!(receipt_integration.result.is_err());
+        assert_eq!(
+            receipt_integration.trace.finalization,
+            FinalizationTrace::Failed(FinalizationFailure::ReceiptIntegration)
+        );
+
+        let mut receipt_budget = observed.clone();
+        let canonical_callsite = receipt_budget.built.receipts[0]
+            .callsite_identity
+            .split_once('|')
+            .map_or(
+                receipt_budget.built.receipts[0].callsite_identity.as_str(),
+                |(identity, _)| identity,
+            );
+        receipt_budget.built.receipts[0].callsite_identity =
+            format!("{canonical_callsite}|{}", "x".repeat(70_000));
+        let receipt_budget =
+            finalize_observed_call_path(&contract, &hashes, &rendering, receipt_budget);
+        assert!(matches!(
+            receipt_budget.result,
+            Ok(IntegratedProjectedCallPathResult {
+                projection: InternalProjection::Complete { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            receipt_budget.trace.finalization,
+            FinalizationTrace::Complete {
+                projection_bytes
+            } if projection_bytes > 70_000
+        ));
+
+        let (missing_contract, missing_hashes, missing_rendering) =
+            validated_contract("missing-id", &["target-id"]);
+        let mut projection_budget = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &missing_contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        projection_budget.built.publication.project_id = "x".repeat(70_000);
+        let projection_budget = finalize_observed_call_path(
+            &missing_contract,
+            &missing_hashes,
+            &missing_rendering,
+            projection_budget,
+        );
+        assert!(matches!(
+            projection_budget.result,
+            Ok(IntegratedProjectedCallPathResult {
+                projection: InternalProjection::Complete { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            projection_budget.trace.finalization,
+            FinalizationTrace::Complete {
+                projection_bytes
+            } if projection_bytes > 70_000
+        ));
     }
 
     #[test]
@@ -1345,6 +3255,296 @@ mod tests {
     }
 
     #[test]
+    fn python_exact_fact_accepts_reconstructed_project_relative_selectors() {
+        let fixture = source_built_fixture_with_extension(
+            "py",
+            "def target():\n    pass\n\ndef source():\n    target()\n",
+        );
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let facts = fixture.store.get_proof_resolution_facts().unwrap();
+        let exact_fact = facts
+            .iter()
+            .find(|fact| {
+                fact.callsite.raw_target == "target"
+                    && fact.status == ProofResolutionStatus::Exact
+                    && fact.edge_id.is_some()
+            })
+            .unwrap_or_else(|| panic!("{facts:#?}"));
+        let edge = fixture
+            .store
+            .get_edges()
+            .unwrap()
+            .into_iter()
+            .find(|edge| Some(edge.id) == exact_fact.edge_id)
+            .unwrap();
+        let admitted = diagnose_raw_call_edge(&edge, source.id, target.id).unwrap();
+        assert!(resolution_fact_matches_raw_edge(
+            exact_fact, &admitted, source.id, target.id
+        ));
+        assert!(canonical_id(&source).ends_with(":source#0"));
+        assert!(canonical_id(&target).ends_with(":target#0"));
+        let (contract, hashes, rendering) =
+            validated_contract("src/lib.py:source#0", &["src/lib.py:target#0"]);
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                observed.trace.steps.as_slice(),
+                [StepQualificationTrace {
+                    outcome: StepQualificationOutcome::Admitted { edge_ids },
+                    ..
+                }] if edge_ids == &[edge.id]
+            ),
+            "{:#?}",
+            observed.trace
+        );
+        let result =
+            check_built_call_path_integration(&contract, &hashes, &rendering, observed.built)
+                .unwrap();
+        assert!(
+            matches!(
+                result.disposition(),
+                ProofDisposition::ContractProven { receipts, .. } if receipts.len() == 1
+            ),
+            "{:#?}",
+            result.disposition()
+        );
+        assert_eq!(
+            result.built_facts().receipts[0].source.pinned.node_id,
+            source.id.0.to_string()
+        );
+        assert_eq!(
+            result.built_facts().receipts[0].target.pinned.node_id,
+            target.id.0.to_string()
+        );
+    }
+
+    #[test]
+    fn source_built_resealed_span_cannot_move_to_an_identical_same_line_token() {
+        let source_text = "fn target() {}\n\
+                           fn source() { target(); let _label = \"target\"; }\n";
+        let mut fixture = source_built_fixture(source_text);
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let (contract, _hashes, _rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+        let manifest = fixture
+            .store
+            .get_proof_resolution_publication()
+            .unwrap()
+            .unwrap();
+        let mut facts = fixture.store.get_proof_resolution_facts().unwrap();
+        let exact = facts
+            .iter_mut()
+            .find(|fact| fact.status == ProofResolutionStatus::Exact)
+            .expect("one exact source-built call");
+        let authentic_start = exact.callsite.start_byte;
+        let shifted_start = u64::try_from(source_text.rfind("target").unwrap()).unwrap();
+        assert!(shifted_start > authentic_start);
+        exact.callsite.start_byte = shifted_start;
+        exact.callsite.end_byte_exclusive = shifted_start + exact.callsite.raw_target.len() as u64;
+        *exact = seal_call_resolution_fact(exact.clone()).unwrap();
+        let funnel = build_proof_resolution_funnel(&facts);
+        fixture
+            .store
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM proof_resolution_fact; DELETE FROM proof_resolution_publication;",
+            )
+            .unwrap();
+        fixture
+            .store
+            .replace_proof_resolution_projection(
+                &fixture.publication,
+                &ProofResolutionProjection {
+                    adapter_roster: manifest.adapter_roster,
+                    facts,
+                    funnel,
+                },
+            )
+            .expect("the store cannot inspect source bytes, so runtime must close the span");
+
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed.built.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
+        );
+        assert!(observed.built.receipts.is_empty());
+        assert!(matches!(
+            observed.trace.steps[0].outcome,
+            StepQualificationOutcome::FirstZeroSurvivor {
+                gate: CandidateGate::Line,
+                ref histogram,
+            } if histogram.iter().any(|failure| {
+                failure.reason
+                    == CandidateFailure::SourceBinding(
+                        SourceBindingFailure::ExactCallsiteMismatch,
+                    )
+            })
+        ));
+    }
+
+    #[test]
+    fn source_built_runtime_rejects_a_compiled_stale_adapter_roster() {
+        let mut fixture = source_built_fixture("fn target() {}\nfn source() { target(); }\n");
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let (contract, _hashes, _rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+        let manifest = fixture
+            .store
+            .get_proof_resolution_publication()
+            .unwrap()
+            .unwrap();
+        let mut facts = fixture.store.get_proof_resolution_facts().unwrap();
+        for fact in &mut facts {
+            fact.provenance.language_adapter_version = "wrong-v1".to_owned();
+            *fact = seal_call_resolution_fact(fact.clone()).unwrap();
+        }
+        let mut adapter_roster = manifest.adapter_roster;
+        adapter_roster
+            .iter_mut()
+            .find(|adapter| adapter.language == "rust")
+            .unwrap()
+            .adapter_version = "wrong-v1".to_owned();
+        let funnel = build_proof_resolution_funnel(&facts);
+        fixture
+            .store
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM proof_resolution_fact; DELETE FROM proof_resolution_publication;",
+            )
+            .unwrap();
+        fixture
+            .store
+            .replace_proof_resolution_projection(
+                &fixture.publication,
+                &ProofResolutionProjection {
+                    adapter_roster,
+                    facts,
+                    funnel,
+                },
+            )
+            .expect("the stored roster still covers each stored fact provenance");
+        fixture
+            .store
+            .validate_proof_resolution_publication(&fixture.publication)
+            .expect("store validation accepts a self-consistent stored roster");
+
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &contract,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed.built.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
+        );
+        assert!(observed.built.receipts.is_empty());
+    }
+
+    #[test]
+    fn source_built_same_line_repeated_calls_build_distinct_receipts() {
+        let fixture = source_built_fixture(
+            "fn target() {}\n\
+             fn source() { target(); target(); }\n",
+        );
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+
+        let result = evaluate_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let receipts = &result.built_facts().receipts;
+        assert_eq!(receipts.len(), 2, "one receipt per exact repeated callsite");
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.receipt.edge_id.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "repeated callsites must not reuse an ordinary edge"
+        );
+        let earliest = receipts
+            .iter()
+            .min_by_key(|receipt| receipt.exact_callsite_start_byte)
+            .unwrap();
+        assert!(matches!(
+            result.disposition(),
+            ProofDisposition::ContractProven { receipts, .. }
+                if receipts == std::slice::from_ref(&earliest.receipt)
+        ));
+    }
+
+    #[test]
+    fn source_built_exact_span_accepts_byte_columns_after_multibyte_and_crlf_lines() {
+        let source_text = "fn target() {}\r\nfn source() { let _accent = \"é\"; target(); }\r\n";
+        let fixture = source_built_fixture(source_text);
+        let source = source_callable(&fixture.store, "source");
+        let target = source_callable(&fixture.store, "target");
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&source), &[canonical_id(&target)]);
+
+        let result = evaluate_from_store(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            CheckedIntegrationInputs {
+                contract: &contract,
+                hashes: &hashes,
+                rendering: &rendering,
+            },
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.disposition(),
+            ProofDisposition::ContractProven { .. }
+        ));
+        assert_eq!(
+            result.built_facts().receipts[0].exact_callsite_start_byte,
+            u64::try_from(source_text.rfind("target").unwrap()).unwrap()
+        );
+    }
+
+    #[test]
     fn source_built_hostile_mutations_never_preserve_a_proven_contract() {
         let six = source_built_fixture(
             "pub fn step0() { step1(); }\n\
@@ -1459,11 +3659,10 @@ mod tests {
             .into_iter()
             .find(|edge| edge.kind == EdgeKind::CALL)
             .unwrap();
-        let mut uncertain = raw_edge.clone();
-        uncertain.certainty = Some(ResolutionCertainty::Uncertain);
         let mut ambiguous = raw_edge.clone();
         ambiguous.candidate_targets = vec![nodes[2].id];
-        for (mutation, edge) in [("uncertain", &uncertain), ("ambiguous", &ambiguous)] {
+        {
+            let (mutation, edge) = ("ambiguous", &ambiguous);
             assert_eq!(
                 admit_raw_call_edge(edge, edge.effective_source(), edge.effective_target()),
                 RawCallEdgeAdmission::Rejected
@@ -1586,7 +3785,7 @@ mod tests {
             refuted.disposition(),
             &ProofDisposition::ContractRefuted {
                 contract_digest: prohibited_hashes.contract_digest().to_owned(),
-                refutation: codestory_agent::indexed_source_call_path_v1::Refutation::ProhibitedScopeTraversal {
+                refutation: Refutation::ProhibitedScopeTraversal {
                     step_index: 1,
                     prohibition_index: 0,
                     connected_receipts: expected_chain.clone(),
@@ -1599,15 +3798,7 @@ mod tests {
         };
         assert_eq!(
             root["disposition"]["refutation"]["connected_receipts"],
-            json!(
-                expected_chain
-                    .iter()
-                    .map(|receipt| json!({
-                        "receipt_id": receipt.receipt_id,
-                        "edge_id": receipt.edge_id,
-                    }))
-                    .collect::<Vec<_>>()
-            )
+            json!([0, 1])
         );
 
         let (excluded, excluded_hashes, excluded_rendering) = validated_contract_with_policies(
@@ -1632,7 +3823,7 @@ mod tests {
         assert!(matches!(
             excluded_result.disposition(),
             ProofDisposition::Unknown { gaps, .. }
-                if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index: 1 }]
+                if gaps == &[ProofGap::ProjectionExclusionConflictsWithRequiredReceipt { step_index: 1 }]
         ));
     }
 
@@ -1662,7 +3853,7 @@ mod tests {
         assert!(matches!(
             recursive_result.disposition(),
             ProofDisposition::Unknown { gaps, .. }
-                if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::FactBuild(
+                if gaps == &[ProofGap::FactBuild(
                     FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 }
                 )]
         ));
@@ -1706,7 +3897,7 @@ mod tests {
                 gaps,
                 connected_receipts,
                 ..
-            } if gaps == &[codestory_agent::indexed_source_call_path_v1::ProofGap::FactBuild(
+            } if gaps == &[ProofGap::FactBuild(
                 FactBuildGap::DirectCallMissing { step_index: 1 }
             )] && connected_receipts.len() == 1
         ));
@@ -1751,6 +3942,12 @@ mod tests {
         let (contract, hashes, rendering) =
             validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
         drop(store);
+        let wal_path = PathBuf::from(format!("{}-wal", storage_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", storage_path.display()));
+        assert!(
+            !wal_path.exists() && !shm_path.exists(),
+            "the sealed fixture must force the public operation to establish its normal reader pair"
+        );
 
         let retrieval_pin_calls = Rc::new(Cell::new(0));
         let observed_retrieval_pin_calls = Rc::clone(&retrieval_pin_calls);
@@ -1758,6 +3955,7 @@ mod tests {
             observed_retrieval_pin_calls.set(observed_retrieval_pin_calls.get() + 1);
         });
         let service = crate::services::PublicOperationService::new(controller.clone());
+        reset_full_proof_publication_validations();
         let operation = run_integrated_projected_public_operation(
             &service,
             &controller,
@@ -1778,14 +3976,76 @@ mod tests {
         ));
         assert!(matches!(
             operation.value.projection,
-            codestory_agent::indexed_source_call_path_v1::InternalProjection::Complete { .. }
+            InternalProjection::Complete { .. }
         ));
+        assert!(
+            wal_path.is_file() && shm_path.is_file(),
+            "the active public-operation snapshot must establish the reader pair before the proof observer opens"
+        );
         assert_eq!(
             Store::open(&storage_path)
                 .unwrap()
                 .get_retrieval_index_publication(&project_identity_v3(project.path()).project_id)
                 .unwrap(),
             None
+        );
+
+        let warm_operation = run_integrated_projected_public_operation(
+            &service,
+            &controller,
+            &contract,
+            &hashes,
+            &rendering,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(matches!(
+            warm_operation.value.integration.disposition(),
+            ProofDisposition::ContractProven { .. }
+        ));
+        assert_eq!(
+            full_proof_publication_validation_count(),
+            1,
+            "an unchanged publication validates once before warm proof execution"
+        );
+
+        let mutating_store = Store::open(&storage_path).unwrap();
+        let fact_id = mutating_store
+            .get_proof_resolution_facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.status == ProofResolutionStatus::Exact)
+            .expect("indexed proof has one exact fact")
+            .fact_id;
+        mutating_store
+            .get_connection()
+            .execute(
+                "DELETE FROM proof_resolution_fact WHERE fact_id = ?1",
+                [&fact_id],
+            )
+            .unwrap();
+        drop(mutating_store);
+
+        let mutated_operation = run_integrated_projected_public_operation(
+            &service,
+            &controller,
+            &contract,
+            &hashes,
+            &rendering,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert!(
+            !matches!(
+                mutated_operation.value.integration.disposition(),
+                ProofDisposition::ContractProven { .. }
+            ),
+            "an in-place proof fact mutation must discard the warm validation receipt"
+        );
+        assert_eq!(
+            full_proof_publication_validation_count(),
+            2,
+            "the changed data_version forces one fresh complete validation"
         );
 
         let builds = Cell::new(0_usize);
@@ -1805,6 +4065,204 @@ mod tests {
     }
 
     #[test]
+    fn active_snapshot_poison_restored_before_current_observation_cannot_prove() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("src/lib.rs");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(
+            &source_path,
+            "pub fn callee() -> i32 { 1 }\npub fn caller() -> i32 { callee(); 1 }\n",
+        )
+        .unwrap();
+        let storage_path = project.path().join(".codestory-test/codestory.db");
+        let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let store = Store::open(&storage_path).unwrap();
+        let caller = source_callable(&store, "caller");
+        let callee = source_callable(&store, "callee");
+        let publication = store.get_complete_index_publication().unwrap().unwrap();
+        let original = store
+            .get_proof_resolution_facts()
+            .unwrap()
+            .into_iter()
+            .find(|fact| fact.status == ProofResolutionStatus::Exact)
+            .expect("indexed proof has one exact fact");
+        drop(store);
+        let (contract, hashes, rendering) =
+            validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
+
+        controller.arm_proof_publication_validation();
+        let normal_reader = controller.open_storage_read_only().unwrap();
+        controller
+            .prepare_armed_proof_publication_validation()
+            .unwrap();
+
+        let mut poisoned = original.clone();
+        poisoned.provenance.parser_fingerprint = "f".repeat(64);
+        let poisoned = seal_call_resolution_fact(poisoned).unwrap();
+        let writer = Store::open(&storage_path).unwrap();
+        writer
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_fact
+                 SET fact_id = ?1, parser_fingerprint = ?2, evidence_digest = ?3
+                 WHERE fact_id = ?4",
+                (
+                    &poisoned.fact_id,
+                    &poisoned.provenance.parser_fingerprint,
+                    &poisoned.provenance.evidence_sha256,
+                    &original.fact_id,
+                ),
+            )
+            .unwrap();
+        drop(writer);
+
+        let active = Store::open_read_only(&storage_path).unwrap();
+        let active_snapshot = active.read_snapshot().unwrap();
+        assert_eq!(
+            active_snapshot
+                .storage()
+                .get_proof_resolution_facts()
+                .unwrap()
+                .into_iter()
+                .find(|fact| fact.status == ProofResolutionStatus::Exact)
+                .expect("active snapshot exact fact")
+                .provenance
+                .parser_fingerprint,
+            poisoned.provenance.parser_fingerprint,
+            "the active snapshot must retain the poisoned but resealed fact"
+        );
+        drop(normal_reader);
+
+        let restored = Store::open(&storage_path).unwrap();
+        restored
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_fact
+                 SET fact_id = ?1, parser_fingerprint = ?2, evidence_digest = ?3
+                 WHERE fact_id = ?4",
+                (
+                    &original.fact_id,
+                    &original.provenance.parser_fingerprint,
+                    &original.provenance.evidence_sha256,
+                    &poisoned.fact_id,
+                ),
+            )
+            .unwrap();
+        assert!(
+            restored
+                .validate_proof_resolution_publication(&publication)
+                .is_ok(),
+            "the current database is restored and would authorize an observer-only validation"
+        );
+        drop(restored);
+
+        reset_full_proof_publication_validations();
+        let validation = controller
+            .validate_proof_publication_for_active_snapshot(&publication, active_snapshot.storage())
+            .unwrap();
+        assert!(matches!(
+            &validation,
+            &ProofPublicationValidationUse::Unavailable
+        ));
+        assert_eq!(full_proof_publication_validation_count(), 1);
+        let observed = build_from_store_observed_with_validation(
+            active_snapshot.storage(),
+            project.path(),
+            &project_identity_v3(project.path()).project_id,
+            &publication,
+            &contract,
+            validation.proof_projection_available(),
+            |path| fs::read(path),
+        )
+        .unwrap();
+        let selector_early_return = observed.trace.selector_early_return;
+        let integration =
+            check_built_call_path_integration(&contract, &hashes, &rendering, observed.built)
+                .unwrap();
+        assert!(!matches!(
+            integration.disposition(),
+            ProofDisposition::ContractProven { .. }
+        ));
+        assert!(selector_early_return);
+        controller.finish_proof_publication_validation_operation();
+        active_snapshot.finish().unwrap();
+    }
+
+    #[test]
+    fn python_resealed_path_move_is_rejected_by_the_public_operation_freshness_fence() {
+        let project = tempfile::tempdir().unwrap();
+        let source_path = project.path().join("src/lib.py");
+        fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        fs::write(
+            &source_path,
+            "def target():\n    pass\n\ndef source():\n    target()\n",
+        )
+        .unwrap();
+        let storage_path = project.path().join(".codestory-test/codestory.db");
+        let controller = AppController::new_with_config(crate::test_sidecar_runtime_from_env());
+        controller
+            .open_project_summary_with_storage_path(
+                project.path().to_path_buf(),
+                storage_path.clone(),
+            )
+            .unwrap();
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+            .unwrap();
+        let contract = contract("src/lib.py:source#0", &["src/lib.py:target#0"]);
+        let service = crate::services::PublicOperationService::new(controller.clone());
+        let builds = Cell::new(0_usize);
+        let operation = service
+            .run_with_cancel(PROOF_DOMAIN, Arc::new(AtomicBool::new(false)), || {
+                let attempt = builds.get() + 1;
+                builds.set(attempt);
+                let built = build_indexed_source_call_path_facts(&controller, &contract)?;
+                if attempt == 1 {
+                    assert_eq!(built.receipts.len(), 1, "{built:#?}");
+                    let moved = project.path().join("src/moved.py");
+                    fs::rename(&source_path, &moved).unwrap();
+                    let store = Store::open(&storage_path).unwrap();
+                    let file_id = store
+                        .get_files()
+                        .unwrap()
+                        .into_iter()
+                        .find(|file| file.language == "python")
+                        .expect("indexed Python source")
+                        .id;
+                    store
+                        .get_connection()
+                        .execute(
+                            "UPDATE file SET path = ?1 WHERE id = ?2",
+                            (moved.to_string_lossy().into_owned(), file_id),
+                        )
+                        .unwrap();
+                }
+                Ok(built)
+            })
+            .unwrap();
+        assert_eq!(operation.attempt, 2);
+        assert!(
+            operation.value.receipts.is_empty(),
+            "{:#?}",
+            operation.value
+        );
+        assert_eq!(
+            operation.value.unavailable,
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
+        );
+        assert_eq!(builds.get(), 2);
+    }
+
+    #[test]
     fn builds_a_hash_bound_raw_edge_receipt_and_reads_source_once() {
         let fixture = fixture(b"fn source() { target(); }\r\nfn target() {}\n");
         fixture
@@ -1815,13 +4273,12 @@ mod tests {
                 target: NodeId(3),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
-                line: Some(1),
+                line: Some(2),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
-                callsite_identity: Some("1:1:1:3|rust".to_owned()),
+                callsite_identity: Some("1:2:1:3|rust".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         fixture
@@ -1850,10 +4307,9 @@ mod tests {
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
                 callsite_identity: Some("6:1:0:3|wrong-file".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         let reads = Cell::new(0);
@@ -1871,14 +4327,15 @@ mod tests {
         .unwrap();
 
         assert_eq!(reads.get(), 1);
-        assert_eq!(built.facts.len(), 2);
+        assert_eq!(built.facts.len(), 1);
         assert!(built.gaps.is_empty());
         assert!(built.unavailable.is_empty());
-        assert_eq!(built.receipts.len(), 2);
+        assert_eq!(built.receipts.len(), 1);
         let receipt = &built.receipts[0];
         assert_eq!(receipt.receipt.edge_id, "10");
-        assert_eq!(receipt.certainty, ResolutionCertainty::Certain);
-        assert_eq!(receipt.callsite_identity, "1:1:0:3|rust");
+        assert_eq!(receipt.resolution_fact_id.len(), 64);
+        assert_eq!(receipt.resolution_evidence_sha256.len(), 64);
+        assert_eq!(receipt.callsite_identity, "1:1:1:30|rust");
         assert_eq!(receipt.containment.owner_node_id, NodeId(2));
         assert_eq!(receipt.line_window.kind, "indexed_line_v1");
         assert_eq!(receipt.line_window.text, "fn source() { target(); }\r\n");
@@ -1922,7 +4379,7 @@ mod tests {
         assert_eq!(reads.get(), 0);
         assert_eq!(
             missing_result.unavailable,
-            vec![UnavailableReason::SourceNotBoundToPublication]
+            vec![UnavailableReason::ProofSemanticProjectionUnavailable]
         );
 
         let hash_fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
@@ -1974,13 +4431,12 @@ mod tests {
                 target: NodeId(3),
                 kind: EdgeKind::CALL,
                 file_node_id: Some(NodeId(1)),
-                line: Some(1),
+                line: Some(2),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(3)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
-                callsite_identity: Some("1:1:1:3|second-callsite".to_owned()),
+                callsite_identity: Some("1:2:1:3|second-callsite".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         fs::write(&fixture.source_path, [0xff, b'\n']).unwrap();
@@ -2105,10 +4561,9 @@ mod tests {
                 line: Some(3),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(4)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
                 callsite_identity: Some("1:3:0:4|out-of-range".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         fixture
@@ -2127,7 +4582,7 @@ mod tests {
         assert!(built.facts.is_empty());
         assert_eq!(
             built.gaps,
-            vec![FactBuildGap::SourceLineOutOfRange { step_index: 0 }]
+            vec![FactBuildGap::DirectCallMissing { step_index: 0 }]
         );
     }
 
@@ -2137,7 +4592,9 @@ mod tests {
             (MAX_LINE_WINDOW_BYTES, true),
             (MAX_LINE_WINDOW_BYTES + 1, false),
         ] {
-            let fixture = fixture(&vec![b'a'; length]);
+            let mut bytes = vec![b'a'; length];
+            bytes[.."target".len()].copy_from_slice(b"target");
+            let fixture = fixture(&bytes);
             let built = build_from_store(
                 &fixture.store,
                 &fixture.root,
@@ -2174,10 +4631,9 @@ mod tests {
                 line: Some(1),
                 resolved_source: Some(NodeId(2)),
                 resolved_target: Some(NodeId(2)),
-                confidence: Some(1.0),
-                certainty: Some(ResolutionCertainty::Certain),
                 callsite_identity: Some("1:1:0:2|synthetic".to_owned()),
                 candidate_targets: Vec::new(),
+                ..Default::default()
             })
             .unwrap();
         let recursive = contract("source-id", &["source-id"]);
@@ -2190,8 +4646,11 @@ mod tests {
             |path| fs::read(path),
         )
         .unwrap();
-        assert_eq!(self_edge.facts.len(), 1);
-        assert!(self_edge.gaps.is_empty());
+        assert!(self_edge.facts.is_empty());
+        assert_eq!(
+            self_edge.gaps,
+            vec![FactBuildGap::RecursiveCallNotRepresentable { step_index: 0 }]
+        );
 
         let missing = contract("target-id", &["source-id"]);
         let absent = build_from_store(
@@ -2294,15 +4753,202 @@ mod tests {
     }
 
     #[test]
-    fn qualified_resolution_uses_exact_names_components_and_native_file_identity() {
+    fn canonical_selector_reconstructs_one_exact_project_relative_file_identity() {
         let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
-        let files = fixture.store.files().get_files().unwrap();
+        let absolute_prefix = fixture.source_path.to_string_lossy();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE node SET canonical_id = ?1 WHERE id = 2",
+                [format!("{absolute_prefix}:crate::source#0")],
+            )
+            .unwrap();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE node SET canonical_id = ?1 WHERE id = 3",
+                [format!("{absolute_prefix}:crate::target#0")],
+            )
+            .unwrap();
+
+        let relative = contract(
+            "src/lib.rs:crate::source#0",
+            &["src/lib.rs:crate::target#0"],
+        );
+        let observed = build_from_store_observed(
+            &fixture.store,
+            &fixture.root,
+            &fixture.project_id,
+            &fixture.publication,
+            &relative,
+            |path| fs::read(path),
+        )
+        .unwrap();
+
+        assert!(
+            !observed.trace.selector_early_return,
+            "{:#?}",
+            observed.trace
+        );
+        assert!(
+            observed
+                .trace
+                .selectors
+                .iter()
+                .all(|selector| matches!(selector.outcome, SelectorGateOutcome::Resolved { .. }))
+        );
+    }
+
+    #[test]
+    fn exact_canonical_selector_rejects_resealed_file_path_move() {
+        let fixture = source_built_fixture("fn source() { target(); }\nfn target() {}\n");
+        let source = source_callable(&fixture.store, "source");
+        let old_canonical = canonical_id(&source).to_owned();
+        let moved = fixture.root.join("src/moved.rs");
+        fs::rename(&fixture.source_path, &moved).unwrap();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE file SET path = ?1 WHERE id = ?2",
+                (
+                    moved.to_string_lossy().into_owned(),
+                    source.file_node_id.unwrap().0,
+                ),
+            )
+            .unwrap();
+
+        let files = fixture.store.get_files().unwrap();
+        let mut identities = OperationPathIdentityResolver::native();
+        let canonical_index =
+            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
         let context = SelectorContext {
             store: &fixture.store,
             project_root: &fixture.root,
             project_id: &fixture.project_id,
             publication: &fixture.publication,
             files: &files,
+            canonical_index: &canonical_index,
+        };
+        assert!(matches!(
+            resolve_canonical(
+                &context,
+                &old_canonical,
+                &mut OperationPathIdentityResolver::native(),
+            )
+            .unwrap(),
+            SelectorResolution::Unavailable(UnavailableReason::SourceNotBoundToPublication)
+        ));
+    }
+
+    #[test]
+    fn canonical_selector_reconstruction_fails_closed_for_hostile_file_identity_cases() {
+        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let absolute_prefix = fixture.source_path.to_string_lossy();
+        fixture
+            .store
+            .get_connection()
+            .execute(
+                "UPDATE node SET canonical_id = ?1 WHERE id = 3",
+                [format!("{absolute_prefix}:crate::target#0")],
+            )
+            .unwrap();
+        let files = fixture.store.files().get_files().unwrap();
+        let mut identities = OperationPathIdentityResolver::native();
+        let canonical_index =
+            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
+        let context = SelectorContext {
+            store: &fixture.store,
+            project_root: &fixture.root,
+            project_id: &fixture.project_id,
+            publication: &fixture.publication,
+            files: &files,
+            canonical_index: &canonical_index,
+        };
+
+        for missing in ["src/index:crate::target#0", "src/indexer:crate::target#0"] {
+            assert!(matches!(
+                resolve_canonical(
+                    &context,
+                    missing,
+                    &mut OperationPathIdentityResolver::native(),
+                )
+                .unwrap(),
+                SelectorResolution::Missing
+            ));
+        }
+
+        fixture
+            .store
+            .insert_node(&node(
+                4,
+                NodeKind::FUNCTION,
+                "target",
+                &format!("{absolute_prefix}:crate::target#0"),
+                1,
+                2,
+                2,
+            ))
+            .unwrap();
+        assert!(matches!(
+            resolve_canonical(
+                &context,
+                "src/lib.rs:crate::target#0",
+                &mut OperationPathIdentityResolver::native(),
+            )
+            .unwrap(),
+            SelectorResolution::Ambiguous
+        ));
+
+        #[cfg(unix)]
+        {
+            let alias = fixture.root.join("src/alias.rs");
+            std::fs::hard_link(&fixture.source_path, &alias).unwrap();
+            let mut colliding_files = files.clone();
+            let mut alias_file = colliding_files[0].clone();
+            alias_file.id += 100;
+            alias_file.path = PathBuf::from("src/alias.rs");
+            colliding_files.push(alias_file);
+            let collision = CanonicalSelectorIndex::prepare(
+                &fixture.root,
+                &colliding_files,
+                &mut OperationPathIdentityResolver::native(),
+            );
+            assert!(collision.reconstruct("src/lib.rs:crate::target#0").is_err());
+
+            let outside = tempfile::tempdir().unwrap();
+            fs::write(outside.path().join("outside.rs"), "fn outside() {}\n").unwrap();
+            std::os::unix::fs::symlink(outside.path(), fixture.root.join("src/escape")).unwrap();
+            let mut escaped_files = files.clone();
+            let mut escaped_file = escaped_files[0].clone();
+            escaped_file.id += 101;
+            escaped_file.path = PathBuf::from("src/escape/outside.rs");
+            escaped_files.push(escaped_file);
+            let escaped = CanonicalSelectorIndex::prepare(
+                &fixture.root,
+                &escaped_files,
+                &mut OperationPathIdentityResolver::native(),
+            );
+            assert!(escaped.reconstruct("src/lib.rs:crate::target#0").is_err());
+        }
+    }
+
+    #[test]
+    fn qualified_resolution_uses_exact_names_components_and_native_file_identity() {
+        let fixture = fixture(b"fn source() { target(); }\nfn target() {}\n");
+        let files = fixture.store.files().get_files().unwrap();
+        let mut identities = OperationPathIdentityResolver::native();
+        let canonical_index =
+            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
+        let context = SelectorContext {
+            store: &fixture.store,
+            project_root: &fixture.root,
+            project_id: &fixture.project_id,
+            publication: &fixture.publication,
+            files: &files,
+            canonical_index: &canonical_index,
         };
         let exact_path = ["src".to_owned(), "lib.rs".to_owned()];
         let exact = resolve_qualified(
@@ -2405,12 +5051,16 @@ mod tests {
             node_id: "2".to_owned(),
         };
         let files = fixture.store.files().get_files().unwrap();
+        let mut identities = OperationPathIdentityResolver::native();
+        let canonical_index =
+            CanonicalSelectorIndex::prepare(&fixture.root, &files, &mut identities);
         let context = SelectorContext {
             store: &fixture.store,
             project_root: &fixture.root,
             project_id: &fixture.project_id,
             publication: &wrong_publication,
             files: &files,
+            canonical_index: &canonical_index,
         };
         assert!(matches!(
             resolve_pinned(&context, &pin, &mut OperationPathIdentityResolver::native(),).unwrap(),

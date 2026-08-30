@@ -1,7 +1,7 @@
 interface:
   display_name: "CodeStory Grounding"
   short_description: "Ground local repositories through CodeStory MCP before source claims, edits, reviews, or test planning."
-  default_prompt: "Call the CodeStory tool that matches the repository task with the target repository's absolute root as project. If CodeStory reports preparing, retry that same tool after its delay, then answer from returned evidence."
+  default_prompt: "Read and follow the loaded codestory-grounding skill. It is the sole source of truth for CodeStory tool routing and evidence boundaries; this metadata adds no parallel instructions."
 dependencies:
   tools:
     - type: "mcp"

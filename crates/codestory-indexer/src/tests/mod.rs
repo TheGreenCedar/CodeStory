@@ -16,6 +16,320 @@ use rusqlite::types::Value;
 use std::collections::HashSet;
 use tempfile::tempdir;
 
+fn measured_go_method_identity_qualification_work(method_count: usize) -> usize {
+    let mut nodes = HashMap::new();
+    let mut roles = HashMap::new();
+    let mut specs = Vec::new();
+    for index in 0..method_count {
+        let id = NodeId(i64::try_from(index + 1).expect("method id"));
+        let line = u32::try_from(index + 1).expect("method line");
+        nodes.insert(
+            id,
+            Node {
+                id,
+                kind: NodeKind::METHOD,
+                serialized_name: format!("Method{index}"),
+                start_line: Some(line),
+                start_col: Some(1),
+                end_line: Some(line),
+                end_col: Some(20),
+                ..Default::default()
+            },
+        );
+        roles.insert(id, CanonicalNodeRole::Definition);
+        specs.push(ManualMemberEdgeSpec {
+            source_name: format!("Owner{index}"),
+            target_name: format!("Method{index}"),
+            source_span: GraphNodeSpan {
+                start_line: line,
+                start_col: 1,
+                end_line: line,
+                end_col: 5,
+            },
+            target_span: GraphNodeSpan {
+                start_line: line,
+                start_col: 1,
+                end_line: line,
+                end_col: 20,
+            },
+            line: Some(line),
+        });
+    }
+
+    reset_go_method_identity_work();
+    apply_go_receiver_method_identities("go", &mut nodes, &specs, &HashSet::new(), &roles);
+    assert!(
+        nodes
+            .values()
+            .all(|node| node.serialized_name.starts_with("Owner"))
+    );
+    go_method_identity_work()
+}
+
+#[test]
+fn go_method_identity_qualification_work_is_linear() {
+    let baseline = measured_go_method_identity_qualification_work(128);
+    let doubled = measured_go_method_identity_qualification_work(256);
+    assert!(baseline >= 256, "Go identity work was not fully counted");
+    assert!(
+        doubled <= baseline * 2 + 16,
+        "Go identity qualification grew superlinearly: {baseline} -> {doubled}"
+    );
+}
+
+#[test]
+fn go_builtin_new_package_and_local_shadowing_matrix_is_closed() -> Result<()> {
+    struct Case {
+        name: &'static str,
+        declarations: &'static str,
+        expect_receiver_resolution: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "direct package var",
+            declarations: "var new func(int)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package var",
+            declarations: "var (\n  new func(int)\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "direct package const",
+            declarations: "const new = 1\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package const",
+            declarations: "const (\n  new = 1\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "direct package type",
+            declarations: "type new int\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "grouped package type",
+            declarations: "type (\n  new int\n)\n",
+            expect_receiver_resolution: false,
+        },
+        Case {
+            name: "unrelated package names",
+            declarations: "var otherVar func(int)\nconst otherConst = 1\ntype otherType int\n",
+            expect_receiver_resolution: true,
+        },
+        Case {
+            name: "local new in unrelated callable",
+            declarations: r#"
+func unrelated() {
+  { var new func(int); _ = new }
+  { const new = 1; _ = new }
+  { type new int; var _ new }
+}
+"#,
+            expect_receiver_resolution: true,
+        },
+        Case {
+            name: "local new in caller",
+            declarations: "",
+            expect_receiver_resolution: false,
+        },
+    ];
+
+    for case in cases {
+        let caller_shadow = if case.name == "local new in caller" {
+            "  var new func(int)\n"
+        } else {
+            ""
+        };
+        let source = format!(
+            r#"package proof
+
+type node struct{{}}
+func (*node) addRoute() {{}}
+
+{}
+func build() {{
+{}  root := new(node)
+  root.addRoute()
+}}
+"#,
+            case.declarations, caller_shadow
+        );
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .expect("Go parser language");
+        let tree = parser.parse(&source, None).expect("Go syntax tree");
+        assert!(
+            !tree.root_node().has_error(),
+            "case `{}` must be syntactically valid",
+            case.name
+        );
+
+        let has_receiver_spec = languages::go::receiver_call_specs(&tree, &source)
+            .iter()
+            .any(|spec| {
+                spec.source_name == "build"
+                    && spec.owner_name == "node"
+                    && spec.method_name == "addRoute"
+            });
+        assert_eq!(
+            has_receiver_spec, case.expect_receiver_resolution,
+            "case `{}` receiver-spec decision",
+            case.name
+        );
+
+        let language_config = get_language_for_ext("go").expect("Go language config");
+        let result = index_file(Path::new("main.go"), &source, &language_config, None, None)?;
+        let nodes_by_id = result
+            .nodes
+            .iter()
+            .map(|node| (node.id, node))
+            .collect::<HashMap<_, _>>();
+        let has_resolved_method_edge = result.edges.iter().any(|edge| {
+            edge.kind == EdgeKind::CALL
+                && edge
+                    .resolved_target
+                    .and_then(|target| nodes_by_id.get(&target))
+                    .is_some_and(|target| {
+                        target.serialized_name == "node.addRoute"
+                            || target.serialized_name.ends_with(".node.addRoute")
+                    })
+        });
+        assert_eq!(
+            has_resolved_method_edge, case.expect_receiver_resolution,
+            "case `{}` resolved-edge decision",
+            case.name
+        );
+    }
+
+    Ok(())
+}
+
+fn measured_manual_receiver_index_work(owner_count: usize, lookup_count: usize) -> usize {
+    let file_id = NodeId(1);
+    let mut nodes = HashMap::new();
+    let mut edges = Vec::new();
+    for index in 0..owner_count {
+        let owner_id = NodeId(i64::try_from(index * 2 + 2).expect("owner id"));
+        let target_id = NodeId(i64::try_from(index * 2 + 3).expect("target id"));
+        nodes.insert(
+            owner_id,
+            Node {
+                id: owner_id,
+                kind: NodeKind::CLASS,
+                serialized_name: format!("Owner{index}"),
+                qualified_name: Some(format!("module.Owner{index}")),
+                file_node_id: Some(file_id),
+                start_line: Some(u32::try_from(index + 1).expect("owner line")),
+                end_line: Some(u32::try_from(index + 2).expect("owner end line")),
+                ..Default::default()
+            },
+        );
+        nodes.insert(
+            target_id,
+            Node {
+                id: target_id,
+                kind: NodeKind::METHOD,
+                serialized_name: "run".to_owned(),
+                qualified_name: Some(format!("module.Owner{index}.run")),
+                file_node_id: Some(file_id),
+                start_line: Some(u32::try_from(index + 2).expect("method line")),
+                ..Default::default()
+            },
+        );
+        edges.push(Edge {
+            source: owner_id,
+            target: target_id,
+            kind: EdgeKind::MEMBER,
+            ..Default::default()
+        });
+    }
+    reset_manual_receiver_lookup_work();
+    let prepared = PreparedMemberTargetIndex::prepare(&nodes, &edges);
+    for index in 0..lookup_count {
+        let owner_index = index % owner_count;
+        assert_eq!(
+            prepared.target(&format!("Owner{owner_index}"), "run", file_id, false, None,),
+            Some(NodeId(
+                i64::try_from(owner_index * 2 + 3).expect("target id")
+            ))
+        );
+    }
+    manual_receiver_lookup_work()
+}
+
+#[test]
+fn prepared_manual_receiver_members_and_lookups_are_independently_linear() {
+    let baseline = measured_manual_receiver_index_work(64, 64);
+    let more_members = measured_manual_receiver_index_work(128, 64);
+    let more_lookups = measured_manual_receiver_index_work(64, 128);
+    let combined = measured_manual_receiver_index_work(128, 128);
+    assert!(baseline >= 64, "manual receiver work was not counted");
+    assert!(
+        more_members <= baseline * 2 + 64,
+        "member preparation: {baseline} -> {more_members}"
+    );
+    assert!(
+        more_lookups <= baseline * 2 + 64,
+        "member lookups: {baseline} -> {more_lookups}"
+    );
+    assert!(
+        combined <= baseline * 2 + 128,
+        "combined work: {baseline} -> {combined}"
+    );
+}
+
+fn measured_python_local_owner_line_work(owner_count: usize, lookup_count: usize) -> usize {
+    let mut source = String::new();
+    for index in 0..owner_count {
+        source.push_str(&format!(
+            "def caller_{index}():\n    class Owner{index}:\n        pass\n\n"
+        ));
+    }
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_python::LANGUAGE.into())
+        .expect("Python parser language");
+    let tree = parser.parse(&source, None).expect("Python syntax tree");
+    reset_manual_receiver_lookup_work();
+    let prepared = PythonLocalOwnerLineIndex::prepare(&tree, &source);
+    for index in 0..lookup_count {
+        let owner_index = index % owner_count;
+        assert!(
+            prepared
+                .unique_line(&format!("caller_{owner_index}.Owner{owner_index}"))
+                .is_some()
+        );
+    }
+    manual_receiver_lookup_work()
+}
+
+#[test]
+fn python_local_owner_lines_are_prepared_once_and_looked_up_linearly() {
+    let baseline = measured_python_local_owner_line_work(64, 64);
+    let more_owners = measured_python_local_owner_line_work(128, 64);
+    let more_lookups = measured_python_local_owner_line_work(64, 128);
+    let combined = measured_python_local_owner_line_work(128, 128);
+    assert!(baseline >= 64, "Python owner-line work was not counted");
+    assert!(
+        more_owners <= baseline * 2 + 128,
+        "owner preparation: {baseline} -> {more_owners}"
+    );
+    assert!(
+        more_lookups <= baseline * 2 + 64,
+        "owner lookups: {baseline} -> {more_lookups}"
+    );
+    assert!(
+        combined <= baseline * 2 + 192,
+        "combined work: {baseline} -> {combined}"
+    );
+}
+
 /// A file whose only structural node is a position-derived one: a shape
 /// several collectors produce today, because `structural_node_id` mixes the
 /// declaration's line and column into the id.
@@ -1357,6 +1671,7 @@ fn parser_result_changed_with_restored_mtime_is_incomplete_and_not_cached() -> R
         full_path: path.clone(),
         artifact_cache_path: Some(path.with_extension("artifact")),
         source: original.to_string(),
+        source_utf8_exact: true,
         compilation_info: None,
         language_config: get_language_for_ext("rs").expect("rust config"),
         artifact_cache_key: Some("old-source".to_string()),
@@ -1944,6 +2259,7 @@ fn structural_source_drift_discards_units_and_cache_write_even_with_restored_mti
     let content_hash = source_content_hash(original.as_bytes());
     let prepared = PreparedStructuralInput {
         full_path: path.clone(),
+        role_classification_path: PathBuf::from("schema.sql"),
         artifact_cache_path: Some(PathBuf::from("schema.sql")),
         artifact_cache_key: Some("v1:original".to_string()),
         source: original.to_string(),
@@ -2121,6 +2437,11 @@ fn prepare_path_preserves_specialized_structural_and_openapi_routing() -> Result
             "[package]\nname = \"app\"\n",
             "structural_cargo_manifest_collector",
         ),
+        (
+            "tsconfig.json",
+            "{\"openapi\":\"3.1.0\",\"paths\":{\"/health\":{\"get\":{}}},\"compilerOptions\":{\"strict\":true}}",
+            "structural_typescript_config_jsonc_collector",
+        ),
     ];
     for (relative, source, _expected_producer) in fixtures {
         let path = dir.path().join(relative);
@@ -2229,6 +2550,49 @@ fn prepare_path_preserves_specialized_structural_and_openapi_routing() -> Result
         Ok(_) => panic!("parser-backed .sh entered structural fallback"),
         Err(_) => panic!("parser-backed .sh preparation failed"),
     }
+    Ok(())
+}
+
+#[test]
+fn structural_zero_byte_role_uses_the_workspace_relative_path() -> Result<()> {
+    let dir = tempdir()?;
+    let root = dir.path().join("target/workspace");
+    let relative = PathBuf::from("src/__tests__/fixtures/empty.json");
+    let full_path = root.join(&relative);
+    std::fs::create_dir_all(full_path.parent().expect("fixture parent"))?;
+    std::fs::write(&full_path, [])?;
+
+    let indexer = WorkspaceIndexer::new(root.clone());
+    let mut storage = Storage::new_in_memory()?;
+    let symbol_table = Arc::new(SymbolTable::new());
+    let mut stats = IncrementalIndexingStats::default();
+    let prepared_result = {
+        let mut cache_access =
+            ArtifactCacheAccess::storage(&mut storage, ArtifactCachePolicies::default());
+        indexer.prepare_index_work(
+            &mut cache_access,
+            &relative,
+            &root,
+            None,
+            &symbol_table,
+            &mut stats,
+        )
+    };
+    let prepared = match prepared_result {
+        Ok(prepared) => prepared,
+        Err(_) => panic!("zero-byte test JSON preparation failed"),
+    };
+    let input = match prepared {
+        PreparedIndexWork::Structural(input) => input,
+        _ => panic!("zero-byte test JSON must enter structural collection"),
+    };
+    let projected = indexer.execute_prepared_structural_index(&input);
+    assert!(projected.local_storage.errors.is_empty());
+    assert_eq!(
+        projected.local_storage.files[0].file_role,
+        codestory_store::FileRole::Test
+    );
+    assert!(projected.local_storage.structural_text_units.is_empty());
     Ok(())
 }
 

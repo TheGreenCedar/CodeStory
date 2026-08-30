@@ -1,8 +1,8 @@
-//! Inert, closed DTO vocabulary for future v3 evidence projections.
+//! Closed public DTO vocabulary for CodeStory v3 evidence projections.
 //!
 //! These types deliberately carry rendered evidence availability, not the
-//! internal planning or proof state that produced it. No production adapter
-//! references this module in the v3 preparation slices.
+//! internal planning or proof state that produced it. Packet, context, and
+//! search adapters serialize only these bounded projections.
 
 use std::fmt;
 
@@ -328,6 +328,8 @@ pub struct DiagnosticReferenceV3Dto {
     pub artifact_id: IdentityTextV3,
     pub sha256: Sha256DigestV3Dto,
     pub byte_length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wall_expiry_epoch_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +360,7 @@ pub enum PacketProjectionV3Dto {
         status: EvidenceAvailabilityV3Dto,
         retrieval: RetrievalStateDescriptorV3Dto,
         diagnostics: DiagnosticsCapabilityV3Dto,
+        gaps: BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3>,
         maximum_bytes: u64,
         required_complete_bytes: u64,
     },
@@ -382,8 +385,8 @@ pub struct ContextEvidenceRowV3Dto {
     pub identity: EvidenceIdentityV3Dto,
     pub path: PathTextV3,
     pub symbol_id: Option<SymbolIdTextV3>,
-    pub start_line: u32,
-    pub end_line: u32,
+    pub start_line: Option<u32>,
+    pub end_line: Option<u32>,
     pub excerpt: Option<ExcerptTextV3>,
 }
 
@@ -527,6 +530,7 @@ mod tests {
             artifact_id: text("diagnostic-1"),
             sha256: Sha256DigestV3Dto::new("c".repeat(64)).expect("artifact digest"),
             byte_length: 512,
+            wall_expiry_epoch_ms: None,
         }
     }
 
@@ -712,6 +716,7 @@ mod tests {
             status: EvidenceAvailabilityV3Dto::Unavailable,
             retrieval: retrieval(RetrievalStateV3Dto::Degraded),
             diagnostics: diagnostics(),
+            gaps: list(vec![gap(GapKindV3Dto::OutputBudgetExceeded)]),
             maximum_bytes: 16_384,
             required_complete_bytes: 16_385,
         };
@@ -729,8 +734,8 @@ mod tests {
                 identity: evidence_identity("context-evidence-1"),
                 path: text("src/lib.rs"),
                 symbol_id: Some(text("crate::entry")),
-                start_line: 4,
-                end_line: 9,
+                start_line: Some(4),
+                end_line: Some(9),
                 excerpt: Some(text("pub fn entry() { runtime(); }")),
             }]),
             gaps: list(vec![gap(GapKindV3Dto::EvidenceMissing)]),

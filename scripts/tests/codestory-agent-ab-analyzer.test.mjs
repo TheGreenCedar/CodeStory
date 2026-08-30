@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
@@ -59,6 +59,7 @@ import {
   packetManifestQualitySummary,
   packetObligationAccounting,
   packetDispositionTelemetry,
+  preludePublicFields,
   packetPreludeContractBlockers,
   publicPacketPreludeContractPasses,
   packetPreludeManifestComplete,
@@ -66,8 +67,11 @@ import {
   packetFirstCommandForPrompt,
   packetRuntimePublishableBlockers,
   packetRuntimeQualityGateRequired,
+  preludeAllowsAgentRun,
   publicCoreCorpusAudit,
   projectResourceUri,
+  reanalysisExactCandidateAcceptance,
+  reanalysisPacketProjection,
   planAgentRuns,
   repoProvenance,
   repoProvenanceBlockers,
@@ -84,6 +88,7 @@ import {
   summarizeCostAccounting,
   summarizePacketObligationAccounting,
   summarizePacketRuntimeRuns,
+  runCodeStoryPacketPrelude,
   runAgentBenchmarkPipeline,
   runPlannedAgentRuns,
   runProcess,
@@ -95,6 +100,7 @@ import {
   cachePolicyForRun,
   cacheProvenanceBlockers,
 } from "../codestory-agent-ab-benchmark.mjs";
+import * as benchmarkHarness from "../codestory-agent-ab-benchmark.mjs";
 import {
   packetGateSelectionOrThrow,
   packetGateStderrPath,
@@ -107,6 +113,1789 @@ const RUN_INDEX_SYMBOL = "IndexService::run_indexing_blocking";
 const RUNTIME_REFRESH_CLAIM =
   "The runtime opens the workspace and store, chooses full or incremental indexing, and coordinates later refresh phases.";
 
+const EXACT_CANDIDATE_ARMS = [
+  "without_codestory",
+  "published_0_17_4",
+  "candidate_0_18",
+];
+const EXACT_TASKS = [
+  ["python-requests-session-flow", "psf-requests"],
+  ["java-commons-lang-string-utils", "apache-commons-lang"],
+  ["rust-ripgrep-search-pipeline", "BurntSushi-ripgrep"],
+  ["javascript-express-routing-flow", "expressjs-express"],
+  ["typescript-swr-hook-flow", "vercel-swr"],
+  ["cpp-fmt-formatting-flow", "fmtlib-fmt"],
+  ["c-redis-command-loop", "redis-redis"],
+  ["go-gin-route-dispatch", "gin-gonic-gin"],
+  ["ruby-jekyll-site-build", "jekyll-jekyll"],
+  ["php-monolog-record-flow", "Seldaek-monolog"],
+  ["csharp-automapper-map-flow", "AutoMapper-AutoMapper"],
+  ["kotlin-okio-buffer-flow", "square-okio"],
+  ["swift-alamofire-request-flow", "Alamofire-Alamofire"],
+  ["dart-http-client-flow", "dart-lang-http"],
+  ["bash-nvm-install-dispatch", "nvm-sh-nvm"],
+  ["html-mdn-form-validation", "mdn-learning-area"],
+  ["css-animate-base-and-keyframes", "animate-css-animate-css"],
+  ["sql-chinook-schema-relations", "lerocha-chinook-database"],
+];
+
+function exactLifecycle() {
+  return {
+    contract: "codestory.agent-benchmark-exact-lifecycle/v1",
+    package_authentication_order: ["published_0_17_4", "candidate_0_18"],
+    package_authentication_ms: { published_0_17_4: 10, candidate_0_18: 10 },
+    total_package_authentication_ms: 20,
+    model_initialization_ms: { published_0_17_4: 5, candidate_0_18: 5 },
+    cost_rates: {
+      currency: "USD",
+      model: "gpt-5.6-sol",
+      input_per_mtok: 4,
+      output_per_mtok: 20,
+      source: "configured_environment",
+    },
+    preparation_order: EXACT_TASKS.map(([_, repo], index) => ({
+      repo,
+      arms: index % 2 === 0
+        ? ["published_0_17_4", "candidate_0_18"]
+        : ["candidate_0_18", "published_0_17_4"],
+    })),
+  };
+}
+
+function passingCacheProvenance(schemaVersion = 2) {
+  const provenance = {
+    doctor_status: "pass",
+    storage_path: "/isolated/cache.db",
+    cache_policy: "prepared-retrieval-cache-read-only",
+    retrieval_mode: "full",
+    semantic_generation: "semantic-1",
+    manifest_embedding_backend: `per-user-server:coderank-embed:q8_0:sha256-${"a".repeat(64)}:fixture`,
+    embedding_engine_instance_id: "engine-1",
+    embedding_policy: "accelerated",
+    semantic_backend: "embedded",
+    local_only: true,
+    indexed: true,
+    freshness_status: "fresh",
+    semantic_ready: true,
+    indexing_in_timed_run: false,
+    transport_mode: "agent_harness_prelude",
+    packet_embedding_execution: {
+      source: "packet.answer.retrieval_trace",
+      transport_mode: "agent_harness_prelude",
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      embedding_policy: "accelerated",
+      retrieval_mode: "full",
+      diagnostic_count: 1,
+      full_diagnostic_count: 1,
+      semantic_stage_count: 1,
+      completed_semantic_stage_count: 1,
+      invalid_semantic_stage_count: 0,
+      shadow_degraded_reason: null,
+      shadow_error: null,
+      shadow_cancel_reason: null,
+      semantic_fallback_count: 0,
+      semantic_generation: "semantic-1",
+      prepared_semantic_generation: "semantic-1",
+    },
+    cache_preparation: {
+      preparation_wall_ms: 100,
+      incremental_status: "pass",
+      incremental_wall_ms: 20,
+      coherence_refresh_status: "pass",
+      coherence_refresh_exit_code: 0,
+      coherence_semantic_generation: "semantic-1",
+      incremental_source_mutation: {
+        path: "src/named.rs",
+        original_sha256: "b".repeat(64),
+        mutated_sha256: "c".repeat(64),
+        restored_sha256: "b".repeat(64),
+      },
+    },
+  };
+  if (schemaVersion === 3) {
+    provenance.cache_preparation.cold_retrieval_work_evidence = {
+      core_phase_timings: { total_ms: 80 },
+      retrieval_phase_timings: [
+        { phase: "input fingerprint", elapsed_ms: 1 },
+        { phase: "lexical sidecar", elapsed_ms: 20 },
+        { phase: "embedded vectors", elapsed_ms: 40 },
+        { phase: "graph artifact", elapsed_ms: 19 },
+      ],
+      retrieval_component_work: [
+        { component: "lexical", mode: "complete", retained: 0, inserted: 100, removed: 0 },
+        { component: "vectors", mode: "complete", retained: 0, inserted: 80, removed: 0 },
+        { component: "graph", mode: "complete", retained: 0, inserted: 120, removed: 0 },
+      ],
+    };
+    provenance.cache_preparation.incremental_retrieval_work_evidence = {
+      core_phase_timings: { total_ms: 12 },
+      retrieval_phase_timings: [
+        { phase: "input fingerprint", elapsed_ms: 1 },
+        { phase: "lexical sidecar", elapsed_ms: 4 },
+        { phase: "embedded vectors", elapsed_ms: 4 },
+        { phase: "graph artifact", elapsed_ms: 3 },
+      ],
+      retrieval_component_work: [
+        { component: "lexical", mode: "copy_on_write", retained: 99, inserted: 1, removed: 1 },
+        { component: "vectors", mode: "reused", retained: 80, inserted: 0, removed: 0 },
+        { component: "graph", mode: "copy_on_write", retained: 119, inserted: 1, removed: 1 },
+      ],
+    };
+    provenance.packet_embedding_execution = {
+      source: "packet.v3_public_projection",
+      schema_version: 3,
+      transport_mode: "agent_harness_prelude",
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      embedding_policy: "accelerated",
+      retrieval_mode: "full",
+      packet_kind: "complete",
+      evidence_status: "available",
+      evidence_count: 1,
+      gap_count: 0,
+      core_generation: "core-1",
+      core_run_id: "run-1",
+      retrieval_core_generation: "core-1",
+      retrieval_core_run_id: "run-1",
+      retrieval_generation: "retrieval-1",
+      retrieval_state_generation: "retrieval-1",
+      semantic_generation: "semantic-1",
+      prepared_semantic_generation: "semantic-1",
+      diagnostics_availability: "available",
+      diagnostics_artifact_id: "diagnostic-1",
+      diagnostics_sha256: "7".repeat(64),
+      diagnostics_byte_length: 512,
+    };
+  }
+  return provenance;
+}
+
+function exactCandidateRows() {
+  const rows = [];
+  for (const [taskId, repo] of EXACT_TASKS) {
+    for (let repeat = 1; repeat <= 3; repeat += 1) {
+      for (const arm of EXACT_CANDIDATE_ARMS) {
+        const codestory = arm !== "without_codestory";
+        const packageVersion = "0.17.4";
+        const packageByte = arm === "published_0_17_4" ? "a" : "b";
+        rows.push({
+          repo,
+          task_id: taskId,
+          arm,
+          repeat,
+          status: "pass",
+          quality: {
+            pass: true,
+            material_factual_errors: { found: 0, found_anchors: [] },
+            unsupported_proof_claims: { found: 0, found_claims: [] },
+          },
+          usage: codestory
+            ? { input_tokens: 50, output_tokens: 20, total_tokens: 70 }
+            : { input_tokens: 70, output_tokens: 30, total_tokens: 100 },
+          estimated_cost_usd: codestory ? 0.7 : 1,
+          tool_calls_observed: codestory ? 7 : 10,
+          transcript_analysis: {
+            command_count: codestory ? 7 : 10,
+            tool_categories: { command_execution: codestory ? 7 : 10 },
+            command_categories: codestory
+              ? { codestory_cli: 1, direct_file_read: 6 }
+              : { codestory_cli: 0, direct_file_read: 10 },
+            interaction_turns: codestory
+              ? {
+                  total: 9, model_messages: 2, tool_actions: 7, failed_tool_actions: 0,
+                  reasoning_items_excluded: 0, error_items_excluded: 0,
+                }
+              : {
+                  total: 12, model_messages: 2, tool_actions: 10, failed_tool_actions: 0,
+                  reasoning_items_excluded: 0, error_items_excluded: 0,
+                },
+            codestory_mcp_tool_calls_observed: 0,
+            codestory_mcp_completed_calls_observed: 0,
+            codestory_mcp_runtime_identities: [],
+            external_context_tool_calls: 0,
+            direct_source_reads: codestory
+              ? [{ path: "src/named.rs", authorization: { status: "authorized", reason: "user_named_file" } }]
+              : [{ path: "src/read.rs", authorization: { status: "baseline_local_exploration", reason: "without_codestory" } }],
+            direct_source_reads_total: 1,
+          },
+          exact_candidate_timing: codestory
+            ? {
+                cold_ms: arm === "candidate_0_18" ? 100 : 100,
+                warm_ms: arm === "candidate_0_18" ? 50 : 50,
+                incremental_ms: arm === "candidate_0_18" ? 20 : 20,
+                all_in_ms: arm === "candidate_0_18" ? 50 : 50,
+              }
+            : { cold_ms: 0, warm_ms: 100, incremental_ms: 0, all_in_ms: 100 },
+          wall_ms: codestory ? 50 : 100,
+          malformed_stdout_lines: 0,
+          json_events: 1,
+          analysis_events: 1,
+          event_types: { fixture: 1 },
+          packet_first_required: codestory,
+          packet_first_pass: true,
+          repo_provenance: pinnedRepoProvenance(),
+          task_manifest_snapshot: {
+            repo,
+            repo_metadata: {
+              name: repo,
+              url: "https://github.com/example/fixture.git",
+              ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
+            },
+          },
+          package_identity: arm === "published_0_17_4"
+            ? {
+                contract: "codestory.agent-benchmark-package/v2",
+                arm,
+                package_version: packageVersion,
+                package_sha256: packageByte.repeat(64),
+                cli_sha256: "c".repeat(64),
+                source_commit: "e".repeat(40),
+                source_tree: "1".repeat(40),
+                schema_version: 2,
+                protocol_revision: "2024-11-05",
+                discovery_contract_sha256: null,
+                trust_root_kind: "official_published_checksum",
+                trust_root_sha256: "5".repeat(64),
+              }
+            : null,
+          source_cli_identity: arm === "candidate_0_18"
+            ? {
+                contract: "codestory.agent-benchmark-source-cli/v1",
+                arm,
+                package_version: packageVersion,
+                cli_sha256: "d".repeat(64),
+                source_commit: "f".repeat(40),
+                source_tree: "2".repeat(40),
+                schema_version: 3,
+                protocol_revision: "2025-11-25",
+                discovery_contract_sha256: "4".repeat(64),
+                plugin_manifest_sha256: "6".repeat(64),
+                catalog_sha256: "7".repeat(64),
+              }
+            : null,
+          codestory_prelude_cli: codestory ? "/authenticated/codestory-cli" : null,
+          codestory_prelude_cli_sha256: codestory
+            ? (arm === "published_0_17_4" ? "c" : "d").repeat(64)
+            : null,
+          codestory_binary_identity: codestory
+            ? {
+                status: "prelude_only",
+                prelude_cli_sha256: (arm === "published_0_17_4" ? "c" : "d").repeat(64),
+              }
+            : null,
+          codestory_cache_provenance: codestory
+            ? passingCacheProvenance(arm === "candidate_0_18" ? 3 : 2)
+            : null,
+          codestory_harness_prelude: codestory
+            ? {
+                status: "pass",
+                packet_schema_version: arm === "candidate_0_18" ? 3 : 2,
+                packet_extra_probe_strategy: null,
+                packet_contract_runtime: {
+                  cli_version: packageVersion,
+                  cli_source: "direct_cli_launch",
+                  known_override_skew_channel: false,
+                },
+                ...(arm === "candidate_0_18"
+                  ? {
+                      packet_evidence_gap_accounting: {
+                        contract: "codestory.packet-v3-evidence-gap-accounting/v1",
+                        kind: "complete",
+                        status: "available",
+                        evidence_count: 1,
+                        unique_evidence_id_count: 1,
+                        evidence_kind_counts: { exact_source: 1 },
+                        gap_count: 0,
+                        unique_gap_id_count: 0,
+                        gap_kind_counts: {},
+                        continuation_gap_count: 0,
+                        unique_continuation_gap_id_count: 0,
+                        continuation_gap_ids_bound: true,
+                      },
+                    }
+                  : { packet_sufficiency: {
+                  obligation_accounting: {
+                    total: 0,
+                    material: 0,
+                    nonmaterial: 0,
+                    material_status_buckets: {},
+                  },
+                } }),
+              }
+            : null,
+        });
+      }
+    }
+  }
+  return rows;
+}
+
+function exactArgs(extra = []) {
+  return [
+    "--exact-candidate",
+    "--task-suite", "language-expansion-holdout",
+    "--published-archive", "/tmp/published.tar.gz",
+    "--published-checksum-manifest", "/tmp/SHA256SUMS.txt",
+    "--published-checksum-sha256", "a".repeat(64),
+    "--candidate-source-root", "/tmp/candidate-source",
+    ...extra,
+  ];
+}
+
+test("exact-candidate mode freezes the 18x3x3 shape and rejects baseline reuse", () => {
+  assert.throws(
+    () => benchmarkHarness.parseArgs(exactArgs(["--reuse-baseline-from", "/tmp/old"])),
+    /forbids option.*reuse-baseline/i,
+  );
+  const opts = benchmarkHarness.parseArgs(exactArgs());
+  assert.deepEqual(opts.arms, EXACT_CANDIDATE_ARMS);
+  assert.equal(opts.repeats, 3);
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateShape(opts, Array.from({ length: 17 }, (_, index) => ({ id: `t-${index}` }))),
+    /exactly 18 pinned tasks/i,
+  );
+  assert.doesNotThrow(() =>
+    benchmarkHarness.validateExactCandidateShape(
+      opts,
+      Array.from({ length: 18 }, (_, index) => ({ id: `t-${index}` })),
+    )
+  );
+});
+
+test("exact-candidate task contract includes the file-local routing field", async () => {
+  const opts = benchmarkHarness.parseArgs(exactArgs());
+  const tasks = await loadTasks(opts);
+  assert.equal(tasks.length, 18);
+  assert.ok(tasks.every((task) => task.file_local === false));
+  assert.doesNotThrow(() => benchmarkHarness.validateExactCandidateShape(opts, tasks));
+
+  const changedTasks = tasks.map((task, index) =>
+    index === 0 ? { ...task, prompt: `${task.prompt} changed` } : task
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateShape(opts, changedTasks),
+    /qualification inputs differ from the pinned task window/i,
+  );
+});
+
+test("exact-candidate cost rates fail before package or repository work", () => {
+  assert.throws(
+    () => benchmarkHarness.exactCandidateCostRates({}),
+    /requires positive CODESTORY_BENCH_INPUT_COST_PER_MTOK.*before package authentication or repository materialization/i,
+  );
+  assert.deepEqual(
+    benchmarkHarness.exactCandidateCostRates({
+      CODESTORY_BENCH_INPUT_COST_PER_MTOK: "4",
+      CODESTORY_BENCH_OUTPUT_COST_PER_MTOK: "20",
+    }),
+    {
+      currency: "USD",
+      model: "gpt-5.6-sol",
+      input_per_mtok: 4,
+      output_per_mtok: 20,
+      source: "configured_environment",
+    },
+  );
+});
+
+test("exact-candidate mode closes every option that can change freshness oracle or run shape", () => {
+  const forbidden = [
+    ["--list"],
+    ["--self-test"],
+    ["--reanalyze-dir", "/tmp/old"],
+    ["--quick"],
+    ["--publishable"],
+    ["--allow-failures"],
+    ["--diagnostic-extra-probes-from-manifest"],
+    ["--include-local-repos"],
+    ["--packet-runtime"],
+    ["--packet-runtime-mode", "cold-cli"],
+    ["--codestory-cli", "/tmp/local-codestory-cli"],
+    ["--repos", "psf-requests"],
+    ["--arms", EXACT_CANDIDATE_ARMS.join(",")],
+    ["--task-ids", EXACT_TASKS[0][0]],
+    ["--task-manifest", "/tmp/tasks"],
+    ["--repeats", "3"],
+    ["--runner", "codex"],
+    ["--model", "gpt-5.6-sol"],
+    ["--sandbox", "workspace-write"],
+    ["--benchmark-run-id", "reused"],
+    ["--timeout-ms", "600000"],
+    ["--jobs", "1"],
+    ["--reuse-baseline-from", "/tmp/old"],
+    ["--prepare-codestory-cache"],
+    ["--no-prepare-codestory-cache"],
+    ["--prepare-codestory-timeout-ms", "1800000"],
+    ["--prepare-codestory-jobs", "1"],
+    ["--canary-task-id", EXACT_TASKS[0][0]],
+    ["--shard-count", "1"],
+    ["--shard-index", "0"],
+    ["--aggregate-shards", "/tmp/shard"],
+    ["--candidate-package-sha256", "c".repeat(64)],
+    ["--candidate-cli", "/tmp/arbitrary-candidate-cli"],
+    ["--candidate-cli-sha256", "c".repeat(64)],
+    ["--collect-all-failures"],
+    ["--max-source-reads-after-packet", "0"],
+  ];
+  for (const args of forbidden) {
+    assert.throws(
+      () => benchmarkHarness.parseArgs(exactArgs(args)),
+      /exact-candidate mode forbids|unsupported|mutually exclusive|unknown option/i,
+      args[0],
+    );
+  }
+
+  for (const required of [
+    "--published-archive",
+    "--published-checksum-manifest",
+    "--published-checksum-sha256",
+    "--candidate-source-root",
+  ]) {
+    const args = exactArgs();
+    args.splice(args.indexOf(required), 2);
+    assert.throws(
+      () => benchmarkHarness.parseArgs(args),
+      /requires authenticated published archive and candidate source input/i,
+      required,
+    );
+  }
+  for (const digestOption of ["--published-checksum-sha256"]) {
+    const args = exactArgs();
+    args[args.indexOf(digestOption) + 1] = "0".repeat(64);
+    assert.throws(() => benchmarkHarness.parseArgs(args), /all-zero digest/i, digestOption);
+  }
+
+  const permitted = benchmarkHarness.parseArgs(exactArgs([
+    "--materialize-repos",
+    "--repo-cache-dir", "/tmp/exact-repos",
+    "--out-dir", "/tmp/exact-output",
+    "--resume-prefix-from", "/tmp/exact-prefix",
+  ]));
+  assert.equal(permitted.materializeRepos, true);
+  assert.equal(permitted.diagnosticExtraProbesFromManifest, false);
+  assert.equal(permitted.resumePrefixFrom, "/tmp/exact-prefix");
+
+  const comparatorReuse = benchmarkHarness.parseArgs(exactArgs([
+    "--reuse-comparators-from", "/tmp/exact-comparators",
+    "--reuse-comparators-ledger-sha256", "b".repeat(64),
+    "--reuse-comparators-artifacts-sha256", "c".repeat(64),
+  ]));
+  assert.equal(comparatorReuse.reuseComparatorsFrom, "/tmp/exact-comparators");
+  assert.equal(comparatorReuse.reuseComparatorsLedgerSha256, "b".repeat(64));
+  assert.equal(comparatorReuse.reuseComparatorsArtifactsSha256, "c".repeat(64));
+  assert.throws(
+    () => benchmarkHarness.parseArgs(exactArgs([
+      "--reuse-comparators-from", "/tmp/exact-comparators",
+    ])),
+    /requires --reuse-comparators-from.*ledger.*artifacts/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.parseArgs(exactArgs([
+      "--resume-prefix-from", "/tmp/exact-prefix",
+      "--reuse-comparators-from", "/tmp/exact-comparators",
+      "--reuse-comparators-ledger-sha256", "b".repeat(64),
+      "--reuse-comparators-artifacts-sha256", "c".repeat(64),
+    ])),
+    /mutually exclusive/i,
+  );
+});
+
+test("exact-candidate planning balances deterministic arm position across 162 fresh rows", () => {
+  const tasks = Array.from({ length: 18 }, (_, index) => ({
+    id: `task-${index + 1}`,
+    repo: `repo-${index + 1}`,
+  }));
+  const opts = { exactCandidate: true, arms: EXACT_CANDIDATE_ARMS, repeats: 3, repos: null };
+  const first = benchmarkHarness.planAgentRuns(opts, tasks);
+  const second = benchmarkHarness.planAgentRuns(opts, tasks);
+  assert.deepEqual(first, second);
+  assert.equal(first.length, 162);
+  const positions = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [arm, [0, 0, 0]]));
+  for (let index = 0; index < first.length; index += 3) {
+    const triplet = first.slice(index, index + 3);
+    assert.equal(new Set(triplet.map((run) => run.task.id)).size, 1);
+    assert.equal(new Set(triplet.map((run) => run.repeat)).size, 1);
+    assert.deepEqual(new Set(triplet.map((run) => run.arm)), new Set(EXACT_CANDIDATE_ARMS));
+    triplet.forEach((run, position) => {
+      positions[run.arm][position] += 1;
+    });
+  }
+  for (const arm of EXACT_CANDIDATE_ARMS) {
+    assert.deepEqual(positions[arm], [18, 18, 18]);
+  }
+});
+
+test("exact-candidate resume accepts only an authenticated whole-task contiguous prefix", () => {
+  const tasks = [
+    { id: "task-1", repo: "repo-1" },
+    { id: "task-2", repo: "repo-2" },
+  ];
+  const candidate = {
+    contract: "codestory.agent-benchmark-source-cli/v1",
+    arm: "candidate_0_18",
+    package_version: "0.17.5",
+    cli_sha256: "1".repeat(64),
+    source_commit: "2".repeat(40),
+    source_tree: "3".repeat(40),
+    schema_version: 3,
+    protocol_revision: "2025-11-25",
+    discovery_contract_sha256: "4".repeat(64),
+    plugin_manifest_sha256: "5".repeat(64),
+    catalog_sha256: "6".repeat(64),
+  };
+  const published = {
+    contract: "codestory.agent-benchmark-exact-package/v1",
+    arm: "published_0_17_4",
+    package_version: "0.17.4",
+    package_sha256: "7".repeat(64),
+    cli_sha256: "8".repeat(64),
+    source_commit: "9".repeat(40),
+    source_tree: "a".repeat(40),
+    schema_version: 2,
+    protocol_revision: "2024-11-05",
+    discovery_contract_sha256: null,
+    trust_root: { kind: "official_published_checksum", sha256: "b".repeat(64) },
+  };
+  const opts = {
+    exactCandidate: true,
+    arms: EXACT_CANDIDATE_ARMS,
+    repeats: 3,
+    repos: null,
+    exactCandidatePackageByArm: new Map([
+      ["candidate_0_18", candidate],
+      ["published_0_17_4", published],
+    ]),
+  };
+  const planned = benchmarkHarness.planAgentRuns(opts, tasks);
+  const rows = planned.slice(0, 9).map((run) => ({
+    repo: run.repo,
+    task_id: run.task.id,
+    arm: run.arm,
+    repeat: run.repeat,
+    status: "pass",
+    task_manifest_snapshot: benchmarkHarness.taskSnapshotForResult(run.task),
+    package_identity: run.arm === "published_0_17_4"
+      ? {
+          contract: published.contract,
+          arm: published.arm,
+          package_version: published.package_version,
+          package_sha256: published.package_sha256,
+          cli_sha256: published.cli_sha256,
+          source_commit: published.source_commit,
+          source_tree: published.source_tree,
+          schema_version: published.schema_version,
+          protocol_revision: published.protocol_revision,
+          discovery_contract_sha256: null,
+          trust_root_kind: published.trust_root.kind,
+          trust_root_sha256: published.trust_root.sha256,
+        }
+      : null,
+    source_cli_identity: run.arm === "candidate_0_18"
+      ? { ...candidate, source_commit: "c".repeat(40), source_tree: "d".repeat(40) }
+      : null,
+  }));
+
+  assert.equal(
+    benchmarkHarness.validateExactCandidateResumePrefixRows(rows, planned, opts),
+    1,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateResumePrefixRows(rows.slice(0, 8), planned, opts),
+    /complete task boundary/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateResumePrefixRows(
+      [rows[1], rows[0], ...rows.slice(2)],
+      planned,
+      opts,
+    ),
+    /planned contiguous prefix/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateResumePrefixRows(
+      rows.map((row) => row.arm === "candidate_0_18"
+        ? { ...row, source_cli_identity: { ...row.source_cli_identity, cli_sha256: "e".repeat(64) } }
+        : row),
+      planned,
+      opts,
+    ),
+    /candidate CLI or public contract identity changed/i,
+  );
+});
+
+test("exact comparator reuse accepts only complete ordered comparator triplets and never candidates", () => {
+  const tasks = [
+    { id: "task-1", repo: "repo-1" },
+    { id: "task-2", repo: "repo-2" },
+  ];
+  const candidate = {
+    contract: "codestory.agent-benchmark-source-cli/v1",
+    arm: "candidate_0_18",
+    package_version: "0.17.5",
+    cli_sha256: "1".repeat(64),
+    source_commit: "2".repeat(40),
+    source_tree: "3".repeat(40),
+    schema_version: 3,
+    protocol_revision: "2025-11-25",
+    discovery_contract_sha256: "4".repeat(64),
+    plugin_manifest_sha256: "5".repeat(64),
+    catalog_sha256: "6".repeat(64),
+    cli_path: "/new/candidate",
+  };
+  const published = {
+    contract: "codestory.agent-benchmark-package/v2",
+    arm: "published_0_17_4",
+    package_version: "0.17.4",
+    package_sha256: "7".repeat(64),
+    cli_sha256: "8".repeat(64),
+    source_commit: "9".repeat(40),
+    source_tree: "a".repeat(40),
+    schema_version: 2,
+    protocol_revision: "2024-11-05",
+    discovery_contract_sha256: null,
+    trust_root: { kind: "official_published_checksum", sha256: "b".repeat(64) },
+    cli_path: "/new/published",
+  };
+  const opts = {
+    exactCandidate: true,
+    arms: EXACT_CANDIDATE_ARMS,
+    repeats: 3,
+    repos: null,
+    runner: "codex",
+    model: "gpt-5.6-sol",
+    sandbox: "workspace-write",
+    taskSuite: "language-expansion-holdout",
+    exactCandidatePackageByArm: new Map([
+      ["candidate_0_18", candidate],
+      ["published_0_17_4", published],
+    ]),
+  };
+  const planned = benchmarkHarness.planAgentRuns(opts, tasks);
+  const publishedIdentity = {
+    contract: published.contract,
+    arm: published.arm,
+    package_version: published.package_version,
+    package_sha256: published.package_sha256,
+    cli_sha256: published.cli_sha256,
+    source_commit: published.source_commit,
+    source_tree: published.source_tree,
+    schema_version: published.schema_version,
+    protocol_revision: published.protocol_revision,
+    discovery_contract_sha256: null,
+    trust_root_kind: published.trust_root.kind,
+    trust_root_sha256: published.trust_root.sha256,
+  };
+  const rows = planned.slice(0, 9).map((run) => ({
+    repo: run.repo,
+    task_id: run.task.id,
+    arm: run.arm,
+    repeat: run.repeat,
+    status: "pass",
+    task_manifest_snapshot: benchmarkHarness.taskSnapshotForResult(run.task),
+    benchmark_contract: benchmarkHarness.benchmarkContractForRun(opts, run),
+    package_identity: run.arm === "published_0_17_4" ? publishedIdentity : null,
+    source_cli_identity: run.arm === "candidate_0_18"
+      ? { ...candidate, cli_sha256: "c".repeat(64), source_commit: "d".repeat(40) }
+      : null,
+  }));
+
+  const accepted = benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+    rows,
+    planned,
+    opts,
+  );
+  assert.equal(accepted.completedTaskCount, 1);
+  assert.equal(accepted.comparatorRows.length, 6);
+  assert.equal(accepted.comparatorRows.some((row) => row.arm === "candidate_0_18"), false);
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+      rows.filter((row) => !(row.arm === "published_0_17_4" && row.repeat === 3)),
+      planned,
+      opts,
+    ),
+    /complete task boundary|comparator triplets/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+      [rows[1], rows[0], ...rows.slice(2)],
+      planned,
+      opts,
+    ),
+    /planned contiguous prefix/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+      rows.map((row) => row.arm === "published_0_17_4"
+        ? { ...row, package_identity: { ...row.package_identity, cli_sha256: "e".repeat(64) } }
+        : row),
+      planned,
+      opts,
+    ),
+    /published package identity/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
+      rows.map((row) => row.arm === "without_codestory"
+        ? { ...row, benchmark_contract: { ...row.benchmark_contract, model: "drifted" } }
+        : row),
+      planned,
+      opts,
+    ),
+    /benchmark contract/i,
+  );
+});
+
+test("exact comparator reuse binds both ledger and referenced artifact bytes", async () => {
+  const runDir = await mkdtemp(path.join(os.tmpdir(), "codestory-comparator-source-"));
+  const outDir = await mkdtemp(path.join(os.tmpdir(), "codestory-comparator-copy-"));
+  try {
+    const ledgerBytes = Buffer.from('{"row":1}\n', "utf8");
+    await writeFile(path.join(runDir, "runs.jsonl"), ledgerBytes);
+    await writeFile(path.join(runDir, "row.stdout.jsonl"), '{"type":"done"}\n');
+    await writeFile(path.join(runDir, "row.stderr.txt"), "");
+    const artifactPaths = ["row.stdout.jsonl", "row.stderr.txt"];
+    const artifactSha = await benchmarkHarness.exactComparatorArtifactBundleSha256(
+      runDir,
+      artifactPaths,
+    );
+    const ledgerSha = createHash("sha256").update(ledgerBytes).digest("hex");
+    await benchmarkHarness.copyAuthenticatedComparatorArtifacts(
+      runDir,
+      outDir,
+      artifactPaths,
+      artifactSha,
+    );
+    assert.equal(
+      await readFile(path.join(outDir, "row.stdout.jsonl"), "utf8"),
+      '{"type":"done"}\n',
+    );
+    assert.doesNotThrow(() =>
+      benchmarkHarness.validateExactComparatorLedgerSha256(ledgerBytes, ledgerSha)
+    );
+
+    await writeFile(path.join(runDir, "row.stdout.jsonl"), '{"type":"tampered"}\n');
+    await assert.rejects(
+      benchmarkHarness.copyAuthenticatedComparatorArtifacts(
+        runDir,
+        outDir,
+        artifactPaths,
+        artifactSha,
+      ),
+      /artifact bundle digest/i,
+    );
+    assert.throws(
+      () => benchmarkHarness.validateExactComparatorLedgerSha256(
+        Buffer.from('{"row":2}\n', "utf8"),
+        ledgerSha,
+      ),
+      /ledger digest/i,
+    );
+  } finally {
+    await rm(runDir, { recursive: true, force: true });
+    await rm(outDir, { recursive: true, force: true });
+  }
+});
+
+async function makeExactArchive(root, name, {
+  version,
+  runtimeVersion = version,
+  schema,
+  source,
+  tree,
+  discovery,
+  executionMarker = null,
+}) {
+  const packageRoot = path.join(root, `${name}-root`);
+  await mkdir(packageRoot, { recursive: true });
+  const cliPath = path.join(packageRoot, "codestory-cli");
+  await writeFile(
+    cliPath,
+    `#!/usr/bin/env node
+const readline = require("node:readline");
+const fs = require("node:fs");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method !== "initialize") return;
+  ${executionMarker ? `fs.writeFileSync(${JSON.stringify(executionMarker)}, "executed");` : ""}
+  const response = {
+    jsonrpc: "2.0",
+    id: request.id,
+    result: {
+      protocolVersion: request.params.protocolVersion,
+      serverInfo: { name: "codestory", version: ${JSON.stringify(runtimeVersion)} },
+      _meta: {
+        codestory_publication: { schema_version: ${schema} },
+        codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discovery)} },
+      },
+    },
+  };
+  process.stdout.write(JSON.stringify(response) + "\\n");
+});
+`,
+  );
+  await chmod(cliPath, 0o755);
+  const cliSha = createHash("sha256").update(await readFile(cliPath)).digest("hex");
+  await writeFile(path.join(packageRoot, "codestory-native-manifest.json"), JSON.stringify({
+    schema_version: 3,
+    release_version: version,
+    source: { commit: source, tree, tracked_dirty: false },
+    binary: { name: "codestory-cli", sha256: cliSha },
+  }));
+  const archivePath = path.join(root, `${name}.tar.gz`);
+  const packed = spawnSync("tar", ["-czf", archivePath, "-C", root, path.basename(packageRoot)], {
+    encoding: "utf8",
+  });
+  assert.equal(packed.status, 0, packed.stderr);
+  return {
+    archivePath,
+    sha256: createHash("sha256").update(await readFile(archivePath)).digest("hex"),
+  };
+}
+
+async function makeCandidateSourceCli(root, name, {
+  version = "0.17.5",
+  pluginVersion = version,
+  runtimeVersion = version,
+  schema = 3,
+  catalogSchema = 3,
+  protocol = "2025-11-25",
+  discovery = "f".repeat(64),
+  executionMarker = null,
+}) {
+  const sourceRoot = path.join(root, `${name}-source`);
+  await mkdir(path.join(sourceRoot, "crates", "codestory-cli"), { recursive: true });
+  await mkdir(path.join(sourceRoot, "plugins", "codestory"), { recursive: true });
+  await writeFile(path.join(sourceRoot, ".gitignore"), "target/\n");
+  await writeFile(path.join(sourceRoot, "crates", "codestory-cli", "Cargo.toml"), `[package]\nname = "codestory-cli"\nversion = "${version}"\n`);
+  const pluginBytes = Buffer.from(`${JSON.stringify({ name: "codestory", version: pluginVersion }, null, 2)}\n`);
+  const catalogBytes = Buffer.from(`${JSON.stringify({
+    wireContract: {
+      publicationStampSchemaVersion: catalogSchema,
+      minimumCompatiblePublicationStampSchemaVersion: catalogSchema,
+      supportedMcpProtocolVersions: ["2024-11-05", "2025-03-26", "2025-06-18", protocol],
+      preferredMcpProtocolVersion: protocol,
+      discoveryContracts: { [protocol]: discovery },
+    },
+  }, null, 2)}\n`);
+  await writeFile(path.join(sourceRoot, "plugins", "codestory", "plugin.json"), pluginBytes);
+  await writeFile(path.join(sourceRoot, "plugins", "codestory", "generated-mcp-catalog.json"), catalogBytes);
+  for (const args of [
+    ["init", "-q", sourceRoot],
+    ["-C", sourceRoot, "config", "user.email", "fixture@example.com"],
+    ["-C", sourceRoot, "config", "user.name", "Fixture"],
+    ["-C", sourceRoot, "add", "."],
+    ["-C", sourceRoot, "commit", "-q", "-m", "fixture"],
+  ]) {
+    const result = spawnSync("git", args, { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+  }
+  const cliPath = path.join(root, `${name}-codestory-cli`);
+  await writeFile(cliPath, `#!/usr/bin/env node
+const readline = require("node:readline");
+const fs = require("node:fs");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method !== "initialize") return;
+  ${executionMarker ? `fs.writeFileSync(${JSON.stringify(executionMarker)}, "executed");` : ""}
+  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result: {
+    protocolVersion: request.params.protocolVersion,
+    serverInfo: { name: "codestory", version: ${JSON.stringify(runtimeVersion)} },
+    _meta: {
+      codestory_publication: { schema_version: ${schema} },
+      codestory_protocol: { discovery_contract_sha256: ${JSON.stringify(discovery)} },
+    },
+  } }) + "\\n");
+});
+`);
+  await chmod(cliPath, 0o755);
+  const cliSha256 = createHash("sha256").update(await readFile(cliPath)).digest("hex");
+  const sourceCommit = spawnSync("git", ["-C", sourceRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+  const sourceTree = spawnSync("git", ["-C", sourceRoot, "rev-parse", "HEAD^{tree}"], { encoding: "utf8" }).stdout.trim();
+  return {
+    sourceRoot,
+    cliPath,
+    cliSha256,
+    sourceCommit,
+    sourceTree,
+    pluginSha256: createHash("sha256").update(pluginBytes).digest("hex"),
+    catalogSha256: createHash("sha256").update(catalogBytes).digest("hex"),
+  };
+}
+
+test("exact candidate binds clean source, checked-in identities, immutable CLI bytes, and live initialize", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-three-arm-source-cli-"));
+  try {
+    const published = await makeExactArchive(root, "published", {
+      version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
+    });
+    const candidate = await makeCandidateSourceCli(root, "candidate", {});
+    const checksumPath = path.join(root, "SHA256SUMS.txt");
+    await writeFile(checksumPath, `${published.sha256}  ${path.basename(published.archivePath)}\n`);
+    const checksumSha = createHash("sha256").update(await readFile(checksumPath)).digest("hex");
+    const run = async (candidateInput = candidate, overrides = {}) => {
+      const state = await mkdtemp(path.join(root, "state-"));
+      return await benchmarkHarness.authenticateExactCandidatePackages({
+        exactCandidate: true,
+        exactCandidateStateRoot: state,
+        publishedArchive: published.archivePath,
+        publishedChecksumManifest: checksumPath,
+        publishedChecksumSha256: checksumSha,
+        candidateSourceRoot: candidateInput.sourceRoot,
+        exactCandidateBuildCli: async ({ sourceRoot, targetDir, cliPath }) => {
+          assert.equal(sourceRoot, await realpath(candidateInput.sourceRoot));
+          assert.equal(targetDir, path.join(sourceRoot, "target", "codestory-mission-candidate"));
+          assert.equal(cliPath, path.join(targetDir, "release", process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli"));
+          await mkdir(path.dirname(cliPath), { recursive: true });
+          await copyFile(candidateInput.cliPath, cliPath);
+          await chmod(cliPath, 0o755);
+        },
+        ...overrides,
+      });
+    };
+    const accepted = await run();
+    assert.equal(accepted.packages.get("published_0_17_4").package_sha256, published.sha256);
+    assert.equal(accepted.packages.get("published_0_17_4").protocol_revision, "2024-11-05");
+    assert.equal(accepted.packages.get("published_0_17_4").discovery_contract_sha256, null);
+    const candidateIdentity = accepted.packages.get("candidate_0_18");
+    assert.equal(candidateIdentity.contract, "codestory.agent-benchmark-source-cli/v1");
+    assert.equal(candidateIdentity.source_commit, candidate.sourceCommit);
+    assert.equal(candidateIdentity.source_tree, candidate.sourceTree);
+    assert.equal(candidateIdentity.cli_sha256, candidate.cliSha256);
+    assert.equal(candidateIdentity.plugin_manifest_sha256, candidate.pluginSha256);
+    assert.equal(candidateIdentity.catalog_sha256, candidate.catalogSha256);
+    assert.equal(Object.hasOwn(candidateIdentity, "package_sha256"), false);
+    assert.equal(Object.hasOwn(candidateIdentity, "trust_root"), false);
+    assert.match(accepted.packages.get("candidate_0_18").cli_path, /state-/);
+    await assert.rejects(run(candidate, { publishedChecksumSha256: "2".repeat(64) }), /external digest/i);
+    const runtimeDrift = await makeCandidateSourceCli(root, "candidate-runtime-drift", { runtimeVersion: "0.18.0" });
+    await assert.rejects(run(runtimeDrift), /runtime package_version=0\.18\.0; expected 0\.17\.5/i);
+    const schemaDrift = await makeCandidateSourceCli(root, "candidate-schema-drift", { schema: 4 });
+    await assert.rejects(run(schemaDrift), /runtime schema_version=4; expected 3/i);
+    const pluginDrift = await makeCandidateSourceCli(root, "candidate-plugin-drift", { pluginVersion: "9.9.9" });
+    await assert.rejects(run(pluginDrift), /checked-in plugin\/catalog identity/i);
+    await writeFile(path.join(candidate.sourceRoot, "untracked"), "dirty");
+    await assert.rejects(run(candidate), /clean tracked and untracked worktree/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact input ingestion makes every caller path irrelevant before parsing extraction or execution", async () => {
+  for (const kind of [
+    "published_checksum_manifest",
+    "published_0_17_4_archive",
+    "candidate_cli",
+  ]) {
+    const root = await mkdtemp(path.join(os.tmpdir(), `codestory-exact-race-${kind}-`));
+    try {
+      const marker = path.join(root, "substituted-cli-executed");
+      const published = await makeExactArchive(root, "published-original", {
+        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
+      });
+      const candidate = await makeCandidateSourceCli(root, "candidate-original", {});
+      const publishedSubstitute = await makeExactArchive(root, "published-substitute", {
+        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
+        executionMarker: marker,
+      });
+      const candidateSubstitute = await makeCandidateSourceCli(root, "candidate-substitute", {
+        executionMarker: marker,
+      });
+      const publishedInput = path.join(root, "published-input.tar.gz");
+      const candidateInput = path.join(root, "candidate-input-cli");
+      await copyFile(published.archivePath, publishedInput);
+      await copyFile(candidate.cliPath, candidateInput);
+      await chmod(candidateInput, 0o755);
+      const checksumPath = path.join(root, "SHA256SUMS.txt");
+      await writeFile(checksumPath, `${published.sha256}  ${path.basename(publishedInput)}\n`);
+      const state = await mkdtemp(path.join(root, "state-"));
+      const result = await benchmarkHarness.authenticateExactCandidatePackages({
+        exactCandidate: true,
+        exactCandidateStateRoot: state,
+        publishedArchive: publishedInput,
+        publishedChecksumManifest: checksumPath,
+        publishedChecksumSha256: createHash("sha256").update(await readFile(checksumPath)).digest("hex"),
+        candidateSourceRoot: candidate.sourceRoot,
+        exactCandidateBuildCli: async ({ cliPath }) => {
+          await mkdir(path.dirname(cliPath), { recursive: true });
+          await copyFile(candidateInput, cliPath);
+          await chmod(cliPath, 0o755);
+        },
+        exactCandidateAfterInputIngest: async (event) => {
+          if (event.kind !== kind) return;
+          if (kind === "published_checksum_manifest") {
+            await writeFile(event.source_path, "substituted after ingest");
+          } else if (kind === "published_0_17_4_archive") {
+            await copyFile(publishedSubstitute.archivePath, event.source_path);
+          } else {
+            await copyFile(candidateSubstitute.cliPath, event.source_path);
+          }
+        },
+      });
+      assert.equal(result.packages.get("published_0_17_4").package_sha256, published.sha256, kind);
+      assert.equal(result.packages.get("candidate_0_18").cli_sha256, candidate.cliSha256, kind);
+      assert.equal(existsSync(marker), false, `${kind} executed the substituted CLI`);
+      assert.ok(isPathInside(path.join(state, "authenticated-inputs"), result.packages.get("published_0_17_4").package_path));
+      assert.ok(isPathInside(path.join(state, "authenticated-inputs"), result.packages.get("candidate_0_18").cli_path));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("exact-candidate acceptance closes the complete causal threshold matrix", () => {
+  const passing = exactCandidateRows();
+  const accepted = benchmarkHarness.exactCandidateAcceptance(passing, exactLifecycle());
+  assert.equal(accepted.pass, true, JSON.stringify(accepted));
+  assert.equal(accepted.expected_runs, 162);
+  assert.equal(accepted.completed_runs, 162);
+
+  const failedCommandTelemetry = exactCandidateRows();
+  failedCommandTelemetry[0].transcript_analysis.interaction_turns.failed_tool_actions = 1;
+  assert.equal(
+    benchmarkHarness.exactCandidateAcceptance(failedCommandTelemetry, exactLifecycle()).pass,
+    true,
+    "a reconciled failed command is telemetry, not an incomplete run",
+  );
+
+  const mutations = [
+    ["complete rows", (rows) => rows.pop(), /162 complete runs/i],
+    ["candidate quality vs published", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").quality.pass = false;
+    }, /candidate quality.*published/i],
+    ["candidate quality vs baseline", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.quality.pass = false;
+    }, /candidate quality.*without_codestory/i],
+    ["candidate-only factual error", (rows) => {
+      const row = rows.find((entry) => entry.arm === "candidate_0_18");
+      row.quality.material_factual_errors = { found: 1, found_anchors: ["false fact"] };
+    }, /candidate-only material factual error/i],
+    ["unsupported proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").quality.unsupported_proof_claims = { found: 1, found_claims: ["ContractProven"] };
+    }, /unsupported proof claim/i],
+    ["task repeat loss", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18" && entry.task_id === EXACT_TASKS[0][0] && entry.repeat <= 2)) row.quality.pass = false;
+      rows.find((entry) => entry.arm === "without_codestory" && entry.task_id === EXACT_TASKS[0][0]).quality.pass = false;
+    }, /loses 2 repeats/i],
+    ["tokens vs published", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
+        row.usage.input_tokens = 54;
+        row.usage.total_tokens = 74;
+      }
+    }, /tokens.*105%/i],
+    ["tokens vs baseline", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
+        row.usage.input_tokens = 61;
+        row.usage.total_tokens = 81;
+      }
+      for (const row of rows.filter((entry) => entry.arm === "published_0_17_4")) {
+        row.usage.input_tokens = 60;
+        row.usage.total_tokens = 80;
+      }
+    }, /tokens.*80%/i],
+    ["tools", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
+        row.tool_calls_observed = 8;
+        row.transcript_analysis.tool_categories.command_execution = 8;
+      }
+    }, /tool calls/i],
+    ["cost", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.estimated_cost_usd = 0.81;
+    }, /cost/i],
+    ["warm", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) {
+        row.exact_candidate_timing.warm_ms = 53;
+        row.exact_candidate_timing.all_in_ms = 53;
+      }
+    }, /warm.*105%/i],
+    ["cold", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.cold_ms = 106;
+    }, /cold.*5%/i],
+    ["incremental", (rows) => {
+      for (const row of rows.filter((entry) => entry.arm === "candidate_0_18")) row.exact_candidate_timing.incremental_ms = 22;
+    }, /incremental.*5%/i],
+    ["row all-in mismatch", (rows) => {
+      rows.find((entry) => entry.arm === "candidate_0_18").exact_candidate_timing.all_in_ms = 89;
+    }, /row all-in timing/i],
+    ["source authorization", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.direct_source_reads[0].authorization = { status: "unauthorized", reason: null };
+    }, /unauthorized direct source read/i],
+    ["forged source authorization", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").transcript_analysis.direct_source_reads[0].authorization = { status: "authorized", reason: "reviewer_said_ok" };
+    }, /unauthorized direct source read/i],
+    ["identity", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").source_cli_identity.cli_sha256 = "0".repeat(64);
+    }, /candidate source\/CLI identity mismatch/i],
+    ["fabricated legacy discovery identity", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").package_identity.discovery_contract_sha256 = "9".repeat(64);
+    }, /published package identity mismatch/i],
+    ["missing candidate discovery identity", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").source_cli_identity.discovery_contract_sha256 = null;
+    }, /candidate source\/CLI identity mismatch/i],
+    ["accounting", (rows) => {
+      delete rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.tool_categories;
+    }, /missing tool categories/i],
+    ["arbitrary task id", (rows) => {
+      rows[0].task_id = "invented-task";
+    }, /exact task\/repository\/arm\/repeat keys/i],
+    ["arbitrary repository id", (rows) => {
+      rows[0].repo = "invented-repository";
+    }, /exact task\/repository\/arm\/repeat keys/i],
+    ["null token telemetry", (rows) => {
+      rows[0].usage.total_tokens = null;
+    }, /token accounting/i],
+    ["negative category telemetry", (rows) => {
+      rows[0].transcript_analysis.tool_categories.command_execution = -1;
+      rows[0].tool_calls_observed = -1;
+    }, /tool or command categories|tool call or cost/i],
+    ["empty category telemetry", (rows) => {
+      rows[0].transcript_analysis.tool_categories = {};
+    }, /tool or command categories/i],
+    ["failed action overcount", (rows) => {
+      rows[0].transcript_analysis.interaction_turns.failed_tool_actions =
+        rows[0].transcript_analysis.interaction_turns.tool_actions + 1;
+    }, /interaction accounting/i],
+    ["factual count mismatch", (rows) => {
+      rows[0].quality.material_factual_errors.found = 1;
+    }, /error or proof-claim counts/i],
+    ["timing repeat mismatch", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").exact_candidate_timing.cold_ms = 99;
+    }, /timing disagrees across repeats/i],
+    ["baseline CodeStory visibility", (rows) => {
+      rows.find((row) => row.arm === "without_codestory").transcript_analysis.command_categories.codestory_cli = 1;
+    }, /baseline has CodeStory visibility/i],
+    ["published runtime proof", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_contract_runtime = null;
+    }, /missing per-arm exact runtime proof/i],
+    ["candidate cache proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance = null;
+    }, /missing per-arm cache proof/i],
+    ["published obligation proof", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_sufficiency = null;
+    }, /missing per-arm obligation proof/i],
+    ["candidate v3 evidence gap proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_harness_prelude.packet_evidence_gap_accounting = null;
+    }, /missing per-arm v3 evidence\/gap proof/i],
+    ["candidate source mutation proof", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_source_mutation = null;
+    }, /missing verified source mutation/i],
+    ["candidate source mutation digest", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_source_mutation.original_sha256 = null;
+    }, /missing verified source mutation/i],
+    ["candidate cold work evidence", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.cold_retrieval_work_evidence = null;
+    }, /missing candidate cold retrieval work evidence/i],
+    ["candidate incremental work evidence", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence = null;
+    }, /missing candidate incremental retrieval work evidence/i],
+    ["candidate incremental complete rebuild", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence.retrieval_component_work[1].mode = "complete";
+    }, /candidate incremental retrieval rebuilt vectors completely/i],
+    ["candidate incremental duplicate component", (rows) => {
+      const evidence = rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence;
+      evidence.retrieval_component_work[2].component = "vectors";
+    }, /candidate incremental retrieval component roster/i],
+    ["candidate incremental invalid component work", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence.retrieval_component_work[0].retained = -1;
+    }, /candidate incremental retrieval component work/i],
+    ["candidate incremental missing phase timing", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence.retrieval_phase_timings = [];
+    }, /candidate incremental retrieval phase timings/i],
+    ["cache timing mismatch", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").codestory_cache_provenance.cache_preparation.incremental_wall_ms = 19;
+    }, /cache lifecycle timings do not reconcile/i],
+    ["cross-arm coherence", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.coherence_semantic_generation = "stale";
+    }, /cross-arm cache coherence/i],
+    ["executed CLI substitution", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").codestory_prelude_cli_sha256 = "9".repeat(64);
+    }, /executed CLI is not bound/i],
+    ["zero trust root", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").package_identity.trust_root_sha256 = "0".repeat(64);
+    }, /published package identity mismatch/i],
+    ["malformed JSONL", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").malformed_stdout_lines = 1;
+    }, /malformed or unreconciled JSONL parser telemetry/i],
+    ["external web context", (rows) => {
+      rows.find((row) => row.arm === "published_0_17_4").transcript_analysis.external_context_tool_calls = 1;
+    }, /external web\/search context is forbidden/i],
+    ["zero baseline local commands", (rows) => {
+      const row = rows.find((entry) => entry.arm === "without_codestory");
+      row.transcript_analysis.command_count = 0;
+      row.transcript_analysis.command_categories = {};
+    }, /baseline local inspection telemetry is incomplete/i],
+    ["packet-first failure", (rows) => {
+      rows.find((row) => row.arm === "candidate_0_18").packet_first_pass = false;
+    }, /packet-first contract failed/i],
+    ["dirty repo provenance", (rows) => {
+      rows[0].repo_provenance.git_dirty = true;
+    }, /owning repo provenance.*dirty/i],
+    ["moving repo provenance", (rows) => {
+      rows[0].repo_provenance.configured.ref = "main";
+    }, /owning repo provenance.*not pinned/i],
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const rows = exactCandidateRows();
+    mutate(rows);
+    const result = benchmarkHarness.exactCandidateAcceptance(rows, exactLifecycle());
+    assert.equal(result.pass, false, `${label}: ${JSON.stringify(result)}`);
+    assert.match(result.reasons.join("\n"), expected, label);
+  }
+
+  for (const [label, mutate, expected] of [
+    ["missing lifecycle", () => null, /one-time package and model lifecycle/i],
+    ["missing model lifecycle", (lifecycle) => {
+      delete lifecycle.model_initialization_ms;
+      return lifecycle;
+    }, /one-time package and model lifecycle/i],
+    ["unbalanced lifecycle", (lifecycle) => {
+      for (const entry of lifecycle.preparation_order) {
+        entry.arms = ["published_0_17_4", "candidate_0_18"];
+      }
+      return lifecycle;
+    }, /balanced deterministic 9\/9 rotation/i],
+    ["all-in lifecycle", (lifecycle) => {
+      lifecycle.package_authentication_ms.candidate_0_18 = 1000;
+      return lifecycle;
+    }, /all-in timing exceeds 110%/i],
+    ["missing cost rates", (lifecycle) => {
+      delete lifecycle.cost_rates;
+      return lifecycle;
+    }, /cost rates are missing/i],
+  ]) {
+    const lifecycle = mutate(exactLifecycle());
+    const result = benchmarkHarness.exactCandidateAcceptance(exactCandidateRows(), lifecycle);
+    assert.equal(result.pass, false, `${label}: ${JSON.stringify(result)}`);
+    assert.match(result.reasons.join("\n"), expected, label);
+  }
+});
+
+test("retrieval index work evidence preserves the measured trust-boundary fields", () => {
+  const evidence = benchmarkHarness.retrievalIndexWorkEvidence(JSON.stringify({
+    unrelated: "discarded",
+    core_phase_timings: { publish_ms: 7 },
+    retrieval_phase_timings: [{ phase: "graph artifact", elapsed_ms: 3 }],
+    retrieval_component_work: [
+      { component: "graph", mode: "copy_on_write", retained: 9, inserted: 1, removed: 1 },
+    ],
+  }, null, 2));
+  assert.deepEqual(evidence, {
+    core_phase_timings: { publish_ms: 7 },
+    retrieval_phase_timings: [{ phase: "graph artifact", elapsed_ms: 3 }],
+    retrieval_component_work: [
+      { component: "graph", mode: "copy_on_write", retained: 9, inserted: 1, removed: 1 },
+    ],
+  });
+  assert.equal(benchmarkHarness.retrievalIndexWorkEvidence("not json"), null);
+});
+
+test("exact lifecycle alternates preparation and restores the selected source bytes", async () => {
+  assert.deepEqual(benchmarkHarness.exactCandidatePreparationArmOrder(0), [
+    "published_0_17_4", "candidate_0_18",
+  ]);
+  assert.deepEqual(benchmarkHarness.exactCandidatePreparationArmOrder(1), [
+    "candidate_0_18", "published_0_17_4",
+  ]);
+  const firstArms = Array.from({ length: 18 }, (_, index) =>
+    benchmarkHarness.exactCandidatePreparationArmOrder(index)[0]
+  );
+  assert.equal(firstArms.filter((arm) => arm === "published_0_17_4").length, 9);
+  assert.equal(firstArms.filter((arm) => arm === "candidate_0_18").length, 9);
+
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-mutation-"));
+  const sourcePath = path.join(root, "source.ts");
+  const original = Buffer.from("export function run() {}\n", "utf8");
+  await writeFile(sourcePath, original);
+  const spy = [];
+  try {
+    const receipt = await benchmarkHarness.withExactSourceMutation(
+      sourcePath,
+      async ({ original_sha256, mutated_sha256 }) => {
+        spy.push("incremental");
+        assert.notEqual(mutated_sha256, original_sha256);
+        assert.notDeepEqual(await readFile(sourcePath), original);
+        return { status: "pass" };
+      },
+      async ({ original_sha256, restored_sha256 }) => {
+        spy.push("restore");
+        assert.equal(restored_sha256, original_sha256);
+        assert.deepEqual(await readFile(sourcePath), original);
+      },
+    );
+    assert.deepEqual(spy, ["incremental", "restore"]);
+    assert.equal(receipt.result.status, "pass");
+    assert.deepEqual(await readFile(sourcePath), original);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("final exact-candidate coherence refresh overwrites stale cross-arm publication state", async () => {
+  const task = { repo: "psf-requests", project: "/repo" };
+  const opts = {
+    exactCandidate: true,
+    exactCandidateStateRoot: "/tmp/exact-state",
+    exactCandidatePackageByArm: new Map([
+      ["candidate_0_18", { cli_path: "/authenticated/candidate-cli" }],
+    ]),
+    prepareCodestoryTimeoutMs: 60_000,
+    signal: null,
+    packetRuntimeChildEnv: {},
+  };
+  const row = {
+    project: "/repo",
+    retrieval_status: { semantic_generation: "stale-generation" },
+  };
+  const calls = [];
+  await benchmarkHarness.refreshExactCandidatePreparation(
+    opts,
+    task,
+    "candidate_0_18",
+    row,
+    {
+      run: async (command, args) => {
+        calls.push([command, ...args]);
+        return { status: "pass", exitCode: 0, stdout: "", stderr: "" };
+      },
+      statusSnapshot: async () => ({
+        status: "pass",
+        retrieval_mode: "full",
+        degraded_reason: null,
+        semantic_generation: "fresh-generation",
+      }),
+      engineSnapshot: async () => ({
+        status: "pass",
+        retrieval_mode: "full",
+        degraded_reason: null,
+        engine: {},
+        server: null,
+      }),
+      doctorSnapshot: async () => ({ freshness_status: "fresh" }),
+    },
+  );
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "/authenticated/candidate-cli");
+  assert.equal(row.retrieval_status.semantic_generation, "fresh-generation");
+  assert.equal(row.coherence_refresh_status, "pass");
+  assert.equal(row.coherence_semantic_generation, "fresh-generation");
+});
+
+test("exact CodeStory arms use disjoint embedding-server qualification namespaces", () => {
+  const stateRoot = path.join(os.tmpdir(), "codestory-exact-state");
+  const opts = {
+    exactCandidate: true,
+    exactCandidateStateRoot: stateRoot,
+  };
+  const published = benchmarkHarness.exactCandidateArmEnv(opts, "published_0_17_4");
+  const candidate = benchmarkHarness.exactCandidateArmEnv(opts, "candidate_0_18");
+
+  for (const [arm, env] of [
+    ["published_0_17_4", published],
+    ["candidate_0_18", candidate],
+  ]) {
+    assert.equal(
+      env.CODESTORY_EMBED_QUALIFICATION_DIR,
+      path.join(stateRoot, arm, "embedding-qualification"),
+    );
+    assert.match(env.CODESTORY_EMBED_QUALIFICATION_NONCE, /^[A-Za-z0-9_-]+$/);
+  }
+  assert.notEqual(
+    published.CODESTORY_EMBED_QUALIFICATION_DIR,
+    candidate.CODESTORY_EMBED_QUALIFICATION_DIR,
+  );
+  assert.notEqual(
+    published.CODESTORY_EMBED_QUALIFICATION_NONCE,
+    candidate.CODESTORY_EMBED_QUALIFICATION_NONCE,
+  );
+});
+
+test("exact candidate private state roots use their canonical native path", async () => {
+  const root = await benchmarkHarness.createExactCandidatePrivateStateRoot(
+    "codestory-exact-canonical-state-",
+  );
+  try {
+    assert.equal(root, await realpath(root));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact candidate setup removes every allocated root after a later setup failure", async () => {
+  const parent = await realpath(await mkdtemp(path.join(os.tmpdir(), "codestory-exact-setup-")));
+  const allocated = [];
+  const opts = { exactCandidate: true };
+  try {
+    await assert.rejects(
+      benchmarkHarness.initializeExactCandidateState(opts, {
+        createPrivateStateRoot: async (prefix) => {
+          const root = await mkdtemp(path.join(parent, prefix));
+          allocated.push(root);
+          return root;
+        },
+        makeDirectory: async () => {
+          throw new Error("synthetic later setup failure");
+        },
+        authenticatePackages: async () => {
+          throw new Error("authentication must not run");
+        },
+      }),
+      /synthetic later setup failure/,
+    );
+    assert.equal(allocated.length, 2);
+    for (const root of allocated) assert.equal(existsSync(root), false);
+    assert.equal(opts.exactCandidateStateRoot, undefined);
+    assert.equal(opts.exactCandidateBaselineContainerRoot, undefined);
+    assert.equal(opts.exactCandidateBaselineStateRoot, undefined);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("exact candidate setup preserves its primary failure across every cleanup failure", async () => {
+  for (const failedRoots of [
+    new Set(["/fixture/baseline-state"]),
+    new Set(["/fixture/exact-state"]),
+    new Set(["/fixture/baseline-state", "/fixture/exact-state"]),
+  ]) {
+    const opts = { exactCandidate: true };
+    const primary = new Error("primary authentication failure");
+    const initializationRemovals = [];
+    let allocation = 0;
+    let observed;
+    try {
+      await benchmarkHarness.initializeExactCandidateState(opts, {
+        createPrivateStateRoot: async () => [
+          "/fixture/exact-state",
+          "/fixture/baseline-state",
+        ][allocation++],
+        makeDirectory: async () => {},
+        authenticatePackages: async () => {
+          throw primary;
+        },
+        remove: async (root, options) => {
+          initializationRemovals.push({ root, options });
+          if (failedRoots.has(root)) {
+            const error = new Error(`cleanup failed for ${root}`);
+            error.code = "ENOTEMPTY";
+            throw error;
+          }
+        },
+      });
+    } catch (error) {
+      observed = error;
+    }
+    assert.equal(observed, primary);
+    assert.deepEqual(initializationRemovals.map(({ root }) => root), [
+      "/fixture/baseline-state",
+      "/fixture/exact-state",
+    ]);
+    assert.ok(initializationRemovals.every(({ options }) => options.maxRetries >= 10));
+    assert.equal(
+      opts.exactCandidateBaselineContainerRoot,
+      failedRoots.has("/fixture/baseline-state") ? "/fixture/baseline-state" : undefined,
+    );
+    assert.equal(
+      opts.exactCandidateStateRoot,
+      failedRoots.has("/fixture/exact-state") ? "/fixture/exact-state" : undefined,
+    );
+
+    const finalizationRemovals = [];
+    const failures = await benchmarkHarness.finalizeBenchmarkResources(
+      opts,
+      { close: async () => {} },
+      { close: async () => {} },
+      {
+        remove: async (root) => {
+          finalizationRemovals.push(root);
+        },
+      },
+    );
+    assert.deepEqual(finalizationRemovals, [...failedRoots].reverse());
+    assert.deepEqual(
+      new Set(failures.map(({ path }) => path)),
+      failedRoots,
+    );
+    assert.equal(benchmarkHarness.finalBenchmarkFailure(primary, failures), primary);
+  }
+});
+
+test("durable JSONL appender closes its handle after every pending failure", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-ledger-close-"));
+  try {
+    for (const stage of ["serialization", "write", "sync"]) {
+      let closeCalls = 0;
+      const stageFailure = new Error(`${stage} failed`);
+      const closeFailure = new Error(`${stage} close failed`);
+      const appender = await createDurableJsonlAppender(
+        path.join(root, `${stage}.jsonl`),
+        {
+          openFile: async () => ({
+            write: async () => {
+              if (stage === "write") throw stageFailure;
+            },
+            sync: async () => {
+              if (stage === "sync") throw stageFailure;
+            },
+            close: async () => {
+              closeCalls += 1;
+              throw closeFailure;
+            },
+          }),
+        },
+      );
+      const row = {};
+      if (stage === "serialization") row.self = row;
+      let appendFailure;
+      try {
+        await appender.append(row);
+      } catch (error) {
+        appendFailure = error;
+      }
+      let observedCloseFailure;
+      try {
+        await appender.close();
+      } catch (error) {
+        observedCloseFailure = error;
+      }
+      assert.equal(closeCalls, 1);
+      assert.equal(observedCloseFailure, appendFailure);
+      assert.deepEqual(observedCloseFailure.benchmarkSecondaryFailures, [{
+        resource: "ledger_handle",
+        code: null,
+        message: closeFailure.message,
+      }]);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("benchmark finalization retries owned roots and preserves the pipeline failure", async () => {
+  const removed = [];
+  const opts = {
+    exactCandidateStateRoot: "/fixture/exact-state",
+    exactCandidateBaselineContainerRoot: "/fixture/baseline-state",
+    exactCandidateBaselineStateRoot: "/fixture/baseline-state/private-state",
+    exactCandidatePackageByArm: new Map(),
+    exactCandidateLifecycle: {},
+  };
+  const pipelineFailure = { kind: "preparation_failed", repo: "fmtlib-fmt" };
+  const failures = await benchmarkHarness.finalizeBenchmarkResources(
+    opts,
+    { close: async () => {} },
+    { close: async () => {} },
+    {
+      remove: async (root, options) => {
+        removed.push({ root, options });
+        if (root.endsWith("exact-state")) {
+          const error = new Error("directory not empty");
+          error.code = "ENOTEMPTY";
+          throw error;
+        }
+      },
+    },
+  );
+
+  assert.deepEqual(removed.map(({ root }) => root), [
+    "/fixture/exact-state",
+    "/fixture/baseline-state",
+  ]);
+  for (const { options } of removed) {
+    assert.equal(options.recursive, true);
+    assert.equal(options.force, true);
+    assert.ok(options.maxRetries >= 10);
+    assert.ok(options.retryDelay >= 100);
+  }
+  assert.deepEqual(failures, [{
+    resource: "exact_candidate_state",
+    path: "/fixture/exact-state",
+    code: "ENOTEMPTY",
+    message: "directory not empty",
+  }]);
+  assert.equal(
+    benchmarkHarness.finalBenchmarkFailure(pipelineFailure, failures),
+    pipelineFailure,
+  );
+  assert.equal(opts.exactCandidateStateRoot, undefined);
+  assert.equal(opts.exactCandidateBaselineContainerRoot, undefined);
+  assert.equal(opts.exactCandidateBaselineStateRoot, undefined);
+  assert.ok(opts.exactCandidatePackageByArm instanceof Map);
+  assert.deepEqual(opts.exactCandidateLifecycle, {});
+});
+
+test("benchmark finalization closes and cleans every resource after independent failures", async () => {
+  const events = [];
+  const opts = {
+    exactCandidateStateRoot: "/fixture/exact-state",
+    exactCandidateBaselineContainerRoot: "/fixture/baseline-state",
+  };
+  const failures = await benchmarkHarness.finalizeBenchmarkResources(
+    opts,
+    {
+      close: async () => {
+        events.push("runs");
+        const error = new Error("runs close failed");
+        error.benchmarkSecondaryFailures = [{
+          resource: "ledger_handle",
+          code: "EIO",
+          message: "runs descriptor close failed",
+        }];
+        throw error;
+      },
+    },
+    {
+      close: async () => {
+        events.push("preparations");
+        throw new Error("preparations close failed");
+      },
+    },
+    {
+      remove: async (root) => {
+        events.push(root);
+        if (root.endsWith("exact-state")) throw new Error("exact cleanup failed");
+      },
+    },
+  );
+
+  assert.deepEqual(events, [
+    "runs",
+    "preparations",
+    "/fixture/exact-state",
+    "/fixture/baseline-state",
+  ]);
+  assert.deepEqual(failures.map(({ resource }) => resource), [
+    "runs_ledger",
+    "runs_ledger.ledger_handle",
+    "preparations_ledger",
+    "exact_candidate_state",
+  ]);
+  assert.equal(benchmarkHarness.finalBenchmarkFailure(null, failures).kind, "cleanup_failed");
+});
+
+test("exact Codex isolation keeps scalar namespace credentials out of cache roots and cwd", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-isolation-"));
+  const sourceCodexHome = path.join(root, "source-codex-home");
+  const stateRoot = path.join(root, "state");
+  const baselineRoot = path.join(root, "baseline", "private-state");
+  const outDir = path.join(root, "out");
+  await mkdir(sourceCodexHome, { recursive: true });
+  await mkdir(baselineRoot, { recursive: true });
+  await mkdir(outDir, { recursive: true });
+  await writeFile(path.join(sourceCodexHome, "auth.json"), "{}\n");
+  const harnessUrl = new URL("../codestory-agent-ab-benchmark.mjs", import.meta.url).href;
+  const script = `
+    const benchmark = await import(${JSON.stringify(harnessUrl)});
+    const opts = {
+      exactCandidate: true,
+      exactCandidateStateRoot: ${JSON.stringify(stateRoot)},
+      exactCandidateBaselineStateRoot: ${JSON.stringify(baselineRoot)},
+      exactCandidatePackageByArm: new Map([
+        ["published_0_17_4", { cli_path: process.execPath }],
+        ["candidate_0_18", { cli_path: process.execPath }],
+      ]),
+      model: "gpt-5.6-sol",
+    };
+    const result = await benchmark.prepareAgentCodexIsolation(${JSON.stringify(outDir)}, opts);
+    process.stdout.write(JSON.stringify(result.receipt));
+  `;
+  try {
+    const child = await runProcess(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: root,
+      env: { ...process.env, CODEX_HOME: sourceCodexHome },
+      timeoutMs: 10_000,
+    });
+    assert.equal(child.status, "pass", child.stderr);
+    const receipt = JSON.parse(child.stdout);
+    const rootEntries = await readdir(root);
+    assert.equal(rootEntries.includes("agent-benchmark-published_0_17_4"), false);
+    assert.equal(rootEntries.includes("agent-benchmark-candidate_0_18"), false);
+    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      assert.equal(
+        Object.hasOwn(receipt.cache_roots[arm], "CODESTORY_EMBED_QUALIFICATION_NONCE"),
+        false,
+      );
+      assert.equal(
+        receipt.embedding_server_namespaces[arm].nonce,
+        `agent-benchmark-${arm}`,
+      );
+      assert.match(
+        receipt.embedding_server_namespaces[arm].qualification_directory,
+        /embedding-qualification$/,
+      );
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("exact baseline child gets an allowlisted disjoint environment with no CodeStory surface", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "agent-exact-baseline-env-"));
+  const codeStoryRoot = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-arm-env-"));
+  try {
+    const baselineContainer = path.join(root, "baseline-container");
+    const baselineRoot = path.join(baselineContainer, "private-state");
+    const exposedBin = path.join(root, "exposed-bin");
+    await mkdir(baselineRoot, { recursive: true });
+    await mkdir(codeStoryRoot, { recursive: true });
+    await mkdir(exposedBin, { recursive: true });
+    await writeFile(path.join(exposedBin, "codestory-cli"), "not executable");
+    const baselineEnv = benchmarkHarness.exactCandidateBaselineEnv({
+      exactCandidate: true,
+      exactCandidateBaselineStateRoot: baselineRoot,
+      exactCandidateStateRoot: codeStoryRoot,
+    }, {
+      ...process.env,
+      PATH: `${exposedBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      CODESTORY_CLI: path.join(exposedBin, "codestory-cli"),
+      CODESTORY_CACHE_ROOT: path.join(codeStoryRoot, "cache"),
+      CODESTORY_PLUGIN_DATA: path.join(codeStoryRoot, "plugin"),
+    });
+    for (const directory of [
+      baselineEnv.HOME, baselineEnv.TMPDIR, baselineEnv.XDG_CACHE_HOME,
+      baselineEnv.XDG_CONFIG_HOME, baselineEnv.XDG_DATA_HOME,
+    ]) {
+      await mkdir(directory, { recursive: true });
+    }
+    const childEnv = agentRunnerEnv(baselineEnv, path.join(baselineRoot, "host"), false);
+    await mkdir(childEnv.CODEX_HOME, { recursive: true });
+    const child = await runProcess(process.execPath, ["-e", `
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const entries = String(process.env.PATH || "").split(path.delimiter).filter(Boolean);
+      const executableHits = entries.filter((entry) =>
+        ["codestory", "codestory-cli", "codestory.exe", "codestory-cli.exe", "codestory.cmd"]
+          .some((name) => fs.existsSync(path.join(entry, name)))
+      );
+      const readableParent = path.dirname(path.dirname(process.env.HOME));
+      process.stdout.write(JSON.stringify({
+        env: process.env,
+        executableHits,
+        readableParent,
+        parentEntries: fs.readdirSync(readableParent),
+      }));
+    `], { env: childEnv, timeoutMs: 10_000 });
+    assert.equal(child.status, "pass", child.stderr);
+    const observed = JSON.parse(child.stdout);
+    assert.deepEqual(observed.executableHits, []);
+    assert.equal(Object.keys(observed.env).some((key) => key.startsWith("CODESTORY_")), false);
+    assert.equal(
+      Object.values(observed.env).some((value) => String(value).includes(codeStoryRoot)),
+      false,
+    );
+    assert.equal(
+      Object.values(observed.env).some((value) => /codestory/i.test(String(value))),
+      false,
+    );
+    assert.deepEqual(observed.parentEntries, ["private-state"]);
+    assert.equal(observed.env.PATH.includes(exposedBin), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(codeStoryRoot, { recursive: true, force: true });
+  }
+});
+
 test("keeps CLI overrides out of both isolated agent arms", () => {
   const opts = {
     runner: "codex",
@@ -116,11 +1905,8 @@ test("keeps CLI overrides out of both isolated agent arms", () => {
   const baseline = runnerCommand(opts, "/tmp/repo", "prompt", "without_codestory");
   const measured = runnerCommand(opts, "/tmp/repo", "prompt", "with_codestory");
   assert.ok(baseline.args.includes("--ignore-user-config"));
-  assert.ok(!measured.args.includes("--ignore-user-config"));
-  assert.deepEqual(
-    baseline.args.filter((arg) => arg !== "--ignore-user-config"),
-    measured.args,
-  );
+  assert.ok(measured.args.includes("--ignore-user-config"));
+  assert.deepEqual(baseline.args, measured.args);
   for (const setting of [
     'approval_policy="never"',
     'model_reasoning_effort="xhigh"',
@@ -261,6 +2047,193 @@ function exactPacketStdout(packet) {
   }
 }
 
+function packetV3Fixture() {
+  return {
+    schema_version: 3,
+    kind: "complete",
+    status: "available",
+    identity: {
+      packet_id: "packet-v3",
+      request_id: "request-v3",
+      question_sha256: "1".repeat(64),
+    },
+    publication: {
+      core: {
+        project_id: "project-v3",
+        generation_id: "core-v3",
+        run_id: "run-v3",
+      },
+      retrieval: {
+        core_generation_id: "core-v3",
+        core_run_id: "run-v3",
+        retrieval_generation: "retrieval-v3",
+        retrieval_input_sha256: "2".repeat(64),
+        semantic_generation: "semantic-v3",
+      },
+    },
+    retrieval: { state: "full", generation_id: "retrieval-v3" },
+    evidence: [{
+      identity: { evidence_id: "evidence-v3" },
+      kind: "exact_source",
+      path: "src/lib.rs",
+      symbol_id: "crate::run",
+      start_line: 4,
+      end_line: 7,
+      summary: "run calls dispatch",
+    }],
+    gaps: [],
+    continuation: null,
+    diagnostics: {
+      availability: "available",
+      reference: {
+        artifact_id: "diagnostic-v3",
+        sha256: "3".repeat(64),
+        byte_length: 512,
+      },
+    },
+    _meta: {
+      codestory_publication: {
+        contract_runtime: {
+          cli_source: "direct_cli_launch",
+          cli_version: "0.17.4",
+          known_override_skew_channel: false,
+        },
+      },
+    },
+  };
+}
+
+test("v3 packet validation keeps evidence authority version-native and closed", () => {
+  const packet = packetV3Fixture();
+  assert.deepEqual(packetPreludeContractBlockers(packet, JSON.stringify(packet), {
+    requireSupported: true,
+    requireManagedRuntime: false,
+  }), []);
+  assert.match(
+    packetPreludeContractBlockers(packet, JSON.stringify(packet), {
+      expectedQuestion: "different question",
+    }).join("\n"),
+    /question digest does not match/,
+  );
+  assert.equal(publicPacketPreludeContractPasses(packet, JSON.stringify(packet)), true);
+  const prompt = packetForAgentPrompt(packet);
+  assert.equal(prompt.schema_version, 3);
+  assert.equal(prompt.status, "available");
+  assert.equal(prompt.evidence.length, 1);
+  assert.equal(Object.hasOwn(prompt, "support"), false);
+  assert.equal(Object.hasOwn(prompt, "disposition"), false);
+  assert.deepEqual(benchmarkHarness.packetV3EvidenceGapAccounting(packet), {
+    contract: "codestory.packet-v3-evidence-gap-accounting/v1",
+    kind: "complete",
+    status: "available",
+    evidence_count: 1,
+    unique_evidence_id_count: 1,
+    evidence_kind_counts: { exact_source: 1 },
+    gap_count: 0,
+    unique_gap_id_count: 0,
+    gap_kind_counts: {},
+    continuation_gap_count: 0,
+    unique_continuation_gap_id_count: 0,
+    continuation_gap_ids_bound: true,
+  });
+
+  const mutations = [
+    ["missing identity", (value) => { value.evidence[0].identity.evidence_id = ""; }, /evidence identity is missing/],
+    ["duplicate evidence", (value) => { value.evidence.push(structuredClone(value.evidence[0])); }, /evidence identity=.*duplicated/],
+    ["duplicate gap", (value) => {
+      value.status = "continuation_available";
+      value.gaps = [
+        { identity: { gap_id: "gap-v3" }, kind: "continuation_required", message: null },
+        { identity: { gap_id: "gap-v3" }, kind: "evidence_missing", message: null },
+      ];
+      value.continuation = {
+        continuation_id: "continuation-v3",
+        remaining_rounds: 1,
+        gap_ids: [{ gap_id: "gap-v3" }],
+      };
+    }, /gap identity=.*duplicated/],
+    ["unbound continuation", (value) => {
+      value.status = "continuation_available";
+      value.gaps = [{ identity: { gap_id: "gap-v3" }, kind: "continuation_required", message: null }];
+      value.continuation = {
+        continuation_id: "continuation-v3",
+        remaining_rounds: 1,
+        gap_ids: [{ gap_id: "other-gap" }],
+      };
+    }, /continuation gap identities.*unbound/],
+    ["wrong retrieval binding", (value) => {
+      value.publication.retrieval.core_generation_id = "other-core";
+    }, /retrieval publication is not bound/],
+    ["over cap", (value) => { value.padding = "x".repeat(17_000); }, /compact bytes=.*exceeds public cap/],
+  ];
+  for (const [label, mutate, expected] of mutations) {
+    const hostile = structuredClone(packet);
+    mutate(hostile);
+    assert.match(
+      packetPreludeContractBlockers(hostile, JSON.stringify(hostile)).join("\n"),
+      expected,
+      label,
+    );
+  }
+});
+
+test("v3 packet continuation and budget fallback remain bounded and non-partial", () => {
+  const continuation = packetV3Fixture();
+  continuation.status = "continuation_available";
+  continuation.gaps = [{
+    identity: { gap_id: "gap-v3" },
+    kind: "continuation_required",
+    message: "one more bounded lookup",
+  }];
+  continuation.continuation = {
+    continuation_id: "continuation-v3",
+    remaining_rounds: 1,
+    gap_ids: [{ gap_id: "gap-v3" }],
+  };
+  assert.deepEqual(
+    drillPacketCommandArgs(
+      { path: "/repo", prompt: "question" },
+      { prompt: "question", task_class: "architecture_explanation" },
+      {},
+      continuation,
+    ).slice(-8),
+    [
+      "--parent-packet-id", "continuation-v3",
+      "--option-id", "gap-v3",
+      "--core-generation-id", "core-v3",
+      "--retrieval-generation", "retrieval-v3",
+    ],
+  );
+
+  const fallback = packetV3Fixture();
+  fallback.kind = "budget_exceeded";
+  fallback.status = "unavailable";
+  delete fallback.evidence;
+  delete fallback.continuation;
+  fallback.gaps = [{
+    identity: { gap_id: "packet-output-budget-exceeded" },
+    kind: "output_budget_exceeded",
+    message: null,
+  }];
+  fallback.maximum_bytes = 16 * 1024;
+  fallback.required_complete_bytes = 16 * 1024 + 1;
+  assert.deepEqual(
+    packetPreludeContractBlockers(fallback, JSON.stringify(fallback)),
+    [],
+  );
+  fallback.evidence = [];
+  assert.match(
+    packetPreludeContractBlockers(fallback, JSON.stringify(fallback)).join("\n"),
+    /contains partial evidence or continuation/,
+  );
+  delete fallback.evidence;
+  fallback.required_complete_bytes = 16 * 1024;
+  assert.match(
+    packetPreludeContractBlockers(fallback, JSON.stringify(fallback)).join("\n"),
+    /required_complete_bytes is invalid/,
+  );
+});
+
 function managedRuntimeIdentity(overrides = {}) {
   return {
     plugin_version: "0.17.0",
@@ -283,7 +2256,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     answer: {
       citations: [{ node_id: "carrier", file_path: "src/lib.rs" }],
       graphs: Array.from(
-        { length: 21 },
+        { length: 61 },
         () => ({ graph: { edges: [{ id: "protected" }] } }),
       ),
       retrieval_trace: {
@@ -295,13 +2268,13 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     disposition: { kind: "supported", omission_receipts: [] },
     budget: {
       limits: {
-        max_anchors: 13,
+        max_anchors: 16,
         max_files: 1,
-        max_output_bytes: 98_304,
+        max_output_bytes: 128 * 1024,
         max_snippets: 1,
-        max_trail_edges: 20,
+        max_trail_edges: 60,
       },
-      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 1, trail_edges: 21 },
+      used: { anchors: 1, files: 1, output_bytes: 0, snippets: 1, trail_edges: 61 },
     },
   };
   const stdout = exactPacketStdout(packet);
@@ -309,11 +2282,11 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
     requireSupported: true,
     requireManagedRuntime: true,
   });
-  assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=21 exceeds 20")));
+  assert.ok(blockers.some((blocker) => blocker.includes("trail_edges=61 exceeds 60")));
   assert.equal(blockers.some((blocker) => blocker.includes("stdout bytes")), false);
 
   packet.answer.graphs.pop();
-  packet.budget.used.trail_edges = 20;
+  packet.budget.used.trail_edges = 60;
   const validStdout = exactPacketStdout(packet);
   assert.deepEqual(packetPreludeContractBlockers(packet, validStdout, {
     requireSupported: true,
@@ -338,9 +2311,9 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   });
 
   for (const [field, lowered, publicCap] of [
-    ["max_anchors", 12, 13],
-    ["max_trail_edges", 19, 20],
-    ["max_output_bytes", 90_000, 98_304],
+    ["max_anchors", 15, 16],
+    ["max_trail_edges", 59, 60],
+    ["max_output_bytes", 120_000, 128 * 1024],
   ]) {
     const original = packet.budget.limits[field];
     packet.budget.limits[field] = lowered;
@@ -405,22 +2378,22 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
   packet.answer.retrieval_trace.retrieval_shadow = { retrieval_mode: "full" };
 
   packet.budget.limits.max_output_bytes = 200_000;
-  packet.hostile_padding = "x".repeat(100_000);
+  packet.hostile_padding = "x".repeat(140_000);
   const raisedLimitStdout = exactPacketStdout(packet);
-  assert.ok(packet.budget.used.output_bytes > 98_304);
+  assert.ok(packet.budget.used.output_bytes > 128 * 1024);
   assert.match(
     packetPreludeContractBlockers(packet, raisedLimitStdout, {
       requireSupported: true,
       requireManagedRuntime: true,
     }).join("\n"),
-    /max_output_bytes=200000 does not equal public cap=98304.*used\.output_bytes=.*exceeds public cap=98304/s,
+    /max_output_bytes=200000 does not equal public cap=131072.*used\.output_bytes=.*exceeds public cap=131072/s,
   );
   delete packet.hostile_padding;
-  packet.budget.limits.max_output_bytes = 98_304;
+  packet.budget.limits.max_output_bytes = 128 * 1024;
 
-  for (const identity of [
-    managedRuntimeIdentity({ plugin_version: "0.16.3" }),
-    managedRuntimeIdentity({ cli_source: "override", known_override_skew_channel: true }),
+  for (const [identity, selectedVersion] of [
+    [managedRuntimeIdentity({ plugin_version: "0.16.3" }), "0.16.3"],
+    [managedRuntimeIdentity({ cli_source: "override", known_override_skew_channel: true }), "0.17.0"],
   ]) {
     packet._meta.codestory_publication.contract_runtime = identity;
     const staleStdout = exactPacketStdout(packet);
@@ -429,7 +2402,7 @@ test("packet canary rejects exact byte and graph-limit escapes before the agent"
         requireSupported: true,
         requireManagedRuntime: true,
       }).join("\n"),
-      /runtime identity is not managed 0\.17\.0/,
+      new RegExp(`runtime identity is not managed ${selectedVersion.replaceAll(".", "\\.")}`, "u"),
     );
   }
   packet._meta.codestory_publication.contract_runtime = managedRuntimeIdentity();
@@ -481,6 +2454,66 @@ test("drill continuation packets are public only when they keep the advertised b
     packetPreludeContractBlockers(packet, shrunk).join("\n"),
     /max_anchors=8 does not equal public cap=16/,
   );
+});
+
+test("nonzero packet prelude preserves structured retrieval failure and keeps the agent gate closed", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-packet-structured-failure-"));
+  try {
+    const cliPath = path.join(root, "codestory-cli");
+    const failure = {
+      schema_version: 1,
+      error: {
+        code: "retrieval_unavailable",
+        message: "retrieval rejected query: sidecar retrieval trace `stage_deadline` is not eligible for primary results; stages=[stage1_lexical added=0 cancel=stage_deadline; stage1b_semantic added=0 cancel=stage_deadline]",
+        details: {
+          failed_layer: "retrieval_engine",
+          project: root,
+          next_commands: ["codestory-cli retrieval index --project fixture"],
+          minimum_next: ["codestory-cli retrieval index --project fixture"],
+          full_repair: ["codestory-cli retrieval index --project fixture"],
+        },
+      },
+    };
+    await writeFile(
+      cliPath,
+      `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(failure)}\n`)});\nprocess.exitCode = 1;\n`,
+      "utf8",
+    );
+    await chmod(cliPath, 0o755);
+
+    const prelude = await runCodeStoryPacketPrelude(
+      {
+        timeoutMs: 5_000,
+        publishable: false,
+        diagnosticExtraProbesFromManifest: false,
+      },
+      {
+        task: {
+          prompt: "Trace the Redis command loop.",
+          task_class: "route_tracing",
+        },
+      },
+      { path: root, prompt: "Trace the Redis command loop." },
+      root,
+      "redis-structured-failure",
+      cliPath,
+      process.env,
+    );
+
+    assert.equal(prelude.public.process_status, "fail");
+    assert.equal(prelude.public.exit_code, 1);
+    assert.equal(prelude.public.status, "fail");
+    assert.equal(prelude.public.packet_parse_error, null);
+    assert.deepEqual(prelude.public.packet_command_failure, failure);
+    assert.match(prelude.public.error, /^retrieval_unavailable: retrieval rejected query:/);
+    assert.match(prelude.public.error, /stages=\[stage1_lexical/);
+    assert.match(prelude.public.error, /failed_layer=retrieval_engine/);
+    assert.deepEqual(prelude.public.packet_contract_blockers, [prelude.public.error]);
+    assert.equal(preludeAllowsAgentRun(prelude.public), false);
+    assert.equal(prelude.packet, null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("packet obligation accounting preserves the historical material split", () => {
@@ -535,6 +2568,164 @@ test("packet obligation accounting preserves the historical material split", () 
     missing_reason: 1,
     "unclassified_reason:new_reason": 1,
   });
+});
+
+test("packet prelude projection preserves revision-native accounting", () => {
+  const legacyPacket = {
+    plan: {
+      obligations: {
+        claim_obligations: [
+          { material: true, proof_status: "proven" },
+          {
+            material: true,
+            proof_status: "reported",
+            reason: "required_evidence_edge_missing",
+          },
+          { material: false, proof_status: "planned" },
+        ],
+      },
+    },
+    sufficiency: {
+      status: "partial",
+      covered_claims: [],
+      open_next: [],
+      gaps: ["missing edge"],
+      follow_up_commands: [],
+    },
+  };
+  const legacySufficiency = packetSufficiencyTelemetry(legacyPacket, { pass: false });
+  const legacyPrelude = preludePublicFields({
+    command: "codestory-cli packet --project . --question flow",
+    packet_schema_version: 2,
+    packet_sufficiency: legacySufficiency,
+  });
+  assert.deepEqual(legacyPrelude.packet_sufficiency?.obligation_accounting, {
+    total: 3,
+    material: 2,
+    nonmaterial: 1,
+    material_status_buckets: {
+      proven: 1,
+      required_evidence_edge_missing: 1,
+    },
+  });
+
+  const v3Accounting = {
+    contract: "codestory.packet-v3-evidence-gap-accounting/v1",
+    kind: "complete",
+    status: "available",
+    evidence_count: 1,
+    unique_evidence_id_count: 1,
+    evidence_kind_counts: { exact_source: 1 },
+    gap_count: 0,
+    unique_gap_id_count: 0,
+    gap_kind_counts: {},
+    continuation_gap_count: 0,
+    unique_continuation_gap_id_count: 0,
+    continuation_gap_ids_bound: true,
+  };
+  const v3Prelude = preludePublicFields({
+    command: "candidate_cli.bin packet --project . --question flow",
+    packet_schema_version: 3,
+    packet_sufficiency: null,
+    packet_evidence_gap_accounting: v3Accounting,
+  });
+  assert.equal(v3Prelude.packet_sufficiency, null);
+  assert.deepEqual(v3Prelude.packet_evidence_gap_accounting, v3Accounting);
+});
+
+test("saved packet reanalysis rebuilds revision-native accounting and derived acceptance", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-packet-reanalysis-"));
+  const task = {
+    expected_files: [],
+    expected_symbols: [],
+    expected_claims: [],
+    forbidden_claims: [],
+  };
+  try {
+    const legacyPath = path.join(root, "legacy.json");
+    await writeFile(legacyPath, JSON.stringify({
+      plan: {
+        obligations: {
+          claim_obligations: [
+            { material: true, proof_status: "proven" },
+            { material: false, proof_status: "planned" },
+          ],
+        },
+      },
+      sufficiency: {
+        status: "partial",
+        covered_claims: [],
+        open_next: [],
+        gaps: ["missing edge"],
+        follow_up_commands: [],
+      },
+    }));
+    const legacy = await reanalysisPacketProjection({
+      codestory_harness_prelude: {
+        stdout_path: legacyPath,
+        packet_schema_version: 2,
+      },
+    }, root, task);
+    assert.deepEqual(legacy.packet_sufficiency?.obligation_accounting, {
+      total: 2,
+      material: 1,
+      nonmaterial: 1,
+      material_status_buckets: { proven: 1 },
+    });
+    assert.equal(legacy.packet_evidence_gap_accounting, null);
+    const legacyWithoutTask = await reanalysisPacketProjection({
+      codestory_harness_prelude: {
+        stdout_path: legacyPath,
+        packet_schema_version: 2,
+      },
+    }, root, null);
+    assert.deepEqual(
+      legacyWithoutTask.packet_sufficiency?.obligation_accounting,
+      legacy.packet_sufficiency.obligation_accounting,
+    );
+    assert.equal(legacyWithoutTask.packet_manifest_quality, null);
+
+    const v3Path = path.join(root, "v3.json");
+    await writeFile(v3Path, JSON.stringify({
+      schema_version: 3,
+      kind: "complete",
+      status: "available",
+      evidence: [
+        { identity: { evidence_id: "evidence-1" }, kind: "exact_source" },
+      ],
+      gaps: [
+        { identity: { gap_id: "gap-1" }, kind: "evidence_missing" },
+      ],
+      continuation: null,
+    }));
+    const v3 = await reanalysisPacketProjection({
+      codestory_harness_prelude: {
+        stdout_path: v3Path,
+        packet_schema_version: 3,
+      },
+    }, root, task);
+    assert.equal(v3.packet_sufficiency, null);
+    assert.equal(v3.packet_evidence_gap_accounting.evidence_count, 1);
+    assert.equal(v3.packet_evidence_gap_accounting.gap_count, 1);
+    const v3WithoutTask = await reanalysisPacketProjection({
+      codestory_harness_prelude: {
+        stdout_path: v3Path,
+        packet_schema_version: 3,
+      },
+    }, root, null);
+    assert.equal(v3WithoutTask.packet_evidence_gap_accounting.evidence_count, 1);
+    assert.equal(v3WithoutTask.packet_evidence_gap_accounting.gap_count, 1);
+    assert.equal(v3WithoutTask.packet_manifest_quality, null);
+
+    const refreshed = reanalysisExactCandidateAcceptance({
+      exact_candidate_acceptance: { stale: true },
+      exact_candidate_lifecycle: exactLifecycle(),
+    }, exactCandidateRows());
+    assert.equal(refreshed.stale, undefined);
+    assert.equal(refreshed.pass, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("packet obligation accounting rejects unreconciled summaries", () => {
@@ -774,6 +2965,19 @@ function pipelinePreparation(repo, retrievalOverrides = {}) {
   };
 }
 
+function exactPipelinePreparation(repo, overridesByArm = {}) {
+  const published = pipelinePreparation(repo, overridesByArm.published_0_17_4);
+  const candidate = pipelinePreparation(repo, overridesByArm.candidate_0_18);
+  return {
+    ...candidate,
+    arm: "candidate_0_18",
+    arm_preparations: {
+      published_0_17_4: published,
+      candidate_0_18: candidate,
+    },
+  };
+}
+
 test("canary preparation requires complete live accelerator and server identity", () => {
   const preparation = pipelinePreparation("canary");
   assert.deepEqual(
@@ -789,8 +2993,8 @@ test("canary preparation requires complete live accelerator and server identity"
     [{ embedding_execution_devices: [] }, /execution devices are missing/],
     [{ embedding_offloaded_layer_count: 12 }, /not every embedding model layer was offloaded/],
     [{ embedding_server_identity: { peer_verified: false } }, /peer identity is not verified/],
+    [{ embedding_engine_instance_id: "engine-2" }, /instance identities disagree/],
     [{ embedding_server_identity: { load_generation: 2 } }, /load identities disagree/],
-    [{ embedding_server_identity: { executable_version: "0.16.0" } }, /expected 0\.17\.0/],
   ]) {
     const blockers = cachePreparationCanaryBlockers(
       pipelinePreparation("canary", overrides),
@@ -798,6 +3002,14 @@ test("canary preparation requires complete live accelerator and server identity"
     );
     assert.match(blockers.join("\n"), expected);
   }
+  const versionDrift = pipelinePreparation("canary", {
+    embedding_server_identity: { executable_version: "0.17.4" },
+  });
+  versionDrift.package_identity = { package_version: "0.18.0" };
+  assert.match(
+    cachePreparationCanaryBlockers(versionDrift, { CODESTORY_EMBED_ALLOW_CPU: "0" }).join("\n"),
+    /expected 0\.18\.0/,
+  );
 });
 
 function retrievalEngineDiagnosticsPayload(overrides = {}) {
@@ -1356,7 +3568,6 @@ test("preparation identity drift aborts before later rows and remains evidence o
     ["embedding_backend", "Vulkan"],
     ["embedding_adapter", "Different GPU"],
     ["embedding_policy", "different-policy"],
-    ["embedding_engine_instance_id", "engine-2"],
   ]) {
     const evidence = [];
     const launched = [];
@@ -1382,7 +3593,7 @@ test("preparation identity drift aborts before later rows and remains evidence o
   }
 });
 
-test("nonowner shard establishes a local preparation identity reference", async () => {
+test("preparation identity permits authenticated engine restarts on one host class", async () => {
   const fixture = pipelineFixture({
     repos: ["first", "second"],
     canaryTaskId: "global-canary-not-on-this-shard",
@@ -1393,7 +3604,10 @@ test("nonowner shard establishes a local preparation identity reference", async 
     materializeGroup: async () => {},
     prepareGroup: async (group) => [
       pipelinePreparation(group.repo, group.repo === "second"
-        ? { embedding_engine_instance_id: "engine-2" }
+        ? {
+            embedding_engine_instance_id: "engine-2",
+            embedding_server_identity: { server_instance_id: "engine-2" },
+          }
         : {}),
     ],
     executeRun: async (_opts, run) => {
@@ -1401,12 +3615,14 @@ test("nonowner shard establishes a local preparation identity reference", async 
       return pipelineResult(run);
     },
   });
-  assert.equal(outcome.firstFailure.kind, "preparation_identity_mismatch");
-  assert.deepEqual(outcome.cachePreparation.map((row) => row.repo), ["first"]);
-  assert.equal(launched.includes("second"), false);
-  assert.equal(
-    outcome.results.some((row) => row.arm === "with_codestory"),
-    false,
+  assert.equal(outcome.firstFailure, null);
+  assert.deepEqual(outcome.cachePreparation.map((row) => row.repo), ["first", "second"]);
+  assert.equal(launched.includes("second"), true);
+  assert.deepEqual(
+    outcome.cachePreparation.map(
+      (row) => row.retrieval_status.embedding_engine_instance_id,
+    ),
+    ["engine-1", "engine-2"],
   );
 });
 
@@ -1426,7 +3642,7 @@ test("identity failure aborts sibling preparation before durable failure recordi
       if (activePreparations === 2) bothStarted.resolve();
       await bothStarted.promise;
       if (group.repo === "failing") {
-        return [pipelinePreparation(group.repo, { embedding_engine_instance_id: "engine-2" })];
+        return [pipelinePreparation(group.repo, { embedding_model_sha256: "c".repeat(64) })];
       }
       await new Promise((resolve) => {
         if (signal.aborted) return resolve();
@@ -1466,13 +3682,43 @@ test("host class and shard attestation reject inconsistent preparation identity"
     ["embedding_backend", "Vulkan"],
     ["embedding_adapter", "Different GPU"],
     ["embedding_policy", "different-policy"],
-    ["embedding_engine_instance_id", "engine-2"],
   ]) {
     const changed = pipelinePreparation("second", { [field]: value });
     assert.match(cachePreparationIdentityBlockers(first, changed).join("\n"), new RegExp(field));
     assert.throws(
       () => benchmarkHostClass([first, changed]),
-      /do not share one retrieval engine identity/,
+      /do not share one retrieval host class/,
+    );
+  }
+  const restarted = pipelinePreparation("second", {
+    embedding_engine_instance_id: "engine-2",
+    embedding_server_identity: { server_instance_id: "engine-2" },
+  });
+  assert.deepEqual(cachePreparationIdentityBlockers(first, restarted), []);
+  assert.deepEqual(benchmarkHostClass([first, restarted]), hostClass);
+  const exactFirst = exactPipelinePreparation("first");
+  const exactRestarted = exactPipelinePreparation("second", {
+    published_0_17_4: {
+      embedding_engine_instance_id: "published-engine-2",
+      embedding_server_identity: { server_instance_id: "published-engine-2" },
+    },
+    candidate_0_18: {
+      embedding_engine_instance_id: "candidate-engine-2",
+      embedding_server_identity: { server_instance_id: "candidate-engine-2" },
+    },
+  });
+  assert.deepEqual(cachePreparationIdentityBlockers(exactFirst, exactRestarted), []);
+  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    const changed = exactPipelinePreparation("second", {
+      [arm]: { embedding_model_sha256: "c".repeat(64) },
+    });
+    assert.match(
+      cachePreparationIdentityBlockers(exactFirst, changed).join("\n"),
+      new RegExp(`${arm}.*embedding_model_sha256`),
+    );
+    assert.throws(
+      () => benchmarkHostClass([exactFirst, changed]),
+      /do not share one retrieval host class/,
     );
   }
   const fixture = pipelineFixture({ repos: ["first", "second"] });
@@ -1507,16 +3753,60 @@ test("host class and shard attestation reject inconsistent preparation identity"
     ),
     /preparation rows do not match/,
   );
-  await assert.rejects(
-    () => benchmarkShardAttestation(
-      fixture.opts,
-      fixture.tasks,
-      [first, pipelinePreparation("second", { embedding_engine_instance_id: "engine-2" })],
-      [],
-      CLEAN_SHARD_ATTESTATION,
-    ),
-    /do not share one retrieval engine identity/,
+  const restartedAttestation = await benchmarkShardAttestation(
+    fixture.opts,
+    fixture.tasks,
+    [first, restarted],
+    [],
+    CLEAN_SHARD_ATTESTATION,
   );
+  assert.deepEqual(restartedAttestation.host_class, hostClass);
+});
+
+test("exact-candidate preparation fences stable identity drift in either CodeStory arm", async () => {
+  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    const tasks = ["first", "second"].map((repo) => ({
+      id: `${repo}-task`,
+      repo,
+      prompt: `trace ${repo}`,
+    }));
+    const opts = {
+      exactCandidate: true,
+      exactCandidateStateRoot: "/fixture/exact-candidate-state",
+      arms: EXACT_CANDIDATE_ARMS,
+      jobs: 1,
+    };
+    const launched = [];
+    const outcome = await runAgentBenchmarkPipeline({
+      opts,
+      tasks,
+      plannedRuns: tasks.map((task) => ({
+        task,
+        repo: task.repo,
+        arm: "candidate_0_18",
+        repeat: 1,
+      })),
+      prepareGroup: async (group) => [exactPipelinePreparation(
+        group.repo,
+        group.repo === "second"
+          ? { [arm]: { embedding_adapter: "Different GPU" } }
+          : {},
+      )],
+      prepareIsolation: async () => ({ receipt: {} }),
+      executeRun: async (_runOpts, run) => {
+        launched.push(run.repo);
+        return pipelineResult(run);
+      },
+    });
+    assert.equal(outcome.firstFailure.kind, "preparation_failed");
+    assert.match(
+      outcome.firstFailure.error,
+      new RegExp(`${arm}.*embedding_adapter`),
+    );
+    assert.deepEqual(launched, []);
+    assert.equal(opts.cachePreparationByRepo.has("first"), true);
+    assert.equal(opts.cachePreparationByRepo.has("second"), false);
+  }
 });
 
 test("fail-fast closeout keeps the first failure instead of requiring unfinished shard preparation", async () => {
@@ -2564,6 +4854,52 @@ test("cold packet embedding execution binds full retrieval to the prepared seman
   );
 });
 
+test("v3 public packet projection binds full retrieval to the prepared publication", () => {
+  const preparation = {
+    retrieval_contract: {
+      retrieval_contract: "in_process_v1",
+      embedding_engine: "process_shared",
+      execution_policy: "accelerated",
+    },
+    retrieval_status: { semantic_generation: "semantic-v3" },
+  };
+  const packet = packetV3Fixture();
+  const proof = packetEmbeddingExecutionProof(
+    packet,
+    preparation,
+    "agent_harness_prelude",
+  );
+  const provenance = localCacheProvenance({
+    semantic_generation: "semantic-v3",
+    transport_mode: "agent_harness_prelude",
+    packet_embedding_execution: proof,
+  });
+  assert.equal(proof.source, "packet.v3_public_projection");
+  assert.equal(proof.semantic_generation, "semantic-v3");
+  assert.deepEqual(
+    cacheProvenanceBlockers({ codestory_cache_provenance: provenance }),
+    [],
+  );
+
+  for (const [field, value, expected] of [
+    ["retrieval_mode", "degraded", /retrieval mode=degraded/],
+    ["retrieval_state_generation", "other", /state generation does not match/],
+    ["semantic_generation", "other", /does not match the prepared generation/],
+    ["diagnostics_sha256", null, /no valid diagnostics reference/],
+    ["evidence_count", -1, /invalid evidence accounting/],
+  ]) {
+    const hostileProof = structuredClone(proof);
+    hostileProof[field] = value;
+    const blockers = cacheProvenanceBlockers({
+      codestory_cache_provenance: {
+        ...provenance,
+        packet_embedding_execution: hostileProof,
+      },
+    });
+    assert.match(blockers.join("\n"), expected, field);
+  }
+});
+
 test("packet latency telemetry preserves retrieval shadow cache diagnostics", () => {
   const packet = {
     answer: {
@@ -2933,7 +5269,7 @@ test("Axios v2 release task preserves v1 evidence while binding its exact projec
   }
 });
 
-test("materialization scrubs reusable checkouts before installing the bound project manifest", async () => {
+test("materialization scrubs reusable checkouts before installing the bound project manifest", async (t) => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-materialized-project-"));
   try {
     const source = path.join(dir, "source");
@@ -2983,6 +5319,54 @@ test("materialization scrubs reusable checkouts before installing the bound proj
     assert.equal(await readFile(path.join(checkout, "codestory_project.json"), "utf8"), template);
     assert.equal(gitFixture(["status", "--porcelain"], checkout), "");
     assert.equal(gitFixture(["rev-parse", "HEAD"], checkout), ref);
+
+    const manifestSha256 = createHash("sha256").update(template).digest("hex");
+    const provenanceConfig = {
+      name: "scrub-fixture",
+      path: checkout,
+      checkout_path: checkout,
+      url: "https://github.com/example/fixture.git",
+      ref,
+      manifest_url: "https://github.com/example/fixture.git",
+      manifest_ref: ref,
+      manifest_codestory_project_manifest: {
+        source_path: templatePath,
+        declared_path: "project.json",
+        sha256: manifestSha256,
+      },
+      installed_codestory_project_manifest: null,
+    };
+    await t.test("observes the installed manifest after the in-memory receipt is lost", async () => {
+      const observed = await repoProvenance(provenanceConfig);
+      assert.deepEqual(observed.installed_codestory_project_manifest, {
+        source_path: path.relative(path.resolve("."), templatePath).replaceAll(path.sep, "/"),
+        declared_sha256: manifestSha256,
+        installed_path: "codestory_project.json",
+        installed_sha256: manifestSha256,
+        ignored: true,
+      });
+      assert.doesNotMatch(
+        repoProvenanceBlockers({ repo_provenance: observed }).join("\n"),
+        /CodeStory project manifest/,
+      );
+    });
+
+    await t.test("keeps tampered and missing installed manifests fail-closed", async () => {
+      await writeFile(path.join(checkout, "codestory_project.json"), '{"name":"tampered"}\n', "utf8");
+      const tampered = await repoProvenance(provenanceConfig);
+      assert.match(
+        repoProvenanceBlockers({ repo_provenance: tampered }).join("\n"),
+        /installed CodeStory project manifest bytes do not match declared hash/,
+      );
+
+      await rm(path.join(checkout, "codestory_project.json"));
+      const missing = await repoProvenance(provenanceConfig);
+      assert.equal(missing.installed_codestory_project_manifest, null);
+      assert.match(
+        repoProvenanceBlockers({ repo_provenance: missing }).join("\n"),
+        /missing installed CodeStory project manifest provenance/,
+      );
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -3043,6 +5427,9 @@ test("packet and cache preparation share one explicit agent retrieval namespace"
 
   const args = packetCommandArgs({ path: "C:\\repo" }, task);
   assert.equal(args.filter((arg) => arg === "--extra-probe").length, 0);
+  for (const anchor of [...task.expected_files, ...task.expected_symbol_probes]) {
+    assert.equal(args.includes(anchor), false, `expected anchor leaked into packet arguments: ${anchor}`);
+  }
   assert.deepEqual(benchmarkAgentScopeArgs(), ["--profile", "agent", "--run-id", "shared-agent"]);
   assert.deepEqual(args.slice(3, 7), benchmarkAgentScopeArgs());
 
@@ -3081,6 +5468,8 @@ test("packet and cache preparation share one explicit agent retrieval namespace"
     "shared-agent",
     "--refresh",
     "auto",
+    "--format",
+    "json",
   ]);
   assert.deepEqual(retrievalStatusCommandArgs("C:\\repo"), [
     "retrieval",
@@ -3114,6 +5503,27 @@ test("benchmark artifact run ids strip path separators from dynamic parts", () =
     benchmarkRunId(["../repo", "task/id", "with codestory", "01"]),
     "repo-task-id-with-codestory-01",
   );
+});
+
+test("v3 benchmark routing treats projection bounds as descriptive rather than read authority", () => {
+  const instruction = benchmarkHarness.codeStoryArmInstruction({ schema_version: 3 });
+
+  assert.match(instruction, /output_budget_exceeded gap is descriptive/);
+  assert.match(instruction, /does not authorize a source read or another repository tool/);
+  assert.match(instruction, /at most one declared continuation/);
+  assert.match(instruction, /reassess its returned gaps without another retrieval call/);
+  assert.match(instruction, /exact focused source read/);
+  assert.match(instruction, /file-local task/);
+  assert.match(instruction, /broad flow question.*does not authorize/i);
+  assert.match(instruction, /at most one bounded read per authorized path/i);
+  assert.match(instruction, /Do not use shell search, Git, or free-form repository recovery/);
+  assert.match(instruction, /requested material stage.*direct subject-verb claim/iu);
+  assert.match(instruction, /before describing.*gaps/iu);
+  assert.match(instruction, /heading.*symbol inventory.*partial observation/iu);
+  assert.match(instruction, /claim.*no broader than.*evidence row/iu);
+  assert.match(instruction, /higher-level action.*mechanism.*same evidence rows/iu);
+  assert.match(instruction, /participates.*calls/iu);
+  assert.doesNotMatch(instruction, /direct source reads as packet recovery/);
 });
 
 test("publishable benchmark args reject diagnostic packet probes", () => {
@@ -3460,6 +5870,368 @@ test("counts direct source reads for every supported language extension family",
   assert.equal(analysis.direct_source_reads_total, paths.length);
 });
 
+test("transcript analysis authorizes source reads only from user-named files or prior explicit evidence gaps", () => {
+  const project = "/tmp/exact-transcript-project";
+  const namedEvents = [
+    commandEvent("named", "item.started", "Get-Content src/named.ts"),
+    commandEvent("named", "item.completed", "Get-Content src/named.ts", "source"),
+  ];
+  const named = analyzeTranscript(namedEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Inspect src/named.ts and explain the call.", file_local: true },
+  });
+  assert.equal(named.direct_source_reads[0].authorization.reason, "user_named_file");
+
+  const broadNamed = analyzeTranscript(namedEvents, project, {
+    arm: "candidate_0_18",
+    task: {
+      task_class: "route_tracing",
+      prompt: "Trace the broad flow through src/named.ts and the rest of the subsystem.",
+    },
+  });
+  assert.equal(broadNamed.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const gapEvents = [
+    commandEvent("packet", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent("packet", "item.completed", "$CODESTORY_CLI packet --project . --question flow", "Unknown: explicit evidence gap for src/gap.ts"),
+    commandEvent("gap-read", "item.started", "Get-Content src/gap.ts"),
+    commandEvent("gap-read", "item.completed", "Get-Content src/gap.ts", "source"),
+  ];
+  const gap = analyzeTranscript(gapEvents, project, {
+    arm: "published_0_17_4",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(gap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
+  assert.equal(gap.direct_source_reads[0].authorization.evidence_command_id, "packet");
+
+  const repeatedGapRead = analyzeTranscript([
+    ...gapEvents,
+    commandEvent("gap-read-again", "item.started", "Get-Content src/gap.ts"),
+    commandEvent("gap-read-again", "item.completed", "Get-Content src/gap.ts", "source again"),
+  ], project, {
+    arm: "published_0_17_4",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(repeatedGapRead.direct_source_reads[0].authorization.status, "authorized");
+  assert.equal(repeatedGapRead.direct_source_reads[1].authorization.status, "unauthorized");
+
+  const distinctSuffixReads = analyzeTranscript([
+    commandEvent("vendor-read", "item.started", "Get-Content vendor/src/foo.rs"),
+    commandEvent("vendor-read", "item.completed", "Get-Content vendor/src/foo.rs", "vendor"),
+    commandEvent("source-read", "item.started", "Get-Content src/foo.rs"),
+    commandEvent("source-read", "item.completed", "Get-Content src/foo.rs", "source"),
+  ], project, {
+    arm: "candidate_0_18",
+    task: {
+      file_local: true,
+      prompt: "Compare `vendor/src/foo.rs` with `src/foo.rs`.",
+    },
+  });
+  assert.deepEqual(
+    distinctSuffixReads.direct_source_reads.map((read) => read.authorization.status),
+    ["authorized", "authorized"],
+  );
+
+  if (process.platform !== "win32") {
+    const caseDistinctReads = analyzeTranscript([
+      commandEvent("upper-read", "item.started", "Get-Content src/Foo.rs"),
+      commandEvent("upper-read", "item.completed", "Get-Content src/Foo.rs", "upper"),
+      commandEvent("lower-read", "item.started", "Get-Content src/foo.rs"),
+      commandEvent("lower-read", "item.completed", "Get-Content src/foo.rs", "lower"),
+    ], project, {
+      arm: "candidate_0_18",
+      task: {
+        file_local: true,
+        prompt: "Compare `src/Foo.rs` with `src/foo.rs`.",
+      },
+    });
+    assert.deepEqual(
+      caseDistinctReads.direct_source_reads.map((read) => read.authorization.status),
+      ["authorized", "authorized"],
+    );
+  }
+
+  const v3GapEvents = [
+    commandEvent("packet-v3", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet-v3",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      JSON.stringify({
+        schema_version: 3,
+        status: "no_useful_evidence",
+        gaps: [{ kind: "evidence_missing", message: "Missing evidence for src/v3-gap.ts" }],
+      }),
+    ),
+    commandEvent("v3-gap-read", "item.started", "Get-Content src/v3-gap.ts"),
+    commandEvent("v3-gap-read", "item.completed", "Get-Content src/v3-gap.ts", "source"),
+  ];
+  const v3Gap = analyzeTranscript(v3GapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(v3Gap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
+  assert.equal(v3Gap.direct_source_reads[0].authorization.evidence_command_id, "packet-v3");
+
+  const unrelatedGapEvents = [
+    ...v3GapEvents.slice(0, 2),
+    commandEvent("unrelated-read", "item.started", "Get-Content src/unrelated.ts"),
+    commandEvent("unrelated-read", "item.completed", "Get-Content src/unrelated.ts", "source"),
+  ];
+  const unrelatedGap = analyzeTranscript(unrelatedGapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(unrelatedGap.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const outputBudgetEvents = [
+    commandEvent("packet-budget", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet-budget",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      JSON.stringify({
+        status: "unavailable",
+        reason: "output_budget_exceeded for src/budget.ts",
+      }),
+    ),
+    commandEvent("budget-read", "item.started", "Get-Content src/budget.ts"),
+    commandEvent("budget-read", "item.completed", "Get-Content src/budget.ts", "source"),
+  ];
+  const outputBudget = analyzeTranscript(outputBudgetEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(outputBudget.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const failedGapEvents = [
+    commandEvent("packet-failed", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet-failed",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      "Unknown: missing evidence for src/failed.ts",
+      1,
+    ),
+    commandEvent("failed-read", "item.started", "Get-Content src/failed.ts"),
+    commandEvent("failed-read", "item.completed", "Get-Content src/failed.ts", "source"),
+  ];
+  const failedGap = analyzeTranscript(failedGapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(failedGap.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const retroactiveGapEvents = [
+    commandEvent("packet-late", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent("late-read", "item.started", "Get-Content src/late.ts"),
+    commandEvent(
+      "packet-late",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      "Unknown: missing evidence for src/late.ts",
+    ),
+    commandEvent("late-read", "item.completed", "Get-Content src/late.ts", "source"),
+  ];
+  const retroactiveGap = analyzeTranscript(retroactiveGapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(retroactiveGap.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const citedPathEvents = [
+    commandEvent("packet-cited", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet-cited",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      "Unknown: missing evidence for src/other.ts, cited src/cited.ts",
+    ),
+    commandEvent("cited-read", "item.started", "Get-Content src/cited.ts"),
+    commandEvent("cited-read", "item.completed", "Get-Content src/cited.ts", "source"),
+  ];
+  const citedPath = analyzeTranscript(citedPathEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(citedPath.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const mcpGapBody = {
+    status: "no_useful_evidence",
+    gaps: [{ kind: "evidence_missing", message: "Missing evidence for src/mcp-gap.ts" }],
+  };
+  const mcpGapEvents = [
+    {
+      type: "item.started",
+      item: { id: "mcp-gap", type: "mcp_tool_call", server: "codestory", tool: "packet" },
+    },
+    {
+      type: "item.completed",
+      item: {
+        id: "mcp-gap",
+        type: "mcp_tool_call",
+        server: "codestory",
+        tool: "packet",
+        result: {
+          structuredContent: mcpGapBody,
+          content: [{ type: "text", text: JSON.stringify(mcpGapBody) }],
+        },
+      },
+    },
+    commandEvent("mcp-gap-read", "item.started", "Get-Content src/mcp-gap.ts"),
+    commandEvent("mcp-gap-read", "item.completed", "Get-Content src/mcp-gap.ts", "source"),
+  ];
+  const mcpGap = analyzeTranscript(mcpGapEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(mcpGap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
+  assert.equal(mcpGap.direct_source_reads[0].authorization.evidence_event_index, 1);
+
+  const mismatchedMirrorEvents = structuredClone(mcpGapEvents);
+  mismatchedMirrorEvents[1].item.result.structuredContent.gaps[0].message = "Missing evidence for src/other.ts";
+  const mismatchedMirror = analyzeTranscript(mismatchedMirrorEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(mismatchedMirror.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const unauthorized = analyzeTranscript(namedEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(unauthorized.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const prefixCollision = analyzeTranscript(namedEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Inspect src/named.tsx and explain the call." },
+  });
+  assert.equal(prefixCollision.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const escapedEvents = [
+    commandEvent("escaped", "item.started", "Get-Content ../secret.ts"),
+    commandEvent("escaped", "item.completed", "Get-Content ../secret.ts", "source"),
+  ];
+  const escaped = analyzeTranscript(escapedEvents, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Inspect ../secret.ts and explain the call." },
+  });
+  assert.equal(escaped.direct_source_reads[0].authorization.status, "unauthorized");
+
+  const baseline = analyzeTranscript(gapEvents.slice(2), project, {
+    arm: "without_codestory",
+    task: { prompt: "Explain the flow." },
+  });
+  assert.equal(baseline.direct_source_reads[0].authorization.status, "baseline_local_exploration");
+});
+
+test("file-local read authorization survives manifest normalization and result snapshots", async () => {
+  await withManifestFile(
+    manifestFixture({
+      file_local: true,
+      prompt: "Inspect src/main.rs and explain its local behavior.",
+    }),
+    async (manifestPath, dir) => {
+      const [task] = await loadTasks({
+        taskManifest: manifestPath,
+        taskSuite: null,
+        taskIds: null,
+        repoCacheDir: path.join(dir, "repos"),
+      });
+      const snapshot = taskSnapshotForResult(task);
+      assert.equal(task.file_local, true);
+      assert.equal(snapshot.file_local, true);
+
+      const project = path.join(dir, "repos", "fixture-repo");
+      const analysis = analyzeTranscript([
+        commandEvent("named-read", "item.started", "Get-Content src/main.rs"),
+        commandEvent("named-read", "item.completed", "Get-Content src/main.rs", "source"),
+      ], project, { arm: "candidate_0_18", task: snapshot });
+      assert.equal(analysis.direct_source_reads[0].authorization.reason, "user_named_file");
+    },
+  );
+
+  await withManifestFile(
+    manifestFixture({ file_local: "true" }),
+    async (manifestPath, dir) => {
+      await assert.rejects(
+        () => loadTasks({
+          taskManifest: manifestPath,
+          taskSuite: null,
+          taskIds: null,
+          repoCacheDir: path.join(dir, "repos"),
+        }),
+        /file_local must be a boolean/,
+      );
+    },
+  );
+});
+
+test("transcript analysis authorizes an exact source read from a continuation's returned material gap", () => {
+  const project = "/tmp/exact-transcript-project";
+  const events = [
+    commandEvent("packet", "item.started", "$CODESTORY_CLI packet --project . --question flow"),
+    commandEvent(
+      "packet",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow",
+      JSON.stringify({
+        schema_version: 3,
+        status: "continuation_available",
+        gaps: [{ kind: "continuation_required", message: "Continue the bounded lookup" }],
+      }),
+    ),
+    commandEvent(
+      "continuation",
+      "item.started",
+      "$CODESTORY_CLI packet --project . --question flow --parent-packet-id continuation-v3",
+    ),
+    commandEvent(
+      "continuation",
+      "item.completed",
+      "$CODESTORY_CLI packet --project . --question flow --parent-packet-id continuation-v3",
+      JSON.stringify({
+        schema_version: 3,
+        status: "no_useful_evidence",
+        gaps: [{ kind: "evidence_missing", message: "Missing evidence for src/continued-gap.ts" }],
+      }),
+    ),
+    commandEvent("continued-gap-read", "item.started", "Get-Content src/continued-gap.ts"),
+    commandEvent("continued-gap-read", "item.completed", "Get-Content src/continued-gap.ts", "source"),
+  ];
+
+  const analysis = analyzeTranscript(events, project, {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the flow." },
+  });
+
+  assert.equal(analysis.direct_source_reads[0].authorization.status, "authorized");
+  assert.equal(analysis.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
+  assert.equal(analysis.direct_source_reads[0].authorization.evidence_command_id, "continuation");
+});
+
+test("exact telemetry sees malformed JSONL web context and an empty local transcript through the real parser", () => {
+  const jsonl = [
+    JSON.stringify({ type: "item.started", item: { id: "web", type: "web_search", query: "upstream source" } }),
+    "{malformed-jsonl",
+  ].join("\n");
+  const { parsed, malformed } = parseJsonLines(jsonl);
+  assert.equal(parsed.length, 1);
+  assert.equal(malformed.length, 1);
+  const web = analyzeTranscript(parsed, "/tmp/exact-parser", {
+    arm: "candidate_0_18",
+    task: { prompt: "Explain the local repository." },
+  });
+  assert.equal(web.external_context_tool_calls, 1);
+  assert.equal(web.tool_categories.web_search, 1);
+  const empty = analyzeTranscript([], "/tmp/exact-parser", {
+    arm: "without_codestory",
+    task: { prompt: "Explain the local repository." },
+  });
+  assert.equal(empty.command_count, 0);
+  assert.equal(empty.direct_source_reads_total, 0);
+});
+
 test("counts PowerShell LiteralPath source reads after a CodeStory packet", () => {
   const command = String.raw`"C:\\Program Files\\PowerShell\\pwsh.exe" -Command '$lines = Get-Content -LiteralPath '"'src/index/use-swr.ts'
 for ($i = 1; $i -le 2; $i++) { "{0}: {1}" -f $i, $lines[$i - 1] }'`;
@@ -3475,6 +6247,20 @@ for ($i = 1; $i -le 2; $i++) { "{0}: {1}" -f $i, $lines[$i - 1] }'`;
   assert.equal(analysis.direct_source_reads_total, 1);
   assert.equal(analysis.ordinary_source_reads_after_first_packet, 1);
   assert.deepEqual(analysis.direct_file_reads_duplicated, {});
+});
+
+test("multiline numbered reads do not treat the next nl command as a sed path", () => {
+  const command = `/bin/zsh -lc "nl -ba src/first.java | sed -n '1,20p'
+nl -ba src/second.java | sed -n '30,40p'"`;
+  const events = [
+    commandEvent("read", "item.started", command),
+    commandEvent("read", "item.completed", command, "source"),
+  ];
+  const analysis = analyzeTranscript(events);
+  assert.deepEqual(
+    analysis.direct_source_reads.map((read) => read.path),
+    ["src/first.java", "src/second.java"],
+  );
 });
 
 test("counts modern Codex JSONL tool categories including web search", () => {
@@ -3956,6 +6742,53 @@ test("harness packet prelude counts as the first context command", () => {
   assert.equal(analysis.packet_was_first_context_command, true);
 });
 
+test("typed harness packet preludes preserve semantics independent of executable spelling and prompt text", () => {
+  const command =
+    '/authenticated-inputs/candidate_cli.bin packet --project . --question "Explain the type-erased request flow" --format json';
+  const harnessSemantics = {
+    source: "codestory_packet_prelude_v1",
+    category: "codestory_cli",
+    operation: "packet",
+  };
+  const events = [
+    {
+      type: "harness.command.started",
+      item: {
+        id: "harness_codestory_packet",
+        type: "command_execution",
+        command,
+        harness_semantics: harnessSemantics,
+      },
+    },
+    {
+      type: "harness.command.completed",
+      item: {
+        id: "harness_codestory_packet",
+        type: "command_execution",
+        command,
+        harness_semantics: harnessSemantics,
+        aggregated_output: '{"kind":"complete","schema_version":3}',
+        exit_code: 0,
+        status: "completed",
+      },
+    },
+  ];
+
+  const analysis = analyzeTranscript(events);
+  assert.equal(analysis.command_categories.codestory_cli, 1);
+  assert.equal(analysis.command_categories.direct_file_read ?? 0, 0);
+  assert.equal(analysis.direct_source_reads_total, 0);
+  assert.equal(analysis.first_successful_packet_command.id, "harness_codestory_packet");
+  assert.equal(analysis.packet_was_first_context_command, true);
+
+  const unmarked = analyzeTranscript([
+    commandEvent("agent_command", "item.completed", command, "ok", 0),
+  ]);
+  assert.equal(unmarked.command_categories.codestory_cli ?? 0, 0);
+  assert.equal(unmarked.first_successful_packet_command, null);
+  assert.equal(unmarked.packet_was_first_context_command, false);
+});
+
 test("codestory cli resolver prefers explicit path, release binary, then fails closed", () => {
   const explicit = resolveCodeStoryCli({ codestoryCli: "C:/custom/codestory-cli.exe" }, () => {
     throw new Error("explicit path should not probe local candidates");
@@ -3993,6 +6826,39 @@ test("scores expected claims without requiring exact wording", () => {
   );
 
   assert.equal(quality.expected_claims.recall, 1);
+});
+
+test("positive claim scoring expands snake-case roles without crediting a partial flow", () => {
+  const task = {
+    id: "identifier-role-flow",
+    task_class: "architecture_explanation",
+    expected_files: [],
+    expected_symbols: [],
+    expected_claims: [
+      "Parallel search uses the walker parallel builder to distribute file work.",
+    ],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0,
+      min_expected_file_recall: 0,
+      min_expected_symbol_recall: 0,
+      min_expected_claim_recall: 1,
+      min_citation_coverage: 0,
+      max_forbidden_claims: 0,
+    },
+  };
+
+  const complete = scoreQuality([
+    agentMessageEvent(
+      "`search_parallel` starts `walk_builder().build_parallel().run(...)`. Traversal supplies parallelism by feeding files to a search worker.",
+    ),
+  ], task);
+  assert.equal(complete.expected_claims.found, 1);
+
+  const partial = scoreQuality([
+    agentMessageEvent("`search_parallel` starts a local worker."),
+  ], task);
+  assert.equal(partial.expected_claims.found, 0);
 });
 
 test("aggregate anchor recall uses fuzzy claim matching", () => {
@@ -4048,6 +6914,300 @@ test("quality scoring treats class member separator variants as symbol matches",
   assert.equal(quality.pass, true);
 });
 
+test("quality scoring never turns negative or gap sentences into positive symbol and claim credit", () => {
+  const task = {
+    id: "swift-polarity",
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["DataRequest.validate", "RequestTaskMap"],
+    expected_claims: ["DataRequest.validate runs before the response is serialized."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0,
+      min_expected_file_recall: 0,
+      min_expected_symbol_recall: 0,
+      min_expected_claim_recall: 0,
+      min_citation_coverage: 0,
+      max_forbidden_claims: 0,
+    },
+  };
+
+  const negative = scoreQuality([
+    agentMessageEvent(
+      "The packet does not establish `DataRequest.validate`. `RequestTaskMap` remains an evidence gap, so its role is unknown.",
+    ),
+  ], task);
+  assert.equal(negative.expected_symbols.found, 0);
+  assert.equal(negative.expected_claims.found, 0);
+
+  const affirmative = scoreQuality([
+    agentMessageEvent(
+      "`DataRequest.validate` runs before the response is serialized. `RequestTaskMap` owns the concrete task mapping.",
+    ),
+  ], task);
+  assert.equal(affirmative.expected_symbols.found, 2);
+  assert.equal(affirmative.expected_claims.found, 1);
+
+  const mixed = scoreQuality([
+    agentMessageEvent(
+      "The packet does not establish `DataRequest.validate`. `RequestTaskMap` owns the concrete task mapping.",
+    ),
+  ], task);
+  assert.deepEqual(mixed.expected_symbols.found_anchors, ["RequestTaskMap"]);
+  assert.equal(mixed.expected_claims.found, 0);
+});
+
+test("quality scoring keeps affirmative support units intact without combining unrelated bullets", () => {
+  const compoundTask = {
+    id: "compound-support-unit",
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["createApplication"],
+    expected_claims: [
+      "createApplication creates the callable app and mixes in the EventEmitter prototype.",
+    ],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0,
+      min_expected_file_recall: 0,
+      min_expected_symbol_recall: 0,
+      min_expected_claim_recall: 0,
+      min_citation_coverage: 0,
+      max_forbidden_claims: 0,
+    },
+  };
+
+  const oneUnit = scoreQuality([
+    agentMessageEvent(
+      "1. `createApplication` creates the callable app. It then mixes in the EventEmitter prototype.",
+    ),
+  ], compoundTask);
+  assert.equal(oneUnit.expected_claims.found, 1);
+
+  const separateUnits = scoreQuality([
+    agentMessageEvent(
+      "- `createApplication` creates the callable app.\n\n- The EventEmitter prototype is mixed into another object.",
+    ),
+  ], compoundTask);
+  assert.equal(separateUnits.expected_claims.found, 0);
+
+  const subjectTask = {
+    ...compoundTask,
+    id: "subject-bound-support-unit",
+    expected_symbols: ["Engine.addRoute", "RouterGroup.Handle"],
+    expected_claims: ["RouterGroup.Handle registers route handlers."],
+  };
+  const adversative = scoreQuality([
+    agentMessageEvent(
+      "`Engine.addRoute` is established, but `RouterGroup.Handle` is missing. The engine registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.deepEqual(adversative.expected_symbols.found_anchors, ["Engine.addRoute"]);
+  assert.equal(adversative.expected_claims.found, 0);
+
+  const lacksEvidence = scoreQuality([
+    agentMessageEvent(
+      "`RouterGroup.Handle` lacks evidence; `Engine.addRoute` registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.deepEqual(lacksEvidence.expected_symbols.found_anchors, ["Engine.addRoute"]);
+  assert.equal(lacksEvidence.expected_claims.found, 0);
+
+  const noEvidence = scoreQuality([
+    agentMessageEvent(
+      "No evidence establishes `RouterGroup.Handle`; `Engine.addRoute` registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.deepEqual(noEvidence.expected_symbols.found_anchors, ["Engine.addRoute"]);
+  assert.equal(noEvidence.expected_claims.found, 0);
+
+  const differentAffirmativeSubject = scoreQuality([
+    agentMessageEvent(
+      "`RouterGroup.Handle` reports registration errors; `Engine.addRoute` registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.equal(differentAffirmativeSubject.expected_claims.found, 0);
+
+  const linkedWithinOneUnit = scoreQuality([
+    agentMessageEvent(
+      "`Session.send` is the dispatch point. Packet relations show it calls `Session.get_adapter`; the next cited line shows `adapter.send(request)`.",
+    ),
+  ], {
+    ...compoundTask,
+    id: "linked-one-unit",
+    expected_symbols: ["Session.send", "Session.get_adapter", "HTTPAdapter.send"],
+    expected_claims: ["Session.send chooses an adapter and calls the adapter send method."],
+  });
+  assert.equal(linkedWithinOneUnit.expected_claims.found, 1);
+
+  const genericCapitalizedSubject = scoreQuality([
+    agentMessageEvent(
+      "`source/_vars.css` defines shared `:root` variables for `--animate-duration`, `--animate-delay`, and `--animate-repeat`.",
+    ),
+  ], {
+    ...compoundTask,
+    id: "generic-capitalized-subject",
+    expected_symbols: [":root", "--animate-duration", "--animate-delay", "--animate-repeat"],
+    expected_claims: [
+      "Shared CSS custom properties define animation duration, delay, and repeat defaults.",
+    ],
+  });
+  assert.equal(genericCapitalizedSubject.expected_claims.found, 1);
+
+  const nestedListRelation = scoreQuality([
+    agentMessageEvent(
+      "- Named animation classes connect to same-named keyframes through `animation-name`:\n  - `@keyframes bounce`; `.bounce { animation-name: bounce; }`",
+    ),
+  ], {
+    ...compoundTask,
+    id: "nested-list-relation",
+    expected_symbols: ["@keyframes bounce", ".bounce"],
+    expected_claims: [
+      "Named classes such as .bounce set animation-name to matching keyframes.",
+    ],
+  });
+  assert.equal(nestedListRelation.expected_claims.found, 1);
+
+  const unrelatedSibling = scoreQuality([
+    agentMessageEvent(
+      "- Named animation classes connect to same-named keyframes through `animation-name`:\n- `.bounce` is listed in an unrelated selector inventory.",
+    ),
+  ], {
+    ...compoundTask,
+    id: "unrelated-list-sibling",
+    expected_symbols: ["@keyframes bounce", ".bounce"],
+    expected_claims: [
+      "Named classes such as .bounce set animation-name to matching keyframes.",
+    ],
+  });
+  assert.equal(unrelatedSibling.expected_claims.found, 0);
+
+  const gapSection = scoreQuality([
+    agentMessageEvent(
+      "The request reaches `Session.send`.\n\n## Material gaps\n`RouterGroup.Handle` registers route handlers.",
+    ),
+  ], subjectTask);
+  assert.equal(gapSection.expected_symbols.found, 0);
+  assert.equal(gapSection.expected_claims.found, 0);
+});
+
+test("quality scoring accepts bounded routing and check paraphrases for the same subject", () => {
+  const task = {
+    id: "routing-check-paraphrases",
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["processCommand"],
+    expected_claims: ["processCommand performs command routing and execution checks."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 0,
+      min_expected_file_recall: 0,
+      min_expected_symbol_recall: 0,
+      min_expected_claim_recall: 0,
+      min_citation_coverage: 0,
+      max_forbidden_claims: 0,
+    },
+  };
+
+  for (const answer of [
+    "`processCommand` determines a cluster target; an absent or non-local result rejects the command.",
+    "`processCommand` selects a destination and rejects commands that fail its admission checks.",
+  ]) {
+    const quality = scoreQuality([agentMessageEvent(answer)], task);
+    assert.equal(quality.expected_claims.found, 1, answer);
+  }
+
+  for (const answer of [
+    "`processCommand` does not select a destination or reject invalid commands.",
+    "`prepareCommand` selects a destination and rejects invalid commands; `processCommand` remains unknown.",
+    "`processCommand` selects only metrics; it does not route or check commands.",
+  ]) {
+    const quality = scoreQuality([agentMessageEvent(answer)], task);
+    assert.equal(quality.expected_claims.found, 0, answer);
+  }
+});
+
+test("positive claim normalization is closed over qualified tokens and call relations", () => {
+  const zeroThresholds = {
+    min_expected_anchor_recall: 0,
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    max_forbidden_claims: 0,
+  };
+  const dartTask = {
+    id: "dart-qualified-call-relations",
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["Client", "BaseClient", "BaseRequest.finalize", "IOClient.send"],
+    expected_claims: [
+      "Top-level package:http helpers delegate to a Client.",
+      "BaseClient implements convenience methods in terms of send.",
+      "BaseRequest.finalize prepares the request body for sending.",
+      "IOClient.send is the dart:io transport implementation.",
+    ],
+    forbidden_claims: ["Top-level package:http helpers bypass Client."],
+    quality_thresholds: zeroThresholds,
+  };
+
+  const dartQuality = scoreQuality([
+    agentMessageEvent(
+      "- The top-level API in `http.dart` exposes `get`, which calls `_withClient`; its callback invokes `client.get`.\n" +
+      "- `BaseClient` convenience methods forward through `_sendUnstreamed`, which calls `send`.\n" +
+      "- `BaseRequest.finalize` marks the request finalized, but the evidence does not establish body preparation.\n" +
+      "- `IOClient.send` owns the I/O transport in `io_client`; it opens the platform request with `openUrl`.",
+    ),
+  ], dartTask);
+  assert.deepEqual(dartQuality.expected_claims.found_anchors, [
+    "Top-level package:http helpers delegate to a Client.",
+    "BaseClient implements convenience methods in terms of send.",
+    "IOClient.send is the dart:io transport implementation.",
+  ]);
+  assert.equal(dartQuality.forbidden_claims.found, 0);
+
+  const relationTask = (relation) => ({
+    id: `closed-call-relation-${relation}`,
+    task_class: "route_tracing",
+    expected_files: [],
+    expected_symbols: ["Session.send", "Adapter.send"],
+    expected_claims: [`Session.send ${relation} payload via Adapter.send.`],
+    forbidden_claims: ["Session.send bypasses Adapter.send."],
+    quality_thresholds: zeroThresholds,
+  });
+  for (const [expected, observed] of [
+    ["delegates", "calls"],
+    ["invokes", "forwards"],
+    ["calls", "delegates"],
+    ["forwards", "invokes"],
+  ]) {
+    const quality = scoreQuality([
+      agentMessageEvent(`\`Session.send\` ${observed} bytes through \`Adapter.send\`.`),
+    ], relationTask(expected));
+    assert.equal(quality.expected_claims.found, 1, `${expected} should match ${observed}`);
+    assert.equal(quality.forbidden_claims.found, 0);
+  }
+
+  const wrongSubject = scoreQuality([
+    agentMessageEvent(
+      "`BrowserClient.send` calls bytes through `Adapter.send`. `Session.send` is listed separately.",
+    ),
+  ], relationTask("delegates"));
+  assert.equal(wrongSubject.expected_claims.found, 0);
+
+  const negative = scoreQuality([
+    agentMessageEvent("`Session.send` does not call bytes through `Adapter.send`."),
+  ], relationTask("delegates"));
+  assert.equal(negative.expected_claims.found, 0);
+
+  const splitFlow = scoreQuality([
+    agentMessageEvent(
+      "- `Session.send` is present.\n- `Adapter.send` receives the payload.\n- `Router.forward` invokes telemetry.",
+    ),
+  ], relationTask("delegates"));
+  assert.equal(splitFlow.expected_claims.found, 0);
+});
+
 test("quality scoring treats Ruby instance separator variants as symbol matches", () => {
   const task = {
     id: "ruby-symbol-separator",
@@ -4068,6 +7228,35 @@ test("quality scoring treats Ruby instance separator variants as symbol matches"
   const events = [
     agentMessageEvent(
       "`Site.process` in `lib/jekyll/site.rb` runs reset, read, generate, render, cleanup, and write phases. `Site.read`, `Site.render`, and `Site.write` are the lifecycle phase methods.",
+    ),
+  ];
+
+  const quality = scoreQuality(events, task);
+
+  assert.equal(quality.expected_symbols.recall, 1);
+  assert.equal(quality.pass, true);
+});
+
+test("quality scoring treats Go receiver notation as a canonical member match", () => {
+  const task = {
+    id: "go-receiver-symbol",
+    task_class: "route_tracing",
+    expected_files: ["gin.go", "context.go"],
+    expected_symbols: ["Engine.handleHTTPRequest", "Context.Next"],
+    expected_claims: ["Engine dispatches a matched request through the context handler chain."],
+    forbidden_claims: [],
+    quality_thresholds: {
+      min_expected_anchor_recall: 1,
+      min_expected_file_recall: 1,
+      min_expected_symbol_recall: 1,
+      min_expected_claim_recall: 1,
+      min_citation_coverage: 1,
+      max_forbidden_claims: 0,
+    },
+  };
+  const events = [
+    agentMessageEvent(
+      "`(*Engine).handleHTTPRequest` in `gin.go` dispatches a matched request through the context handler chain by calling `(*Context).Next` in `context.go`.",
     ),
   ];
 
@@ -4592,6 +7781,58 @@ test("forbidden claim scoring keeps polarity inside one candidate sentence", () 
 
   assert.equal(quality.forbidden_claims.found, 0);
   assert.equal(quality.pass, true);
+});
+
+test("forbidden claim scoring does not invert an explicit evidence-gap sentence", () => {
+  const task = runtimeQualityTask("forbidden-shell-gap-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = [
+    "nvm is a compiled binary and does not dispatch through shell functions.",
+  ];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "Material gaps: the packet does not establish how downloaded nvm.sh is added to or sourced by a shell profile, the main nvm() command-dispatch cases for install, download, or use, the binary-install route, or any nvm use execution path.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 0);
+  assert.equal(quality.pass, true);
+});
+
+test("forbidden claim scoring still catches a polarity-preserving paraphrase", () => {
+  const task = runtimeQualityTask("forbidden-shell-paraphrase-fixture", {
+    min_expected_file_recall: 0,
+    min_expected_symbol_recall: 0,
+    min_expected_claim_recall: 0,
+    min_citation_coverage: 0,
+    min_expected_anchor_recall: 0,
+    max_forbidden_claims: 0,
+  });
+  task.forbidden_claims = [
+    "nvm is a compiled binary and does not dispatch through shell functions.",
+  ];
+
+  const quality = scoreQuality(
+    [
+      agentMessageEvent(
+        "nvm is a compiled binary; it does not dispatch through shell functions.",
+      ),
+    ],
+    task,
+  );
+
+  assert.equal(quality.forbidden_claims.found, 1);
+  assert.equal(quality.pass, false);
 });
 
 function pinnedRepoProvenance() {

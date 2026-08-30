@@ -11,16 +11,21 @@ use crate::{
     node_display_name,
 };
 use anyhow::Error as AnyhowError;
+use codestory_agent::packet_flow_requirements::{
+    FlowRequirement, flow_requirement_call_boundary_is_discoverable,
+    flow_requirement_call_receipt_is_valid,
+};
 use codestory_contracts::api::NodeKind as ApiNodeKind;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto,
-    GraphArtifactDto, GraphNodeDto, GraphResponse, PacketQueryCompletionDto,
-    PacketSidecarQueryDiagnosticDto, RetrievalCandidateResolutionCountDto,
-    RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto, RetrievalShadowDto,
-    RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
+    AgentAnswerDto, AgentCitationDto, AgentPacketDto, ApiError,
+    EmbeddingVectorPublicationIdentityDto, GraphArtifactDto, GraphEdgeDto, GraphNodeDto,
+    GraphResponse, PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
+    RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto,
+    RetrievalShadowDto, RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
 use codestory_contracts::graph::{
-    EdgeKind, NodeId as CoreNodeId, NodeKind, TrailCallerScope, TrailConfig, TrailDirection,
+    EdgeKind, NodeId as CoreNodeId, NodeKind, ResolutionCertainty, TrailCallerScope, TrailConfig,
+    TrailDirection,
 };
 #[cfg(test)]
 use codestory_retrieval::SidecarRuntimeConfig;
@@ -2061,6 +2066,8 @@ type PacketCandidateGraphHydration = (
 
 const PACKET_CANDIDATE_DIRECTION_NODE_LIMIT: usize = 65;
 const PACKET_FILE_STRUCTURAL_TRAIL_DEPTH: u32 = 2;
+const PACKET_EXACT_CALL_BOUNDARY_EDGE_LIMIT: u32 = 128;
+const PACKET_EXACT_CALL_BOUNDARY_ARTIFACT_PREFIX: &str = "packet-exact-call-boundary-";
 
 /// Node cap of the POST-PASS depth-2 FILE structural trail (round 5.5 item 1
 /// residual, option (ii)).
@@ -2533,6 +2540,206 @@ pub(crate) fn hydrate_packet_atom_trails_post_pass(
         return;
     };
     hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, answer);
+}
+
+/// Completes exact outgoing CALL boundaries for strict Legacy carriers that already survived
+/// retrieval. Generic trail hydration is intentionally unsuitable here: its navigation policy may
+/// erase exact resolution fields and its node-shaped cap can lose a lawful edge in a high-fanout
+/// caller. This pass reads a fixed raw prefix, admits only fully correlated exact CALL rows, and
+/// retains at most one positive witness per declared boundary. Truncation never proves absence.
+pub(crate) fn hydrate_packet_exact_call_boundaries_post_pass(
+    controller: &AppController,
+    flow_requirements: &[FlowRequirement],
+    answer: &mut AgentAnswerDto,
+) {
+    let Ok(storage) = controller.open_storage() else {
+        return;
+    };
+    hydrate_packet_exact_call_boundaries_in_storage(
+        &storage,
+        &HashMap::new(),
+        flow_requirements,
+        answer,
+    );
+}
+
+fn raw_call_is_exact_boundary_candidate(
+    edge: &codestory_contracts::graph::Edge,
+    source: &codestory_contracts::graph::Node,
+) -> bool {
+    let Some(file_node_id) = edge.file_node_id else {
+        return false;
+    };
+    let Some(line) = edge.line.filter(|line| *line >= 1) else {
+        return false;
+    };
+    let Some(callsite_identity) = edge.callsite_identity.as_deref() else {
+        return false;
+    };
+    let Some(pre_marker) = callsite_identity.split('|').next() else {
+        return false;
+    };
+    let fields = pre_marker.split(':').collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return false;
+    }
+    let (Ok(identity_file), Ok(identity_line), Ok(_column), Ok(identity_target)) = (
+        fields[0].parse::<i64>(),
+        fields[1].parse::<u32>(),
+        fields[2].parse::<u32>(),
+        fields[3].parse::<i64>(),
+    ) else {
+        return false;
+    };
+    let target = edge.effective_target();
+    edge.kind == EdgeKind::CALL
+        && edge.certainty == Some(ResolutionCertainty::Certain)
+        && edge.effective_source() == source.id
+        && edge.resolved_target == Some(target)
+        && edge.candidate_targets.is_empty()
+        && source.file_node_id == Some(file_node_id)
+        && source
+            .start_line
+            .zip(source.end_line)
+            .is_some_and(|(start, end)| start <= line && line <= end)
+        && identity_file == file_node_id.0
+        && identity_line == line
+        && identity_target == edge.target.0
+}
+
+fn exact_call_boundary_graph_for_citation(
+    storage: &Store,
+    node_names: &HashMap<CoreNodeId, String>,
+    flow_requirements: &[FlowRequirement],
+    citation: &AgentCitationDto,
+) -> Result<Option<GraphResponse>, ApiError> {
+    let applicable = flow_requirements
+        .iter()
+        .filter(|requirement| requirement.proof.formula().is_none())
+        .filter(|requirement| flow_requirement_call_boundary_is_discoverable(requirement, citation))
+        .collect::<Vec<_>>();
+    if applicable.is_empty() {
+        return Ok(None);
+    }
+    let Ok(source) = citation.node_id.0.parse::<i64>().map(CoreNodeId) else {
+        return Ok(None);
+    };
+    let Some(source_node) = storage.get_node(source).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to load exact packet CALL boundary source: {error}"
+        ))
+    })?
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        source_node.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    ) {
+        return Ok(None);
+    }
+    let bounded = storage
+        .get_bounded_raw_call_edges_by_effective_source(
+            source,
+            PACKET_EXACT_CALL_BOUNDARY_EDGE_LIMIT,
+        )
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to load bounded exact packet CALL boundaries: {error}"
+            ))
+        })?;
+    let graph_flags = app_graph_flags();
+    let mut selected = Vec::<GraphEdgeDto>::new();
+    let mut selected_ids = HashSet::new();
+    for requirement in applicable {
+        let Some(edge_dto) = bounded.edges.iter().find_map(|edge| {
+            if !raw_call_is_exact_boundary_candidate(edge, &source_node) {
+                return None;
+            }
+            let target = edge.effective_target();
+            let target_node = storage.get_node(target).ok().flatten()?;
+            if !matches!(
+                target_node.kind,
+                NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+            ) {
+                return None;
+            }
+            let label = node_names
+                .get(&target)
+                .cloned()
+                .unwrap_or_else(|| node_display_name(&target_node));
+            let edge_dto = graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags);
+            flow_requirement_call_receipt_is_valid(
+                requirement,
+                citation,
+                &edge_dto,
+                &label,
+                ApiNodeKind::from(target_node.kind),
+            )
+            .then_some(edge_dto)
+        }) else {
+            continue;
+        };
+        if selected_ids.insert(edge_dto.id.clone()) {
+            selected.push(edge_dto);
+        }
+    }
+    if selected.is_empty() {
+        return Ok(None);
+    }
+    let nodes = packet_graph_endpoint_nodes(storage, node_names, source, &selected)?;
+    let omitted =
+        bounded.edges.len().saturating_sub(selected.len()) + usize::from(bounded.truncated);
+    Ok(Some(GraphResponse {
+        center_id: source.into(),
+        nodes,
+        edges: selected,
+        truncated: omitted > 0,
+        omitted_edge_count: u32::try_from(omitted).unwrap_or(u32::MAX),
+        canonical_layout: None,
+    }))
+}
+
+fn hydrate_packet_exact_call_boundaries_in_storage(
+    storage: &Store,
+    node_names: &HashMap<CoreNodeId, String>,
+    flow_requirements: &[FlowRequirement],
+    answer: &mut AgentAnswerDto,
+) {
+    for citation in &mut answer.citations {
+        let Ok(Some(graph)) = exact_call_boundary_graph_for_citation(
+            storage,
+            node_names,
+            flow_requirements,
+            citation,
+        ) else {
+            continue;
+        };
+        for edge in &graph.edges {
+            if !citation.evidence_edge_ids.contains(&edge.id) {
+                citation.evidence_edge_ids.insert(0, edge.id.clone());
+            }
+        }
+        citation.evidence_edge_ids.truncate(12);
+        let artifact_id = format!(
+            "{PACKET_EXACT_CALL_BOUNDARY_ARTIFACT_PREFIX}{}",
+            graph.center_id.0
+        );
+        if !answer.graphs.iter().any(|artifact| match artifact {
+            GraphArtifactDto::Uml { id, .. } | GraphArtifactDto::Mermaid { id, .. } => {
+                id == &artifact_id
+            }
+        }) {
+            answer.graphs.push(GraphArtifactDto::Uml {
+                id: artifact_id.clone(),
+                title: "Exact packet CALL boundary".to_string(),
+                graph,
+            });
+        }
+        if !answer.subgraph_ids.contains(&artifact_id) {
+            answer.subgraph_ids.push(artifact_id);
+        }
+    }
 }
 
 /// Storage-level core of the post-pass, testable with an in-memory store.
@@ -3113,7 +3320,8 @@ mod tests {
     use crate::agent::packet_evidence::PacketEvidenceTier;
     use crate::test_support::{git, git_available};
     use codestory_contracts::api::{
-        NodeId, NodeKind as ApiNodeKind, SearchHitOrigin, SearchTargetDto,
+        AgentCitationDto, NodeId, NodeKind as ApiNodeKind, PacketTaskClassDto, SearchHitOrigin,
+        SearchTargetDto,
     };
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalCacheKey, RetrievalStageKind, StageTrace,
@@ -4288,6 +4496,316 @@ mod tests {
                 .any(|producer| producer == "core_incident_call")
         );
         assert!(packet_hit.has_proof_call_provenance());
+    }
+
+    fn exact_boundary_test_citation(id: i64, display_name: &str) -> AgentCitationDto {
+        AgentCitationDto {
+            node_id: NodeId(id.to_string()),
+            display_name: display_name.to_string(),
+            kind: ApiNodeKind::FUNCTION,
+            file_path: Some("src/runtime.c".to_string()),
+            line: Some(2),
+            score: 1.0,
+            origin: SearchHitOrigin::IndexedSymbol,
+            target: None,
+            resolvable: true,
+            subgraph_id: None,
+            evidence_edge_ids: Vec::new(),
+            retrieval_score_breakdown: None,
+            evidence_tier: None,
+            evidence_producer: None,
+            resolution_status: None,
+            loss_reason: None,
+            coverage_role: None,
+            eligible_for_sufficiency: Some(true),
+            source_excerpt: None,
+        }
+    }
+
+    fn exact_boundary_test_requirements() -> Vec<FlowRequirement> {
+        codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
+            &codestory_agent::packet_terms::packet_probe_terms(
+                "Trace how the server enters the event loop and routes a command for execution.",
+            ),
+            PacketTaskClassDto::RouteTracing,
+        )
+    }
+
+    fn exact_boundary_test_edge(
+        id: i64,
+        source: i64,
+        target: i64,
+        line: u32,
+    ) -> codestory_contracts::graph::Edge {
+        codestory_contracts::graph::Edge {
+            id: codestory_contracts::graph::EdgeId(id),
+            source: CoreNodeId(source),
+            target: CoreNodeId(target),
+            kind: EdgeKind::CALL,
+            file_node_id: Some(CoreNodeId(1)),
+            line: Some(line),
+            resolved_target: Some(CoreNodeId(target)),
+            certainty: Some(ResolutionCertainty::Certain),
+            callsite_identity: Some(format!("1:{line}:1:{target}|syntax:c-call")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exact_boundary_post_pass_recovers_only_correlated_router_and_loop_witnesses() {
+        use codestory_store::{FileInfo, FileRole};
+
+        let mut storage = Store::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: PathBuf::from("src/runtime.c"),
+                language: "c".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 300,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        storage
+            .insert_file(&FileInfo {
+                id: 2,
+                path: PathBuf::from("src/other.c"),
+                language: "c".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 300,
+                file_role: FileRole::Source,
+            })
+            .expect("insert other file");
+        let mut nodes = vec![
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::FILE,
+                serialized_name: "src/runtime.c".into(),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(2),
+                kind: NodeKind::FILE,
+                serialized_name: "src/other.c".into(),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(10),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "processCommand".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(2),
+                end_line: Some(150),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(20),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "rejectCommand".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(200),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(30),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "recordCommandMetrics".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(210),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(40),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "aeMain".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(220),
+                end_line: Some(225),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(41),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "EventLoop.processEvents".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(230),
+                ..Default::default()
+            },
+        ];
+        nodes.extend((0..70).map(|index| codestory_contracts::graph::Node {
+            id: CoreNodeId(100 + index),
+            kind: NodeKind::FUNCTION,
+            serialized_name: format!("recordMetric{index}"),
+            file_node_id: Some(CoreNodeId(1)),
+            start_line: Some(10 + index as u32),
+            ..Default::default()
+        }));
+        storage.insert_nodes_batch(&nodes).expect("insert nodes");
+
+        let mut edges = (0..70)
+            .map(|index| exact_boundary_test_edge(index + 1, 10, 100 + index, 10 + index as u32))
+            .collect::<Vec<_>>();
+        let mut probable = exact_boundary_test_edge(80, 10, 20, 90);
+        probable.certainty = Some(ResolutionCertainty::Probable);
+        edges.push(probable);
+        let mut candidate_bearing = exact_boundary_test_edge(81, 10, 20, 91);
+        candidate_bearing.candidate_targets = vec![CoreNodeId(30)];
+        edges.push(candidate_bearing);
+        let mut unresolved = exact_boundary_test_edge(82, 10, 20, 92);
+        unresolved.resolved_target = None;
+        edges.push(unresolved);
+        let mut malformed = exact_boundary_test_edge(83, 10, 20, 93);
+        malformed.callsite_identity = Some("syntax:c-call".into());
+        edges.push(malformed);
+        edges.push(exact_boundary_test_edge(84, 10, 30, 94));
+        edges.push(exact_boundary_test_edge(85, 10, 20, 151));
+        let mut wrong_file = exact_boundary_test_edge(86, 10, 20, 101);
+        wrong_file.file_node_id = Some(CoreNodeId(2));
+        wrong_file.callsite_identity = Some("2:101:1:20|syntax:c-call".into());
+        edges.push(wrong_file);
+        edges.push(exact_boundary_test_edge(90, 10, 20, 100));
+        edges.push(exact_boundary_test_edge(91, 40, 41, 221));
+        storage.insert_edges_batch(&edges).expect("insert edges");
+
+        let requirements = exact_boundary_test_requirements();
+        let router = exact_call_boundary_graph_for_citation(
+            &storage,
+            &HashMap::new(),
+            &requirements,
+            &exact_boundary_test_citation(10, "processCommand"),
+        )
+        .expect("router hydration")
+        .expect("exact router boundary");
+        assert_eq!(
+            router
+                .edges
+                .iter()
+                .map(|edge| edge.id.0.as_str())
+                .collect::<Vec<_>>(),
+            ["90"],
+            "high fanout must not hide the one exact routing witness; probable, candidate-bearing, unresolved, malformed, and wrong-target rows remain excluded"
+        );
+
+        let loop_driver = exact_call_boundary_graph_for_citation(
+            &storage,
+            &HashMap::new(),
+            &requirements,
+            &exact_boundary_test_citation(40, "aeMain"),
+        )
+        .expect("loop hydration")
+        .expect("exact loop boundary");
+        assert_eq!(loop_driver.edges[0].id.0, "91");
+
+        let mut answer = sidecar_answer_with_citation_node("10");
+        answer.citations = vec![
+            exact_boundary_test_citation(10, "processCommand"),
+            exact_boundary_test_citation(40, "aeMain"),
+        ];
+        hydrate_packet_exact_call_boundaries_in_storage(
+            &storage,
+            &HashMap::new(),
+            &requirements,
+            &mut answer,
+        );
+        assert_eq!(answer.citations[0].evidence_edge_ids[0].0, "90");
+        assert_eq!(answer.citations[1].evidence_edge_ids[0].0, "91");
+        assert_eq!(answer.graphs.len(), 2);
+        assert_eq!(answer.subgraph_ids.len(), 2);
+
+        assert!(
+            exact_call_boundary_graph_for_citation(
+                &storage,
+                &HashMap::new(),
+                &requirements,
+                &exact_boundary_test_citation(40, "Connection.rebindEventLoop"),
+            )
+            .expect("hostile carrier")
+            .is_none(),
+            "a rebind wrapper must not enter exact boundary hydration"
+        );
+    }
+
+    #[test]
+    fn exact_boundary_post_pass_never_claims_a_match_beyond_its_fixed_raw_prefix() {
+        use codestory_store::{FileInfo, FileRole};
+
+        let mut storage = Store::new_in_memory().expect("storage");
+        storage
+            .insert_file(&FileInfo {
+                id: 1,
+                path: PathBuf::from("src/runtime.c"),
+                language: "c".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 400,
+                file_role: FileRole::Source,
+            })
+            .expect("insert file");
+        let mut nodes = vec![
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(1),
+                kind: NodeKind::FILE,
+                serialized_name: "src/runtime.c".into(),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(10),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "processCommand".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(2),
+                end_line: Some(400),
+                ..Default::default()
+            },
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(20),
+                kind: NodeKind::FUNCTION,
+                serialized_name: "rejectCommand".into(),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(300),
+                ..Default::default()
+            },
+        ];
+        nodes.extend((0..PACKET_EXACT_CALL_BOUNDARY_EDGE_LIMIT).map(|index| {
+            codestory_contracts::graph::Node {
+                id: CoreNodeId(100 + i64::from(index)),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("recordMetric{index}"),
+                file_node_id: Some(CoreNodeId(1)),
+                start_line: Some(10 + index),
+                ..Default::default()
+            }
+        }));
+        storage.insert_nodes_batch(&nodes).expect("insert nodes");
+        let mut edges = (0..PACKET_EXACT_CALL_BOUNDARY_EDGE_LIMIT)
+            .map(|index| {
+                exact_boundary_test_edge(
+                    1 + i64::from(index),
+                    10,
+                    100 + i64::from(index),
+                    10 + index,
+                )
+            })
+            .collect::<Vec<_>>();
+        edges.push(exact_boundary_test_edge(10_000, 10, 20, 350));
+        storage.insert_edges_batch(&edges).expect("insert edges");
+
+        assert!(
+            exact_call_boundary_graph_for_citation(
+                &storage,
+                &HashMap::new(),
+                &exact_boundary_test_requirements(),
+                &exact_boundary_test_citation(10, "processCommand"),
+            )
+            .expect("bounded hydration")
+            .is_none(),
+            "a lawful edge beyond the fixed raw prefix remains unproven; truncation is never absence or authority"
+        );
     }
 
     #[test]

@@ -97,7 +97,7 @@ fn cap_citations_with_priorities(
     for citation in candidates {
         let file = citation.file_path.as_deref().map(packet_display_path);
         let role = packet_evidence_role(&citation);
-        let claim_key = role.map(|role| packet_claim_key_for_citation(role, &citation));
+        let claim_key = packet_cap_claim_key(&citation);
         let low_priority_role = packet_low_priority_cap_role(role);
         let protected = packet_citation_is_protected(&citation, protected_citation_keys);
         let ordinary_file_limit_reached = !protected
@@ -157,8 +157,9 @@ fn cap_citations_with_priorities(
                 && !secondary_claim_keys.contains(key)
                 && packet_keep_secondary_claim_definition(key, &citation)
         });
-        let claim_key_expands_primary_packet_coverage =
-            !low_priority_role && claim_key_is_new && (role_is_new || file_is_new);
+        let claim_key_expands_primary_packet_coverage = !low_priority_role
+            && claim_key_is_new
+            && (role_is_new || file_is_new || role.is_none());
         let expands_primary_packet_coverage = !low_priority_role
             && (claim_key_expands_primary_packet_coverage
                 || role_is_new
@@ -358,7 +359,7 @@ fn packet_marginal_utility(
     prefer_primary_sources: bool,
 ) -> f32 {
     let role = packet_evidence_role(citation);
-    let claim_key = role.map(|role| packet_claim_key_for_citation(role, citation));
+    let claim_key = packet_cap_claim_key(citation);
     let new_coverage = role.is_some_and(|role| !roles.contains(&role))
         || claim_key
             .as_ref()
@@ -376,6 +377,17 @@ fn packet_marginal_utility(
             } else {
                 0.0
             }
+}
+
+fn packet_unscoped_identity_key(citation: &AgentCitationDto) -> Option<String> {
+    let identity = normalize_identifier(&citation.display_name);
+    (!identity.is_empty()).then(|| format!("unscoped:{identity}"))
+}
+
+fn packet_cap_claim_key(citation: &AgentCitationDto) -> Option<String> {
+    packet_evidence_role(citation)
+        .map(|role| packet_claim_key_for_citation(role, citation))
+        .or_else(|| packet_unscoped_identity_key(citation))
 }
 
 fn packet_citation_is_non_primary(citation: &AgentCitationDto) -> bool {
@@ -422,7 +434,9 @@ fn record_packet_utility_coverage(
 ) {
     if let Some(role) = packet_evidence_role(citation) {
         roles.insert(role);
-        claim_keys.insert(packet_claim_key_for_citation(role, citation));
+    }
+    if let Some(claim_key) = packet_cap_claim_key(citation) {
+        claim_keys.insert(claim_key);
     }
     if let Some(subsystem) = packet_citation_subsystem(citation) {
         subsystems.insert(subsystem);
@@ -596,11 +610,10 @@ fn replace_weaker_duplicate_claim_citation(
     candidate: AgentCitationDto,
     protected_citation_keys: &HashSet<String>,
 ) -> bool {
-    let Some(index) = kept.iter().position(|citation| {
-        packet_evidence_role(citation)
-            .map(|role| packet_claim_key_for_citation(role, citation) == claim_key)
-            .unwrap_or(false)
-    }) else {
+    let Some(index) = kept
+        .iter()
+        .position(|citation| packet_cap_claim_key(citation).as_deref() == Some(claim_key))
+    else {
         return false;
     };
     if packet_citation_is_protected(&kept[index], protected_citation_keys) {
@@ -755,7 +768,9 @@ fn rebuild_packet_cap_tracking(
         }
         if let Some(role) = packet_evidence_role(citation) {
             roles.insert(role);
-            claim_keys.insert(packet_claim_key_for_citation(role, citation));
+        }
+        if let Some(claim_key) = packet_cap_claim_key(citation) {
+            claim_keys.insert(claim_key);
         }
     }
 }
@@ -1699,6 +1714,59 @@ mod tests {
     }
 
     #[test]
+    fn marginal_utility_keeps_distinct_roleless_source_identities_ahead_of_lower_ranked_roles() {
+        let roleless = [
+            (
+                "IMapperConfigurationExpression",
+                "src/AutoMapper/Internal/InternalApi.cs",
+            ),
+            ("IMapperBase", "src/AutoMapper/Mapper.cs"),
+            ("IMapper", "src/AutoMapper/Mapper.cs"),
+        ]
+        .into_iter()
+        .map(|(name, path)| {
+            let mut citation = with_fused_score(citation(name, path, 1.0), 1.0);
+            citation.kind = NodeKind::INTERFACE;
+            citation.evidence_tier = Some(PacketEvidenceTierDto::SyntheticSourceScan);
+            citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+            citation
+        });
+        let role_backed = (0..8).map(|index| {
+            with_fused_score(
+                citation(
+                    &format!("sourceHelper{index}"),
+                    &format!("src/AutoMapper/Helper{index}.cs"),
+                    0.95,
+                ),
+                0.95,
+            )
+        });
+        let mut answer = answer_fixture(roleless.chain(role_backed).collect());
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 3,
+            max_files: 3,
+            max_snippets: 3,
+            max_trail_edges: 3,
+            max_output_bytes: 1024,
+        };
+
+        assert!(cap_citations_with_priorities(
+            &mut answer,
+            &limits,
+            &HashSet::new(),
+            &HashSet::new(),
+        ));
+        assert_eq!(
+            answer
+                .citations
+                .iter()
+                .map(|citation| citation.display_name.as_str())
+                .collect::<Vec<_>>(),
+            ["IMapperConfigurationExpression", "IMapperBase", "IMapper"]
+        );
+    }
+
+    #[test]
     fn required_probe_prefers_primary_path_over_higher_ranked_test_namespace() {
         let primary = citation("AutoMapper.Mapper.Map", "src/AutoMapper/Mapper.cs", 0.4);
         let test = citation(
@@ -2129,6 +2197,24 @@ mod tests {
                 .all(|path| path.contains("commonMain")),
             "generic source probes should protect shared source-set evidence before platform variants: {protected_paths:?}"
         );
+    }
+
+    #[test]
+    fn type_declaration_probe_promotes_the_type_over_same_file_members() {
+        let mut member = citation("Client.send", "src/network/client.dart", 100.0);
+        member.kind = NodeKind::METHOD;
+        let mut client_type = citation("Client", "src/network/client.dart", 1.0);
+        client_type.kind = NodeKind::CLASS;
+        let mut unrelated_type = citation("Response", "src/network/client.dart", 50.0);
+        unrelated_type.kind = NodeKind::CLASS;
+        let client_type_key = packet_citation_key(&client_type);
+        let mut answer = answer_fixture(vec![member, unrelated_type, client_type]);
+
+        let protected =
+            promote_required_probe_citations(&mut answer, &["client type declaration".to_string()]);
+
+        assert_eq!(answer.citations[0].display_name, "Client");
+        assert_eq!(protected, HashSet::from([client_type_key]));
     }
 
     #[test]

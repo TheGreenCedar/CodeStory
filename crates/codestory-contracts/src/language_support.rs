@@ -279,7 +279,7 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
     },
     StructuralSourceProofContract {
         collector_name: "json",
-        path_pattern: "generic **/*.json after dedicated OpenAPI routing",
+        path_pattern: "generic **/*.json after dedicated OpenAPI and TypeScript/JavaScript config JSONC routing",
         emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
         source_span: "1-based exact source span for an object-key anchor",
         evidence_tier: PacketEvidenceTierDto::StructuralText,
@@ -287,6 +287,18 @@ pub const STRUCTURAL_SOURCE_PROOF_CONTRACTS: &[StructuralSourceProofContract] = 
         confidence: 1.0,
         unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
         claim_boundary: "structural exact-source proof only; not OpenAPI semantics, typed target resolution, or packet semantic-proof admission",
+        semantic_proof_allowed: false,
+    },
+    StructuralSourceProofContract {
+        collector_name: "typescript_config_jsonc",
+        path_pattern: "basename-scoped tsconfig.json, tsconfig.<suffix>.json, jsconfig.json, or jsconfig.<suffix>.json",
+        emitted_node_kinds: GENERIC_STRUCTURAL_NODE_KINDS,
+        source_span: "1-based exact source span for a quoted JSONC object-key anchor",
+        evidence_tier: PacketEvidenceTierDto::StructuralText,
+        resolution: PacketEvidenceResolutionDto::SourceRangeOnly,
+        confidence: 1.0,
+        unsupported_shape_notes: GENERIC_STRUCTURAL_UNSUPPORTED_SHAPES,
+        claim_boundary: "structural exact-source proof only; not generic JSONC support, TypeScript compiler semantics, typed target resolution, or packet semantic-proof admission",
         semantic_proof_allowed: false,
     },
     StructuralSourceProofContract {
@@ -719,6 +731,32 @@ pub fn is_cargo_manifest_file_path_with_case(path: &str, path_case: NativePathCa
         .is_some_and(|file_name| match path_case {
             NativePathCase::Sensitive => file_name == "Cargo.toml",
             NativePathCase::Insensitive => file_name.eq_ignore_ascii_case("Cargo.toml"),
+        })
+}
+
+/// Whether a path names a TypeScript or JavaScript config that admits the
+/// JSONC dialect under explicit native basename-case rules.
+pub fn is_typescript_config_jsonc_file_path(path: &str) -> bool {
+    is_typescript_config_jsonc_file_path_with_case(path, NativePathCase::current())
+}
+
+/// Whether a path names a TypeScript or JavaScript config under `path_case`.
+pub fn is_typescript_config_jsonc_file_path_with_case(
+    path: &str,
+    path_case: NativePathCase,
+) -> bool {
+    let normalized = path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or_default();
+    let file_name = match path_case {
+        NativePathCase::Sensitive => std::borrow::Cow::Borrowed(file_name),
+        NativePathCase::Insensitive => std::borrow::Cow::Owned(file_name.to_ascii_lowercase()),
+    };
+    matches!(file_name.as_ref(), "tsconfig.json" | "jsconfig.json")
+        || ["tsconfig.", "jsconfig."].into_iter().any(|prefix| {
+            file_name
+                .strip_prefix(prefix)
+                .and_then(|suffix| suffix.strip_suffix(".json"))
+                .is_some_and(|suffix| !suffix.is_empty())
         })
 }
 
@@ -1466,6 +1504,41 @@ mod tests {
             );
         }
         assert!(!is_structural_source_path("config.jsonc"));
+    }
+
+    #[test]
+    fn typescript_config_jsonc_routing_is_basename_scoped_under_native_case_rules() {
+        for path in [
+            "tsconfig.json",
+            "config/tsconfig.build.json",
+            r"config\\jsconfig.editor.json",
+            "jsconfig.json",
+        ] {
+            assert!(
+                is_typescript_config_jsonc_file_path_with_case(path, NativePathCase::Sensitive),
+                "{path}"
+            );
+        }
+        for path in [
+            "config.json",
+            "my-tsconfig.json",
+            "tsconfig.json.bak",
+            "tsconfig..json",
+            "tsconfig.jsonc",
+        ] {
+            assert!(
+                !is_typescript_config_jsonc_file_path_with_case(path, NativePathCase::Sensitive),
+                "{path}"
+            );
+        }
+        assert!(is_typescript_config_jsonc_file_path_with_case(
+            "TSCONFIG.JSON",
+            NativePathCase::Insensitive
+        ));
+        assert!(!is_typescript_config_jsonc_file_path_with_case(
+            "TSCONFIG.JSON",
+            NativePathCase::Sensitive
+        ));
     }
 
     #[test]

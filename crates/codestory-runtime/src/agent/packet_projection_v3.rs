@@ -1,4 +1,4 @@
-//! Dark, pure v3 packet/context/search projection builders.
+//! Pure v3 packet, context, and search projection builders.
 
 #![allow(dead_code)]
 
@@ -8,11 +8,11 @@ use codestory_contracts::packet_projection_v3::{
     BoundViolationV3, BoundedVecV3, ContextEvidenceRowV3Dto, ContextProjectionKindV3Dto,
     ContextProjectionV3Dto, ContextTargetV3Dto, DIAGNOSTIC_ROWS_MAX_V3,
     DiagnosticArtifactKindV3Dto, DiagnosticArtifactV3Dto, DiagnosticReferenceV3Dto,
-    DiagnosticRowV3Dto, DiagnosticsCapabilityV3Dto, EvidenceAvailabilityV3Dto, GapKindV3Dto,
-    IdentityTextV3, PACKET_PROJECTION_V3_SCHEMA_VERSION, PacketProjectionV3Dto,
-    PacketRequestIdentityV3Dto, ProjectionGapRowV3Dto, PublicationIdentityV3Dto,
-    RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto, SearchEvidenceRowV3Dto,
-    SearchProjectionKindV3Dto, SearchProjectionV3Dto, Sha256DigestV3Dto,
+    DiagnosticRowV3Dto, DiagnosticsCapabilityV3Dto, EvidenceAvailabilityV3Dto, GAP_ROWS_MAX_V3,
+    GapIdentityV3Dto, GapKindV3Dto, IdentityTextV3, PACKET_PROJECTION_V3_SCHEMA_VERSION,
+    PacketProjectionV3Dto, PacketRequestIdentityV3Dto, ProjectionGapRowV3Dto,
+    PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
+    SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SearchProjectionV3Dto, Sha256DigestV3Dto,
 };
 use sha2::{Digest, Sha256};
 
@@ -157,40 +157,98 @@ impl FinalizedSearchProjectionInputV3 {
 pub(crate) fn build_packet_projection_v3(
     record: &PacketExecutionRecordV3,
     diagnostics: DiagnosticsCapabilityV3Dto,
-    mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+    measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
 ) -> Result<PacketProjectionV3Dto, ProjectionBuildErrorV3> {
-    let mut candidate = packet_complete_candidate_v3(record, diagnostics.clone(), false, false)?;
-    let mut required_complete_bytes =
-        measure(&candidate).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
+    let mut projection = packet_complete_candidate_v3(record, diagnostics)?;
+    finalize_packet_projection_v3(&mut projection, measure)?;
+    Ok(projection)
+}
+
+pub(crate) fn finalize_packet_projection_v3(
+    projection: &mut PacketProjectionV3Dto,
+    mut measure: impl FnMut(&PacketProjectionV3Dto) -> Result<usize, ()>,
+) -> Result<usize, ProjectionBuildErrorV3> {
+    let required_complete_bytes =
+        measure(projection).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
     if required_complete_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-        return Ok(candidate);
+        return Ok(required_complete_bytes);
     }
+    let PacketProjectionV3Dto::Complete {
+        schema_version,
+        identity,
+        publication,
+        retrieval,
+        diagnostics,
+        evidence,
+        gaps,
+        continuation,
+        ..
+    } = projection
+    else {
+        return Err(ProjectionBuildErrorV3::FallbackTooLarge {
+            required_bytes: required_complete_bytes,
+        });
+    };
 
-    if record.evidence().iter().any(|row| row.summary.is_some()) {
-        candidate = packet_complete_candidate_v3(record, diagnostics.clone(), true, false)?;
-        required_complete_bytes =
-            measure(&candidate).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
-        if required_complete_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-            return Ok(candidate);
-        }
-    }
+    let original_evidence = evidence.as_slice().to_vec();
+    let original_gaps = gaps.as_slice().to_vec();
+    let original_continuation = continuation.clone();
+    let schema_version = *schema_version;
+    let identity = identity.clone();
+    let publication = publication.clone();
+    let retrieval = retrieval.clone();
+    let diagnostics = diagnostics.clone();
 
-    if record.gaps().iter().any(|row| row.message.is_some()) {
-        candidate = packet_complete_candidate_v3(record, diagnostics.clone(), true, true)?;
-        required_complete_bytes =
-            measure(&candidate).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
-        if required_complete_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-            return Ok(candidate);
+    let candidate = |detailed_rows: usize| {
+        compact_packet_candidate_v3(
+            schema_version,
+            identity.clone(),
+            publication.clone(),
+            retrieval.clone(),
+            diagnostics.clone(),
+            &original_evidence,
+            &original_gaps,
+            original_continuation.as_ref(),
+            detailed_rows,
+        )
+    };
+
+    // Every evidence and gap identity is mandatory. Optional row context and
+    // prose are the only fields compacted. Measure the mandatory complete
+    // envelope first, then binary-search the largest relevance-ordered prefix
+    // that can retain its useful source or relation context.
+    let minimal = candidate(0)?;
+    let minimal_bytes = measure(&minimal).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
+    if minimal_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+        let mut low = 0_usize;
+        let mut high = original_evidence.len();
+        let mut best = minimal;
+        let mut best_bytes = minimal_bytes;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let next = candidate(middle)?;
+            let next_bytes =
+                measure(&next).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
+            if next_bytes <= PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+                low = middle;
+                best = next;
+                best_bytes = next_bytes;
+            } else {
+                high = middle - 1;
+            }
         }
+        *projection = best;
+        return Ok(best_bytes);
     }
 
     let fallback = PacketProjectionV3Dto::BudgetExceeded {
-        schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
-        identity: identity_from_record(record),
-        publication: publication_from_record(record),
+        schema_version,
+        identity,
+        publication,
         status: EvidenceAvailabilityV3Dto::Unavailable,
-        retrieval: record.retrieval().clone(),
+        retrieval,
         diagnostics,
+        gaps: packet_budget_exceeded_gaps_v3(),
         maximum_bytes: PACKET_PUBLIC_RESULT_MAX_BYTES_V3 as u64,
         required_complete_bytes: required_complete_bytes as u64,
     };
@@ -201,29 +259,28 @@ pub(crate) fn build_packet_projection_v3(
             required_bytes: fallback_bytes,
         });
     }
-    Ok(fallback)
+    *projection = fallback;
+    Ok(fallback_bytes)
+}
+
+fn packet_budget_exceeded_gaps_v3() -> BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3> {
+    BoundedVecV3::new(vec![ProjectionGapRowV3Dto {
+        identity: GapIdentityV3Dto {
+            gap_id: IdentityTextV3::new("packet-output-budget-exceeded")
+                .expect("static budget gap identity is bounded"),
+        },
+        kind: GapKindV3Dto::OutputBudgetExceeded,
+        message: None,
+    }])
+    .expect("one budget gap fits the closed projection")
 }
 
 fn packet_complete_candidate_v3(
     record: &PacketExecutionRecordV3,
     diagnostics: DiagnosticsCapabilityV3Dto,
-    remove_summaries: bool,
-    remove_messages: bool,
 ) -> Result<PacketProjectionV3Dto, ProjectionBuildErrorV3> {
-    let mut evidence = record.evidence().to_vec();
-    let mut gaps = record.gaps().to_vec();
-    evidence.sort_by(|left, right| left.identity.cmp(&right.identity));
-    gaps.sort_by(|left, right| left.identity.cmp(&right.identity));
-    if remove_summaries {
-        for row in &mut evidence {
-            row.summary = None;
-        }
-    }
-    if remove_messages {
-        for row in &mut gaps {
-            row.message = None;
-        }
-    }
+    let evidence = record.evidence().to_vec();
+    let gaps = record.gaps().to_vec();
     let continuation = canonical_continuation_v3(record.continuation(), &gaps)?;
     Ok(PacketProjectionV3Dto::Complete {
         schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
@@ -236,6 +293,59 @@ fn packet_complete_candidate_v3(
             &gaps,
         ),
         retrieval: record.retrieval().clone(),
+        evidence: BoundedVecV3::new(evidence).map_err(ProjectionBuildErrorV3::BoundViolation)?,
+        gaps: BoundedVecV3::new(gaps).map_err(ProjectionBuildErrorV3::BoundViolation)?,
+        continuation,
+        diagnostics,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compact_packet_candidate_v3(
+    schema_version: u16,
+    identity: PacketRequestIdentityV3Dto,
+    publication: PublicationIdentityV3Dto,
+    retrieval: RetrievalStateDescriptorV3Dto,
+    diagnostics: DiagnosticsCapabilityV3Dto,
+    original_evidence: &[codestory_contracts::packet_projection_v3::PacketEvidenceRowV3Dto],
+    original_gaps: &[ProjectionGapRowV3Dto],
+    original_continuation: Option<
+        &codestory_contracts::packet_projection_v3::ContinuationStateV3Dto,
+    >,
+    detailed_rows: usize,
+) -> Result<PacketProjectionV3Dto, ProjectionBuildErrorV3> {
+    let mut evidence = original_evidence.to_vec();
+    for row in evidence.iter_mut().skip(detailed_rows) {
+        row.summary = None;
+    }
+    let mut gaps = original_gaps.to_vec();
+    for row in &mut gaps {
+        row.message = None;
+    }
+    if gaps.len() < GAP_ROWS_MAX_V3 {
+        gaps.push(ProjectionGapRowV3Dto {
+            identity: GapIdentityV3Dto {
+                gap_id: IdentityTextV3::new("packet-optional-context-omitted")
+                    .expect("static budget gap identity is bounded"),
+            },
+            kind: GapKindV3Dto::OutputBudgetExceeded,
+            message: None,
+        });
+    }
+    gaps.sort_by(|left, right| left.identity.cmp(&right.identity));
+    gaps.dedup_by(|left, right| left.identity == right.identity);
+    let continuation = canonical_continuation_v3(original_continuation, &gaps)?;
+    Ok(PacketProjectionV3Dto::Complete {
+        schema_version,
+        identity,
+        publication,
+        status: evidence_availability_v3(
+            continuation.is_some(),
+            !evidence.is_empty(),
+            &retrieval,
+            &gaps,
+        ),
+        retrieval,
         evidence: BoundedVecV3::new(evidence).map_err(ProjectionBuildErrorV3::BoundViolation)?,
         gaps: BoundedVecV3::new(gaps).map_err(ProjectionBuildErrorV3::BoundViolation)?,
         continuation,
@@ -512,6 +622,7 @@ pub(crate) fn build_diagnostic_artifact_v3(
         artifact_id,
         sha256,
         byte_length: bytes.len() as u64,
+        wall_expiry_epoch_ms: None,
     };
     Ok(DiagnosticArtifactBuildV3::Complete {
         artifact: Box::new(artifact),
@@ -589,6 +700,11 @@ fn diagnostic_artifact_id_v3(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::agent::packet_execution_record_v3::{
+        FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3, PacketProfileV3,
+        PacketRequestFingerprintV3, build_packet_execution_record_fixture_v3,
+    };
     use codestory_contracts::{
         api::{AgentPacketRequestDto, PacketBudgetModeDto},
         packet_projection_v3::{
@@ -601,12 +717,6 @@ mod tests {
             PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
             SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3,
         },
-    };
-
-    use super::*;
-    use crate::agent::packet_execution_record_v3::{
-        FinalizedDiagnosticSourceRowV3, FinalizedPacketExecutionInputV3, PacketProfileV3,
-        PacketRequestFingerprintV3, build_packet_execution_record_fixture_v3,
     };
 
     fn identity(value: &str) -> IdentityTextV3 {
@@ -650,7 +760,6 @@ mod tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: None,
             option_ids: Vec::new(),
@@ -729,6 +838,7 @@ mod tests {
                 artifact_id: identity("diagnostic-artifact-1"),
                 sha256: Sha256DigestV3Dto::new("d".repeat(64)).unwrap(),
                 byte_length: 512,
+                wall_expiry_epoch_ms: None,
             },
         }
     }
@@ -875,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_projection_v3_trims_only_optional_text_and_retains_every_identity() {
+    fn packet_projection_v3_trims_only_optional_context_and_retains_every_identity() {
         let gaps = vec![
             projection_gap("gap-b", GapKindV3Dto::EvidenceMissing, Some("second gap")),
             projection_gap(
@@ -917,7 +1027,12 @@ mod tests {
             let PacketProjectionV3Dto::Complete { evidence, gaps, .. } = candidate else {
                 return Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
             };
-            if evidence.as_slice().iter().any(|row| row.summary.is_some()) {
+            let detailed = evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.summary.is_some())
+                .count();
+            if detailed > 1 {
                 Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 2)
             } else if gaps.as_slice().iter().any(|row| row.message.is_some()) {
                 Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1)
@@ -935,11 +1050,11 @@ mod tests {
             ..
         } = projection
         else {
-            panic!("text-only trimming should retain a complete projection");
+            panic!("optional-context trimming should retain a complete projection");
         };
         assert_eq!(
-            measurements, 3,
-            "measure complete, summary-free, then message-free"
+            measurements, 4,
+            "measure complete, mandatory envelope, and the binary-search probes"
         );
         assert_eq!(
             evidence
@@ -949,13 +1064,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["evidence-a", "evidence-b"]
         );
-        assert!(evidence.as_slice().iter().all(|row| row.summary.is_none()));
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .map(|row| row.summary.as_ref().map(|value| value.as_str()))
+                .collect::<Vec<_>>(),
+            [Some("first summary"), None]
+        );
+        assert_eq!(evidence.as_slice()[0].start_line, Some(7));
+        assert_eq!(
+            evidence.as_slice()[1].start_line,
+            Some(7),
+            "compaction removes optional prose without erasing the evidence locator"
+        );
         assert_eq!(
             gaps.as_slice()
                 .iter()
                 .map(|row| row.identity.gap_id.as_str())
                 .collect::<Vec<_>>(),
-            ["gap-a", "gap-b"]
+            ["gap-a", "gap-b", "packet-optional-context-omitted"]
         );
         assert!(gaps.as_slice().iter().all(|row| row.message.is_none()));
         assert_eq!(projected_continuation, Some(continuation));
@@ -964,6 +1092,200 @@ mod tests {
             record, before,
             "budget projection must not mutate its record"
         );
+    }
+
+    #[test]
+    fn modern_packet_compaction_keeps_the_relevance_prefix_and_all_sixteen_identities() {
+        let evidence = (0..16)
+            .map(|index| {
+                let id = format!("packet-evidence-{index:03}");
+                let summary = format!("relevance-ranked flow evidence {index}");
+                packet_evidence(&id, Some(&summary))
+            })
+            .collect::<Vec<_>>();
+        let record = record_fixture_with(
+            "retain the relevance-ranked prefix",
+            PacketBudgetModeDto::Compact,
+            PacketProfileV3::Callflow,
+            evidence,
+            Vec::new(),
+            None,
+            RetrievalStateDescriptorV3Dto {
+                state: RetrievalStateV3Dto::Full,
+                generation_id: Some(identity("retrieval-generation-1")),
+            },
+            Vec::new(),
+            true,
+        );
+        let diagnostics = diagnostics_capability_fixture();
+        let four_detail_shape =
+            build_packet_projection_v3(&record, diagnostics.clone(), |candidate| match candidate {
+                PacketProjectionV3Dto::Complete { evidence, .. }
+                    if evidence
+                        .as_slice()
+                        .iter()
+                        .filter(|row| row.summary.is_some())
+                        .count()
+                        > 4 =>
+                {
+                    Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1)
+                }
+                PacketProjectionV3Dto::Complete { .. } => Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3),
+                PacketProjectionV3Dto::BudgetExceeded { .. } => {
+                    Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3)
+                }
+            })
+            .expect("four-detail fixture");
+        let fixed_envelope_bytes = PACKET_PUBLIC_RESULT_MAX_BYTES_V3
+            - planned_transport_size(PlannedTransportShape::June2025, &four_detail_shape);
+
+        let projection = build_packet_projection_v3(&record, diagnostics, |candidate| {
+            Ok(
+                planned_transport_size(PlannedTransportShape::June2025, candidate)
+                    + fixed_envelope_bytes,
+            )
+        })
+        .expect("modern mirrored projection should compact to a complete result");
+        let PacketProjectionV3Dto::Complete { evidence, .. } = projection else {
+            panic!("the sixteen-identity envelope should fit after optional compaction");
+        };
+
+        assert_eq!(evidence.as_slice().len(), 16);
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.summary.is_some())
+                .count(),
+            4
+        );
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .take(4)
+                .map(|row| row.identity.evidence_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "packet-evidence-000",
+                "packet-evidence-001",
+                "packet-evidence-002",
+                "packet-evidence-003",
+            ]
+        );
+        assert!(
+            evidence
+                .as_slice()
+                .iter()
+                .skip(4)
+                .all(|row| row.summary.is_none())
+        );
+    }
+
+    #[test]
+    fn modern_packet_compaction_retains_every_multifile_source_locator() {
+        let evidence = (0..16)
+            .map(|index| {
+                let id = format!("packet-evidence-{index:03}");
+                let mut row = packet_evidence(
+                    &id,
+                    Some(&format!(
+                        "source-backed stage {index}: {}",
+                        "implementation evidence ".repeat(24)
+                    )),
+                );
+                row.path = Some(
+                    PathTextV3::new(format!("lib/src/stage_{index}.dart"))
+                        .expect("bounded source path"),
+                );
+                row.symbol_id = Some(
+                    codestory_contracts::packet_projection_v3::SymbolIdTextV3::new(format!(
+                        "Stage{index}.send"
+                    ))
+                    .expect("bounded symbol identity"),
+                );
+                row.start_line = Some(index + 1);
+                row.end_line = Some(index + 4);
+                row
+            })
+            .collect::<Vec<_>>();
+        let record = record_fixture_with(
+            "explain the complete multi-file request flow",
+            PacketBudgetModeDto::Compact,
+            PacketProfileV3::Callflow,
+            evidence,
+            Vec::new(),
+            None,
+            RetrievalStateDescriptorV3Dto {
+                state: RetrievalStateV3Dto::Full,
+                generation_id: Some(identity("retrieval-generation-1")),
+            },
+            Vec::new(),
+            true,
+        );
+        let diagnostics = diagnostics_capability_fixture();
+        let four_summary_shape =
+            build_packet_projection_v3(&record, diagnostics.clone(), |candidate| match candidate {
+                PacketProjectionV3Dto::Complete { evidence, .. }
+                    if evidence
+                        .as_slice()
+                        .iter()
+                        .filter(|row| row.summary.is_some())
+                        .count()
+                        > 4 =>
+                {
+                    Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1)
+                }
+                PacketProjectionV3Dto::Complete { .. } => Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3),
+                PacketProjectionV3Dto::BudgetExceeded { .. } => {
+                    Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3)
+                }
+            })
+            .expect("four-summary packet shape");
+        let fixed_envelope_bytes = PACKET_PUBLIC_RESULT_MAX_BYTES_V3
+            - planned_transport_size(PlannedTransportShape::June2025, &four_summary_shape);
+
+        let projection = build_packet_projection_v3(&record, diagnostics, |candidate| {
+            Ok(
+                planned_transport_size(PlannedTransportShape::June2025, candidate)
+                    + fixed_envelope_bytes,
+            )
+        })
+        .expect("the multi-file locator envelope should fit at sixteen KiB");
+        let PacketProjectionV3Dto::Complete { evidence, gaps, .. } = projection else {
+            panic!("the bounded multi-file packet should remain complete");
+        };
+
+        assert_eq!(evidence.as_slice().len(), 16);
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.summary.is_some())
+                .count(),
+            4
+        );
+        assert!(
+            evidence.as_slice().iter().all(|row| {
+                row.path.is_some()
+                    && row.symbol_id.is_some()
+                    && row.start_line.is_some()
+                    && row.end_line.is_some()
+            }),
+            "compaction must not turn preserved evidence identities into contentless rows"
+        );
+        assert_eq!(
+            evidence.as_slice()[15]
+                .path
+                .as_ref()
+                .map(|path| path.as_str()),
+            Some("lib/src/stage_15.dart"),
+            "the only locator for a later upstream file must survive summary trimming"
+        );
+        assert!(gaps.as_slice().iter().any(|gap| {
+            gap.identity.gap_id.as_str() == "packet-optional-context-omitted"
+                && gap.kind == GapKindV3Dto::OutputBudgetExceeded
+        }));
     }
 
     #[derive(Clone, Copy)]
@@ -1091,11 +1413,19 @@ mod tests {
                     status,
                     retrieval: record.retrieval().clone(),
                     diagnostics,
+                    gaps: packet_budget_exceeded_gaps_v3(),
                     maximum_bytes,
                     required_complete_bytes,
                 })
                 .unwrap();
-                for absent in ["evidence", "gaps", "continuation", "summary", "message"] {
+                let gaps = serialized["gaps"].as_array().expect("typed budget gap");
+                assert_eq!(gaps.len(), 1, "fallback must carry exactly one gap");
+                assert_eq!(gaps[0]["kind"], "output_budget_exceeded");
+                assert_eq!(
+                    gaps[0]["identity"]["gap_id"],
+                    "packet-output-budget-exceeded"
+                );
+                for absent in ["evidence", "continuation", "summary"] {
                     assert!(serialized.get(absent).is_none(), "fallback leaked {absent}");
                 }
             }
@@ -1153,8 +1483,8 @@ mod tests {
                 },
                 path: PathTextV3::new("src/lib.rs").unwrap(),
                 symbol_id: None,
-                start_line: 3,
-                end_line: 5,
+                start_line: Some(3),
+                end_line: Some(5),
                 excerpt: None,
             }],
             Vec::new(),
@@ -1215,8 +1545,8 @@ mod tests {
                     },
                     path: PathTextV3::new("src/b.rs").unwrap(),
                     symbol_id: None,
-                    start_line: 7,
-                    end_line: 8,
+                    start_line: Some(7),
+                    end_line: Some(8),
                     excerpt: None,
                 },
                 ContextEvidenceRowV3Dto {
@@ -1225,8 +1555,8 @@ mod tests {
                     },
                     path: PathTextV3::new("src/a.rs").unwrap(),
                     symbol_id: None,
-                    start_line: 3,
-                    end_line: 4,
+                    start_line: Some(3),
+                    end_line: Some(4),
                     excerpt: None,
                 },
             ],

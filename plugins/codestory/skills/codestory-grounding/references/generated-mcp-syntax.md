@@ -11,7 +11,7 @@ CLI docs. Do not send CLI flags as MCP arguments.
 Live tools: `status`, `packet`, `search`, `ground`, `files`, `affected`,
 `symbol`, `trail`, `callers`, `callees`, `trace`, `get_node`, `neighbors`,
 `shortest_path`, `query_subgraph`, `definition`, `references`, `symbols`,
-`snippet`, `context`.
+`snippet`, `context`, `prove_call_path`.
 
 There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 `bookmark`, `serve`, or `cache` tool. Product tools own activation.
@@ -21,7 +21,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | Tool | Required besides `project` | Optional | Notes |
 | --- | --- | --- | --- |
 | `status` | | | Observational. Do not call first. |
-| `packet` | `question` | `budget`, `task_class`, `probes`, `extra_probes`, `include_evidence`, `latency_budget_ms`, DrillOnce `parent_packet_id` / `option_ids` / generation pins | Broad questions. |
+| `packet` | `question` | `budget`, `task_class`, `probes`, `extra_probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Broad evidence questions. No `include_evidence`. |
 | `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery, not packet recovery. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
 | `files` | | `language`, `path`, `role`, `limit` | Refreshes the local map before dispatch. No `refresh` field. |
@@ -40,6 +40,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
 | `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | After packet/search/graph selects targets. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
+| `prove_call_path` | `source_text`, `clauses`, `spec` | | Observational exact verification of a host-supplied typed contract. Never construct one from free English or invoke this tool automatically. |
 
 ## Resources and prompts
 
@@ -49,3 +50,17 @@ project-free.
 
 Host prompts `explain_symbol`, `trace_callflow`, and `impact_analysis` exist
 only if the host exposes them. Prefer the matching tool.
+
+## Wire profiles
+
+CodeStory supports MCP revisions `2024-11-05`, `2025-03-26`, `2025-06-18`,
+and `2025-11-25`, preferring the newest. The 2024 profile lists only
+`name`/`description`/`inputSchema`; March adds annotations; June and November
+add `title`, `outputSchema`, and Tool `_meta`. Older profiles return one JSON
+text object. Modern profiles return schema-valid structured content and the
+identical JSON text object. Tool errors are text-only in every profile.
+
+CodeStory publication stamps use schema 3 with minimum compatible schema 3.
+Each negotiated profile has its own discovery digest. The 2024 and March
+profiles accept ordered JSON-RPC batches and omit notification responses; June
+and November reject arrays with `-32600`.

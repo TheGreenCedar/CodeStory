@@ -1,12 +1,12 @@
 use std::path::Path;
 
 pub use codestory_retrieval::{
-    CacheCleanPlan, CacheCleanReport, FinalizeIndexOutcome, GenerationRetentionApplyReport,
-    GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
-    RetainedRollbackObservation, RetrievalIndexManifest, RetrievalStatusReport,
-    RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
-    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarGcReport, SidecarInventoryReport,
-    SidecarProcessDefaults as RetrievalProcessDefaults,
+    CacheCleanPlan, CacheCleanReport, FinalizeComponentWork, FinalizeIndexOutcome,
+    FinalizePhaseTiming, GenerationRetentionApplyReport, GenerationRetentionPlan,
+    ProcessOwnerState, ProcessStartProbe, QueryResult, RetainedRollbackObservation,
+    RetrievalIndexManifest, RetrievalStatusReport, RollbackActivationError,
+    RollbackActivationOutcome, RollbackActivationRefusal, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
+    SidecarGcReport, SidecarInventoryReport, SidecarProcessDefaults as RetrievalProcessDefaults,
     SidecarRuntimeDefaults as RetrievalRuntimeDefaults,
     SidecarRuntimeOverrides as RetrievalRuntimeOverrides,
 };

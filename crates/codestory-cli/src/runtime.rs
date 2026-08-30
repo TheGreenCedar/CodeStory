@@ -59,6 +59,7 @@ pub(crate) struct RefreshDecision {
 /// artifact paths. Product surfaces initialize the shared embedded engine when
 /// they need semantic work; inspect-only surfaces remain observational.
 pub(crate) struct RuntimeContext {
+    pub(crate) runtime: Runtime,
     pub(crate) activation: ActivationService,
     pub(crate) public_operation: PublicOperationService,
     pub(crate) project: ProjectService,
@@ -182,6 +183,7 @@ impl RuntimeContextConfiguration {
             ));
         let events = runtime.events();
         RuntimeContext {
+            runtime: runtime.clone(),
             activation: runtime.activation_service(),
             public_operation: runtime.public_operation_service(),
             project: runtime.project_service(),
@@ -1330,11 +1332,11 @@ mod tests {
         // must see the bump rather than a self-referential comparison.
         assert_eq!(
             value.pointer("/_meta/codestory_publication/schema_version"),
-            Some(&serde_json::json!(2))
+            Some(&serde_json::json!(3))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/minimum_compatible_schema_version"),
-            Some(&serde_json::json!(2))
+            Some(&serde_json::json!(3))
         );
         assert_eq!(
             value.pointer("/_meta/codestory_publication/contract_runtime/cli_version"),

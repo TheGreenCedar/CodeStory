@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Added an observational exact call-path verifier to the CLI and MCP. It checks
+  a complete host-supplied typed contract against one pinned indexed
+  publication, reports proof-domain uncertainty explicitly, and never treats
+  packet, context, or search output as proof authority.
+- Packet, context, and search now return closed CodeStory schema-3 evidence
+  projections. They report concrete evidence, gaps, retrieval state, and one
+  bounded continuation without claiming that an arbitrary natural-language
+  answer is proved. Packet diagnostics can be written separately with
+  `--diagnostics-out` or read through a short-lived session capability.
+- MCP discovery and results now match the negotiated 2024, March 2025, June
+  2025, or November 2025 protocol profile. Older profiles receive JSON text;
+  modern profiles receive matching structured content and JSON text. Invalid
+  packet fields fail as invalid arguments, and packet no longer accepts
+  `include_evidence` or `--no-evidence`.
+- TypeScript and JavaScript config files can now be indexed when they use JSONC comments or trailing commas. Ordinary JSON stays strict, and malformed config changes leave the previous complete index available.
+- Full-coverage cold indexing sends more documents through each bounded
+  embedding request, reducing client/server overhead without changing the
+  model, dense coverage, stored vectors, or search ranking.
+
 ## 0.17.5
 
 Cursor still dropped `files`, `snippet`, and preparing `packet`/`search`/`context` results: empty `policy_exclusions` were omitted, batched snippets used a ranges document, and the shared `codestory_preparing` envelope was undeclared.

@@ -389,7 +389,7 @@ fn append_index_members(markdown: &mut String, output: &IndexOutput<'_>) {
     }
 }
 
-fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
+pub(crate) fn append_index_phase_timings(markdown: &mut String, timings: &IndexingPhaseTimings) {
     let _ = writeln!(
         markdown,
         "timings_ms: parse={} flush={} resolve={} cleanup={} cache_refresh={}",
@@ -3120,45 +3120,78 @@ pub(crate) fn render_drill_markdown(output: &DrillOutput) -> String {
 }
 
 fn append_evidence_packet(markdown: &mut String, output: &DrillOutput) {
-    let packet = &output.evidence_packet;
-    let _ = writeln!(
-        markdown,
-        "evidence_packet: id={} sufficiency={} citations={}",
-        packet.packet_id,
-        crate::packet_sufficiency_label(packet.disposition.kind),
-        packet.answer.citations.len()
-    );
-    let _ = writeln!(markdown, "- question: {}", packet.question);
-    if !packet.support.is_empty() {
-        let _ = writeln!(markdown, "- support:");
-        for unit in packet.support.iter().take(EVIDENCE_PREVIEW_LIMIT) {
-            let _ = writeln!(markdown, "  - {}", unit.summary);
-        }
-    }
-    if !packet.disposition.omission_receipts.is_empty() {
-        let _ = writeln!(markdown, "- gaps:");
-        for gap in packet
-            .disposition
-            .omission_receipts
-            .iter()
-            .take(EVIDENCE_PREVIEW_LIMIT)
-        {
-            let _ = writeln!(markdown, "  - {gap}");
-        }
-    }
-    if !packet.answer.citations.is_empty() {
-        let _ = writeln!(markdown, "- citations:");
-        for citation in packet.answer.citations.iter().take(EVIDENCE_PREVIEW_LIMIT) {
-            let path = citation.file_path.as_deref().unwrap_or("<no-file>");
-            let line = citation
-                .line
-                .map(|line| format!(":{line}"))
-                .unwrap_or_default();
+    match &output.evidence_packet {
+        codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::Complete {
+            identity,
+            status,
+            evidence,
+            gaps,
+            ..
+        } => {
+            let availability = match status {
+                codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::Available => {
+                    "available"
+                }
+                codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::ContinuationAvailable => {
+                    "continuation_available"
+                }
+                codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::NoUsefulEvidence => {
+                    "no_useful_evidence"
+                }
+                codestory_contracts::packet_projection_v3::EvidenceAvailabilityV3Dto::Unavailable => {
+                    "unavailable"
+                }
+            };
             let _ = writeln!(
                 markdown,
-                "  - `{}` [{:?}] `{path}`{line} score={:.3}",
-                citation.display_name, citation.kind, citation.score
+                "evidence_packet: id={} availability={availability} evidence={}",
+                identity.packet_id.as_str(),
+                evidence.as_slice().len()
             );
+            if !evidence.as_slice().is_empty() {
+                let _ = writeln!(markdown, "- evidence:");
+                for row in evidence.as_slice().iter().take(EVIDENCE_PREVIEW_LIMIT) {
+                    let summary = row
+                        .summary
+                        .as_ref()
+                        .map_or("evidence row", |value| value.as_str());
+                    let path = row
+                        .path
+                        .as_ref()
+                        .map_or("<no-file>", |value| value.as_str());
+                    let _ = writeln!(markdown, "  - {summary} (`{path}`)");
+                }
+            }
+            if !gaps.as_slice().is_empty() {
+                let _ = writeln!(markdown, "- gaps:");
+                for gap in gaps.as_slice().iter().take(EVIDENCE_PREVIEW_LIMIT) {
+                    let message = gap
+                        .message
+                        .as_ref()
+                        .map_or("additional evidence required", |value| value.as_str());
+                    let _ = writeln!(markdown, "  - {message}");
+                }
+            }
+        }
+        codestory_contracts::packet_projection_v3::PacketProjectionV3Dto::BudgetExceeded {
+            identity,
+            gaps,
+            maximum_bytes,
+            required_complete_bytes,
+            ..
+        } => {
+            let _ = writeln!(
+                markdown,
+                "evidence_packet: id={} availability=unavailable budget={maximum_bytes} required={required_complete_bytes}",
+                identity.packet_id.as_str()
+            );
+            for gap in gaps.as_slice() {
+                let _ = writeln!(
+                    markdown,
+                    "- gap: output_budget_exceeded (`{}`)",
+                    gap.identity.gap_id.as_str()
+                );
+            }
         }
     }
 }

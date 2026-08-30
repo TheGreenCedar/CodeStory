@@ -159,6 +159,12 @@ impl AppController {
         };
         if changed {
             self.sidecar_query_cache.lock().clear();
+            #[cfg(any(
+                test,
+                feature = "test-support",
+                feature = "proof-qualification-support"
+            ))]
+            self.clear_proof_publication_validation_cache();
         }
 
         Ok(summary)
@@ -191,6 +197,12 @@ impl AppController {
             publish_search_engine(&mut s, loaded.engine, loaded.publication);
         }
         self.sidecar_query_cache.lock().clear();
+        #[cfg(any(
+            test,
+            feature = "test-support",
+            feature = "proof-qualification-support"
+        ))]
+        self.clear_proof_publication_validation_cache();
 
         let _ = self.events_tx.send(AppEventPayload::StatusUpdate {
             message: "Project opened.".to_string(),
@@ -327,6 +339,12 @@ impl AppController {
         };
         if changed {
             self.sidecar_query_cache.lock().clear();
+            #[cfg(any(
+                test,
+                feature = "test-support",
+                feature = "proof-qualification-support"
+            ))]
+            self.clear_proof_publication_validation_cache();
         }
         Ok(Some(summary))
     }

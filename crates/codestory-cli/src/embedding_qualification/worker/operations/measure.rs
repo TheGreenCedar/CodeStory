@@ -770,6 +770,7 @@ fn validate_vector_response(
             columns,
             encoding,
             identity,
+            ..
         }) => (*rows, *columns, encoding, identity.as_ref()),
         _ => bail!("embedding_qualification_measurement_vectors_missing"),
     };

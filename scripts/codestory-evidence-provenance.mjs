@@ -188,6 +188,9 @@ export function packetEmbeddingExecutionProofBlockers(provenance) {
   if (!proof) {
     return ["missing cold packet embedding execution proof"];
   }
+  if (proof.source === "packet.v3_public_projection") {
+    return packetV3PublicProjectionProofBlockers(provenance, proof);
+  }
   const reasons = [];
   if (proof.source !== "packet.answer.retrieval_trace") {
     reasons.push(`cold packet embedding execution source=${proof.source ?? "unknown"}; expected packet.answer.retrieval_trace`);
@@ -257,6 +260,97 @@ export function packetEmbeddingExecutionProofBlockers(provenance) {
     provenance?.embedding_policy
     && proof.embedding_policy
     && provenance.embedding_policy !== proof.embedding_policy
+  ) {
+    reasons.push("cold packet embedding policy does not match cache provenance");
+  }
+  return reasons;
+}
+
+function packetV3PublicProjectionProofBlockers(provenance, proof) {
+  const reasons = [];
+  if (proof.schema_version !== 3) {
+    reasons.push(`cold packet public projection schema=${proof.schema_version ?? "unknown"}; expected 3`);
+  }
+  if (!["cold_cli_packet", "agent_harness_prelude"].includes(proof.transport_mode)) {
+    reasons.push(`cold packet embedding execution transport=${proof.transport_mode ?? "unknown"}; expected cold_cli_packet or agent_harness_prelude`);
+  }
+  if (proof.retrieval_contract !== "in_process_v1") {
+    reasons.push(`cold packet retrieval contract=${proof.retrieval_contract ?? "unknown"}; expected in_process_v1`);
+  }
+  if (proof.embedding_engine !== "process_shared") {
+    reasons.push(`cold packet embedding engine=${proof.embedding_engine ?? "unknown"}; expected process_shared`);
+  }
+  if (proof.embedding_policy !== "accelerated") {
+    reasons.push(`cold packet embedding policy=${proof.embedding_policy ?? "unknown"}; expected accelerated`);
+  }
+  if (proof.retrieval_mode !== "full") {
+    reasons.push(`cold packet retrieval mode=${proof.retrieval_mode ?? "unknown"}; expected full`);
+  }
+  if (!["complete", "budget_exceeded"].includes(proof.packet_kind)) {
+    reasons.push(`cold packet public projection kind=${proof.packet_kind ?? "unknown"} is invalid`);
+  }
+  if (!["available", "continuation_available", "no_useful_evidence", "unavailable"].includes(proof.evidence_status)) {
+    reasons.push(`cold packet evidence status=${proof.evidence_status ?? "unknown"} is invalid`);
+  }
+  if (!Number.isInteger(proof.evidence_count) || proof.evidence_count < 0) {
+    reasons.push("cold packet public projection has invalid evidence accounting");
+  }
+  if (!Number.isInteger(proof.gap_count) || proof.gap_count < 0) {
+    reasons.push("cold packet public projection has invalid gap accounting");
+  }
+  if (
+    proof.packet_kind === "budget_exceeded" &&
+    (proof.evidence_count !== 0 || proof.gap_count <= 0 || proof.evidence_status !== "unavailable")
+  ) {
+    reasons.push("cold packet budget fallback contains invalid evidence or gap accounting");
+  }
+  if (!proof.core_generation || !proof.core_run_id) {
+    reasons.push("cold packet public projection is missing core publication identity");
+  }
+  if (
+    proof.retrieval_core_generation !== proof.core_generation ||
+    proof.retrieval_core_run_id !== proof.core_run_id
+  ) {
+    reasons.push("cold packet retrieval publication does not match its core publication");
+  }
+  if (
+    !proof.retrieval_generation ||
+    proof.retrieval_state_generation !== proof.retrieval_generation
+  ) {
+    reasons.push("cold packet retrieval state generation does not match its publication");
+  }
+  if (!proof.semantic_generation || !proof.prepared_semantic_generation) {
+    reasons.push("cold packet public projection is missing semantic generation identity");
+  } else if (proof.semantic_generation !== proof.prepared_semantic_generation) {
+    reasons.push("cold packet semantic generation does not match the prepared generation");
+  }
+  if (
+    provenance?.semantic_generation &&
+    proof.prepared_semantic_generation &&
+    provenance.semantic_generation !== proof.prepared_semantic_generation
+  ) {
+    reasons.push("cold packet prepared semantic generation does not match cache provenance");
+  }
+  if (
+    proof.diagnostics_availability !== "available" ||
+    !String(proof.diagnostics_artifact_id ?? "").trim() ||
+    !isSha256(proof.diagnostics_sha256) ||
+    !Number.isInteger(proof.diagnostics_byte_length) ||
+    proof.diagnostics_byte_length < 0
+  ) {
+    reasons.push("cold packet public projection has no valid diagnostics reference");
+  }
+  if (
+    provenance?.transport_mode &&
+    proof.transport_mode &&
+    provenance.transport_mode !== proof.transport_mode
+  ) {
+    reasons.push("cold packet transport does not match cache provenance");
+  }
+  if (
+    provenance?.embedding_policy &&
+    proof.embedding_policy &&
+    provenance.embedding_policy !== proof.embedding_policy
   ) {
     reasons.push("cold packet embedding policy does not match cache provenance");
   }

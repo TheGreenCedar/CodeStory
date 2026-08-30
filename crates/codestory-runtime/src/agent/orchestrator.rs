@@ -115,7 +115,8 @@ use crate::agent::packet_terms::{
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
-    RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
+    RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome,
+    hydrate_packet_exact_call_boundaries_post_pass, maybe_run_retrieval_shadow,
     sidecar_retrieval_blocks_nucleo_supplement, sidecar_retrieval_primary_enabled,
     sidecar_retrieval_unavailable_error, try_sidecar_primary_search,
 };
@@ -459,12 +460,8 @@ pub(crate) fn agent_packet(
         }
     }
     let probe_resolutions = resolve_packet_probes(controller, probes);
-    let exact_probe_citations = exact_packet_probe_citations(
-        controller,
-        &probe_resolutions,
-        &question,
-        req.include_evidence,
-    );
+    let exact_probe_citations =
+        exact_packet_probe_citations(controller, &probe_resolutions, &question, true);
     let extra_probes = resolved_packet_probe_queries(&probe_resolutions);
     let mut plan =
         build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);
@@ -508,7 +505,7 @@ pub(crate) fn agent_packet(
             max_results: Some(limits.max_anchors.clamp(1, 25)),
             response_mode: AgentResponseModeDto::Structured,
             latency_budget_ms: req.latency_budget_ms,
-            include_evidence: req.include_evidence,
+            include_evidence: true,
             hybrid_weights: None,
         },
     )?;
@@ -517,7 +514,7 @@ pub(crate) fn agent_packet(
         let selected = merge_packet_initial_search_hits(
             &mut answer,
             &initial_packet_hits,
-            req.include_evidence,
+            true,
             &rank_terms,
             packet_stage_citation_carry_limit(&limits),
             &flow_requirements,
@@ -562,7 +559,7 @@ pub(crate) fn agent_packet(
         &plan,
         req.budget,
         &limits,
-        req.include_evidence,
+        true,
         packet_latency,
         &rank_terms,
         &mut answer,
@@ -615,6 +612,7 @@ pub(crate) fn agent_packet(
     // sidecar stage clock. This fills the session ledger the extras builder
     // reads below.
     crate::agent::retrieval_primary::hydrate_packet_atom_trails_post_pass(controller, &mut answer);
+    hydrate_packet_exact_call_boundaries_post_pass(controller, &flow_requirements, &mut answer);
     // R7: the runtime's verified evidence extras — R2 trail-coverage records
     // and R4 anchored receipts — are threaded through the proving passes.
     // The pre-cap capture proves against the uncapped graphs with coverage
@@ -670,6 +668,7 @@ pub(crate) fn agent_packet(
         &mut answer,
         &limits,
         &proof_session,
+        &protected_carrier_node_ids,
     );
 
     // Coverage belongs to the evidence that survives the real citation cap. Observing the
@@ -1750,6 +1749,34 @@ fn cited_source_paths_with_extensions(
         }
         paths.push(path);
     }
+    for node in answer
+        .graphs
+        .iter()
+        .filter_map(|artifact| match artifact {
+            GraphArtifactDto::Uml { graph, .. } => Some(&graph.nodes),
+            GraphArtifactDto::Mermaid { .. } => None,
+        })
+        .flatten()
+    {
+        let Some(raw) = node.file_path.as_deref() else {
+            continue;
+        };
+        let path = if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            project_root.join(raw)
+        };
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .unwrap_or_default();
+        if extensions.iter().any(|expected| extension == *expected)
+            && !paths.iter().any(|existing| existing == &path)
+        {
+            paths.push(path);
+        }
+    }
     paths
 }
 
@@ -2367,9 +2394,9 @@ fn order_packet_sections(sections: &mut [AgentResponseSectionDto]) {
 const CARRIER_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
 const CARRIER_SOURCE_MAX_SNIPPET_BYTES: usize = 1_536;
 const CARRIER_SOURCE_FOCUSED_SNIPPET_BYTES: usize = CARRIER_SOURCE_MAX_SNIPPET_BYTES / 2;
-const CARRIER_SOURCE_FOCUS_CONTEXT_LINES: usize = 4;
+const CARRIER_SOURCE_FOCUS_CONTEXT_LINES: usize = 5;
 const CARRIER_SOURCE_FILE_FOCUS_CONTEXT_LINES: usize = 17;
-const CARRIER_SOURCE_MAX_FOCUSED_WINDOWS: usize = 2;
+const CARRIER_SOURCE_MAX_FOCUSED_WINDOWS: usize = 3;
 const CARRIER_SOURCE_MAX_FOCUS_FILE_BYTES: u64 = 512 * 1_024;
 const CARRIER_SOURCE_DECLARATION_FALLBACK_LINES: u32 = 24;
 /// R4 anchored windows span the declaration line plus this many lines below
@@ -2415,13 +2442,45 @@ fn citation_is_lexical_source_range(citation: &AgentCitationDto) -> bool {
         && citation.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
 }
 
-fn citation_needs_bounded_source_read(citation: &AgentCitationDto) -> bool {
-    let structural_source = citation.evidence_tier == Some(PacketEvidenceTierDto::StructuralText)
+fn citation_is_structural_source_range(citation: &AgentCitationDto) -> bool {
+    citation.evidence_tier == Some(PacketEvidenceTierDto::StructuralText)
         && citation
             .evidence_producer
             .as_deref()
-            .is_some_and(|producer| producer.starts_with("structural_"));
-    structural_source || citation_is_lexical_source_range(citation)
+            .is_some_and(|producer| producer.starts_with("structural_"))
+}
+
+fn citation_is_internal_synthetic_source_range(citation: &AgentCitationDto) -> bool {
+    citation.evidence_tier == Some(PacketEvidenceTierDto::SyntheticSourceScan)
+        && citation.resolution_status == Some(PacketEvidenceResolutionDto::SourceRangeOnly)
+        && citation
+            .evidence_producer
+            .as_deref()
+            .is_some_and(|producer| producer.starts_with("packet_"))
+}
+
+fn citation_needs_bounded_source_read(citation: &AgentCitationDto) -> bool {
+    citation_is_structural_source_range(citation)
+        || citation_is_lexical_source_range(citation)
+        || citation_is_internal_synthetic_source_range(citation)
+}
+
+/// Upgrade only a CodeStory-owned source-shape lead after its bounded source read succeeded.
+fn promote_verified_bounded_source_citation(citation: &mut AgentCitationDto) -> bool {
+    if !citation_is_structural_source_range(citation)
+        && !citation_is_internal_synthetic_source_range(citation)
+    {
+        return false;
+    }
+    let producer = citation
+        .evidence_producer
+        .as_deref()
+        .unwrap_or("source_shape_collector");
+    citation.evidence_tier = Some(PacketEvidenceTierDto::ExactSource);
+    citation.evidence_producer = Some(format!("verified_{producer}_source_read"));
+    citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+    citation.eligible_for_sufficiency = Some(true);
+    true
 }
 
 fn demote_parser_partial_citations_without_source_receipts(
@@ -3029,6 +3088,7 @@ fn append_packet_carrier_source_sections(
     answer: &mut AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,
     proof_session: &PacketProofSession,
+    protected_carrier_node_ids: &[NodeId],
 ) -> (Vec<SupportUnitDto>, Vec<VerifiedSourceAspectReceipt>) {
     if answer.citations.is_empty() || limits.max_snippets == 0 {
         return (Vec::new(), Vec::new());
@@ -3038,34 +3098,36 @@ fn append_packet_carrier_source_sections(
     let mut steps = Vec::new();
     let mut source_support = Vec::new();
     let file_focus_text = packet_file_source_focus_text(question, answer);
-
-    'citations: for citation_index in 0..answer.citations.len() {
-        if steps.len() >= limits.max_snippets as usize {
-            break;
-        }
-        let citation = answer.citations[citation_index].clone();
-        let structural_source = citation.evidence_tier
-            == Some(PacketEvidenceTierDto::StructuralText)
-            && citation
-                .evidence_producer
-                .as_deref()
-                .is_some_and(|producer| producer.starts_with("structural_"));
-        let bounded_source_read = citation_needs_bounded_source_read(&citation);
+    let load_sources = |citation: &AgentCitationDto| -> Vec<CarrierSourceRange> {
+        let bounded_source_read = citation_needs_bounded_source_read(citation);
         let behavioral_source = matches!(
             citation.kind,
             NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
         );
         if !bounded_source_read && !behavioral_source {
-            continue;
+            return Vec::new();
         }
-        let started = Instant::now();
-        let sources = if bounded_source_read {
+        if bounded_source_read {
             let (Some(path), Some(line)) = (citation.file_path.as_deref(), citation.line) else {
-                continue;
+                return Vec::new();
             };
             let focused =
-                if citation.kind == NodeKind::FILE && citation_is_lexical_source_range(&citation) {
+                if citation.kind == NodeKind::FILE && citation_is_lexical_source_range(citation) {
                     focused_file_source_ranges(controller, &file_focus_text, path)
+                } else if behavioral_source {
+                    controller
+                        .snippet_function_body_context(citation.node_id.clone(), 0)
+                        .ok()
+                        .map(|snippet| {
+                            focused_function_source_ranges(
+                                controller,
+                                &file_focus_text,
+                                &snippet.path,
+                                snippet.line,
+                                snippet.node.end_line,
+                            )
+                        })
+                        .unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -3120,7 +3182,7 @@ fn append_packet_carrier_source_sections(
                     {
                         let focused = focused_function_source_ranges(
                             controller,
-                            question,
+                            &file_focus_text,
                             &snippet.path,
                             snippet.line,
                             snippet.node.end_line,
@@ -3136,66 +3198,140 @@ fn append_packet_carrier_source_sections(
                     }]
                 })
                 .unwrap_or_default()
-        };
+        }
+    };
+
+    // Spend one source slot on each exact material carrier first, then return to the original
+    // citation/window order for optional context. Reads remain on demand: once the existing
+    // snippet or byte cap binds, later citations are never opened.
+    let append_source = |answer: &mut AgentAnswerDto,
+                         rendered: &mut String,
+                         source_support: &mut Vec<SupportUnitDto>,
+                         steps: &mut Vec<AgentRetrievalStepDto>,
+                         citation_index: usize,
+                         duration_ms: u32,
+                         source: CarrierSourceRange|
+     -> bool {
+        promote_verified_bounded_source_citation(&mut answer.citations[citation_index]);
+        let citation = answer.citations[citation_index].clone();
+        let body = source.body.trim_end();
+        if body.is_empty() {
+            return true;
+        }
+        let retained_body = truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES);
+        let entry = format!("### {}\n\n{}\n\n", citation.display_name, retained_body);
+        if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
+            return false;
+        }
+        rendered.push_str(&entry);
+        let citation = &answer.citations[citation_index];
+        if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
+            let path = packet_display_path(&source.path);
+            let (start_line, end_line) =
+                source_receipt_line_range(retained_body, source.start_line);
+            source_support.push(SupportUnitDto {
+                id: format!("source:{}:{start_line}", citation.node_id.0),
+                kind: SupportUnitKindDto::SourceRange,
+                summary: format!(
+                    "source for {} at {path}:{start_line}-{end_line}",
+                    citation.display_name,
+                ),
+                path: Some(path),
+                symbol_id: Some(citation.node_id.0.clone()),
+                start_line: Some(start_line),
+                end_line: Some(end_line),
+                snippet: Some(retained_body.to_string()),
+                edge_kind: None,
+                from_symbol: None,
+                to_symbol: None,
+                query: None,
+            });
+        }
+        steps.push(AgentRetrievalStepDto {
+            kind: AgentRetrievalStepKindDto::SourceRead,
+            status: AgentRetrievalStepStatusDto::Ok,
+            duration_ms,
+            input: Vec::new(),
+            output: Vec::new(),
+            message: Some(format!("carrier source for {}", citation.display_name)),
+        });
+        true
+    };
+
+    let protected = protected_carrier_node_ids.iter().collect::<HashSet<_>>();
+    let mut attempted = HashSet::new();
+    let mut deferred = HashMap::new();
+    let mut source_read_citations = HashSet::new();
+    let mut source_budget_exhausted = false;
+    for citation_index in 0..answer.citations.len() {
+        if steps.len() >= limits.max_snippets as usize {
+            break;
+        }
+        let citation = answer.citations[citation_index].clone();
+        if !protected.contains(&citation.node_id) {
+            continue;
+        }
+        attempted.insert(citation_index);
+        debug_assert!(steps.len() < limits.max_snippets as usize);
+        debug_assert!(source_read_citations.insert(citation_index));
+        let started = Instant::now();
+        let mut sources = load_sources(&citation);
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u32::MAX);
         if sources.is_empty() {
             continue;
         }
-        if structural_source {
-            let citation = &mut answer.citations[citation_index];
-            let producer = citation
-                .evidence_producer
-                .as_deref()
-                .unwrap_or("structural_source_collector");
-            citation.evidence_tier = Some(PacketEvidenceTierDto::ExactSource);
-            citation.evidence_producer = Some(format!("verified_{producer}_source_read"));
-            citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
-            citation.eligible_for_sufficiency = Some(true);
+        let first = sources.remove(0);
+        if !append_source(
+            answer,
+            &mut rendered,
+            &mut source_support,
+            &mut steps,
+            citation_index,
+            duration_ms,
+            first,
+        ) {
+            source_budget_exhausted = true;
+            break;
         }
-        for source in sources {
+        deferred.insert(citation_index, (duration_ms, sources));
+    }
+
+    if !source_budget_exhausted {
+        'citations: for citation_index in 0..answer.citations.len() {
             if steps.len() >= limits.max_snippets as usize {
-                break 'citations;
+                break;
             }
-            let body = source.body.trim_end();
-            if body.is_empty() {
-                continue;
+            let citation = answer.citations[citation_index].clone();
+            let (duration_ms, sources) = if attempted.contains(&citation_index) {
+                deferred
+                    .remove(&citation_index)
+                    .unwrap_or_else(|| (0, Vec::new()))
+            } else {
+                debug_assert!(steps.len() < limits.max_snippets as usize);
+                debug_assert!(source_read_citations.insert(citation_index));
+                let started = Instant::now();
+                let sources = load_sources(&citation);
+                (
+                    started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
+                    sources,
+                )
+            };
+            for source in sources {
+                if steps.len() >= limits.max_snippets as usize {
+                    break 'citations;
+                }
+                if !append_source(
+                    answer,
+                    &mut rendered,
+                    &mut source_support,
+                    &mut steps,
+                    citation_index,
+                    duration_ms,
+                    source,
+                ) {
+                    break 'citations;
+                }
             }
-            let retained_body = truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES);
-            let entry = format!("### {}\n\n{}\n\n", citation.display_name, retained_body);
-            if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
-                break 'citations;
-            }
-            rendered.push_str(&entry);
-            let citation = &answer.citations[citation_index];
-            if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
-                let path = packet_display_path(&source.path);
-                let (start_line, end_line) =
-                    source_receipt_line_range(retained_body, source.start_line);
-                source_support.push(SupportUnitDto {
-                    id: format!("source:{}:{start_line}", citation.node_id.0),
-                    kind: SupportUnitKindDto::SourceRange,
-                    summary: format!(
-                        "source for {} at {path}:{start_line}-{end_line}",
-                        citation.display_name,
-                    ),
-                    path: Some(path),
-                    symbol_id: Some(citation.node_id.0.clone()),
-                    start_line: Some(start_line),
-                    end_line: Some(end_line),
-                    snippet: Some(retained_body.to_string()),
-                    edge_kind: None,
-                    from_symbol: None,
-                    to_symbol: None,
-                    query: None,
-                });
-            }
-            steps.push(AgentRetrievalStepDto {
-                kind: AgentRetrievalStepKindDto::SourceRead,
-                status: AgentRetrievalStepStatusDto::Ok,
-                duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
-                input: Vec::new(),
-                output: Vec::new(),
-                message: Some(format!("carrier source for {}", citation.display_name)),
-            });
         }
     }
 
@@ -3674,8 +3810,8 @@ fn source_receipt_line_range(markdown: &str, fallback_start: u32) -> (u32, u32) 
     )
 }
 
-/// A long function is rarely best represented by its prologue. Select at most two bounded,
-/// non-overlapping windows whose source words match separate action clauses from the question.
+/// A long function is rarely best represented by its prologue. Select at most three bounded,
+/// distinct windows whose source words match separate action clauses from the question.
 /// The ranges remain exact source receipts for the already selected symbol; this changes only
 /// which verified bytes spend the packet's fixed source budget.
 fn focused_function_source_ranges(
@@ -3770,10 +3906,7 @@ fn focused_function_source_lines(
             continue;
         };
         let focus_line = (center + 1) as u32;
-        let overlaps_existing = selected.iter().any(|selected_line: &u32| {
-            selected_line.abs_diff(focus_line) <= (CARRIER_SOURCE_FOCUS_CONTEXT_LINES * 2) as u32
-        });
-        if !overlaps_existing {
+        if !selected.contains(&focus_line) {
             selected.push(focus_line);
         }
         if selected.len() >= CARRIER_SOURCE_MAX_FOCUSED_WINDOWS {
@@ -3785,12 +3918,48 @@ fn focused_function_source_lines(
 }
 
 fn source_focus_clauses(question: &str) -> Vec<Vec<String>> {
-    question
-        .split([',', ';', '.', '?', '!', '\n', '\r'])
-        .flat_map(|clause| clause.split(" and "))
-        .map(source_focus_terms)
-        .filter(|terms| terms.len() >= 2)
-        .collect()
+    let mut clauses: Vec<Vec<String>> = Vec::new();
+    let mut active_list: Option<Vec<String>> = None;
+    for clause in question.split([',', ';', '.', '?', '!', '\n', '\r']) {
+        let clause = clause.trim();
+        let continuation = clause.strip_prefix("and ").unwrap_or(clause);
+        let combined_terms = source_focus_terms(continuation);
+        if (combined_terms.len() <= 1
+            || (continuation.len() != clause.len() && combined_terms.len() <= 2))
+            && let Some(previous) = clauses.last_mut()
+        {
+            let list = active_list
+                .get_or_insert_with(|| previous.last().cloned().into_iter().collect::<Vec<_>>());
+            for term in combined_terms {
+                if !previous.contains(&term) {
+                    previous.push(term.clone());
+                }
+                if !list.contains(&term) {
+                    list.push(term);
+                }
+            }
+            continue;
+        }
+        if let Some(list) = active_list.take()
+            && list.len() >= 2
+            && !clauses.contains(&list)
+        {
+            clauses.push(list);
+        }
+        for action in continuation.split(" and ") {
+            let terms = source_focus_terms(action);
+            if terms.len() >= 2 && !clauses.contains(&terms) {
+                clauses.push(terms);
+            }
+        }
+    }
+    if let Some(list) = active_list
+        && list.len() >= 2
+        && !clauses.contains(&list)
+    {
+        clauses.push(list);
+    }
+    clauses
 }
 
 fn source_focus_terms(value: &str) -> Vec<String> {
@@ -3845,9 +4014,16 @@ fn source_focus_stem(term: &str) -> &str {
 }
 
 fn source_focus_terms_match(left: &str, right: &str) -> bool {
-    left == right
-        || (left.len().min(right.len()) >= 4
-            && (left.starts_with(right) || right.starts_with(left)))
+    if left == right {
+        return true;
+    }
+    fn role_noun_base(term: &str) -> Option<&str> {
+        term.strip_suffix("er").filter(|base| base.len() >= 4)
+    }
+    if role_noun_base(left) == Some(right) || role_noun_base(right) == Some(left) {
+        return false;
+    }
+    left.len().min(right.len()) >= 4 && (left.starts_with(right) || right.starts_with(left))
 }
 
 fn packet_evidence_ledger_markdown(
@@ -8178,6 +8354,55 @@ mod tests {
     }
 
     #[test]
+    fn source_focus_does_not_treat_control_flow_as_a_component_owner() {
+        assert!(!source_focus_terms_match("matcher", "match"));
+        assert!(!source_focus_terms_match("searcher", "search"));
+        assert!(!source_focus_terms_match("printer", "print"));
+        assert!(source_focus_terms_match("matcher", "matcher"));
+    }
+
+    #[test]
+    fn long_function_focus_keeps_component_list_and_parallel_dispatch_together() {
+        let source = [
+            "fn search_parallel(args: &HiArgs) {",
+            "    let started_at = Instant::now();",
+            "    let buffer = args.buffer_writer();",
+            "    let stats = args.stats();",
+            "    let matched = AtomicBool::new(false);",
+            "    let searched = AtomicBool::new(false);",
+            "    let haystack_builder = args.haystack_builder();",
+            "    let mut worker = args.search_worker(",
+            "        args.matcher()?,",
+            "        args.searcher()?,",
+            "        args.printer(),",
+            "    )?;",
+            "    args.walk_builder()?.build_parallel().run(|| {",
+            "        let haystack = haystack_builder.build_from_result(result);",
+            "        worker.search(&haystack);",
+            "    });",
+            "}",
+        ];
+
+        let focus = focused_function_source_lines(
+            &source,
+            1,
+            source.len() as u32,
+            "Explain how the program walks candidate files and executes a search over each haystack through matcher, searcher, and printer components.\nparallel search walk builder",
+        );
+
+        let covers = |line: u32| {
+            focus.iter().any(|focus_line| {
+                focus_line.saturating_sub(CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32) <= line
+                    && focus_line + CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32 >= line
+            })
+        };
+        assert!(
+            covers(8) && covers(13),
+            "the focused ranges must keep both component construction and parallel dispatch: {focus:?}",
+        );
+    }
+
+    #[test]
     fn file_focus_skips_title_and_covers_structure_and_behavior() {
         let source = [
             "<!DOCTYPE html>",
@@ -8203,7 +8428,16 @@ mod tests {
             "Explain how native form constraints combine with custom validation.\nsubmit prevent default\nvalidity state",
         );
 
-        assert_eq!(focus, [7, 16]);
+        let covers = |line: u32| {
+            focus.iter().any(|focus_line| {
+                focus_line.saturating_sub(CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32) <= line
+                    && focus_line + CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32 >= line
+            })
+        };
+        assert!(
+            covers(8) && covers(12),
+            "the focused ranges must keep both native constraints and custom validation: {focus:?}",
+        );
         assert!(!focus.contains(&4), "the title is not behavioral evidence");
     }
 
@@ -8429,6 +8663,34 @@ mod tests {
 
         citation.resolution_status = Some(PacketEvidenceResolutionDto::Unresolved);
         assert!(!citation_needs_bounded_source_read(&citation));
+    }
+
+    #[test]
+    fn internal_synthetic_source_scan_uses_its_path_and_line_for_the_receipt() {
+        let mut citation = test_packet_citation("format_arg_store", "include/fmt/base.h", 46.0);
+        citation.kind = NodeKind::STRUCT;
+        citation.evidence_tier = Some(PacketEvidenceTierDto::SyntheticSourceScan);
+        citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+        citation.evidence_producer = Some("packet_cited_formatting_type".to_owned());
+
+        assert!(citation_needs_bounded_source_read(&citation));
+        assert!(citation_is_internal_synthetic_source_range(&citation));
+        assert!(promote_verified_bounded_source_citation(&mut citation));
+        assert_eq!(
+            citation.evidence_tier,
+            Some(PacketEvidenceTierDto::ExactSource)
+        );
+        assert_eq!(
+            citation.evidence_producer.as_deref(),
+            Some("verified_packet_cited_formatting_type_source_read")
+        );
+        assert!(crate::agent::packet_evidence::citation_sufficiency_eligible(&citation));
+
+        citation.evidence_producer = Some("external_source_scan".to_owned());
+        citation.evidence_tier = Some(PacketEvidenceTierDto::SyntheticSourceScan);
+        assert!(!citation_needs_bounded_source_read(&citation));
+        assert!(!citation_is_internal_synthetic_source_range(&citation));
+        assert!(!promote_verified_bounded_source_citation(&mut citation));
     }
 
     #[test]
@@ -11078,6 +11340,31 @@ mod tests {
             !displays.contains(&"ILeftoverMapper"),
             "uncited mapper files must not be scanned: {displays:?}"
         );
+
+        let mut graphed = packet_answer_fixture(prompt, Vec::new());
+        let mut mapper_node = typed_graph_node("runtime-mapper", NodeKind::CLASS);
+        mapper_node.file_path = Some(
+            root.join("src/ObjectMapping/RuntimeMapper.cs")
+                .display()
+                .to_string(),
+        );
+        graphed.graphs = vec![uml_artifact(
+            "mapper-flow",
+            "runtime-mapper",
+            vec![mapper_node],
+            Vec::new(),
+        )];
+        maybe_append_cited_mapper_interface_citations(&root, prompt, &mut graphed);
+        let graphed_displays = graphed
+            .citations
+            .iter()
+            .map(|citation| citation.display_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            graphed_displays.contains(&"IRuntimeMapperBase")
+                && graphed_displays.contains(&"IRuntimeMapper"),
+            "retained graph source should promote mapper interfaces: {graphed_displays:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -11241,7 +11528,6 @@ mod tests {
         for expected in [
             "server bootstrap",
             "command server entrypoint",
-            "event loop source",
             "network command input",
             "command table dispatch",
             "event loop",

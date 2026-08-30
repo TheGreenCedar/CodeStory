@@ -1,6 +1,6 @@
 use crate::index_commit::{
     CoreCommitMode, PreparedCoreCommit, StagedPreparation, next_index_publication,
-    stage_core_publication_identity,
+    rematerialize_staged_proof_resolution_projection, stage_core_publication_identity,
 };
 use crate::index_coverage::validate_source_policy_exclusions;
 use crate::index_timings::{
@@ -793,6 +793,11 @@ fn prepare_incremental_refresh(
         &mut policy_exclusions,
     )?;
     validate_incremental_refresh_coverage(preparation.staged_mut(), root)?;
+    rematerialize_staged_proof_resolution_projection(
+        preparation.staged_mut(),
+        &publication,
+        cancel_token,
+    )?;
     let semantic_refresh_scope = incremental_semantic_refresh_scope(
         preparation.staged_mut(),
         root,

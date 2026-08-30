@@ -1767,15 +1767,26 @@ fn finalize_claim_obligation(
     let mut matching_citations = answer
         .citations
         .iter()
-        .filter(|citation| requirement.evidence.citation_proves(citation))
+        .filter(|citation| {
+            citation_matches_requirement_or_exact_discovery_boundary(
+                obligation,
+                requirement,
+                citation,
+                answer,
+            )
+        })
         .collect::<Vec<_>>();
     rank_obligation_citations_by_context(obligation, &mut matching_citations);
     let mut reported_citations = answer
         .citations
         .iter()
         .filter(|citation| {
-            requirement.evidence.citation_proves(citation)
-                || citation_plausibly_reports_obligation(citation, obligation.kind)
+            citation_matches_requirement_or_exact_discovery_boundary(
+                obligation,
+                requirement,
+                citation,
+                answer,
+            ) || citation_plausibly_reports_obligation(citation, obligation.kind)
         })
         .collect::<Vec<_>>();
     rank_obligation_citations_by_context(obligation, &mut reported_citations);
@@ -1906,6 +1917,23 @@ fn finalize_claim_obligation(
     }
     obligation.proof_status = PacketObligationProofStatusDto::Proven;
     obligation.reason = None;
+}
+
+fn citation_matches_requirement_or_exact_discovery_boundary(
+    obligation: &PacketClaimObligationDto,
+    requirement: &FlowRequirement,
+    citation: &AgentCitationDto,
+    answer: &AgentAnswerDto,
+) -> bool {
+    requirement.evidence.citation_proves(citation)
+        || obligation.required_edge_kind == Some(EdgeKind::CALL)
+            && citation_edge_proof_for_flow_requirement(
+                citation,
+                EdgeKind::CALL,
+                requirement,
+                answer,
+            )
+            .is_some()
 }
 
 /// Finalizes one formula-bearing obligation. `proof_status` comes exclusively
@@ -2134,6 +2162,18 @@ fn rank_obligation_citations_by_context(
     };
     let query_terms = symbol_query_tokens(query);
     citations.sort_by_key(|citation| {
+        // An exact event-loop boundary may have both the top-level driver and one lower-level
+        // iteration routine. Protect the main-shaped caller first; it is still only a candidate,
+        // and finalization still requires its declared exact outgoing CALL receipt.
+        let boundary_depth = if obligation.id == "command_event_loop"
+            && symbol_query_tokens(&citation.display_name)
+                .last()
+                .is_some_and(|token| token == "main")
+        {
+            0
+        } else {
+            1
+        };
         let mut carrier_terms = symbol_query_tokens(&citation.display_name);
         if let Some(path) = citation.file_path.as_deref() {
             carrier_terms.extend(symbol_query_tokens(&packet_display_path(path)));
@@ -2142,7 +2182,7 @@ fn rank_obligation_citations_by_context(
             .iter()
             .filter(|term| carrier_terms.iter().any(|carrier| carrier == *term))
             .count();
-        std::cmp::Reverse(overlap)
+        (boundary_depth, std::cmp::Reverse(overlap))
     });
 }
 
@@ -4020,7 +4060,17 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(plan.binding_terms.is_empty(), "{plan:#?}");
-        assert_eq!(material_ids, ["request_entrypoint", "request_dispatch"]);
+        assert_eq!(
+            material_ids,
+            [
+                "request_entrypoint",
+                "request_dispatch",
+                "server_route_insertion_handoff",
+                "server_request_handler_handoff",
+                "server_route_match_lookup",
+                "server_handler_chain_handoff",
+            ]
+        );
         assert!(
             plan.claim_obligations
                 .iter()
@@ -6020,20 +6070,140 @@ mod tests {
     }
 
     #[test]
+    fn command_event_loop_prefers_the_top_level_exact_driver_over_an_iteration_routine() {
+        let question = "Trace how a command server enters the event loop and processes events.";
+        let mut main = citation("aeMain", "src/runtime.c", NodeKind::FUNCTION);
+        main.node_id = NodeId("main-driver".to_string());
+        main.evidence_edge_ids = vec![EdgeId("main-loop-call".to_string())];
+        let mut iteration = citation(
+            "EventLoop.processEvents",
+            "src/runtime.c",
+            NodeKind::FUNCTION,
+        );
+        iteration.node_id = NodeId("iteration-driver".to_string());
+        iteration.evidence_edge_ids = vec![EdgeId("iteration-call".to_string())];
+        let next_iteration = citation(
+            "EventLoop.processTimeEvents",
+            "src/runtime.c",
+            NodeKind::FUNCTION,
+        );
+        let mut carried_answer = answer(vec![iteration.clone(), main.clone()]);
+        carried_answer.prompt = question.to_string();
+        let node = |citation: &AgentCitationDto| GraphNodeDto {
+            id: citation.node_id.clone(),
+            label: citation.display_name.clone(),
+            kind: citation.kind,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: citation.file_path.clone(),
+            qualified_name: Some(citation.display_name.clone()),
+            member_access: None,
+        };
+        carried_answer.graphs.push(GraphArtifactDto::Uml {
+            id: "event-loop-boundaries".to_string(),
+            title: "Event loop boundaries".to_string(),
+            graph: GraphResponse {
+                center_id: main.node_id.clone(),
+                nodes: vec![node(&main), node(&iteration), node(&next_iteration)],
+                edges: vec![
+                    GraphEdgeDto {
+                        id: EdgeId("main-loop-call".to_string()),
+                        source: main.node_id.clone(),
+                        target: iteration.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:main-loop".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("iteration-call".to_string()),
+                        source: iteration.node_id.clone(),
+                        target: next_iteration.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:iteration".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let mut plan =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == "command_event_loop");
+        plan.query_obligations.clear();
+
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &plan,
+            &carried_answer,
+            &PacketProofEvidenceExtras::default(),
+        );
+        assert_eq!(
+            protected_packet_obligation_carrier_node_ids(&snapshot).first(),
+            Some(&main.node_id),
+            "the exact top-level caller is protected before the lower-level iteration routine"
+        );
+        assert_eq!(
+            protected_packet_obligation_edge_ids(&snapshot).first(),
+            Some(&EdgeId("main-loop-call".to_string()))
+        );
+
+        let GraphArtifactDto::Uml { graph, .. } = &mut carried_answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == iteration.node_id)
+            .expect("main target")
+            .label = "loadConfiguration".to_string();
+        let hostile = capture_packet_obligation_edge_proofs_before_budget(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &plan,
+            &carried_answer,
+            &PacketProofEvidenceExtras::default(),
+        );
+        assert_eq!(
+            protected_packet_obligation_carrier_node_ids(&hostile).first(),
+            Some(&iteration.node_id),
+            "a main-shaped caller with the wrong exact target cannot displace a valid iteration receipt"
+        );
+    }
+
+    #[test]
     fn probable_call_context_selects_only_a_secondary_carrier_with_its_own_proof() {
         let question = "Trace how a command server initializes, enters the event loop, reads client input, and routes command execution.";
         let primary_proof_id = EdgeId("primary-proof".to_string());
         let secondary_proof_id = EdgeId("secondary-proof".to_string());
         let uncertain_proof_id = EdgeId("uncertain-proof".to_string());
         let context_edge_id = EdgeId("probable-wrapper-core".to_string());
+        let hostile_proof_id = EdgeId("hostile-proof".to_string());
+        let hostile_context_edge_id = EdgeId("probable-wrapper-hostile".to_string());
         let unproven_context_edge_id = EdgeId("probable-wrapper-unproven".to_string());
         let uncertain_context_edge_id = EdgeId("uncertain-wrapper-core".to_string());
         let mut primary = citation(
+            "CommandRouter.executeCommand",
+            "src/server.c",
+            NodeKind::FUNCTION,
+        );
+        primary.evidence_edge_ids = vec![primary_proof_id.clone()];
+        let mut hostile = citation(
             "executeCommandAndRecordMetrics",
             "src/networking.c",
             NodeKind::FUNCTION,
         );
-        primary.evidence_edge_ids = vec![primary_proof_id.clone()];
+        hostile.evidence_edge_ids = vec![hostile_proof_id.clone()];
         let unproven = citation(
             "executeCommandWithoutProof",
             "src/server.c",
@@ -6047,9 +6217,10 @@ mod tests {
         uncertain.evidence_edge_ids = vec![uncertain_proof_id.clone()];
         let mut secondary = citation("executeCommand", "src/server.c", NodeKind::FUNCTION);
         secondary.evidence_edge_ids = vec![secondary_proof_id.clone()];
-        let primary_target_id = NodeId("commandProcessed".to_string());
-        let secondary_target_id = NodeId("preprocessCommand".to_string());
-        let uncertain_target_id = NodeId("validateCommand".to_string());
+        let primary_target_id = NodeId("validateCommand".to_string());
+        let hostile_target_id = NodeId("commandProcessed".to_string());
+        let secondary_target_id = NodeId("queueCommand".to_string());
+        let uncertain_target_id = NodeId("rejectCommand".to_string());
         let graph_node = |id: NodeId, label: &str, depth: u32| GraphNodeDto {
             id,
             label: label.to_string(),
@@ -6065,6 +6236,7 @@ mod tests {
         };
         let mut answer = answer(vec![
             primary.clone(),
+            hostile.clone(),
             unproven.clone(),
             uncertain.clone(),
             secondary.clone(),
@@ -6077,12 +6249,14 @@ mod tests {
                 center_id: primary.node_id.clone(),
                 nodes: vec![
                     graph_node(primary.node_id.clone(), &primary.display_name, 0),
+                    graph_node(hostile.node_id.clone(), &hostile.display_name, 1),
                     graph_node(unproven.node_id.clone(), &unproven.display_name, 1),
                     graph_node(uncertain.node_id.clone(), &uncertain.display_name, 1),
                     graph_node(secondary.node_id.clone(), &secondary.display_name, 1),
-                    graph_node(primary_target_id.clone(), "commandProcessed", 1),
-                    graph_node(uncertain_target_id.clone(), "validateCommand", 2),
-                    graph_node(secondary_target_id.clone(), "preprocessCommand", 2),
+                    graph_node(primary_target_id.clone(), "validateCommand", 1),
+                    graph_node(hostile_target_id.clone(), "commandProcessed", 2),
+                    graph_node(uncertain_target_id.clone(), "rejectCommand", 2),
+                    graph_node(secondary_target_id.clone(), "queueCommand", 2),
                 ],
                 edges: vec![
                     GraphEdgeDto {
@@ -6093,6 +6267,26 @@ mod tests {
                         confidence: Some(1.0),
                         certainty: Some("certain".to_string()),
                         callsite_identity: Some("test:primary-proof".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: hostile_context_edge_id.clone(),
+                        source: primary.node_id.clone(),
+                        target: hostile.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(0.8),
+                        certainty: Some("probable".to_string()),
+                        callsite_identity: Some("test:hostile-selection-context".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: hostile_proof_id.clone(),
+                        source: hostile.node_id.clone(),
+                        target: hostile_target_id,
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:hostile-proof".to_string()),
                         candidate_targets: Vec::new(),
                     },
                     GraphEdgeDto {
@@ -6174,6 +6368,10 @@ mod tests {
             &[primary_proof_id, secondary_proof_id]
         );
         assert!(!protected_packet_obligation_edge_ids(&snapshot).contains(&context_edge_id));
+        assert!(
+            !protected_packet_obligation_edge_ids(&snapshot).contains(&hostile_context_edge_id)
+        );
+        assert!(!protected_packet_obligation_edge_ids(&snapshot).contains(&hostile_proof_id));
         assert!(
             !protected_packet_obligation_edge_ids(&snapshot).contains(&unproven_context_edge_id)
         );

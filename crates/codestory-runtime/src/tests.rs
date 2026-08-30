@@ -398,7 +398,7 @@ fn llm_doc_embed_batch_size_uses_throughput_default() {
     let _lock = process_env_test_lock();
     let _env = EnvGuard::remove(LLM_DOC_EMBED_BATCH_SIZE_ENV);
 
-    assert_eq!(llm_doc_embed_batch_size(), 128);
+    assert_eq!(llm_doc_embed_batch_size(), 1024);
 }
 
 #[test]
@@ -3184,6 +3184,62 @@ fn full_refresh_publishes_structural_unit_exclusion_without_graph_claims() {
 }
 
 #[test]
+fn full_refresh_publishes_typescript_jsonc_and_exact_empty_test_json_then_preserves_previous_core()
+{
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    let config_path = workspace.path().join("tsconfig.json");
+    let empty_test_path = workspace.path().join("tests/empty.json");
+    fs::create_dir_all(empty_test_path.parent().expect("test parent")).expect("create test parent");
+    fs::write(
+        &config_path,
+        "{\n  // strict JSONC config\n  \"compilerOptions\": { \"strict\": true, },\n}\n",
+    )
+    .expect("write JSONC config");
+    fs::write(&empty_test_path, []).expect("write exact empty test JSON");
+
+    let storage_path = workspace.path().join(".cache/codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("recognized JSONC config and exact empty test artifact should publish");
+
+    let baseline = Storage::open(&storage_path)
+        .expect("open baseline storage")
+        .get_complete_index_publication()
+        .expect("read baseline publication")
+        .expect("complete baseline publication");
+    let storage = Storage::open(&storage_path).expect("open published storage");
+    assert_eq!(
+        storage
+            .get_file_by_path(&empty_test_path)
+            .expect("read empty test JSON")
+            .expect("empty test JSON file row")
+            .file_role,
+        codestory_store::FileRole::Test
+    );
+    drop(storage);
+
+    fs::write(&config_path, "{ \"compilerOptions\": , }").expect("write malformed JSONC");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect_err("malformed JSONC must reject a later full refresh");
+    assert_eq!(
+        Storage::open(&storage_path)
+            .expect("open preserved storage")
+            .get_complete_index_publication()
+            .expect("read preserved publication"),
+        Some(baseline)
+    );
+}
+
+#[test]
 fn incremental_refresh_replaces_structural_projection_and_semantics_with_unit_exclusion() {
     let _env = hybrid_test_env();
     let workspace = tempdir().expect("workspace");
@@ -4259,6 +4315,249 @@ fn republishing_projections_keeps_a_structural_exclusion_publishable() {
 }
 
 #[test]
+fn semantic_projection_republish_rebinds_valid_proof_and_preserves_absence() {
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("main.ts"),
+        "export function target() {}\nexport function caller() { target(); }\n",
+    )
+    .expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core");
+    let (before_publication, before_proof, before_facts) = {
+        let storage = Storage::open(&storage_path).expect("open baseline");
+        let publication = storage.get_complete_index_publication().unwrap().unwrap();
+        let proof = storage
+            .validate_proof_resolution_publication(&publication)
+            .expect("valid baseline proof");
+        let facts = storage.get_proof_resolution_facts().unwrap();
+        (publication, proof, facts)
+    };
+    controller
+        .republish_semantic_projections_blocking()
+        .expect("semantic republish");
+    let after_publication = Storage::database_complete_index_publication(&storage_path)
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        after_publication.generation_id,
+        before_publication.generation_id
+    );
+    let storage = Storage::open(&storage_path).expect("open rebound core");
+    let after_proof = storage
+        .validate_proof_resolution_publication(&after_publication)
+        .expect("proof rebound to semantic identity");
+    assert_eq!(after_proof.fact_digest, before_proof.fact_digest);
+    assert_eq!(after_proof.adapter_roster, before_proof.adapter_roster);
+    assert_eq!(after_proof.funnel, before_proof.funnel);
+    assert_eq!(storage.get_proof_resolution_facts().unwrap(), before_facts);
+
+    storage
+        .get_connection()
+        .execute_batch(
+            "DELETE FROM proof_resolution_publication; DELETE FROM proof_resolution_fact;",
+        )
+        .unwrap();
+    drop(storage);
+    controller
+        .republish_semantic_projections_blocking()
+        .expect("semantic republish preserves migrated absence");
+    let storage = Storage::open(&storage_path).unwrap();
+    assert_eq!(storage.get_proof_resolution_publication().unwrap(), None);
+}
+
+#[test]
+fn semantic_projection_republish_rejects_corrupt_proof_and_preserves_old_core() {
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("main.ts"),
+        "export function target() {}\nexport function caller() { target(); }\n",
+    )
+    .expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish complete core");
+    let before = Storage::database_complete_index_publication(&storage_path)
+        .unwrap()
+        .unwrap();
+    let storage = Storage::open(&storage_path).unwrap();
+    storage
+        .get_connection()
+        .execute(
+            "UPDATE proof_resolution_publication SET funnel_json = '[]' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+    drop(storage);
+    let error = controller
+        .republish_semantic_projections_blocking()
+        .expect_err("corrupt old proof must reject semantic rebind");
+    assert!(
+        error.message.contains("proof resolution projection"),
+        "{error:?}"
+    );
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn exact_proof_rematerializes_for_full_and_incremental_edits_and_faults_preserve_live() {
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source = workspace.path().join("main.ts");
+    fs::write(
+        &source,
+        "export function target() {}\nexport function caller() { target(); }\n",
+    )
+    .expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline");
+
+    for (mode, revision) in [(IndexMode::Full, 1), (IndexMode::Incremental, 2)] {
+        let (before_publication, before_proof, before_facts) = {
+            let store = Storage::open(&storage_path).expect("open baseline");
+            let publication = store
+                .get_complete_index_publication()
+                .unwrap()
+                .expect("complete publication");
+            let proof = store
+                .validate_proof_resolution_publication(&publication)
+                .expect("valid proof");
+            (
+                publication,
+                proof,
+                store.get_proof_resolution_facts().unwrap(),
+            )
+        };
+        fs::write(
+            &source,
+            format!(
+                "export function target() {{}}\nexport function caller() {{ target(); }}\n// revision {revision}\n"
+            ),
+        )
+        .expect("edit source");
+        arm_publication_test_fault(
+            PublicationTestBoundary::SearchBuild,
+            PublicationTestAction::Fail,
+        );
+        controller
+            .run_indexing_blocking_without_runtime_refresh(mode)
+            .expect_err("precommit fault must reject candidate");
+        {
+            let store = Storage::open(&storage_path).expect("open preserved core");
+            assert_eq!(
+                store.get_complete_index_publication().unwrap(),
+                Some(before_publication.clone())
+            );
+            assert_eq!(
+                store.get_proof_resolution_publication().unwrap(),
+                Some(before_proof)
+            );
+            assert_eq!(store.get_proof_resolution_facts().unwrap(), before_facts);
+        }
+
+        controller
+            .run_indexing_blocking_without_runtime_refresh(mode)
+            .expect("publish edited core");
+        let store = Storage::open(&storage_path).expect("open edited core");
+        let publication = store
+            .get_complete_index_publication()
+            .unwrap()
+            .expect("complete edited publication");
+        assert_ne!(publication.generation_id, before_publication.generation_id);
+        store
+            .validate_proof_resolution_publication(&publication)
+            .expect("rematerialized proof");
+        let facts = store.get_proof_resolution_facts().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            facts[0].status,
+            codestory_contracts::proof_resolution::ProofResolutionStatus::Exact
+        );
+        assert_ne!(
+            facts[0].callsite.source_sha256,
+            before_facts[0].callsite.source_sha256
+        );
+    }
+}
+
+#[test]
+fn full_refresh_publishes_incomplete_proof_domain_for_parser_incomplete_source() {
+    let _env = hybrid_test_env();
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("main.ts"),
+        "export function target() {}\nexport function caller() { target(); }\n<",
+    )
+    .expect("write parser-incomplete source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("parser incompleteness must not abort proof publication");
+
+    let storage = Storage::open(&storage_path).expect("open published core");
+    let publication = storage
+        .get_complete_index_publication()
+        .unwrap()
+        .expect("complete core publication");
+    storage
+        .validate_proof_resolution_publication(&publication)
+        .expect("complete proof projection");
+    let facts = storage.get_proof_resolution_facts().unwrap();
+    let fact = facts
+        .iter()
+        .find(|fact| fact.callsite.raw_target == "target")
+        .expect("target call fact");
+    assert_eq!(
+        fact.status,
+        codestory_contracts::proof_resolution::ProofResolutionStatus::IncompleteDomain
+    );
+    assert!(fact.evidence_chain.is_empty());
+    assert_eq!(fact.target, None);
+    assert_eq!(fact.edge_id, None);
+}
+
+#[test]
 fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     let _env = hybrid_test_env();
     let workspace = copy_tictactoe_workspace();
@@ -4399,6 +4698,16 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
             .expect("read republished core"),
         Some(outcome.publication.clone())
     );
+    let proof = storage
+        .get_proof_resolution_publication()
+        .expect("read rebound proof publication")
+        .expect("stored proof publication remains present");
+    assert_eq!(proof.core_generation_id, outcome.publication.generation_id);
+    assert_eq!(proof.core_run_id, outcome.publication.run_id);
+    assert_eq!(
+        proof.published_at_epoch_ms,
+        outcome.publication.published_at_epoch_ms
+    );
     storage
         .validate_dense_anchor_publication(&outcome.publication)
         .expect("dense publication is coherent");
@@ -4446,6 +4755,37 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     assert_eq!(
         Storage::database_complete_index_publication(&storage_path)
             .expect("read publication after rejected source policy"),
+        Some(outcome.publication.clone())
+    );
+    assert_no_staged_publication_artifacts(&storage_path);
+
+    let tampered = rusqlite::Connection::open(&storage_path).expect("open rebound core");
+    let go_edge_id = tampered
+        .query_row(
+            "SELECT edge_id FROM proof_resolution_fact
+             WHERE status = 'exact' AND language_adapter = 'go'
+             ORDER BY edge_id LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("stored fixture has one exact Go edge");
+    tampered
+        .execute(
+            "UPDATE edge SET line = line + 1 WHERE id = ?1",
+            [go_edge_id],
+        )
+        .expect("tamper stored Go correlation");
+    drop(tampered);
+    let error = controller
+        .republish_semantic_projections_at_blocking(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect_err("stored-graph tamper must reject source-free proof rebind");
+    assert!(error.message.contains("proof resolution"), "{error:?}");
+    assert_eq!(
+        Storage::database_complete_index_publication(&storage_path)
+            .expect("read publication after rejected proof rebind"),
         Some(outcome.publication)
     );
     assert_no_staged_publication_artifacts(&storage_path);
@@ -8231,6 +8571,53 @@ fn full_refresh_pipeline_writer_failure_preserves_live_publication() {
 }
 
 #[test]
+fn full_refresh_rejects_a_nonempty_proof_overlay_before_graph_mutation() {
+    let workspace = tempdir().expect("workspace dir");
+    fs::write(workspace.path().join("lib.rs"), "pub fn value() {}\n").expect("write source");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new();
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline");
+    let baseline = Storage::open(&storage_path)
+        .unwrap()
+        .get_complete_index_publication()
+        .unwrap()
+        .unwrap();
+
+    arm_full_refresh_staged_store_hook(|storage| {
+        storage
+            .get_connection()
+            .execute(
+                "INSERT INTO proof_resolution_publication (
+                    id, core_generation_id, core_run_id, fact_schema_version,
+                    adapter_roster_json, complete, fact_count, fact_digest,
+                    funnel_json, published_at_epoch_ms
+                 ) VALUES (1, 'stale', 'stale', 1, '[]', 1, 0, ?1, '[]', 1)",
+                ["0".repeat(64)],
+            )
+            .expect("inject stale staged proof receipt");
+    });
+    let error = controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect_err("full stage must begin without a proof overlay");
+    assert!(error.message.contains("proof overlay"), "{error:?}");
+    assert_eq!(
+        Storage::open(&storage_path)
+            .unwrap()
+            .get_complete_index_publication()
+            .unwrap(),
+        Some(baseline)
+    );
+}
+
+#[test]
 fn full_refresh_semantic_endpoint_index_failure_preserves_live_publication() {
     let workspace = tempdir().expect("workspace dir");
     let source_path = workspace.path().join("lib.rs");
@@ -10270,6 +10657,23 @@ fn full_refresh_publishes_both_grounding_snapshot_tiers() {
     let workspace = copy_tictactoe_workspace();
     let storage_path = workspace.path().join(".cache").join("codestory.db");
     let controller = AppController::new();
+    let assert_ready = |phase: &str| {
+        let storage = Storage::open(&storage_path).expect("reopen storage");
+        assert!(
+            storage
+                .snapshots()
+                .has_ready_summary()
+                .expect("summary snapshot readiness"),
+            "{phase} should publish ready grounding summary snapshots"
+        );
+        assert!(
+            storage
+                .snapshots()
+                .has_ready_detail()
+                .expect("detail snapshot readiness"),
+            "{phase} should publish ready grounding detail snapshots"
+        );
+    };
 
     controller
         .open_project_summary_with_storage_path(
@@ -10280,22 +10684,16 @@ fn full_refresh_publishes_both_grounding_snapshot_tiers() {
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("index without runtime refresh");
+    assert_ready("full refresh");
 
-    let storage = Storage::open(&storage_path).expect("reopen storage");
-    assert!(
-        storage
-            .snapshots()
-            .has_ready_summary()
-            .expect("summary snapshot readiness"),
-        "full refresh should publish ready grounding summary snapshots"
-    );
-    assert!(
-        storage
-            .snapshots()
-            .has_ready_detail()
-            .expect("detail snapshot readiness"),
-        "full refresh should publish ready grounding detail snapshots"
-    );
+    let source_path = workspace.path().join("rust_tictactoe.rs");
+    let mut source = fs::read_to_string(&source_path).expect("read indexed source");
+    source.push_str("\nfn snapshot_incremental_probe() {}\n");
+    fs::write(&source_path, source).expect("write incremental source edit");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+        .expect("incremental index without runtime refresh");
+    assert_ready("incremental refresh");
 }
 
 #[test]

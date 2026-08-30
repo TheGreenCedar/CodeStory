@@ -3,20 +3,20 @@ use crate::{IndexResult, LanguageConfig, intermediate_storage::IntermediateStora
 use codestory_contracts::graph::{
     AccessKind, CallableProjectionState, Edge, Node, NodeId, Occurrence,
 };
+use codestory_contracts::proof_resolution::ExactCallsite;
 use codestory_store::FileInfo;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
-// Bumped to 3 with the position-free callable projection format: a cached
-// artifact from version 2 carries node ids minted from declaration lines and
-// projection rows whose `signature_hash` still binds a position, so reusing one
-// would mix two identity formats inside a single file.
-const INDEX_ARTIFACT_CACHE_VERSION: u32 = 3;
+// Versioned with proof-input semantics so older parser artifacts fail closed.
+const INDEX_ARTIFACT_CACHE_VERSION: u32 = 29;
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x00000100000001B3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedIndexArtifact {
+    #[serde(default)]
+    pub resolution_input_schema_version: u32,
     pub files: Vec<FileInfo>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
@@ -24,11 +24,340 @@ pub(crate) struct CachedIndexArtifact {
     pub component_access: Vec<(NodeId, AccessKind)>,
     pub callable_projection_states: Vec<CallableProjectionState>,
     pub impl_anchor_node_ids: Vec<NodeId>,
+    #[serde(default)]
+    pub call_resolution_inputs: Vec<CachedCallResolutionInput>,
+    #[serde(default)]
+    pub resolution_file: Option<CachedResolutionFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCallResolutionInput {
+    pub callsite: ExactCallsite,
+    pub caller: Option<NodeId>,
+    pub binding: CachedResolutionBinding,
+    pub language: String,
+    pub adapter_version: String,
+    pub parser_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CachedResolutionBinding {
+    SameFile {
+        declaration: NodeId,
+        #[serde(default)]
+        rust_glob_local_module: Option<Vec<String>>,
+    },
+    StaticImport {
+        import: NodeId,
+        module_specifier: String,
+        imported_name: String,
+        is_default: bool,
+    },
+    ImplicitReceiver {
+        owner: NodeId,
+        declaration: NodeId,
+        owner_name: String,
+    },
+    ConstructorBinding {
+        class_binding: CachedClassBinding,
+        method_name: String,
+    },
+    ExplicitReceiverType {
+        class_binding: CachedClassBinding,
+        method_name: String,
+    },
+    RustPath {
+        module_path: Vec<String>,
+        components: Vec<String>,
+        import: Option<CachedRustUseBinding>,
+        associated_owner: Option<NodeId>,
+    },
+    RustImplicitReceiver {
+        module_path: Vec<String>,
+        owner_name: String,
+        import: CachedRustUseBinding,
+        declaration: NodeId,
+    },
+    RustExplicitReceiver {
+        module_path: Vec<String>,
+        owner_name: String,
+        import: Option<CachedRustUseBinding>,
+        constructor: bool,
+        constructor_record: bool,
+        constructor_method: Option<String>,
+    },
+    GoPackageFunction {
+        package_name: String,
+        name: String,
+    },
+    GoImplicitReceiver {
+        package_name: String,
+        owner_name: String,
+        receiver_is_pointer: bool,
+    },
+    GoExplicitReceiver {
+        package_name: String,
+        owner_name: String,
+        receiver_is_pointer: bool,
+        constructor: bool,
+        constructor_uses_builtin_new: bool,
+    },
+    JavaKotlinImportedReceiver {
+        package_name: String,
+        owner_name: String,
+        method_name: String,
+        import: NodeId,
+        constructor: bool,
+    },
+    JavaKotlinPackageFunction {
+        package_name: String,
+        name: String,
+    },
+    JavaKotlinImportedFunction {
+        package_name: String,
+        owner_name: Option<String>,
+        name: String,
+        import: NodeId,
+    },
+    JavaKotlinPackageReceiver {
+        package_name: String,
+        owner_name: String,
+        method_name: String,
+        constructor: bool,
+    },
+    CCppQualified {
+        components: Vec<NodeId>,
+    },
+    Ambiguous,
+    MissingBinding,
+    Unsupported,
+    IncompleteDomain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum CachedClassBinding {
+    SameFile {
+        owner: NodeId,
+        owner_name: String,
+    },
+    StaticImport {
+        import: NodeId,
+        module_specifier: String,
+        imported_name: String,
+        is_default: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedResolutionFile {
+    pub file_id: NodeId,
+    pub source_sha256: String,
+    pub language: String,
+    pub adapter_version: String,
+    pub parser_fingerprint: String,
+    pub complete: bool,
+    pub lookup_input_complete: bool,
+    pub typescript_module: bool,
+    pub top_level_declarations: Vec<CachedTopLevelDeclaration>,
+    pub inherent_methods: Vec<CachedInherentMethod>,
+    #[serde(default)]
+    pub classes: Vec<CachedClassDeclaration>,
+    pub direct_exports: Vec<CachedDirectExport>,
+    #[serde(default)]
+    pub export_poison_all: bool,
+    #[serde(default)]
+    pub poisoned_export_names: Vec<String>,
+    #[serde(default)]
+    pub rust_modules: Vec<CachedRustModule>,
+    #[serde(default)]
+    pub rust_types: Vec<CachedRustType>,
+    #[serde(default)]
+    pub rust_uses: Vec<CachedRustUseBinding>,
+    #[serde(default)]
+    pub go_package: Option<CachedGoPackage>,
+    #[serde(default)]
+    pub java_kotlin_package: Option<String>,
+    #[serde(default)]
+    pub php_namespace: CachedPhpNamespace,
+    #[serde(default)]
+    pub c_cpp_file: Option<CachedCCppFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCCppFile {
+    pub source_path: PathBuf,
+    pub source_role: CachedCCppSourceRole,
+    pub namespaces: Vec<CachedCCppNamespace>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
+pub(crate) enum CachedPhpNamespace {
+    Global,
+    Named(String),
+    #[default]
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CachedCCppSourceRole {
+    Source,
+    Header,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedCCppNamespace {
+    pub path: Vec<String>,
+    pub declaration: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoPackage {
+    pub name: String,
+    pub build_constrained: bool,
+    pub generated: bool,
+    pub package_blockers: Vec<String>,
+    pub types: Vec<CachedGoType>,
+    pub methods: Vec<CachedGoMethod>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoType {
+    pub name: String,
+    pub declaration: NodeId,
+    pub interface: bool,
+    pub generic: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedGoMethod {
+    pub owner_name: String,
+    pub method_name: String,
+    pub declaration: NodeId,
+    pub pointer_receiver: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedTopLevelDeclaration {
+    pub name: String,
+    pub declaration: NodeId,
+    #[serde(default)]
+    pub module_path: Vec<String>,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedInherentMethod {
+    pub owner_name: String,
+    pub method_name: String,
+    pub declaration: NodeId,
+    #[serde(default)]
+    pub module_path: Vec<String>,
+    #[serde(default)]
+    pub owner: Option<NodeId>,
+    #[serde(default)]
+    pub has_self: bool,
+    #[serde(default)]
+    pub return_owner: Option<String>,
+    #[serde(default)]
+    pub domain_complete: bool,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustModule {
+    pub module_path: Vec<String>,
+    pub declaration: Option<NodeId>,
+    pub domain_complete: bool,
+    #[serde(default)]
+    pub value_blockers: Vec<String>,
+    #[serde(default)]
+    pub incomplete_value_names: Vec<String>,
+    #[serde(default)]
+    pub file_children: Vec<CachedRustFileModule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustFileModule {
+    pub name: String,
+    pub declaration: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustType {
+    pub module_path: Vec<String>,
+    pub name: String,
+    pub declaration: NodeId,
+    pub generic: bool,
+    pub cross_module_visible: bool,
+    pub unit_constructor: bool,
+    pub record_constructor: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedRustUseBinding {
+    pub module_path: Vec<String>,
+    pub local_name: String,
+    pub components: Vec<String>,
+    pub import: NodeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedClassDeclaration {
+    pub name: String,
+    pub declaration: NodeId,
+    pub methods: Vec<CachedClassMethod>,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+    #[serde(default)]
+    pub runtime_closed: bool,
+    #[serde(default)]
+    pub super_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedClassMethod {
+    pub name: String,
+    pub declaration: NodeId,
+    #[serde(default)]
+    pub cross_module_visible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedDirectExport {
+    pub exported_name: String,
+    pub declaration: NodeId,
+    pub is_default: bool,
+    #[serde(default)]
+    pub declaration_kind: CachedDeclarationKind,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CachedDeclarationKind {
+    #[default]
+    Callable,
+    Class,
 }
 
 impl CachedIndexArtifact {
+    #[cfg(test)]
     pub(crate) fn from_index_result(index_result: IndexResult) -> Self {
+        Self::from_index_result_with_resolution_inputs(index_result, Vec::new(), None)
+    }
+
+    pub(crate) fn from_index_result_with_resolution_inputs(
+        index_result: IndexResult,
+        call_resolution_inputs: Vec<CachedCallResolutionInput>,
+        resolution_file: Option<CachedResolutionFile>,
+    ) -> Self {
         Self {
+            resolution_input_schema_version: 28,
             files: index_result.files,
             nodes: index_result.nodes,
             edges: index_result.edges,
@@ -36,6 +365,8 @@ impl CachedIndexArtifact {
             component_access: index_result.component_access,
             callable_projection_states: index_result.callable_projection_states,
             impl_anchor_node_ids: index_result.impl_anchor_node_ids,
+            call_resolution_inputs,
+            resolution_file,
         }
     }
 
@@ -109,9 +440,9 @@ impl CachedStructuralArtifact {
     }
 }
 
-// Bumped to 3 alongside the index artifact cache: the SQL, HTML, and callable
-// projection changes in this wave all reach structural artifacts too.
-pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 3;
+// Bumped to 4 because workspace-relative role classification changes persisted
+// structural file metadata and zero-byte JSON admission.
+pub(crate) const STRUCTURAL_ARTIFACT_CACHE_VERSION: u32 = 4;
 
 pub(crate) fn build_structural_artifact_cache_key(
     cache_path: &Path,
@@ -414,6 +745,39 @@ mod tests {
     }
 
     #[test]
+    fn parser_cache_key_distinguishes_raw_bytes_with_the_same_lossy_text() {
+        let config = crate::get_language_for_ext("c").expect("C config");
+        let root = Path::new("project");
+        let cache_path = Path::new("src/non-utf8.c");
+        let first = build_index_artifact_cache_key(
+            root,
+            cache_path,
+            b"/* \x80 */",
+            &config,
+            None,
+            false,
+            true,
+        )
+        .expect("first cache key");
+        let second = build_index_artifact_cache_key(
+            root,
+            cache_path,
+            b"/* \x81 */",
+            &config,
+            None,
+            false,
+            true,
+        )
+        .expect("second cache key");
+
+        assert_eq!(
+            String::from_utf8_lossy(b"/* \x80 */"),
+            String::from_utf8_lossy(b"/* \x81 */")
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn test_artifact_cache_key_skips_unportable_compile_paths() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().join("root");
@@ -476,5 +840,37 @@ mod tests {
             assert!(key.is_none(), "{flag} must fail closed");
         }
         Ok(())
+    }
+
+    #[test]
+    fn parser_cache_without_resolution_inputs_decodes_as_an_empty_legacy_projection() {
+        let legacy = serde_json::json!({
+            "files": [],
+            "nodes": [],
+            "edges": [],
+            "occurrences": [],
+            "component_access": [],
+            "callable_projection_states": [],
+            "impl_anchor_node_ids": []
+        });
+
+        let decoded: CachedIndexArtifact = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.resolution_input_schema_version, 0);
+        assert!(decoded.call_resolution_inputs.is_empty());
+        assert!(decoded.resolution_file.is_none());
+        assert!(
+            !crate::proof_resolution::cached_resolution_inputs_are_current(
+                &decoded,
+                "typescript",
+                &"0".repeat(64),
+                &"0".repeat(64),
+            )
+        );
+        assert!(
+            !crate::proof_resolution::cached_resolution_inputs_are_current(
+                &decoded, "go", "unused", "unused",
+            ),
+            "a legacy cache without proof inputs cannot satisfy the installed Go adapter"
+        );
     }
 }

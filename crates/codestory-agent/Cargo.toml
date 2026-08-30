@@ -4,15 +4,22 @@ version = "0.17.5"
 edition = "2024"
 
 [features]
+default = ["proof-qualification-support"]
 # Compiles the eval/holdout probe hooks for downstream unit tests. No product
 # build enables it.
-test-support = ["dep:serde_json_canonicalizer", "dep:sha2"]
+test-support = ["dep:sha2"]
+# Compiles the private exact-verifier kernel and its qualification facade. The
+# public CLI/runtime use the same sealed implementation that benchmarks inspect.
+proof-qualification-support = ["dep:sha2"]
+# Compiles only the dark v3 evidence planner needed by the Q1 separability
+# gate. It has no proof-kernel edge and registers no product surface.
+v3-evidence-separation-support = []
 
 [dependencies]
 codestory-contracts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_json_canonicalizer = { workspace = true, optional = true }
+serde_json_canonicalizer = { workspace = true }
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]

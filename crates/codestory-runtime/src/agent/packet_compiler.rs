@@ -19,7 +19,7 @@ use codestory_contracts::api::{
     PACKET_DRILL_MAX_OPTIONS, PacketClaimObligationDto, PacketClaimObligationKindDto,
     PacketDispositionDto, PacketDispositionKindDto, PacketObligationProofStatusDto, PacketPlanDto,
     PacketProbeResolutionStatusDto, PacketQueryCompletionDto, SourceCoverageStatusDto,
-    SupportUnitDto, SupportUnitKindDto, decode_drill_option_id,
+    SupportUnitDto, SupportUnitKindDto, decode_drill_option_id, encode_drill_option_id,
 };
 use codestory_contracts::graph::FileCoverageReason;
 use std::collections::BTreeSet;
@@ -154,10 +154,10 @@ fn typed_edge_support_units(
     graph: &GraphResponse,
     seen: &mut BTreeSet<String>,
 ) -> Vec<SupportUnitDto> {
-    let labels = graph
+    let nodes = graph
         .nodes
         .iter()
-        .map(|node| (node.id.0.as_str(), node.label.as_str()))
+        .map(|node| (node.id.0.as_str(), node))
         .collect::<std::collections::HashMap<_, _>>();
     let mut units = Vec::new();
     for edge in &graph.edges {
@@ -178,13 +178,13 @@ fn typed_edge_support_units(
         if !seen.insert(id.clone()) {
             continue;
         }
-        let from = labels
-            .get(edge.source.0.as_str())
-            .copied()
+        let source_node = nodes.get(edge.source.0.as_str()).copied();
+        let from = source_node
+            .map(|node| node.label.as_str())
             .unwrap_or(edge.source.0.as_str());
-        let to = labels
+        let to = nodes
             .get(edge.target.0.as_str())
-            .copied()
+            .map(|node| node.label.as_str())
             .unwrap_or(edge.target.0.as_str());
         let kind = match edge.kind {
             EdgeKind::CALL => "CALL",
@@ -198,8 +198,10 @@ fn typed_edge_support_units(
             id,
             kind: SupportUnitKindDto::TypedGraphEdge,
             summary: format!("`{from}` {kind} `{to}`"),
-            path: None,
-            symbol_id: None,
+            path: source_node
+                .and_then(|node| node.file_path.as_deref())
+                .map(packet_display_path),
+            symbol_id: Some(edge.source.0.clone()),
             start_line: None,
             end_line: None,
             snippet: None,
@@ -490,28 +492,40 @@ fn collect_drill_options(
                 && obligation.proof_status != PacketObligationProofStatusDto::Proven
         })
     {
+        let named_schema_gap = obligation
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("named_sql_table_carriers_missing:"));
+        if obligation.kind != PacketClaimObligationKindDto::ExactProbe
+            && !named_schema_gap
+            && let Some(query) = obligation
+                .open_next_candidates
+                .iter()
+                .find(|candidate| !candidate.trim().is_empty())
+        {
+            let option = omitted_support_query_option(
+                format!("omitted-material:{}", obligation.id),
+                query.trim(),
+            );
+            if seen.insert(option.id.clone()) {
+                options.push(option);
+            }
+            continue;
+        }
         if let Some(edge_kind) = obligation.required_edge_kind
             && matches!(edge_kind, EdgeKind::CALL | EdgeKind::INHERITANCE)
             && obligation.carrier_edge_proofs.is_empty()
             && let Some(target) = obligation.carrier_node_ids.first()
         {
-            let option = DrillOptionDto::omitted_symbol(
-                format!("omitted-edge:{}", obligation.id),
-                &target.0,
-            );
+            let option =
+                omitted_support_option(answer, format!("omitted-edge:{}", obligation.id), target);
             if seen.insert(option.id.clone()) {
                 options.push(option);
             }
         }
-        let named_schema_gap = obligation
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.starts_with("named_sql_table_carriers_missing:"));
         if !named_schema_gap && let Some(node) = obligation.carrier_node_ids.first() {
-            let option = DrillOptionDto::omitted_symbol(
-                format!("omitted-material:{}", obligation.id),
-                &node.0,
-            );
+            let option =
+                omitted_support_option(answer, format!("omitted-material:{}", obligation.id), node);
             if seen.insert(option.id.clone()) {
                 options.push(option);
             }
@@ -570,6 +584,41 @@ fn collect_drill_options(
     options
 }
 
+fn omitted_support_option(
+    answer: &AgentAnswerDto,
+    gap_id: impl Into<String>,
+    node: &codestory_contracts::api::NodeId,
+) -> DrillOptionDto {
+    if node.0.starts_with("packet::")
+        && let Some(path) = answer
+            .citations
+            .iter()
+            .find(|citation| citation.node_id == *node)
+            .and_then(|citation| citation.file_path.as_deref())
+    {
+        return DrillOptionDto::omitted_source_path(gap_id, packet_display_path(path));
+    }
+    DrillOptionDto::omitted_symbol(gap_id, &node.0)
+}
+
+fn omitted_support_query_option(
+    gap_id: impl Into<String>,
+    query: impl Into<String>,
+) -> DrillOptionDto {
+    let query = query.into();
+    DrillOptionDto {
+        id: encode_drill_option_id(
+            codestory_contracts::api::DrillGapKindDto::OmittedMandatorySupport,
+            &format!("query:{query}"),
+        ),
+        gap_id: gap_id.into(),
+        kind: codestory_contracts::api::DrillGapKindDto::OmittedMandatorySupport,
+        path: None,
+        symbol_id: None,
+        query: Some(query),
+    }
+}
+
 pub fn apply_compiled_evidence(
     packet: &mut AgentPacketDto,
     request: Option<&AgentPacketRequestDto>,
@@ -622,8 +671,17 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
                     DrillOptionDto::bounded_source_read(format!("named-path:{target}"), target)
                 }
                 codestory_contracts::api::DrillGapKindDto::OmittedMandatorySupport => {
-                    let symbol = target.strip_prefix("symbol:").unwrap_or(&target);
-                    DrillOptionDto::omitted_symbol(format!("omitted-symbol:{symbol}"), symbol)
+                    if let Some(path) = target.strip_prefix("path:") {
+                        DrillOptionDto::omitted_source_path(
+                            format!("omitted-source-path:{path}"),
+                            path,
+                        )
+                    } else if let Some(query) = target.strip_prefix("query:") {
+                        omitted_support_query_option(format!("omitted-query:{query}"), query)
+                    } else {
+                        let symbol = target.strip_prefix("symbol:").unwrap_or(&target);
+                        DrillOptionDto::omitted_symbol(format!("omitted-symbol:{symbol}"), symbol)
+                    }
                 }
                 codestory_contracts::api::DrillGapKindDto::DeadlineLostCandidate => {
                     DrillOptionDto::deadline_lost_query(format!("deadline-lost:{target}"), target)
@@ -642,10 +700,11 @@ mod tests {
     use codestory_agent::packet_command::packet_follow_up_argv;
     use codestory_contracts::api::{
         AgentCitationDto, AgentRetrievalStepDto, AgentRetrievalStepKindDto,
-        AgentRetrievalStepStatusDto, NodeId, NodeKind, PacketBudgetModeDto, PacketPlanDto,
-        PacketProbeDto, PacketProbeResolutionDto, PacketProbeResolutionStatusDto,
-        PacketQueryObligationDto, PacketQueryObligationKindDto, PacketTaskClassDto,
-        SearchHitOrigin, SourceCoverageObservationDto,
+        AgentRetrievalStepStatusDto, DrillGapKindDto, NodeId, NodeKind, PacketBudgetModeDto,
+        PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketPlanDto, PacketProbeDto,
+        PacketProbeResolutionDto, PacketProbeResolutionStatusDto, PacketQueryObligationDto,
+        PacketQueryObligationKindDto, PacketTaskClassDto, SearchHitOrigin,
+        SourceCoverageObservationDto,
     };
     use std::path::Path;
 
@@ -827,7 +886,6 @@ mod tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: Some(packet.packet_id.clone()),
             option_ids: drill
@@ -847,6 +905,53 @@ mod tests {
         );
         assert_eq!(continuation.kind, PacketDispositionKindDto::Supported);
         assert!(continuation.is_terminal());
+    }
+
+    #[test]
+    fn unmet_flow_stage_drills_by_its_planned_query_with_or_without_a_current_carrier() {
+        for current_carrier in [None, Some("Downstream.handle")] {
+            let mut packet = test_packet("Explain the complete request lifecycle.", 98_304);
+            packet.answer.freshness = Some(fresh_index_observation());
+            let mut obligation = claim_obligation(
+                PacketClaimObligationKindDto::Dispatch,
+                PacketObligationProofStatusDto::Reported,
+            );
+            obligation.id = "upstream_public_stage".to_string();
+            obligation.open_next_candidates = vec!["public request registration".to_string()];
+            if let Some(carrier) = current_carrier {
+                packet.answer.citations = vec![eligible_citation(carrier, "src/downstream.rs")];
+                obligation.carrier_node_ids = vec![NodeId(carrier.to_string())];
+            }
+            packet.plan = empty_plan();
+            packet.plan.obligations.claim_obligations = vec![obligation];
+
+            let (_support, disposition) = compile_packet_evidence(
+                &packet.packet_id,
+                &packet.question,
+                &packet.plan,
+                &packet.answer,
+                None,
+            );
+            let options = disposition
+                .drill
+                .expect("an unmet planned stage must remain closable")
+                .options;
+
+            assert_eq!(options.len(), 1, "current carrier: {current_carrier:?}");
+            assert_eq!(
+                options[0].query.as_deref(),
+                Some("public request registration"),
+                "the continuation must not replay a downstream carrier: {current_carrier:?}"
+            );
+            assert!(options[0].symbol_id.is_none());
+            assert!(options[0].path.is_none());
+            let decoded = drill_options_from_ids(&[options[0].id.clone()]);
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].kind, options[0].kind);
+            assert_eq!(decoded[0].query, options[0].query);
+            assert!(decoded[0].symbol_id.is_none());
+            assert!(decoded[0].path.is_none());
+        }
     }
 
     #[test]
@@ -876,6 +981,61 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_source_carriers_drill_by_exact_path_instead_of_opaque_symbol_id() {
+        let mut packet = test_packet("explain the imported animation keyframe", 98_304);
+        packet.answer.freshness = Some(fresh_index_observation());
+        let mut citation = eligible_citation(
+            "@keyframes bounce",
+            "/private/tmp/product-value/repos/animate-css-animate-css/source/attention_seekers/bounce.css",
+        );
+        citation.node_id = NodeId(
+            "packet::css_import::source/attention_seekers/bounce.css::@keyframes bounce"
+                .to_string(),
+        );
+        citation.resolvable = false;
+        citation.evidence_tier = Some(PacketEvidenceTierDto::SyntheticSourceScan);
+        citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
+        packet.answer.citations = vec![citation.clone()];
+
+        let mut obligation = claim_obligation(
+            PacketClaimObligationKindDto::Dispatch,
+            PacketObligationProofStatusDto::Reported,
+        );
+        obligation.carrier_node_ids = vec![citation.node_id];
+        packet.plan = empty_plan();
+        packet.plan.obligations.claim_obligations = vec![obligation];
+
+        let (_support, disposition) = compile_packet_evidence(
+            &packet.packet_id,
+            &packet.question,
+            &packet.plan,
+            &packet.answer,
+            None,
+        );
+        let option = disposition
+            .drill
+            .expect("synthetic source omission should offer one bounded continuation")
+            .options
+            .into_iter()
+            .next()
+            .expect("bounded continuation option");
+
+        assert_eq!(option.kind, DrillGapKindDto::OmittedMandatorySupport);
+        assert_eq!(
+            option.path.as_deref(),
+            Some("source/attention_seekers/bounce.css")
+        );
+        assert!(option.symbol_id.is_none());
+        let decoded = drill_options_from_ids(&[option.id]);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(
+            decoded[0].path.as_deref(),
+            Some("source/attention_seekers/bounce.css")
+        );
+        assert!(decoded[0].symbol_id.is_none());
+    }
+
+    #[test]
     fn a_material_flow_still_unproven_after_drill_is_terminal_not_established() {
         let mut packet = test_packet("explain routing", 98_304);
         packet.answer.freshness = Some(fresh_index_observation());
@@ -893,7 +1053,6 @@ mod tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: Some(packet.packet_id.clone()),
             option_ids: vec!["omitted_mandatory_support:symbol%3ARouter.use".to_string()],
@@ -1224,7 +1383,6 @@ mod tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: None,
             parent_packet_id: Some(packet.packet_id.clone()),
             option_ids: vec!["bounded_source_read:src%2Funread.rs".to_string()],
@@ -1516,7 +1674,7 @@ mod tests {
             badge_visible_members: None,
             badge_total_members: None,
             merged_symbol_examples: Vec::new(),
-            file_path: None,
+            file_path: (id == "builder").then(|| "src/builder.rs".to_string()),
             qualified_name: None,
             member_access: None,
         };
@@ -1558,5 +1716,7 @@ mod tests {
                 .all(|unit| unit.kind == SupportUnitKindDto::TypedGraphEdge)
         );
         assert_eq!(units[0].summary, "`builder` TYPE_USAGE `config`");
+        assert_eq!(units[0].path.as_deref(), Some("src/builder.rs"));
+        assert_eq!(units[0].symbol_id.as_deref(), Some("builder"));
     }
 }

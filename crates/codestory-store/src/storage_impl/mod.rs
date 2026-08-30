@@ -31,6 +31,7 @@ use thiserror::Error;
 
 mod bookmarks;
 mod helpers;
+mod proof_resolution;
 mod retrieval_manifest;
 mod row_mapping;
 mod schema;
@@ -46,8 +47,14 @@ use helpers::{
 };
 
 pub use helpers::{StoredVectorEncoding, stored_vector_encoding};
+#[cfg(debug_assertions)]
+pub use proof_resolution::{
+    BashStoreResolutionWork, bash_store_resolution_work, reset_bash_store_resolution_work,
+    reset_store_replay_work, store_replay_work,
+};
+pub use proof_resolution::{ProofResolutionPublication, seal_call_resolution_fact};
 
-const SCHEMA_VERSION: u32 = 31;
+const SCHEMA_VERSION: u32 = 32;
 // Reserved outside the sequential migration range so a future real schema version cannot
 // accidentally be treated as an interrupted run from this release.
 const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
@@ -86,6 +93,29 @@ const RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL: &str = "SELECT e.id, e.source_node
        AND e.source_node_id = ?1
        AND e.resolved_source_node_id IS NULL
      ORDER BY id ASC";
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundedRawCallEdges {
+    pub edges: Vec<Edge>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactCallEdgeProjection {
+    pub edge_id: EdgeId,
+    pub raw_source: NodeId,
+    pub raw_target: NodeId,
+    pub raw_kind: EdgeKind,
+    pub file_node_id: Option<NodeId>,
+    pub line: Option<u32>,
+    pub callsite_identity: Option<String>,
+    pub raw_target_kind: NodeKind,
+    pub raw_target_file_node_id: Option<NodeId>,
+    pub raw_target_start_line: Option<u32>,
+    pub raw_target_name: String,
+    pub caller: NodeId,
+    pub target: NodeId,
+}
 pub const BUILD_EDGE_SEED_BATCH_SIZE: usize = 200;
 const EDGE_NODE_LOOKUP_BATCH_SIZE: usize = BUILD_EDGE_SEED_BATCH_SIZE;
 const NODE_LOOKUP_BATCH_SIZE: usize = 200;
@@ -114,15 +144,17 @@ const SOURCE_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 2;
 const STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION: u32 = 3;
 const STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION: u32 = 4;
 const SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION: u32 = 5;
-const PROMOTION_JOURNAL_VERSION: u32 = 6;
+const ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION: u32 = 6;
+const PROMOTION_JOURNAL_VERSION: u32 = 7;
 // Snapshot promotion first shipped with schema 21. Journal v2 added the
 // source-policy identity at schema 27, and journal v3 added structural-text
 // identity at schema 28. Journal v4 binds the structural-unit source-policy
 // identity added at schema 29. Journal v5 admits the semantic-projection
 // publication mode added at schema 30. Journal v6 admits the annotation-sidecar
 // cutover at schema 31, which moves user annotations out of the promoted
-// database entirely. Recovery runs before schema migration, so these
-// boundaries are part of the durable journal contract.
+// database entirely. Journal v7 binds the optional proof-resolution projection
+// added at schema 32. Recovery runs before schema migration, so these boundaries
+// are part of the durable journal contract.
 const LEGACY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 21;
 const SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION: u32 = 27;
 const STRUCTURAL_TEXT_PROMOTION_MIN_SCHEMA_VERSION: u32 = 28;
@@ -602,9 +634,13 @@ impl RecoveryDatabaseContract {
                     ..=SEMANTIC_PROJECTION_PROMOTION_MIN_SCHEMA_VERSION)
                     .contains(&schema_version)
             }
-            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+            Self::Journal(ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION) => {
                 (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION
                     ..=ANNOTATION_SIDECAR_PROMOTION_MIN_SCHEMA_VERSION)
+                    .contains(&schema_version)
+            }
+            Self::Journal(PROMOTION_JOURNAL_VERSION) => {
+                (STRUCTURAL_POLICY_PROMOTION_MIN_SCHEMA_VERSION..=SCHEMA_VERSION)
                     .contains(&schema_version)
             }
             Self::Journal(_) => false,
@@ -628,6 +664,10 @@ struct PromotionJournal {
     previous_structural_text: Option<StructuralTextUnitRollbackIdentity>,
     #[serde(default)]
     candidate_structural_text: Option<StructuralTextUnitRollbackIdentity>,
+    #[serde(default)]
+    previous_proof_resolution: Option<ProofResolutionRollbackIdentity>,
+    #[serde(default)]
+    candidate_proof_resolution: Option<ProofResolutionRollbackIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,6 +700,16 @@ struct StructuralTextUnitRollbackIdentity {
     projection_digest: String,
     descriptor_version: u32,
     migration_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ProofResolutionRollbackIdentity {
+    core_generation_id: String,
+    core_run_id: String,
+    core_published_at_epoch_ms: i64,
+    fact_schema_version: u32,
+    fact_count: u64,
+    fact_digest: String,
 }
 
 fn read_source_policy_exclusion_rollback_identity(
@@ -1007,6 +1057,97 @@ fn require_candidate_structural_text_identity(
     require_recorded_structural_text_identity(path, publication, expected, role)
 }
 
+fn read_proof_resolution_rollback_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+) -> Result<Option<ProofResolutionRollbackIdentity>, StorageError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(
+        sqlite_path::open_path(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let schema_version = conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?
+        .max(0) as u32;
+    let fact_table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'proof_resolution_fact'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    let publication_table_exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'proof_resolution_publication'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if fact_table_exists == 0 || publication_table_exists == 0 {
+        if schema_version < SCHEMA_VERSION
+            && fact_table_exists == 0
+            && publication_table_exists == 0
+        {
+            return Ok(None);
+        }
+        return Err(promotion_error(format!(
+            "Proof resolution rollback tables are missing from {}",
+            path.display()
+        )));
+    }
+    let storage = Storage {
+        conn,
+        cache: StorageCache::default(),
+        deferred_secondary_indexes: false,
+        durability_profile: SqliteDurabilityProfile::Durable,
+    };
+    let fact_count = storage.proof_resolution_fact_count()?;
+    let Some(_) = storage.get_proof_resolution_publication()? else {
+        if fact_count == 0 {
+            return Ok(None);
+        }
+        return Err(promotion_error(format!(
+            "Proof resolution rollback facts have no publication in {}",
+            path.display()
+        )));
+    };
+    let receipt = storage
+        .validate_stored_proof_resolution_publication(publication)
+        .map_err(|error| {
+            promotion_error(format!(
+                "Proof resolution rollback identity does not match {}: {error}",
+                path.display()
+            ))
+        })?;
+    Ok(Some(ProofResolutionRollbackIdentity {
+        core_generation_id: receipt.core_generation_id,
+        core_run_id: receipt.core_run_id,
+        core_published_at_epoch_ms: receipt.published_at_epoch_ms,
+        fact_schema_version: receipt.fact_schema_version,
+        fact_count: receipt.fact_count,
+        fact_digest: receipt.fact_digest,
+    }))
+}
+
+fn require_recorded_proof_resolution_identity(
+    path: &Path,
+    publication: &IndexPublicationRecord,
+    expected: &Option<ProofResolutionRollbackIdentity>,
+    role: &str,
+) -> Result<(), StorageError> {
+    if &read_proof_resolution_rollback_identity(path, publication)? != expected {
+        return Err(promotion_error(format!(
+            "{role} proof resolution identity does not match {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Byte extent of the SQLite database header.
 const SQLITE_DATABASE_HEADER_BYTES: usize = 100;
 
@@ -1123,6 +1264,7 @@ fn validate_promoted_live_database(
     candidate: &IndexPublicationRecord,
     candidate_source_policy: &Option<SourcePolicyExclusionRollbackIdentity>,
     candidate_structural_text: &Option<StructuralTextUnitRollbackIdentity>,
+    candidate_proof_resolution: &Option<ProofResolutionRollbackIdentity>,
     candidate_image: Option<PromotionDatabaseImage>,
 ) -> Result<PromotedValidation, StorageError> {
     let published =
@@ -1148,6 +1290,12 @@ fn validate_promoted_live_database(
         live_path,
         &published,
         candidate_structural_text,
+        "Promoted live database",
+    )?;
+    require_recorded_proof_resolution_identity(
+        live_path,
+        &published,
+        candidate_proof_resolution,
         "Promoted live database",
     )?;
     Ok(PromotedValidation::Revalidated)
@@ -1309,6 +1457,7 @@ fn read_promotion_journal(path: &Path) -> Result<PromotionJournal, StorageError>
             | STRUCTURAL_TEXT_PROMOTION_JOURNAL_VERSION
             | STRUCTURAL_POLICY_PROMOTION_JOURNAL_VERSION
             | SEMANTIC_PROJECTION_PROMOTION_JOURNAL_VERSION
+            | ANNOTATION_SIDECAR_PROMOTION_JOURNAL_VERSION
             | PROMOTION_JOURNAL_VERSION
     ) {
         return Err(promotion_error(format!(
@@ -1529,6 +1678,14 @@ fn recover_interrupted_promotion_locked(path: &Path) -> Result<(), StorageError>
                 "Legacy committed live database",
             )?;
         }
+        if committed.version >= PROMOTION_JOURNAL_VERSION {
+            require_recorded_proof_resolution_identity(
+                path,
+                &live_identity,
+                &committed.candidate_proof_resolution,
+                "Committed live database",
+            )?;
+        }
         if let Err(error) = cleanup_committed_promotion_artifacts(path) {
             tracing::warn!(
                 live_path = %path.display(),
@@ -1614,6 +1771,14 @@ fn rollback_prepared_promotion(
                     "Prepared candidate",
                 )?;
             }
+            if prepared.version >= PROMOTION_JOURNAL_VERSION {
+                require_recorded_proof_resolution_identity(
+                    live_path,
+                    live_identity,
+                    &prepared.candidate_proof_resolution,
+                    "Prepared candidate",
+                )?;
+            }
         } else if prepared.previous.as_ref() == Some(live_identity) {
             require_recorded_source_policy_identity(
                 live_path,
@@ -1627,6 +1792,14 @@ fn rollback_prepared_promotion(
                 &prepared.previous_structural_text,
                 "Prepared previous live database",
             )?;
+            if prepared.version >= PROMOTION_JOURNAL_VERSION {
+                require_recorded_proof_resolution_identity(
+                    live_path,
+                    live_identity,
+                    &prepared.previous_proof_resolution,
+                    "Prepared previous live database",
+                )?;
+            }
         }
     }
 
@@ -1655,6 +1828,14 @@ fn rollback_prepared_promotion(
                 &prepared.previous_structural_text,
                 "Prepared recovery backup",
             )?;
+            if prepared.version >= PROMOTION_JOURNAL_VERSION {
+                require_recorded_proof_resolution_identity(
+                    &backup_path,
+                    &backup_identity,
+                    &prepared.previous_proof_resolution,
+                    "Prepared recovery backup",
+                )?;
+            }
             if live_identity.as_ref() != Some(expected_previous) {
                 restore_promotion_database(&backup_path, live_path)?;
             }
@@ -1681,6 +1862,14 @@ fn rollback_prepared_promotion(
                 &prepared.previous_structural_text,
                 "Restored live database",
             )?;
+            if prepared.version >= PROMOTION_JOURNAL_VERSION {
+                require_recorded_proof_resolution_identity(
+                    live_path,
+                    &restored,
+                    &prepared.previous_proof_resolution,
+                    "Restored live database",
+                )?;
+            }
             remove_promotion_file(&prepared_path)?;
             cleanup_sqlite_sidecars(&backup_path)
         }
@@ -1699,18 +1888,19 @@ fn rollback_prepared_promotion(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveryAuxiliaryIdentities {
+    source_policy: Option<SourcePolicyExclusionRollbackIdentity>,
+    structural_text: Option<StructuralTextUnitRollbackIdentity>,
+    proof_resolution: Option<ProofResolutionRollbackIdentity>,
+}
+
 fn read_journal_less_recovery_auxiliary_identities(
     path: &Path,
     publication: &IndexPublicationRecord,
     schema_version: u32,
     role: &str,
-) -> Result<
-    (
-        Option<SourcePolicyExclusionRollbackIdentity>,
-        Option<StructuralTextUnitRollbackIdentity>,
-    ),
-    StorageError,
-> {
+) -> Result<RecoveryAuxiliaryIdentities, StorageError> {
     let source_policy = if schema_version >= SOURCE_POLICY_PROMOTION_MIN_SCHEMA_VERSION {
         read_source_policy_exclusion_rollback_identity(path, publication)?
     } else {
@@ -1734,7 +1924,16 @@ fn read_journal_less_recovery_auxiliary_identities(
     } else {
         None
     };
-    Ok((source_policy, structural_text))
+    let proof_resolution = if schema_version == SCHEMA_VERSION {
+        read_proof_resolution_rollback_identity(path, publication)?
+    } else {
+        None
+    };
+    Ok(RecoveryAuxiliaryIdentities {
+        source_policy,
+        structural_text,
+        proof_resolution,
+    })
 }
 
 fn recover_legacy_promotion_backup(
@@ -1755,13 +1954,12 @@ fn recover_legacy_promotion_backup(
         "Legacy promotion backup",
         recovery_contract,
     )?;
-    let (backup_source_policy, backup_structural_text) =
-        read_journal_less_recovery_auxiliary_identities(
-            backup_path,
-            &backup_identity,
-            backup_schema_version,
-            "legacy promotion backup",
-        )?;
+    let backup_auxiliary = read_journal_less_recovery_auxiliary_identities(
+        backup_path,
+        &backup_identity,
+        backup_schema_version,
+        "legacy promotion backup",
+    )?;
     let live_identity = read_recovery_database_identity(live_path, recovery_contract);
     let restore_backup = match live_identity {
         Ok(None) => true,
@@ -1783,12 +1981,7 @@ fn recover_legacy_promotion_backup(
                 live_schema_version,
                 "live database",
             ) {
-                Ok((live_source_policy, live_structural_text))
-                    if live_source_policy == backup_source_policy
-                        && live_structural_text == backup_structural_text =>
-                {
-                    false
-                }
+                Ok(live_auxiliary) if live_auxiliary == backup_auxiliary => false,
                 Ok(_) | Err(_) => true,
             }
         }
@@ -1835,13 +2028,19 @@ fn recover_legacy_promotion_backup(
         require_recorded_source_policy_identity(
             live_path,
             &restored,
-            &backup_source_policy,
+            &backup_auxiliary.source_policy,
             "Recovered live database",
         )?;
         require_recorded_structural_text_identity(
             live_path,
             &restored,
-            &backup_structural_text,
+            &backup_auxiliary.structural_text,
+            "Recovered live database",
+        )?;
+        require_recorded_proof_resolution_identity(
+            live_path,
+            &restored,
+            &backup_auxiliary.proof_resolution,
             "Recovered live database",
         )?;
     }
@@ -2658,6 +2857,17 @@ pub struct FileInfo {
 pub struct FileContentHash {
     pub file_id: i64,
     pub content_hash: String,
+}
+
+/// Opaque parser-cache payload retained for one source path.
+///
+/// The store deliberately does not interpret this blob. Indexer-owned
+/// publication builders use the complete ordered set to rematerialize private
+/// derived projections after core graph construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexArtifactCacheEntry {
+    pub file_path: PathBuf,
+    pub artifact_blob: Vec<u8>,
 }
 
 pub const STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION: u32 = 1;
@@ -4283,6 +4493,7 @@ pub struct SymbolSummaryRecord {
 enum NonmutatingOpenPolicy {
     StrictCurrentSchema,
     FreshnessFence,
+    ProofValidation,
     SchemaVersion,
 }
 
@@ -4340,6 +4551,17 @@ impl Storage {
         Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::StrictCurrentSchema)
     }
 
+    /// Open the current database for one persistent proof-validation observer.
+    ///
+    /// This keeps the same nonmutating promotion and sidecar fences as ordinary
+    /// observation, and requires an already-complete WAL/SHM pair. The
+    /// persistent non-immutable reader observes later in-place commits via
+    /// `PRAGMA data_version`; refusing a standalone database prevents this
+    /// observer from materializing SQLite sidecars itself.
+    pub fn open_proof_validation_observer<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        Self::open_nonmutating(path.as_ref(), NonmutatingOpenPolicy::ProofValidation)
+    }
+
     /// Open storage only to inspect index freshness without repairing,
     /// migrating, or exposing a fenced database as a readable publication.
     ///
@@ -4387,17 +4609,35 @@ impl Storage {
                 path.display()
             )));
         }
+        if policy == NonmutatingOpenPolicy::ProofValidation && !wal_exists {
+            return Err(StorageError::Other(format!(
+                "Proof validation requires an existing complete WAL sidecar pair: {}",
+                path.display()
+            )));
+        }
         // `immutable=1` guarantees that a standalone database cannot acquire
         // locks or sidecars, but it intentionally ignores committed WAL state.
         // When a complete WAL/SHM pair already exists, a normal read-only
         // connection observes it without materializing either sidecar. SQLite
         // may update transient reader marks inside the existing SHM wal-index;
         // durable database and WAL bytes remain observationally unchanged.
-        let uri = sqlite_path::observational_uri(path, !wal_exists);
-        let conn = Connection::open_with_flags(
-            uri,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )?;
+        let conn = if policy == NonmutatingOpenPolicy::ProofValidation {
+            // A plain read-only filename stays non-immutable, so this
+            // persistent connection can observe later commits through
+            // `data_version`. The complete pair above was established by the
+            // active read path, rather than this observer.
+            Connection::open_with_flags(
+                sqlite_path::open_path(path),
+                OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?
+        } else {
+            let immutable = !wal_exists;
+            let uri = sqlite_path::observational_uri(path, immutable);
+            Connection::open_with_flags(
+                uri,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )?
+        };
         if policy == NonmutatingOpenPolicy::FreshnessFence {
             // The freshness decision combines the schema sentinel, durable
             // fence, stored inventory, and workspace comparison. Pin one
@@ -4427,6 +4667,11 @@ impl Storage {
             NonmutatingOpenPolicy::FreshnessFence if version != SCHEMA_VERSION => {
                 return Err(StorageError::Other(format!(
                     "Freshness observation requires schema version {SCHEMA_VERSION} or the fenced incomplete sentinel, found {version}"
+                )));
+            }
+            NonmutatingOpenPolicy::ProofValidation if version != SCHEMA_VERSION => {
+                return Err(StorageError::Other(format!(
+                    "Proof validation requires schema version {SCHEMA_VERSION}, found {version}"
                 )));
             }
             NonmutatingOpenPolicy::SchemaVersion => {}
@@ -4682,6 +4927,18 @@ impl Storage {
         &self.conn
     }
 
+    /// Return SQLite's connection-local commit observation counter.
+    ///
+    /// A persistent read-only observer compares this value before reusing a
+    /// previously validated publication. SQLite changes it when another
+    /// connection commits, so it detects in-place mutations without treating
+    /// file metadata as publication authority.
+    pub fn sqlite_data_version(&self) -> Result<i64, StorageError> {
+        self.conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(StorageError::from)
+    }
+
     /// Open a query-only artifact-cache reader for this file-backed store.
     ///
     /// The reader is intentionally narrower than `open_read_only`: it does not
@@ -4723,6 +4980,24 @@ impl Storage {
         cache_key: &str,
     ) -> Result<Option<Vec<u8>>, StorageError> {
         get_index_artifact_cache_from_connection(&self.conn, path, cache_key)
+    }
+
+    pub fn get_index_artifact_cache_entries(
+        &self,
+    ) -> Result<Vec<IndexArtifactCacheEntry>, StorageError> {
+        let mut statement = self.conn.prepare(
+            "SELECT file_path, artifact_blob
+             FROM index_artifact_cache
+             ORDER BY file_path",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(IndexArtifactCacheEntry {
+                file_path: PathBuf::from(row.get::<_, String>(0)?),
+                artifact_blob: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
 
     pub fn get_structural_text_artifact_cache(
@@ -5112,7 +5387,22 @@ impl Storage {
 
     /// Mark a live incremental index run incomplete before it mutates projections.
     pub fn begin_incremental_run(&self) -> Result<(), StorageError> {
+        self.begin_index_run(true)
+    }
+
+    /// Mark a staged derived-projection rebuild incomplete without discarding
+    /// core-bound proof facts. This path never mutates the graph and rebinds
+    /// the authenticated proof publication before promotion.
+    pub fn begin_derived_projection_run(&self) -> Result<(), StorageError> {
+        self.begin_index_run(false)
+    }
+
+    fn begin_index_run(&self, invalidate_proof_resolution: bool) -> Result<(), StorageError> {
         let transaction = self.conn.unchecked_transaction()?;
+        if invalidate_proof_resolution {
+            transaction.execute("DELETE FROM proof_resolution_publication", [])?;
+            transaction.execute("DELETE FROM proof_resolution_fact", [])?;
+        }
         transaction.execute(
             "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
              VALUES (1, ?1)
@@ -5573,6 +5863,8 @@ impl Storage {
 
     pub fn clear(&self) -> Result<(), StorageError> {
         let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM proof_resolution_publication", [])?;
+        tx.execute("DELETE FROM proof_resolution_fact", [])?;
         tx.execute("DELETE FROM callable_projection_state", [])?;
         tx.execute("DELETE FROM structural_text_unit_publication", [])?;
         tx.execute("DELETE FROM structural_text_unit", [])?;
@@ -5978,6 +6270,8 @@ impl Storage {
                 staged_path.display()
             )));
         }
+        let candidate_proof_resolution =
+            read_proof_resolution_rollback_identity(staged_path, &candidate)?;
         // A receipt may only seal bytes the validation above actually read, so
         // the image is taken on both sides of it. A staged file that moved under
         // its own validation seals nothing and the promoted copy is revalidated.
@@ -6000,6 +6294,10 @@ impl Storage {
         };
         let previous_structural_text = match previous.as_ref() {
             Some(previous) => read_structural_text_unit_rollback_identity(live_path, previous)?,
+            None => None,
+        };
+        let previous_proof_resolution = match previous.as_ref() {
+            Some(previous) => read_proof_resolution_rollback_identity(live_path, previous)?,
             None => None,
         };
         cleanup_sqlite_sidecars(&backup_path)?;
@@ -6046,6 +6344,12 @@ impl Storage {
                 &previous_structural_text,
                 "Promotion backup",
             )?;
+            require_recorded_proof_resolution_identity(
+                &backup_path,
+                &backup_identity,
+                &previous_proof_resolution,
+                "Promotion backup",
+            )?;
             rollback_backup_bytes = Some(database_logical_bytes_at_path(&backup_path)?);
             durations.backup_validation = Some(backup_validation_started.elapsed());
         }
@@ -6058,6 +6362,8 @@ impl Storage {
             candidate_source_policy: candidate_source_policy.clone(),
             previous_structural_text,
             candidate_structural_text: candidate_structural_text.clone(),
+            previous_proof_resolution,
+            candidate_proof_resolution: candidate_proof_resolution.clone(),
         };
         let journal_write_stats = match write_promotion_journal(&prepared_path, &prepared) {
             Ok(stats) => stats,
@@ -6129,6 +6435,7 @@ impl Storage {
             &candidate,
             &candidate_source_policy,
             &candidate_structural_text,
+            &candidate_proof_resolution,
             candidate_image,
         ) {
             Ok(promoted_validation) => promoted_validation,
@@ -6433,6 +6740,89 @@ impl Storage {
             ],
         )?;
         self.invalidate_grounding_snapshots()?;
+        Ok(())
+    }
+
+    /// Authenticates existing CALL edges with exact syntax resolution metadata.
+    ///
+    /// Raw graph identity is immutable here: this updates only the resolved
+    /// endpoints and resolution metadata. The whole batch commits or rolls back
+    /// together so a staged proof projection cannot observe a partial upgrade.
+    pub fn project_exact_call_edge_resolutions(
+        &mut self,
+        projections: &[ExactCallEdgeProjection],
+    ) -> Result<(), StorageError> {
+        if projections.is_empty() {
+            return Ok(());
+        }
+        let mut edge_ids = HashSet::with_capacity(projections.len());
+        if projections
+            .iter()
+            .any(|projection| !edge_ids.insert(projection.edge_id))
+        {
+            return Err(StorageError::Other(
+                "exact CALL edge projection contains a duplicate edge ID".to_owned(),
+            ));
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "UPDATE edge
+                 SET resolved_source_node_id = ?2,
+                     resolved_target_node_id = ?3,
+                     confidence = 1.0,
+                     certainty = 'certain',
+                     candidate_target_node_ids = '[]'
+                 WHERE id = ?1
+                   AND source_node_id = ?4
+                   AND target_node_id = ?5
+                   AND kind = ?6
+                   AND file_node_id IS ?7
+                   AND line IS ?8
+                   AND callsite_identity IS ?9
+                   AND EXISTS (
+                       SELECT 1
+                       FROM node raw
+                       WHERE raw.id = edge.target_node_id
+                         AND raw.kind = ?10
+                         AND raw.file_node_id IS ?11
+                         AND raw.start_line IS ?12
+                         AND raw.serialized_name = ?13
+                   )",
+            )?;
+            for projection in projections {
+                let updated = statement.execute(params![
+                    projection.edge_id.0,
+                    projection.caller.0,
+                    projection.target.0,
+                    projection.raw_source.0,
+                    projection.raw_target.0,
+                    projection.raw_kind as i32,
+                    projection.file_node_id.map(|id| id.0),
+                    projection.line,
+                    projection.callsite_identity.as_deref(),
+                    projection.raw_target_kind as i32,
+                    projection.raw_target_file_node_id.map(|id| id.0),
+                    projection.raw_target_start_line,
+                    &projection.raw_target_name,
+                ])?;
+                if updated != 1 {
+                    return Err(StorageError::Other(format!(
+                        "exact CALL edge projection did not match one CALL edge: {}",
+                        projection.edge_id.0
+                    )));
+                }
+            }
+        }
+        Self::write_grounding_snapshot_states_on(
+            &tx,
+            GroundingSnapshotState::Dirty,
+            GroundingSnapshotState::Dirty,
+            None,
+            None,
+        )?;
+        Self::invalidate_resolution_support_snapshot_on(&tx)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -6969,6 +7359,33 @@ impl Storage {
             edges.push(Self::edge_from_row(row)?);
         }
         Ok(edges)
+    }
+
+    /// Reads at most `maximum` raw CALL edges and detects one additional row.
+    ///
+    /// Callers that use this for proof construction must treat `truncated` as
+    /// an unclassified result. The retained prefix is diagnostic evidence, not
+    /// authorization to prove over a partial candidate set.
+    pub fn get_bounded_raw_call_edges_by_effective_source(
+        &self,
+        source_node_id: NodeId,
+        maximum: u32,
+    ) -> Result<BoundedRawCallEdges, StorageError> {
+        let sql = format!("{RAW_CALL_EDGES_BY_EFFECTIVE_SOURCE_SQL} LIMIT ?3");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let query_limit = i64::from(maximum) + 1;
+        let mut rows = stmt.query(params![
+            source_node_id.0,
+            EdgeKind::CALL as i32,
+            query_limit
+        ])?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        let truncated = edges.len() > maximum as usize;
+        edges.truncate(maximum as usize);
+        Ok(BoundedRawCallEdges { edges, truncated })
     }
 
     pub fn get_edges_for_node_ids(

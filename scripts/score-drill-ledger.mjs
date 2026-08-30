@@ -116,15 +116,16 @@ function scoreSingleDrill(drill, sourceLedger) {
     claims.filter((claim) => claim.classification === classification).length;
   const correct = count("correct");
   const partial = count("partial");
+  const packet = drill.evidence_packet ?? {};
   const citedFiles = new Set(
-    (drill.evidence_packet?.answer?.citations ?? [])
-      .map((citation) => citation.file_path)
+    (packet.evidence ?? [])
+      .map((evidence) => evidence.path)
       .filter(Boolean),
   );
   const ledgerFiles = new Set(claims.flatMap((claim) => claim.source_files ?? []));
   return {
-    packet_id: drill.evidence_packet?.packet_id ?? null,
-    packet_sufficiency: drill.evidence_packet?.sufficiency?.status ?? null,
+    packet_id: packet.identity?.packet_id ?? null,
+    packet_availability: packet.status ?? null,
     claim_count: claims.length,
     correct,
     partial,
@@ -142,7 +143,7 @@ function scoreSingleDrill(drill, sourceLedger) {
 
 function expectedFileStats(repo) {
   const expected = repo.expectations?.source_truth_files ?? [];
-  const targets = new Set((repo.summary?.source_truth?.target_files ?? []).map(pathKey));
+  const targets = new Set((repo.summary?.evidence_review?.target_files ?? []).map(pathKey));
   const missing = expected.filter((path) => !targets.has(pathKey(path)));
   return {
     expected_file_count: expected.length,
@@ -157,12 +158,12 @@ function expectedFileStats(repo) {
 
 function scoreSuiteRepo(repo, ledgerCase, ledgerSupplied) {
   const expected = expectedFileStats(repo);
-  const blocked = repo.summary?.verdict?.status === "blocked";
+  const unavailable = repo.summary?.availability?.status === "unavailable";
   const ledgerStatus = ledgerCase ? "present" : ledgerSupplied ? "case_missing" : "not_supplied";
   const claims = ledgerCase?.claims ?? [];
   validateClaims(claims, `ledger case ${repo.slug}`);
   const warnings = [];
-  if (blocked) {
+  if (unavailable) {
     return {
       ledger_status: ledgerStatus,
       final_answer_status: "blocked",
@@ -177,7 +178,7 @@ function scoreSuiteRepo(repo, ledgerCase, ledgerSupplied) {
       ...expected,
       forbidden_claim_count: 0,
       ...nonEmpty("layer_findings", ledgerCase?.layer_findings ?? []),
-      warnings: ["drill blocked before answer-quality scoring could complete"],
+      warnings: ["drill evidence was unavailable before answer-quality scoring could complete"],
     };
   }
   if (expected.expected_file_missing_count > 0) {
@@ -243,13 +244,13 @@ function scoreSuiteRepo(repo, ledgerCase, ledgerSupplied) {
 function scoredNextAction(repo) {
   const quality = repo.answer_quality;
   if (quality.final_answer_status === "ready") {
-    if (repo.summary?.verdict?.status === "ready") {
+    if (repo.summary?.availability?.status === "available") {
       return "answer is source-verified; keep the artifacts as the ready baseline";
     }
     if ((repo.summary?.bridges?.partial ?? 0) > 0 || (repo.summary?.bridges?.graph_path ?? 0) === 0) {
-      return `answer is source-verified; improve graph/bridge evidence before promoting the mechanical verdict (${repo.summary?.bridges?.partial ?? 0} partial bridge(s), ${repo.summary?.bridges?.graph_path ?? 0} graph bridge(s))`;
+      return `answer is source-verified; improve graph/bridge evidence before promoting evidence availability (${repo.summary?.bridges?.partial ?? 0} partial bridge(s), ${repo.summary?.bridges?.graph_path ?? 0} graph bridge(s))`;
     }
-    return "answer is source-verified; inspect the mechanical degraded reason before promotion";
+    return "answer is source-verified; inspect the partial evidence-availability reason before promotion";
   }
   if (quality.final_answer_status === "degraded") {
     if (quality.material_revision_count > 0 || quality.claim_partial_count > 0) {
@@ -260,7 +261,7 @@ function scoredNextAction(repo) {
   if (quality.final_answer_status === "failed") {
     return `remove or correct misleading/unsupported final claims before trusting the answer (misleading=${quality.claim_misleading_count}, unsupported=${quality.claim_unsupported_count})`;
   }
-  return repo.summary?.verdict?.next_action ?? "inspect the scored report";
+  return repo.summary?.availability?.next_action ?? "inspect the scored report";
 }
 
 function scoreSuite(suite, sourceLedger) {

@@ -742,6 +742,36 @@ impl ActivationService {
         }
     }
 
+    /// Bind an already-complete core publication without starting managed
+    /// activation. Strictly observational tools use this path so a cold or
+    /// fenced cache stays unavailable instead of triggering indexing or
+    /// retrieval preparation.
+    pub fn bind_existing_complete_core_for_observation(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<(), ApiError> {
+        if cancelled.load(Ordering::Acquire) {
+            return Err(ApiError::new(
+                "cancelled",
+                "request cancelled before observational core admission",
+            ));
+        }
+        match self.classify_complete_core_admission(project_root, storage_path) {
+            CompleteCoreAdmission::Complete => Ok(()),
+            CompleteCoreAdmission::Corrupt(error) => Err(error),
+            CompleteCoreAdmission::Cold => Err(ApiError::new(
+                "proof_semantic_projection_unavailable",
+                "no complete exact-proof core publication is available",
+            )),
+            CompleteCoreAdmission::Fenced => Err(ApiError::new(
+                "proof_semantic_projection_unavailable",
+                "the exact-proof core publication is fenced by an incomplete index run",
+            )),
+        }
+    }
+
     fn classify_complete_core_admission(
         &self,
         project_root: &Path,
@@ -1898,7 +1928,6 @@ impl PublicOperationService {
         })
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn active_project_identity_v3(
         &self,
     ) -> Result<codestory_workspace::ProjectIdentityV3, ApiError> {
@@ -2783,7 +2812,7 @@ mod freshness_gate_tests {
     #[test]
     fn dark_indexed_call_path_builder_remains_core_only() {
         assert!(!operation_requires_retrieval(
-            codestory_agent::indexed_source_call_path_v1::PROOF_DOMAIN
+            codestory_agent::proof_qualification_test_support::PROOF_DOMAIN
         ));
         for operation in ["packet", "search", "context", "drill"] {
             assert!(operation_requires_retrieval(operation));
@@ -3480,7 +3509,6 @@ pub(crate) mod activation_tests {
             task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
-            include_evidence: true,
             latency_budget_ms: Some(30_000),
             parent_packet_id: None,
             option_ids: Vec::new(),

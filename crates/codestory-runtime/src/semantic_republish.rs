@@ -175,7 +175,7 @@ fn prepare_semantic_projection(
     let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
     staged
         .store_mut()
-        .begin_incremental_run()
+        .begin_derived_projection_run()
         .map_err(|error| {
             ApiError::internal(format!(
                 "Failed to fence the staged semantic projection writer: {error}"
@@ -233,6 +233,7 @@ fn prepare_semantic_projection(
 fn stage_semantic_projection_publication(
     staged: &mut StagedSnapshot,
     root: &Path,
+    previous_publication: &IndexPublicationRecord,
     publication: &IndexPublicationRecord,
     source_exclusions: &[SourcePolicyExclusionRecord],
     source_index_policy: &SourceIndexPolicy,
@@ -294,6 +295,14 @@ fn stage_semantic_projection_publication(
         .map_err(|error| {
             ApiError::internal(format!(
                 "Failed to rebind pinned structural publication: {error}"
+            ))
+        })?;
+    staged
+        .store_mut()
+        .rebind_proof_resolution_publication(previous_publication, publication)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to rebind the pinned proof resolution projection: {error}"
             ))
         })?;
     staged
@@ -464,6 +473,7 @@ pub(super) fn semantic_projection_republish_for_runtime(
         let dense_anchor_count = stage_semantic_projection_publication(
             &mut staged,
             root,
+            &expected_publication,
             &publication,
             &source_exclusions,
             source_index_policy,

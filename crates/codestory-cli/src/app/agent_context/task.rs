@@ -1,18 +1,23 @@
 use super::super::artifacts::{ensure_dot_only_for_trail, preflight_output_file};
 use super::super::lifecycle::{OpenedAgentSurface, open_agent_surface};
+#[cfg(test)]
 use super::packet::{
     packet_budget_omitted_sections, packet_disposition_label, packet_operator_status,
 };
 use crate::args;
 use crate::args::{TaskAction, TaskBriefCommand, TaskCommand};
+#[cfg(test)]
 use crate::display;
 use crate::output::{RenderedPublicOutput, emit_public_operation};
 use crate::runtime::map_api_error;
 use anyhow::Result;
-use codestory_contracts::api::{
-    AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, PacketDispositionKindDto,
-    PacketTaskClassDto,
+#[cfg(test)]
+use codestory_contracts::api::{AgentPacketDto, BoundedDrillPlanDto, PacketDispositionKindDto};
+use codestory_contracts::api::{AgentPacketRequestDto, PacketTaskClassDto};
+use codestory_contracts::packet_projection_v3::{
+    ContinuationStateV3Dto, EvidenceAvailabilityV3Dto, PacketProjectionV3Dto,
 };
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
@@ -30,30 +35,195 @@ fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
+    let request = AgentPacketRequestDto {
+        question: cmd.prompt.clone(),
+        budget: cmd.budget.into(),
+        task_class: Some(PacketTaskClassDto::EditPlanning),
+        probes: cmd.probes.clone(),
+        extra_probes: cmd.extra_probes.clone(),
+        latency_budget_ms: cmd.latency_budget_ms,
+        parent_packet_id: None,
+        option_ids: Vec::new(),
+        core_generation_id: None,
+        retrieval_generation: None,
+    };
     let operation = runtime.run_public_operation("packet", || {
         let packet = runtime
             .browser
-            .packet(AgentPacketRequestDto {
-                question: cmd.prompt.clone(),
-                budget: cmd.budget.into(),
-                task_class: Some(PacketTaskClassDto::EditPlanning),
-                probes: cmd.probes.clone(),
-                extra_probes: cmd.extra_probes.clone(),
-                include_evidence: !cmd.no_evidence,
-                latency_budget_ms: cmd.latency_budget_ms,
-                parent_packet_id: None,
-                option_ids: Vec::new(),
-                core_generation_id: None,
-                retrieval_generation: None,
-            })
+            .packet(request.clone())
             .map_err(map_api_error)?;
-        let brief = build_task_brief_output(&packet);
-        let markdown = render_task_brief_markdown(&brief);
+        let product = codestory_runtime::project_packet_v3(
+            &runtime.public_operation,
+            "codestory-cli-task-brief",
+            &request,
+            &packet,
+            |candidate| {
+                serde_json::to_vec(candidate)
+                    .map(|bytes| bytes.len())
+                    .map_err(|_| ())
+            },
+        )
+        .map_err(map_api_error)?;
+        let brief = build_task_brief_v3_output(&cmd.prompt, &product.projection);
+        let markdown = render_task_brief_v3_markdown(&brief);
         RenderedPublicOutput::structured(&brief, markdown)
     })?;
     emit_public_operation(cmd.format, operation, cmd.output_file.as_deref())
 }
 
+#[derive(Debug, serde::Serialize)]
+struct TaskBriefV3Output {
+    task_brief_version: u32,
+    prompt: String,
+    evidence_availability: String,
+    source_packet_id: String,
+    first_files: Vec<TaskBriefFileOutput>,
+    relevant_symbols: Vec<TaskBriefSymbolOutput>,
+    risks_unknowns: Vec<String>,
+    packet_continuation: Option<ContinuationStateV3Dto>,
+}
+
+fn build_task_brief_v3_output(
+    prompt: &str,
+    projection: &PacketProjectionV3Dto,
+) -> TaskBriefV3Output {
+    match projection {
+        PacketProjectionV3Dto::Complete {
+            identity,
+            status,
+            evidence,
+            gaps,
+            continuation,
+            ..
+        } => {
+            let first_files = evidence
+                .as_slice()
+                .iter()
+                .filter_map(|row| {
+                    row.path.as_ref().map(|path| TaskBriefFileOutput {
+                        path: path.as_str().to_owned(),
+                        line: row.start_line,
+                        reason: row
+                            .summary
+                            .as_ref()
+                            .map_or("packet evidence".to_string(), |summary| {
+                                summary.as_str().to_owned()
+                            }),
+                    })
+                })
+                .take(8)
+                .collect();
+            let relevant_symbols = evidence
+                .as_slice()
+                .iter()
+                .filter_map(|row| {
+                    row.symbol_id.as_ref().map(|symbol| TaskBriefSymbolOutput {
+                        name: symbol.as_str().to_owned(),
+                        kind: "indexed_symbol".to_string(),
+                        path: row.path.as_ref().map(|path| path.as_str().to_owned()),
+                        line: row.start_line,
+                        reason: row
+                            .summary
+                            .as_ref()
+                            .map_or("packet evidence".to_string(), |summary| {
+                                summary.as_str().to_owned()
+                            }),
+                    })
+                })
+                .take(12)
+                .collect();
+            let mut risks_unknowns = gaps
+                .as_slice()
+                .iter()
+                .map(|gap| {
+                    gap.message.as_ref().map_or_else(
+                        || format!("evidence gap {}", gap.identity.gap_id.as_str()),
+                        |message| message.as_str().to_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if risks_unknowns.is_empty() {
+                risks_unknowns.push("verify affected files and tests before editing".to_string());
+            }
+            TaskBriefV3Output {
+                task_brief_version: 3,
+                prompt: prompt.to_owned(),
+                evidence_availability: evidence_availability_label(status).to_string(),
+                source_packet_id: identity.packet_id.as_str().to_owned(),
+                first_files,
+                relevant_symbols,
+                risks_unknowns,
+                packet_continuation: continuation.clone(),
+            }
+        }
+        PacketProjectionV3Dto::BudgetExceeded { identity, gaps, .. } => {
+            debug_assert_eq!(gaps.as_slice().len(), 1);
+            debug_assert_eq!(
+                gaps.as_slice()[0].kind,
+                codestory_contracts::packet_projection_v3::GapKindV3Dto::OutputBudgetExceeded
+            );
+            TaskBriefV3Output {
+                task_brief_version: 3,
+                prompt: prompt.to_owned(),
+                evidence_availability: "unavailable".to_string(),
+                source_packet_id: identity.packet_id.as_str().to_owned(),
+                first_files: Vec::new(),
+                relevant_symbols: Vec::new(),
+                risks_unknowns: vec![
+                    "output_budget_exceeded: packet projection exceeded the public result budget"
+                        .to_string(),
+                ],
+                packet_continuation: None,
+            }
+        }
+    }
+}
+
+fn evidence_availability_label(status: &EvidenceAvailabilityV3Dto) -> &'static str {
+    match status {
+        EvidenceAvailabilityV3Dto::Available => "available",
+        EvidenceAvailabilityV3Dto::ContinuationAvailable => "continuation_available",
+        EvidenceAvailabilityV3Dto::NoUsefulEvidence => "no_useful_evidence",
+        EvidenceAvailabilityV3Dto::Unavailable => "unavailable",
+    }
+}
+
+fn render_task_brief_v3_markdown(brief: &TaskBriefV3Output) -> String {
+    let mut markdown = String::from("# Task Brief\n");
+    let _ = writeln!(markdown, "task_brief_version: {}", brief.task_brief_version);
+    let _ = writeln!(
+        markdown,
+        "evidence_availability: `{}`",
+        brief.evidence_availability
+    );
+    let _ = writeln!(markdown, "source_packet_id: `{}`", brief.source_packet_id);
+    let _ = writeln!(
+        markdown,
+        "prompt: `{}`",
+        task_brief_markdown_text(&brief.prompt)
+    );
+    append_task_brief_files(&mut markdown, "First Files", &brief.first_files);
+    append_task_brief_symbols(&mut markdown, "Relevant Symbols", &brief.relevant_symbols);
+    append_task_brief_strings(&mut markdown, "Risks And Unknowns", &brief.risks_unknowns);
+    let _ = writeln!(markdown, "\n## Packet Continuation");
+    if let Some(continuation) = &brief.packet_continuation {
+        let _ = writeln!(
+            markdown,
+            "- continuation_id: `{}`",
+            continuation.continuation_id.as_str()
+        );
+        let _ = writeln!(
+            markdown,
+            "- remaining_rounds: {}",
+            continuation.remaining_rounds
+        );
+    } else {
+        let _ = writeln!(markdown, "- none");
+    }
+    markdown
+}
+
+#[cfg(test)]
 #[derive(Debug, serde::Serialize)]
 pub(in crate::app) struct TaskBriefOutput {
     pub(in crate::app) task_brief_version: u32,
@@ -86,6 +256,7 @@ pub(in crate::app) struct TaskBriefSymbolOutput {
     pub(in crate::app) reason: String,
 }
 
+#[cfg(test)]
 pub(in crate::app) fn build_task_brief_output(packet: &AgentPacketDto) -> TaskBriefOutput {
     let citations = packet_task_brief_citations(packet);
     let first_files = task_brief_first_files(&citations);
@@ -114,6 +285,7 @@ pub(in crate::app) fn build_task_brief_output(packet: &AgentPacketDto) -> TaskBr
     }
 }
 
+#[cfg(test)]
 fn packet_task_brief_citations(
     packet: &AgentPacketDto,
 ) -> Vec<&codestory_contracts::api::AgentCitationDto> {
@@ -122,6 +294,7 @@ fn packet_task_brief_citations(
     citations
 }
 
+#[cfg(test)]
 fn task_brief_first_files(
     citations: &[&codestory_contracts::api::AgentCitationDto],
 ) -> Vec<TaskBriefFileOutput> {
@@ -145,6 +318,7 @@ fn task_brief_first_files(
     files
 }
 
+#[cfg(test)]
 fn task_brief_relevant_symbols(
     citations: &[&codestory_contracts::api::AgentCitationDto],
 ) -> Vec<TaskBriefSymbolOutput> {
@@ -173,6 +347,7 @@ fn task_brief_relevant_symbols(
     symbols
 }
 
+#[cfg(test)]
 fn task_brief_likely_tests(
     citations: &[&codestory_contracts::api::AgentCitationDto],
 ) -> Vec<TaskBriefFileOutput> {
@@ -196,6 +371,7 @@ fn task_brief_likely_tests(
     tests
 }
 
+#[cfg(test)]
 fn task_brief_path_is_test(path: &str) -> bool {
     let normalized = path.replace('\\', "/").to_ascii_lowercase();
     normalized.contains("/tests/")
@@ -207,6 +383,7 @@ fn task_brief_path_is_test(path: &str) -> bool {
         || normalized.ends_with(".spec.js")
 }
 
+#[cfg(test)]
 fn task_brief_impacted_surfaces(
     first_files: &[TaskBriefFileOutput],
     symbols: &[TaskBriefSymbolOutput],
@@ -222,6 +399,7 @@ fn task_brief_impacted_surfaces(
     surfaces.into_iter().take(8).collect()
 }
 
+#[cfg(test)]
 fn task_brief_surface_for_path(path: &str) -> String {
     let normalized = path.replace('\\', "/");
     let mut parts = normalized.split('/');
@@ -233,6 +411,7 @@ fn task_brief_surface_for_path(path: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn task_brief_risks_unknowns(
     packet: &AgentPacketDto,
     likely_tests: &[TaskBriefFileOutput],
@@ -256,6 +435,7 @@ fn task_brief_risks_unknowns(
     risks
 }
 
+#[cfg(test)]
 pub(in crate::app) fn render_task_brief_markdown(brief: &TaskBriefOutput) -> String {
     let mut markdown = String::new();
     let _ = writeln!(markdown, "# Task Brief");
@@ -360,6 +540,7 @@ fn append_task_brief_strings(markdown: &mut String, title: &str, values: &[Strin
     }
 }
 
+#[cfg(test)]
 fn append_task_brief_continuation(
     markdown: &mut String,
     continuation: Option<&BoundedDrillPlanDto>,

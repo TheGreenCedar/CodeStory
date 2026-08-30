@@ -1,6 +1,6 @@
 use crate::index_commit::{
     CoreCommitMode, PreparedCoreCommit, StagedPreparation, next_index_publication,
-    stage_core_publication_identity,
+    rematerialize_staged_proof_resolution_projection, stage_core_publication_identity,
 };
 use crate::index_incremental::spawn_progress_forwarder;
 use crate::index_timings::{
@@ -331,6 +331,29 @@ fn run_full_refresh_indexer(
     let mut preparation = StagedPreparation::new(staged);
     #[cfg(test)]
     run_full_refresh_staged_store_hook(preparation.staged_mut().store_mut());
+    let staged_proof_fact_count = preparation
+        .staged_mut()
+        .store_mut()
+        .proof_resolution_fact_count()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect the fresh full-refresh proof overlay: {error}"
+            ))
+        })?;
+    let staged_proof_publication = preparation
+        .staged_mut()
+        .store_mut()
+        .get_proof_resolution_publication()
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect the fresh full-refresh proof overlay: {error}"
+            ))
+        })?;
+    if staged_proof_fact_count != 0 || staged_proof_publication.is_some() {
+        return Err(ApiError::internal(
+            "Fresh full-refresh storage contains a proof overlay before graph mutation",
+        ));
+    }
     let copied_structural_artifacts = if live_state.has_verified_publication {
         match preparation
             .staged_mut()
@@ -449,6 +472,11 @@ fn prepare_full_refresh(
         copy_forward_full_refresh_artifacts(preparation.staged_mut(), storage_path);
     }
     wall_durations.copy_forward = copy_started.elapsed();
+    rematerialize_staged_proof_resolution_projection(
+        preparation.staged_mut(),
+        &live_state.publication,
+        cancel_token,
+    )?;
     let snapshots = prepare_full_refresh_snapshots(
         preparation.staged_mut(),
         &live_state.dense_anchor_source_identity,

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync, realpathSync, statSync } from "node:fs";
-import { copyFile, mkdir, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -45,9 +45,71 @@ const MAX_PACKET_MANIFEST_EXTRA_PROBES = 12;
 const PUBLIC_PACKET_MAX_ANCHORS = 16;
 const PUBLIC_PACKET_MAX_TRAIL_EDGES = 60;
 const PUBLIC_PACKET_MAX_OUTPUT_BYTES = 128 * 1024;
+const PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES = 16 * 1024;
 const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
-const REQUIRED_MANAGED_CODESTORY_VERSION = "0.17.0";
+const EXACT_CANDIDATE_ARMS = Object.freeze([
+  "without_codestory",
+  "published_0_17_4",
+  "candidate_0_18",
+]);
+const EXACT_CANDIDATE_TASK_IDS = Object.freeze([
+  "python-requests-session-flow",
+  "java-commons-lang-string-utils",
+  "rust-ripgrep-search-pipeline",
+  "javascript-express-routing-flow",
+  "typescript-swr-hook-flow",
+  "cpp-fmt-formatting-flow",
+  "c-redis-command-loop",
+  "go-gin-route-dispatch",
+  "ruby-jekyll-site-build",
+  "php-monolog-record-flow",
+  "csharp-automapper-map-flow",
+  "kotlin-okio-buffer-flow",
+  "swift-alamofire-request-flow",
+  "dart-http-client-flow",
+  "bash-nvm-install-dispatch",
+  "html-mdn-form-validation",
+  "css-animate-base-and-keyframes",
+  "sql-chinook-schema-relations",
+]);
+const EXACT_CANDIDATE_TASK_REPOS = Object.freeze({
+  "python-requests-session-flow": "psf-requests",
+  "java-commons-lang-string-utils": "apache-commons-lang",
+  "rust-ripgrep-search-pipeline": "BurntSushi-ripgrep",
+  "javascript-express-routing-flow": "expressjs-express",
+  "typescript-swr-hook-flow": "vercel-swr",
+  "cpp-fmt-formatting-flow": "fmtlib-fmt",
+  "c-redis-command-loop": "redis-redis",
+  "go-gin-route-dispatch": "gin-gonic-gin",
+  "ruby-jekyll-site-build": "jekyll-jekyll",
+  "php-monolog-record-flow": "Seldaek-monolog",
+  "csharp-automapper-map-flow": "AutoMapper-AutoMapper",
+  "kotlin-okio-buffer-flow": "square-okio",
+  "swift-alamofire-request-flow": "Alamofire-Alamofire",
+  "dart-http-client-flow": "dart-lang-http",
+  "bash-nvm-install-dispatch": "nvm-sh-nvm",
+  "html-mdn-form-validation": "mdn-learning-area",
+  "css-animate-base-and-keyframes": "animate-css-animate-css",
+  "sql-chinook-schema-relations": "lerocha-chinook-database",
+});
+const EXACT_CANDIDATE_PACKAGE_CONTRACT = "codestory.agent-benchmark-package/v2";
+const EXACT_CANDIDATE_SOURCE_CLI_CONTRACT = "codestory.agent-benchmark-source-cli/v1";
+const MAX_EXACT_RECEIPT_BYTES = 64 * 1024;
+const MAX_EXACT_CHECKSUM_MANIFEST_BYTES = 1024 * 1024;
+const MAX_EXACT_ARCHIVE_BYTES = 8 * 1024 * 1024 * 1024;
+const MAX_EXACT_CLI_BYTES = 1024 * 1024 * 1024;
+const MAX_EXACT_SOURCE_IDENTITY_BYTES = 16 * 1024 * 1024;
+const MAX_EXACT_ARCHIVE_ENTRIES = 16_384;
+const MAX_EXACT_ARCHIVE_LISTING_BYTES = 2 * 1024 * 1024;
+const EXACT_CANDIDATE_TASK_CONTRACT_SHA256 =
+  "601092667e757421c4cadafdaf0661a64f7066ea0aa8365f19706264a6931173";
+const MCP_PROTOCOL_REVISIONS = new Set([
+  "2024-11-05",
+  "2025-03-26",
+  "2025-06-18",
+  "2025-11-25",
+]);
 const PINNED_CODEX_RUNNER_CONFIG = [
   'model_reasoning_effort="xhigh"',
   'service_tier="default"',
@@ -56,6 +118,9 @@ const PINNED_CODEX_RUNNER_CONFIG = [
 ];
 const REUSABLE_BASELINE_ARTIFACT_NAME_PATTERN =
   /(?:\.stdout\.jsonl|\.stderr\.txt|\.baseline-context\.json|\.baseline-context\.stderr\.txt)$/;
+const EXACT_COMPARATOR_ARTIFACT_NAME_PATTERN =
+  /(?:\.stdout\.jsonl|\.stderr\.txt|\.baseline-context\.json|\.baseline-context\.stderr\.txt|\.codestory-packet(?:-drill)?\.stdout\.json|\.codestory-packet(?:-drill)?\.stderr\.txt)$/;
+const MAX_EXACT_COMPARATOR_LEDGER_BYTES = 64 * 1024 * 1024;
 const PACKET_TASK_CLASSES = new Set([
   "architecture_explanation",
   "bug_localization",
@@ -144,12 +209,34 @@ const LOCAL_REPOS = {
 
 const ALL_REPOS = { ...PUBLIC_REPOS, ...LOCAL_REPOS };
 
+const CODESTORY_ARM_INSTRUCTION =
+  "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.";
+
+const CODESTORY_V3_ARM_INSTRUCTION =
+  "Use the CodeStory packet supplied by the harness as repository evidence, not as proof or an answer-authority verdict. Answer only from its evidence rows. For every requested material stage that an evidence row establishes, state a direct subject-verb claim naming the subject and established action before describing any gaps. Do not substitute a heading, symbol inventory, or adjacent partial observation, and make the claim no broader than the cited evidence row. When a higher-level action and its mechanism are established by the same evidence rows, name both: the subject performs, drives, or handles the action by calling the mechanism. Avoid weak role labels such as `is the ... symbol` or `participates in`; do not report only that the subject `calls` a downstream target. Then state every material gap, scoped only to requested links or stages the rows do not establish. Follow at most one declared continuation using the packet's continuation and publication identities, then reassess its returned gaps without another retrieval call. An exact focused source read is allowed only for a file-local task where the user named that exact file, or when a material evidence-missing, Unknown, or Unavailable boundary authenticates that exact path. A file mentioned inside a broad flow question does not authorize a read. Perform at most one bounded read per authorized path. An output_budget_exceeded gap is descriptive and does not authorize a source read or another repository tool by itself. A packet-cited path or range alone is not read authorization, and an unrelated gap does not authorize arbitrary files. Do not use shell search, Git, or free-form repository recovery. Do not call search or context as packet recovery in this controlled comparison. Do not turn missing evidence into absence or runtime behavior. Do not repeat the initial packet call or use web search, browser tools, remote URLs, or upstream mirrors.";
+
 const ARMS = {
   without_codestory:
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
-    "Use the CodeStory packet supplied by the harness as the only repository context. Judge its compiled support units directly. Supported, not_established, and unavailable are terminal. For supported, answer from support. For not_established, answer every directly established part and explicitly name the material gaps without inferring missing links. For unavailable, report the typed availability reason. Drill_once permits exactly one MCP packet continuation with the original question, parent_packet_id, listed option_ids, and the declared core_generation_id/retrieval_generation pins; after that result, apply the same terminal rules and stop. Do not use search, context, trail, snippet, shell, git, or direct source reads as packet recovery. Preserve exact source identifiers and paths from support and citations. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
+    CODESTORY_ARM_INSTRUCTION,
+  published_0_17_4: CODESTORY_ARM_INSTRUCTION,
+  candidate_0_18: CODESTORY_ARM_INSTRUCTION,
 };
+
+function isCodeStoryArm(arm) {
+  return arm === "with_codestory" || arm === "published_0_17_4" || arm === "candidate_0_18";
+}
+
+function isPacketProjectionV3(packet) {
+  return packet?.schema_version === 3;
+}
+
+function codeStoryArmInstruction(packet) {
+  return isPacketProjectionV3(packet)
+    ? CODESTORY_V3_ARM_INSTRUCTION
+    : CODESTORY_ARM_INSTRUCTION;
+}
 
 function usage() {
   console.log(`Usage:
@@ -158,6 +245,7 @@ function usage() {
   node scripts/codestory-agent-ab-benchmark.mjs --reanalyze-dir target/agent-benchmark/<run-dir>
   node scripts/codestory-agent-ab-benchmark.mjs --packet-runtime --task-suite <suite> [--materialize-repos] [--repeats n]
   node scripts/codestory-agent-ab-benchmark.mjs [--quick] [--repos names] [--arms names] [--task-suite name] [--task-ids ids] [--task-manifest path] [--include-local-repos] [--repeats n] [--runner codex] [--model model] [--sandbox mode] [--out-dir path] [--timeout-ms ms] [--prepare-codestory-cache] [--canary-task-id id] [--shard-count n --shard-index n] [--allow-failures] [--publishable]
+  node scripts/codestory-agent-ab-benchmark.mjs --exact-candidate --task-suite language-expansion-holdout --published-archive <path> --published-checksum-manifest <path> --published-checksum-sha256 <sha256> --candidate-source-root <path>
 
 Options:
   --list          Print configured benchmark repositories or selected manifest tasks and exit.
@@ -165,7 +253,7 @@ Options:
   --reanalyze-dir Recompute transcript analysis, quality scores, and summaries from an existing run directory.
   --quick         Default to repo=codestory and repeats=1 unless explicitly set.
   --repos         Comma-separated repo names. Public: ${Object.keys(PUBLIC_REPOS).join(", ")}. Local optional: ${Object.keys(LOCAL_REPOS).join(", ")}
-  --arms          Comma-separated A/B arms. Default: ${Object.keys(ARMS).join(", ")}.
+  --arms          Comma-separated A/B arms. Default: without_codestory, with_codestory.
   --task-suite    Task suite folder under benchmarks/tasks, such as public-core or holdout-retrieval.
   --task-ids      Comma-separated manifest task ids to include after suite/path loading.
   --task-manifest Task manifest JSON file or directory. When set, tasks drive repos and prompts.
@@ -191,6 +279,24 @@ Options:
   --jobs          Parallel jobs for independent packet-runtime cold-cli rows or independent agent repo groups. Default: 1.
   --reuse-baseline-from
                   Reuse matching without-CodeStory rows from an earlier run directory when the task snapshot is unchanged.
+  --resume-prefix-from
+                  Exact-candidate only: authenticate and reanalyze one complete-task prefix, then run only the remaining tasks.
+  --reuse-comparators-from
+                  Exact-candidate only: reuse authenticated no-CodeStory and published-0.17.4 triplets while rerunning every candidate row.
+  --reuse-comparators-ledger-sha256
+                  External SHA-256 binding for the comparator source runs.jsonl.
+  --reuse-comparators-artifacts-sha256
+                  External SHA-256 binding for the comparator source artifact bundle.
+  --exact-candidate
+                  Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.4, and the frozen 0.18 candidate.
+  --published-archive
+                  Published CodeStory 0.17.4 native archive named by the authenticated checksum manifest.
+  --published-checksum-manifest
+                  Official published SHA256SUMS.txt containing the selected archive digest.
+  --published-checksum-sha256
+                  External SHA-256 binding for the official published checksum manifest.
+  --candidate-source-root
+                  Clean Git root whose checked-in plugin and MCP catalog define the 0.18 candidate. Exact mode builds its CLI with Cargo --locked --release.
   --prepare-codestory-cache
                   Before timed with-CodeStory runs, refresh stale or semantic-empty local caches and record indexing cost separately.
                   Packet-runtime mode enables this by default because packets require prepared local indexes.
@@ -264,6 +370,15 @@ function parseArgs(argv) {
       "timeout-ms": { type: "string" },
       jobs: { type: "string" },
       "reuse-baseline-from": { type: "string" },
+      "resume-prefix-from": { type: "string" },
+      "reuse-comparators-from": { type: "string" },
+      "reuse-comparators-ledger-sha256": { type: "string" },
+      "reuse-comparators-artifacts-sha256": { type: "string" },
+      "exact-candidate": { type: "boolean" },
+      "published-archive": { type: "string" },
+      "published-checksum-manifest": { type: "string" },
+      "published-checksum-sha256": { type: "string" },
+      "candidate-source-root": { type: "string" },
       "prepare-codestory-cache": { type: "boolean" },
       "no-prepare-codestory-cache": { type: "boolean" },
       "prepare-codestory-timeout-ms": { type: "string" },
@@ -277,6 +392,7 @@ function parseArgs(argv) {
       "max-source-reads-after-packet": { type: "string" },
     },
   });
+  const providedOptions = new Set(Object.keys(values));
   const opts = {
     list: false,
     selfTest: false,
@@ -302,6 +418,16 @@ function parseArgs(argv) {
     timeoutMs: 600000,
     jobs: 1,
     reuseBaselineFrom: null,
+    resumePrefixFrom: null,
+    reuseComparatorsFrom: null,
+    reuseComparatorsLedgerSha256: null,
+    reuseComparatorsArtifactsSha256: null,
+    exactCandidate: false,
+    publishedArchive: null,
+    publishedChecksumManifest: null,
+    publishedChecksumSha256: null,
+    candidateSourceRoot: null,
+    exactCandidatePackageByArm: null,
     prepareCodestoryCache: null,
     prepareCodestoryJobs: 2,
     prepareCodestoryTimeoutMs: 1_800_000,
@@ -361,6 +487,15 @@ function parseArgs(argv) {
   opts.timeoutMs = values["timeout-ms"] == null ? opts.timeoutMs : Number.parseInt(values["timeout-ms"], 10);
   opts.jobs = values.jobs == null ? opts.jobs : Number.parseInt(values.jobs, 10);
   opts.reuseBaselineFrom = values["reuse-baseline-from"] ?? null;
+  opts.resumePrefixFrom = values["resume-prefix-from"] ?? null;
+  opts.reuseComparatorsFrom = values["reuse-comparators-from"] ?? null;
+  opts.reuseComparatorsLedgerSha256 = values["reuse-comparators-ledger-sha256"] ?? null;
+  opts.reuseComparatorsArtifactsSha256 = values["reuse-comparators-artifacts-sha256"] ?? null;
+  opts.exactCandidate = values["exact-candidate"] === true;
+  opts.publishedArchive = values["published-archive"] ?? null;
+  opts.publishedChecksumManifest = values["published-checksum-manifest"] ?? null;
+  opts.publishedChecksumSha256 = values["published-checksum-sha256"] ?? null;
+  opts.candidateSourceRoot = values["candidate-source-root"] ?? null;
   opts.prepareCodestoryCache = values["prepare-codestory-cache"] === true ? true : null;
   opts.prepareCodestoryTimeoutMs =
     values["prepare-codestory-timeout-ms"] == null
@@ -379,7 +514,7 @@ function parseArgs(argv) {
     throw new Error("--task-suite and --task-manifest are mutually exclusive");
   }
 
-  if (!opts.reanalyzeDir && !opts.repos && !opts.taskSuite && !opts.taskManifest) {
+  if (!opts.reanalyzeDir && !opts.repos && !opts.taskSuite && !opts.taskManifest && !opts.exactCandidate) {
     opts.repos = opts.quick
       ? ["codestory"]
       : [
@@ -387,13 +522,78 @@ function parseArgs(argv) {
           ...(opts.includeLocalRepos ? Object.keys(LOCAL_REPOS) : []),
         ];
   }
-  opts.arms ??= Object.keys(ARMS);
+  if (opts.exactCandidate) {
+    const exactOptionAllowlist = new Set([
+      "exact-candidate",
+      "task-suite",
+      "materialize-repos",
+      "repo-cache-dir",
+      "out-dir",
+      "published-archive",
+      "published-checksum-manifest",
+      "published-checksum-sha256",
+      "candidate-source-root",
+      "resume-prefix-from",
+      "reuse-comparators-from",
+      "reuse-comparators-ledger-sha256",
+      "reuse-comparators-artifacts-sha256",
+    ]);
+    const forbiddenOptions = [...providedOptions].filter((name) => !exactOptionAllowlist.has(name));
+    if (forbiddenOptions.length) {
+      throw new Error(`exact-candidate mode forbids option(s): ${forbiddenOptions.sort().join(", ")}`);
+    }
+    if (opts.reuseBaselineFrom) {
+      throw new Error("baseline reuse is forbidden in exact-candidate mode");
+    }
+    if (opts.quick || opts.packetRuntime || opts.aggregateShards || opts.shardCount !== 1 || opts.shardIndex !== 0) {
+      throw new Error("exact-candidate mode forbids quick, packet-runtime, aggregation, and sharding");
+    }
+    if (opts.runner !== "codex" || (opts.model != null && opts.model !== DEFAULT_BENCHMARK_MODEL)) {
+      throw new Error(`exact-candidate mode requires runner=codex and model=${DEFAULT_BENCHMARK_MODEL}`);
+    }
+    if (opts.sandbox !== "workspace-write" || opts.jobs !== 1 || opts.timeoutMs !== 600_000) {
+      throw new Error("exact-candidate mode requires the pinned workspace-write, single-job, 600000ms run window");
+    }
+    if (opts.taskIds || opts.repos) {
+      throw new Error("exact-candidate mode forbids task and repository subsets");
+    }
+    opts.taskSuite ??= "language-expansion-holdout";
+    if (opts.taskSuite !== "language-expansion-holdout") {
+      throw new Error("exact-candidate mode requires the language-expansion-holdout task suite");
+    }
+    if (
+      !opts.publishedArchive ||
+      !opts.publishedChecksumManifest ||
+      !opts.publishedChecksumSha256 ||
+      !opts.candidateSourceRoot
+    ) {
+      throw new Error("exact-candidate mode requires authenticated published archive and candidate source input");
+    }
+    if (opts.arms && opts.arms.join(",") !== EXACT_CANDIDATE_ARMS.join(",")) {
+      throw new Error(`exact-candidate arms are frozen as ${EXACT_CANDIDATE_ARMS.join(",")}`);
+    }
+    if (opts.repeats != null && opts.repeats !== 3) {
+      throw new Error("exact-candidate mode requires exactly 3 repeats");
+    }
+    opts.arms = [...EXACT_CANDIDATE_ARMS];
+    opts.repeats = 3;
+    opts.model = DEFAULT_BENCHMARK_MODEL;
+    opts.prepareCodestoryCache = true;
+    opts.publishedChecksumSha256 = normalizeExternalSha256(
+      opts.publishedChecksumSha256,
+      "--published-checksum-sha256",
+    );
+  }
+  opts.arms ??= ["without_codestory", "with_codestory"];
   if (!opts.arms.length) {
     throw new Error("--arms must include at least one arm");
   }
   for (const arm of opts.arms) {
     if (!ARMS[arm]) {
       throw new Error(`Unknown arm '${arm}'. Known: ${Object.keys(ARMS).join(", ")}`);
+    }
+    if (!opts.exactCandidate && EXACT_CANDIDATE_ARMS.includes(arm) && arm !== "without_codestory") {
+      throw new Error(`Arm '${arm}' is available only with --exact-candidate`);
     }
   }
   if (!opts.repeats) {
@@ -457,6 +657,39 @@ function parseArgs(argv) {
   if (opts.reuseBaselineFrom) {
     opts.reuseBaselineFrom = path.resolve(opts.reuseBaselineFrom);
   }
+  if (opts.resumePrefixFrom) {
+    if (!opts.exactCandidate) {
+      throw new Error("--resume-prefix-from is available only in exact-candidate mode");
+    }
+    opts.resumePrefixFrom = path.resolve(opts.resumePrefixFrom);
+  }
+  const comparatorReuseInputs = [
+    opts.reuseComparatorsFrom,
+    opts.reuseComparatorsLedgerSha256,
+    opts.reuseComparatorsArtifactsSha256,
+  ];
+  if (comparatorReuseInputs.some(Boolean)) {
+    if (!opts.exactCandidate) {
+      throw new Error("--reuse-comparators-from is available only in exact-candidate mode");
+    }
+    if (!comparatorReuseInputs.every(Boolean)) {
+      throw new Error(
+        "comparator reuse requires --reuse-comparators-from, --reuse-comparators-ledger-sha256, and --reuse-comparators-artifacts-sha256",
+      );
+    }
+    if (opts.resumePrefixFrom) {
+      throw new Error("--reuse-comparators-from and --resume-prefix-from are mutually exclusive");
+    }
+    opts.reuseComparatorsFrom = path.resolve(opts.reuseComparatorsFrom);
+    opts.reuseComparatorsLedgerSha256 = normalizeExternalSha256(
+      opts.reuseComparatorsLedgerSha256,
+      "--reuse-comparators-ledger-sha256",
+    );
+    opts.reuseComparatorsArtifactsSha256 = normalizeExternalSha256(
+      opts.reuseComparatorsArtifactsSha256,
+      "--reuse-comparators-artifacts-sha256",
+    );
+  }
   if (opts.repos) {
     for (const name of opts.repos) {
       if (!ALL_REPOS[name]) {
@@ -482,8 +715,261 @@ function retrievalEnv() {
   return benchmarkRetrievalEnv(benchmarkChildEnv(process.env));
 }
 
-function selectedBenchmarkChildEnv(opts = {}) {
-  return { ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)) };
+function exactCandidateArmEnv(opts, arm) {
+  if (!opts.exactCandidate || !isCodeStoryArm(arm)) return {};
+  const armRoot = path.join(opts.exactCandidateStateRoot, arm);
+  return {
+    CODESTORY_CACHE_ROOT: path.join(armRoot, "cache"),
+    CODESTORY_STDIO_CACHE_ROOT: path.join(armRoot, "stdio-cache"),
+    CODESTORY_PLUGIN_DATA: path.join(armRoot, "plugin-data"),
+    CODESTORY_EMBED_QUALIFICATION_DIR: path.join(armRoot, "embedding-qualification"),
+    CODESTORY_EMBED_QUALIFICATION_NONCE: `agent-benchmark-${arm}`,
+  };
+}
+
+const EXACT_CANDIDATE_ARM_DIRECTORY_ENV_KEYS = Object.freeze([
+  "CODESTORY_CACHE_ROOT",
+  "CODESTORY_STDIO_CACHE_ROOT",
+  "CODESTORY_PLUGIN_DATA",
+  "CODESTORY_EMBED_QUALIFICATION_DIR",
+]);
+
+const EXACT_CANDIDATE_ARM_SCALAR_ENV_KEYS = Object.freeze([
+  "CODESTORY_EMBED_QUALIFICATION_NONCE",
+]);
+
+function exactCandidateArmEnvironmentGroups(opts, arm) {
+  const env = exactCandidateArmEnv(opts, arm);
+  const select = (keys) => Object.fromEntries(
+    keys.filter((key) => Object.hasOwn(env, key)).map((key) => [key, env[key]]),
+  );
+  return {
+    directories: select(EXACT_CANDIDATE_ARM_DIRECTORY_ENV_KEYS),
+    scalars: select(EXACT_CANDIDATE_ARM_SCALAR_ENV_KEYS),
+  };
+}
+
+async function createExactCandidatePrivateStateRoot(prefix) {
+  const created = await mkdtemp(path.join(os.tmpdir(), prefix));
+  try {
+    return realpathSync(created);
+  } catch (error) {
+    await rm(created, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+const OWNED_BENCHMARK_ROOT_REMOVE_OPTIONS = Object.freeze({
+  recursive: true,
+  force: true,
+  maxRetries: 12,
+  retryDelay: 250,
+});
+
+function benchmarkResourceFailure(resource, error, resourcePath = null) {
+  return {
+    resource,
+    ...(resourcePath ? { path: resourcePath } : {}),
+    code: typeof error?.code === "string" ? error.code : null,
+    message: error instanceof Error ? error.message : String(error),
+  };
+}
+
+async function removeOwnedBenchmarkRoot(remove, resource, root) {
+  try {
+    await remove(root, OWNED_BENCHMARK_ROOT_REMOVE_OPTIONS);
+    return null;
+  } catch (error) {
+    return benchmarkResourceFailure(resource, error, root);
+  }
+}
+
+async function initializeExactCandidateState(opts, dependencies = {}) {
+  const createPrivateStateRoot = dependencies.createPrivateStateRoot
+    ?? createExactCandidatePrivateStateRoot;
+  const makeDirectory = dependencies.makeDirectory ?? mkdir;
+  const authenticatePackages = dependencies.authenticatePackages
+    ?? authenticateExactCandidatePackages;
+  const remove = dependencies.remove ?? rm;
+  const allocated = [];
+  try {
+    opts.exactCandidateStateRoot = await createPrivateStateRoot(
+      "codestory-agent-exact-candidate-",
+    );
+    allocated.push({
+      resource: "exact_candidate_state",
+      root: opts.exactCandidateStateRoot,
+      clear: () => delete opts.exactCandidateStateRoot,
+    });
+    opts.exactCandidateBaselineContainerRoot = await createPrivateStateRoot(
+      "agent-exact-baseline-",
+    );
+    allocated.push({
+      resource: "exact_candidate_baseline_state",
+      root: opts.exactCandidateBaselineContainerRoot,
+      clear: () => {
+        delete opts.exactCandidateBaselineContainerRoot;
+        delete opts.exactCandidateBaselineStateRoot;
+      },
+    });
+    opts.exactCandidateBaselineStateRoot = path.join(
+      opts.exactCandidateBaselineContainerRoot,
+      "private-state",
+    );
+    await makeDirectory(opts.exactCandidateBaselineStateRoot, {
+      recursive: true,
+      mode: 0o700,
+    });
+    const authenticated = await authenticatePackages(opts);
+    opts.exactCandidatePackageByArm = authenticated.packages;
+    opts.exactCandidateLifecycle = authenticated.lifecycle;
+  } catch (error) {
+    const cleanupFailures = [];
+    for (const allocation of allocated.reverse()) {
+      const failure = await removeOwnedBenchmarkRoot(
+        remove,
+        allocation.resource,
+        allocation.root,
+      );
+      if (failure) {
+        cleanupFailures.push(failure);
+      } else {
+        allocation.clear();
+      }
+    }
+    if (cleanupFailures.length) {
+      opts.exactCandidateInitializationCleanupFailures = cleanupFailures;
+    } else {
+      delete opts.exactCandidateInitializationCleanupFailures;
+    }
+    delete opts.exactCandidatePackageByArm;
+    delete opts.exactCandidateLifecycle;
+    throw error;
+  }
+}
+
+async function finalizeBenchmarkResources(opts, ledger, preparationLedger, dependencies = {}) {
+  const remove = dependencies.remove ?? rm;
+  const failures = [...(opts.exactCandidateInitializationCleanupFailures ?? [])];
+  const attempt = async (resource, action, resourcePath = null) => {
+    try {
+      await action();
+    } catch (error) {
+      failures.push(benchmarkResourceFailure(resource, error, resourcePath));
+      for (const secondary of error?.benchmarkSecondaryFailures ?? []) {
+        failures.push({
+          ...secondary,
+          resource: `${resource}.${secondary.resource}`,
+        });
+      }
+    }
+  };
+
+  await attempt("runs_ledger", () => ledger.close());
+  await attempt("preparations_ledger", () => preparationLedger.close());
+  for (const [resource, root] of [
+    ["exact_candidate_state", opts.exactCandidateStateRoot],
+    ["exact_candidate_baseline_state", opts.exactCandidateBaselineContainerRoot],
+  ]) {
+    if (!root) continue;
+    const failure = await removeOwnedBenchmarkRoot(remove, resource, root);
+    if (failure) failures.push(failure);
+  }
+  delete opts.exactCandidateStateRoot;
+  delete opts.exactCandidateBaselineContainerRoot;
+  delete opts.exactCandidateBaselineStateRoot;
+  delete opts.exactCandidateInitializationCleanupFailures;
+  return failures;
+}
+
+function finalBenchmarkFailure(primaryFailure, finalizationFailures) {
+  if (primaryFailure) return primaryFailure;
+  if (!finalizationFailures.length) return null;
+  const reason = finalizationFailures
+    .map((failure) => `${failure.resource}: ${failure.message}`)
+    .join("; ");
+  return pipelineStageFailure("cleanup", null, new Error(reason));
+}
+
+const EXACT_BASELINE_ENV_ALLOWLIST = Object.freeze([
+  "ALL_PROXY", "COMSPEC", "HTTPS_PROXY", "HTTP_PROXY", "LANG", "LC_ALL", "LC_CTYPE",
+  "LOGNAME", "NODE_EXTRA_CA_CERTS", "NO_PROXY", "PATH", "PATHEXT", "SHELL",
+  "SSL_CERT_DIR", "SSL_CERT_FILE", "SYSTEMROOT", "TERM", "TZ", "USER", "WINDIR",
+]);
+
+function pathEntryExposesCodeStory(entry) {
+  const normalized = normalizePathLike(entry).toLowerCase();
+  if (normalized.includes("codestory")) return true;
+  return ["codestory", "codestory-cli", "codestory.exe", "codestory-cli.exe", "codestory.cmd"]
+    .some((name) => existsSync(path.join(entry, name)));
+}
+
+function exactCandidateBaselineEnv(opts, baseEnv = process.env) {
+  const root = opts.exactCandidateBaselineStateRoot;
+  if (!opts.exactCandidate || !root) throw new Error("exact baseline environment requires its disjoint private state root");
+  const env = {};
+  for (const key of EXACT_BASELINE_ENV_ALLOWLIST) {
+    if (baseEnv[key] != null) env[key] = baseEnv[key];
+  }
+  env.PATH = String(env.PATH ?? "")
+    .split(path.delimiter)
+    .filter(Boolean)
+    .filter((entry) => !pathEntryExposesCodeStory(entry))
+    .join(path.delimiter);
+  const home = path.join(root, "home");
+  const temporary = path.join(root, "tmp");
+  env.HOME = home;
+  env.USERPROFILE = home;
+  env.XDG_CACHE_HOME = path.join(root, "xdg-cache");
+  env.XDG_CONFIG_HOME = path.join(root, "xdg-config");
+  env.XDG_DATA_HOME = path.join(root, "xdg-data");
+  env.TMPDIR = temporary;
+  env.TMP = temporary;
+  env.TEMP = temporary;
+  return env;
+}
+
+function selectedBenchmarkChildEnv(opts = {}, arm = null) {
+  if (opts.exactCandidate && arm === "without_codestory") {
+    return exactCandidateBaselineEnv(opts);
+  }
+  return {
+    ...(opts.packetRuntimeChildEnv ?? benchmarkChildEnv(process.env)),
+    ...exactCandidateArmEnv(opts, arm),
+  };
+}
+
+function exactCandidatePackageIdentity(receipt, arm) {
+  if (arm !== "published_0_17_4") {
+    return null;
+  }
+  const identity = Object.fromEntries([
+    "contract", "arm", "package_version", "package_sha256", "cli_sha256",
+    "source_commit", "source_tree", "schema_version", "protocol_revision",
+    "discovery_contract_sha256",
+  ].map((field) => [field, receipt?.[field] ?? null]));
+  identity.trust_root_kind = receipt?.trust_root?.kind ?? null;
+  identity.trust_root_sha256 = receipt?.trust_root?.sha256 ?? null;
+  return identity;
+}
+
+function exactCandidateSourceCliIdentity(receipt, arm) {
+  if (arm !== "candidate_0_18") return null;
+  return Object.fromEntries([
+    "contract", "arm", "package_version", "cli_sha256", "source_commit",
+    "source_tree", "schema_version", "protocol_revision",
+    "discovery_contract_sha256", "plugin_manifest_sha256", "catalog_sha256",
+  ].map((field) => [field, receipt?.[field] ?? null]));
+}
+
+function exactCandidateResultIdentity(result) {
+  return result?.arm === "candidate_0_18"
+    ? result?.source_cli_identity
+    : result?.package_identity;
+}
+
+function resolveCodeStoryCliForArm(opts, arm) {
+  return opts.exactCandidatePackageByArm?.get(arm)?.cli_path ?? resolveCodeStoryCli(opts);
 }
 
 function runnerCommand(opts, repoPath, prompt, arm = null) {
@@ -499,7 +985,7 @@ function runnerCommand(opts, repoPath, prompt, arm = null) {
   const command = process.platform === "win32" ? "cmd.exe" : "codex";
   const codexArgs = [
     "exec",
-    ...(arm === "without_codestory" ? ["--ignore-user-config"] : []),
+    "--ignore-user-config",
     "--config",
     'approval_policy="never"',
     ...PINNED_CODEX_RUNNER_CONFIG.flatMap((value) => ["--config", value]),
@@ -519,9 +1005,15 @@ function runnerCommand(opts, repoPath, prompt, arm = null) {
   return { command, args, stdin: prompt, killProcessTree: process.platform === "win32" };
 }
 
-function agentRunnerEnv(baseEnv = process.env, codexHome = null) {
-  const env = benchmarkChildEnv(baseEnv);
-  delete env.CODESTORY_CLI;
+function agentRunnerEnv(baseEnv = process.env, codexHome = null, allowCodeStory = true) {
+  const env = allowCodeStory ? benchmarkChildEnv(baseEnv) : { ...baseEnv };
+  if (allowCodeStory) {
+    delete env.CODESTORY_CLI;
+  } else {
+    for (const key of Object.keys(env)) {
+      if (key.startsWith("CODESTORY_")) delete env[key];
+    }
+  }
   if (codexHome) {
     env.CODEX_HOME = codexHome;
   }
@@ -547,14 +1039,75 @@ async function prepareAgentCodexIsolation(outDir, opts = {}) {
     model: opts.model ?? DEFAULT_BENCHMARK_MODEL,
     runner_config: PINNED_CODEX_RUNNER_CONFIG,
   };
+  let homes = null;
+  if (opts.exactCandidate) {
+    homes = {};
+    for (const arm of EXACT_CANDIDATE_ARMS) {
+      const armRoot = arm === "without_codestory"
+        ? opts.exactCandidateBaselineStateRoot
+        : path.join(opts.exactCandidateStateRoot, arm);
+      const codexHome = path.join(armRoot, "host");
+      await mkdir(codexHome, { recursive: true });
+      if (arm === "without_codestory") {
+        for (const directory of [
+          "home", "tmp", "xdg-cache", "xdg-config", "xdg-data",
+        ]) {
+          await mkdir(path.join(armRoot, directory), { recursive: true });
+        }
+      }
+      await copyFile(authPath, path.join(codexHome, "auth.json"));
+      homes[arm] = codexHome;
+      for (const value of Object.values(
+        exactCandidateArmEnvironmentGroups(opts, arm).directories,
+      )) {
+        await mkdir(value, { recursive: true, mode: 0o700 });
+      }
+      if (isCodeStoryArm(arm)) {
+        const cli = resolveCodeStoryCliForArm(opts, arm);
+        await writeFile(
+          path.join(codexHome, "config.toml"),
+          `[mcp_servers.codestory]\ncommand = ${JSON.stringify(cli)}\nargs = ["serve", "--stdio", "--multi-project"]\n`,
+          "utf8",
+        );
+      }
+    }
+    receipt.contract = "codestory.agent-benchmark-codex-isolation/v3";
+    receipt.with_codestory_config = "arm_specific_checksum_bound_cli";
+    receipt.homes = Object.fromEntries(
+      EXACT_CANDIDATE_ARMS.map((arm) => [arm, path.relative(outDir, homes[arm])]),
+    );
+    receipt.cache_roots = Object.fromEntries(
+      EXACT_CANDIDATE_ARMS.map((arm) => [
+        arm,
+        Object.fromEntries(Object.entries(
+          exactCandidateArmEnvironmentGroups(opts, arm).directories,
+        ).map(([key, value]) => [
+          key,
+          path.relative(outDir, value),
+        ])),
+      ]),
+    );
+    receipt.embedding_server_namespaces = Object.fromEntries(
+      EXACT_CANDIDATE_ARMS.filter(isCodeStoryArm).map((arm) => {
+        const groups = exactCandidateArmEnvironmentGroups(opts, arm);
+        return [arm, {
+          qualification_directory: path.relative(
+            outDir,
+            groups.directories.CODESTORY_EMBED_QUALIFICATION_DIR,
+          ),
+          nonce: groups.scalars.CODESTORY_EMBED_QUALIFICATION_NONCE,
+        }];
+      }),
+    );
+  }
   await writeFile(
     path.join(outDir, "codex-agent-isolation.json"),
     `${JSON.stringify(receipt, null, 2)}\n`,
     "utf8",
   );
   return {
-    root: null,
-    homes: null,
+    root: opts.exactCandidate ? opts.exactCandidateStateRoot : null,
+    homes,
     receipt,
   };
 }
@@ -632,6 +1185,497 @@ function normalizeSha256(value, label) {
     throw new Error(`${label} must be a lowercase SHA-256 digest`);
   }
   return normalized;
+}
+
+function normalizeExternalSha256(value, label) {
+  const digest = normalizeSha256(value, label);
+  if (/^0{64}$/.test(digest)) throw new Error(`${label} cannot be the all-zero digest`);
+  return digest;
+}
+
+async function sha256FileBounded(filePath, maxBytes, label) {
+  const handle = await open(filePath, "r");
+  try {
+    return await streamOpenedFileBounded(handle, maxBytes, label);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readBoundedFile(filePath, maxBytes, label) {
+  const handle = await open(filePath, "r");
+  try {
+    return await streamOpenedFileBounded(handle, maxBytes, label, { capture: true });
+  } finally {
+    await handle.close();
+  }
+}
+
+async function writeAll(handle, bytes) {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const { bytesWritten } = await handle.write(bytes, offset, bytes.length - offset);
+    if (bytesWritten <= 0) throw new Error("immutable input staging stopped before all bytes were written");
+    offset += bytesWritten;
+  }
+}
+
+async function streamOpenedFileBounded(handle, maxBytes, label, options = {}) {
+  const before = await handle.stat();
+  if (!before.isFile() || !Number.isSafeInteger(before.size) || before.size < 0 || before.size > maxBytes) {
+    throw new Error(`${label} exceeds the ${maxBytes}-byte bound or is not a regular file`);
+  }
+  const hash = createHash("sha256");
+  const chunks = options.capture ? [] : null;
+  const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1));
+  let observed = 0;
+  while (true) {
+    const remaining = maxBytes + 1 - observed;
+    const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, remaining), null);
+    if (bytesRead === 0) break;
+    observed += bytesRead;
+    if (observed > maxBytes) throw new Error(`${label} exceeds the ${maxBytes}-byte bound`);
+    const chunk = buffer.subarray(0, bytesRead);
+    hash.update(chunk);
+    if (options.destination) await writeAll(options.destination, chunk);
+    if (chunks) chunks.push(Buffer.from(chunk));
+  }
+  const after = await handle.stat();
+  if (after.size !== observed) throw new Error(`${label} changed while it was being ingested`);
+  return {
+    sha256: hash.digest("hex"),
+    byte_length: observed,
+    ...(chunks ? { bytes: Buffer.concat(chunks, observed) } : {}),
+  };
+}
+
+async function ingestExactInput(opts, kind, sourcePath, maxBytes) {
+  const source = path.resolve(sourcePath);
+  const stagingRoot = path.join(opts.exactCandidateStateRoot, "authenticated-inputs");
+  await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+  const stagedPath = path.join(stagingRoot, `${kind}.bin`);
+  const sourceHandle = await open(source, "r");
+  let destinationHandle = null;
+  try {
+    destinationHandle = await open(stagedPath, "wx", 0o600);
+    const identity = await streamOpenedFileBounded(
+      sourceHandle,
+      maxBytes,
+      kind.replaceAll("_", " "),
+      { destination: destinationHandle },
+    );
+    await destinationHandle.sync();
+    await destinationHandle.chmod(0o400);
+    await destinationHandle.close();
+    destinationHandle = null;
+    await sourceHandle.close();
+    await opts.exactCandidateAfterInputIngest?.({
+      kind,
+      source_path: source,
+      staged_path: stagedPath,
+      sha256: identity.sha256,
+      byte_length: identity.byte_length,
+    });
+    return { ...identity, source_path: source, staged_path: stagedPath };
+  } catch (error) {
+    await destinationHandle?.close().catch(() => {});
+    await sourceHandle.close().catch(() => {});
+    await rm(stagedPath, { force: true });
+    throw error;
+  }
+}
+
+function exactArchiveEntryIsSafe(entry) {
+  const normalized = normalizePathLike(entry).replace(/\/$/, "");
+  return Boolean(normalized) &&
+    !isAbsolutePathLike(normalized) &&
+    !normalized.split("/").some((part) => part === "" || part === "." || part === "..");
+}
+
+async function walkExactArchive(root) {
+  const files = [];
+  const pending = [root];
+  while (pending.length) {
+    const current = pending.pop();
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      const absolute = path.join(current, entry.name);
+      if (entry.isSymbolicLink()) throw new Error(`exact package archive contains a symlink: ${entry.name}`);
+      if (entry.isDirectory()) pending.push(absolute);
+      else if (entry.isFile()) files.push(absolute);
+      else throw new Error(`exact package archive contains a non-file entry: ${entry.name}`);
+      if (files.length + pending.length > MAX_EXACT_ARCHIVE_ENTRIES) {
+        throw new Error("exact package archive contains too many entries");
+      }
+    }
+  }
+  return files;
+}
+
+async function probeExactPackageRuntime(cliPath, expected, env) {
+  const session = createSequencedStdioSession(
+    cliPath,
+    ["serve", "--stdio", "--multi-project", "--refresh", "none"],
+    { env, timeoutMs: 30_000 },
+  );
+  try {
+    const response = await session.request({
+      jsonrpc: "2.0",
+      id: "exact-candidate-authentication",
+      method: "initialize",
+      params: {
+        protocolVersion: expected.protocol_revision,
+        capabilities: {},
+        clientInfo: { name: "codestory-exact-candidate-authenticator", version: "1" },
+      },
+    });
+    await session.close();
+    if (response.error) throw new Error(`exact package initialize failed: ${JSON.stringify(response.error)}`);
+    const result = response.result;
+    const observed = {
+      package_version: result?.serverInfo?.version ?? null,
+      schema_version: result?._meta?.codestory_publication?.schema_version ?? null,
+      protocol_revision: result?.protocolVersion ?? null,
+      discovery_contract_sha256:
+        result?._meta?.codestory_protocol?.discovery_contract_sha256 ?? null,
+    };
+    for (const field of ["package_version", "schema_version", "protocol_revision"]) {
+      if (observed[field] !== expected[field]) {
+        throw new Error(`exact package runtime ${field}=${observed[field] ?? "missing"}; expected ${expected[field]}`);
+      }
+    }
+    if (expected.discovery_contract_sha256) {
+      observed.discovery_contract_sha256 = normalizeExternalSha256(
+        observed.discovery_contract_sha256,
+        "runtime discovery_contract_sha256",
+      );
+      if (observed.discovery_contract_sha256 !== expected.discovery_contract_sha256) {
+        throw new Error("exact package runtime discovery contract does not match its authenticated receipt");
+      }
+    } else if (observed.discovery_contract_sha256 !== null) {
+      throw new Error("legacy exact package unexpectedly declared a discovery contract digest");
+    }
+    return observed;
+  } catch (error) {
+    await session.stop();
+    throw error;
+  }
+}
+
+async function authenticateExactArchive({ arm, archivePath, archiveSha256, archiveIdentity, expected, trustRoot }, root, env) {
+  if (archiveIdentity.sha256 !== archiveSha256) throw new Error(`${arm} archive checksum mismatch`);
+  const unpackRoot = path.join(root, "packages", arm);
+  await mkdir(unpackRoot, { recursive: true });
+  const listing = await runProcess("tar", ["-tf", archivePath], {
+    timeoutMs: 30_000,
+    maxOutputBytes: MAX_EXACT_ARCHIVE_LISTING_BYTES,
+  });
+  if (listing.status !== "pass") throw new Error(`${arm} archive listing failed: ${trimTail(listing.stderr)}`);
+  const entries = listing.stdout.split(/\r?\n/).filter(Boolean);
+  if (!entries.length || entries.length > MAX_EXACT_ARCHIVE_ENTRIES || entries.some((entry) => !exactArchiveEntryIsSafe(entry))) {
+    throw new Error(`${arm} archive contains an invalid entry set`);
+  }
+  const unpack = await runProcess("tar", ["-xf", archivePath, "-C", unpackRoot], {
+    timeoutMs: 120_000,
+    maxOutputBytes: MAX_EXACT_ARCHIVE_LISTING_BYTES,
+  });
+  if (unpack.status !== "pass") throw new Error(`${arm} archive extraction failed: ${trimTail(unpack.stderr)}`);
+  const files = await walkExactArchive(unpackRoot);
+  const manifestPaths = files.filter((file) => path.basename(file) === "codestory-native-manifest.json");
+  if (manifestPaths.length !== 1) throw new Error(`${arm} archive must contain one native manifest`);
+  const manifestRead = await readBoundedFile(manifestPaths[0], MAX_EXACT_RECEIPT_BYTES, `${arm} native manifest`);
+  const manifest = JSON.parse(manifestRead.bytes.toString("utf8"));
+  const sourceCommit = String(manifest?.source?.commit ?? "");
+  const sourceTree = String(manifest?.source?.tree ?? "");
+  if (!/^[0-9a-f]{40}$/.test(sourceCommit) || !/^[0-9a-f]{40}$/.test(sourceTree) || manifest?.source?.tracked_dirty !== false) {
+    throw new Error(`${arm} native manifest has invalid source identity`);
+  }
+  if (manifest?.release_version !== expected.package_version) {
+    throw new Error(`${arm} native manifest version drifted from authenticated identity`);
+  }
+  if (expected.source_commit && sourceCommit !== expected.source_commit) throw new Error(`${arm} source commit drifted`);
+  if (expected.source_tree && sourceTree !== expected.source_tree) throw new Error(`${arm} source tree drifted`);
+  const cliName = String(manifest?.binary?.name ?? "");
+  const cliCandidates = files.filter((file) => path.basename(file) === cliName);
+  if (!cliName || cliCandidates.length !== 1) throw new Error(`${arm} archive does not contain its declared CLI exactly once`);
+  const cliIdentity = await sha256FileBounded(cliCandidates[0], MAX_EXACT_ARCHIVE_BYTES, `${arm} CLI`);
+  if (cliIdentity.sha256 !== normalizeSha256(manifest?.binary?.sha256, `${arm} native manifest binary sha256`)) {
+    throw new Error(`${arm} unpacked CLI does not belong to the authenticated archive manifest`);
+  }
+  const runtime = await probeExactPackageRuntime(cliCandidates[0], expected, env);
+  return {
+    contract: EXACT_CANDIDATE_PACKAGE_CONTRACT,
+    arm,
+    package_version: expected.package_version,
+    package_path: archivePath,
+    package_sha256: archiveIdentity.sha256,
+    cli_path: cliCandidates[0],
+    cli_sha256: cliIdentity.sha256,
+    source_commit: sourceCommit,
+    source_tree: sourceTree,
+    schema_version: runtime.schema_version,
+    protocol_revision: runtime.protocol_revision,
+    discovery_contract_sha256: runtime.discovery_contract_sha256,
+    trust_root: trustRoot,
+  };
+}
+
+async function readCandidateTrackedFile(sourceRoot, relativePath, label) {
+  const result = await runProcess(
+    "git",
+    ["-C", sourceRoot, "show", `HEAD:${relativePath}`],
+    { timeoutMs: 10_000, maxOutputBytes: MAX_EXACT_SOURCE_IDENTITY_BYTES },
+  );
+  if (result.status !== "pass") {
+    throw new Error(`candidate source is missing checked-in ${label}: ${trimTail(result.stderr || result.stdout)}`);
+  }
+  const bytes = Buffer.from(result.stdout, "utf8");
+  if (bytes.length > MAX_EXACT_SOURCE_IDENTITY_BYTES) {
+    throw new Error(`candidate checked-in ${label} exceeds the identity byte bound`);
+  }
+  return { bytes, sha256: sha256Bytes(bytes) };
+}
+
+async function candidateSourceSnapshot(sourcePath) {
+  const sourceRoot = realpathSync(path.resolve(sourcePath));
+  const topLevel = await gitCheckedOutput(
+    ["-C", sourceRoot, "rev-parse", "--show-toplevel"],
+    repoRoot,
+    { timeoutMs: 10_000, maxOutputBytes: 1024 * 1024 },
+  );
+  if (realpathSync(topLevel) !== sourceRoot) {
+    throw new Error("--candidate-source-root must name the Git worktree root exactly");
+  }
+  const status = await gitCheckedOutput(
+    ["-C", sourceRoot, "status", "--porcelain=v1", "--untracked-files=all"],
+    repoRoot,
+    { timeoutMs: 10_000, maxOutputBytes: 1024 * 1024 },
+  );
+  if (status) throw new Error("candidate source root must have a clean tracked and untracked worktree");
+  const sourceCommit = await gitCheckedOutput(
+    ["-C", sourceRoot, "rev-parse", "HEAD"],
+    repoRoot,
+    { timeoutMs: 10_000, maxOutputBytes: 1024 },
+  );
+  const sourceTree = await gitCheckedOutput(
+    ["-C", sourceRoot, "rev-parse", "HEAD^{tree}"],
+    repoRoot,
+    { timeoutMs: 10_000, maxOutputBytes: 1024 },
+  );
+  if (
+    !/^[0-9a-f]{40}$/.test(sourceCommit) || /^0{40}$/.test(sourceCommit) ||
+    !/^[0-9a-f]{40}$/.test(sourceTree) || /^0{40}$/.test(sourceTree)
+  ) {
+    throw new Error("candidate source HEAD/tree identity is invalid");
+  }
+  const [cargo, plugin, catalog] = await Promise.all([
+    readCandidateTrackedFile(sourceRoot, "crates/codestory-cli/Cargo.toml", "CLI manifest"),
+    readCandidateTrackedFile(sourceRoot, "plugins/codestory/plugin.json", "plugin manifest"),
+    readCandidateTrackedFile(sourceRoot, "plugins/codestory/generated-mcp-catalog.json", "MCP catalog"),
+  ]);
+  const versionMatch = /^version\s*=\s*"([^"]+)"\s*$/mu.exec(cargo.bytes.toString("utf8"));
+  const pluginJson = JSON.parse(plugin.bytes.toString("utf8"));
+  const catalogJson = JSON.parse(catalog.bytes.toString("utf8"));
+  const wire = catalogJson?.wireContract;
+  const packageVersion = versionMatch?.[1] ?? null;
+  const preferredProtocol = wire?.preferredMcpProtocolVersion ?? null;
+  const discoveryContractSha256 = normalizeExternalSha256(
+    wire?.discoveryContracts?.[preferredProtocol],
+    "candidate catalog preferred discovery contract",
+  );
+  if (
+    pluginJson?.name !== "codestory" || !packageVersion || pluginJson?.version !== packageVersion ||
+    wire?.publicationStampSchemaVersion !== 3 ||
+    wire?.minimumCompatiblePublicationStampSchemaVersion !== 3 ||
+    preferredProtocol !== "2025-11-25" ||
+    !Array.isArray(wire?.supportedMcpProtocolVersions) ||
+    !wire.supportedMcpProtocolVersions.includes(preferredProtocol)
+  ) {
+    throw new Error("candidate checked-in plugin/catalog identity is not the schema-3 preferred-profile source contract");
+  }
+  return {
+    source_root: sourceRoot,
+    source_commit: sourceCommit,
+    source_tree: sourceTree,
+    package_version: packageVersion,
+    schema_version: 3,
+    protocol_revision: preferredProtocol,
+    discovery_contract_sha256: discoveryContractSha256,
+    plugin_manifest_sha256: plugin.sha256,
+    catalog_sha256: catalog.sha256,
+  };
+}
+
+async function buildExactCandidateCli({ sourceRoot, targetDir, cliPath }) {
+  const result = await runProcess(
+    "cargo",
+    [
+      "build", "--locked", "--release", "-p", "codestory-cli",
+      "--target-dir", targetDir,
+    ],
+    {
+      cwd: sourceRoot,
+      timeoutMs: 30 * 60 * 1000,
+      maxOutputBytes: 16 * 1024 * 1024,
+    },
+  );
+  if (result.status !== "pass") {
+    throw new Error(`candidate locked release CLI build failed: ${trimTail(result.stderr || result.stdout)}`);
+  }
+  if (!existsSync(cliPath)) throw new Error("candidate locked release CLI build did not produce codestory-cli");
+}
+
+async function authenticateExactCandidateSourceCli(opts) {
+  const before = await candidateSourceSnapshot(opts.candidateSourceRoot);
+  const targetDir = path.join(before.source_root, "target", "codestory-mission-candidate");
+  const cliPath = path.join(
+    targetDir,
+    "release",
+    process.platform === "win32" ? "codestory-cli.exe" : "codestory-cli",
+  );
+  const buildCli = opts.exactCandidateBuildCli ?? buildExactCandidateCli;
+  await buildCli({ sourceRoot: before.source_root, targetDir, cliPath });
+  const cliInput = await ingestExactInput(
+    opts,
+    "candidate_cli",
+    cliPath,
+    MAX_EXACT_CLI_BYTES,
+  );
+  await chmod(cliInput.staged_path, 0o500);
+  const runtime = await probeExactPackageRuntime(cliInput.staged_path, before, selectedBenchmarkChildEnv(opts, "candidate_0_18"));
+  const afterCli = await sha256FileBounded(cliInput.staged_path, MAX_EXACT_CLI_BYTES, "authenticated candidate CLI");
+  if (afterCli.sha256 !== cliInput.sha256 || afterCli.byte_length !== cliInput.byte_length) {
+    throw new Error("authenticated candidate CLI bytes changed during live initialize");
+  }
+  const after = await candidateSourceSnapshot(opts.candidateSourceRoot);
+  for (const field of [
+    "source_root", "source_commit", "source_tree", "package_version", "schema_version",
+    "protocol_revision", "discovery_contract_sha256", "plugin_manifest_sha256", "catalog_sha256",
+  ]) {
+    if (after[field] !== before[field]) throw new Error(`candidate source identity changed during authentication: ${field}`);
+  }
+  return {
+    contract: EXACT_CANDIDATE_SOURCE_CLI_CONTRACT,
+    arm: "candidate_0_18",
+    package_version: before.package_version,
+    cli_path: cliInput.staged_path,
+    cli_sha256: cliInput.sha256,
+    source_commit: before.source_commit,
+    source_tree: before.source_tree,
+    schema_version: runtime.schema_version,
+    protocol_revision: runtime.protocol_revision,
+    discovery_contract_sha256: runtime.discovery_contract_sha256,
+    plugin_manifest_sha256: before.plugin_manifest_sha256,
+    catalog_sha256: before.catalog_sha256,
+  };
+}
+
+async function authenticateExactCandidatePackages(opts) {
+  const started = performance.now();
+  const publishedManifestInput = await ingestExactInput(
+    opts,
+    "published_checksum_manifest",
+    opts.publishedChecksumManifest,
+    MAX_EXACT_CHECKSUM_MANIFEST_BYTES,
+  );
+  const publishedManifest = await readBoundedFile(
+    publishedManifestInput.staged_path,
+    MAX_EXACT_CHECKSUM_MANIFEST_BYTES,
+    "staged published checksum manifest",
+  );
+  if (
+    publishedManifest.sha256 !== normalizeExternalSha256(
+      opts.publishedChecksumSha256,
+      "published checksum manifest external digest",
+    )
+  ) {
+    throw new Error("published checksum manifest does not match its external digest");
+  }
+  const publishedArchive = path.resolve(opts.publishedArchive);
+  const publishedName = path.basename(publishedArchive);
+  const publishedMatches = publishedManifest.bytes.toString("utf8").split(/\r?\n/).flatMap((line) => {
+    const match = /^([0-9a-f]{64})\s+\*?(.+)$/.exec(line.trim());
+    return match && path.basename(match[2]) === publishedName ? [match[1]] : [];
+  });
+  if (publishedMatches.length !== 1) throw new Error("official checksum data must name the published archive exactly once");
+
+  const packageRoot = opts.exactCandidateStateRoot;
+  const order = opts.exactCandidatePackageAuthenticationOrder ?? ["published_0_17_4", "candidate_0_18"];
+  const publishedDefinition = {
+    arm: "published_0_17_4",
+    sourceArchivePath: publishedArchive,
+    archiveSha256: normalizeExternalSha256(publishedMatches[0], "official published archive sha256"),
+    expected: { package_version: "0.17.4", schema_version: 2, protocol_revision: "2024-11-05" },
+    trustRoot: { kind: "official_published_checksum", sha256: publishedManifest.sha256 },
+  };
+  const packages = new Map();
+  const armTimings = {};
+  for (const arm of order) {
+    if (!EXACT_CANDIDATE_ARMS.includes(arm) || arm === "without_codestory" || packages.has(arm)) {
+      throw new Error("package authentication order must contain each exact CodeStory arm once");
+    }
+    const armStarted = performance.now();
+    if (arm === "published_0_17_4") {
+      const archiveInput = await ingestExactInput(
+        opts,
+        `${arm}_archive`,
+        publishedDefinition.sourceArchivePath,
+        MAX_EXACT_ARCHIVE_BYTES,
+      );
+      packages.set(arm, await authenticateExactArchive(
+        {
+          ...publishedDefinition,
+          archivePath: archiveInput.staged_path,
+          archiveIdentity: archiveInput,
+        },
+        packageRoot,
+        selectedBenchmarkChildEnv(opts, arm),
+      ));
+    } else {
+      packages.set(arm, await authenticateExactCandidateSourceCli(opts));
+    }
+    armTimings[arm] = Math.round((performance.now() - armStarted) * 1000) / 1000;
+  }
+  if (packages.size !== 2) throw new Error("package authentication order omitted an exact CodeStory arm");
+  return {
+    packages,
+    lifecycle: {
+      contract: "codestory.agent-benchmark-exact-lifecycle/v1",
+      package_authentication_order: order,
+      package_authentication_ms: armTimings,
+      total_package_authentication_ms: Math.round((performance.now() - started) * 1000) / 1000,
+    },
+  };
+}
+
+function validateExactCandidateShape(opts, tasks) {
+  if (!opts.exactCandidate) return;
+  if (tasks.length !== 18 || new Set(tasks.map((task) => task.id)).size !== 18) {
+    throw new Error("exact-candidate mode requires exactly 18 pinned tasks");
+  }
+  if (
+    tasks.some((task) => task.suite != null) &&
+    tasks.map((task) => task.id).join(",") !== EXACT_CANDIDATE_TASK_IDS.join(",")
+  ) {
+    throw new Error("exact-candidate task ids or order differ from the pinned 18-task window");
+  }
+  if (tasks.some((task) => task.suite != null)) {
+    const taskContract = tasks.map((task) => {
+      const { manifest_path: _manifestPath, ...snapshot } = taskSnapshotForResult(task);
+      return snapshot;
+    });
+    if (sha256Bytes(stableJsonForHash(taskContract)) !== EXACT_CANDIDATE_TASK_CONTRACT_SHA256) {
+      throw new Error("exact-candidate prompts or qualification inputs differ from the pinned task window");
+    }
+  }
+  if (opts.taskSuite !== "language-expansion-holdout") {
+    throw new Error("exact-candidate mode requires the pinned language-expansion-holdout suite");
+  }
+  if (opts.repeats !== 3 || opts.arms.join(",") !== EXACT_CANDIDATE_ARMS.join(",")) {
+    throw new Error("exact-candidate mode requires the frozen three arms and exactly 3 repeats");
+  }
+  if (opts.reuseBaselineFrom) {
+    throw new Error("baseline reuse is forbidden in exact-candidate mode");
+  }
 }
 
 function normalizeCodestoryProjectManifest(filePath, value) {
@@ -865,6 +1909,9 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
   validateQualityThresholds(filePath, qualityThresholds);
   const id = validateManifestTaskId(filePath, taskIdFromManifest(filePath, raw));
   const taskClass = validatePacketTaskClass(filePath, raw.task_class ?? raw.taskClass);
+  if (raw.file_local != null && typeof raw.file_local !== "boolean") {
+    throw new Error(`Task manifest file_local must be a boolean: ${filePath}`);
+  }
 
   return {
     id,
@@ -873,6 +1920,7 @@ function normalizeManifestTask(filePath, raw, opts = {}) {
     repo,
     repo_metadata: typeof raw.repo === "object" ? raw.repo : null,
     task_class: taskClass,
+    file_local: raw.file_local === true,
     prompt,
     expected_files: expectedFiles,
     expected_verification_files: expectedVerificationFiles,
@@ -897,6 +1945,7 @@ function taskSnapshotForResult(task) {
       repo: task.repo,
       repo_metadata: task.repo_metadata ?? null,
       task_class: task.task_class,
+      file_local: task.file_local === true,
       prompt: task.prompt,
       expected_files: task.expected_files ?? [],
       expected_verification_files: task.expected_verification_files ?? [],
@@ -1217,6 +2266,7 @@ async function runProcess(command, args, options = {}) {
     let aborted = false;
     let settled = false;
     let forceKillTimer = null;
+    let outputBytes = 0;
     const terminate = (signal, message = null) => {
       if (message) {
         stderr += `\n${message}\n`;
@@ -1266,9 +2316,19 @@ async function runProcess(command, args, options = {}) {
       resolve({ timedOut, aborted, ...payload });
     }
     child.stdout.on("data", (chunk) => {
+      outputBytes += chunk.length;
+      if (options.maxOutputBytes && outputBytes > options.maxOutputBytes) {
+        terminate("SIGTERM", `Process output exceeded ${options.maxOutputBytes} bytes.`);
+        return;
+      }
       stdout += chunk.toString();
     });
     child.stderr.on("data", (chunk) => {
+      outputBytes += chunk.length;
+      if (options.maxOutputBytes && outputBytes > options.maxOutputBytes) {
+        terminate("SIGTERM", `Process output exceeded ${options.maxOutputBytes} bytes.`);
+        return;
+      }
       stderr += chunk.toString();
     });
     if (options.stdin != null) {
@@ -1573,7 +2633,7 @@ function composePrompt(repoName, repoConfig, armName, task = null, context = {})
 Task class: ${task.task_class ?? "unspecified"}`
     : "";
   const packetFirstCommand =
-    armName === "with_codestory"
+    isCodeStoryArm(armName)
       ? packetFirstCommandForPrompt(taskPrompt, task)
       : null;
   const packetFirstBlock = packetFirstCommand && !context.codestoryPrelude?.packet
@@ -1586,8 +2646,11 @@ ${packetFirstCommand}
 Run that answer packet before any repository search, direct source read, git command, CodeStory primitive, or help/probe command. The benchmark treats help/probe commands such as \`--help\` as not packet-first.`
     : "";
   const stopContractBlock =
-    armName === "with_codestory"
-      ? `
+    isCodeStoryArm(armName)
+      ? isPacketProjectionV3(context.codestoryPrelude?.packet)
+        ? `
+The packet is an evidence-only projection. Use its evidence rows directly. For every requested material stage that a row establishes, state a direct subject-verb claim naming the subject and established action before describing any gaps. Do not substitute a heading, symbol inventory, or adjacent partial observation, and make the claim no broader than the cited row. When a higher-level action and its mechanism are established by the same evidence rows, name both: the subject performs, drives, or handles the action by calling the mechanism. Avoid weak role labels such as \`is the ... symbol\` or \`participates in\`; do not report only that the subject \`calls\` a downstream target. Then name every gap, scoped only to requested links or stages the rows do not establish. Do not infer proof, completeness, runtime behavior, or absence from availability. If status is \`continuation_available\`, execute exactly the declared one-shot continuation, then reassess its returned gaps without another retrieval call. An exact focused source read is allowed only for a file-local task where the user named that exact file, or when a material \`evidence_missing\`, \`Unknown\`, or \`Unavailable\` boundary authenticates that exact path. A file mentioned inside this broad flow question does not authorize a read. Perform at most one bounded read per authorized path. An \`output_budget_exceeded\` gap is descriptive and does not authorize a source read or another repository tool by itself. A packet-cited path or range alone is not authorization, and an unrelated gap does not authorize arbitrary files.`
+        : `
 The packet's own \`disposition\` is the complete control contract. The benchmark's expected-answer manifest is never shown to you and does not authorize extra retrieval. Stop on \`supported\`, \`not_established\`, or \`unavailable\`. A \`not_established\` packet can still contain directly useful support: answer those established parts, identify the material gaps, and do not infer the missing links. On \`drill_once\`, execute exactly the declared one-shot packet continuation, apply the same terminal answer rule, and then stop regardless of its result.`
       : "";
   const harnessPacketBlock = packetPreludePromptBlock(context.codestoryPrelude);
@@ -1599,7 +2662,9 @@ ${taskHeader}
 Task: ${taskPrompt}
 
 Arm: ${armName}
-Instruction: ${ARMS[armName]}
+Instruction: ${isCodeStoryArm(armName)
+    ? codeStoryArmInstruction(context.codestoryPrelude?.packet)
+    : ARMS[armName]}
 ${packetFirstBlock}
 ${stopContractBlock}
 ${harnessPacketBlock}
@@ -1629,6 +2694,22 @@ function packetPreludePromptBlock(prelude) {
   if (!prelude?.packet) {
     return "";
   }
+  if (isPacketProjectionV3(prelude.packet)) {
+    return `
+The benchmark harness already ran the required first repository-context command before starting you:
+\`\`\`${packetFirstCommandFenceLanguage()}
+${prelude.public.command}
+\`\`\`
+
+Use the evidence rows as bounded repository evidence and preserve every gap and
+availability boundary. This packet does not prove claims. Do not repeat the
+initial packet call or synthesize legacy support/disposition semantics.
+
+CodeStory packet JSON excerpt:
+\`\`\`json
+${JSON.stringify(packetForAgentPrompt(prelude.packet), null, 2)}
+\`\`\``;
+  }
   return `
 The benchmark harness already ran the required first repository-context command before starting you:
 \`\`\`${packetFirstCommandFenceLanguage()}
@@ -1650,6 +2731,42 @@ function packetForAgentPrompt(packet) {
   if (!packet || typeof packet !== "object") {
     return packet;
   }
+  if (isPacketProjectionV3(packet)) {
+    return {
+      schema_version: 3,
+      kind: packet.kind ?? null,
+      status: packet.status ?? null,
+      identity: packet.identity ?? null,
+      publication: packet.publication ?? null,
+      retrieval: packet.retrieval ?? null,
+      evidence: (packet.evidence ?? []).map((row) => ({
+        identity: row?.identity ?? null,
+        kind: row?.kind ?? null,
+        path: row?.path ?? null,
+        symbol_id: row?.symbol_id ?? null,
+        start_line: row?.start_line ?? null,
+        end_line: row?.end_line ?? null,
+        summary: row?.summary == null
+          ? null
+          : truncatePacketPromptText(row.summary, 1_200),
+      })),
+      gaps: (packet.gaps ?? []).map((row) => ({
+        identity: row?.identity ?? null,
+        kind: row?.kind ?? null,
+        message: row?.message == null
+          ? null
+          : truncatePacketPromptText(row.message, 800),
+      })),
+      continuation: packet.continuation ?? null,
+      diagnostics: packet.diagnostics ?? null,
+      ...(packet.kind === "budget_exceeded"
+        ? {
+            maximum_bytes: packet.maximum_bytes ?? null,
+            required_complete_bytes: packet.required_complete_bytes ?? null,
+          }
+        : {}),
+    };
+  }
   return {
     packet_id: packet.packet_id ?? null,
     question: packet.question ?? null,
@@ -1669,6 +2786,13 @@ function packetPreludeManifestComplete(publicPrelude) {
   const quality = publicPrelude?.packet_manifest_quality;
   if (!quality?.pass) {
     return false;
+  }
+  if (publicPrelude?.packet_schema_version === 3) {
+    return (
+      publicPrelude?.packet_projection_kind === "complete" &&
+      publicPrelude?.packet_evidence_availability?.status === "available" &&
+      (presentFiniteNumber(publicPrelude?.packet_evidence_count) ?? 0) > 0
+    );
   }
   if (publicPrelude?.packet_disposition_kind !== "supported") {
     return false;
@@ -1701,15 +2825,32 @@ function packetManifestQualitySummary(packet, task) {
     )
     .filter(Boolean)
     .join("\n");
-  const claimText = (packet.support ?? [])
+  const claimText = isPacketProjectionV3(packet)
+    ? (packet.evidence ?? [])
+      .map((row) => [
+        row?.path,
+        row?.symbol_id,
+        row?.start_line == null ? null : `line ${row.start_line}`,
+        row?.summary,
+      ].filter(Boolean).join(" "))
+      .filter(Boolean)
+      .join("\n")
+    : (packet.support ?? [])
     .map((support) => String(support?.summary ?? "").trim())
     .filter(Boolean)
     .join("\n");
+  const gapText = isPacketProjectionV3(packet)
+    ? (packet.gaps ?? [])
+      .map((gap) => [gap?.kind, gap?.message].filter(Boolean).join(" "))
+      .filter(Boolean)
+      .join("\n")
+    : "";
   const text = [
     packet.answer?.summary ?? "",
     packetAnswerText(packet),
     citationText,
     claimText,
+    gapText,
   ]
     .filter(Boolean)
     .join("\n");
@@ -1972,6 +3113,37 @@ function pathMatchesLike(actual, expected) {
   return left === right || left.endsWith(`/${right}`);
 }
 
+function sourceReadPathIdentity(value, projectRoot) {
+  const normalized = normalizePathLike(value);
+  if (!normalized) return null;
+  const normalizedRoot = normalizePathLike(projectRoot);
+  const windowsPath = /^[A-Za-z]:\//.test(normalized) || /^[A-Za-z]:\//.test(normalizedRoot);
+  let relative = normalized;
+  if (isAbsolutePathLike(normalized)) {
+    if (!normalizedRoot || !isAbsolutePathLike(normalizedRoot)) return null;
+    relative = normalizePathLike(
+      windowsPath
+        ? path.win32.relative(normalizedRoot.replaceAll("/", "\\"), normalized.replaceAll("/", "\\"))
+        : path.relative(normalizedRoot, normalized),
+    );
+  }
+  const components = relative.split("/");
+  if (
+    !relative ||
+    isAbsolutePathLike(relative) ||
+    components.some((component) =>
+      !component || component === "." || component === ".." || component.includes("\0")
+    )
+  ) {
+    return null;
+  }
+  const caseInsensitive = windowsPath || process.platform === "win32";
+  return {
+    relative,
+    key: caseInsensitive ? relative.toLowerCase() : relative,
+  };
+}
+
 function isLikelySourcePath(value) {
   const normalized = normalizePathLike(value).toLowerCase();
   return /\.(rs|js|jsx|mjs|cjs|ts|tsx|mts|cts|py|pyi|go|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|hh|hxx|rb|php|swift|dart|sh|bash|html|htm|css|sql|md|toml|json|yaml|yml)$/i.test(normalized);
@@ -2000,12 +3172,16 @@ function extractDirectFileReads(command) {
     }
   }
 
+  const shellArgument = String.raw`(?:'[^'\r\n]*'|"[^"\r\n]*"|[^\s;|]+)`;
   const patterns = [
     /\bGet-Content\b(?:\s+-(?!LiteralPath\b|Path\b)[A-Za-z]+)*\s+(?:-(?:LiteralPath|Path)\s+)?['"]*([^'";|`\r\n]+)['"]*/gi,
     /\bcat\b\s+['"]*([^'";|`\r\n]+)['"]*/gi,
     /\btype\b\s+['"]*([^'";|`\r\n]+)['"]*/gi,
     /\bnl\b(?:\s+-[A-Za-z]+)*\s+['"]*([^'";|`\r\n]+)['"]*/gi,
-    /\bsed\b\s+-n\s+['"]?[^'"]+['"]?\s+['"]*([^'";|`\r\n]+)['"]*/gi,
+    new RegExp(
+      String.raw`\bsed\b[ \t]+-n[ \t]+${shellArgument}[ \t]+['"]*([^'";|\x60\r\n]+)['"]*`,
+      "gi",
+    ),
   ];
 
   for (const pattern of patterns) {
@@ -2051,6 +3227,7 @@ function extractCommandExecutions(events) {
       status: null,
       started_event_index: null,
       completed_event_index: null,
+      harness_semantics: null,
     };
     if (item.command) {
       existing.command = item.command;
@@ -2064,11 +3241,20 @@ function extractCommandExecutions(events) {
       existing.exit_code = item.exit_code ?? null;
       existing.status = item.status ?? null;
     }
+    if (
+      eventTypeOf(event).startsWith("harness.command.") &&
+      item.harness_semantics?.source === "codestory_packet_prelude_v1" &&
+      item.harness_semantics?.category === "codestory_cli" &&
+      item.harness_semantics?.operation === "packet"
+    ) {
+      existing.harness_semantics = item.harness_semantics;
+    }
     byId.set(id, existing);
   });
 
   for (const command of byId.values()) {
-    command.category = commandCategory(command.command);
+    command.category = command.harness_semantics?.category ?? commandCategory(command.command);
+    command.codestory_operation = command.harness_semantics?.operation ?? null;
     command.pattern = commandPattern(command.command);
     commands.push(command);
   }
@@ -2164,7 +3350,174 @@ function interactionTurnTelemetry(events) {
   };
 }
 
-function analyzeTranscript(events, projectRoot = null) {
+const MATERIAL_SOURCE_GAP_CODES = new Set([
+  "unknown",
+  "unavailable",
+  "not_established",
+  "evidence_missing",
+  "retrieval_unavailable",
+  "source_unavailable",
+]);
+
+const MATERIAL_SOURCE_GAP_TEXT =
+  /\b(?:unknown|unavailable|not_established|evidence gap|material gap|missing evidence|evidence_missing|retrieval_unavailable|source_unavailable)\b/i;
+const NON_AUTHORIZING_GAP_TEXT = /\b(?:output_budget_exceeded|continuation_required)\b/i;
+
+function textMentionsExactPath(value, normalizedPath) {
+  if (!normalizedPath) return false;
+  const text = String(value ?? "").replaceAll("\\", "/");
+  let offset = text.indexOf(normalizedPath);
+  while (offset >= 0) {
+    const before = offset === 0 ? "" : text[offset - 1];
+    const afterOffset = offset + normalizedPath.length;
+    const after = afterOffset >= text.length ? "" : text[afterOffset];
+    const pathCharacter = /[A-Za-z0-9._~:/-]/;
+    if ((!before || !pathCharacter.test(before)) && (!after || !pathCharacter.test(after))) {
+      return true;
+    }
+    offset = text.indexOf(normalizedPath, offset + 1);
+  }
+  return false;
+}
+
+function gapTextUniquelyCorrelatesPath(value, normalizedPath) {
+  if (!textMentionsExactPath(value, normalizedPath)) return false;
+  const text = String(value ?? "").replaceAll("\\", "/");
+  const paths = new Set(
+    (text.match(/(?:[A-Za-z0-9_@+.-]+\/)+[A-Za-z0-9_@+.-]*[A-Za-z0-9_@+-]|[A-Za-z0-9_@+-]+\.[A-Za-z0-9_@+.-]*[A-Za-z0-9_@+-]/gu) ?? [])
+      .map(normalizePathLike),
+  );
+  paths.add(normalizedPath);
+  return paths.size === 1;
+}
+
+function explicitEvidenceGapAuthorizesPath(value, normalizedPath, seen = new Set()) {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+      try {
+        return explicitEvidenceGapAuthorizesPath(JSON.parse(trimmed), normalizedPath, seen);
+      } catch {
+        // Fall through to bounded line correlation for non-JSON tool output.
+      }
+    }
+    return trimmed.split(/\r?\n/u).some((line) =>
+      MATERIAL_SOURCE_GAP_TEXT.test(line) &&
+      !NON_AUTHORIZING_GAP_TEXT.test(line) &&
+      gapTextUniquelyCorrelatesPath(line, normalizedPath)
+    );
+  }
+  if (Array.isArray(value)) {
+    return value.some((entry) => explicitEvidenceGapAuthorizesPath(entry, normalizedPath, seen));
+  }
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+
+  const code = String(value.kind ?? value.status ?? "").trim().toLowerCase();
+  const classificationText = [value.kind, value.status, value.message, value.reason, value.reasons]
+    .flat()
+    .filter((entry) => entry != null)
+    .join(" ");
+  if (MATERIAL_SOURCE_GAP_CODES.has(code) && !NON_AUTHORIZING_GAP_TEXT.test(classificationText)) {
+    const correlationText = ["message", "reason", "reasons", "detail", "details", "path", "source_path", "source_paths"]
+      .flatMap((field) => Array.isArray(value[field]) ? value[field] : [value[field]])
+      .filter((entry) => entry != null)
+      .join("\n");
+    if (gapTextUniquelyCorrelatesPath(correlationText, normalizedPath)) return true;
+  }
+
+  return ["gaps", "gap", "disposition", "result", "structuredContent", "structured_content", "content", "text"]
+    .some((field) => explicitEvidenceGapAuthorizesPath(value[field], normalizedPath, seen));
+}
+
+function canonicalMcpEvidenceResult(result) {
+  if (!result || typeof result !== "object") return null;
+  const structured = result.structuredContent ?? result.structured_content ?? null;
+  const textItems = Array.isArray(result.content)
+    ? result.content.filter((entry) => entry?.type === "text" && typeof entry.text === "string")
+    : [];
+  const parsedText = [];
+  for (const item of textItems) {
+    try {
+      parsedText.push(JSON.parse(item.text));
+    } catch {
+      return null;
+    }
+  }
+  if (structured != null) {
+    if (parsedText.some((value) => stableJsonForHash(value) !== stableJsonForHash(structured))) return null;
+    return structured;
+  }
+  if (parsedText.length === 1) return parsedText[0];
+  if (parsedText.length > 1) {
+    const expected = stableJsonForHash(parsedText[0]);
+    return parsedText.every((value) => stableJsonForHash(value) === expected) ? parsedText[0] : null;
+  }
+  return result;
+}
+
+function directSourceReadAuthorization(read, commands, events, projectRoot, context) {
+  if (context.arm === "without_codestory") {
+    return { status: "baseline_local_exploration", reason: "without_codestory" };
+  }
+  const prompt = String(context.task?.prompt ?? "").replaceAll("\\", "/");
+  const readIdentity = sourceReadPathIdentity(read.path, projectRoot);
+  if (!readIdentity) {
+    return { status: "unauthorized", reason: null };
+  }
+  const relativePath = readIdentity.relative;
+  const readEventIndex = read.event_index ?? -1;
+  const repeatedRead = commands.some((command) =>
+    command.category === "direct_file_read" &&
+    (command.started_event_index ?? command.completed_event_index ?? -1) < readEventIndex &&
+    extractDirectFileReads(command.command).some((candidate) =>
+      sourceReadPathIdentity(candidate, projectRoot)?.key === readIdentity.key
+    )
+  );
+  if (repeatedRead) {
+    return { status: "unauthorized", reason: "repeated_source_read" };
+  }
+  if (
+    context.task?.file_local === true &&
+    relativePath &&
+    textMentionsExactPath(prompt, relativePath)
+  ) {
+    return { status: "authorized", reason: "user_named_file" };
+  }
+  const priorCommand = [...commands].reverse().find((command) =>
+    command.category === "codestory_cli" &&
+    command.exit_code === 0 &&
+    String(command.status ?? "completed").toLowerCase() !== "failed" &&
+    (command.completed_event_index ?? -1) < (read.event_index ?? -1) &&
+    explicitEvidenceGapAuthorizesPath(command.aggregated_output, relativePath)
+  );
+  if (priorCommand) {
+    return {
+      status: "authorized",
+      reason: "explicit_evidence_gap",
+      evidence_command_id: priorCommand.id,
+    };
+  }
+  const priorMcpEventIndex = events.findLastIndex((event, index) =>
+    index < (read.event_index ?? -1) &&
+    isSuccessfulCodeStoryMcpToolCallEvent(event) &&
+    explicitEvidenceGapAuthorizesPath(
+      canonicalMcpEvidenceResult(itemOf(event).result ?? event.result),
+      relativePath,
+    ),
+  );
+  if (priorMcpEventIndex >= 0) {
+    return {
+      status: "authorized",
+      reason: "explicit_evidence_gap",
+      evidence_event_index: priorMcpEventIndex,
+    };
+  }
+  return { status: "unauthorized", reason: null };
+}
+
+function analyzeTranscript(events, projectRoot = null, context = {}) {
   const commands = extractCommandExecutions(events);
   const toolCategories = toolCallCategories(events);
   const codestoryMcpToolCalls = events.filter(isCodeStoryMcpToolCallStartEvent);
@@ -2179,12 +3532,15 @@ function analyzeTranscript(events, projectRoot = null) {
   for (const command of commands) {
     bumpCount(commandCategories, command.category);
     bumpCount(outputCharsByCategory, command.category, String(command.aggregated_output ?? "").length);
-    for (const filePath of extractDirectFileReads(command.command)) {
+    const directReads = command.category === "direct_file_read"
+      ? extractDirectFileReads(command.command)
+      : [];
+    for (const filePath of directReads) {
       directFileReads.push({
         path: filePath,
         command_id: command.id,
         category: command.category,
-        event_index: command.completed_event_index ?? command.started_event_index,
+        event_index: command.started_event_index ?? command.completed_event_index,
         source_like: isLikelySourcePath(filePath),
         repo_like: isPathInsideProject(filePath, projectRoot),
       });
@@ -2198,13 +3554,17 @@ function analyzeTranscript(events, projectRoot = null) {
     (command) =>
       command.category === "codestory_cli" &&
       command.exit_code === 0 &&
-      isCodestoryPacketCommand(command.command),
+      (command.codestory_operation === "packet" || isCodestoryPacketCommand(command.command)),
   );
   const codestoryIndexCommands = commands.filter(
     (command) => command.category === "codestory_cli" && isCodestoryIndexCommand(command.command),
   );
   const firstSuccessfulContextCommand = commands.find(isSuccessfulContextCommand);
   const sourceReads = directFileReads.filter((read) => read.source_like && read.repo_like);
+  const authorizedSourceReads = sourceReads.map((read) => ({
+    ...read,
+    authorization: directSourceReadAuthorization(read, commands, events, projectRoot, context),
+  }));
   const afterIndex = (first) =>
     first == null
       ? null
@@ -2223,6 +3583,7 @@ function analyzeTranscript(events, projectRoot = null) {
     output_chars_by_category: outputCharsByCategory,
     direct_file_reads_total: directFileReads.length,
     direct_source_reads_total: sourceReads.length,
+    direct_source_reads: authorizedSourceReads,
     direct_file_reads_duplicated: duplicateCounts(directFileReads.map((read) => read.path)),
     first_successful_codestory_command: firstSuccessfulCodeStory
       ? {
@@ -2456,6 +3817,8 @@ function anchorSearchVariants(anchor) {
   ) {
     variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1::$2"));
     variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "$1#$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "(*$1).$2"));
+    variants.add(normalized.replace(/([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)/gi, "($1).$2"));
   }
   if (/[a-z_][a-z0-9_]*#[a-z_][a-z0-9_]*/i.test(normalized)) {
     variants.add(normalized.replace(/([a-z_][a-z0-9_]*)#([a-z_][a-z0-9_]*)/gi, "$1.$2"));
@@ -2480,12 +3843,15 @@ function anchorMatched(haystack, anchor) {
   return variants.some((variant) => normalizedHaystack.includes(variant));
 }
 
-function scoreAnchorSet(anchors, haystack) {
+function scoreAnchorSet(anchors, haystack, opts = {}) {
   const expected = [...new Set((anchors ?? []).map(String).map((value) => value.trim()).filter(Boolean))];
   const found = [];
   const missed = [];
   for (const anchor of expected) {
-    if (anchorMatched(haystack, anchor)) {
+    const matched = opts.affirmative === true
+      ? affirmativeQualityClauses(haystack).some((clause) => anchorMatched(clause, anchor))
+      : anchorMatched(haystack, anchor);
+    if (matched) {
       found.push(anchor);
     } else {
       missed.push(anchor);
@@ -2517,32 +3883,61 @@ const CLAIM_STOPWORDS = new Set([
   "with",
 ]);
 
-function claimTokens(value) {
-  return normalizeSearchText(value)
-    .split(/[^a-z0-9_:.]+/)
+function claimTokens(value, { expandQualified = false } = {}) {
+  const raw = String(value ?? "");
+  const inputs = expandQualified
+    ? [raw, raw.replace(/([a-z0-9])([A-Z])/g, "$1 $2")]
+    : [raw];
+  return inputs
+    .flatMap((input) => normalizeSearchText(input).split(/[^a-z0-9_:.]+/))
     .map((token) => token.trim().replace(/^[.:]+|[.:]+$/g, ""))
+    .flatMap((token) => expandQualified ? [token, ...token.split(/(?:::|[.#_])/g)] : [token])
     .filter((token) => token.length >= 3 && !CLAIM_STOPWORDS.has(token));
 }
 
+const POSITIVE_CLAIM_EQUIVALENCE_CLASSES = [
+  new Set(["call", "delegate", "forward", "invoke"]),
+  new Set(["choose", "determine", "dispatch", "route", "select"]),
+  new Set(["admission", "admit", "check", "guard", "reject", "validate"]),
+];
+
 function positiveClaimTokenVariants(token) {
-  const variants = new Set([token]);
-  if (token.length >= 5 && token.endsWith("ies")) {
-    variants.add(`${token.slice(0, -3)}y`);
+  const variants = new Set();
+  const splitComponents = token.split(/(?:::|[.:#_])/g);
+  const alternatives = token.includes(":") ? splitComponents.slice(-1) : splitComponents;
+  const components = [token, ...alternatives]
+    .filter((component, index) =>
+      component.length >= (index === 0 ? 3 : 2) && !CLAIM_STOPWORDS.has(component)
+    );
+  for (const component of components) {
+    variants.add(component);
+    if (component.length >= 5 && component.endsWith("ies")) {
+      variants.add(`${component.slice(0, -3)}y`);
+    }
+    if (component.length >= 5 && component.endsWith("ing")) {
+      variants.add(component.slice(0, -3));
+      variants.add(`${component.slice(0, -3)}e`);
+    }
+    if (component.length >= 4 && component.endsWith("ed")) {
+      variants.add(component.slice(0, -2));
+      variants.add(component.slice(0, -1));
+    }
+    if (component.length >= 4 && component.endsWith("es")) {
+      variants.add(component.slice(0, -2));
+      variants.add(component.slice(0, -1));
+    }
+    if (component.length >= 4 && component.endsWith("s")) {
+      variants.add(component.slice(0, -1));
+    }
+    if (component.length >= 6 && component.endsWith("er")) {
+      const roleBase = component.slice(0, -2);
+      if (roleBase.length >= 4) variants.add(roleBase);
+    }
   }
-  if (token.length >= 5 && token.endsWith("ing")) {
-    variants.add(token.slice(0, -3));
-    variants.add(`${token.slice(0, -3)}e`);
-  }
-  if (token.length >= 4 && token.endsWith("ed")) {
-    variants.add(token.slice(0, -2));
-    variants.add(token.slice(0, -1));
-  }
-  if (token.length >= 4 && token.endsWith("es")) {
-    variants.add(token.slice(0, -2));
-    variants.add(token.slice(0, -1));
-  }
-  if (token.length >= 4 && token.endsWith("s")) {
-    variants.add(token.slice(0, -1));
+  for (const equivalents of POSITIVE_CLAIM_EQUIVALENCE_CLASSES) {
+    if ([...variants].some((variant) => equivalents.has(variant))) {
+      for (const equivalent of equivalents) variants.add(equivalent);
+    }
   }
   return variants;
 }
@@ -2552,12 +3947,7 @@ function positiveClaimTokenMatched(token, haystackTokens) {
   for (const candidate of haystackTokens) {
     for (const expected of expectedVariants) {
       for (const observed of positiveClaimTokenVariants(candidate)) {
-        if (
-          expected === observed ||
-          (expected.length >= 5 &&
-            observed.length >= 5 &&
-            (observed.includes(expected) || expected.includes(observed)))
-        ) {
+        if (expected === observed) {
           return true;
         }
       }
@@ -2578,15 +3968,15 @@ function claimTokenMatched(token, haystackTokens) {
   return false;
 }
 
-function claimMatched(haystack, claim) {
-  if (anchorMatched(haystack, claim)) {
+function claimMatchedInSupportUnit(unit, claim) {
+  if (anchorMatched(unit, claim)) {
     return true;
   }
   const expectedTokens = [...new Set(claimTokens(claim))];
   if (expectedTokens.length < 3) {
     return false;
   }
-  const haystackTokens = new Set(claimTokens(haystack));
+  const haystackTokens = new Set(claimTokens(unit, { expandQualified: true }));
   const matched = expectedTokens.filter((token) =>
     positiveClaimTokenMatched(token, haystackTokens),
   ).length;
@@ -2596,6 +3986,41 @@ function claimMatched(haystack, claim) {
   // paraphrase while still rejecting a sentence that merely repeats one symbol name. Forbidden
   // claims retain the stricter polarity-aware matcher below.
   return matched >= Math.min(3, expectedTokens.length) && ratio >= 0.6;
+}
+
+function claimMatched(haystack, claim, subjectAnchors = []) {
+  const subject = claimSubjectAnchor(claim, subjectAnchors);
+  return qualitySupportUnits(haystack).some((unit) => {
+    const clauses = qualityClausesInUnit(unit);
+    if (!subject) {
+      const affirmative = clauses.filter(qualityClauseIsAffirmative);
+      return affirmative.length > 0 && claimMatchedInSupportUnit(affirmative.join(" "), claim);
+    }
+    return clauses.some((clause, index) => {
+      if (!qualityClauseIsAffirmative(clause) || !anchorMatched(clause, subject)) {
+        return false;
+      }
+      const candidate = [];
+      if (
+        index > 0 &&
+        qualityClauseIsAffirmative(clauses[index - 1]) &&
+        claimTokens(clauses[index - 1]).length <= 4 &&
+        !leadingClaimSubject(clauses[index - 1], subjectAnchors)
+      ) {
+        candidate.push(clauses[index - 1]);
+      }
+      candidate.push(clause);
+      for (let next = index + 1; next < clauses.length; next += 1) {
+        if (!qualityClauseIsAffirmative(clauses[next])) {
+          break;
+        }
+        const nextSubject = leadingClaimSubject(clauses[next], subjectAnchors);
+        if (nextSubject && nextSubject !== subject) break;
+        candidate.push(clauses[next]);
+      }
+      return claimMatchedInSupportUnit(candidate.join(" "), claim);
+    });
+  });
 }
 
 const FORBIDDEN_POLARITY_TERMS = new Set([
@@ -2626,8 +4051,135 @@ function forbiddenCandidateSentences(haystack) {
     .filter(Boolean);
 }
 
+const NON_AFFIRMATIVE_QUALITY_TEXT =
+  /\b(?:unknown|unavailable|unproven|unsupported|missing|gaps?|not_established|evidence_missing|unresolved|(?:no|without)\s+evidence|(?:lacks?|lacked|lacking)\s+(?:evidence|support)|(?:does|do|did|can|could)\s+not\b|cannot\b|doesn't\b|don't\b|didn't\b|can't\b|couldn't\b|never\b|fails? to (?:establish|show|support|prove|verify|demonstrate))\b/i;
+
+function qualitySupportUnits(haystack) {
+  const units = [];
+  let current = [];
+  let currentListIndent = null;
+  const listParents = [];
+  let inCodeFence = false;
+  let inGapSection = false;
+  const flush = () => {
+    const unit = current.join(" ").trim();
+    if (unit) units.push(unit);
+    current = [];
+    const listIndent = currentListIndent;
+    currentListIndent = null;
+    return unit ? { unit, listIndent } : null;
+  };
+  for (const rawLine of String(haystack ?? "").replace(/\r\n/g, "\n").split("\n")) {
+    const line = rawLine.trim();
+    if (/^```/.test(line)) {
+      flush();
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) continue;
+
+    const heading = line.match(/^#{1,6}\s+(.+)$/);
+    if (heading) {
+      flush();
+      listParents.length = 0;
+      inGapSection = /\b(?:gaps?|unknown|unavailable|limitations?)\b/i.test(heading[1]);
+      continue;
+    }
+    if (/^(?:material\s+)?gaps?\s*:/i.test(line)) {
+      flush();
+      listParents.length = 0;
+      inGapSection = true;
+      continue;
+    }
+    if (!line) {
+      flush();
+      listParents.length = 0;
+      continue;
+    }
+    if (inGapSection) continue;
+    if (/^(?:supporting|repository evidence) command\s*:/i.test(line)) {
+      flush();
+      continue;
+    }
+
+    const listItem = line.match(/^(?:[-*+]\s+|\d+[.)]\s+)(.*)$/);
+    if (listItem) {
+      const indent = rawLine.match(/^\s*/u)?.[0].replace(/\t/gu, "  ").length ?? 0;
+      const previous = flush();
+      while (listParents.at(-1)?.listIndent >= indent) listParents.pop();
+      if (
+        previous?.listIndent != null &&
+        previous.listIndent < indent &&
+        previous.unit.endsWith(":")
+      ) {
+        listParents.push(previous);
+      }
+      const parent = listParents.at(-1);
+      current.push(
+        parent && parent.listIndent < indent
+          ? `${parent.unit.replace(/:\s*$/u, "")} ${listItem[1]}`
+          : listItem[1],
+      );
+      currentListIndent = indent;
+    } else {
+      current.push(line);
+    }
+  }
+  flush();
+  return units;
+}
+
+function qualityClausesInUnit(unit) {
+  return String(unit ?? "")
+    .split(/(?:[.!?](?:["'`)]*)\s+|;\s*|\s+[—–]\s+|\s+(?:but|however|although|though|yet)\b[,:]?\s*)/iu)
+    .map((clause) => clause.trim())
+    .filter(Boolean);
+}
+
+function qualityClauseIsAffirmative(clause) {
+  return !NON_AFFIRMATIVE_QUALITY_TEXT.test(clause);
+}
+
+function affirmativeQualityClausesInUnit(unit) {
+  return qualityClausesInUnit(unit).filter(qualityClauseIsAffirmative);
+}
+
+function affirmativeQualityClauses(haystack) {
+  return qualitySupportUnits(haystack).flatMap(affirmativeQualityClausesInUnit);
+}
+
+function claimSubjectAnchor(claim, subjectAnchors = []) {
+  const leadingKnown = leadingClaimSubject(claim, subjectAnchors);
+  if (leadingKnown) return leadingKnown;
+
+  const normalized = String(claim ?? "")
+    .trim()
+    .replace(/^[`*_]+|[`*_]+$/g, "");
+  const subject = normalized.match(
+    /^([A-Za-z_$][A-Za-z0-9_$]*(?:(?:::|[.#])[A-Za-z_$][A-Za-z0-9_$]*)*)\b/,
+  )?.[1] ?? null;
+  if (!subject || /^(?:a|an|the|this|these|those)$/i.test(subject)) return null;
+  return /(?:::|[.#])/.test(subject) || /[A-Z_]/.test(subject.slice(1)) ? subject : null;
+}
+
+function leadingClaimSubject(clause, subjectAnchors) {
+  const normalized = normalizeSearchText(clause)
+    .replace(/^[^a-z0-9_$]+/i, "")
+    .replace(/^(?:a|an|the)\s+/i, "");
+  return [...new Set(subjectAnchors.map(String).filter(Boolean))]
+    .sort((left, right) => right.length - left.length || left.localeCompare(right))
+    .find((anchor) => anchorSearchVariants(anchor).some((variant) => {
+      if (!normalized.startsWith(variant)) return false;
+      const next = normalized[variant.length];
+      return next == null || !/[a-z0-9_$]/i.test(next);
+    })) ?? null;
+}
+
 function hasContradictingNegation(sentence) {
-  const tokens = claimTokens(sentence);
+  const tokens = normalizeSearchText(sentence)
+    .split(/[^a-z0-9_:.]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
   return tokens.some((token) => FORBIDDEN_CONTRADICTION_TERMS.has(token));
 }
 
@@ -2650,7 +4202,10 @@ function forbiddenClaimMatched(haystack, claim) {
 
     const matched = expectedTokens.filter((token) => claimTokenMatched(token, sentenceTokens)).length;
     const ratio = matched / expectedTokens.length;
-    if (matched < Math.min(4, expectedTokens.length) || ratio < 0.65) {
+    // Polarity-bearing forbidden claims need near-complete semantic coverage. A lower ratio
+    // confuses an explicit evidence-gap sentence with the opposite claim when both name the same
+    // subsystem, binary route, and dispatch vocabulary.
+    if (matched < Math.min(4, expectedTokens.length) || ratio < 0.8) {
       return false;
     }
     return polarityTokens.every((token) => claimTokenMatched(token, sentenceTokens));
@@ -2662,7 +4217,9 @@ function scoreClaimSet(claims, haystack, opts = {}) {
   const found = [];
   const missed = [];
   for (const claim of expected) {
-    const matched = opts.forbidden ? forbiddenClaimMatched(haystack, claim) : claimMatched(haystack, claim);
+    const matched = opts.forbidden
+      ? forbiddenClaimMatched(haystack, claim)
+      : claimMatched(haystack, claim, opts.subjectAnchors ?? []);
     if (matched) {
       found.push(claim);
     } else {
@@ -2719,7 +4276,34 @@ function scoreQuality(events, task) {
   const transcript = commands
     .map((command) => `${command.command}\n${command.aggregated_output ?? ""}`)
     .join("\n");
-  return scoreQualityFromText(finalAnswer, transcript, task);
+  const quality = scoreQualityFromText(finalAnswer, transcript, task);
+  const proofClaims = forbiddenCandidateSentences(finalAnswer).filter((sentence) =>
+    /\b(?:contractproven|contractrefuted)\b/i.test(sentence) ||
+    /\bcodestory\s+(?:proved|proves|refuted|refutes|verified)\b/i.test(sentence)
+  );
+  const proofEvidence = [
+    ...commands
+      .filter((command) => command.category === "codestory_cli" && command.exit_code === 0)
+      .map((command) => command.aggregated_output ?? ""),
+    ...events.filter(isSuccessfulCodeStoryMcpToolCallEvent).map((event) => JSON.stringify(event)),
+  ].join("\n");
+  const unsupportedProofClaims = proofClaims.filter((claim) => {
+    const refutationClaim = /\b(?:contractrefuted|refuted|refutes)\b/i.test(claim);
+    return refutationClaim
+      ? !/\bContractRefuted\b/.test(proofEvidence)
+      : !/\bContractProven\b/.test(proofEvidence);
+  });
+  return {
+    ...quality,
+    material_factual_errors: {
+      found: quality.forbidden_claims.found,
+      found_anchors: quality.forbidden_claims.found_anchors,
+    },
+    unsupported_proof_claims: {
+      found: unsupportedProofClaims.length,
+      found_claims: unsupportedProofClaims,
+    },
+  };
 }
 
 function scoreQualityFromText(finalAnswer, transcript, task) {
@@ -2729,10 +4313,14 @@ function scoreQualityFromText(finalAnswer, transcript, task) {
   const finalAndTranscript = `${finalAnswer}\n${transcript}`;
 
   const observedFiles = scoreAnchorSet(task.expected_files, finalAndTranscript);
-  const observedSymbols = scoreAnchorSet(task.expected_symbols, finalAndTranscript);
+  const observedSymbols = scoreAnchorSet(task.expected_symbols, finalAndTranscript, {
+    affirmative: true,
+  });
   const files = scoreAnchorSet(task.expected_files, finalAnswer);
-  const symbols = scoreAnchorSet(task.expected_symbols, finalAnswer);
-  const claims = scoreClaimSet(task.expected_claims, finalAnswer);
+  const symbols = scoreAnchorSet(task.expected_symbols, finalAnswer, { affirmative: true });
+  const claims = scoreClaimSet(task.expected_claims, finalAnswer, {
+    subjectAnchors: task.expected_symbols ?? [],
+  });
   const citations = scoreAnchorSet(task.expected_files, finalAnswer);
   const verificationFiles = scoreAnchorSet(task.expected_verification_files ?? [], finalAnswer);
   const forbidden = scoreClaimSet(task.forbidden_claims, finalAnswer, { forbidden: true });
@@ -2893,9 +4481,13 @@ function extractUsage(events) {
   };
 }
 
-function estimateCost(usage) {
-  const inputCost = Number.parseFloat(process.env.CODESTORY_BENCH_INPUT_COST_PER_MTOK ?? "");
-  const outputCost = Number.parseFloat(process.env.CODESTORY_BENCH_OUTPUT_COST_PER_MTOK ?? "");
+function estimateCost(usage, rates = null) {
+  const inputCost = Number.parseFloat(
+    rates?.input_per_mtok ?? process.env.CODESTORY_BENCH_INPUT_COST_PER_MTOK ?? "",
+  );
+  const outputCost = Number.parseFloat(
+    rates?.output_per_mtok ?? process.env.CODESTORY_BENCH_OUTPUT_COST_PER_MTOK ?? "",
+  );
   if (
     !Number.isFinite(inputCost) ||
     !Number.isFinite(outputCost) ||
@@ -2905,6 +4497,28 @@ function estimateCost(usage) {
     return null;
   }
   return (usage.input_tokens / 1_000_000) * inputCost + (usage.output_tokens / 1_000_000) * outputCost;
+}
+
+function exactCandidateCostRates(env = process.env) {
+  const inputPerMtok = Number.parseFloat(env.CODESTORY_BENCH_INPUT_COST_PER_MTOK ?? "");
+  const outputPerMtok = Number.parseFloat(env.CODESTORY_BENCH_OUTPUT_COST_PER_MTOK ?? "");
+  if (
+    !Number.isFinite(inputPerMtok) ||
+    inputPerMtok <= 0 ||
+    !Number.isFinite(outputPerMtok) ||
+    outputPerMtok <= 0
+  ) {
+    throw new Error(
+      "exact-candidate mode requires positive CODESTORY_BENCH_INPUT_COST_PER_MTOK and CODESTORY_BENCH_OUTPUT_COST_PER_MTOK before package authentication or repository materialization",
+    );
+  }
+  return {
+    currency: "USD",
+    model: DEFAULT_BENCHMARK_MODEL,
+    input_per_mtok: inputPerMtok,
+    output_per_mtok: outputPerMtok,
+    source: "configured_environment",
+  };
 }
 
 const BENCHMARK_AGENT_RUN_ID = "shared-agent";
@@ -2934,6 +4548,8 @@ function retrievalIndexCommandArgs(project) {
     ...benchmarkAgentScopeArgs(),
     "--refresh",
     "auto",
+    "--format",
+    "json",
   ];
 }
 
@@ -2961,10 +4577,15 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
 
 function drillPacketCommandArgs(repoConfig, task, opts, packet) {
   const drill = packet?.disposition?.drill;
-  const parentPacketId = String(drill?.parent_packet_id ?? "").trim();
-  const options = Array.isArray(drill?.options) ? drill.options : [];
+  const continuation = isPacketProjectionV3(packet) ? packet.continuation : null;
+  const parentPacketId = String(
+    continuation?.continuation_id ?? drill?.parent_packet_id ?? "",
+  ).trim();
+  const options = continuation
+    ? (Array.isArray(continuation.gap_ids) ? continuation.gap_ids : [])
+    : (Array.isArray(drill?.options) ? drill.options : []);
   const optionIds = options
-    .map((option) => String(option?.id ?? "").trim())
+    .map((option) => String(option?.gap_id ?? option?.id ?? "").trim())
     .filter(Boolean);
   if (!parentPacketId || optionIds.length === 0) {
     return null;
@@ -2974,11 +4595,17 @@ function drillPacketCommandArgs(repoConfig, task, opts, packet) {
   for (const optionId of optionIds) {
     args.push("--option-id", optionId);
   }
-  const coreGenerationId = String(drill.core_generation_id ?? "").trim();
+  const coreGenerationId = String(
+    packet?.publication?.core?.generation_id ?? drill?.core_generation_id ?? "",
+  ).trim();
   if (coreGenerationId) {
     args.push("--core-generation-id", coreGenerationId);
   }
-  const retrievalGeneration = String(drill.retrieval_generation ?? "").trim();
+  const retrievalGeneration = String(
+    packet?.publication?.retrieval?.retrieval_generation ??
+      drill?.retrieval_generation ??
+      "",
+  ).trim();
   if (retrievalGeneration) {
     args.push("--retrieval-generation", retrievalGeneration);
   }
@@ -3016,8 +4643,16 @@ function preludePublicFields(prelude) {
     stdout_bytes: prelude.stdout_bytes,
     stderr_bytes: prelude.stderr_bytes,
     packet_parse_error: prelude.packet_parse_error,
+    packet_schema_version: prelude.packet_schema_version ?? null,
+    packet_projection_kind: prelude.packet_projection_kind ?? null,
+    packet_evidence_availability: prelude.packet_evidence_availability ?? null,
+    packet_evidence_gap_accounting: prelude.packet_evidence_gap_accounting ?? null,
+    packet_evidence_count: prelude.packet_evidence_count ?? null,
+    packet_gap_count: prelude.packet_gap_count ?? null,
     packet_disposition_kind: prelude.packet_disposition_kind ?? null,
     packet_disposition: prelude.packet_disposition ?? null,
+    packet_sufficiency_status: prelude.packet_sufficiency_status ?? null,
+    packet_sufficiency: prelude.packet_sufficiency ?? null,
     packet_support_count: prelude.packet_support_count ?? null,
     packet_support_kind_counts: prelude.packet_support_kind_counts ?? null,
     packet_citation_count: prelude.packet_citation_count,
@@ -3029,6 +4664,10 @@ function preludePublicFields(prelude) {
     packet_extra_probe_count: prelude.packet_extra_probe_count ?? null,
     packet_extra_probe_strategy: prelude.packet_extra_probe_strategy ?? null,
     packet_drill_continuation: prelude.packet_drill_continuation === true,
+    packet_contract_blockers: prelude.packet_contract_blockers ?? [],
+    ...(prelude.packet_command_failure == null
+      ? {}
+      : { packet_command_failure: prelude.packet_command_failure }),
   };
 }
 
@@ -3038,6 +4677,11 @@ function harnessPacketPreludeEvents(prelude, stdout = "") {
   }
   const command = prelude.command ?? "";
   const id = "harness_codestory_packet";
+  const harnessSemantics = {
+    source: "codestory_packet_prelude_v1",
+    category: "codestory_cli",
+    operation: "packet",
+  };
   return [
     {
       type: "harness.command.started",
@@ -3045,6 +4689,7 @@ function harnessPacketPreludeEvents(prelude, stdout = "") {
         id,
         type: "command_execution",
         command,
+        harness_semantics: harnessSemantics,
       },
     },
     {
@@ -3053,6 +4698,7 @@ function harnessPacketPreludeEvents(prelude, stdout = "") {
         id,
         type: "command_execution",
         command,
+        harness_semantics: harnessSemantics,
         aggregated_output: stdout,
         exit_code: prelude.exit_code,
         status: prelude.status,
@@ -3378,7 +5024,9 @@ async function runBaselinePrelude(opts, run, repoConfig, outDir, runId) {
   ];
   const command = displayCommand("rg", args);
   const started = performance.now();
-  const env = { ...process.env };
+  const env = opts.exactCandidate
+    ? selectedBenchmarkChildEnv(opts, "without_codestory")
+    : { ...process.env };
   delete env.CODESTORY_CLI;
   const result = await runProcess("rg", args, {
     cwd: repoConfig.path,
@@ -3484,18 +5132,20 @@ function packetFollowUpCount(packet) {
   );
 }
 
-function managedRuntimeIdentityBlockers(identity, label) {
-  const versionMatches = [
+function managedRuntimeIdentityBlockers(identity, label, expectedVersion = null) {
+  const versions = [
     identity?.plugin_version,
     identity?.plugin_cli_version,
     identity?.cli_version,
-  ].every((version) => version === REQUIRED_MANAGED_CODESTORY_VERSION);
+  ];
+  const selectedVersion = expectedVersion ?? versions[0];
+  const versionMatches = Boolean(selectedVersion) && versions.every((version) => version === selectedVersion);
   return versionMatches &&
     identity?.pinned_pair_matches === true &&
     identity?.cli_source === "managed" &&
     identity?.known_override_skew_channel === false
     ? []
-    : [`${label} runtime identity is not managed ${REQUIRED_MANAGED_CODESTORY_VERSION}: ${JSON.stringify(identity ?? null)}`];
+    : [`${label} runtime identity is not managed ${selectedVersion ?? "a bound version"}: ${JSON.stringify(identity ?? null)}`];
 }
 
 function packetMaterialObligationBucket(obligation) {
@@ -3588,10 +5238,13 @@ function resultPacketObligationAccounting(result) {
 }
 
 function resultRequiresPacketObligationAccounting(result) {
-  if (result?.arm !== "with_codestory" && result?.mode == null) {
+  if (!isCodeStoryArm(result?.arm) && result?.mode == null) {
     return false;
   }
   const prelude = result?.codestory_harness_prelude;
+  if (prelude?.packet_schema_version === 3) {
+    return false;
+  }
   if (
     result?.disposition != null ||
     prelude?.packet_disposition != null ||
@@ -3668,9 +5321,365 @@ function publicPacketPreludeContractPasses(packet, stdout) {
   }).length === 0;
 }
 
+function nonemptyString(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function packetV3EvidenceGapAccounting(packet) {
+  if (!isPacketProjectionV3(packet)) {
+    return null;
+  }
+  const evidence = Array.isArray(packet.evidence) ? packet.evidence : [];
+  const gaps = Array.isArray(packet.gaps) ? packet.gaps : [];
+  const evidenceIds = evidence
+    .map((row) => row?.identity?.evidence_id)
+    .filter(nonemptyString);
+  const gapIds = gaps
+    .map((row) => row?.identity?.gap_id)
+    .filter(nonemptyString);
+  const continuationGapIds = Array.isArray(packet.continuation?.gap_ids)
+    ? packet.continuation.gap_ids
+      .map((identity) => identity?.gap_id)
+      .filter(nonemptyString)
+    : [];
+  const kindCounts = (rows) => Object.fromEntries(
+    [...rows.reduce((counts, row) => {
+      const kind = String(row?.kind ?? "unknown");
+      counts.set(kind, (counts.get(kind) ?? 0) + 1);
+      return counts;
+    }, new Map()).entries()].sort(([left], [right]) => left.localeCompare(right)),
+  );
+  return {
+    contract: "codestory.packet-v3-evidence-gap-accounting/v1",
+    kind: packet.kind ?? null,
+    status: packet.status ?? null,
+    evidence_count: evidence.length,
+    unique_evidence_id_count: new Set(evidenceIds).size,
+    evidence_kind_counts: kindCounts(evidence),
+    gap_count: gaps.length,
+    unique_gap_id_count: new Set(gapIds).size,
+    gap_kind_counts: kindCounts(gaps),
+    continuation_gap_count: continuationGapIds.length,
+    unique_continuation_gap_id_count: new Set(continuationGapIds).size,
+    continuation_gap_ids_bound:
+      continuationGapIds.every((gapId) => new Set(gapIds).has(gapId)),
+  };
+}
+
+function packetV3EvidenceAvailabilityTelemetry(packet, quality) {
+  if (!isPacketProjectionV3(packet)) {
+    return null;
+  }
+  const accounting = packetV3EvidenceGapAccounting(packet);
+  return {
+    kind: packet.kind ?? null,
+    status: packet.status ?? null,
+    terminal: packet.status !== "continuation_available",
+    retrieval_state: packet.retrieval?.state ?? null,
+    evidence_count: accounting.evidence_count,
+    evidence_kind_counts: accounting.evidence_kind_counts,
+    gap_count: accounting.gap_count,
+    gap_kind_counts: accounting.gap_kind_counts,
+    continuation_id: packet.continuation?.continuation_id ?? null,
+    continuation_gap_count: accounting.continuation_gap_count,
+    remaining_rounds: presentFiniteNumber(packet.continuation?.remaining_rounds),
+    available_quality_mismatch:
+      packet.status === "available" && quality?.pass === false,
+  };
+}
+
+function packetV3ContractBlockers(packet, options = {}) {
+  const blockers = [];
+  const isSha256 = (value) =>
+    SHA256_PATTERN.test(String(value ?? "")) && !/^0{64}$/.test(String(value));
+  const identity = packet.identity;
+  const publication = packet.publication;
+  const core = publication?.core;
+  const retrievalPublication = publication?.retrieval ?? null;
+  const retrieval = packet.retrieval;
+  const evidence = packet.evidence;
+  const gaps = packet.gaps;
+  const allowedStatuses = new Set([
+    "available",
+    "continuation_available",
+    "no_useful_evidence",
+    "unavailable",
+  ]);
+  const allowedRetrievalStates = new Set(["full", "degraded", "unavailable"]);
+  const allowedEvidenceKinds = new Set([
+    "exact_source",
+    "structural_source",
+    "graph_relation",
+    "retrieval_excerpt",
+  ]);
+  const allowedGapKinds = new Set([
+    "evidence_missing",
+    "retrieval_unavailable",
+    "source_unavailable",
+    "continuation_required",
+    "output_budget_exceeded",
+  ]);
+
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) {
+    blockers.push("packet v3 identity is missing or invalid");
+  } else {
+    for (const field of ["packet_id", "request_id"]) {
+      if (!nonemptyString(identity[field])) {
+        blockers.push(`packet v3 identity.${field} is missing`);
+      }
+    }
+    if (!isSha256(identity.question_sha256)) {
+      blockers.push("packet v3 identity.question_sha256 is invalid");
+    } else if (
+      options.expectedQuestion != null &&
+      identity.question_sha256 !== sha256Bytes(String(options.expectedQuestion))
+    ) {
+      blockers.push("packet v3 question digest does not match the benchmark task");
+    }
+  }
+  if (!core || typeof core !== "object" || Array.isArray(core)) {
+    blockers.push("packet v3 core publication is missing or invalid");
+  } else {
+    for (const field of ["project_id", "generation_id", "run_id"]) {
+      if (!nonemptyString(core[field])) {
+        blockers.push(`packet v3 publication.core.${field} is missing`);
+      }
+    }
+  }
+  if (!retrieval || typeof retrieval !== "object" || Array.isArray(retrieval)) {
+    blockers.push("packet v3 retrieval state is missing or invalid");
+  } else if (!allowedRetrievalStates.has(retrieval.state)) {
+    blockers.push(`packet v3 retrieval state=${retrieval.state ?? "missing"} is invalid`);
+  }
+  if (retrievalPublication != null) {
+    for (const field of [
+      "core_generation_id",
+      "core_run_id",
+      "retrieval_generation",
+      "semantic_generation",
+    ]) {
+      if (!nonemptyString(retrievalPublication[field])) {
+        blockers.push(`packet v3 publication.retrieval.${field} is missing`);
+      }
+    }
+    if (!isSha256(retrievalPublication.retrieval_input_sha256)) {
+      blockers.push("packet v3 publication.retrieval.retrieval_input_sha256 is invalid");
+    }
+    if (
+      core &&
+      (
+        retrievalPublication.core_generation_id !== core.generation_id ||
+        retrievalPublication.core_run_id !== core.run_id
+      )
+    ) {
+      blockers.push("packet v3 retrieval publication is not bound to the core publication");
+    }
+    if (retrieval?.generation_id !== retrievalPublication.retrieval_generation) {
+      blockers.push("packet v3 retrieval state generation does not match its publication");
+    }
+  }
+  if (retrieval?.state === "full" && !retrievalPublication) {
+    blockers.push("packet v3 full retrieval has no retrieval publication");
+  }
+  if (retrieval?.state === "unavailable" && retrievalPublication != null) {
+    blockers.push("packet v3 unavailable retrieval unexpectedly has a publication");
+  }
+  if (
+    ["degraded", "unavailable"].includes(retrieval?.state) &&
+    retrievalPublication == null &&
+    retrieval?.generation_id != null
+  ) {
+    blockers.push("packet v3 retrieval state has a generation without a publication");
+  }
+
+  if (!Array.isArray(gaps) || gaps.length > 256) {
+    blockers.push("packet v3 gaps are missing, invalid, or over the public row cap");
+  }
+  const gapIds = new Set();
+  for (const gap of Array.isArray(gaps) ? gaps : []) {
+    const gapId = gap?.identity?.gap_id;
+    if (!nonemptyString(gapId)) {
+      blockers.push("packet v3 gap identity is missing");
+    } else if (gapIds.has(gapId)) {
+      blockers.push(`packet v3 gap identity=${gapId} is duplicated`);
+    } else {
+      gapIds.add(gapId);
+    }
+    if (!allowedGapKinds.has(gap?.kind)) {
+      blockers.push(`packet v3 gap kind=${gap?.kind ?? "missing"} is invalid`);
+    }
+  }
+
+  const diagnostics = packet.diagnostics;
+  if (!diagnostics || !["available", "unavailable"].includes(diagnostics.availability)) {
+    blockers.push("packet v3 diagnostics capability is missing or invalid");
+  } else if (diagnostics.availability === "available") {
+    const reference = diagnostics.reference;
+    if (
+      !nonemptyString(reference?.artifact_id) ||
+      !isSha256(reference?.sha256) ||
+      !Number.isInteger(reference?.byte_length) ||
+      reference.byte_length < 0
+    ) {
+      blockers.push("packet v3 diagnostics reference is invalid");
+    }
+  } else if (diagnostics.reference != null) {
+    blockers.push("packet v3 unavailable diagnostics unexpectedly include a reference");
+  }
+
+  const compactBytes = Buffer.byteLength(JSON.stringify(packet), "utf8");
+  if (compactBytes > PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES) {
+    blockers.push(
+      `packet v3 compact bytes=${compactBytes} exceeds public cap=${PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES}`,
+    );
+  }
+
+  if (packet.kind === "complete") {
+    if (!Array.isArray(evidence) || evidence.length > 256) {
+      blockers.push("packet v3 evidence is missing, invalid, or over the public row cap");
+    }
+    const evidenceIds = new Set();
+    for (const row of Array.isArray(evidence) ? evidence : []) {
+      const evidenceId = row?.identity?.evidence_id;
+      if (!nonemptyString(evidenceId)) {
+        blockers.push("packet v3 evidence identity is missing");
+      } else if (evidenceIds.has(evidenceId)) {
+        blockers.push(`packet v3 evidence identity=${evidenceId} is duplicated`);
+      } else {
+        evidenceIds.add(evidenceId);
+      }
+      if (!allowedEvidenceKinds.has(row?.kind)) {
+        blockers.push(`packet v3 evidence kind=${row?.kind ?? "missing"} is invalid`);
+      }
+      if (
+        row?.start_line != null &&
+        (!Number.isInteger(row.start_line) || row.start_line < 1)
+      ) {
+        blockers.push(`packet v3 evidence start_line=${row.start_line} is invalid`);
+      }
+      if (
+        row?.end_line != null &&
+        (!Number.isInteger(row.end_line) || row.end_line < 1)
+      ) {
+        blockers.push(`packet v3 evidence end_line=${row.end_line} is invalid`);
+      }
+      if (
+        Number.isInteger(row?.start_line) &&
+        Number.isInteger(row?.end_line) &&
+        row.end_line < row.start_line
+      ) {
+        blockers.push("packet v3 evidence line range is reversed");
+      }
+    }
+    if (!allowedStatuses.has(packet.status)) {
+      blockers.push(`packet v3 status=${packet.status ?? "missing"} is invalid`);
+    }
+    const expectedStatus = packet.continuation != null
+      ? "continuation_available"
+      : Array.isArray(evidence) && evidence.length > 0
+        ? "available"
+        : retrieval?.state === "unavailable" ||
+            (Array.isArray(gaps) && gaps.some((gap) =>
+              ["retrieval_unavailable", "source_unavailable"].includes(gap?.kind)))
+          ? "unavailable"
+          : "no_useful_evidence";
+    if (allowedStatuses.has(packet.status) && packet.status !== expectedStatus) {
+      blockers.push(
+        `packet v3 status=${packet.status} does not match evidence availability=${expectedStatus}`,
+      );
+    }
+    const continuation = packet.continuation;
+    if (packet.status === "continuation_available") {
+      const references = continuation?.gap_ids;
+      if (
+        !nonemptyString(continuation?.continuation_id) ||
+        continuation?.remaining_rounds !== 1 ||
+        !Array.isArray(references) ||
+        references.length === 0
+      ) {
+        blockers.push("packet v3 continuation_available state has an invalid continuation");
+      } else {
+        const referenceIds = references.map((entry) => entry?.gap_id);
+        if (
+          referenceIds.some((gapId) => !nonemptyString(gapId) || !gapIds.has(gapId)) ||
+          new Set(referenceIds).size !== referenceIds.length
+        ) {
+          blockers.push("packet v3 continuation gap identities are missing, duplicated, or unbound");
+        }
+      }
+    } else if (continuation != null) {
+      blockers.push(`packet v3 status=${packet.status ?? "missing"} unexpectedly includes continuation`);
+    }
+    if (packet.status === "available" && (!Array.isArray(evidence) || evidence.length === 0)) {
+      blockers.push("packet v3 available status has no evidence");
+    }
+    if (
+      ["no_useful_evidence", "unavailable"].includes(packet.status) &&
+      Array.isArray(evidence) &&
+      evidence.length > 0
+    ) {
+      blockers.push(`packet v3 status=${packet.status} unexpectedly includes evidence`);
+    }
+    if (packet.maximum_bytes != null || packet.required_complete_bytes != null) {
+      blockers.push("packet v3 complete result unexpectedly includes budget fallback fields");
+    }
+  } else if (packet.kind === "budget_exceeded") {
+    if (packet.status !== "unavailable") {
+      blockers.push(`packet v3 budget fallback status=${packet.status ?? "missing"}; expected unavailable`);
+    }
+    if (packet.evidence != null || packet.continuation != null) {
+      blockers.push("packet v3 budget fallback contains partial evidence or continuation");
+    }
+    if (packet.maximum_bytes !== PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES) {
+      blockers.push(
+        `packet v3 budget fallback maximum_bytes=${packet.maximum_bytes ?? "missing"}; expected ${PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES}`,
+      );
+    }
+    if (
+      !Number.isInteger(packet.required_complete_bytes) ||
+      packet.required_complete_bytes <= PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES
+    ) {
+      blockers.push("packet v3 budget fallback required_complete_bytes is invalid");
+    }
+    if (
+      !Array.isArray(gaps) ||
+      gaps.length === 0 ||
+      gaps.some((gap) => gap?.kind !== "output_budget_exceeded")
+    ) {
+      blockers.push("packet v3 budget fallback lacks its output_budget_exceeded gap");
+    }
+  } else {
+    blockers.push(`packet v3 kind=${packet.kind ?? "missing"} is invalid`);
+  }
+
+  if (options.requireSupported) {
+    if (
+      packet.kind !== "complete" ||
+      packet.status !== "available" ||
+      packet.retrieval?.state !== "full" ||
+      !Array.isArray(packet.evidence) ||
+      packet.evidence.length === 0
+    ) {
+      blockers.push("packet v3 does not contain available full-retrieval evidence");
+    }
+  }
+  if (options.requireManagedRuntime) {
+    blockers.push(
+      ...managedRuntimeIdentityBlockers(
+        packet?._meta?.codestory_publication?.contract_runtime,
+        "packet",
+      ),
+    );
+  }
+  return blockers;
+}
+
 function packetPreludeContractBlockers(packet, stdout, options = {}) {
   if (!packet || typeof packet !== "object") {
     return ["packet JSON is missing"];
+  }
+  if (isPacketProjectionV3(packet)) {
+    return packetV3ContractBlockers(packet, options);
   }
   const blockers = [];
   const limits = packet.budget?.limits ?? {};
@@ -3807,6 +5816,36 @@ function packetPreludeContractBlockers(packet, stdout, options = {}) {
   return blockers;
 }
 
+function packetCommandFailureEnvelope(value) {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    value.schema_version !== 1 ||
+    !value.error ||
+    typeof value.error !== "object" ||
+    Array.isArray(value.error) ||
+    !nonemptyString(value.error.code) ||
+    !nonemptyString(value.error.message)
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function packetCommandFailureReason(envelope) {
+  if (!envelope) {
+    return null;
+  }
+  const failedLayer = envelope.error?.details?.failed_layer;
+  const context = envelope.context;
+  return [
+    `${envelope.error.code}: ${envelope.error.message}`,
+    nonemptyString(failedLayer) ? `failed_layer=${failedLayer}` : null,
+    context == null ? null : `context=${JSON.stringify(context)}`,
+  ].filter(Boolean).join("; ");
+}
+
 async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, codestoryCli, env) {
   const args = packetCommandArgs(repoConfig, run.task, opts);
   const extraProbes = packetCommandExtraProbes(run.task, opts);
@@ -3825,15 +5864,18 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   await writeFile(stdoutPath, result.stdout, "utf8");
   await writeFile(stderrPath, result.stderr, "utf8");
 
-  let packet = null;
+  let parsedOutput = null;
   let parseError = null;
-  if (result.status === "pass") {
+  if (result.stdout.trim()) {
     try {
-      packet = JSON.parse(result.stdout);
+      parsedOutput = JSON.parse(result.stdout);
     } catch (error) {
       parseError = error.message;
     }
   }
+  let commandFailure = packetCommandFailureEnvelope(parsedOutput);
+  let commandFailureReason = packetCommandFailureReason(commandFailure);
+  let packet = commandFailure ? null : parsedOutput;
 
   let activeStdoutPath = stdoutPath;
   let activeStderrPath = stderrPath;
@@ -3841,7 +5883,10 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   if (
     result.status === "pass" &&
     !parseError &&
-    packet?.disposition?.kind === "drill_once"
+    (
+      packet?.disposition?.kind === "drill_once" ||
+      (isPacketProjectionV3(packet) && packet?.status === "continuation_available")
+    )
   ) {
     const drillArgs = drillPacketCommandArgs(repoConfig, run.task, opts, packet);
     if (drillArgs) {
@@ -3868,6 +5913,8 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
             activeStderrPath = drillStderrPath;
             drillContinuation = true;
             parseError = null;
+            commandFailure = null;
+            commandFailureReason = null;
           }
         } catch (error) {
           parseError = error.message;
@@ -3880,27 +5927,48 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   const manifestQuality = packetManifestQualitySummary(packet, run.task);
   const contractBlockers = parseError
     ? [`packet JSON parse failed: ${parseError}`]
-    : packetPreludeContractBlockers(packet, result.stdout, {
-        requireSupported: opts.publishable,
-        requireManagedRuntime: opts.publishable,
-      });
+    : commandFailureReason
+      ? [commandFailureReason]
+      : packetPreludeContractBlockers(packet, result.stdout, {
+          requireSupported: opts.publishable,
+          requireManagedRuntime: opts.publishable,
+          expectedQuestion: run.task?.prompt ?? repoConfig.prompt,
+        });
   const dispositionTelemetry = packetDispositionTelemetry(packet, manifestQuality);
+  const evidenceAvailabilityTelemetry = packetV3EvidenceAvailabilityTelemetry(
+    packet,
+    manifestQuality,
+  );
+  const evidenceGapAccounting = packetV3EvidenceGapAccounting(packet);
+  const sufficiencyTelemetry = packetSufficiencyTelemetry(packet, manifestQuality);
   const publicPrelude = preludePublicFields({
     command,
     args: activeArgs,
-    status: result.status === "pass" && !parseError && !contractBlockers.length ? "pass" : "fail",
+    status: result.status === "pass" && !parseError && !commandFailure && !contractBlockers.length
+      ? "pass"
+      : "fail",
     process_status: result.status,
     exit_code: result.exitCode,
     signal: result.signal,
-    error: result.error ?? parseError ?? contractBlockers[0] ?? null,
+    error: result.error ?? parseError ?? commandFailureReason ?? contractBlockers[0] ?? null,
     wall_ms: wallMs,
     stdout_path: activeStdoutPath,
     stderr_path: activeStderrPath,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
     stderr_bytes: Buffer.byteLength(result.stderr, "utf8"),
     packet_parse_error: parseError,
-    packet_disposition_kind: dispositionTelemetry?.kind ?? null,
-    packet_disposition: dispositionTelemetry,
+    packet_schema_version: packet?.schema_version ?? null,
+    packet_projection_kind: isPacketProjectionV3(packet) ? packet?.kind ?? null : null,
+    packet_evidence_availability: evidenceAvailabilityTelemetry,
+    packet_evidence_gap_accounting: evidenceGapAccounting,
+    packet_evidence_count: evidenceGapAccounting?.evidence_count ?? null,
+    packet_gap_count: evidenceGapAccounting?.gap_count ?? null,
+    packet_disposition_kind: isPacketProjectionV3(packet)
+      ? null
+      : dispositionTelemetry?.kind ?? null,
+    packet_disposition: isPacketProjectionV3(packet) ? null : dispositionTelemetry,
+    packet_sufficiency_status: sufficiencyTelemetry?.status ?? null,
+    packet_sufficiency: sufficiencyTelemetry,
     packet_support_count: dispositionTelemetry?.support_count ?? null,
     packet_support_kind_counts: dispositionTelemetry?.support_kind_counts ?? null,
     packet_citation_count: Array.isArray(packet?.answer?.citations)
@@ -3915,6 +5983,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     packet_extra_probe_strategy: packetExtraProbeStrategy(extraProbes),
     packet_drill_continuation: drillContinuation,
     packet_contract_blockers: contractBlockers,
+    packet_command_failure: commandFailure,
   });
   return {
     public: publicPrelude,
@@ -3960,22 +6029,32 @@ async function runOne(opts, run, outDir) {
     run.arm,
     String(run.repeat).padStart(2, "0"),
   ]);
-  const resolvedCodeStoryCli = run.arm === "with_codestory" ? resolveCodeStoryCli(opts) : null;
+  const resolvedCodeStoryCli = isCodeStoryArm(run.arm)
+    ? resolveCodeStoryCliForArm(opts, run.arm)
+    : null;
   const codestoryPreludeCli = resolvedCodeStoryCli
     ? path.isAbsolute(resolvedCodeStoryCli) || /[\\/]/.test(resolvedCodeStoryCli)
       ? path.resolve(resolvedCodeStoryCli)
       : resolvedCodeStoryCli
     : null;
   const codestoryPreludeCliSha256 = codestoryPreludeCli && existsSync(codestoryPreludeCli)
-    ? sha256Bytes(await readFile(codestoryPreludeCli))
+    ? (await sha256FileBounded(
+      codestoryPreludeCli,
+      MAX_EXACT_ARCHIVE_BYTES,
+      "CodeStory prelude CLI",
+    )).sha256
     : null;
-  const env = agentRunnerEnv(process.env, opts.agentCodexHomes?.[run.arm] ?? null);
+  const env = agentRunnerEnv(
+    selectedBenchmarkChildEnv(opts, run.arm),
+    opts.agentCodexHomes?.[run.arm] ?? null,
+    !opts.exactCandidate || isCodeStoryArm(run.arm),
+  );
   const baselinePrelude =
     run.arm === "without_codestory"
       ? await runBaselinePrelude(opts, run, repoConfig, outDir, runId)
       : null;
   const codestoryPrelude =
-    run.arm === "with_codestory"
+    isCodeStoryArm(run.arm)
       ? await runCodeStoryPacketPrelude(
           opts,
           run,
@@ -4039,8 +6118,8 @@ async function runOne(opts, run, outDir) {
   const usage = extractUsage(parsed);
   const codexToolCalls = parsed.filter(isToolCallStartEvent).length;
   const toolCalls = analysisEvents.filter(isToolCallStartEvent).length;
-  const analysis = analyzeTranscript(analysisEvents, repoConfig.path);
-  const codestoryBinaryIdentity = run.arm === "with_codestory"
+  const analysis = analyzeTranscript(analysisEvents, repoConfig.path, { task: run.task, arm: run.arm });
+  const codestoryBinaryIdentity = isCodeStoryArm(run.arm)
     ? codeStoryBinaryIdentity(codestoryPreludeCliSha256, analysis)
     : null;
   const binaryIdentityFailed = codestoryBinaryIdentity != null && ![
@@ -4048,11 +6127,11 @@ async function runOne(opts, run, outDir) {
     "exact_match",
   ].includes(codestoryBinaryIdentity.status);
   const provenance = await repoProvenance(repoConfig, opts.signal);
-  const packetFirstRequired = run.arm === "with_codestory";
+  const packetFirstRequired = isCodeStoryArm(run.arm);
   const packetFirstPass =
     !packetFirstRequired || Boolean(analysis.packet_was_first_context_command);
   const quality = scoreQuality(analysisEvents, run.task);
-  const cacheProvenance = run.arm === "with_codestory"
+  const cacheProvenance = isCodeStoryArm(run.arm)
     ? await codestoryCacheProvenance(
         opts,
         repoConfig,
@@ -4061,7 +6140,9 @@ async function runOne(opts, run, outDir) {
           run.repo,
           codestoryPrelude?.packet ?? null,
           analysis,
+          run.arm,
         ),
+        run.arm,
       )
     : null;
   const benchmarkContract = benchmarkContractForRun(opts, run, env);
@@ -4086,9 +6167,15 @@ async function runOne(opts, run, outDir) {
     args,
     stdin: stdin == null ? null : "<prompt>",
     codestory_cli_env: null,
-    codestory_prelude_cli: run.arm === "with_codestory" ? codestoryPreludeCli : null,
-    codestory_prelude_cli_sha256: run.arm === "with_codestory"
+    codestory_prelude_cli: isCodeStoryArm(run.arm) ? codestoryPreludeCli : null,
+    codestory_prelude_cli_sha256: isCodeStoryArm(run.arm)
       ? codestoryPreludeCliSha256
+      : null,
+    package_identity: opts.exactCandidate
+      ? exactCandidatePackageIdentity(opts.exactCandidatePackageByArm?.get(run.arm), run.arm)
+      : null,
+    source_cli_identity: opts.exactCandidate
+      ? exactCandidateSourceCliIdentity(opts.exactCandidatePackageByArm?.get(run.arm), run.arm)
       : null,
     codestory_binary_identity: codestoryBinaryIdentity,
     repo_path: repoConfig.path,
@@ -4107,6 +6194,14 @@ async function runOne(opts, run, outDir) {
       ? `CodeStory binary identity ${codestoryBinaryIdentity.status}`
       : result.error,
     wall_ms: wallMs,
+    exact_candidate_timing: opts.exactCandidate
+      ? {
+          cold_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.preparation_wall_ms ?? 0,
+          warm_ms: wallMs,
+          incremental_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.incremental_wall_ms ?? 0,
+          all_in_ms: wallMs,
+        }
+      : null,
     agent_runner_wall_ms: runnerWallMs,
     baseline_harness_prelude: baselinePrelude?.public ?? null,
     codestory_harness_prelude: codestoryPrelude?.public ?? null,
@@ -4152,6 +6247,52 @@ async function gitOutput(
     return null;
   }
   return result.stdout.trim();
+}
+
+async function installedCodestoryProjectManifestProvenance(
+  config,
+  checkoutPath,
+  signal = null,
+  processOptions = {},
+) {
+  const manifest = config.manifest_codestory_project_manifest ?? null;
+  if (!manifest) {
+    return config.installed_codestory_project_manifest ?? null;
+  }
+  const workspacePath = path.resolve(config.path);
+  assertPathInside(checkoutPath, workspacePath, "CodeStory project manifest workspace path");
+  const destination = assertPathInside(
+    workspacePath,
+    path.join(workspacePath, "codestory_project.json"),
+    "CodeStory project manifest destination",
+  );
+  const relativeDestination = path.relative(checkoutPath, destination).replaceAll(path.sep, "/");
+  if (!relativeDestination || relativeDestination.startsWith("../") || path.isAbsolute(relativeDestination)) {
+    return null;
+  }
+  let installedBytes;
+  try {
+    installedBytes = await readFile(destination);
+  } catch {
+    return null;
+  }
+  const ignored = await runProcess(
+    "git",
+    ["-C", checkoutPath, "check-ignore", "-q", "--", relativeDestination],
+    {
+      ...processOptions,
+      cwd: repoRoot,
+      timeoutMs: 10_000,
+      signal,
+    },
+  );
+  return {
+    source_path: path.relative(repoRoot, manifest.source_path).replaceAll(path.sep, "/"),
+    declared_sha256: manifest.sha256,
+    installed_path: relativeDestination,
+    installed_sha256: sha256Bytes(installedBytes),
+    ignored: ignored.exitCode === 0,
+  };
 }
 
 async function repoProvenance(config, signal = null, processOptions = {}) {
@@ -4203,7 +6344,12 @@ async function repoProvenance(config, signal = null, processOptions = {}) {
     ),
     git_dirty: statusShort == null ? null : statusShort.length > 0,
     git_status_short: statusShort,
-    installed_codestory_project_manifest: config.installed_codestory_project_manifest ?? null,
+    installed_codestory_project_manifest: await installedCodestoryProjectManifestProvenance(
+      config,
+      checkoutPath,
+      signal,
+      processOptions,
+    ),
   };
 }
 
@@ -4794,6 +6940,74 @@ function cachePreparationAction(snapshot) {
   return cacheNeedsPreparation(snapshot) ? "retrieval-index-auto" : "already-ready";
 }
 
+function retrievalIndexWorkEvidence(stdout) {
+  let payload;
+  try {
+    payload = JSON.parse(String(stdout ?? ""));
+  } catch {
+    return null;
+  }
+  const evidence = {
+    core_phase_timings: payload?.core_phase_timings ?? null,
+    retrieval_phase_timings: payload?.retrieval_phase_timings ?? null,
+    retrieval_component_work: payload?.retrieval_component_work ?? null,
+  };
+  return Object.values(evidence).some((value) => value != null) ? evidence : null;
+}
+
+function retrievalWorkEvidenceShapeBlockers(evidence, label) {
+  if (!evidence || typeof evidence !== "object") {
+    return [`missing ${label} retrieval work evidence`];
+  }
+  const blockers = [];
+  const coreTimings = evidence.core_phase_timings;
+  if (!coreTimings || typeof coreTimings !== "object" || Array.isArray(coreTimings) || Object.keys(coreTimings).length === 0) {
+    blockers.push(`${label} core phase timings are missing`);
+  }
+  const phaseTimings = evidence.retrieval_phase_timings;
+  if (
+    !Array.isArray(phaseTimings) || phaseTimings.length === 0 ||
+    phaseTimings.some((phase) =>
+      typeof phase?.phase !== "string" || !phase.phase ||
+      typeof phase?.elapsed_ms !== "number" || !Number.isFinite(phase.elapsed_ms) || phase.elapsed_ms < 0
+    )
+  ) {
+    blockers.push(`${label} retrieval phase timings are missing or invalid`);
+  }
+  const componentWork = evidence.retrieval_component_work;
+  const expectedComponents = ["graph", "lexical", "vectors"];
+  const observedComponents = Array.isArray(componentWork)
+    ? componentWork.map((entry) => entry?.component).sort()
+    : [];
+  if (
+    observedComponents.length !== expectedComponents.length ||
+    observedComponents.some((component, index) => component !== expectedComponents[index])
+  ) {
+    blockers.push(`${label} retrieval component roster must contain graph, lexical, and vectors exactly once`);
+  } else if (componentWork.some((entry) =>
+    !["complete", "copy_on_write", "reused"].includes(entry.mode) ||
+    ![entry.retained, entry.inserted, entry.removed].every((value) =>
+      typeof value === "number" && Number.isInteger(value) && value >= 0
+    )
+  )) {
+    blockers.push(`${label} retrieval component work is missing or invalid`);
+  }
+  return blockers;
+}
+
+function candidateIncrementalRetrievalWorkBlockers(evidence) {
+  const label = "candidate incremental";
+  const blockers = retrievalWorkEvidenceShapeBlockers(evidence, label);
+  if (blockers.length === 0) {
+    for (const entry of evidence.retrieval_component_work) {
+      if (entry.mode === "complete") {
+        blockers.push(`${label} retrieval rebuilt ${entry.component} completely`);
+      }
+    }
+  }
+  return blockers;
+}
+
 function compactCachePreparation(preparation) {
   if (!preparation) {
     return null;
@@ -4809,6 +7023,15 @@ function compactCachePreparation(preparation) {
     retrieval_index_status: preparation.retrieval_index_status ?? null,
     retrieval_index_exit_code: preparation.retrieval_index_exit_code ?? null,
     retrieval_index_wall_ms: preparation.retrieval_index_wall_ms ?? null,
+    incremental_status: preparation.incremental_status ?? null,
+    incremental_exit_code: preparation.incremental_exit_code ?? null,
+    incremental_wall_ms: preparation.incremental_wall_ms ?? null,
+    incremental_source_mutation: preparation.incremental_source_mutation ?? null,
+    cold_retrieval_work_evidence: preparation.cold_retrieval_work_evidence ?? null,
+    incremental_retrieval_work_evidence: preparation.incremental_retrieval_work_evidence ?? null,
+    coherence_refresh_status: preparation.coherence_refresh_status ?? null,
+    coherence_refresh_exit_code: preparation.coherence_refresh_exit_code ?? null,
+    coherence_semantic_generation: preparation.coherence_semantic_generation ?? null,
     retrieval_mode: preparation.retrieval_status?.retrieval_mode ?? null,
     retrieval_degraded_reason: preparation.retrieval_status?.degraded_reason ?? null,
     semantic_generation: preparation.retrieval_status?.semantic_generation ?? null,
@@ -4953,8 +7176,9 @@ function cachePreparationCanaryBlockers(preparation, env = process.env) {
   if (!/^[0-9a-f]{64}$/i.test(String(server?.executable_sha256 ?? ""))) {
     blockers.push("embedding server executable digest is missing or malformed");
   }
-  if (server?.executable_version !== REQUIRED_MANAGED_CODESTORY_VERSION) {
-    blockers.push(`embedding server version=${server?.executable_version ?? "missing"}; expected ${REQUIRED_MANAGED_CODESTORY_VERSION}`);
+  const expectedServerVersion = exactCandidateResultIdentity(preparation)?.package_version ?? null;
+  if (expectedServerVersion && server?.executable_version !== expectedServerVersion) {
+    blockers.push(`embedding server version=${server?.executable_version ?? "missing"}; expected ${expectedServerVersion}`);
   }
   if (!server?.server_instance_id || server.server_instance_id !== retrieval.embedding_engine_instance_id) {
     blockers.push("embedding server and engine instance identities disagree");
@@ -4984,7 +7208,7 @@ function benchmarkHostClass(cachePreparations) {
       const blockers = cachePreparationIdentityBlockers(reference, preparation);
       if (blockers.length) {
         throw new Error(
-          `Benchmark preparations do not share one retrieval engine identity: ${blockers.join("; ")}`,
+          `Benchmark preparations do not share one retrieval host class: ${blockers.join("; ")}`,
         );
       }
     }
@@ -5013,7 +7237,6 @@ const BENCHMARK_PREPARATION_IDENTITY_FIELDS = [
   "embedding_backend",
   "embedding_adapter",
   "embedding_policy",
-  "embedding_engine_instance_id",
 ];
 
 function cachePreparationIdentity(preparation) {
@@ -5024,6 +7247,20 @@ function cachePreparationIdentity(preparation) {
 }
 
 function cachePreparationIdentityBlockers(referencePreparation, preparation) {
+  const referenceArms = referencePreparation?.arm_preparations;
+  const observedArms = preparation?.arm_preparations;
+  if (referenceArms || observedArms) {
+    return ["published_0_17_4", "candidate_0_18"].flatMap((arm) => {
+      const expected = referenceArms?.[arm];
+      const observed = observedArms?.[arm];
+      if (!expected || !observed) {
+        return [`${arm} retrieval preparation identity is missing`];
+      }
+      return cachePreparationIdentityBlockers(expected, observed).map(
+        (blocker) => `${arm}: ${blocker}`,
+      );
+    });
+  }
   const expected = cachePreparationIdentity(referencePreparation);
   const observed = cachePreparationIdentity(preparation);
   return BENCHMARK_PREPARATION_IDENTITY_FIELDS.flatMap((field) =>
@@ -5036,7 +7273,261 @@ function cachePreparationIdentityBlockers(referencePreparation, preparation) {
   );
 }
 
+async function withExactSourceMutation(sourcePath, whileMutated, afterRestore) {
+  const original = await readBoundedFile(sourcePath, 16 * 1024 * 1024, "incremental source file");
+  const mutation = Buffer.concat([original.bytes, Buffer.from("\n", "utf8")]);
+  const mutatedSha256 = sha256Bytes(mutation);
+  if (mutatedSha256 === original.sha256) throw new Error("incremental source mutation did not change bytes");
+  let result;
+  try {
+    await writeFile(sourcePath, mutation);
+    const observedMutation = await sha256FileBounded(sourcePath, mutation.length, "mutated source file");
+    if (observedMutation.sha256 !== mutatedSha256) throw new Error("incremental source mutation was not observed");
+    result = await whileMutated({ original_sha256: original.sha256, mutated_sha256: mutatedSha256 });
+  } finally {
+    await writeFile(sourcePath, original.bytes);
+    const restored = await sha256FileBounded(sourcePath, original.bytes.length, "restored source file");
+    if (restored.sha256 !== original.sha256) throw new Error("incremental source restoration did not restore exact bytes");
+    await afterRestore({ original_sha256: original.sha256, restored_sha256: restored.sha256 });
+  }
+  return {
+    result,
+    original_sha256: original.sha256,
+    mutated_sha256: mutatedSha256,
+    restored_sha256: original.sha256,
+  };
+}
+
+async function measureExactIncrementalRefresh(opts, task, arm, row, childEnv) {
+  const projectRoot = realpathSync(ALL_REPOS[task.repo].path);
+  const candidates = (task.expected_files ?? []).map((file) => path.resolve(projectRoot, file));
+  const sourcePath = candidates.find((candidate) =>
+    existsSync(candidate) &&
+    statSync(candidate).isFile() &&
+    path.resolve(candidate) === realpathSync(candidate) &&
+    isPathInside(projectRoot, realpathSync(candidate))
+  );
+  if (!sourcePath) throw new Error(`no pinned task source file is available for incremental timing: ${task.id}`);
+  let incrementalWallMs = null;
+  const mutation = await withExactSourceMutation(sourcePath, async () => {
+    const incrementalStarted = performance.now();
+    const incrementalArgs = retrievalIndexCommandArgs(row.project);
+    incrementalArgs[incrementalArgs.indexOf("auto")] = "incremental";
+    const incremental = await runProcess(resolveCodeStoryCliForArm(opts, arm), incrementalArgs, {
+      env: childEnv,
+      signal: opts.signal,
+      timeoutMs: opts.prepareCodestoryTimeoutMs,
+      timeoutMessage: `incremental timing run timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
+    });
+    incrementalWallMs = Math.round((performance.now() - incrementalStarted) * 1000) / 1000;
+    return incremental;
+  }, async () => {
+    const restoreArgs = retrievalIndexCommandArgs(row.project);
+    restoreArgs[restoreArgs.indexOf("auto")] = "incremental";
+    const restoreIndex = await runProcess(resolveCodeStoryCliForArm(opts, arm), restoreArgs, {
+      env: childEnv,
+      signal: opts.signal,
+      timeoutMs: opts.prepareCodestoryTimeoutMs,
+      timeoutMessage: `incremental restoration timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
+    });
+    if (restoreIndex.status !== "pass") throw new Error(`incremental cache restoration failed for ${row.repo}/${arm}`);
+    const restoredDoctor = await codestoryDoctorSnapshot(
+      resolveCodeStoryCliForArm(opts, arm),
+      row.project,
+      60_000,
+      childEnv,
+      opts.signal,
+    );
+    if (restoredDoctor.freshness_status !== "fresh") {
+      throw new Error(`incremental cache restoration stayed ${restoredDoctor.freshness_status ?? "unknown"}`);
+    }
+    const refreshed = await exactCandidateRetrievalSnapshot(opts, task, arm);
+    row.retrieval_status = refreshed.retrieval_status;
+    row.retrieval_engine_diagnostics = refreshed.retrieval_engine_diagnostics;
+    row.after = refreshed.doctor;
+  });
+  const incremental = mutation.result;
+  row.incremental_wall_ms = incrementalWallMs;
+  row.incremental_status = incremental?.status ?? "error";
+  row.incremental_exit_code = incremental?.exitCode ?? null;
+  row.incremental_retrieval_work_evidence = retrievalIndexWorkEvidence(incremental?.stdout);
+  row.incremental_source_mutation = {
+    path: normalizePathLike(path.relative(projectRoot, sourcePath)),
+    original_sha256: mutation.original_sha256,
+    mutated_sha256: mutation.mutated_sha256,
+    restored_sha256: mutation.restored_sha256,
+    mutation: "append_one_lf_v1",
+  };
+  if (incremental?.status !== "pass") {
+    throw new Error(`incremental timing failed for ${row.repo}/${arm}: ${trimTail(incremental?.stderr || incremental?.stdout)}`);
+  }
+  if (arm === "candidate_0_18") {
+    const blockers = candidateIncrementalRetrievalWorkBlockers(
+      row.incremental_retrieval_work_evidence,
+    );
+    if (blockers.length) {
+      throw new Error(
+        `candidate incremental retrieval work is not admissible for ${row.repo}: ${blockers.join("; ")}`,
+      );
+    }
+  }
+}
+
+async function exactCandidateRetrievalSnapshot(opts, task, arm, dependencies = {}) {
+  const statusSnapshot = dependencies.statusSnapshot ?? codestoryRetrievalStatusSnapshot;
+  const engineSnapshot = dependencies.engineSnapshot
+    ?? codestoryRetrievalEngineDiagnosticsSnapshot;
+  const doctorSnapshot = dependencies.doctorSnapshot ?? codestoryDoctorSnapshot;
+  const codestoryCli = resolveCodeStoryCliForArm(opts, arm);
+  const project = task.project ?? ALL_REPOS[task.repo]?.path;
+  if (!project) {
+    throw new Error(`exact candidate repository ${task.repo} has no project path`);
+  }
+  const childEnv = selectedBenchmarkChildEnv(opts, arm);
+  const timeoutMs = opts.prepareCodestoryTimeoutMs;
+  const publicRetrievalStatus = await statusSnapshot(
+    codestoryCli,
+    project,
+    timeoutMs,
+    childEnv,
+    opts.signal,
+  );
+  const retrievalEngineDiagnostics = await engineSnapshot(
+    codestoryCli,
+    project,
+    timeoutMs,
+    childEnv,
+    opts.signal,
+  );
+  const retrievalStatus = mergeRetrievalStatusWithEngineDiagnostics(
+    publicRetrievalStatus,
+    retrievalEngineDiagnostics,
+  );
+  const doctor = await doctorSnapshot(
+    codestoryCli,
+    project,
+    timeoutMs,
+    childEnv,
+    opts.signal,
+  );
+  if (
+    publicRetrievalStatus.status !== "pass" ||
+    retrievalEngineDiagnostics.status !== "pass" ||
+    retrievalStatus.retrieval_mode !== "full" ||
+    doctor.freshness_status !== "fresh"
+  ) {
+    throw new Error(
+      `exact candidate retrieval snapshot is not coherent for ${task.repo}/${arm}`,
+    );
+  }
+  return { retrieval_status: retrievalStatus, retrieval_engine_diagnostics: retrievalEngineDiagnostics, doctor };
+}
+
+async function refreshExactCandidatePreparation(
+  opts,
+  task,
+  arm,
+  row,
+  dependencies = {},
+) {
+  const run = dependencies.run ?? runProcess;
+  const codestoryCli = resolveCodeStoryCliForArm(opts, arm);
+  const childEnv = selectedBenchmarkChildEnv(opts, arm);
+  const refresh = await run(codestoryCli, retrievalIndexCommandArgs(row.project), {
+    env: childEnv,
+    signal: opts.signal,
+    timeoutMs: opts.prepareCodestoryTimeoutMs,
+    timeoutMessage: `final exact-candidate coherence refresh timed out after ${opts.prepareCodestoryTimeoutMs}ms.`,
+  });
+  if (refresh.status !== "pass") {
+    throw new Error(
+      `final exact-candidate coherence refresh failed for ${task.repo}/${arm}: ${trimTail(refresh.stderr || refresh.stdout)}`,
+    );
+  }
+  const snapshot = await exactCandidateRetrievalSnapshot(
+    opts,
+    task,
+    arm,
+    dependencies,
+  );
+  row.retrieval_status = snapshot.retrieval_status;
+  row.retrieval_engine_diagnostics = snapshot.retrieval_engine_diagnostics;
+  row.after = snapshot.doctor;
+  row.coherence_refresh_status = "pass";
+  row.coherence_refresh_exit_code = refresh.exitCode ?? 0;
+  row.coherence_semantic_generation = snapshot.retrieval_status.semantic_generation ?? null;
+  return row;
+}
+
+function exactCandidatePreparationArmOrder(index) {
+  const arms = ["published_0_17_4", "candidate_0_18"];
+  return index % 2 === 0 ? arms : [...arms].reverse();
+}
+
 async function prepareCodeStoryCaches(opts, tasks) {
+  if (opts.exactCandidate) {
+    if (tasks.length !== 1) throw new Error("exact-candidate preparation owns one pinned repository at a time");
+    const task = tasks[0];
+    const sequence = opts.exactCandidateLifecycle.preparation_order?.length ?? 0;
+    const armOrder = exactCandidatePreparationArmOrder(sequence);
+    opts.exactCandidateLifecycle.preparation_order ??= [];
+    opts.exactCandidateLifecycle.preparation_order.push({ repo: task.repo, arms: armOrder });
+    const preparedByArm = new Map();
+    for (const arm of armOrder) {
+      for (const value of Object.values(
+        exactCandidateArmEnvironmentGroups(opts, arm).directories,
+      )) {
+        await mkdir(value, { recursive: true, mode: 0o700 });
+      }
+      const childEnv = selectedBenchmarkChildEnv(opts, arm);
+      const rows = await prepareCodeStoryCaches(
+        {
+          ...opts,
+          exactCandidate: false,
+          arms: ["with_codestory"],
+          codestoryCli: resolveCodeStoryCliForArm(opts, arm),
+          packetRuntimeChildEnv: childEnv,
+        },
+        [task],
+      );
+      for (const row of rows) {
+        row.arm = arm;
+        row.package_identity = exactCandidatePackageIdentity(
+          opts.exactCandidatePackageByArm.get(arm),
+          arm,
+        );
+        row.source_cli_identity = exactCandidateSourceCliIdentity(
+          opts.exactCandidatePackageByArm.get(arm),
+          arm,
+        );
+        await measureExactIncrementalRefresh(opts, task, arm, row, childEnv);
+        opts.exactCandidateLifecycle.model_initialization_ms ??= {};
+        if (!Object.hasOwn(opts.exactCandidateLifecycle.model_initialization_ms, arm)) {
+          const initializationMs = row.retrieval_status?.embedding_initialization_ms;
+          if (typeof initializationMs !== "number" || !Number.isFinite(initializationMs) || initializationMs < 0) {
+            throw new Error(`missing one-time model initialization timing for ${arm}`);
+          }
+          opts.exactCandidateLifecycle.model_initialization_ms[arm] = initializationMs;
+        }
+      }
+      preparedByArm.set(arm, rows);
+    }
+    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      for (const row of preparedByArm.get(arm)) {
+        await refreshExactCandidatePreparation(opts, task, arm, row);
+      }
+    }
+    const publishedByRepo = new Map(preparedByArm.get("published_0_17_4").map((row) => [row.repo, row]));
+    const candidateByRepo = new Map(preparedByArm.get("candidate_0_18").map((row) => [row.repo, row]));
+    return [task.repo].map((repo) => ({
+      ...candidateByRepo.get(repo),
+      arm: "candidate_0_18",
+      arm_preparations: {
+        published_0_17_4: publishedByRepo.get(repo),
+        candidate_0_18: candidateByRepo.get(repo),
+      },
+    }));
+  }
   if (!opts.arms.includes("with_codestory")) {
     return [];
   }
@@ -5074,6 +7565,7 @@ async function prepareCodeStoryCaches(opts, tasks) {
       index_stderr_tail: null,
       retrieval_status: null,
       retrieval_engine_diagnostics: null,
+      cold_retrieval_work_evidence: null,
       retrieval_index_stdout_tail: null,
       retrieval_index_stderr_tail: null,
       after: null,
@@ -5108,6 +7600,9 @@ async function prepareCodeStoryCaches(opts, tasks) {
           Math.round((performance.now() - retrievalStarted) * 1000) / 1000;
         preparation.retrieval_index_stdout_tail = trimTail(retrievalIndex.stdout);
         preparation.retrieval_index_stderr_tail = trimTail(retrievalIndex.stderr);
+        preparation.cold_retrieval_work_evidence = retrievalIndexWorkEvidence(
+          retrievalIndex.stdout,
+        );
         if (retrievalIndex.status !== "pass") {
           throw new Error(
             `mandatory retrieval index failed for ${repo}: ${trimTail(retrievalIndex.stderr || retrievalIndex.stdout)}`,
@@ -5194,15 +7689,17 @@ function cachePolicyForRun(observations = {}) {
   return observations.cache_prepared ? "prepared-retrieval-cache-read-only" : "unprepared-cache-blocked";
 }
 
-function cachePreparationForRepo(opts, repoName) {
+function cachePreparationForRepo(opts, repoName, arm = null) {
+  if (opts.exactCandidate && arm === "without_codestory") return null;
   const preparation = opts.cachePreparationByRepo;
+  let row = null;
   if (preparation instanceof Map) {
-    return preparation.get(repoName) ?? null;
+    row = preparation.get(repoName) ?? null;
   }
-  if (Array.isArray(preparation)) {
-    return preparation.find((row) => row?.repo === repoName) ?? null;
+  if (!row && Array.isArray(preparation)) {
+    row = preparation.find((entry) => entry?.repo === repoName) ?? null;
   }
-  return null;
+  return arm && row?.arm_preparations?.[arm] ? row.arm_preparations[arm] : row;
 }
 
 function packetRuntimeCacheObservations(opts, repoName, transportMode) {
@@ -5216,12 +7713,16 @@ function packetRuntimeCacheObservations(opts, repoName, transportMode) {
   };
 }
 
-function agentPacketPreludeCacheObservations(opts, repoName, packet, analysis) {
+function agentPacketPreludeCacheObservations(opts, repoName, packet, analysis, arm = null) {
   const observations = packetRuntimeCacheObservations(
     opts,
     repoName,
     "agent_harness_prelude",
   );
+  if (arm) {
+    observations.cache_preparation = cachePreparationForRepo(opts, repoName, arm);
+    observations.cache_prepared = Boolean(observations.cache_preparation);
+  }
   observations.codestory_index_commands_observed =
     analysis?.codestory_index_commands_observed ?? 0;
   observations.indexing_in_timed_run =
@@ -5235,6 +7736,41 @@ function agentPacketPreludeCacheObservations(opts, repoName, packet, analysis) {
 }
 
 function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) {
+  const retrievalContract = cachePreparation?.retrieval_contract ?? null;
+  if (isPacketProjectionV3(packet)) {
+    const reference = packet?.diagnostics?.availability === "available"
+      ? packet.diagnostics.reference
+      : null;
+    return {
+      source: "packet.v3_public_projection",
+      schema_version: 3,
+      transport_mode: transportMode,
+      retrieval_contract: retrievalContract?.retrieval_contract ?? null,
+      embedding_engine: retrievalContract?.embedding_engine ?? null,
+      embedding_policy: retrievalContract?.execution_policy ?? null,
+      retrieval_mode: packet?.retrieval?.state ?? null,
+      packet_kind: packet?.kind ?? null,
+      evidence_status: packet?.status ?? null,
+      evidence_count: Array.isArray(packet?.evidence) ? packet.evidence.length : 0,
+      gap_count: Array.isArray(packet?.gaps) ? packet.gaps.length : 0,
+      core_generation: packet?.publication?.core?.generation_id ?? null,
+      core_run_id: packet?.publication?.core?.run_id ?? null,
+      retrieval_core_generation:
+        packet?.publication?.retrieval?.core_generation_id ?? null,
+      retrieval_core_run_id: packet?.publication?.retrieval?.core_run_id ?? null,
+      retrieval_generation:
+        packet?.publication?.retrieval?.retrieval_generation ?? null,
+      retrieval_state_generation: packet?.retrieval?.generation_id ?? null,
+      semantic_generation:
+        packet?.publication?.retrieval?.semantic_generation ?? null,
+      prepared_semantic_generation:
+        cachePreparation?.retrieval_status?.semantic_generation ?? null,
+      diagnostics_availability: packet?.diagnostics?.availability ?? null,
+      diagnostics_artifact_id: reference?.artifact_id ?? null,
+      diagnostics_sha256: reference?.sha256 ?? null,
+      diagnostics_byte_length: reference?.byte_length ?? null,
+    };
+  }
   const trace = packet?.answer?.retrieval_trace ?? null;
   const diagnostics = Array.isArray(trace?.packet_sidecar_diagnostics)
     ? trace.packet_sidecar_diagnostics
@@ -5255,7 +7791,6 @@ function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) 
   const fullDiagnosticCount = diagnostics.filter(
     (diagnostic) => diagnostic?.retrieval_mode === "full",
   ).length;
-  const retrievalContract = cachePreparation?.retrieval_contract ?? null;
   return {
     source: "packet.answer.retrieval_trace",
     transport_mode: transportMode,
@@ -5279,10 +7814,10 @@ function packetEmbeddingExecutionProof(packet, cachePreparation, transportMode) 
   };
 }
 
-async function codestoryCacheProvenance(opts, config, observations = {}) {
+async function codestoryCacheProvenance(opts, config, observations = {}, arm = null) {
   let codestoryCli;
   try {
-    codestoryCli = resolveCodeStoryCli(opts);
+    codestoryCli = arm ? resolveCodeStoryCliForArm(opts, arm) : resolveCodeStoryCli(opts);
   } catch (error) {
     return {
       codestory_cli: null,
@@ -5299,7 +7834,7 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
     codestoryCli,
     config.path,
     Math.min(opts.timeoutMs ?? 600_000, 60_000),
-    selectedBenchmarkChildEnv(opts),
+    selectedBenchmarkChildEnv(opts, arm),
     opts.signal,
   );
   const retrievalStatus = observations.cache_preparation?.retrieval_status ??
@@ -5307,7 +7842,7 @@ async function codestoryCacheProvenance(opts, config, observations = {}) {
       codestoryCli,
       config.path,
       Math.min(opts.timeoutMs ?? 600_000, 60_000),
-      selectedBenchmarkChildEnv(opts),
+      selectedBenchmarkChildEnv(opts, arm),
       opts.signal,
     );
   return {
@@ -5425,9 +7960,9 @@ async function resolveReanalysisStdoutPath(result, runDir) {
   return null;
 }
 
-async function reanalysisPacketManifestQuality(result, runDir, task) {
+async function reanalysisPacketProjection(result, runDir, task) {
   const packetPath = result.codestory_harness_prelude?.stdout_path;
-  if (!packetPath || !task) {
+  if (!packetPath) {
     return null;
   }
   const resolved = path.isAbsolute(packetPath) ? packetPath : path.resolve(runDir, packetPath);
@@ -5435,12 +7970,30 @@ async function reanalysisPacketManifestQuality(result, runDir, task) {
     return null;
   }
   const packet = JSON.parse(await readFile(resolved, "utf8"));
-  return packetManifestQualitySummary(packet, task);
+  const manifestQuality = task ? packetManifestQualitySummary(packet, task) : null;
+  const evidenceGapAccounting = packetV3EvidenceGapAccounting(packet);
+  const sufficiency = packetSufficiencyTelemetry(packet, manifestQuality);
+  return {
+    packet_schema_version:
+      packet?.schema_version ?? result.codestory_harness_prelude?.packet_schema_version ?? null,
+    packet_projection_kind: isPacketProjectionV3(packet) ? packet?.kind ?? null : null,
+    packet_evidence_availability: packetV3EvidenceAvailabilityTelemetry(
+      packet,
+      manifestQuality,
+    ),
+    packet_evidence_gap_accounting: evidenceGapAccounting,
+    packet_evidence_count: evidenceGapAccounting?.evidence_count ?? null,
+    packet_gap_count: evidenceGapAccounting?.gap_count ?? null,
+    packet_sufficiency_status: sufficiency?.status ?? null,
+    packet_sufficiency: sufficiency,
+    packet_manifest_quality: manifestQuality,
+  };
 }
 
-async function createDurableJsonlAppender(filePath) {
+async function createDurableJsonlAppender(filePath, dependencies = {}) {
   await mkdir(path.dirname(filePath), { recursive: true });
-  const handle = await open(filePath, "a");
+  const openFile = dependencies.openFile ?? open;
+  const handle = await openFile(filePath, "a");
   let pending = Promise.resolve();
   return {
     append(row) {
@@ -5451,8 +8004,28 @@ async function createDurableJsonlAppender(filePath) {
       return pending;
     },
     async close() {
-      await pending;
-      await handle.close();
+      let pendingFailure = null;
+      let handleFailure = null;
+      try {
+        await pending;
+      } catch (error) {
+        pendingFailure = error;
+      }
+      try {
+        await handle.close();
+      } catch (error) {
+        handleFailure = error;
+      }
+      if (pendingFailure) {
+        if (handleFailure && pendingFailure instanceof Error) {
+          Object.defineProperty(pendingFailure, "benchmarkSecondaryFailures", {
+            configurable: true,
+            value: [benchmarkResourceFailure("ledger_handle", handleFailure)],
+          });
+        }
+        throw pendingFailure;
+      }
+      if (handleFailure) throw handleFailure;
     },
   };
 }
@@ -5472,13 +8045,17 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     ...parsed,
   ];
   const task = await loadTaskForResult(result, opts, taskCache);
-  const packetManifestQuality = await reanalysisPacketManifestQuality(result, runDir, task);
+  const packetProjection = await reanalysisPacketProjection(result, runDir, task);
   const repoConfig = ALL_REPOS[result.repo] ?? null;
   const usage = extractUsage(parsed);
-  const analysis = analyzeTranscript(analysisEvents, result.repo_path ?? repoConfig?.path ?? runDir);
-  const packetFirstRequired = result.packet_first_required ?? result.arm === "with_codestory";
+  const analysis = analyzeTranscript(
+    analysisEvents,
+    result.repo_path ?? repoConfig?.path ?? runDir,
+    { task, arm: result.arm },
+  );
+  const packetFirstRequired = result.packet_first_required ?? isCodeStoryArm(result.arm);
   const cacheProvenance = result.codestory_cache_provenance ?? (
-    repoConfig && result.arm === "with_codestory"
+    repoConfig && isCodeStoryArm(result.arm)
       ? await codestoryCacheProvenance(opts, repoConfig, {
           codestory_index_commands_observed: analysis.codestory_index_commands_observed,
           indexing_in_timed_run: analysis.codestory_index_commands_observed > 0,
@@ -5494,14 +8071,13 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
     codestory_harness_prelude: result.codestory_harness_prelude
       ? {
           ...result.codestory_harness_prelude,
-          packet_manifest_quality:
-            packetManifestQuality ?? result.codestory_harness_prelude.packet_manifest_quality,
+          ...(packetProjection ?? {}),
         }
       : null,
     repo_provenance: result.repo_provenance ?? (repoConfig ? await repoProvenance(repoConfig) : null),
     codestory_cache_provenance: cacheProvenance,
     usage,
-    estimated_cost_usd: estimateCost(usage),
+    estimated_cost_usd: estimateCost(usage, opts.exactCandidateCostRates),
     tool_calls_observed: analysisEvents.filter(isToolCallStartEvent).length,
     codex_tool_calls_observed: parsed.filter(isToolCallStartEvent).length,
     transcript_analysis: analysis,
@@ -5522,6 +8098,15 @@ async function recomputeRunAnalysis(result, opts, runDir, taskCache) {
   };
 }
 
+function reanalysisExactCandidateAcceptance(originalSummary, rows) {
+  return originalSummary.exact_candidate_acceptance == null
+    ? null
+    : exactCandidateAcceptance(
+        rows,
+        originalSummary.exact_candidate_lifecycle ?? null,
+      );
+}
+
 async function reanalyzeAgentRunDirectory(opts) {
   const runDir = path.resolve(opts.reanalyzeDir);
   const runsPath = path.join(runDir, "runs.jsonl");
@@ -5532,6 +8117,10 @@ async function reanalyzeAgentRunDirectory(opts) {
   const originalSummary = existsSync(originalSummaryPath)
     ? JSON.parse(await readFile(originalSummaryPath, "utf8"))
     : {};
+  const reanalysisOpts = {
+    ...opts,
+    exactCandidateCostRates: originalSummary.cost_rates ?? null,
+  };
   const rows = (await readFile(runsPath, "utf8"))
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -5541,7 +8130,7 @@ async function reanalyzeAgentRunDirectory(opts) {
   const taskCache = new Map();
   const reanalyzed = [];
   for (const row of rows) {
-    reanalyzed.push(await recomputeRunAnalysis(row, opts, runDir, taskCache));
+    reanalyzed.push(await recomputeRunAnalysis(row, reanalysisOpts, runDir, taskCache));
   }
 
   const summary = summarizeRuns(reanalyzed);
@@ -5566,6 +8155,10 @@ async function reanalyzeAgentRunDirectory(opts) {
     packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
+    exact_candidate_acceptance: reanalysisExactCandidateAcceptance(
+      originalSummary,
+      reanalyzed,
+    ),
   };
   await writeFile(
     path.join(runDir, "reanalyzed-runs.jsonl"),
@@ -5618,6 +8211,20 @@ function packetPayloadText(packet) {
     return String(packet ?? "");
   }
   const chunks = [];
+  if (isPacketProjectionV3(packet)) {
+    for (const row of packet.evidence ?? []) {
+      chunks.push([
+        row?.path,
+        row?.symbol_id,
+        row?.start_line == null ? null : `line ${row.start_line}`,
+        row?.summary,
+      ].filter(Boolean).join(" "));
+    }
+    for (const gap of packet.gaps ?? []) {
+      chunks.push([gap?.kind, gap?.message].filter(Boolean).join(" "));
+    }
+    return chunks.filter(Boolean).join("\n");
+  }
   chunks.push(packetAnswerText(packet));
   for (const citation of packet.answer?.citations ?? []) {
     chunks.push(
@@ -5644,6 +8251,16 @@ function packetAnswerText(packet) {
     return String(packet ?? "");
   }
   const chunks = [];
+  if (isPacketProjectionV3(packet)) {
+    for (const row of packet.evidence ?? []) {
+      chunks.push([
+        row?.path,
+        row?.symbol_id,
+        row?.summary,
+      ].filter(Boolean).join(" "));
+    }
+    return chunks.join("\n");
+  }
   if (packet.answer?.summary) {
     chunks.push(packet.answer.summary);
   }
@@ -5672,7 +8289,8 @@ function packetComposition(packet, task) {
       (task.expected_verification_files ?? []).map(String).map((value) => value.trim()).filter(Boolean),
     ),
   ];
-  const citationPaths = (packet.answer?.citations ?? [])
+  const citationPaths = [
+    ...(packet.answer?.citations ?? [])
     .map((citation, index) => ({
       source: "answer.citations",
       path: citation.file_path,
@@ -5680,7 +8298,19 @@ function packetComposition(packet, task) {
       display_name: citation.display_name ?? null,
       line: citation.line ?? null,
     }))
-    .filter((entry) => entry.path);
+    .filter((entry) => entry.path),
+    ...(isPacketProjectionV3(packet)
+      ? (packet.evidence ?? [])
+        .map((row, index) => ({
+          source: "packet.evidence",
+          path: row?.path,
+          rank: index + 1,
+          display_name: row?.symbol_id ?? null,
+          line: row?.start_line ?? null,
+        }))
+        .filter((entry) => entry.path)
+      : []),
+  ];
   const avoidOpeningPaths = packetAvoidOpeningRawPaths(packet)
     .map((pathValue, index) => ({
       source: "sufficiency.avoid_opening_paths",
@@ -5980,6 +8610,22 @@ function packetShape(packet) {
   if (!packet || typeof packet !== "object") {
     return null;
   }
+  if (isPacketProjectionV3(packet)) {
+    return {
+      schema_version: 3,
+      kind: packet.kind ?? null,
+      status: packet.status ?? null,
+      packet_bytes: jsonByteLength(packet),
+      evidence_count: Array.isArray(packet.evidence) ? packet.evidence.length : 0,
+      gap_count: Array.isArray(packet.gaps) ? packet.gaps.length : 0,
+      continuation_present: packet.continuation != null,
+      budget_limit_output_bytes: packet.kind === "budget_exceeded"
+        ? packet.maximum_bytes ?? null
+        : PUBLIC_PACKET_V3_MAX_OUTPUT_BYTES,
+      budget_required_complete_bytes: packet.required_complete_bytes ?? null,
+      budget_truncated: packet.kind === "budget_exceeded",
+    };
+  }
   return {
     packet_bytes: jsonByteLength(packet),
     answer_bytes: jsonByteLength(packet.answer),
@@ -5995,6 +8641,9 @@ function packetShape(packet) {
 
 function packetDispositionTelemetry(packet, quality) {
   if (!packet || typeof packet !== "object") {
+    return null;
+  }
+  if (isPacketProjectionV3(packet)) {
     return null;
   }
   const support = Array.isArray(packet.support) ? packet.support : [];
@@ -6034,6 +8683,9 @@ function packetDispositionTelemetry(packet, quality) {
 
 function packetSufficiencyTelemetry(packet, quality) {
   if (!packet || typeof packet !== "object") {
+    return null;
+  }
+  if (isPacketProjectionV3(packet)) {
     return null;
   }
   const status = packet.sufficiency?.status ?? null;
@@ -6238,6 +8890,18 @@ function topPacketSearchQueries(searchSteps, limit = 8) {
 function packetLatencyTelemetry(packet, wallMs) {
   if (!packet || typeof packet !== "object") {
     return null;
+  }
+  if (isPacketProjectionV3(packet)) {
+    return {
+      schema_version: 3,
+      public_projection_only: true,
+      freshness_ms: null,
+      retrieval_total_ms: null,
+      accounted_trace_ms: null,
+      unaccounted_ms: Number.isFinite(wallMs) ? wallMs : null,
+      non_trace_wall_ms: Number.isFinite(wallMs) ? wallMs : null,
+      retrieval_shadow: null,
+    };
   }
   const retrievalTrace = packet.answer?.retrieval_trace ?? null;
   const retrievalShadow = packetRetrievalShadowTelemetry(packetRetrievalShadow(packet));
@@ -7944,6 +10608,7 @@ function usefulAnchorHitsPer10kContextChars(row) {
 
 function managedCodeStoryRuntimeIdentityBlockers(result) {
   const reasons = [];
+  const expectedVersion = exactCandidateResultIdentity(result)?.package_version ?? null;
   const analysis = result?.transcript_analysis;
   const started = analysis?.codestory_mcp_tool_calls_observed ?? 0;
   const completed = analysis?.codestory_mcp_completed_calls_observed ?? 0;
@@ -7957,23 +10622,97 @@ function managedCodeStoryRuntimeIdentityBlockers(result) {
     reasons.push(
       ...managedRuntimeIdentityBlockers(
         prelude.packet_contract_runtime,
-        "with_codestory packet prelude",
+        "CodeStory packet prelude",
+        expectedVersion,
       ),
     );
     return reasons;
   }
   if (identities.length <= 0) {
-    reasons.push("with_codestory arm has no managed CodeStory runtime identity");
+    reasons.push("CodeStory arm has no managed CodeStory runtime identity");
   }
   if (identities.length < completed) {
     reasons.push(
-      `with_codestory arm proved ${identities.length}/${completed} completed CodeStory MCP runtime identities`,
+      `CodeStory arm proved ${identities.length}/${completed} completed CodeStory MCP runtime identities`,
     );
   }
   for (const identity of identities) {
-    reasons.push(...managedRuntimeIdentityBlockers(identity, "with_codestory arm"));
+    reasons.push(...managedRuntimeIdentityBlockers(identity, "CodeStory arm", expectedVersion));
   }
   return reasons;
+}
+
+function exactPackageRuntimeIdentityBlockers(result) {
+  const reasons = [];
+  const packageIdentity = exactCandidateResultIdentity(result);
+  const expectedContract = result?.arm === "candidate_0_18"
+    ? EXACT_CANDIDATE_SOURCE_CLI_CONTRACT
+    : EXACT_CANDIDATE_PACKAGE_CONTRACT;
+  if (packageIdentity?.contract !== expectedContract) {
+    return ["CodeStory arm has no authenticated exact runtime identity"];
+  }
+  const analysis = result?.transcript_analysis;
+  const started = analysis?.codestory_mcp_tool_calls_observed ?? 0;
+  if (started > 0) {
+    return managedCodeStoryRuntimeIdentityBlockers(result);
+  }
+  const prelude = result?.codestory_harness_prelude;
+  const runtime = prelude?.packet_contract_runtime;
+  if (prelude?.status !== "pass") {
+    reasons.push("CodeStory exact runtime packet prelude did not pass");
+  }
+  if (
+    result?.codestory_prelude_cli_sha256 !== packageIdentity.cli_sha256 ||
+    result?.codestory_binary_identity?.prelude_cli_sha256 !== packageIdentity.cli_sha256 ||
+    !["prelude_only", "exact_match"].includes(result?.codestory_binary_identity?.status)
+  ) {
+    reasons.push("CodeStory CLI is not bound to the authenticated arm identity");
+  }
+  if (
+    runtime?.cli_source !== "direct_cli_launch" ||
+    runtime?.cli_version !== packageIdentity.package_version ||
+    runtime?.known_override_skew_channel !== false
+  ) {
+    reasons.push(
+      `CodeStory exact runtime is not a direct authenticated CLI ${packageIdentity.package_version}: ${JSON.stringify(runtime ?? null)}`,
+    );
+  }
+  return reasons;
+}
+
+function packetV3EvidenceGapAccountingError(accounting, label = "packet v3 evidence/gaps") {
+  if (!accounting || accounting.contract !== "codestory.packet-v3-evidence-gap-accounting/v1") {
+    return `${label} accounting is missing`;
+  }
+  for (const [count, uniqueCount, name] of [
+    [accounting.evidence_count, accounting.unique_evidence_id_count, "evidence"],
+    [accounting.gap_count, accounting.unique_gap_id_count, "gap"],
+    [
+      accounting.continuation_gap_count,
+      accounting.unique_continuation_gap_id_count,
+      "continuation gap",
+    ],
+  ]) {
+    if (!Number.isInteger(count) || count < 0 || uniqueCount !== count) {
+      return `${label} ${name} identities are missing or duplicated`;
+    }
+  }
+  if (accounting.continuation_gap_ids_bound !== true) {
+    return `${label} continuation gap identities are not bound to emitted gaps`;
+  }
+  if (accounting.kind === "complete") {
+    if (!["available", "continuation_available", "no_useful_evidence", "unavailable"].includes(accounting.status)) {
+      return `${label} availability status is invalid`;
+    }
+  } else if (
+    accounting.kind !== "budget_exceeded" ||
+    accounting.status !== "unavailable" ||
+    accounting.evidence_count !== 0 ||
+    accounting.gap_count <= 0
+  ) {
+    return `${label} budget fallback accounting is invalid`;
+  }
+  return null;
 }
 
 function agentPublishableBlockers(results, opts = {}) {
@@ -8006,7 +10745,7 @@ function agentPublishableBlockers(results, opts = {}) {
       ) {
         environmentReasons.push("without_codestory arm used CodeStory");
       }
-      if (opts.publishable && result.arm === "with_codestory") {
+      if (opts.publishable && isCodeStoryArm(result.arm)) {
         environmentReasons.push(
           ...managedCodeStoryRuntimeIdentityBlockers(result),
         );
@@ -8035,7 +10774,7 @@ function agentPublishableBlockers(results, opts = {}) {
       }
       if (
         opts.publishable &&
-        result.arm === "with_codestory" &&
+        isCodeStoryArm(result.arm) &&
         result.packet_first_required &&
         maxSourceReadsAfterPacket == null
       ) {
@@ -8045,7 +10784,7 @@ function agentPublishableBlockers(results, opts = {}) {
         result.codestory_harness_prelude?.packet_extra_probe_strategy ??
         result.packet_extra_probe_strategy ??
         null;
-      if (opts.publishable && result.arm === "with_codestory" && packetExtraProbeStrategy) {
+      if (opts.publishable && isCodeStoryArm(result.arm) && packetExtraProbeStrategy) {
         harnessReasons.push(`diagnostic packet extra probes used: ${packetExtraProbeStrategy}`);
       }
       for (const { label, prelude } of [
@@ -8140,7 +10879,7 @@ function agentPublishableBlockers(results, opts = {}) {
       if (externalContextCalls > 0) {
         environmentReasons.push(`external web/search tool calls=${externalContextCalls} > 0`);
       }
-      if (result.arm === "with_codestory" && (opts.publishable || opts.enforceCacheProvenance)) {
+      if (isCodeStoryArm(result.arm) && (opts.publishable || opts.enforceCacheProvenance)) {
         environmentReasons.push(...cacheProvenanceBlockers(result));
       }
       return [
@@ -8756,6 +11495,18 @@ function runSelfTest() {
 
 function planAgentRuns(opts, tasks) {
   const plannedRuns = [];
+  if (opts.exactCandidate) {
+    for (const [taskIndex, task] of tasks.entries()) {
+      for (let repeat = 1; repeat <= opts.repeats; repeat += 1) {
+        const rotation = (taskIndex * opts.repeats + repeat - 1) % opts.arms.length;
+        for (let position = 0; position < opts.arms.length; position += 1) {
+          const arm = opts.arms[(rotation + position) % opts.arms.length];
+          plannedRuns.push({ repo: task.repo, arm, repeat, task });
+        }
+      }
+    }
+    return plannedRuns;
+  }
   if (tasks.length) {
     for (const task of tasks) {
       for (const arm of opts.arms) {
@@ -8774,6 +11525,515 @@ function planAgentRuns(opts, tasks) {
     }
   }
   return plannedRuns;
+}
+
+function exactCandidateAcceptance(rows, lifecycle = null) {
+  const reasons = [];
+  const expectedRuns = 18 * 3 * EXACT_CANDIDATE_ARMS.length;
+  const expectedKeys = new Set(EXACT_CANDIDATE_TASK_IDS.flatMap((taskId) =>
+    EXACT_CANDIDATE_ARMS.flatMap((arm) => [1, 2, 3].map((repeat) =>
+      [taskId, EXACT_CANDIDATE_TASK_REPOS[taskId], arm, repeat].join("\t")
+    ))
+  ));
+  const completeRows = rows.filter((row) => row?.status === "pass");
+  const uniqueKeys = new Set(rows.map((row) => [row.task_id, row.repo, row.arm, row.repeat].join("\t")));
+  const armCounts = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [
+    arm,
+    rows.filter((row) => row.arm === arm).length,
+  ]));
+  if (
+    rows.length !== expectedRuns ||
+    completeRows.length !== expectedRuns ||
+    uniqueKeys.size !== expectedRuns ||
+    EXACT_CANDIDATE_ARMS.some((arm) => armCounts[arm] !== 54)
+  ) {
+    reasons.push(
+      `162 complete runs required; rows=${rows.length} complete=${completeRows.length} unique=${uniqueKeys.size}`,
+    );
+  }
+  if (uniqueKeys.size !== expectedKeys.size || [...uniqueKeys].some((key) => !expectedKeys.has(key))) {
+    reasons.push("exact task/repository/arm/repeat keys do not match the pinned 162-row contract");
+  }
+
+  const byArm = Object.fromEntries(
+    EXACT_CANDIDATE_ARMS.map((arm) => [arm, rows.filter((row) => row.arm === arm)]),
+  );
+  const qualityPasses = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [
+    arm,
+    byArm[arm].filter((row) => row.quality?.pass === true).length,
+  ]));
+  if (qualityPasses.candidate_0_18 < qualityPasses.published_0_17_4) {
+    reasons.push(
+      `candidate quality ${qualityPasses.candidate_0_18} is below published 0.17.4 ${qualityPasses.published_0_17_4}`,
+    );
+  }
+  if (qualityPasses.candidate_0_18 < qualityPasses.without_codestory) {
+    reasons.push(
+      `candidate quality ${qualityPasses.candidate_0_18} is below without_codestory ${qualityPasses.without_codestory}`,
+    );
+  }
+
+  const comparatorErrors = new Set(
+    [...byArm.without_codestory, ...byArm.published_0_17_4].flatMap((row) =>
+      (row.quality?.material_factual_errors?.found_anchors ?? []).map((anchor) =>
+        `${row.task_id}\t${row.repeat}\t${anchor}`
+      )
+    ),
+  );
+  const candidateOnlyErrors = byArm.candidate_0_18.flatMap((row) =>
+    (row.quality?.material_factual_errors?.found_anchors ?? []).filter((anchor) =>
+      !comparatorErrors.has(`${row.task_id}\t${row.repeat}\t${anchor}`)
+    ).map((anchor) => ({ task_id: row.task_id, repeat: row.repeat, anchor }))
+  );
+  if (candidateOnlyErrors.length) {
+    reasons.push(`candidate-only material factual errors=${candidateOnlyErrors.length}`);
+  }
+  const unsupportedProofClaims = byArm.candidate_0_18.reduce(
+    (sum, row) => sum + Number(row.quality?.unsupported_proof_claims?.found ?? 0),
+    0,
+  );
+  if (unsupportedProofClaims > 0) {
+    reasons.push(`candidate unsupported proof claims=${unsupportedProofClaims}`);
+  }
+
+  const taskIds = [...new Set(rows.map((row) => row.task_id).filter(Boolean))];
+  for (const taskId of taskIds) {
+    const publishedPasses = byArm.published_0_17_4.filter(
+      (row) => row.task_id === taskId && row.quality?.pass === true,
+    ).length;
+    const candidatePasses = byArm.candidate_0_18.filter(
+      (row) => row.task_id === taskId && row.quality?.pass === true,
+    ).length;
+    if (publishedPasses - candidatePasses >= 2) {
+      reasons.push(`${taskId} loses 2 repeats or more versus published 0.17.4`);
+    }
+  }
+
+  const sum = (arm, selector) => byArm[arm].reduce((total, row) => {
+    const value = Number(selector(row));
+    return total + (Number.isFinite(value) ? value : 0);
+  }, 0);
+  const resourceThresholds = [
+    ["tokens", (row) => row.usage?.total_tokens],
+    ["tool calls", (row) => row.tool_calls_observed],
+    ["cost", (row) => row.estimated_cost_usd],
+  ];
+  const resourceTotals = {};
+  for (const [label, selector] of resourceThresholds) {
+    const baseline = sum("without_codestory", selector);
+    const published = sum("published_0_17_4", selector);
+    const candidate = sum("candidate_0_18", selector);
+    resourceTotals[label] = { without_codestory: baseline, published_0_17_4: published, candidate_0_18: candidate };
+    if (candidate > published * 1.05) reasons.push(`${label} exceed 105% of published 0.17.4`);
+    if (candidate > baseline * 0.8) reasons.push(`${label} exceed 80% of without_codestory`);
+  }
+
+  const uniqueRepoTiming = (arm, field) => {
+    const byRepo = new Map();
+    for (const row of byArm[arm]) {
+      const value = row.exact_candidate_timing?.[field];
+      if (byRepo.has(row.repo) && byRepo.get(row.repo) !== value) {
+        reasons.push(`${arm} ${field} timing disagrees across repeats for ${row.repo}`);
+      }
+      byRepo.set(row.repo, value);
+    }
+    return [...byRepo.values()].reduce((total, value) => total + (Number.isFinite(value) ? value : 0), 0);
+  };
+  const lifecycleMs = (arm) => lifecycle?.package_authentication_ms?.[arm] ?? 0;
+  const modelInitializationMs = (arm) => lifecycle?.model_initialization_ms?.[arm] ?? 0;
+  const timingTotals = {};
+  for (const arm of EXACT_CANDIDATE_ARMS) {
+    const warm = sum(arm, (row) => row.exact_candidate_timing?.warm_ms);
+    const measuredCold = arm === "without_codestory" ? 0 : uniqueRepoTiming(arm, "cold_ms");
+    const oneTimeModel = arm === "without_codestory" ? 0 : modelInitializationMs(arm);
+    const cold = Math.max(0, measuredCold - oneTimeModel);
+    const incremental = arm === "without_codestory" ? 0 : uniqueRepoTiming(arm, "incremental_ms");
+    timingTotals[arm] = {
+      package_authentication_ms: arm === "without_codestory" ? 0 : lifecycleMs(arm),
+      model_initialization_ms: oneTimeModel,
+      warm_ms: warm,
+      cold_ms: cold,
+      incremental_ms: incremental,
+      all_in_ms: warm + cold + incremental + oneTimeModel +
+        (arm === "without_codestory" ? 0 : lifecycleMs(arm)),
+    };
+  }
+  for (const [label, field, factor, display] of [
+    ["warm", "warm_ms", 1.05, "105%"],
+    ["cold", "cold_ms", 1.05, "5%"],
+    ["incremental", "incremental_ms", 1.05, "5%"],
+    ["all-in", "all_in_ms", 1.10, "110%"],
+  ]) {
+    const published = timingTotals.published_0_17_4[field];
+    const candidate = timingTotals.candidate_0_18[field];
+    if (candidate > published * factor) reasons.push(`${label} timing exceeds ${display} gate`);
+  }
+
+  for (const row of rows) {
+    const finiteNonnegative = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
+    const finiteNonnegativeInteger = (value) => finiteNonnegative(value) && Number.isInteger(value);
+    if (
+      !row.quality || typeof row.quality.pass !== "boolean" ||
+      !row.usage || !finiteNonnegativeInteger(row.usage.total_tokens)
+    ) {
+      reasons.push(`missing quality or token accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (!row.transcript_analysis?.tool_categories) {
+      reasons.push(`missing tool categories for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (!row.transcript_analysis?.command_categories || !row.transcript_analysis?.interaction_turns) {
+      reasons.push(`missing command or interaction accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (!Array.isArray(row.transcript_analysis?.direct_source_reads)) {
+      reasons.push(`missing direct source-read accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (!finiteNonnegativeInteger(row.tool_calls_observed) || !finiteNonnegative(row.estimated_cost_usd)) {
+      reasons.push(`missing tool call or cost accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    for (const field of ["cold_ms", "warm_ms", "incremental_ms", "all_in_ms"]) {
+      if (!finiteNonnegative(row.exact_candidate_timing?.[field])) {
+        reasons.push(`missing ${field} timing for ${row.task_id}/${row.arm}/${row.repeat}`);
+      }
+    }
+    if (!finiteNonnegative(row.wall_ms) || row.exact_candidate_timing?.warm_ms !== row.wall_ms) {
+      reasons.push(`whole-task warm timing does not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (row.exact_candidate_timing?.all_in_ms !== row.exact_candidate_timing?.warm_ms) {
+      reasons.push(`row all-in timing must equal whole-task warm timing for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (
+      !row.quality?.material_factual_errors ||
+      !row.quality?.unsupported_proof_claims
+    ) {
+      reasons.push(`missing factual-error or proof-claim accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    const usageInput = row.usage?.input_tokens;
+    const usageOutput = row.usage?.output_tokens;
+    if (!finiteNonnegativeInteger(usageInput) || !finiteNonnegativeInteger(usageOutput) || usageInput + usageOutput !== row.usage?.total_tokens) {
+      reasons.push(`token accounting does not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    const toolCategoryValues = Object.values(row.transcript_analysis?.tool_categories ?? {});
+    const commandCategoryValues = Object.values(row.transcript_analysis?.command_categories ?? {});
+    const toolCategoryTotal = toolCategoryValues.reduce((total, value) => total + value, 0);
+    const commandCategoryTotal = commandCategoryValues.reduce((total, value) => total + value, 0);
+    if (
+      toolCategoryValues.some((value) => !finiteNonnegativeInteger(value)) ||
+      commandCategoryValues.some((value) => !finiteNonnegativeInteger(value)) ||
+      !finiteNonnegativeInteger(row.transcript_analysis?.command_count) ||
+      toolCategoryTotal !== row.tool_calls_observed ||
+      commandCategoryTotal !== row.transcript_analysis?.command_count
+    ) {
+      reasons.push(`tool or command categories do not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    const turns = row.transcript_analysis?.interaction_turns;
+    if (
+      !turns ||
+      ![
+        turns.total, turns.model_messages, turns.tool_actions, turns.failed_tool_actions,
+        turns.reasoning_items_excluded, turns.error_items_excluded,
+      ].every(finiteNonnegativeInteger) ||
+      turns.total !== turns.model_messages + turns.tool_actions ||
+      turns.tool_actions !== row.tool_calls_observed ||
+      turns.failed_tool_actions > turns.tool_actions
+    ) {
+      reasons.push(`interaction accounting does not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (
+      !finiteNonnegativeInteger(row.quality?.material_factual_errors?.found) ||
+      !Array.isArray(row.quality?.material_factual_errors?.found_anchors) ||
+      !finiteNonnegativeInteger(row.quality?.unsupported_proof_claims?.found) ||
+      !Array.isArray(row.quality?.unsupported_proof_claims?.found_claims) ||
+      row.quality?.material_factual_errors?.found !== row.quality?.material_factual_errors?.found_anchors?.length ||
+      row.quality?.unsupported_proof_claims?.found !== row.quality?.unsupported_proof_claims?.found_claims?.length
+    ) {
+      reasons.push(`error or proof-claim counts do not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (
+      !finiteNonnegativeInteger(row.transcript_analysis?.direct_source_reads_total) ||
+      row.transcript_analysis?.direct_source_reads_total !== row.transcript_analysis?.direct_source_reads?.length
+    ) {
+      reasons.push(`direct source-read totals do not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (
+      !finiteNonnegativeInteger(row.transcript_analysis?.codestory_mcp_tool_calls_observed) ||
+      !finiteNonnegativeInteger(row.transcript_analysis?.codestory_mcp_completed_calls_observed) ||
+      !Array.isArray(row.transcript_analysis?.codestory_mcp_runtime_identities)
+    ) {
+      reasons.push(`CodeStory visibility accounting is incomplete for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    const eventTypeValues = Object.values(row.event_types ?? {});
+    if (
+      row.malformed_stdout_lines !== 0 ||
+      !finiteNonnegativeInteger(row.json_events) ||
+      !finiteNonnegativeInteger(row.analysis_events) ||
+      row.analysis_events < row.json_events ||
+      eventTypeValues.some((value) => !finiteNonnegativeInteger(value)) ||
+      eventTypeValues.reduce((total, value) => total + value, 0) !== row.analysis_events
+    ) {
+      reasons.push(`malformed or unreconciled JSONL parser telemetry for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    const provenanceReasons = repoProvenanceBlockers(row);
+    const repoMetadata = row.task_manifest_snapshot?.repo_metadata;
+    if (
+      row.task_manifest_snapshot?.repo !== row.repo ||
+      repoMetadata?.name !== row.repo ||
+      repoMetadata?.url !== row.repo_provenance?.configured?.url ||
+      repoMetadata?.url !== row.repo_provenance?.manifest?.url ||
+      repoMetadata?.ref !== row.repo_provenance?.configured?.ref ||
+      repoMetadata?.ref !== row.repo_provenance?.manifest?.ref
+    ) {
+      provenanceReasons.push("task manifest repository identity does not match the observed checkout");
+    }
+    if (provenanceReasons.length) {
+      reasons.push(`owning repo provenance is invalid for ${row.task_id}/${row.arm}/${row.repeat}: ${provenanceReasons.join("; ")}`);
+    }
+    if (
+      !finiteNonnegativeInteger(row.transcript_analysis?.external_context_tool_calls) ||
+      row.transcript_analysis.external_context_tool_calls !== 0
+    ) {
+      reasons.push(`external web/search context is forbidden for ${row.task_id}/${row.arm}/${row.repeat}`);
+    }
+    if (row.arm === "without_codestory") {
+      if (
+        row.package_identity != null ||
+        row.source_cli_identity != null ||
+        row.codestory_cache_provenance != null ||
+        row.codestory_harness_prelude != null ||
+        row.codestory_prelude_cli != null ||
+        row.codestory_prelude_cli_sha256 != null ||
+        row.codestory_binary_identity != null ||
+        row.transcript_analysis?.command_categories?.codestory_cli > 0 ||
+        row.transcript_analysis?.codestory_mcp_tool_calls_observed > 0 ||
+        row.transcript_analysis?.codestory_mcp_completed_calls_observed > 0 ||
+        row.exact_candidate_timing?.cold_ms !== 0 ||
+        row.exact_candidate_timing?.incremental_ms !== 0
+      ) {
+        reasons.push(`baseline has CodeStory visibility or use in ${row.task_id}/${row.repeat}`);
+      }
+      if (
+        row.packet_first_required !== false || row.packet_first_pass !== true ||
+        row.transcript_analysis.command_count <= 0
+      ) {
+        reasons.push(`baseline local inspection telemetry is incomplete for ${row.task_id}/${row.repeat}`);
+      }
+    }
+    if (isCodeStoryArm(row.arm)) {
+      const armIdentity = exactCandidateResultIdentity(row);
+      if (row.packet_first_required !== true || row.packet_first_pass !== true) {
+        reasons.push(`packet-first contract failed for ${row.task_id}/${row.arm}/${row.repeat}`);
+      }
+      if (
+        row.codestory_prelude_cli_sha256 !== armIdentity?.cli_sha256 ||
+        row.codestory_binary_identity?.prelude_cli_sha256 !== armIdentity?.cli_sha256 ||
+        !["prelude_only", "exact_match"].includes(row.codestory_binary_identity?.status)
+      ) {
+        reasons.push(`executed CLI is not bound to the authenticated ${row.arm} archive`);
+      }
+      for (const read of row.transcript_analysis?.direct_source_reads ?? []) {
+        const authorization = read.authorization;
+        const reasonIsValid = authorization?.reason === "user_named_file" ||
+          (
+            authorization?.reason === "explicit_evidence_gap" &&
+            (authorization.evidence_command_id != null || authorization.evidence_event_index != null)
+          );
+        if (authorization?.status !== "authorized" || !reasonIsValid) {
+          reasons.push(`unauthorized direct source read ${read.path ?? "unknown"} in ${row.task_id}/${row.arm}/${row.repeat}`);
+        }
+      }
+      const runtimeBlockers = exactPackageRuntimeIdentityBlockers(row);
+      if (runtimeBlockers.length) reasons.push(`missing per-arm exact runtime proof: ${runtimeBlockers.join("; ")}`);
+      const cacheBlockers = cacheProvenanceBlockers(row);
+      if (cacheBlockers.length) reasons.push(`missing per-arm cache proof: ${cacheBlockers.join("; ")}`);
+      if (armIdentity?.schema_version === 3) {
+        const accountingError = packetV3EvidenceGapAccountingError(
+          row.codestory_harness_prelude?.packet_evidence_gap_accounting,
+          "exact packet v3 evidence/gaps",
+        );
+        if (accountingError) {
+          reasons.push(`missing per-arm v3 evidence/gap proof: ${accountingError}`);
+        }
+      } else {
+        const obligation = resultPacketObligationAccounting(row);
+        const obligationError = packetObligationAccountingError(
+          obligation,
+          "exact packet obligations",
+        );
+        if (obligationError) reasons.push(`missing per-arm obligation proof: ${obligationError}`);
+      }
+      if (row.codestory_harness_prelude?.packet_extra_probe_strategy != null) {
+        reasons.push(`diagnostic manifest probes entered ${row.arm}`);
+      }
+      const mutation = row.codestory_cache_provenance?.cache_preparation?.incremental_source_mutation;
+      const cachePreparation = row.codestory_cache_provenance?.cache_preparation;
+      if (
+        cachePreparation?.incremental_status !== "pass" ||
+        !mutation ||
+        typeof mutation.path !== "string" || !mutation.path ||
+        !SHA256_PATTERN.test(String(mutation.original_sha256 ?? "")) ||
+        !SHA256_PATTERN.test(String(mutation.mutated_sha256 ?? "")) ||
+        !SHA256_PATTERN.test(String(mutation.restored_sha256 ?? "")) ||
+        /^0{64}$/.test(String(mutation.original_sha256 ?? "")) ||
+        /^0{64}$/.test(String(mutation.mutated_sha256 ?? "")) ||
+        mutation.original_sha256 !== mutation.restored_sha256 ||
+        mutation.original_sha256 === mutation.mutated_sha256
+      ) {
+        reasons.push(`missing verified source mutation/restore lifecycle for ${row.repo}/${row.arm}`);
+      }
+      if (
+        cachePreparation?.preparation_wall_ms !== row.exact_candidate_timing?.cold_ms ||
+        cachePreparation?.incremental_wall_ms !== row.exact_candidate_timing?.incremental_ms
+      ) {
+        reasons.push(`cache lifecycle timings do not reconcile for ${row.repo}/${row.arm}`);
+      }
+      if (row.arm === "candidate_0_18") {
+        reasons.push(...retrievalWorkEvidenceShapeBlockers(
+          cachePreparation?.cold_retrieval_work_evidence,
+          "candidate cold",
+        ));
+        reasons.push(...candidateIncrementalRetrievalWorkBlockers(
+          cachePreparation?.incremental_retrieval_work_evidence,
+        ));
+      }
+      if (
+        cachePreparation?.coherence_refresh_status !== "pass" ||
+        !cachePreparation?.coherence_semantic_generation ||
+        cachePreparation.coherence_semantic_generation !==
+          row.codestory_cache_provenance?.semantic_generation
+      ) {
+        reasons.push(`final cross-arm cache coherence is missing for ${row.repo}/${row.arm}`);
+      }
+    }
+  }
+
+  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    const candidateArm = arm === "candidate_0_18";
+    const identityFields = candidateArm
+      ? [
+          "contract", "arm", "package_version", "cli_sha256", "source_commit", "source_tree",
+          "schema_version", "protocol_revision", "discovery_contract_sha256",
+          "plugin_manifest_sha256", "catalog_sha256",
+        ]
+      : [
+          "contract", "arm", "package_version", "package_sha256", "cli_sha256",
+          "source_commit", "source_tree", "schema_version", "protocol_revision",
+          "discovery_contract_sha256", "trust_root_kind", "trust_root_sha256",
+        ];
+    const identities = byArm[arm].map((row) => exactCandidateResultIdentity(row));
+    const reference = identities[0];
+    const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : reference?.package_version;
+    const expectedSchema = arm === "published_0_17_4" ? 2 : 3;
+    const expectedProtocol = arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25";
+    const invalidDiscoveryIdentity = arm === "published_0_17_4"
+      ? reference?.discovery_contract_sha256 !== null
+      : !SHA256_PATTERN.test(String(reference?.discovery_contract_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.discovery_contract_sha256 ?? ""));
+    const invalidReference =
+      reference?.contract !== (candidateArm
+        ? EXACT_CANDIDATE_SOURCE_CLI_CONTRACT
+        : EXACT_CANDIDATE_PACKAGE_CONTRACT) ||
+      reference?.arm !== arm ||
+      typeof reference?.package_version !== "string" || !reference.package_version.trim() ||
+      reference?.package_version !== expectedVersion ||
+      (!candidateArm && (
+        !SHA256_PATTERN.test(String(reference?.package_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.package_sha256 ?? ""))
+      )) ||
+      !SHA256_PATTERN.test(String(reference?.cli_sha256 ?? "")) ||
+      /^0{64}$/.test(String(reference?.cli_sha256 ?? "")) ||
+      !/^[0-9a-f]{40}$/.test(String(reference?.source_commit ?? "")) ||
+      /^0{40}$/.test(String(reference?.source_commit ?? "")) ||
+      !/^[0-9a-f]{40}$/.test(String(reference?.source_tree ?? "")) ||
+      /^0{40}$/.test(String(reference?.source_tree ?? "")) ||
+      reference?.schema_version !== expectedSchema ||
+      reference?.protocol_revision !== expectedProtocol ||
+      invalidDiscoveryIdentity ||
+      (!candidateArm && (
+        reference?.trust_root_kind !== "official_published_checksum" ||
+        !SHA256_PATTERN.test(String(reference?.trust_root_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.trust_root_sha256 ?? ""))
+      )) ||
+      (candidateArm && (
+        !SHA256_PATTERN.test(String(reference?.plugin_manifest_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.plugin_manifest_sha256 ?? "")) ||
+        !SHA256_PATTERN.test(String(reference?.catalog_sha256 ?? "")) ||
+        /^0{64}$/.test(String(reference?.catalog_sha256 ?? ""))
+      ));
+    const invalid = invalidReference || identities.some((identity) =>
+      !identity || identityFields.some((field) => identity[field] !== reference[field])
+    );
+    if (invalid) {
+      reasons.push(arm === "candidate_0_18"
+        ? "candidate source/CLI identity mismatch"
+        : "published package identity mismatch");
+    }
+  }
+
+  const preparationOrder = lifecycle?.preparation_order;
+  const packageAuthentication = lifecycle?.package_authentication_ms;
+  const modelInitialization = lifecycle?.model_initialization_ms;
+  const packageAuthenticationOrder = lifecycle?.package_authentication_order;
+  const totalPackageAuthentication = lifecycle?.total_package_authentication_ms;
+  const costRates = lifecycle?.cost_rates;
+  if (
+    lifecycle?.contract !== "codestory.agent-benchmark-exact-lifecycle/v1" ||
+    !packageAuthentication || !modelInitialization ||
+    !["published_0_17_4", "candidate_0_18"].every((arm) =>
+      typeof packageAuthentication[arm] === "number" &&
+      Number.isFinite(packageAuthentication[arm]) &&
+      packageAuthentication[arm] >= 0 &&
+      typeof modelInitialization[arm] === "number" &&
+      Number.isFinite(modelInitialization[arm]) &&
+      modelInitialization[arm] >= 0
+    ) ||
+    !Array.isArray(packageAuthenticationOrder) ||
+    packageAuthenticationOrder.length !== 2 ||
+    new Set(packageAuthenticationOrder).size !== 2 ||
+    packageAuthenticationOrder.some((arm) => !["published_0_17_4", "candidate_0_18"].includes(arm)) ||
+    typeof totalPackageAuthentication !== "number" ||
+    !Number.isFinite(totalPackageAuthentication) ||
+    totalPackageAuthentication + 0.002 <
+      packageAuthentication.published_0_17_4 + packageAuthentication.candidate_0_18
+  ) {
+    reasons.push("exact per-arm one-time package and model lifecycle is missing or invalid");
+  }
+  if (
+    costRates?.currency !== "USD" ||
+    costRates?.model !== DEFAULT_BENCHMARK_MODEL ||
+    ![costRates.input_per_mtok, costRates.output_per_mtok].every(
+      (value) => typeof value === "number" && Number.isFinite(value) && value > 0,
+    )
+  ) {
+    reasons.push("exact configured model cost rates are missing or invalid");
+  }
+  if (
+    !Array.isArray(preparationOrder) ||
+    preparationOrder.length !== 18 ||
+    new Set(preparationOrder.map((entry) => entry.repo)).size !== 18 ||
+    preparationOrder.some((entry) =>
+      !Object.values(EXACT_CANDIDATE_TASK_REPOS).includes(entry.repo) ||
+      entry.arms?.length !== 2 ||
+      new Set(entry.arms).size !== 2 ||
+      entry.arms.some((arm) => !["published_0_17_4", "candidate_0_18"].includes(arm))
+    ) ||
+    preparationOrder.filter((entry) => entry.arms[0] === "published_0_17_4").length !== 9 ||
+    preparationOrder.filter((entry) => entry.arms[0] === "candidate_0_18").length !== 9
+  ) {
+    reasons.push("exact preparation order is not a balanced deterministic 9/9 rotation");
+  }
+
+  return {
+    contract: "codestory.agent-benchmark-exact-candidate-acceptance/v2",
+    pass: reasons.length === 0,
+    reasons: [...new Set(reasons)],
+    expected_runs: expectedRuns,
+    completed_runs: completeRows.length,
+    arm_counts: armCounts,
+    quality_passes: qualityPasses,
+    candidate_only_material_factual_errors: candidateOnlyErrors,
+    unsupported_candidate_proof_claims: unsupportedProofClaims,
+    resource_totals: resourceTotals,
+    timing_totals: timingTotals,
+  };
 }
 
 function agentRunKey(run) {
@@ -8835,7 +12095,9 @@ function benchmarkContractForRun(opts, run, env = process.env) {
     env,
     harnessPath: benchmarkHarnessPath,
     scorerPath: benchmarkScorerPath,
-    cliIdentity: run.arm === "with_codestory" ? opts.codestoryCli ?? env.CODESTORY_CLI ?? null : null,
+    cliIdentity: isCodeStoryArm(run.arm)
+      ? opts.exactCandidatePackageByArm?.get(run.arm)?.cli_path ?? opts.codestoryCli ?? env.CODESTORY_CLI ?? null
+      : null,
   });
 }
 
@@ -9072,10 +12334,558 @@ async function loadReusableBaselines(opts, plannedRuns, outDir) {
   return reusable;
 }
 
+const EXACT_RESUME_CANDIDATE_IDENTITY_FIELDS = [
+  "contract", "arm", "package_version", "cli_sha256", "schema_version",
+  "protocol_revision", "discovery_contract_sha256", "plugin_manifest_sha256",
+  "catalog_sha256",
+];
+
+function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length >= plannedRuns.length) {
+    throw new Error("exact resume must contain a non-empty proper prefix");
+  }
+  const runsPerTask = opts.repeats * opts.arms.length;
+  if (rows.length % runsPerTask !== 0) {
+    throw new Error("exact resume prefix must end at a complete task boundary");
+  }
+  const currentPublished = exactCandidatePackageIdentity(
+    opts.exactCandidatePackageByArm?.get("published_0_17_4"),
+    "published_0_17_4",
+  );
+  const currentCandidate = exactCandidateSourceCliIdentity(
+    opts.exactCandidatePackageByArm?.get("candidate_0_18"),
+    "candidate_0_18",
+  );
+  for (const [index, row] of rows.entries()) {
+    const planned = plannedRuns[index];
+    if (agentRunKey(row) !== agentRunKey(planned) || !taskSnapshotMatches(planned.task, row)) {
+      throw new Error(`exact resume row ${index + 1} is not the planned contiguous prefix`);
+    }
+    if (row.status !== "pass" || row.reanalysis_error) {
+      throw new Error(`exact resume row ${agentRunKey(row)} is not a complete passing row`);
+    }
+    if (row.arm === "published_0_17_4") {
+      if (stableJsonForHash(row.package_identity) !== stableJsonForHash(currentPublished)) {
+        throw new Error("exact resume published package identity does not match the authenticated package");
+      }
+    } else if (row.arm === "candidate_0_18") {
+      const previous = row.source_cli_identity;
+      if (
+        !previous || EXACT_RESUME_CANDIDATE_IDENTITY_FIELDS.some(
+          (field) => previous[field] !== currentCandidate?.[field],
+        )
+      ) {
+        throw new Error("exact resume candidate CLI or public contract identity changed");
+      }
+    } else if (row.package_identity != null || row.source_cli_identity != null) {
+      throw new Error("exact resume baseline row contains a CodeStory identity");
+    }
+  }
+  return rows.length / runsPerTask;
+}
+
+const EXACT_COMPARATOR_ARMS = new Set(["without_codestory", "published_0_17_4"]);
+const EXACT_COMPARATOR_CONTRACT_KEYS = [
+  "contract_version",
+  "task_id",
+  "task_manifest_hash",
+  "scorer_hash",
+  "runner",
+  "model",
+  "sandbox",
+  "retrieval_contract",
+  "retrieval_env",
+  "packet_threshold_config",
+];
+
+function exactComparatorContractMismatch(current, previous) {
+  const integrityError = benchmarkContractIntegrityError(previous, "comparator source row");
+  if (integrityError) return integrityError;
+  const mismatches = EXACT_COMPARATOR_CONTRACT_KEYS.filter(
+    (key) => stableJsonForHash(current?.[key] ?? null) !== stableJsonForHash(previous?.[key] ?? null),
+  );
+  return mismatches.length
+    ? `comparator benchmark contract differs in ${mismatches.join(", ")}`
+    : null;
+}
+
+function validateExactCandidateComparatorPrefixRows(rows, plannedRuns, opts) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length > plannedRuns.length) {
+    throw new Error("exact comparator source must contain a non-empty planned prefix");
+  }
+  const runsPerTask = opts.repeats * opts.arms.length;
+  if (rows.length % runsPerTask !== 0) {
+    throw new Error("exact comparator source must end at a complete task boundary with comparator triplets");
+  }
+  const currentPublished = exactCandidatePackageIdentity(
+    opts.exactCandidatePackageByArm?.get("published_0_17_4"),
+    "published_0_17_4",
+  );
+  for (const [index, row] of rows.entries()) {
+    const planned = plannedRuns[index];
+    if (agentRunKey(row) !== agentRunKey(planned) || !taskSnapshotMatches(planned.task, row)) {
+      throw new Error(`exact comparator row ${index + 1} is not the planned contiguous prefix`);
+    }
+    if (row.status !== "pass" || row.reanalysis_error) {
+      throw new Error(`exact comparator row ${agentRunKey(row)} is not a complete passing row`);
+    }
+    const contractMismatch = exactComparatorContractMismatch(
+      benchmarkContractForRun(opts, planned),
+      row.benchmark_contract,
+    );
+    if (contractMismatch) throw new Error(contractMismatch);
+    if (row.arm === "published_0_17_4") {
+      if (stableJsonForHash(row.package_identity) !== stableJsonForHash(currentPublished)) {
+        throw new Error("exact comparator published package identity does not match the authenticated package");
+      }
+      if (row.source_cli_identity != null) {
+        throw new Error("exact comparator published row contains a candidate source identity");
+      }
+    } else if (row.arm === "without_codestory") {
+      if (row.package_identity != null || row.source_cli_identity != null) {
+        throw new Error("exact comparator baseline row contains a CodeStory identity");
+      }
+    } else if (row.arm !== "candidate_0_18") {
+      throw new Error(`exact comparator source contains unexpected arm ${row.arm}`);
+    }
+  }
+  const completedTaskCount = rows.length / runsPerTask;
+  const comparatorRows = rows.filter((row) => EXACT_COMPARATOR_ARMS.has(row.arm));
+  if (comparatorRows.length !== completedTaskCount * opts.repeats * EXACT_COMPARATOR_ARMS.size) {
+    throw new Error("exact comparator source does not contain complete comparator triplets");
+  }
+  if (comparatorRows.some((row) => row.arm === "candidate_0_18")) {
+    throw new Error("exact comparator source attempted candidate-row reuse");
+  }
+  return { completedTaskCount, comparatorRows };
+}
+
+function validateExactComparatorLedgerSha256(bytes, expectedSha256) {
+  const observed = sha256Bytes(bytes);
+  if (observed !== normalizeExternalSha256(expectedSha256, "comparator ledger digest")) {
+    throw new Error(`comparator ledger digest mismatch: expected ${expectedSha256}, observed ${observed}`);
+  }
+  return observed;
+}
+
+function exactComparatorArtifact(sourceRunDir, artifactPath) {
+  if (!artifactPath) return null;
+  if (!EXACT_COMPARATOR_ARTIFACT_NAME_PATTERN.test(path.basename(String(artifactPath)))) {
+    throw new Error(`comparator artifact name is outside the closed artifact set: ${artifactPath}`);
+  }
+  const sourceRoot = realpathSync(sourceRunDir);
+  const unresolved = path.isAbsolute(artifactPath)
+    ? path.resolve(artifactPath)
+    : path.resolve(sourceRoot, artifactPath);
+  if (!isPathInside(sourceRoot, unresolved) || !existsSync(unresolved)) {
+    throw new Error(`comparator artifact is missing or escapes its source run: ${artifactPath}`);
+  }
+  const source = realpathSync(unresolved);
+  if (!isPathInside(sourceRoot, source) || !statSync(source).isFile()) {
+    throw new Error(`comparator artifact is not a regular source-run file: ${artifactPath}`);
+  }
+  const relative = path.relative(sourceRoot, source);
+  if (!relative || path.isAbsolute(relative) || relative.startsWith("..")) {
+    throw new Error(`comparator artifact has an invalid source-run path: ${artifactPath}`);
+  }
+  return { source, relative };
+}
+
+async function exactComparatorArtifactDescriptors(sourceRunDir, artifactPaths) {
+  const byRelativePath = new Map();
+  for (const artifactPath of artifactPaths) {
+    const artifact = exactComparatorArtifact(sourceRunDir, artifactPath);
+    if (!artifact || byRelativePath.has(artifact.relative)) continue;
+    const bytes = await readBoundedFile(
+      artifact.source,
+      MAX_REUSED_ARTIFACT_BYTES,
+      `comparator artifact ${artifact.relative}`,
+    );
+    byRelativePath.set(artifact.relative, {
+      ...artifact,
+      bytes: bytes.bytes,
+      sha256: bytes.sha256,
+      byte_length: bytes.bytes.length,
+    });
+  }
+  return [...byRelativePath.values()].sort((left, right) =>
+    left.relative.localeCompare(right.relative)
+  );
+}
+
+async function exactComparatorArtifactBundleSha256(sourceRunDir, artifactPaths) {
+  const descriptors = await exactComparatorArtifactDescriptors(sourceRunDir, artifactPaths);
+  return sha256Bytes(stableJsonForHash(descriptors.map((descriptor) => ({
+    path: descriptor.relative,
+    sha256: descriptor.sha256,
+    byte_length: descriptor.byte_length,
+  }))));
+}
+
+async function copyAuthenticatedComparatorArtifacts(
+  sourceRunDir,
+  outDir,
+  artifactPaths,
+  expectedBundleSha256,
+) {
+  const descriptors = await exactComparatorArtifactDescriptors(sourceRunDir, artifactPaths);
+  const observedBundleSha256 = sha256Bytes(stableJsonForHash(descriptors.map((descriptor) => ({
+    path: descriptor.relative,
+    sha256: descriptor.sha256,
+    byte_length: descriptor.byte_length,
+  }))));
+  const expected = normalizeExternalSha256(
+    expectedBundleSha256,
+    "comparator artifact bundle digest",
+  );
+  if (observedBundleSha256 !== expected) {
+    throw new Error(
+      `comparator artifact bundle digest mismatch: expected ${expected}, observed ${observedBundleSha256}`,
+    );
+  }
+  const copied = new Map();
+  for (const descriptor of descriptors) {
+    const destination = path.resolve(outDir, descriptor.relative);
+    assertPathInside(outDir, destination, "comparator artifact destination");
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, descriptor.bytes);
+    const copiedBytes = await readBoundedFile(
+      destination,
+      MAX_REUSED_ARTIFACT_BYTES,
+      `copied comparator artifact ${descriptor.relative}`,
+    );
+    if (copiedBytes.sha256 !== descriptor.sha256 || copiedBytes.bytes.length !== descriptor.byte_length) {
+      throw new Error(`copied comparator artifact failed integrity validation: ${descriptor.relative}`);
+    }
+    copied.set(descriptor.relative, destination);
+  }
+  return copied;
+}
+
+function exactComparatorRowArtifactPaths(row) {
+  return [
+    row.stdout_path,
+    row.stderr_path,
+    row.baseline_harness_prelude?.context_path,
+    row.baseline_harness_prelude?.stderr_path,
+    row.codestory_harness_prelude?.stdout_path,
+    row.codestory_harness_prelude?.stderr_path,
+  ].filter(Boolean);
+}
+
+function copiedExactComparatorArtifactPath(sourceRunDir, copiedArtifacts, artifactPath) {
+  if (!artifactPath) return artifactPath ?? null;
+  const artifact = exactComparatorArtifact(sourceRunDir, artifactPath);
+  const copied = copiedArtifacts.get(artifact.relative);
+  if (!copied) throw new Error(`authenticated comparator artifact was not copied: ${artifact.relative}`);
+  return copied;
+}
+
+function rewriteExactComparatorRowArtifacts(row, sourceRunDir, copiedArtifacts) {
+  const rewritten = {
+    ...row,
+    stdout_path: copiedExactComparatorArtifactPath(sourceRunDir, copiedArtifacts, row.stdout_path),
+    stderr_path: copiedExactComparatorArtifactPath(sourceRunDir, copiedArtifacts, row.stderr_path),
+  };
+  if (row.baseline_harness_prelude) {
+    rewritten.baseline_harness_prelude = {
+      ...row.baseline_harness_prelude,
+      context_path: copiedExactComparatorArtifactPath(
+        sourceRunDir,
+        copiedArtifacts,
+        row.baseline_harness_prelude.context_path,
+      ),
+      stderr_path: copiedExactComparatorArtifactPath(
+        sourceRunDir,
+        copiedArtifacts,
+        row.baseline_harness_prelude.stderr_path,
+      ),
+    };
+  }
+  if (row.codestory_harness_prelude) {
+    rewritten.codestory_harness_prelude = {
+      ...row.codestory_harness_prelude,
+      stdout_path: copiedExactComparatorArtifactPath(
+        sourceRunDir,
+        copiedArtifacts,
+        row.codestory_harness_prelude.stdout_path,
+      ),
+      stderr_path: copiedExactComparatorArtifactPath(
+        sourceRunDir,
+        copiedArtifacts,
+        row.codestory_harness_prelude.stderr_path,
+      ),
+    };
+  }
+  return rewritten;
+}
+
+async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
+  if (!opts.reuseComparatorsFrom) {
+    return { rows: new Map(), completedTaskCount: 0, provenance: null };
+  }
+  const sourceRunDir = opts.reuseComparatorsFrom;
+  const sourceLedgerPath = path.join(sourceRunDir, "runs.jsonl");
+  if (!existsSync(sourceLedgerPath)) {
+    throw new Error(`--reuse-comparators-from must contain runs.jsonl: ${sourceRunDir}`);
+  }
+  const ledger = await readBoundedFile(
+    sourceLedgerPath,
+    MAX_EXACT_COMPARATOR_LEDGER_BYTES,
+    "comparator source ledger",
+  );
+  const sourceLedgerSha256 = validateExactComparatorLedgerSha256(
+    ledger.bytes,
+    opts.reuseComparatorsLedgerSha256,
+  );
+  const sourceRows = ledger.bytes.toString("utf8")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const validated = validateExactCandidateComparatorPrefixRows(sourceRows, plannedRuns, opts);
+  const artifactPaths = validated.comparatorRows.flatMap(exactComparatorRowArtifactPaths);
+  const copiedArtifacts = await copyAuthenticatedComparatorArtifacts(
+    sourceRunDir,
+    outDir,
+    artifactPaths,
+    opts.reuseComparatorsArtifactsSha256,
+  );
+  const taskCache = new Map();
+  const reusable = new Map();
+  for (const sourceRow of validated.comparatorRows) {
+    const key = agentRunKey(sourceRow);
+    const planned = plannedRuns.find((run) => agentRunKey(run) === key);
+    if (!planned || !EXACT_COMPARATOR_ARMS.has(planned.arm)) {
+      throw new Error(`comparator row cannot be mapped to a planned comparator: ${key}`);
+    }
+    const copied = rewriteExactComparatorRowArtifacts(sourceRow, sourceRunDir, copiedArtifacts);
+    const reanalyzed = await recomputeRunAnalysis(copied, opts, outDir, taskCache);
+    if (reanalyzed.reanalysis_error) {
+      throw new Error(`comparator row reanalysis failed for ${key}: ${reanalyzed.reanalysis_error}`);
+    }
+    const currentContract = benchmarkContractForRun(opts, planned);
+    const currentPublished = opts.exactCandidatePackageByArm.get("published_0_17_4");
+    const result = {
+      ...reanalyzed,
+      ...(planned.arm === "published_0_17_4" ? {
+        codestory_prelude_cli: currentPublished.cli_path,
+      } : {}),
+      benchmark_contract: currentContract,
+      promotion_eligible: true,
+      comparator_reuse_provenance: {
+        contract: "codestory.agent-benchmark-exact-comparator-reuse/v1",
+        source_run_dir: sourceRunDir,
+        source_ledger_sha256: sourceLedgerSha256,
+        source_artifacts_sha256: opts.reuseComparatorsArtifactsSha256,
+        original_benchmark_run_id: sourceRow.benchmark_run_id ?? null,
+        original_benchmark_contract: sourceRow.benchmark_contract,
+        current_benchmark_contract: currentContract,
+        original_identity: sourceRow.package_identity ?? null,
+        authenticated_current_identity: planned.arm === "published_0_17_4"
+          ? exactCandidatePackageIdentity(currentPublished, "published_0_17_4")
+          : null,
+        reanalyzed_with_current_scorer: true,
+      },
+    };
+    reusable.set(key, {
+      ...result,
+      resource_accounting: resourceAccountingForResult(result),
+    });
+  }
+  if ([...reusable.values()].some((row) => row.arm === "candidate_0_18")) {
+    throw new Error("comparator reuse attempted to import a candidate row");
+  }
+  return {
+    rows: reusable,
+    completedTaskCount: validated.completedTaskCount,
+    provenance: {
+      contract: "codestory.agent-benchmark-exact-comparator-reuse/v1",
+      source_run_dir: sourceRunDir,
+      source_ledger_sha256: sourceLedgerSha256,
+      source_artifacts_sha256: opts.reuseComparatorsArtifactsSha256,
+      completed_task_count: validated.completedTaskCount,
+      reused_row_count: reusable.size,
+    },
+  };
+}
+
+async function copyExactResumeRowArtifacts(row, sourceRunDir, outDir) {
+  const runId = row.benchmark_run_id;
+  const resumeArtifact = (artifactPath) => {
+    if (!artifactPath || !path.isAbsolute(artifactPath)) return artifactPath;
+    const absolute = path.resolve(artifactPath);
+    if (!isPathInside(sourceRunDir, absolute)) {
+      throw new Error(`exact resume artifact escapes its source run: ${artifactPath}`);
+    }
+    return path.relative(sourceRunDir, absolute);
+  };
+  const copied = {
+    ...row,
+    stdout_path: await copyResultArtifact(sourceRunDir, outDir, resumeArtifact(row.stdout_path), `${runId}.stdout.jsonl`),
+    stderr_path: await copyResultArtifact(sourceRunDir, outDir, resumeArtifact(row.stderr_path), `${runId}.stderr.txt`),
+  };
+  if (copied.baseline_harness_prelude?.context_path) {
+    copied.baseline_harness_prelude = {
+      ...copied.baseline_harness_prelude,
+      context_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        resumeArtifact(copied.baseline_harness_prelude.context_path),
+        `${runId}.baseline-context.json`,
+      ),
+      stderr_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        resumeArtifact(copied.baseline_harness_prelude.stderr_path),
+        `${runId}.baseline-context.stderr.txt`,
+      ),
+    };
+  }
+  if (copied.codestory_harness_prelude?.stdout_path) {
+    copied.codestory_harness_prelude = {
+      ...copied.codestory_harness_prelude,
+      stdout_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        resumeArtifact(copied.codestory_harness_prelude.stdout_path),
+        `${runId}.codestory-packet.stdout.json`,
+      ),
+      stderr_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        resumeArtifact(copied.codestory_harness_prelude.stderr_path),
+        `${runId}.codestory-packet.stderr.txt`,
+      ),
+    };
+  }
+  return copied;
+}
+
+async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) {
+  if (!opts.resumePrefixFrom) {
+    return { rows: [], preparations: [], completedTaskCount: 0 };
+  }
+  const sourceRunDir = opts.resumePrefixFrom;
+  const runsPath = path.join(sourceRunDir, "runs.jsonl");
+  const preparationsPath = path.join(sourceRunDir, "preparations.jsonl");
+  if (!existsSync(runsPath) || !existsSync(preparationsPath)) {
+    throw new Error("--resume-prefix-from must contain runs.jsonl and preparations.jsonl");
+  }
+  const originalRows = await readJsonlRows(runsPath);
+  const taskCache = new Map();
+  const reanalyzed = [];
+  for (const row of originalRows) {
+    reanalyzed.push(await recomputeRunAnalysis(row, opts, sourceRunDir, taskCache));
+  }
+  const completedTaskCount = validateExactCandidateResumePrefixRows(
+    reanalyzed,
+    plannedRuns,
+    opts,
+  );
+  const currentCandidate = exactCandidateSourceCliIdentity(
+    opts.exactCandidatePackageByArm.get("candidate_0_18"),
+    "candidate_0_18",
+  );
+  const copiedRows = [];
+  for (const [index, row] of reanalyzed.entries()) {
+    const planned = plannedRuns[index];
+    const originalIdentity = row.source_cli_identity ?? row.package_identity ?? null;
+    const copied = await copyExactResumeRowArtifacts(row, sourceRunDir, outDir);
+    copiedRows.push({
+      ...copied,
+      ...(row.arm === "candidate_0_18" ? {
+        source_cli_identity: currentCandidate,
+        codestory_prelude_cli: opts.exactCandidatePackageByArm.get("candidate_0_18").cli_path,
+      } : {}),
+      benchmark_contract: benchmarkContractForRun(opts, planned),
+      promotion_eligible: true,
+      resume_provenance: {
+        contract: "codestory.agent-benchmark-exact-prefix-resume/v1",
+        source_run_dir: sourceRunDir,
+        original_benchmark_run_id: row.benchmark_run_id,
+        original_identity: originalIdentity,
+        authenticated_current_identity:
+          row.arm === "candidate_0_18"
+            ? currentCandidate
+            : row.arm === "published_0_17_4"
+              ? exactCandidatePackageIdentity(
+                  opts.exactCandidatePackageByArm.get("published_0_17_4"),
+                  "published_0_17_4",
+                )
+              : null,
+        artifact_cli_sha256: row.codestory_prelude_cli_sha256 ?? null,
+        reanalyzed_with_current_scorer: true,
+      },
+    });
+  }
+
+  const completedRepos = tasks.slice(0, completedTaskCount).map((task) => task.repo);
+  const preparationRows = (await readJsonlRows(preparationsPath))
+    .filter((row) => row.kind === "preparation" && completedRepos.includes(row.repo));
+  if (
+    preparationRows.length !== completedRepos.length ||
+    preparationRows.some((row, index) => row.repo !== completedRepos[index])
+  ) {
+    throw new Error("exact resume preparations do not match the completed task prefix");
+  }
+  const currentPublished = exactCandidatePackageIdentity(
+    opts.exactCandidatePackageByArm.get("published_0_17_4"),
+    "published_0_17_4",
+  );
+  const preparations = preparationRows.map((source) => {
+    const { kind: _kind, recorded_at: originalRecordedAt, ...row } = source;
+    const published = row.arm_preparations?.published_0_17_4;
+    const candidate = row.arm_preparations?.candidate_0_18;
+    if (
+      stableJsonForHash(published?.package_identity) !== stableJsonForHash(currentPublished) ||
+      EXACT_RESUME_CANDIDATE_IDENTITY_FIELDS.some(
+        (field) => candidate?.source_cli_identity?.[field] !== currentCandidate?.[field],
+      )
+    ) {
+      throw new Error(`exact resume preparation identity changed for ${row.repo}`);
+    }
+    return {
+      ...row,
+      source_cli_identity: currentCandidate,
+      arm_preparations: {
+        published_0_17_4: published,
+        candidate_0_18: { ...candidate, source_cli_identity: currentCandidate },
+      },
+      resume_provenance: {
+        contract: "codestory.agent-benchmark-exact-prefix-resume/v1",
+        source_run_dir: sourceRunDir,
+        original_recorded_at: originalRecordedAt,
+        original_candidate_identity: candidate.source_cli_identity,
+        authenticated_current_candidate_identity: currentCandidate,
+      },
+    };
+  });
+  for (const [index, row] of preparations.entries()) {
+    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      const blockers = cachePreparationCanaryBlockers(
+        row.arm_preparations[arm],
+        selectedBenchmarkChildEnv(opts, arm),
+      );
+      if (blockers.length) {
+        throw new Error(`exact resume ${arm} preparation is ineligible: ${blockers.join("; ")}`);
+      }
+    }
+    opts.cachePreparationByRepo.set(row.repo, row);
+    opts.exactCandidateLifecycle.preparation_order ??= [];
+    opts.exactCandidateLifecycle.preparation_order.push({
+      repo: row.repo,
+      arms: exactCandidatePreparationArmOrder(index),
+    });
+  }
+  return { rows: copiedRows, preparations, completedTaskCount };
+}
+
 async function runPlannedAgentRun(opts, run, outDir, reusableBaselines) {
   const reusable = reusableBaselines.get(agentRunKey(run));
   if (reusable) {
-    console.log(`reusing ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats} from ${opts.reuseBaselineFrom}`);
+    const source = reusable.comparator_reuse_provenance?.source_run_dir ?? opts.reuseBaselineFrom;
+    console.log(`reusing ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats} from ${source}`);
     return reusable;
   }
   console.log(`running ${run.repo} ${run.arm} repeat ${run.repeat}/${opts.repeats}`);
@@ -9669,6 +13479,115 @@ function pipelineStageFailure(stage, group, error) {
   };
 }
 
+async function runExactCandidatePipeline({
+  opts,
+  tasks,
+  plannedRuns,
+  executeRun,
+  outDir,
+  materializeGroup,
+  prepareGroup,
+  prepareIsolation,
+  recordResult,
+  recordPreparation,
+  recordPreparationState,
+  recordFirstFailure,
+  reusableBaselines,
+}) {
+  const cachePreparation = [];
+  opts.cachePreparationByRepo ??= new Map();
+  const groups = [...groupTasksByRepo(tasks)].map(([repo, repoTasks]) => ({ repo, tasks: repoTasks }));
+  let firstFailure = null;
+  let preparationIdentityReference = null;
+  for (const group of groups) {
+    try {
+      await materializeGroup(group, null);
+      await recordPreparationState({ kind: "materialized", repo: group.repo });
+      const rows = await prepareGroup(group, null);
+      if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.repo !== group.repo) {
+        throw new Error(`preparation must return exactly one row for ${group.repo}`);
+      }
+      const row = rows[0];
+      for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+        const preparation = row.arm_preparations?.[arm];
+        const blockers = cachePreparationCanaryBlockers(
+          preparation,
+          selectedBenchmarkChildEnv(opts, arm),
+        );
+        if (blockers.length) {
+          throw new Error(`${arm} preparation is not exact-candidate eligible: ${blockers.join("; ")}`);
+        }
+      }
+      const identityBlockers = preparationIdentityReference
+        ? cachePreparationIdentityBlockers(preparationIdentityReference, row)
+        : [];
+      if (identityBlockers.length) {
+        throw new Error(
+          `exact-candidate retrieval preparation identity changed: ${identityBlockers.join("; ")}`,
+        );
+      }
+      await recordPreparation(row);
+      cachePreparation.push(row);
+      opts.cachePreparationByRepo.set(row.repo, row);
+      preparationIdentityReference ??= row;
+      await recordPreparationState({ kind: "prepared", repo: group.repo });
+    } catch (error) {
+      firstFailure = pipelineStageFailure("preparation", group, error);
+      await recordFirstFailure(firstFailure);
+      return {
+        results: [],
+        firstFailure,
+        comparativeFailure: null,
+        comparativePublishable: false,
+        cachePreparation,
+        agentCodexIsolation: null,
+        aborted: true,
+      };
+    }
+  }
+  let agentCodexIsolation;
+  try {
+    agentCodexIsolation = await prepareIsolation();
+  } catch (error) {
+    firstFailure = pipelineStageFailure("agent_isolation", null, error);
+    await recordFirstFailure(firstFailure);
+    return {
+      results: [],
+      firstFailure,
+      comparativeFailure: null,
+      comparativePublishable: false,
+      cachePreparation,
+      agentCodexIsolation: null,
+      aborted: true,
+    };
+  }
+  const outcome = await runPlannedAgentRuns(
+    { ...opts, jobs: 1 },
+    plannedRuns,
+    reusableBaselines,
+    outDir,
+    {
+      runOne: executeRun,
+      failFast: false,
+      onResult: recordResult,
+      onFirstFailure: async (failure) => {
+        firstFailure ??= failure;
+        if (firstFailure === failure) await recordFirstFailure(failure);
+      },
+    },
+  );
+  firstFailure ??= outcome.firstFailure;
+  return {
+    results: outcome.results,
+    firstFailure,
+    comparativeFailure: null,
+    comparativePublishable: firstFailure == null,
+    cachePreparation,
+    agentCodexIsolation,
+    aborted: false,
+  };
+}
+
 async function runAgentBenchmarkPipeline({
   opts,
   tasks,
@@ -9685,6 +13604,23 @@ async function runAgentBenchmarkPipeline({
   recordFirstFailure = async () => {},
   recordComparativeFailure = async () => {},
 }) {
+  if (opts.exactCandidate) {
+    return await runExactCandidatePipeline({
+      opts,
+      tasks,
+      plannedRuns,
+      executeRun,
+      outDir,
+      materializeGroup,
+      prepareGroup,
+      prepareIsolation,
+      recordResult,
+      recordPreparation,
+      recordPreparationState,
+      recordFirstFailure,
+      reusableBaselines,
+    });
+  }
   const results = [];
   const cachePreparation = [];
   const abortController = new AbortController();
@@ -10031,6 +13967,10 @@ async function main() {
     return;
   }
   const allTasks = await loadTasks(opts);
+  validateExactCandidateShape(opts, allTasks);
+  opts.exactCandidateCostRates = opts.exactCandidate
+    ? exactCandidateCostRates(process.env)
+    : null;
   opts.releaseEvidenceCorpusContract = await loadReleaseEvidenceCorpusContract(allTasks, opts);
   if (opts.aggregateShards) {
     await aggregateShardRuns(opts, allTasks);
@@ -10099,14 +14039,43 @@ async function main() {
   );
   const reusableBaselines = await loadReusableBaselines(opts, plannedRuns, outDir);
   opts.cachePreparationByRepo = new Map();
+  let resumedPrefix = { rows: [], preparations: [], completedTaskCount: 0 };
+  let comparatorReuse = { rows: new Map(), completedTaskCount: 0, provenance: null };
   let agentCodexIsolation = null;
   let pipeline = null;
+  let pipelineError = null;
+  let finalizationFailures = [];
   try {
+    if (opts.exactCandidate) {
+      await initializeExactCandidateState(opts);
+      opts.exactCandidateLifecycle.cost_rates = opts.exactCandidateCostRates;
+      resumedPrefix = await loadExactCandidateResumePrefix(
+        opts,
+        tasks,
+        plannedRuns,
+        outDir,
+      );
+      comparatorReuse = await loadExactCandidateComparatorReuse(
+        opts,
+        plannedRuns,
+        outDir,
+      );
+      for (const row of resumedPrefix.rows) {
+        await ledger.append(row);
+      }
+      for (const row of resumedPrefix.preparations) {
+        await preparationLedger.append({
+          kind: "preparation",
+          recorded_at: new Date().toISOString(),
+          ...row,
+        });
+      }
+    }
     pipeline = await runAgentBenchmarkPipeline({
       opts,
-      tasks,
-      plannedRuns,
-      reusableBaselines,
+      tasks: tasks.slice(resumedPrefix.completedTaskCount),
+      plannedRuns: plannedRuns.slice(resumedPrefix.rows.length),
+      reusableBaselines: comparatorReuse.rows.size ? comparatorReuse.rows : reusableBaselines,
       outDir,
       materializeGroup: async (group, signal) => {
         if (opts.materializeRepos) {
@@ -10147,21 +14116,54 @@ async function main() {
         "utf8",
       ),
     });
+    pipeline.results = [...resumedPrefix.rows, ...pipeline.results];
+    pipeline.cachePreparation = [
+      ...resumedPrefix.preparations,
+      ...pipeline.cachePreparation,
+    ];
+  } catch (error) {
+    pipelineError = error;
   } finally {
-    await ledger.close();
-    await preparationLedger.close();
-    if (agentCodexIsolation?.root) {
-      await rm(agentCodexIsolation.root, { recursive: true, force: true });
+    finalizationFailures = await finalizeBenchmarkResources(
+      opts,
+      ledger,
+      preparationLedger,
+    );
+  }
+  if (finalizationFailures.length) {
+    try {
+      await writeFile(
+        path.join(outDir, "cleanup-failure.json"),
+        `${JSON.stringify({ failures: finalizationFailures }, null, 2)}\n`,
+        "utf8",
+      );
+    } catch (error) {
+      finalizationFailures.push({
+        resource: "cleanup_failure_receipt",
+        code: typeof error?.code === "string" ? error.code : null,
+        message: error instanceof Error ? error.message : String(error),
+      });
     }
+  }
+  if (pipelineError) {
+    throw pipelineError;
   }
 
   const {
     results,
-    firstFailure,
+    firstFailure: pipelineFirstFailure,
     comparativeFailure,
     comparativePublishable,
     cachePreparation,
   } = pipeline;
+  const firstFailure = finalBenchmarkFailure(pipelineFirstFailure, finalizationFailures);
+  if (!pipelineFirstFailure && firstFailure) {
+    await writeFile(
+      path.join(outDir, "first-failure.json"),
+      `${JSON.stringify(firstFailure, null, 2)}\n`,
+      "utf8",
+    );
+  }
 
   const canonicalResults = sortAgentResultsCanonical(results, tasks, opts.arms);
   if (cachePreparation.length) {
@@ -10215,6 +14217,11 @@ async function main() {
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     reuse_baseline_from: opts.reuseBaselineFrom,
     reused_baseline_runs: canonicalResults.filter((row) => row.reused_from).length,
+    resume_prefix_from: opts.resumePrefixFrom,
+    resumed_prefix_runs: canonicalResults.filter((row) => row.resume_provenance).length,
+    reuse_comparators_from: opts.reuseComparatorsFrom,
+    reused_comparator_runs: canonicalResults.filter((row) => row.comparator_reuse_provenance).length,
+    comparator_reuse: comparatorReuse.provenance,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
     sandbox: opts.sandbox,
@@ -10231,12 +14238,24 @@ async function main() {
     packet_obligation_accounting: obligationAccounting,
     summary,
     cost_accounting: costAccounting,
+    cost_rates: opts.exactCandidateCostRates,
+    exact_candidate_acceptance: opts.exactCandidate
+      ? exactCandidateAcceptance(canonicalResults, opts.exactCandidateLifecycle)
+      : null,
+    exact_candidate_lifecycle: opts.exactCandidate ? opts.exactCandidateLifecycle : null,
+    finalization_failures: finalizationFailures,
   };
   await writeFile(path.join(outDir, "summary.json"), `${JSON.stringify(summaryPayload, null, 2)}\n`, "utf8");
   await writeFile(path.join(outDir, "summary.md"), markdownSummary(summary, opts, costAccounting), "utf8");
 
   const failedRuns = canonicalResults.filter((result) => result.status !== "pass");
   let exitCode = firstFailure ? 1 : 0;
+  if (opts.exactCandidate && !summaryPayload.exact_candidate_acceptance.pass) {
+    console.error(
+      `exact-candidate acceptance failed: ${summaryPayload.exact_candidate_acceptance.reasons.join(" | ")}`,
+    );
+    exitCode = 1;
+  }
   if (failedRuns.length && !opts.allowFailures) {
     console.error("benchmark failed: every run must pass unless --allow-failures is set.");
     for (const failed of failedRuns) {
@@ -10287,6 +14306,7 @@ export {
   buildPacketQualityDeltas,
   buildQualityDebugPayload,
   copyResultArtifact,
+  copyAuthenticatedComparatorArtifacts,
   qualityFailureReasons,
   commandCategory,
   codeStoryBinaryIdentity,
@@ -10306,15 +14326,22 @@ export {
   parseArgs,
   parseJsonLines,
   cachePolicyForRun,
+  codeStoryArmInstruction,
   cachePreparationCanaryBlockers,
   cachePreparationIdentityBlockers,
+  candidateIncrementalRetrievalWorkBlockers,
   mergeRetrievalStatusWithEngineDiagnostics,
   projectResourceUri,
   retrievalEngineDiagnosticsSnapshotFromOutput,
   resourceUriMatches,
   createDurableJsonlAppender,
+  createExactCandidatePrivateStateRoot,
+  finalizeBenchmarkResources,
+  finalBenchmarkFailure,
+  initializeExactCandidateState,
   benchmarkAgentScopeArgs,
   retrievalIndexCommandArgs,
+  retrievalIndexWorkEvidence,
   retrievalStatusSnapshotFromOutput,
   retrievalStatusCommandArgs,
   packetComposition,
@@ -10325,6 +14352,9 @@ export {
   packetManifestQualitySummary,
   packetObligationAccounting,
   packetDispositionTelemetry,
+  preludePublicFields,
+  reanalysisExactCandidateAcceptance,
+  reanalysisPacketProjection,
   packetPreludeContractBlockers,
   publicPacketPreludeContractPasses,
   packetPreludeManifestComplete,
@@ -10345,7 +14375,23 @@ export {
   packetCompositionFileScore,
   packetFirstCommandForPrompt,
   publicCoreCorpusAudit,
+  preludeAllowsAgentRun,
   planAgentRuns,
+  exactCandidateAcceptance,
+  exactCandidateCostRates,
+  exactComparatorArtifactBundleSha256,
+  authenticateExactCandidatePackages,
+  exactCandidateArmEnv,
+  exactCandidateBaselineEnv,
+  exactCandidatePreparationArmOrder,
+  refreshExactCandidatePreparation,
+  packetV3EvidenceGapAccounting,
+  packetV3EvidenceGapAccountingError,
+  withExactSourceMutation,
+  validateExactCandidateShape,
+  validateExactCandidateResumePrefixRows,
+  validateExactCandidateComparatorPrefixRows,
+  validateExactComparatorLedgerSha256,
   repoProvenanceBlockers,
   repoProvenance,
   runnerCommand,
@@ -10360,6 +14406,7 @@ export {
   taskSnapshotForResult,
   taskShardIndex,
   tasksForShard,
+  runCodeStoryPacketPrelude,
   runAgentBenchmarkPipeline,
   runPlannedAgentRuns,
   runProcess,

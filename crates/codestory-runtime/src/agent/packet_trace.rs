@@ -1628,7 +1628,18 @@ mod golden_tests {
         let terms = packet_probe_terms(prompt);
         let requirements =
             packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing);
-        assert_eq!(requirements.len(), 3);
+        for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
+            assert!(
+                requirements
+                    .iter()
+                    .any(|requirement| requirement.id == requirement_id),
+                "missing exact request boundary {requirement_id}: {:?}",
+                requirements
+                    .iter()
+                    .map(|requirement| requirement.id)
+                    .collect::<Vec<_>>()
+            );
+        }
 
         let mut carriers = [
             call_boundary_hit_with_receiver_owner(

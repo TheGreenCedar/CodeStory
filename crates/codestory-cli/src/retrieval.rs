@@ -1,10 +1,10 @@
 use anyhow::{Context, Result, bail};
-use codestory_contracts::api::IndexMode;
+use codestory_contracts::api::{IndexMode, IndexingPhaseTimings};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use codestory_runtime::{
-    FinalizeIndexOutcome, RetrievalIndexManifest, RetrievalStatusReport, RuntimeRetrievalConfig,
-    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
+    FinalizeComponentWork, FinalizeIndexOutcome, FinalizePhaseTiming, RetrievalIndexManifest,
+    RetrievalStatusReport, RuntimeRetrievalConfig, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
 };
 
 use crate::args::{
@@ -229,20 +229,27 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     let decision = runtime.resolve_refresh_decision_with_preflight(cmd.refresh)?;
     let refresh_mode = decision.effective_mode;
     ensure_retrieval_index_embedding_policy(&sidecar)?;
-    run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
-    let outcome =
-        finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar).or_else(|error| {
-            if !retrieval_index_should_retry_full_refresh(cmd.refresh, &error) {
-                return Err(error);
-            }
-            runtime
-                .index
-                .run_indexing_blocking(IndexMode::Full)
-                .map_err(map_api_error)?;
+    let mut core_phase_timings = run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
+    let outcome = match finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar) {
+        Ok(outcome) => outcome,
+        Err(error) if retrieval_index_should_retry_full_refresh(cmd.refresh, &error) => {
+            core_phase_timings = Some(
+                runtime
+                    .index
+                    .run_indexing_blocking(IndexMode::Full)
+                    .map_err(map_api_error)?,
+            );
             finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar)
-                .context("retrieval index finalize after semantic-doc contract repair")
-        })?;
-    emit_retrieval_index(cmd.format, &outcome, cmd.output_file.as_deref())
+                .context("retrieval index finalize after semantic-doc contract repair")?
+        }
+        Err(error) => return Err(error),
+    };
+    emit_retrieval_index(
+        cmd.format,
+        &outcome,
+        core_phase_timings.as_ref(),
+        cmd.output_file.as_deref(),
+    )
 }
 
 fn ensure_retrieval_index_embedding_policy(sidecar: &RuntimeRetrievalConfig) -> Result<()> {
@@ -289,21 +296,19 @@ fn run_retrieval_index_refresh(
     runtime: &RuntimeContext,
     requested_refresh: RefreshMode,
     refresh_mode: Option<IndexMode>,
-) -> Result<()> {
+) -> Result<Option<IndexingPhaseTimings>> {
     let Some(mode) = refresh_mode else {
-        return Ok(());
+        return Ok(None);
     };
     runtime.open_project_summary()?;
-    runtime
+    match runtime
         .index
         .run_indexing_blocking(mode)
         .map_err(|error| map_api_error(annotate_refresh_error(error, requested_refresh, mode)))
-        .map(|_| ())
-        .or_else(|error| {
-            if !retrieval_index_should_retry_full_refresh(requested_refresh, &error) {
-                return Err(error);
-            }
-            runtime
+    {
+        Ok(timings) => Ok(Some(timings)),
+        Err(error) if retrieval_index_should_retry_full_refresh(requested_refresh, &error) => {
+            let timings = runtime
                 .index
                 .run_indexing_blocking(IndexMode::Full)
                 .map_err(|error| {
@@ -313,9 +318,11 @@ fn run_retrieval_index_refresh(
                         IndexMode::Full,
                     ))
                 })
-                .map(|_| ())
-                .context("retrieval index full refresh after semantic-doc contract repair")
-        })
+                .context("retrieval index full refresh after semantic-doc contract repair")?;
+            Ok(Some(timings))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn finalize_retrieval_index_for_runtime(
@@ -381,21 +388,112 @@ struct RetrievalIndexOutput<'a> {
     scip_stubbed: bool,
     generation_retention_plan: &'a codestory_runtime::GenerationRetentionPlan,
     generation_retention: &'a codestory_runtime::GenerationRetentionApplyReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    core_phase_timings: Option<&'a IndexingPhaseTimings>,
+    retrieval_phase_timings: Vec<RetrievalPhaseTimingOutput<'a>>,
+    retrieval_component_work: Vec<RetrievalComponentWorkOutput<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct RetrievalPhaseTimingOutput<'a> {
+    phase: &'a str,
+    elapsed_ms: u64,
+}
+
+#[derive(serde::Serialize)]
+struct RetrievalComponentWorkOutput<'a> {
+    component: &'a str,
+    mode: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inserted: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reordered: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    predecessor_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attested_bytes: Option<u64>,
+}
+
+const RETRIEVAL_PHASE_ALLOWLIST: &[&str] = &[
+    "input fingerprint",
+    "lexical sidecar",
+    "incremental embedded vectors",
+    "embedded vectors",
+    "vector tokenization",
+    "vector native encode",
+    "vector normalization",
+    "vector sqlite persistence",
+    "vector hashing",
+    "vector final validation",
+    "vector ipc and orchestration",
+    "graph artifact",
+    "manifest write",
+    "unattributed",
+];
+
+const RETRIEVAL_COMPONENT_ALLOWLIST: &[&str] = &["lexical", "vectors", "graph"];
+const RETRIEVAL_COMPONENT_MODE_ALLOWLIST: &[&str] = &["reused", "copy_on_write", "complete"];
+
+fn safe_retrieval_phase_timings(
+    timings: &[FinalizePhaseTiming],
+) -> Vec<RetrievalPhaseTimingOutput<'_>> {
+    timings
+        .iter()
+        .filter(|timing| RETRIEVAL_PHASE_ALLOWLIST.contains(&timing.phase.as_str()))
+        .map(|timing| RetrievalPhaseTimingOutput {
+            phase: &timing.phase,
+            elapsed_ms: timing.elapsed_ms,
+        })
+        .collect()
+}
+
+fn safe_retrieval_component_work(
+    work: &[FinalizeComponentWork],
+) -> Vec<RetrievalComponentWorkOutput<'_>> {
+    work.iter()
+        .filter(|work| {
+            RETRIEVAL_COMPONENT_ALLOWLIST.contains(&work.component.as_str())
+                && RETRIEVAL_COMPONENT_MODE_ALLOWLIST.contains(&work.mode.as_str())
+        })
+        .map(|work| RetrievalComponentWorkOutput {
+            component: &work.component,
+            mode: &work.mode,
+            retained: work.retained,
+            inserted: work.inserted,
+            removed: work.removed,
+            reordered: work.reordered,
+            predecessor_bytes: work.predecessor_bytes,
+            output_bytes: work.output_bytes,
+            attested_bytes: work.attested_bytes,
+        })
+        .collect()
 }
 
 fn emit_retrieval_index(
     format: OutputFormat,
     outcome: &FinalizeIndexOutcome,
+    core_phase_timings: Option<&IndexingPhaseTimings>,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
+    let retrieval_phase_timings = safe_retrieval_phase_timings(&outcome.phase_timings);
+    let retrieval_component_work = safe_retrieval_component_work(&outcome.component_work);
     let payload = RetrievalIndexOutput {
         manifest: &outcome.manifest,
         degraded_modes: &outcome.degraded_modes,
         scip_stubbed: outcome.scip_stubbed,
         generation_retention_plan: &outcome.generation_retention_plan,
         generation_retention: &outcome.generation_retention,
+        core_phase_timings,
+        retrieval_phase_timings,
+        retrieval_component_work,
     };
-    let markdown = format!(
+    let mut markdown = format!(
         "# Retrieval index\n\n- project_id: `{}`\n- lexical_version: `{}`\n- semantic_generation: `{}`\n- scip_revision: {:?}\n- degraded_modes: {:?}\n- retention_retained_bytes: {}\n- retention_reclaimable_bytes: {}\n- retention_removed_bytes: {}\n- retention_remaining_reclaimable_bytes: {}\n- retention_pruning_suppressed: {}\n",
         payload.manifest.project_id,
         payload.manifest.lexical_version,
@@ -408,6 +506,36 @@ fn emit_retrieval_index(
         payload.generation_retention.remaining_reclaimable_bytes,
         payload.generation_retention.pruning_suppressed,
     );
+    if let Some(timings) = core_phase_timings {
+        markdown.push_str("\n## Core indexing\n\n");
+        crate::output::append_index_phase_timings(&mut markdown, timings);
+    }
+    markdown.push_str("\n## Retrieval phases\n\n");
+    for timing in &payload.retrieval_phase_timings {
+        markdown.push_str(&format!("- {}: {} ms\n", timing.phase, timing.elapsed_ms));
+    }
+    markdown.push_str("\n## Retrieval component work\n\n");
+    for work in &payload.retrieval_component_work {
+        markdown.push_str(&format!(
+            "- {}: mode={}, retained={}, inserted={}, removed={}, reordered={}, predecessor_bytes={}, output_bytes={}, attested_bytes={}\n",
+            work.component,
+            work.mode,
+            work.retained
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            work.inserted
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            work.removed
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            work.reordered
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            work.predecessor_bytes
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            work.output_bytes
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+            work.attested_bytes
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        ));
+    }
     emit(format, &payload, markdown, output_file)
 }
 
@@ -576,6 +704,96 @@ mod tests {
     use anyhow::anyhow;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn retrieval_observability_exposes_only_aggregate_allowlisted_values() {
+        let phases = vec![
+            FinalizePhaseTiming {
+                phase: "lexical sidecar".into(),
+                elapsed_ms: 17,
+            },
+            FinalizePhaseTiming {
+                phase: "vector tokenization".into(),
+                elapsed_ms: 3,
+            },
+            FinalizePhaseTiming {
+                phase: "vector native encode".into(),
+                elapsed_ms: 23,
+            },
+            FinalizePhaseTiming {
+                phase: "vector normalization".into(),
+                elapsed_ms: 2,
+            },
+            FinalizePhaseTiming {
+                phase: "vector sqlite persistence".into(),
+                elapsed_ms: 7,
+            },
+            FinalizePhaseTiming {
+                phase: "vector hashing".into(),
+                elapsed_ms: 5,
+            },
+            FinalizePhaseTiming {
+                phase: "vector final validation".into(),
+                elapsed_ms: 11,
+            },
+            FinalizePhaseTiming {
+                phase: "vector ipc and orchestration".into(),
+                elapsed_ms: 13,
+            },
+            FinalizePhaseTiming {
+                phase: "/private/source/path".into(),
+                elapsed_ms: 99,
+            },
+        ];
+        let work = vec![
+            FinalizeComponentWork {
+                component: "vectors".into(),
+                mode: "copy_on_write".into(),
+                retained: Some(41),
+                inserted: Some(2),
+                removed: Some(1),
+                reordered: Some(3),
+                predecessor_bytes: Some(1_024),
+                output_bytes: Some(1_100),
+                attested_bytes: Some(1_100),
+            },
+            FinalizeComponentWork {
+                component: "/private/component".into(),
+                mode: "complete".into(),
+                retained: None,
+                inserted: None,
+                removed: None,
+                reordered: None,
+                predecessor_bytes: None,
+                output_bytes: None,
+                attested_bytes: None,
+            },
+        ];
+
+        let safe_phases = safe_retrieval_phase_timings(&phases);
+        assert_eq!(safe_phases.len(), 8);
+        assert_eq!(safe_phases[0].phase, "lexical sidecar");
+        assert_eq!(safe_phases[0].elapsed_ms, 17);
+        assert_eq!(safe_phases[1].phase, "vector tokenization");
+        assert_eq!(safe_phases[2].phase, "vector native encode");
+        assert_eq!(safe_phases[3].phase, "vector normalization");
+        assert_eq!(safe_phases[4].phase, "vector sqlite persistence");
+        assert_eq!(safe_phases[5].phase, "vector hashing");
+        assert_eq!(safe_phases[6].phase, "vector final validation");
+        assert_eq!(safe_phases[7].phase, "vector ipc and orchestration");
+
+        let safe_work = safe_retrieval_component_work(&work);
+        assert_eq!(safe_work.len(), 1);
+        assert_eq!(safe_work[0].component, "vectors");
+        assert_eq!(safe_work[0].mode, "copy_on_write");
+        assert_eq!(safe_work[0].retained, Some(41));
+        assert_eq!(safe_work[0].inserted, Some(2));
+        assert_eq!(safe_work[0].removed, Some(1));
+        assert_eq!(safe_work[0].reordered, Some(3));
+        assert_eq!(safe_work[0].predecessor_bytes, Some(1_024));
+        assert_eq!(safe_work[0].output_bytes, Some(1_100));
+        assert_eq!(safe_work[0].attested_bytes, Some(1_100));
+    }
 
     struct LiveOperationFixture {
         _project: tempfile::TempDir,
@@ -1238,8 +1456,11 @@ mod tests {
             .resolve_refresh_decision_with_preflight(RefreshMode::Auto)
             .expect("resolve compatible auto refresh");
         assert_eq!(decision.effective_mode, Some(IndexMode::Incremental));
-        run_retrieval_index_refresh(&runtime, RefreshMode::Auto, decision.effective_mode)
-            .expect("run compatible incremental refresh");
+        let timings =
+            run_retrieval_index_refresh(&runtime, RefreshMode::Auto, decision.effective_mode)
+                .expect("run compatible incremental refresh")
+                .expect("executed core refresh must retain its phase timings");
+        assert!(timings.incremental_plan_probe.is_some());
     }
 
     #[test]

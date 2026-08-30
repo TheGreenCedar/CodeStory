@@ -31,6 +31,7 @@ pub(crate) const VALIDATED_KEYWORDS: &[&str] = &[
     "additionalProperties",
     "allOf",
     "anyOf",
+    "const",
     "default",
     "description",
     "enum",
@@ -93,8 +94,17 @@ pub(crate) fn validate_tool_arguments(
     tool: &str,
     arguments: Option<&Value>,
 ) -> Result<(), Vec<ArgumentViolation>> {
-    let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
-        return Ok(());
+    let proof_schema;
+    let schema = if tool == "prove_call_path" {
+        proof_schema = crate::stdio_v3::catalog::proof_tool_source_v3();
+        proof_schema
+            .get("inputSchema")
+            .expect("proof tool source declares inputSchema")
+    } else {
+        let Some(schema) = crate::stdio_catalog::tool_input_schema(tool) else {
+            return Ok(());
+        };
+        schema
     };
     // The dispatcher deliberately admits absent and null arguments; both mean
     // "no arguments supplied", which the schema still has to accept or reject.
@@ -146,30 +156,45 @@ fn validate_value(schema: &Value, value: &Value, pointer: &str, out: &mut Vec<Ar
     let Some(schema) = schema.as_object() else {
         return;
     };
-    if let Some(declared) = schema.get("type") {
-        if !type_matches(declared, value) {
-            out.push(ArgumentViolation::new(
-                "invalid_type",
-                pointer,
-                format!(
-                    "expected type {}, received {}",
-                    render_type(declared),
-                    json_type_name(value)
-                ),
-            ));
-            return;
-        }
-        // A declared-nullable member carries no further constraints when null.
-        if value.is_null() {
-            return;
-        }
+    if let Some(declared) = schema.get("type")
+        && !type_matches(declared, value)
+    {
+        out.push(ArgumentViolation::new(
+            "invalid_type",
+            pointer,
+            format!(
+                "expected type {}, received {}",
+                render_type(declared),
+                json_type_name(value)
+            ),
+        ));
+        return;
     }
+    validate_const(schema, value, pointer, out);
     validate_enum(schema, value, pointer, out);
     validate_number_bounds(schema, value, pointer, out);
     validate_string_length(schema, value, pointer, out);
     validate_array(schema, value, pointer, out);
     validate_object(schema, value, pointer, out);
     validate_combinators(schema, value, pointer, out);
+}
+
+fn validate_const(
+    schema: &Map<String, Value>,
+    value: &Value,
+    pointer: &str,
+    out: &mut Vec<ArgumentViolation>,
+) {
+    let Some(expected) = schema.get("const") else {
+        return;
+    };
+    if expected != value {
+        out.push(ArgumentViolation::new(
+            "invalid_const_value",
+            pointer,
+            format!("expected {}", render_literal(expected)),
+        ));
+    }
 }
 
 fn validate_enum(
@@ -371,11 +396,15 @@ fn validate_combinators(
             .iter()
             .find(|constraint| !accepts(constraint, value))
     {
-        out.push(combined_constraint_violation(
-            constraints.len(),
-            failed,
-            pointer,
-        ));
+        if constraints.len() == 1 {
+            validate_value(failed, value, pointer, out);
+        } else {
+            out.push(combined_constraint_violation(
+                constraints.len(),
+                failed,
+                pointer,
+            ));
+        }
     }
     if let Some(forbidden) = schema.get("not")
         && accepts(forbidden, value)
@@ -560,7 +589,8 @@ mod tests {
                     || members.contains_key("allOf")
                     || members.contains_key("not")
                     || members.contains_key("items")
-                    || members.contains_key("enum");
+                    || members.contains_key("enum")
+                    || members.contains_key("const");
                 for (key, value) in members {
                     if is_schema {
                         found.insert(key.clone());
@@ -662,6 +692,35 @@ mod tests {
                 })
             ),
             vec!["unknown_property", "invalid_selector"]
+        );
+    }
+
+    #[test]
+    fn validator_enforces_const_and_single_all_of_constraints() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "kind": {"type": "string", "const": "tagged"},
+                "value": {"anyOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "integer", "minimum": 1}
+                ]}
+            },
+            "required": ["kind", "value"],
+            "allOf": [{"not": {
+                "properties": {"value": {"const": "forbidden"}},
+                "required": ["value"]
+            }}]
+        });
+
+        assert_eq!(
+            validate_structured_content(&schema, &json!({"kind":"tagged","value":1})),
+            Ok(())
+        );
+        assert_eq!(
+            codes_from_output(&schema, json!({"kind":"wrong","value":"forbidden"})),
+            vec!["invalid_const_value", "forbidden_combination"]
         );
     }
 
@@ -1355,6 +1414,12 @@ mod tests {
 
     #[test]
     fn nullable_members_accept_null_and_non_nullable_members_do_not() {
+        assert!(
+            crate::stdio_catalog::tool_input_schema("packet")
+                .and_then(|schema| schema.pointer("/properties/task_class/enum"))
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.contains(&Value::Null))
+        );
         assert_eq!(
             validate_tool_arguments(
                 "packet",
@@ -1368,6 +1433,15 @@ mod tests {
                 json!({"project": "/repo", "question": "why", "budget": null})
             ),
             vec!["invalid_type"]
+        );
+    }
+
+    #[test]
+    fn nullable_type_does_not_bypass_enum_constraints() {
+        let schema = json!({"type":["string","null"],"enum":["ready"]});
+        assert_eq!(
+            codes_from_output(&schema, Value::Null),
+            vec!["invalid_enum_value"]
         );
     }
 
