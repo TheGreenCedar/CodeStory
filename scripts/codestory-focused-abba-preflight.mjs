@@ -23,6 +23,7 @@ const REQUIRED_TASK_IDS = Object.freeze([
   "rust-ripgrep-search-pipeline",
 ]);
 const ARMS = Object.freeze(["published_0_17_5", "candidate_0_18"]);
+const PINNED_MODEL = "gpt-5.6-sol";
 
 function sha256Bytes(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -204,6 +205,7 @@ async function runFocusedAbba(opts) {
         "--task-ids", planned.task_id,
         "--arms", "with_codestory",
         "--repeats", "1",
+        "--model", PINNED_MODEL,
         "--repo-cache-dir", opts.repoCacheDir,
         "--codestory-cli", cli,
         "--out-dir", rowDir,
@@ -228,7 +230,7 @@ async function runFocusedAbba(opts) {
     const timing = focusedAbbaTiming(rawRow, {
       execution_window_id: executionWindowId,
       host,
-      model: rawRow.model,
+      model: rawRow.model ?? rawRow.benchmark_contract?.model ?? PINNED_MODEL,
       load_policy: "fresh_cli_fresh_agent_session",
       task_id: planned.task_id,
       repeat: planned.repeat,
@@ -256,7 +258,7 @@ async function runFocusedAbba(opts) {
       },
       usage: rawRow.usage,
       host,
-      model: rawRow.model,
+      model: rawRow.model ?? rawRow.benchmark_contract?.model ?? PINNED_MODEL,
       source_attestation: rawSummary?.shard?.attestation ?? null,
       cli_identity: identities[planned.arm],
     });
