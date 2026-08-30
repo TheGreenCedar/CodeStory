@@ -296,6 +296,7 @@ fn select_packet_evidence_indices(
                 .flatten()
         })
         .collect::<HashSet<_>>();
+
     let mut source_count = selected.len();
     for index in &source_order {
         if source_count >= PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3 {
@@ -383,6 +384,28 @@ fn select_packet_evidence_indices(
             selected.push(*index);
         }
     }
+
+    // Repeated windows from a material callable do not satisfy the distinct-path preference by
+    // themselves. After mandatory source and relation receipts are safe, retain every still-
+    // relevant source path that fits before optional relations or same-path remainder fill.
+    for index in &source_order {
+        if selected.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
+            break;
+        }
+        if selected_indices.contains(index) || distinct[*index].2 == 0 {
+            continue;
+        }
+        let row = &distinct[*index].1;
+        if row
+            .path
+            .as_ref()
+            .is_some_and(|path| source_paths.insert(path.as_str()))
+        {
+            selected.push(*index);
+            selected_indices.insert(*index);
+        }
+    }
+
     let relation_target = relation_floor.max(selected.len());
     let mut relation_callers = HashSet::new();
     for index in &selected {
@@ -1959,6 +1982,72 @@ mod tests {
                 (Some("IOClient.send"), Some(147)),
                 (Some("IOClient.send"), Some(206)),
             ]
+        );
+    }
+
+    #[test]
+    fn repeated_material_windows_do_not_displace_relevant_distinct_paths() {
+        let mut support = (0..11)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("material-window-{index}");
+                unit.path = Some("src/io_client.rs".to_owned());
+                unit.symbol_id = Some("IOClient.send".to_owned());
+                unit.start_line = Some(index * 10 + 1);
+                unit.end_line = Some(index * 10 + 4);
+                unit.snippet = Some(format!("material transport window {index}"));
+                unit
+            })
+            .collect::<Vec<_>>();
+        for index in 0..4 {
+            let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+            unit.id = format!("request-response-stage-{index}");
+            unit.path = Some(format!("src/request-response-stage-{index}.rs"));
+            unit.symbol_id = Some(format!("RequestResponse.stage{index}"));
+            unit.start_line = Some(1);
+            unit.end_line = Some(4);
+            unit.snippet = Some(format!("request response stage {index}"));
+            support.push(unit);
+        }
+        let mut relation = support_unit(SupportUnitKindDto::TypedGraphEdge);
+        relation.id = "edge:transport-send".to_owned();
+        relation.path = Some("src/io_client.rs".to_owned());
+        relation.symbol_id = Some("IOClient.send".to_owned());
+        relation.from_symbol = Some("IOClient.send".to_owned());
+        relation.edge_kind = Some("CALL".to_owned());
+        relation.to_symbol = Some("Transport.send".to_owned());
+        support.push(relation);
+
+        let mut obligation = material_obligation("transport-send");
+        obligation.carrier_node_ids = vec![NodeId("IOClient.send".to_owned())];
+        obligation.carrier_edge_proofs = vec![PacketObligationCarrierEdgeProofDto {
+            carrier_node_id: NodeId("IOClient.send".to_owned()),
+            edge_id: EdgeId("transport-send".to_owned()),
+            edge_kind: EdgeKind::CALL,
+        }];
+        let evidence = packet_evidence_rows_with_obligations(
+            &support,
+            "Explain the request response transport stages.",
+            &[obligation],
+        );
+
+        assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+        assert_eq!(
+            evidence[11].kind,
+            EvidenceKindV3Dto::GraphRelation,
+            "the mandatory relation remains ahead of optional source fill"
+        );
+        assert_eq!(
+            evidence[12..]
+                .iter()
+                .filter_map(|row| row.path.as_ref().map(|path| path.as_str()))
+                .collect::<HashSet<_>>(),
+            HashSet::from([
+                "src/request-response-stage-0.rs",
+                "src/request-response-stage-1.rs",
+                "src/request-response-stage-2.rs",
+                "src/request-response-stage-3.rs",
+            ])
         );
     }
 

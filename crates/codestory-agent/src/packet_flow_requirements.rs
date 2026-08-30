@@ -4,40 +4,42 @@ use crate::packet_evidence_carriers::{
     SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
     citation_may_start_command_event_loop_exact_boundary, citation_owns_buffer_read_write,
     citation_owns_buffer_storage, citation_owns_client_adapter_selection,
-    citation_owns_client_convenience_method, citation_owns_client_public_facade_helper,
-    citation_owns_client_public_interface_method, citation_owns_client_request_dispatch,
-    citation_owns_client_request_entrypoint, citation_owns_client_request_finalization,
-    citation_owns_client_response_materialization, citation_owns_client_transport_send,
-    citation_owns_command_event_loop_driver, citation_owns_command_router,
-    citation_owns_css_animation_entrypoint, citation_owns_css_animation_structure,
-    citation_owns_css_structure, citation_owns_form_custom_validation,
-    citation_owns_form_native_constraint, citation_owns_form_submit_guard,
-    citation_owns_format_arguments, citation_owns_formatter_fallback,
-    citation_owns_hook_cache_helper, citation_owns_hook_key_serialization,
-    citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
-    citation_owns_html_app_shell, citation_owns_log_handler_processing,
-    citation_owns_log_record_creation, citation_owns_mapper_configuration,
-    citation_owns_mapper_execution, citation_owns_search_argument_planning,
-    citation_owns_search_candidate_traversal, citation_owns_search_evidence_classification,
-    citation_owns_search_evidence_output, citation_owns_search_haystack_construction,
-    citation_owns_search_matcher_setup, citation_owns_search_printer_setup,
-    citation_owns_search_searcher_setup, citation_owns_search_worker_construction,
-    citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
-    citation_owns_server_request_handler_entrypoint, citation_owns_server_response_terminal,
-    citation_owns_server_route_match_dispatch, citation_owns_server_route_registration,
-    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
-    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
-    citation_owns_site_reader, citation_owns_site_terminal, citation_owns_string_blank_predicate,
-    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
-    client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
-    client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
-    command_event_loop_driver_call_target, command_router_call_target,
-    flow_belongs_to_client_request, flow_belongs_to_command_server, flow_belongs_to_indexing,
-    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
-    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
-    server_handler_chain_call_target, server_request_dispatch_call_target,
-    server_request_entrypoint_call_target, server_response_terminal_call_target,
-    server_route_insertion_call_target, server_route_lookup_call_target,
+    citation_owns_client_concrete_request_finalization,
+    citation_owns_client_convenience_implementation, citation_owns_client_convenience_method,
+    citation_owns_client_public_facade_helper, citation_owns_client_public_interface_method,
+    citation_owns_client_request_dispatch, citation_owns_client_request_entrypoint,
+    citation_owns_client_request_finalization, citation_owns_client_response_materialization,
+    citation_owns_client_transport_send, citation_owns_command_event_loop_driver,
+    citation_owns_command_router, citation_owns_css_animation_entrypoint,
+    citation_owns_css_animation_structure, citation_owns_css_structure,
+    citation_owns_form_custom_validation, citation_owns_form_native_constraint,
+    citation_owns_form_submit_guard, citation_owns_format_arguments,
+    citation_owns_formatter_fallback, citation_owns_hook_cache_helper,
+    citation_owns_hook_key_serialization, citation_owns_hook_mutation_flow,
+    citation_owns_hook_public_export, citation_owns_html_app_shell,
+    citation_owns_log_handler_processing, citation_owns_log_record_creation,
+    citation_owns_mapper_configuration, citation_owns_mapper_execution,
+    citation_owns_search_argument_planning, citation_owns_search_candidate_traversal,
+    citation_owns_search_evidence_classification, citation_owns_search_evidence_output,
+    citation_owns_search_haystack_construction, citation_owns_search_matcher_setup,
+    citation_owns_search_printer_setup, citation_owns_search_searcher_setup,
+    citation_owns_search_worker_construction, citation_owns_server_request_dispatch,
+    citation_owns_server_request_entrypoint, citation_owns_server_request_handler_entrypoint,
+    citation_owns_server_response_terminal, citation_owns_server_route_match_dispatch,
+    citation_owns_server_route_registration, citation_owns_shell_completion,
+    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
+    citation_owns_site_lifecycle, citation_owns_site_reader, citation_owns_site_terminal,
+    citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
+    citation_owns_string_region_handoff, client_public_facade_successor_call_target,
+    client_request_dispatch_predecessor_call_source, client_request_dispatch_successor_call_target,
+    client_request_entrypoint_call_target, command_event_loop_driver_call_target,
+    command_router_call_target, flow_belongs_to_client_request, flow_belongs_to_command_server,
+    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
+    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
+    flow_belongs_to_url_session, server_handler_chain_call_target,
+    server_request_dispatch_call_target, server_request_entrypoint_call_target,
+    server_response_terminal_call_target, server_route_insertion_call_target,
+    server_route_lookup_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -505,6 +507,21 @@ pub fn packet_material_facet_carriers(
             facet_id: requirement.id,
             node_id: citation.node_id.clone(),
         });
+        if requirement.id == "client_request_finalization"
+            && let Some(concrete) = citations.iter().find(|citation| {
+                !selected_nodes.contains(&citation.node_id)
+                    && citation.file_path.is_some()
+                    && citation.line.is_some()
+                    && crate::packet_evidence::citation_sufficiency_eligible(citation)
+                    && citation_owns_client_concrete_request_finalization(citation)
+            })
+        {
+            selected_nodes.insert(concrete.node_id.clone());
+            selected.push(PacketMaterialFacetCarrier {
+                facet_id: "client_concrete_request_finalization",
+                node_id: concrete.node_id.clone(),
+            });
+        }
     }
     selected
 }
@@ -831,6 +848,7 @@ fn push_client_send_requirements_for_terms(
     {
         requirements.push(CLIENT_PUBLIC_INTERFACE_REQUIREMENT);
         requirements.push(CLIENT_INTERFACE_HELPERS_REQUIREMENT);
+        requirements.push(CLIENT_CONVENIENCE_IMPLEMENTATION_REQUIREMENT);
     }
     if has_any(&[
         "finalize",
@@ -887,6 +905,7 @@ fn push_full_client_outbound_request_flow(
     ]) {
         requirements.push(CLIENT_PUBLIC_INTERFACE_REQUIREMENT);
         requirements.push(CLIENT_INTERFACE_HELPERS_REQUIREMENT);
+        requirements.push(CLIENT_CONVENIENCE_IMPLEMENTATION_REQUIREMENT);
     }
     requirements.push(CLIENT_REQUEST_DISPATCH_FLOW[0]);
     requirements.push(CLIENT_REQUEST_FINALIZATION_REQUIREMENT);
@@ -1200,6 +1219,18 @@ const CLIENT_PUBLIC_INTERFACE_REQUIREMENT: FlowRequirement = FlowRequirement {
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
     evidence: EvidencePredicate::CitedCarrier(citation_owns_client_public_interface_method),
+};
+
+const CLIENT_CONVENIENCE_IMPLEMENTATION_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "client_convenience_implementation",
+    role: FlowRole::Dispatch,
+    query_seeds: &[
+        "client convenience implementation",
+        "client request implementation helper",
+    ],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_convenience_implementation),
 };
 
 const CLIENT_REQUEST_FINALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -1861,6 +1892,7 @@ pub fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)
                 CLIENT_PUBLIC_FACADE_REQUIREMENT,
                 CLIENT_PUBLIC_INTERFACE_REQUIREMENT,
                 CLIENT_INTERFACE_HELPERS_REQUIREMENT,
+                CLIENT_CONVENIENCE_IMPLEMENTATION_REQUIREMENT,
                 CLIENT_REQUEST_FINALIZATION_REQUIREMENT,
                 CLIENT_TRANSPORT_SEND_REQUIREMENT,
                 CLIENT_RESPONSE_MATERIALIZATION_REQUIREMENT,
@@ -2052,6 +2084,7 @@ mod tests {
                 "client_public_facade",
                 "client_public_interface",
                 "client_interface_helpers",
+                "client_convenience_implementation",
                 "client_request_finalization",
                 "client_transport_send",
                 "client_response_materialization",
@@ -2075,6 +2108,7 @@ mod tests {
                 "client_public_facade",
                 "client_public_interface",
                 "client_interface_helpers",
+                "client_convenience_implementation",
                 "client_request_finalization",
                 "client_transport_send",
             ]
@@ -2097,10 +2131,16 @@ mod tests {
                 NodeKind::METHOD,
             ),
             witness(
+                "BaseClient._sendUnstreamed",
+                "lib/src/base_client.dart",
+                NodeKind::METHOD,
+            ),
+            witness(
                 "BaseRequest.finalize",
                 "lib/src/base_request.dart",
                 NodeKind::METHOD,
             ),
+            witness("Request.finalize", "lib/src/request.dart", NodeKind::METHOD),
             witness("IOClient.send", "lib/src/io_client.dart", NodeKind::METHOD),
         ];
         for citation in &mut citations {
@@ -2118,7 +2158,12 @@ mod tests {
                 ("client_public_facade", "get"),
                 ("client_public_interface", "Client.get"),
                 ("client_interface_helpers", "BaseClient.get"),
+                (
+                    "client_convenience_implementation",
+                    "BaseClient._sendUnstreamed",
+                ),
                 ("client_request_finalization", "BaseRequest.finalize"),
+                ("client_concrete_request_finalization", "Request.finalize",),
                 ("client_transport_send", "IOClient.send"),
             ]
         );
@@ -2693,6 +2738,7 @@ mod tests {
     const FLOW_REQUIREMENT_INVENTORY: &[&str] = &[
         "buffered_read_write | dispatch | RequiresResolvedSourceOrGraph",
         "buffered_storage | state_or_storage | AllowsSourceRange",
+        "client_convenience_implementation | dispatch | RequiresResolvedSourceOrGraph",
         "client_interface_helpers | entrypoint | RequiresResolvedSourceOrGraph",
         "client_public_facade | entrypoint | RequiresResolvedSourceOrGraph",
         "client_public_interface | entrypoint | RequiresResolvedSourceOrGraph",
@@ -2915,6 +2961,14 @@ mod tests {
             (
                 ("client_interface_helpers", "entrypoint"),
                 witness("BaseClient.get", "lib/base_client.dart", NodeKind::METHOD),
+            ),
+            (
+                ("client_convenience_implementation", "dispatch"),
+                witness(
+                    "BaseClient._sendUnstreamed",
+                    "lib/base_client.dart",
+                    NodeKind::METHOD,
+                ),
             ),
             (
                 ("client_request_finalization", "transform_or_validate"),
@@ -4341,6 +4395,7 @@ mod tests {
             "table",
             "exec",
             "execute",
+            "perform",
             "search",
             "searcher",
             "grep",
@@ -4624,6 +4679,7 @@ mod tests {
             "channel",
             "abstract",
             "base",
+            "contract",
             "default",
             "generic",
             "null",
@@ -4642,6 +4698,7 @@ mod tests {
             "stack",
             "type",
             "types",
+            "trait",
             "object",
             "objects",
             "model",

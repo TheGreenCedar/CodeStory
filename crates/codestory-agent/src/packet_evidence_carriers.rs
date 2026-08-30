@@ -395,7 +395,9 @@ pub fn citation_owns_client_public_interface_method(citation: &AgentCitationDto)
 /// A verb-named convenience implementation supplied by a base/default client type. This is
 /// distinct from the method declared by the public client contract.
 pub fn citation_owns_client_convenience_method(citation: &AgentCitationDto) -> bool {
-    if !citation_has_client_request_verb(citation) {
+    if terminal_segment_raw(&citation.display_name).starts_with('_')
+        || !citation_has_client_request_verb(citation)
+    {
         return false;
     }
     let owner = callable_owner_tokens(citation);
@@ -405,6 +407,39 @@ pub fn citation_owns_client_convenience_method(citation: &AgentCitationDto) -> b
             &["base", "convenience", "default", "helper", "mixin"],
         )
         && has_token(&owner, &["client", "http", "https", "session"])
+}
+
+/// The implementation step behind a base/default client's public convenience methods. This is
+/// deliberately separate from both the verb-named convenience surface and the abstract `send`
+/// boundary: a caller needs the small public delegation and the implementation that constructs the
+/// request, invokes the send boundary, and materializes the response.
+pub fn citation_owns_client_convenience_implementation(citation: &AgentCitationDto) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let owner = callable_owner_tokens(citation);
+    if client_owner_is_unrelated(&owner)
+        || !has_token(
+            &owner,
+            &["base", "convenience", "default", "helper", "mixin"],
+        )
+        || !has_token(&owner, &["client", "http", "https", "session"])
+    {
+        return false;
+    }
+
+    let terminal_raw = terminal_segment_raw(&citation.display_name);
+    let terminal_tokens = identifier_tokens(terminal_raw);
+    let owns_implementation_action = has_token(
+        &terminal_tokens,
+        &["dispatch", "execute", "perform", "request", "send"],
+    );
+    let is_specialized_helper = terminal_raw.starts_with('_')
+        || terminal_tokens.len() > 1
+        || has_token(&terminal_tokens, &["dispatch", "execute", "perform"]);
+    owns_implementation_action
+        && is_specialized_helper
+        && normalize_identifier(terminal_raw) != "send"
 }
 
 fn citation_has_client_request_verb(citation: &AgentCitationDto) -> bool {
@@ -906,6 +941,22 @@ pub fn citation_owns_client_request_finalization(citation: &AgentCitationDto) ->
     names_token_prefix(citation, &["finaliz", "finalis", "prepar"])
         || (names_token(citation, &["request", "requests"])
             && names_token(citation, &["to", "build", "body"]))
+}
+
+/// A concrete request subtype's body-producing finalization implementation. This supplements the
+/// base request contract without turning it into a second proof obligation: both source surfaces
+/// are material when available, while a client with only one remains a lawful packet.
+pub fn citation_owns_client_concrete_request_finalization(citation: &AgentCitationDto) -> bool {
+    if !owns_callable_behavior(citation) || !names_token_prefix(citation, &["finaliz", "finalis"]) {
+        return false;
+    }
+    let owner = callable_owner_tokens(citation);
+    has_token(&owner, &["request", "requests"])
+        && !client_owner_is_unrelated(&owner)
+        && !has_token(
+            &owner,
+            &["abstract", "base", "contract", "interface", "trait"],
+        )
 }
 
 /// The boundary where a transport response becomes a value the caller can read.
@@ -3070,6 +3121,38 @@ mod tests {
             );
         }
 
+        for positive in [
+            "BaseClient._sendUnstreamed",
+            "DefaultHttpClient.sendRequest",
+            "ClientMixin.execute",
+        ] {
+            assert!(
+                citation_owns_client_convenience_implementation(&citation(
+                    positive,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{positive} should carry the convenience implementation body facet"
+            );
+        }
+        for negative in [
+            "BaseClient.get",
+            "BaseClient.send",
+            "Client.get",
+            "DatabaseBaseClient._sendUnstreamed",
+            "CacheClient.sendRequest",
+            "StoreClient.execute",
+        ] {
+            assert!(
+                !citation_owns_client_convenience_implementation(&citation(
+                    negative,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{negative} must not carry the convenience implementation body facet"
+            );
+        }
+
         for positive in ["Session.send", "HttpClient.send"] {
             assert!(citation_owns_client_request_dispatch(&citation(
                 positive,
@@ -3515,6 +3598,24 @@ mod tests {
             "lib/base_request.dart",
             NodeKind::METHOD
         )));
+        assert!(citation_owns_client_concrete_request_finalization(
+            &citation("Request.finalize", "lib/request.dart", NodeKind::METHOD)
+        ));
+        for name in [
+            "BaseRequest.finalize",
+            "AbstractRequest.finalize",
+            "DatabaseRequest.finalize",
+            "CacheRequest.finalize",
+        ] {
+            assert!(
+                !citation_owns_client_concrete_request_finalization(&citation(
+                    name,
+                    "lib/request.dart",
+                    NodeKind::METHOD,
+                )),
+                "{name} is not a concrete HTTP request body finalizer"
+            );
+        }
     }
 
     /// Each of these is a whole *family* of symbol, not one symbol: the HTTP verb set on any

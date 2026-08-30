@@ -3233,7 +3233,7 @@ fn append_packet_carrier_source_sections(
                 .snippet_function_body_context(citation.node_id.clone(), 0)
                 .ok()
                 .map(|snippet| {
-                    if snippet.scope == SnippetScopeDto::LineContext {
+                    if matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
                         let focused = long_behavioral_function_source_ranges(
                             controller,
                             &file_focus_text,
@@ -3946,9 +3946,10 @@ fn focused_function_source_ranges(
         .collect()
 }
 
-/// A parser may know a callable's end line while still returning declaration-only context. Keep
-/// that long callable's declaration, one material internal callsite, and its positive terminal
-/// behavior instead of treating the first 24 lines as the whole implementation.
+/// A parser may return declaration-only context even when the source contains an exact short
+/// declaration or a long body. Keep the exact short range. For a long callable, retain its
+/// declaration, one material internal callsite, and its positive terminal behavior instead of
+/// treating the first 24 lines as the whole implementation.
 fn long_behavioral_function_source_ranges(
     controller: &AppController,
     question: &str,
@@ -3962,17 +3963,36 @@ fn long_behavioral_function_source_ranges(
         return Vec::new();
     };
     let lines = source.text.lines().collect::<Vec<_>>();
-    let Some(end_line) = end_line
-        .filter(|end_line| *end_line > start_line)
-        .or_else(|| discover_braced_callable_end_line(&lines, start_line))
-        .filter(|end_line| {
-            *end_line
-                > start_line
-                    .saturating_add(CARRIER_SOURCE_DECLARATION_FALLBACK_LINES.saturating_sub(1))
-        })
+    let Some(end_line) = discover_callable_end_line(&lines, start_line)
+        .or_else(|| end_line.filter(|end_line| *end_line >= start_line))
     else {
         return Vec::new();
     };
+    if end_line
+        <= start_line.saturating_add(CARRIER_SOURCE_DECLARATION_FALLBACK_LINES.saturating_sub(1))
+    {
+        return controller
+            .bounded_file_snippet_range(
+                path,
+                crate::BoundedSnippetRangeOptions {
+                    focus_line: start_line,
+                    start_line,
+                    end_line,
+                    context_lines: 0,
+                    max_bytes: CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+                    truncation_suffix: SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+                },
+            )
+            .ok()
+            .map(|(path, snippet)| {
+                vec![CarrierSourceRange {
+                    path,
+                    start_line,
+                    body: snippet.markdown,
+                }]
+            })
+            .unwrap_or_default();
+    }
     long_behavioral_function_source_lines(&lines, start_line, end_line, question)
         .into_iter()
         .filter_map(|focus_line| {
@@ -3997,8 +4017,10 @@ fn long_behavioral_function_source_ranges(
         .collect()
 }
 
-fn discover_braced_callable_end_line(lines: &[&str], start_line: u32) -> Option<u32> {
+fn discover_callable_end_line(lines: &[&str], start_line: u32) -> Option<u32> {
     let mut depth = 0_u32;
+    let mut parenthesis_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
     let mut saw_open = false;
     let mut in_block_comment = false;
     let mut quote: Option<char> = None;
@@ -4040,7 +4062,14 @@ fn discover_braced_callable_end_line(lines: &[&str], start_line: u32) -> Option<
                 continue;
             }
             match ch {
-                '{' => {
+                '(' if !saw_open => parenthesis_depth = parenthesis_depth.saturating_add(1),
+                ')' if !saw_open => parenthesis_depth = parenthesis_depth.saturating_sub(1),
+                '[' if !saw_open => bracket_depth = bracket_depth.saturating_add(1),
+                ']' if !saw_open => bracket_depth = bracket_depth.saturating_sub(1),
+                ';' if !saw_open && parenthesis_depth == 0 && bracket_depth == 0 => {
+                    return Some((index + 1) as u32);
+                }
+                '{' if saw_open || (parenthesis_depth == 0 && bracket_depth == 0) => {
                     saw_open = true;
                     depth = depth.saturating_add(1);
                 }
@@ -8695,7 +8724,35 @@ mod tests {
             "void next() {}",
         ];
 
-        assert_eq!(discover_braced_callable_end_line(&source, 1), Some(8));
+        assert_eq!(discover_callable_end_line(&source, 1), Some(8));
+    }
+
+    #[test]
+    fn declaration_only_callable_end_stops_at_the_first_real_semicolon() {
+        let source = [
+            "Future<Response> get(Uri url, {Map<String, String>? headers}) =>",
+            "    _withClient((client) => client.get(url, headers: headers));",
+            "/// unrelated docs with a ; inside the comment",
+            "Future<Response> post(Uri url);",
+        ];
+
+        assert_eq!(discover_callable_end_line(&source, 1), Some(2));
+    }
+
+    #[test]
+    fn callable_end_ignores_named_and_optional_parameter_delimiters() {
+        let source = [
+            "Future<Response> send(String method, {Map<String, String>? headers},",
+            "    [Object? body, Encoding? encoding]) async {",
+            "  if (body != null) {",
+            "    prepare(body);",
+            "  }",
+            "  return await transport.send(body);",
+            "}",
+            "void next() {}",
+        ];
+
+        assert_eq!(discover_callable_end_line(&source, 1), Some(7));
     }
 
     #[test]
