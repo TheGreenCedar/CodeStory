@@ -4972,7 +4972,7 @@ test("Axios v2 release task preserves v1 evidence while binding its exact projec
   }
 });
 
-test("materialization scrubs reusable checkouts before installing the bound project manifest", async () => {
+test("materialization scrubs reusable checkouts before installing the bound project manifest", async (t) => {
   const dir = await mkdtemp(path.join(os.tmpdir(), "codestory-materialized-project-"));
   try {
     const source = path.join(dir, "source");
@@ -5022,6 +5022,54 @@ test("materialization scrubs reusable checkouts before installing the bound proj
     assert.equal(await readFile(path.join(checkout, "codestory_project.json"), "utf8"), template);
     assert.equal(gitFixture(["status", "--porcelain"], checkout), "");
     assert.equal(gitFixture(["rev-parse", "HEAD"], checkout), ref);
+
+    const manifestSha256 = createHash("sha256").update(template).digest("hex");
+    const provenanceConfig = {
+      name: "scrub-fixture",
+      path: checkout,
+      checkout_path: checkout,
+      url: "https://github.com/example/fixture.git",
+      ref,
+      manifest_url: "https://github.com/example/fixture.git",
+      manifest_ref: ref,
+      manifest_codestory_project_manifest: {
+        source_path: templatePath,
+        declared_path: "project.json",
+        sha256: manifestSha256,
+      },
+      installed_codestory_project_manifest: null,
+    };
+    await t.test("observes the installed manifest after the in-memory receipt is lost", async () => {
+      const observed = await repoProvenance(provenanceConfig);
+      assert.deepEqual(observed.installed_codestory_project_manifest, {
+        source_path: path.relative(path.resolve("."), templatePath).replaceAll(path.sep, "/"),
+        declared_sha256: manifestSha256,
+        installed_path: "codestory_project.json",
+        installed_sha256: manifestSha256,
+        ignored: true,
+      });
+      assert.doesNotMatch(
+        repoProvenanceBlockers({ repo_provenance: observed }).join("\n"),
+        /CodeStory project manifest/,
+      );
+    });
+
+    await t.test("keeps tampered and missing installed manifests fail-closed", async () => {
+      await writeFile(path.join(checkout, "codestory_project.json"), '{"name":"tampered"}\n', "utf8");
+      const tampered = await repoProvenance(provenanceConfig);
+      assert.match(
+        repoProvenanceBlockers({ repo_provenance: tampered }).join("\n"),
+        /installed CodeStory project manifest bytes do not match declared hash/,
+      );
+
+      await rm(path.join(checkout, "codestory_project.json"));
+      const missing = await repoProvenance(provenanceConfig);
+      assert.equal(missing.installed_codestory_project_manifest, null);
+      assert.match(
+        repoProvenanceBlockers({ repo_provenance: missing }).join("\n"),
+        /missing installed CodeStory project manifest provenance/,
+      );
+    });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

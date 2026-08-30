@@ -6184,6 +6184,52 @@ async function gitOutput(
   return result.stdout.trim();
 }
 
+async function installedCodestoryProjectManifestProvenance(
+  config,
+  checkoutPath,
+  signal = null,
+  processOptions = {},
+) {
+  const manifest = config.manifest_codestory_project_manifest ?? null;
+  if (!manifest) {
+    return config.installed_codestory_project_manifest ?? null;
+  }
+  const workspacePath = path.resolve(config.path);
+  assertPathInside(checkoutPath, workspacePath, "CodeStory project manifest workspace path");
+  const destination = assertPathInside(
+    workspacePath,
+    path.join(workspacePath, "codestory_project.json"),
+    "CodeStory project manifest destination",
+  );
+  const relativeDestination = path.relative(checkoutPath, destination).replaceAll(path.sep, "/");
+  if (!relativeDestination || relativeDestination.startsWith("../") || path.isAbsolute(relativeDestination)) {
+    return null;
+  }
+  let installedBytes;
+  try {
+    installedBytes = await readFile(destination);
+  } catch {
+    return null;
+  }
+  const ignored = await runProcess(
+    "git",
+    ["-C", checkoutPath, "check-ignore", "-q", "--", relativeDestination],
+    {
+      ...processOptions,
+      cwd: repoRoot,
+      timeoutMs: 10_000,
+      signal,
+    },
+  );
+  return {
+    source_path: path.relative(repoRoot, manifest.source_path).replaceAll(path.sep, "/"),
+    declared_sha256: manifest.sha256,
+    installed_path: relativeDestination,
+    installed_sha256: sha256Bytes(installedBytes),
+    ignored: ignored.exitCode === 0,
+  };
+}
+
 async function repoProvenance(config, signal = null, processOptions = {}) {
   const checkoutPath = path.resolve(config.checkout_path ?? config.path);
   const statusShort = await gitOutput(
@@ -6233,7 +6279,12 @@ async function repoProvenance(config, signal = null, processOptions = {}) {
     ),
     git_dirty: statusShort == null ? null : statusShort.length > 0,
     git_status_short: statusShort,
-    installed_codestory_project_manifest: config.installed_codestory_project_manifest ?? null,
+    installed_codestory_project_manifest: await installedCodestoryProjectManifestProvenance(
+      config,
+      checkoutPath,
+      signal,
+      processOptions,
+    ),
   };
 }
 
