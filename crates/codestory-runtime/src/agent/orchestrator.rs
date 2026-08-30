@@ -115,7 +115,8 @@ use crate::agent::packet_terms::{
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
-    RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
+    RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome,
+    hydrate_packet_exact_call_boundaries_post_pass, maybe_run_retrieval_shadow,
     sidecar_retrieval_blocks_nucleo_supplement, sidecar_retrieval_primary_enabled,
     sidecar_retrieval_unavailable_error, try_sidecar_primary_search,
 };
@@ -611,6 +612,7 @@ pub(crate) fn agent_packet(
     // sidecar stage clock. This fills the session ledger the extras builder
     // reads below.
     crate::agent::retrieval_primary::hydrate_packet_atom_trails_post_pass(controller, &mut answer);
+    hydrate_packet_exact_call_boundaries_post_pass(controller, &flow_requirements, &mut answer);
     // R7: the runtime's verified evidence extras — R2 trail-coverage records
     // and R4 anchored receipts — are threaded through the proving passes.
     // The pre-cap capture proves against the uncapped graphs with coverage

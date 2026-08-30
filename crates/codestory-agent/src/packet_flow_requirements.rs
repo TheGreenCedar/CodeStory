@@ -1219,6 +1219,7 @@ const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
         "event loop",
         "event loop driver",
         "process events callbacks",
+        "main event loop process events",
     ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
@@ -1249,6 +1250,7 @@ const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
         "command dispatch",
         "command table dispatch",
         "command routing checks",
+        "process command routing checks",
     ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
@@ -3475,6 +3477,20 @@ mod tests {
                 "{helper} must not close central command routing"
             );
         }
+    }
+
+    #[test]
+    fn command_loop_queries_name_the_carrier_action_and_exact_boundary() {
+        assert!(
+            COMMAND_EVENT_LOOP_REQUIREMENT
+                .query_seeds
+                .contains(&"main event loop process events")
+        );
+        assert!(
+            COMMAND_DISPATCH_REQUIREMENT
+                .query_seeds
+                .contains(&"process command routing checks")
+        );
     }
 
     #[test]
