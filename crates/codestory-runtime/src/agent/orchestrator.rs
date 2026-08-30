@@ -3323,7 +3323,7 @@ fn append_packet_carrier_source_sections(
                 kind: SupportUnitKindDto::SourceRange,
                 summary: format!(
                     "source for {} at {path}:{start_line}-{end_line}",
-                    citation.display_name,
+                    carrier_source_identity(&citation.display_name, citation.line, end_line,),
                 ),
                 path: Some(path),
                 symbol_id: Some(citation.node_id.0.clone()),
@@ -3903,6 +3903,7 @@ fn source_receipt_line_range(markdown: &str, fallback_start: u32) -> (u32, u32) 
 }
 
 const CARRIER_SOURCE_OWNER_CONTEXT_LOOKBACK_LINES: usize = 32;
+const CARRIER_SOURCE_OWNER_SEPARATE_GAP_LINES: u32 = 12;
 
 /// Keep the source-local type declaration with an owner-qualified method when it fits the same
 /// bounded window. A method body proves mechanics, while the adjacent declaration and comments
@@ -3917,6 +3918,16 @@ fn attach_enclosing_type_source_context(
     if citation.kind != NodeKind::METHOD || sources.is_empty() {
         return sources;
     }
+    let owner_words = citation
+        .display_name
+        .rsplit(['.', ':', '#', '/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .nth(1)
+        .map(source_identifier_words)
+        .unwrap_or_default();
+    if owner_words.len() < 2 {
+        return sources;
+    }
     let Some(anchor_line) = citation.line else {
         return sources;
     };
@@ -3928,6 +3939,44 @@ fn attach_enclosing_type_source_context(
         return sources;
     };
     let lines = source.text.lines().collect::<Vec<_>>();
+    let owner_end_line = anchor_line.saturating_sub(1);
+    let Some(owner_start_line) = enclosing_type_context_start_line(
+        &lines,
+        anchor_line,
+        owner_end_line,
+        &citation.display_name,
+        CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+    ) else {
+        return sources;
+    };
+    if anchor_line.saturating_sub(owner_start_line) > CARRIER_SOURCE_OWNER_SEPARATE_GAP_LINES {
+        let Ok((path, bounded)) = controller.bounded_file_snippet_range(
+            &first.path,
+            crate::BoundedSnippetRangeOptions {
+                focus_line: owner_end_line,
+                start_line: owner_start_line,
+                end_line: owner_end_line,
+                context_lines: 0,
+                max_bytes: CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+                truncation_suffix: SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+            },
+        ) else {
+            return sources;
+        };
+        let rendered_range = source_receipt_line_range(&bounded.markdown, owner_start_line);
+        if rendered_range.0 > owner_start_line || rendered_range.1 < owner_end_line {
+            return sources;
+        }
+        sources.insert(
+            0,
+            CarrierSourceRange {
+                path,
+                start_line: owner_start_line,
+                body: bounded.markdown,
+            },
+        );
+        return sources;
+    }
     let Some(start_line) = enclosing_type_context_start_line(
         &lines,
         anchor_line,
@@ -3977,13 +4026,16 @@ fn enclosing_type_context_start_line(
         .filter(|owner| !owner.is_empty())?;
     let anchor_index = usize::try_from(anchor_line.saturating_sub(1)).ok()?;
     let end_index = usize::try_from(end_line).ok()?.min(lines.len());
-    if anchor_index >= lines.len() || anchor_index >= end_index {
+    if anchor_index >= lines.len() || end_index == 0 {
         return None;
     }
     let search_start = anchor_index.saturating_sub(CARRIER_SOURCE_OWNER_CONTEXT_LOOKBACK_LINES);
     let declaration_index = (search_start..anchor_index)
         .rev()
         .find(|index| source_line_declares_type_owner(lines[*index], &owner))?;
+    if declaration_index >= end_index {
+        return None;
+    }
 
     let mut comment_start = declaration_index;
     while comment_start > search_start
@@ -4047,6 +4099,48 @@ fn source_identifier_key(value: &str) -> String {
         .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
         .flat_map(char::to_lowercase)
         .collect()
+}
+
+fn source_identifier_words(value: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let characters = value.chars().collect::<Vec<_>>();
+    for (index, character) in characters.iter().copied().enumerate() {
+        if !character.is_ascii_alphanumeric() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            continue;
+        }
+        let previous = index.checked_sub(1).and_then(|index| characters.get(index));
+        let next = characters.get(index.saturating_add(1));
+        let begins_word = !word.is_empty()
+            && ((character.is_ascii_uppercase()
+                && previous.is_some_and(|previous| previous.is_ascii_lowercase()))
+                || (character.is_ascii_uppercase()
+                    && previous.is_some_and(|previous| previous.is_ascii_uppercase())
+                    && next.is_some_and(|next| next.is_ascii_lowercase())));
+        if begins_word {
+            words.push(std::mem::take(&mut word));
+        }
+        word.push(character.to_ascii_lowercase());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+fn carrier_source_identity(display_name: &str, anchor_line: Option<u32>, end_line: u32) -> String {
+    if anchor_line.is_some_and(|anchor_line| end_line < anchor_line)
+        && let Some(owner) = display_name
+            .rsplit(['.', ':', '#', '/', '\\'])
+            .filter(|segment| !segment.is_empty())
+            .nth(1)
+    {
+        return format!("enclosing {owner} type that owns {display_name}");
+    }
+    display_name.to_owned()
 }
 
 /// A long function is rarely best represented by its prologue. Select at most three bounded,
@@ -9042,6 +9136,20 @@ mod tests {
                 CARRIER_SOURCE_MAX_SNIPPET_BYTES,
             ),
             Some(3)
+        );
+        assert_eq!(
+            source_identifier_words("DefaultSession"),
+            ["default", "session"]
+        );
+        assert_eq!(source_identifier_words("IOClient"), ["io", "client"]);
+        assert_eq!(source_identifier_words("Client"), ["client"]);
+        assert_eq!(
+            carrier_source_identity("DefaultSession.perform", Some(5), 4),
+            "enclosing DefaultSession type that owns DefaultSession.perform"
+        );
+        assert_eq!(
+            carrier_source_identity("DefaultSession.perform", Some(5), 7),
+            "DefaultSession.perform"
         );
     }
 
