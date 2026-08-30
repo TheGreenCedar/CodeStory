@@ -2134,6 +2134,18 @@ fn rank_obligation_citations_by_context(
     };
     let query_terms = symbol_query_tokens(query);
     citations.sort_by_key(|citation| {
+        // An exact event-loop boundary may have both the top-level driver and one lower-level
+        // iteration routine. Protect the main-shaped caller first; it is still only a candidate,
+        // and finalization still requires its declared exact outgoing CALL receipt.
+        let boundary_depth = if obligation.id == "command_event_loop"
+            && symbol_query_tokens(&citation.display_name)
+                .last()
+                .is_some_and(|token| token == "main")
+        {
+            0
+        } else {
+            1
+        };
         let mut carrier_terms = symbol_query_tokens(&citation.display_name);
         if let Some(path) = citation.file_path.as_deref() {
             carrier_terms.extend(symbol_query_tokens(&packet_display_path(path)));
@@ -2142,7 +2154,7 @@ fn rank_obligation_citations_by_context(
             .iter()
             .filter(|term| carrier_terms.iter().any(|carrier| carrier == *term))
             .count();
-        std::cmp::Reverse(overlap)
+        (boundary_depth, std::cmp::Reverse(overlap))
     });
 }
 
@@ -6027,6 +6039,118 @@ mod tests {
             &PacketProofEvidenceExtras::default(),
         );
         assert!(plan.claim_obligations[0].carrier_edge_proofs.is_empty());
+    }
+
+    #[test]
+    fn command_event_loop_prefers_the_top_level_exact_driver_over_an_iteration_routine() {
+        let question = "Trace how a command server enters the event loop and processes events.";
+        let mut main = citation("aeMain", "src/runtime.c", NodeKind::FUNCTION);
+        main.node_id = NodeId("main-driver".to_string());
+        main.evidence_edge_ids = vec![EdgeId("main-loop-call".to_string())];
+        let mut iteration = citation(
+            "EventLoop.processEvents",
+            "src/runtime.c",
+            NodeKind::FUNCTION,
+        );
+        iteration.node_id = NodeId("iteration-driver".to_string());
+        iteration.evidence_edge_ids = vec![EdgeId("iteration-call".to_string())];
+        let next_iteration = citation(
+            "EventLoop.processTimeEvents",
+            "src/runtime.c",
+            NodeKind::FUNCTION,
+        );
+        let mut carried_answer = answer(vec![iteration.clone(), main.clone()]);
+        carried_answer.prompt = question.to_string();
+        let node = |citation: &AgentCitationDto| GraphNodeDto {
+            id: citation.node_id.clone(),
+            label: citation.display_name.clone(),
+            kind: citation.kind,
+            depth: 1,
+            label_policy: None,
+            badge_visible_members: None,
+            badge_total_members: None,
+            merged_symbol_examples: Vec::new(),
+            file_path: citation.file_path.clone(),
+            qualified_name: Some(citation.display_name.clone()),
+            member_access: None,
+        };
+        carried_answer.graphs.push(GraphArtifactDto::Uml {
+            id: "event-loop-boundaries".to_string(),
+            title: "Event loop boundaries".to_string(),
+            graph: GraphResponse {
+                center_id: main.node_id.clone(),
+                nodes: vec![node(&main), node(&iteration), node(&next_iteration)],
+                edges: vec![
+                    GraphEdgeDto {
+                        id: EdgeId("main-loop-call".to_string()),
+                        source: main.node_id.clone(),
+                        target: iteration.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:main-loop".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: EdgeId("iteration-call".to_string()),
+                        source: iteration.node_id.clone(),
+                        target: next_iteration.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:iteration".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                ],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        });
+        let mut plan =
+            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
+        plan.claim_obligations
+            .retain(|obligation| obligation.id == "command_event_loop");
+        plan.query_obligations.clear();
+
+        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &plan,
+            &carried_answer,
+            &PacketProofEvidenceExtras::default(),
+        );
+        assert_eq!(
+            protected_packet_obligation_carrier_node_ids(&snapshot).first(),
+            Some(&main.node_id),
+            "the exact top-level caller is protected before the lower-level iteration routine"
+        );
+        assert_eq!(
+            protected_packet_obligation_edge_ids(&snapshot).first(),
+            Some(&EdgeId("main-loop-call".to_string()))
+        );
+
+        let GraphArtifactDto::Uml { graph, .. } = &mut carried_answer.graphs[0] else {
+            panic!("fixture must carry a UML graph");
+        };
+        graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == iteration.node_id)
+            .expect("main target")
+            .label = "loadConfiguration".to_string();
+        let hostile = capture_packet_obligation_edge_proofs_before_budget(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &plan,
+            &carried_answer,
+            &PacketProofEvidenceExtras::default(),
+        );
+        assert_eq!(
+            protected_packet_obligation_carrier_node_ids(&hostile).first(),
+            Some(&iteration.node_id),
+            "a main-shaped caller with the wrong exact target cannot displace a valid iteration receipt"
+        );
     }
 
     #[test]

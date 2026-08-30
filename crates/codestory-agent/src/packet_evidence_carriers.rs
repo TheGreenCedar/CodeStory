@@ -1948,6 +1948,8 @@ pub fn citation_owns_command_event_loop_driver(citation: &AgentCitationDto) -> b
         &tokens,
         &[
             "client",
+            "config",
+            "configuration",
             "connection",
             "delete",
             "destroy",
@@ -1962,6 +1964,10 @@ pub fn citation_owns_command_event_loop_driver(citation: &AgentCitationDto) -> b
         return false;
     }
     let terminal = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    // A main-shaped callable is only a candidate for the requirement's exact CALL-boundary
+    // receipt. `COMMAND_EVENT_LOOP_REQUIREMENT` has no role-only fallback, so this never proves
+    // the driver by name: the raw Certain edge still has to reach the declared event-loop target.
+    let main_boundary_candidate = terminal.last().is_some_and(|token| token == "main");
     let driver_action = has_token(
         &terminal,
         &[
@@ -1989,7 +1995,9 @@ pub fn citation_owns_command_event_loop_driver(citation: &AgentCitationDto) -> b
             let repeats = has_token(&source_tokens, &["for", "loop", "loops", "until", "while"]);
             names_loop && drives_loop && repeats
         });
-    driver_action && (loop_owner || processes_events || event_runtime_main || source_backed_main)
+    main_boundary_candidate
+        || (driver_action
+            && (loop_owner || processes_events || event_runtime_main || source_backed_main))
 }
 
 /// Typed CALL targets that perform one iteration of an event loop.
@@ -2420,9 +2428,12 @@ mod tests {
         }
         for negative in [
             "Connection.rebindEventLoop",
+            "Connection.rebindMain",
             "EventLoop.delete",
             "EventHandler.dispatch",
+            "EventLoopMetrics.main",
             "EventLoopMetrics.poll",
+            "mainConfig",
         ] {
             assert!(
                 !citation_owns_command_event_loop_driver(&citation(
@@ -2431,6 +2442,16 @@ mod tests {
                     NodeKind::FUNCTION,
                 )),
                 "{negative} must not own the event-loop driver boundary"
+            );
+        }
+        for main_boundary_candidate in ["main", "aeMain", "runtimeMain"] {
+            assert!(
+                citation_owns_command_event_loop_driver(&citation(
+                    main_boundary_candidate,
+                    "src/runtime.c",
+                    NodeKind::FUNCTION,
+                )),
+                "{main_boundary_candidate} may enter exact boundary discovery"
             );
         }
         let mut source_backed_main = citation("runtimeMain", "src/runtime.c", NodeKind::FUNCTION);

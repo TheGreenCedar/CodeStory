@@ -4630,7 +4630,7 @@ mod tests {
             codestory_contracts::graph::Node {
                 id: CoreNodeId(40),
                 kind: NodeKind::FUNCTION,
-                serialized_name: "EventLoop.run".into(),
+                serialized_name: "aeMain".into(),
                 file_node_id: Some(CoreNodeId(1)),
                 start_line: Some(220),
                 end_line: Some(225),
@@ -4703,7 +4703,7 @@ mod tests {
             &storage,
             &HashMap::new(),
             &requirements,
-            &exact_boundary_test_citation(40, "EventLoop.run"),
+            &exact_boundary_test_citation(40, "aeMain"),
         )
         .expect("loop hydration")
         .expect("exact loop boundary");
@@ -4712,7 +4712,7 @@ mod tests {
         let mut answer = sidecar_answer_with_citation_node("10");
         answer.citations = vec![
             exact_boundary_test_citation(10, "processCommand"),
-            exact_boundary_test_citation(40, "EventLoop.run"),
+            exact_boundary_test_citation(40, "aeMain"),
         ];
         hydrate_packet_exact_call_boundaries_in_storage(
             &storage,

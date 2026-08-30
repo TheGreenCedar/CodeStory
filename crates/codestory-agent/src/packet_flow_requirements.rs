@@ -3445,6 +3445,37 @@ mod tests {
             "EventLoop.processEvents",
             NodeKind::FUNCTION,
         ));
+        let main_driver = witness("aeMain", "src/runtime.c", NodeKind::FUNCTION);
+        assert!(
+            !COMMAND_EVENT_LOOP_REQUIREMENT
+                .evidence
+                .citation_proves_without_call_boundary(&main_driver),
+            "a main-shaped entrypoint is never direct proof"
+        );
+        let main_loop_call = receipt(
+            "main-loop-driver",
+            main_driver.node_id.clone(),
+            NodeId("aeProcessEvents".to_string()),
+        );
+        assert!(flow_requirement_call_receipt_is_valid(
+            &COMMAND_EVENT_LOOP_REQUIREMENT,
+            &main_driver,
+            &main_loop_call,
+            "aeProcessEvents",
+            NodeKind::FUNCTION,
+        ));
+        let unrelated_main_call = receipt(
+            "unrelated-main-call",
+            main_driver.node_id.clone(),
+            NodeId("loadConfiguration".to_string()),
+        );
+        assert!(!flow_requirement_call_receipt_is_valid(
+            &COMMAND_EVENT_LOOP_REQUIREMENT,
+            &main_driver,
+            &unrelated_main_call,
+            "loadConfiguration",
+            NodeKind::FUNCTION,
+        ));
         let rebind = witness(
             "Connection.rebindEventLoop",
             "src/runtime.c",

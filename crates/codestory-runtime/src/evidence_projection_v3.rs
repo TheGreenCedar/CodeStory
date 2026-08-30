@@ -250,6 +250,7 @@ fn select_packet_evidence_indices(
     let relation_order = packet_evidence_kind_order(distinct, SupportUnitKindDto::TypedGraphEdge);
 
     let mandatory_indices = packet_material_carrier_indices(distinct);
+    let mandatory_relation_indices = packet_material_relation_indices(distinct);
     for index in &source_order {
         if mandatory_indices.contains(index) && selected_indices.insert(*index) {
             selected.push(*index);
@@ -331,7 +332,10 @@ fn select_packet_evidence_indices(
         .saturating_add(PACKET_PUBLIC_RELATION_ROWS_TARGET_V3)
         .min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
     for index in &relation_order {
-        if mandatory_indices.contains(index) && selected_indices.insert(*index) {
+        if selected.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
+            break;
+        }
+        if mandatory_relation_indices.contains(index) && selected_indices.insert(*index) {
             selected.push(*index);
         }
     }
@@ -466,10 +470,27 @@ fn packet_material_carrier_ranks(
                 }
                 SupportUnitKindDto::TypedGraphEdge => {
                     unit.id.strip_prefix("edge:").is_some_and(|edge_id| {
-                        obligation
-                            .carrier_edge_proofs
+                        let primary_edge_carrier = obligation
+                            .carrier_node_ids
                             .iter()
-                            .any(|proof| proof.edge_id.0 == edge_id)
+                            .find(|node_id| {
+                                obligation
+                                    .carrier_edge_proofs
+                                    .iter()
+                                    .any(|proof| &proof.carrier_node_id == *node_id)
+                            })
+                            .or_else(|| {
+                                obligation
+                                    .carrier_edge_proofs
+                                    .first()
+                                    .map(|proof| &proof.carrier_node_id)
+                            });
+                        primary_edge_carrier.is_some_and(|primary_edge_carrier| {
+                            obligation.carrier_edge_proofs.iter().any(|proof| {
+                                proof.carrier_node_id == *primary_edge_carrier
+                                    && proof.edge_id.0 == edge_id
+                            })
+                        })
                     })
                 }
                 SupportUnitKindDto::CompleteQueryNegative => false,
@@ -520,6 +541,56 @@ fn packet_material_carrier_indices(
             continue;
         }
         if let Some((_, _, index)) = best_candidate_by_obligation.get(&obligation).copied() {
+            required.insert(index);
+            covered_obligations.extend(distinct[index].3.iter().copied());
+        }
+    }
+    required
+}
+
+/// Keep one exact relation witness for each material obligation before repeated witnesses from an
+/// earlier obligation consume the relation envelope. Source and relation rows are complementary:
+/// the source says what the carrier contains, while the typed edge records the claimed boundary.
+fn packet_material_relation_indices(
+    distinct: &[(
+        SupportUnitKindDto,
+        PacketEvidenceRowV3Dto,
+        usize,
+        Vec<usize>,
+    )],
+) -> HashSet<usize> {
+    let mut obligation_order = Vec::new();
+    let mut best_candidate_by_obligation = HashMap::new();
+    for (index, (kind, _, relevance, obligations)) in distinct.iter().enumerate() {
+        if *kind != SupportUnitKindDto::TypedGraphEdge {
+            continue;
+        }
+        let candidate = (Reverse(*relevance), index);
+        for obligation in obligations {
+            obligation_order.push(*obligation);
+            best_candidate_by_obligation
+                .entry(*obligation)
+                .and_modify(|best| {
+                    if candidate < *best {
+                        *best = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+    obligation_order.sort_unstable();
+    obligation_order.dedup();
+
+    let mut covered_obligations = HashSet::new();
+    let mut required = HashSet::new();
+    for obligation in obligation_order {
+        if required.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
+            break;
+        }
+        if covered_obligations.contains(&obligation) {
+            continue;
+        }
+        if let Some((_, index)) = best_candidate_by_obligation.get(&obligation).copied() {
             required.insert(index);
             covered_obligations.extend(distinct[index].3.iter().copied());
         }
@@ -1609,6 +1680,188 @@ mod tests {
             "Flow.dispatch -[CALL]-> Router.handle"
         );
         assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+    }
+
+    #[test]
+    fn packet_evidence_keeps_each_material_source_with_an_exact_call_witness_under_the_cap() {
+        let mut support = (0..8)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("source-{index}");
+                unit.path = Some(format!("src/flow-{index}.rs"));
+                unit.symbol_id = Some(format!("Flow.stage{index}"));
+                unit.snippet = Some(format!("fn stage_{index}() {{}}"));
+                unit
+            })
+            .collect::<Vec<_>>();
+        support[0].symbol_id = Some("Loop.drive".to_owned());
+        support[1].symbol_id = Some("Command.route".to_owned());
+
+        let relation = |id: &str, caller: &str, target: &str| {
+            let mut unit = support_unit(SupportUnitKindDto::TypedGraphEdge);
+            unit.id = format!("edge:{id}");
+            unit.from_symbol = Some(caller.to_owned());
+            unit.edge_kind = Some("CALL".to_owned());
+            unit.to_symbol = Some(target.to_owned());
+            unit
+        };
+        for index in 0..5 {
+            support.push(relation(
+                &format!("loop-{index}"),
+                "Loop.drive",
+                &format!("Loop.tick{index}"),
+            ));
+        }
+        support.push(relation("command-route", "Command.route", "Command.check"));
+        for index in 0..4 {
+            support.push(relation(
+                &format!("ordinary-{index}"),
+                &format!("Ordinary{index}"),
+                &format!("OrdinaryTarget{index}"),
+            ));
+        }
+
+        let proof = |carrier: &str, edge: &str| PacketObligationCarrierEdgeProofDto {
+            carrier_node_id: NodeId(carrier.to_owned()),
+            edge_id: EdgeId(edge.to_owned()),
+            edge_kind: EdgeKind::CALL,
+        };
+        let mut loop_obligation = material_obligation("event-loop");
+        loop_obligation.carrier_node_ids = vec![NodeId("Loop.drive".to_owned())];
+        loop_obligation.carrier_edge_proofs = (0..5)
+            .map(|index| proof("Loop.drive", &format!("loop-{index}")))
+            .collect();
+        let mut command_obligation = material_obligation("command-router");
+        command_obligation.carrier_node_ids = vec![NodeId("Command.route".to_owned())];
+        command_obligation.carrier_edge_proofs = vec![proof("Command.route", "command-route")];
+
+        let evidence = packet_evidence_rows_with_obligations(
+            &support,
+            "Trace the loop and command route.",
+            &[loop_obligation, command_obligation],
+        );
+        let summaries = evidence
+            .iter()
+            .filter_map(|row| row.summary.as_ref().map(|summary| summary.as_str()))
+            .collect::<HashSet<_>>();
+        let symbols = evidence
+            .iter()
+            .filter_map(|row| row.symbol_id.as_ref().map(|symbol| symbol.as_str()))
+            .collect::<HashSet<_>>();
+
+        assert!(symbols.contains("Loop.drive"));
+        assert!(symbols.contains("Command.route"));
+        assert!(summaries.contains("Loop.drive -[CALL]-> Loop.tick0"));
+        assert!(summaries.contains("Command.route -[CALL]-> Command.check"));
+        assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+    }
+
+    #[test]
+    fn packet_evidence_binds_a_material_relation_to_the_primary_exact_carrier() {
+        let relation = |id: &str, caller: &str, target: &str| {
+            let mut unit = support_unit(SupportUnitKindDto::TypedGraphEdge);
+            unit.id = format!("edge:{id}");
+            unit.from_symbol = Some(caller.to_owned());
+            unit.edge_kind = Some("CALL".to_owned());
+            unit.to_symbol = Some(target.to_owned());
+            unit
+        };
+        let mut support = (0..12)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("source-{index}");
+                unit.path = Some(format!("src/filler-{index}.rs"));
+                unit.symbol_id = Some(format!("Filler{index}"));
+                unit.snippet = Some(format!("fn filler_{index}() {{}}"));
+                unit
+            })
+            .collect::<Vec<_>>();
+        support[0].symbol_id = Some("Runtime.main".to_owned());
+        support[1].symbol_id = Some("EventLoop.processEvents".to_owned());
+        support.push(relation(
+            "main-loop",
+            "Runtime.main",
+            "EventLoop.processEvents",
+        ));
+        support.push(relation(
+            "iteration",
+            "EventLoop.processEvents",
+            "EventLoop.processTimeEvents",
+        ));
+        let mut obligation = material_obligation("event-loop");
+        obligation.carrier_node_ids = vec![
+            NodeId("Runtime.main".to_owned()),
+            NodeId("EventLoop.processEvents".to_owned()),
+        ];
+        obligation.carrier_edge_proofs = vec![
+            PacketObligationCarrierEdgeProofDto {
+                carrier_node_id: NodeId("Runtime.main".to_owned()),
+                edge_id: EdgeId("main-loop".to_owned()),
+                edge_kind: EdgeKind::CALL,
+            },
+            PacketObligationCarrierEdgeProofDto {
+                carrier_node_id: NodeId("EventLoop.processEvents".to_owned()),
+                edge_id: EdgeId("iteration".to_owned()),
+                edge_kind: EdgeKind::CALL,
+            },
+        ];
+
+        let evidence = packet_evidence_rows_with_obligations(
+            &support,
+            "Trace how the process events iteration handles events and time events.",
+            &[obligation],
+        );
+        let summaries = evidence
+            .iter()
+            .filter_map(|row| row.summary.as_ref().map(|summary| summary.as_str()))
+            .collect::<HashSet<_>>();
+
+        assert!(summaries.contains("Runtime.main -[CALL]-> EventLoop.processEvents"));
+    }
+
+    #[test]
+    fn packet_evidence_never_overflows_when_material_sources_fill_the_closed_envelope() {
+        let mut support = Vec::new();
+        let mut obligations = Vec::new();
+        for index in 0..PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
+            let symbol = format!("Flow.stage{index}");
+            let edge_id = format!("edge-{index}");
+            let mut source = support_unit(SupportUnitKindDto::SourceRange);
+            source.id = format!("source-{index}");
+            source.path = Some(format!("src/stage-{index}.rs"));
+            source.symbol_id = Some(symbol.clone());
+            source.snippet = Some(format!("fn stage_{index}() {{}}"));
+            support.push(source);
+
+            let mut relation = support_unit(SupportUnitKindDto::TypedGraphEdge);
+            relation.id = format!("edge:{edge_id}");
+            relation.from_symbol = Some(symbol.clone());
+            relation.edge_kind = Some("CALL".to_owned());
+            relation.to_symbol = Some(format!("Flow.target{index}"));
+            support.push(relation);
+
+            let mut obligation = material_obligation(&format!("stage-{index}"));
+            obligation.carrier_node_ids = vec![NodeId(symbol.clone())];
+            obligation.carrier_edge_proofs = vec![PacketObligationCarrierEdgeProofDto {
+                carrier_node_id: NodeId(symbol),
+                edge_id: EdgeId(edge_id),
+                edge_kind: EdgeKind::CALL,
+            }];
+            obligations.push(obligation);
+        }
+
+        let evidence = packet_evidence_rows_with_obligations(
+            &support,
+            "Trace every material stage.",
+            &obligations,
+        );
+        assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+        assert!(
+            evidence
+                .iter()
+                .all(|row| row.kind == EvidenceKindV3Dto::ExactSource),
+            "source receipts that fill the closed envelope leave no lawful room for relation rows"
+        );
     }
 
     #[test]

@@ -668,6 +668,7 @@ pub(crate) fn agent_packet(
         &mut answer,
         &limits,
         &proof_session,
+        &protected_carrier_node_ids,
     );
 
     // Coverage belongs to the evidence that survives the real citation cap. Observing the
@@ -3087,6 +3088,7 @@ fn append_packet_carrier_source_sections(
     answer: &mut AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,
     proof_session: &PacketProofSession,
+    protected_carrier_node_ids: &[NodeId],
 ) -> (Vec<SupportUnitDto>, Vec<VerifiedSourceAspectReceipt>) {
     if answer.citations.is_empty() || limits.max_snippets == 0 {
         return (Vec::new(), Vec::new());
@@ -3096,27 +3098,21 @@ fn append_packet_carrier_source_sections(
     let mut steps = Vec::new();
     let mut source_support = Vec::new();
     let file_focus_text = packet_file_source_focus_text(question, answer);
-
-    'citations: for citation_index in 0..answer.citations.len() {
-        if steps.len() >= limits.max_snippets as usize {
-            break;
-        }
-        let citation = answer.citations[citation_index].clone();
-        let bounded_source_read = citation_needs_bounded_source_read(&citation);
+    let load_sources = |citation: &AgentCitationDto| -> Vec<CarrierSourceRange> {
+        let bounded_source_read = citation_needs_bounded_source_read(citation);
         let behavioral_source = matches!(
             citation.kind,
             NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
         );
         if !bounded_source_read && !behavioral_source {
-            continue;
+            return Vec::new();
         }
-        let started = Instant::now();
-        let sources = if bounded_source_read {
+        if bounded_source_read {
             let (Some(path), Some(line)) = (citation.file_path.as_deref(), citation.line) else {
-                continue;
+                return Vec::new();
             };
             let focused =
-                if citation.kind == NodeKind::FILE && citation_is_lexical_source_range(&citation) {
+                if citation.kind == NodeKind::FILE && citation_is_lexical_source_range(citation) {
                     focused_file_source_ranges(controller, &file_focus_text, path)
                 } else if behavioral_source {
                     controller
@@ -3202,56 +3198,140 @@ fn append_packet_carrier_source_sections(
                     }]
                 })
                 .unwrap_or_default()
-        };
+        }
+    };
+
+    // Spend one source slot on each exact material carrier first, then return to the original
+    // citation/window order for optional context. Reads remain on demand: once the existing
+    // snippet or byte cap binds, later citations are never opened.
+    let append_source = |answer: &mut AgentAnswerDto,
+                         rendered: &mut String,
+                         source_support: &mut Vec<SupportUnitDto>,
+                         steps: &mut Vec<AgentRetrievalStepDto>,
+                         citation_index: usize,
+                         duration_ms: u32,
+                         source: CarrierSourceRange|
+     -> bool {
+        promote_verified_bounded_source_citation(&mut answer.citations[citation_index]);
+        let citation = answer.citations[citation_index].clone();
+        let body = source.body.trim_end();
+        if body.is_empty() {
+            return true;
+        }
+        let retained_body = truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES);
+        let entry = format!("### {}\n\n{}\n\n", citation.display_name, retained_body);
+        if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
+            return false;
+        }
+        rendered.push_str(&entry);
+        let citation = &answer.citations[citation_index];
+        if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
+            let path = packet_display_path(&source.path);
+            let (start_line, end_line) =
+                source_receipt_line_range(retained_body, source.start_line);
+            source_support.push(SupportUnitDto {
+                id: format!("source:{}:{start_line}", citation.node_id.0),
+                kind: SupportUnitKindDto::SourceRange,
+                summary: format!(
+                    "source for {} at {path}:{start_line}-{end_line}",
+                    citation.display_name,
+                ),
+                path: Some(path),
+                symbol_id: Some(citation.node_id.0.clone()),
+                start_line: Some(start_line),
+                end_line: Some(end_line),
+                snippet: Some(retained_body.to_string()),
+                edge_kind: None,
+                from_symbol: None,
+                to_symbol: None,
+                query: None,
+            });
+        }
+        steps.push(AgentRetrievalStepDto {
+            kind: AgentRetrievalStepKindDto::SourceRead,
+            status: AgentRetrievalStepStatusDto::Ok,
+            duration_ms,
+            input: Vec::new(),
+            output: Vec::new(),
+            message: Some(format!("carrier source for {}", citation.display_name)),
+        });
+        true
+    };
+
+    let protected = protected_carrier_node_ids.iter().collect::<HashSet<_>>();
+    let mut attempted = HashSet::new();
+    let mut deferred = HashMap::new();
+    let mut source_read_citations = HashSet::new();
+    let mut source_budget_exhausted = false;
+    for citation_index in 0..answer.citations.len() {
+        if steps.len() >= limits.max_snippets as usize {
+            break;
+        }
+        let citation = answer.citations[citation_index].clone();
+        if !protected.contains(&citation.node_id) {
+            continue;
+        }
+        attempted.insert(citation_index);
+        debug_assert!(steps.len() < limits.max_snippets as usize);
+        debug_assert!(source_read_citations.insert(citation_index));
+        let started = Instant::now();
+        let mut sources = load_sources(&citation);
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u32::MAX);
         if sources.is_empty() {
             continue;
         }
-        promote_verified_bounded_source_citation(&mut answer.citations[citation_index]);
-        for source in sources {
+        let first = sources.remove(0);
+        if !append_source(
+            answer,
+            &mut rendered,
+            &mut source_support,
+            &mut steps,
+            citation_index,
+            duration_ms,
+            first,
+        ) {
+            source_budget_exhausted = true;
+            break;
+        }
+        deferred.insert(citation_index, (duration_ms, sources));
+    }
+
+    if !source_budget_exhausted {
+        'citations: for citation_index in 0..answer.citations.len() {
             if steps.len() >= limits.max_snippets as usize {
-                break 'citations;
+                break;
             }
-            let body = source.body.trim_end();
-            if body.is_empty() {
-                continue;
+            let citation = answer.citations[citation_index].clone();
+            let (duration_ms, sources) = if attempted.contains(&citation_index) {
+                deferred
+                    .remove(&citation_index)
+                    .unwrap_or_else(|| (0, Vec::new()))
+            } else {
+                debug_assert!(steps.len() < limits.max_snippets as usize);
+                debug_assert!(source_read_citations.insert(citation_index));
+                let started = Instant::now();
+                let sources = load_sources(&citation);
+                (
+                    started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
+                    sources,
+                )
+            };
+            for source in sources {
+                if steps.len() >= limits.max_snippets as usize {
+                    break 'citations;
+                }
+                if !append_source(
+                    answer,
+                    &mut rendered,
+                    &mut source_support,
+                    &mut steps,
+                    citation_index,
+                    duration_ms,
+                    source,
+                ) {
+                    break 'citations;
+                }
             }
-            let retained_body = truncate_carrier_source(body, CARRIER_SOURCE_MAX_SNIPPET_BYTES);
-            let entry = format!("### {}\n\n{}\n\n", citation.display_name, retained_body);
-            if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
-                break 'citations;
-            }
-            rendered.push_str(&entry);
-            let citation = &answer.citations[citation_index];
-            if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
-                let path = packet_display_path(&source.path);
-                let (start_line, end_line) =
-                    source_receipt_line_range(retained_body, source.start_line);
-                source_support.push(SupportUnitDto {
-                    id: format!("source:{}:{start_line}", citation.node_id.0),
-                    kind: SupportUnitKindDto::SourceRange,
-                    summary: format!(
-                        "source for {} at {path}:{start_line}-{end_line}",
-                        citation.display_name,
-                    ),
-                    path: Some(path),
-                    symbol_id: Some(citation.node_id.0.clone()),
-                    start_line: Some(start_line),
-                    end_line: Some(end_line),
-                    snippet: Some(retained_body.to_string()),
-                    edge_kind: None,
-                    from_symbol: None,
-                    to_symbol: None,
-                    query: None,
-                });
-            }
-            steps.push(AgentRetrievalStepDto {
-                kind: AgentRetrievalStepKindDto::SourceRead,
-                status: AgentRetrievalStepStatusDto::Ok,
-                duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
-                input: Vec::new(),
-                output: Vec::new(),
-                message: Some(format!("carrier source for {}", citation.display_name)),
-            });
         }
     }
 
