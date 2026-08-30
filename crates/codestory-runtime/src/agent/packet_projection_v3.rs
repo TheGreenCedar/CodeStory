@@ -316,10 +316,6 @@ fn compact_packet_candidate_v3(
 ) -> Result<PacketProjectionV3Dto, ProjectionBuildErrorV3> {
     let mut evidence = original_evidence.to_vec();
     for row in evidence.iter_mut().skip(detailed_rows) {
-        row.path = None;
-        row.symbol_id = None;
-        row.start_line = None;
-        row.end_line = None;
         row.summary = None;
     }
     let mut gaps = original_gaps.to_vec();
@@ -1077,7 +1073,11 @@ mod tests {
             [Some("first summary"), None]
         );
         assert_eq!(evidence.as_slice()[0].start_line, Some(7));
-        assert_eq!(evidence.as_slice()[1].start_line, None);
+        assert_eq!(
+            evidence.as_slice()[1].start_line,
+            Some(7),
+            "compaction removes optional prose without erasing the evidence locator"
+        );
         assert_eq!(
             gaps.as_slice()
                 .iter()
@@ -1180,6 +1180,112 @@ mod tests {
                 .skip(4)
                 .all(|row| row.summary.is_none())
         );
+    }
+
+    #[test]
+    fn modern_packet_compaction_retains_every_multifile_source_locator() {
+        let evidence = (0..16)
+            .map(|index| {
+                let id = format!("packet-evidence-{index:03}");
+                let mut row = packet_evidence(
+                    &id,
+                    Some(&format!(
+                        "source-backed stage {index}: {}",
+                        "implementation evidence ".repeat(24)
+                    )),
+                );
+                row.path = Some(
+                    PathTextV3::new(format!("lib/src/stage_{index}.dart"))
+                        .expect("bounded source path"),
+                );
+                row.symbol_id = Some(
+                    codestory_contracts::packet_projection_v3::SymbolIdTextV3::new(format!(
+                        "Stage{index}.send"
+                    ))
+                    .expect("bounded symbol identity"),
+                );
+                row.start_line = Some(index + 1);
+                row.end_line = Some(index + 4);
+                row
+            })
+            .collect::<Vec<_>>();
+        let record = record_fixture_with(
+            "explain the complete multi-file request flow",
+            PacketBudgetModeDto::Compact,
+            PacketProfileV3::Callflow,
+            evidence,
+            Vec::new(),
+            None,
+            RetrievalStateDescriptorV3Dto {
+                state: RetrievalStateV3Dto::Full,
+                generation_id: Some(identity("retrieval-generation-1")),
+            },
+            Vec::new(),
+            true,
+        );
+        let diagnostics = diagnostics_capability_fixture();
+        let four_summary_shape =
+            build_packet_projection_v3(&record, diagnostics.clone(), |candidate| match candidate {
+                PacketProjectionV3Dto::Complete { evidence, .. }
+                    if evidence
+                        .as_slice()
+                        .iter()
+                        .filter(|row| row.summary.is_some())
+                        .count()
+                        > 4 =>
+                {
+                    Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1)
+                }
+                PacketProjectionV3Dto::Complete { .. } => Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3),
+                PacketProjectionV3Dto::BudgetExceeded { .. } => {
+                    Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3)
+                }
+            })
+            .expect("four-summary packet shape");
+        let fixed_envelope_bytes = PACKET_PUBLIC_RESULT_MAX_BYTES_V3
+            - planned_transport_size(PlannedTransportShape::June2025, &four_summary_shape);
+
+        let projection = build_packet_projection_v3(&record, diagnostics, |candidate| {
+            Ok(
+                planned_transport_size(PlannedTransportShape::June2025, candidate)
+                    + fixed_envelope_bytes,
+            )
+        })
+        .expect("the multi-file locator envelope should fit at sixteen KiB");
+        let PacketProjectionV3Dto::Complete { evidence, gaps, .. } = projection else {
+            panic!("the bounded multi-file packet should remain complete");
+        };
+
+        assert_eq!(evidence.as_slice().len(), 16);
+        assert_eq!(
+            evidence
+                .as_slice()
+                .iter()
+                .filter(|row| row.summary.is_some())
+                .count(),
+            4
+        );
+        assert!(
+            evidence.as_slice().iter().all(|row| {
+                row.path.is_some()
+                    && row.symbol_id.is_some()
+                    && row.start_line.is_some()
+                    && row.end_line.is_some()
+            }),
+            "compaction must not turn preserved evidence identities into contentless rows"
+        );
+        assert_eq!(
+            evidence.as_slice()[15]
+                .path
+                .as_ref()
+                .map(|path| path.as_str()),
+            Some("lib/src/stage_15.dart"),
+            "the only locator for a later upstream file must survive summary trimming"
+        );
+        assert!(gaps.as_slice().iter().any(|gap| {
+            gap.identity.gap_id.as_str() == "packet-optional-context-omitted"
+                && gap.kind == GapKindV3Dto::OutputBudgetExceeded
+        }));
     }
 
     #[derive(Clone, Copy)]
