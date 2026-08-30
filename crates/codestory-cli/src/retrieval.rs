@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, bail};
-use codestory_contracts::api::{IndexMode, IndexingPhaseTimings};
+use codestory_contracts::api::{
+    IncrementalCoreWallTimings, IncrementalScheduledPathDto, IndexMode, IndexingPhaseTimings,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use codestory_runtime::{
     FinalizeComponentWork, FinalizeIndexOutcome, FinalizePhaseTiming, RetrievalIndexManifest,
@@ -218,6 +221,7 @@ fn run_retrieval_query(cmd: RetrievalQueryCommand) -> Result<()> {
 }
 
 fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
+    let command_started = Instant::now();
     preflight_output(cmd.output_file.as_deref())?;
     let sidecar_profile = cmd.profile.unwrap_or(CliSidecarProfile::Local);
     let runtime = RuntimeContext::new_inspect_only(&cmd.project)?;
@@ -230,6 +234,7 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
     let refresh_mode = decision.effective_mode;
     ensure_retrieval_index_embedding_policy(&sidecar)?;
     let mut core_phase_timings = run_retrieval_index_refresh(&runtime, cmd.refresh, refresh_mode)?;
+    let retrieval_started = Instant::now();
     let outcome = match finalize_retrieval_index_for_sidecar_runtime(&runtime, &sidecar) {
         Ok(outcome) => outcome,
         Err(error) if retrieval_index_should_retry_full_refresh(cmd.refresh, &error) => {
@@ -244,10 +249,35 @@ fn run_retrieval_index(cmd: RetrievalIndexCommand) -> Result<()> {
         }
         Err(error) => return Err(error),
     };
+    let retrieval_finalize_ms = retrieval_started
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let incremental_wall_receipt = match (
+        refresh_mode,
+        core_phase_timings
+            .as_ref()
+            .and_then(|timings| timings.incremental_core_wall.as_ref()),
+    ) {
+        (Some(IndexMode::Incremental), Some(core_wall)) => Some(
+            build_incremental_wall_receipt(
+                command_started
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64,
+                retrieval_finalize_ms,
+                core_wall,
+                &outcome.phase_timings,
+            )
+            .context("incremental wall receipt")?,
+        ),
+        _ => None,
+    };
     emit_retrieval_index(
         cmd.format,
         &outcome,
         core_phase_timings.as_ref(),
+        incremental_wall_receipt.as_ref(),
         cmd.output_file.as_deref(),
     )
 }
@@ -390,8 +420,163 @@ struct RetrievalIndexOutput<'a> {
     generation_retention: &'a codestory_runtime::GenerationRetentionApplyReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     core_phase_timings: Option<&'a IndexingPhaseTimings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    incremental_wall_receipt: Option<&'a IncrementalWallReceiptV1>,
     retrieval_phase_timings: Vec<RetrievalPhaseTimingOutput<'a>>,
     retrieval_component_work: Vec<RetrievalComponentWorkOutput<'a>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct IncrementalWallReceiptV1 {
+    contract: &'static str,
+    total_ms: u64,
+    core_refresh_ms: u64,
+    retrieval_finalize_ms: u64,
+    accounted_ms: u64,
+    reconciliation_basis_points: u32,
+    attributed_ms: u64,
+    attributed_basis_points: u32,
+    phases: IncrementalWallReceiptPhasesV1,
+    scheduled_paths: Vec<IncrementalScheduledPathDto>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+struct IncrementalWallReceiptPhasesV1 {
+    discovery_and_scheduling_ms: u64,
+    stage_open_ms: u64,
+    parse_and_extraction_ms: u64,
+    core_staging_and_mutation_ms: u64,
+    candidate_sealing_ms: u64,
+    pointer_publication_ms: u64,
+    lexical_ms: u64,
+    vector_ms: u64,
+    graph_ms: u64,
+    retrieval_input_fingerprint_ms: u64,
+    retrieval_manifest_publication_ms: u64,
+    lock_wait_ms: u64,
+    process_ipc_ms: u64,
+    unattributed_ms: u64,
+}
+
+impl IncrementalWallReceiptPhasesV1 {
+    fn sum(&self) -> u64 {
+        self.discovery_and_scheduling_ms
+            .saturating_add(self.stage_open_ms)
+            .saturating_add(self.parse_and_extraction_ms)
+            .saturating_add(self.core_staging_and_mutation_ms)
+            .saturating_add(self.candidate_sealing_ms)
+            .saturating_add(self.pointer_publication_ms)
+            .saturating_add(self.lexical_ms)
+            .saturating_add(self.vector_ms)
+            .saturating_add(self.graph_ms)
+            .saturating_add(self.retrieval_input_fingerprint_ms)
+            .saturating_add(self.retrieval_manifest_publication_ms)
+            .saturating_add(self.lock_wait_ms)
+            .saturating_add(self.process_ipc_ms)
+            .saturating_add(self.unattributed_ms)
+    }
+}
+
+fn phase_total(timings: &[FinalizePhaseTiming], phase: &str) -> u64 {
+    timings
+        .iter()
+        .filter(|timing| timing.phase == phase)
+        .fold(0_u64, |total, timing| {
+            total.saturating_add(timing.elapsed_ms)
+        })
+}
+
+fn basis_points(numerator: u64, denominator: u64) -> u32 {
+    if denominator == 0 {
+        return 10_000;
+    }
+    numerator
+        .saturating_mul(10_000)
+        .checked_div(denominator)
+        .unwrap_or_default()
+        .min(10_000) as u32
+}
+
+fn build_incremental_wall_receipt(
+    total_ms: u64,
+    retrieval_finalize_ms: u64,
+    core: &IncrementalCoreWallTimings,
+    retrieval: &[FinalizePhaseTiming],
+) -> Result<IncrementalWallReceiptV1> {
+    let core_named_ms = u64::from(core.discovery_and_scheduling_ms)
+        .saturating_add(u64::from(core.stage_open_ms))
+        .saturating_add(u64::from(core.parse_and_extraction_ms))
+        .saturating_add(u64::from(core.core_staging_and_mutation_ms))
+        .saturating_add(u64::from(core.candidate_sealing_ms))
+        .saturating_add(u64::from(core.pointer_publication_ms))
+        .saturating_add(u64::from(core.lock_wait_ms))
+        .saturating_add(u64::from(core.unattributed_ms));
+    if core_named_ms != u64::from(core.core_refresh_ms) {
+        bail!(
+            "incremental core wall does not reconcile: phases={core_named_ms} total={}",
+            core.core_refresh_ms
+        );
+    }
+    let vector_complete = phase_total(retrieval, "embedded vectors");
+    let vector_incremental = phase_total(retrieval, "incremental embedded vectors");
+    if vector_complete > 0 && vector_incremental > 0 {
+        bail!("retrieval finalization reported both complete and incremental vector totals");
+    }
+    let vector_total = vector_complete.max(vector_incremental);
+    let process_ipc_ms = phase_total(retrieval, "vector ipc and orchestration").min(vector_total);
+    let retrieval_input_fingerprint_ms = phase_total(retrieval, "input fingerprint");
+    let lexical_ms = phase_total(retrieval, "lexical sidecar");
+    let graph_ms = phase_total(retrieval, "graph artifact");
+    let retrieval_manifest_publication_ms = phase_total(retrieval, "manifest write");
+    let retrieval_named_ms = retrieval_input_fingerprint_ms
+        .saturating_add(lexical_ms)
+        .saturating_add(vector_total)
+        .saturating_add(graph_ms)
+        .saturating_add(retrieval_manifest_publication_ms);
+    if retrieval_named_ms > retrieval_finalize_ms {
+        bail!(
+            "retrieval phases exceed finalization wall: phases={retrieval_named_ms} total={retrieval_finalize_ms}"
+        );
+    }
+    let command_named_ms = u64::from(core.core_refresh_ms).saturating_add(retrieval_finalize_ms);
+    if command_named_ms > total_ms {
+        bail!(
+            "core and retrieval phases exceed command wall: phases={command_named_ms} total={total_ms}"
+        );
+    }
+    let unattributed_ms = u64::from(core.unattributed_ms)
+        .saturating_add(retrieval_finalize_ms.saturating_sub(retrieval_named_ms))
+        .saturating_add(total_ms.saturating_sub(command_named_ms));
+    let phases = IncrementalWallReceiptPhasesV1 {
+        discovery_and_scheduling_ms: u64::from(core.discovery_and_scheduling_ms),
+        stage_open_ms: u64::from(core.stage_open_ms),
+        parse_and_extraction_ms: u64::from(core.parse_and_extraction_ms),
+        core_staging_and_mutation_ms: u64::from(core.core_staging_and_mutation_ms),
+        candidate_sealing_ms: u64::from(core.candidate_sealing_ms),
+        pointer_publication_ms: u64::from(core.pointer_publication_ms),
+        lexical_ms,
+        vector_ms: vector_total.saturating_sub(process_ipc_ms),
+        graph_ms,
+        retrieval_input_fingerprint_ms,
+        retrieval_manifest_publication_ms,
+        lock_wait_ms: u64::from(core.lock_wait_ms),
+        process_ipc_ms,
+        unattributed_ms,
+    };
+    let accounted_ms = phases.sum();
+    let attributed_ms = total_ms.saturating_sub(unattributed_ms);
+    Ok(IncrementalWallReceiptV1 {
+        contract: "codestory.incremental-wall-receipt/v1",
+        total_ms,
+        core_refresh_ms: u64::from(core.core_refresh_ms),
+        retrieval_finalize_ms,
+        accounted_ms,
+        reconciliation_basis_points: basis_points(accounted_ms, total_ms),
+        attributed_ms,
+        attributed_basis_points: basis_points(attributed_ms, total_ms),
+        phases,
+        scheduled_paths: core.scheduled_paths.clone(),
+    })
 }
 
 #[derive(serde::Serialize)]
@@ -479,6 +664,7 @@ fn emit_retrieval_index(
     format: OutputFormat,
     outcome: &FinalizeIndexOutcome,
     core_phase_timings: Option<&IndexingPhaseTimings>,
+    incremental_wall_receipt: Option<&IncrementalWallReceiptV1>,
     output_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let retrieval_phase_timings = safe_retrieval_phase_timings(&outcome.phase_timings);
@@ -490,6 +676,7 @@ fn emit_retrieval_index(
         generation_retention_plan: &outcome.generation_retention_plan,
         generation_retention: &outcome.generation_retention,
         core_phase_timings,
+        incremental_wall_receipt,
         retrieval_phase_timings,
         retrieval_component_work,
     };
@@ -509,6 +696,17 @@ fn emit_retrieval_index(
     if let Some(timings) = core_phase_timings {
         markdown.push_str("\n## Core indexing\n\n");
         crate::output::append_index_phase_timings(&mut markdown, timings);
+    }
+    if let Some(receipt) = incremental_wall_receipt {
+        markdown.push_str("\n## Incremental wall receipt\n\n");
+        markdown.push_str(&format!(
+            "- total: {} ms\n- accounted: {} ms\n- reconciliation: {} bp\n- attributed: {} ms\n- attributed: {} bp\n",
+            receipt.total_ms,
+            receipt.accounted_ms,
+            receipt.reconciliation_basis_points,
+            receipt.attributed_ms,
+            receipt.attributed_basis_points,
+        ));
     }
     markdown.push_str("\n## Retrieval phases\n\n");
     for timing in &payload.retrieval_phase_timings {
@@ -793,6 +991,72 @@ mod tests {
         assert_eq!(safe_work[0].predecessor_bytes, Some(1_024));
         assert_eq!(safe_work[0].output_bytes, Some(1_100));
         assert_eq!(safe_work[0].attested_bytes, Some(1_100));
+    }
+
+    #[test]
+    fn incremental_wall_receipt_uses_exclusive_phases_and_reconciles_outer_wall() {
+        let core = codestory_contracts::api::IncrementalCoreWallTimings {
+            core_refresh_ms: 10_000,
+            discovery_and_scheduling_ms: 120,
+            stage_open_ms: 400,
+            parse_and_extraction_ms: 100,
+            core_staging_and_mutation_ms: 5_080,
+            candidate_sealing_ms: 1_700,
+            pointer_publication_ms: 2_400,
+            lock_wait_ms: 200,
+            unattributed_ms: 0,
+            scheduled_paths: vec![codestory_contracts::api::IncrementalScheduledPathDto {
+                path: "src/server.c".into(),
+                action: codestory_contracts::api::IncrementalScheduledPathActionDto::Index,
+                reason: codestory_contracts::api::IncrementalScheduledPathReasonDto::SourceIdentityChanged,
+            }],
+        };
+        let retrieval = vec![
+            FinalizePhaseTiming {
+                phase: "input fingerprint".into(),
+                elapsed_ms: 350,
+            },
+            FinalizePhaseTiming {
+                phase: "lexical sidecar".into(),
+                elapsed_ms: 1_902,
+            },
+            FinalizePhaseTiming {
+                phase: "incremental embedded vectors".into(),
+                elapsed_ms: 741,
+            },
+            FinalizePhaseTiming {
+                phase: "vector native encode".into(),
+                elapsed_ms: 9_999,
+            },
+            FinalizePhaseTiming {
+                phase: "vector ipc and orchestration".into(),
+                elapsed_ms: 343,
+            },
+            FinalizePhaseTiming {
+                phase: "graph artifact".into(),
+                elapsed_ms: 1_388,
+            },
+            FinalizePhaseTiming {
+                phase: "manifest write".into(),
+                elapsed_ms: 1_181,
+            },
+            FinalizePhaseTiming {
+                phase: "unattributed".into(),
+                elapsed_ms: 289,
+            },
+        ];
+
+        let receipt = build_incremental_wall_receipt(16_000, 5_851, &core, &retrieval)
+            .expect("build reconciled receipt");
+        assert_eq!(receipt.contract, "codestory.incremental-wall-receipt/v1");
+        assert_eq!(receipt.total_ms, 16_000);
+        assert_eq!(receipt.accounted_ms, 16_000);
+        assert_eq!(receipt.reconciliation_basis_points, 10_000);
+        assert_eq!(receipt.phases.vector_ms, 398);
+        assert_eq!(receipt.phases.process_ipc_ms, 343);
+        assert_eq!(receipt.phases.unattributed_ms, 438);
+        assert_eq!(receipt.phases.sum(), receipt.total_ms);
+        assert_eq!(receipt.scheduled_paths, core.scheduled_paths);
     }
 
     struct LiveOperationFixture {

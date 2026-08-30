@@ -275,6 +275,7 @@ pub(super) fn sample_phase_timings() -> IndexingPhaseTimings {
             catalog_publication_ms: 30,
             unattributed_ms: 20,
         }),
+        incremental_core_wall: None,
         source_prepare_ms: Some(41),
         projection_batch_wall_ms: Some(50),
         projection_batch_transactions: Some(2),
@@ -375,6 +376,7 @@ pub(super) fn sample_phase_timings() -> IndexingPhaseTimings {
         }),
         core_promotion: Some(CorePromotionTimings {
             total_ms: 89,
+            lock_wait_ms: 0,
             lock_recovery_ms: 1,
             candidate_validation_ms: 11,
             previous_validation_ms: 12,

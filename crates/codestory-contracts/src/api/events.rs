@@ -18,6 +18,52 @@ pub struct FullRefreshWallTimings {
     pub unattributed_ms: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum IncrementalScheduledPathActionDto {
+    Index,
+    Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum IncrementalScheduledPathReasonDto {
+    NewFile,
+    NotIndexed,
+    Incomplete,
+    RetryRequired,
+    SourceIdentityChanged,
+    VerifiedAbsent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct IncrementalScheduledPathDto {
+    pub path: String,
+    pub action: IncrementalScheduledPathActionDto,
+    pub reason: IncrementalScheduledPathReasonDto,
+}
+
+/// Exclusive wall-clock phases for one incremental core refresh.
+///
+/// The named durations plus `unattributed_ms` reconcile to
+/// `core_refresh_ms`. Component-level diagnostics elsewhere in
+/// [`IndexingPhaseTimings`] are nested details and must not be summed into this
+/// receipt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct IncrementalCoreWallTimings {
+    pub core_refresh_ms: u32,
+    pub discovery_and_scheduling_ms: u32,
+    pub stage_open_ms: u32,
+    pub parse_and_extraction_ms: u32,
+    pub core_staging_and_mutation_ms: u32,
+    pub candidate_sealing_ms: u32,
+    pub pointer_publication_ms: u32,
+    pub lock_wait_ms: u32,
+    pub unattributed_ms: u32,
+    #[serde(default)]
+    pub scheduled_paths: Vec<IncrementalScheduledPathDto>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct DatabaseSnapshotCopyTimings {
     pub copy_ms: u32,
@@ -57,6 +103,8 @@ impl PromotedValidationDto {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct CorePromotionTimings {
     pub total_ms: u32,
+    #[serde(default)]
+    pub lock_wait_ms: u32,
     pub lock_recovery_ms: u32,
     pub candidate_validation_ms: u32,
     pub previous_validation_ms: u32,
@@ -182,6 +230,8 @@ pub struct ProjectionPersistenceTimings {
 pub struct IndexingPhaseTimings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_refresh_wall: Option<FullRefreshWallTimings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incremental_core_wall: Option<IncrementalCoreWallTimings>,
     pub parse_index_ms: u32,
     pub projection_flush_ms: u32,
     pub edge_resolution_ms: u32,
@@ -468,6 +518,7 @@ mod tests {
     fn test_indexing_phase_timings_omits_optional_resolution_fields_when_none() {
         let timings = IndexingPhaseTimings {
             full_refresh_wall: None,
+            incremental_core_wall: None,
             parse_index_ms: 1,
             projection_flush_ms: 2,
             edge_resolution_ms: 3,
@@ -871,6 +922,7 @@ mod tests {
         };
         let core_promotion = CorePromotionTimings {
             total_ms: 89,
+            lock_wait_ms: 1,
             lock_recovery_ms: 1,
             candidate_validation_ms: 11,
             previous_validation_ms: 12,
@@ -978,6 +1030,44 @@ mod tests {
         let decoded: IndexingPhaseTimings =
             serde_json::from_value(value).expect("deserialize timings");
         assert_eq!(decoded.incremental_plan_probe, Some(probe));
+    }
+
+    #[test]
+    fn test_indexing_phase_timings_round_trips_reconciled_incremental_core_wall() {
+        let wall = IncrementalCoreWallTimings {
+            core_refresh_ms: 10_000,
+            discovery_and_scheduling_ms: 120,
+            stage_open_ms: 400,
+            parse_and_extraction_ms: 100,
+            core_staging_and_mutation_ms: 5_080,
+            candidate_sealing_ms: 1_700,
+            pointer_publication_ms: 2_400,
+            lock_wait_ms: 200,
+            unattributed_ms: 0,
+            scheduled_paths: vec![IncrementalScheduledPathDto {
+                path: "src/server.c".into(),
+                action: IncrementalScheduledPathActionDto::Index,
+                reason: IncrementalScheduledPathReasonDto::SourceIdentityChanged,
+            }],
+        };
+        let timings = IndexingPhaseTimings {
+            incremental_core_wall: Some(wall.clone()),
+            ..IndexingPhaseTimings::default()
+        };
+
+        let value = serde_json::to_value(&timings).expect("serialize timings");
+        assert_eq!(value["incremental_core_wall"]["core_refresh_ms"], 10_000);
+        assert_eq!(
+            value["incremental_core_wall"]["scheduled_paths"][0],
+            serde_json::json!({
+                "path": "src/server.c",
+                "action": "index",
+                "reason": "source_identity_changed"
+            })
+        );
+        let decoded: IndexingPhaseTimings =
+            serde_json::from_value(value).expect("deserialize timings");
+        assert_eq!(decoded.incremental_core_wall, Some(wall));
     }
 
     #[test]

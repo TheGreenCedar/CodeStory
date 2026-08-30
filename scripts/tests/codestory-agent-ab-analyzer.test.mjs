@@ -37,6 +37,8 @@ import {
   isTrustedPublishableRepoUrl,
   isPathInside,
   interactionTurnTelemetry,
+  installedAgentTiming,
+  installedAgentTimingCohortId,
   loadTaskForResult,
   loadReleaseEvidenceCorpusContract,
   loadTasks,
@@ -92,6 +94,7 @@ import {
   runAgentBenchmarkPipeline,
   runPlannedAgentRuns,
   runProcess,
+  timingIneligibleComparatorRow,
   buildQualityDebugPayload,
   qualityFailureReasons,
   taskSnapshotForResult,
@@ -1389,6 +1392,23 @@ test("retrieval index work evidence preserves the measured trust-boundary fields
     ],
   });
   assert.equal(benchmarkHarness.retrievalIndexWorkEvidence("not json"), null);
+
+  const receipt = {
+    contract: "codestory.incremental-wall-receipt/v1",
+    total_ms: 20_000,
+    accounted_ms: 20_000,
+    reconciliation_basis_points: 10_000,
+    scheduled_paths: [{ path: "src/server.c", action: "index", reason: "source_identity_changed" }],
+  };
+  assert.deepEqual(
+    benchmarkHarness.retrievalIndexWorkEvidence(JSON.stringify({
+      core_phase_timings: { publish_ms: 7 },
+      retrieval_phase_timings: [{ phase: "graph artifact", elapsed_ms: 3 }],
+      retrieval_component_work: [],
+      incremental_wall_receipt: receipt,
+    })).incremental_wall_receipt,
+    receipt,
+  );
 });
 
 test("exact lifecycle alternates preparation and restores the selected source bytes", async () => {
@@ -2511,6 +2531,66 @@ test("nonzero packet prelude preserves structured retrieval failure and keeps th
     assert.deepEqual(prelude.public.packet_contract_blockers, [prelude.public.error]);
     assert.equal(preludeAllowsAgentRun(prelude.public), false);
     assert.equal(prelude.packet, null);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh CLI packet prelude reports first-packet and continuation timing separately", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "codestory-packet-split-timing-"));
+  try {
+    const prompt = "Trace the bounded continuation.";
+    const questionSha256 = createHash("sha256").update(prompt).digest("hex");
+    const first = packetV3Fixture();
+    first.identity.question_sha256 = questionSha256;
+    first.status = "continuation_available";
+    first.gaps = [{
+      identity: { gap_id: "gap-v3" },
+      kind: "continuation_required",
+      message: "one bounded continuation",
+    }];
+    first.continuation = {
+      continuation_id: "continuation-v3",
+      remaining_rounds: 1,
+      gap_ids: [{ gap_id: "gap-v3" }],
+    };
+    const final = packetV3Fixture();
+    final.identity.question_sha256 = questionSha256;
+    const cliPath = path.join(root, "codestory-cli");
+    await writeFile(
+      cliPath,
+      `#!/usr/bin/env node\nconst continuation = process.argv.includes("--parent-packet-id");\nconst payload = continuation ? ${JSON.stringify(JSON.stringify(final))} : ${JSON.stringify(JSON.stringify(first))};\nsetTimeout(() => process.stdout.write(payload + "\\n"), continuation ? 15 : 25);\n`,
+      "utf8",
+    );
+    await chmod(cliPath, 0o755);
+
+    const prelude = await runCodeStoryPacketPrelude(
+      {
+        timeoutMs: 5_000,
+        publishable: false,
+        diagnosticExtraProbesFromManifest: false,
+      },
+      { task: { prompt, task_class: "route_tracing" } },
+      { path: root, prompt },
+      root,
+      "split-timing",
+      cliPath,
+      process.env,
+    );
+
+    assert.equal(prelude.public.packet_drill_continuation, true);
+    assert.equal(prelude.public.packet_process_count, 2);
+    assert.equal(prelude.public.transport_cell, "fresh_cli_prelude");
+    assert.ok(prelude.public.time_to_first_packet_ms >= 20);
+    assert.ok(prelude.public.continuation_ms >= 10);
+    assert.equal(prelude.public.time_to_final_packet_ms, prelude.public.wall_ms);
+    assert.ok(
+      Math.abs(
+        prelude.public.time_to_first_packet_ms
+          + prelude.public.continuation_ms
+          - prelude.public.time_to_final_packet_ms,
+      ) < 0.002,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -9057,4 +9137,89 @@ test("buildQualityDebugPayload preserves packet sufficiency diagnostics", () => 
     ],
     1,
   );
+});
+
+test("installed timing cohorts match only inside one host, model, load-policy, task, repeat, and window", () => {
+  const dimensions = {
+    execution_window_id: "window-2026-08-30T12:00:00Z",
+    host: {
+      platform: "darwin",
+      arch: "arm64",
+      cpu_model: "Apple M4 Max",
+      logical_cpu_count: 16,
+      total_memory_bytes: 64 * 1024 ** 3,
+    },
+    model: "gpt-5.6-sol",
+    load_policy: "fresh_agent_session",
+    task_id: "dart-http-client-flow",
+    repeat: 2,
+  };
+  const cohort = installedAgentTimingCohortId(dimensions);
+  assert.match(cohort, /^[0-9a-f]{64}$/);
+  assert.equal(installedAgentTimingCohortId({ ...dimensions, arm: "published_0_17_5" }), cohort);
+  assert.equal(installedAgentTimingCohortId({ ...dimensions, arm: "candidate_0_18" }), cohort);
+  for (const [field, value] of [
+    ["execution_window_id", "next-window"],
+    ["model", "gpt-5.6-terra"],
+    ["load_policy", "persistent_agent_session"],
+    ["task_id", "c-redis-command-loop"],
+    ["repeat", 3],
+  ]) {
+    assert.notEqual(installedAgentTimingCohortId({ ...dimensions, [field]: value }), cohort, field);
+  }
+  assert.notEqual(
+    installedAgentTimingCohortId({
+      ...dimensions,
+      host: { ...dimensions.host, logical_cpu_count: 12 },
+    }),
+    cohort,
+  );
+});
+
+test("installed timing separates runner, first packet, continuation, final packet, and whole task", () => {
+  const timing = installedAgentTiming({
+    timing_cohort_id: "a".repeat(64),
+    agent_runner_ms: 1_201.4,
+    time_to_first_packet_ms: 410.6,
+    continuation_ms: 92.2,
+    whole_task_wall_ms: 1_704.2,
+  });
+  assert.deepEqual(timing, {
+    timing_cohort_id: "a".repeat(64),
+    agent_runner_ms: 1_201,
+    time_to_first_packet_ms: 411,
+    continuation_ms: 92,
+    time_to_final_packet_ms: 503,
+    whole_task_wall_ms: 1_704,
+  });
+  assert.throws(
+    () => installedAgentTiming({
+      timing_cohort_id: "a".repeat(64),
+      agent_runner_ms: 10,
+      time_to_first_packet_ms: 20,
+      continuation_ms: 30,
+      whole_task_wall_ms: 59,
+    }),
+    /does not reconcile/,
+  );
+});
+
+test("reused comparator rows are always timing-ineligible", () => {
+  const row = timingIneligibleComparatorRow({
+    arm: "published_0_17_5",
+    comparative_wall_time_eligible: true,
+    installed_agent_timing: {
+      timing_cohort_id: "b".repeat(64),
+      agent_runner_ms: 100,
+      time_to_first_packet_ms: 10,
+      continuation_ms: 5,
+      time_to_final_packet_ms: 15,
+      whole_task_wall_ms: 115,
+      timing_eligible: true,
+    },
+  });
+  assert.equal(row.comparative_wall_time_eligible, false);
+  assert.equal(row.installed_agent_timing_eligible, false);
+  assert.equal(row.installed_agent_timing_ineligibility_reason, "reused_comparator_row");
+  assert.equal(Object.keys(row.installed_agent_timing).length, 6);
 });

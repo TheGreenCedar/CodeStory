@@ -148,7 +148,8 @@ fn assert_no_sqlite_sidecars(path: &Path) {
 
 fn assert_core_promotion_stats_reconcile(stats: &CorePromotionStats) {
     let named_ms = stats
-        .lock_recovery_ms
+        .lock_wait_ms
+        .saturating_add(stats.lock_recovery_ms)
         .saturating_add(stats.candidate_validation_ms)
         .saturating_add(stats.previous_validation_ms)
         .saturating_add(stats.rollback_backup_copy_ms.unwrap_or_default())

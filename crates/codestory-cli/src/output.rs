@@ -418,6 +418,22 @@ pub(crate) fn append_index_phase_timings(markdown: &mut String, timings: &Indexi
             wall.unattributed_ms,
         );
     }
+    if let Some(wall) = timings.incremental_core_wall.as_ref() {
+        let _ = writeln!(
+            markdown,
+            "incremental_core_wall_ms: core_refresh={} discovery_and_scheduling={} stage_open={} parse_and_extraction={} core_staging_and_mutation={} candidate_sealing={} pointer_publication={} lock_wait={} unattributed={} scheduled_paths={}",
+            wall.core_refresh_ms,
+            wall.discovery_and_scheduling_ms,
+            wall.stage_open_ms,
+            wall.parse_and_extraction_ms,
+            wall.core_staging_and_mutation_ms,
+            wall.candidate_sealing_ms,
+            wall.pointer_publication_ms,
+            wall.lock_wait_ms,
+            wall.unattributed_ms,
+            wall.scheduled_paths.len(),
+        );
+    }
     append_index_cache_timings(markdown, timings);
     let _ = writeln!(
         markdown,
@@ -606,8 +622,9 @@ fn append_index_cache_timings(markdown: &mut String, timings: &IndexingPhaseTimi
             .map_or_else(|| "none".to_string(), |value| value.to_string());
         let _ = writeln!(
             markdown,
-            "core_promotion_ms: total={} lock_recovery={} candidate_validation={} previous_validation={} rollback_backup_copy={} backup_validation={} prepared_journal_write={} prepared_journal_file_sync={} prepared_journal_directory_sync={} staged_to_live_restore={} promoted_validation={} committed_journal={} cleanup={} unattributed={}",
+            "core_promotion_ms: total={} lock_wait={} lock_recovery={} candidate_validation={} previous_validation={} rollback_backup_copy={} backup_validation={} prepared_journal_write={} prepared_journal_file_sync={} prepared_journal_directory_sync={} staged_to_live_restore={} promoted_validation={} committed_journal={} cleanup={} unattributed={}",
             promotion.total_ms,
+            promotion.lock_wait_ms,
             promotion.lock_recovery_ms,
             promotion.candidate_validation_ms,
             promotion.previous_validation_ms,

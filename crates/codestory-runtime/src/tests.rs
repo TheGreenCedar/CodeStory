@@ -9355,6 +9355,32 @@ fn changed_incremental_refresh_publishes_and_reports_the_probe_as_overhead() {
         timings.cache_refresh_ms.is_some(),
         "a changed workspace must still run the runtime cache rebuild"
     );
+    let wall = timings
+        .incremental_core_wall
+        .as_ref()
+        .expect("a changed incremental refresh must emit one exclusive core wall receipt");
+    assert_eq!(
+        wall.discovery_and_scheduling_ms
+            .saturating_add(wall.stage_open_ms)
+            .saturating_add(wall.parse_and_extraction_ms)
+            .saturating_add(wall.core_staging_and_mutation_ms)
+            .saturating_add(wall.candidate_sealing_ms)
+            .saturating_add(wall.pointer_publication_ms)
+            .saturating_add(wall.lock_wait_ms)
+            .saturating_add(wall.unattributed_ms),
+        wall.core_refresh_ms,
+        "exclusive incremental core phases must reconcile to the outer core wall"
+    );
+    assert_eq!(wall.scheduled_paths.len(), 1);
+    assert_eq!(wall.scheduled_paths[0].path, "lib.rs");
+    assert_eq!(
+        wall.scheduled_paths[0].action,
+        codestory_contracts::api::IncrementalScheduledPathActionDto::Index
+    );
+    assert_eq!(
+        wall.scheduled_paths[0].reason,
+        codestory_contracts::api::IncrementalScheduledPathReasonDto::SourceIdentityChanged
+    );
 
     let storage = Storage::open(&fixture.storage_path).expect("open post-refresh storage");
     let published = storage

@@ -191,6 +191,7 @@ pub struct RehydratedCacheRebaseStats {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CorePromotionStats {
     pub total_ms: u32,
+    pub lock_wait_ms: u32,
     pub lock_recovery_ms: u32,
     pub candidate_validation_ms: u32,
     pub previous_validation_ms: u32,
@@ -220,6 +221,7 @@ struct PromotionJournalWriteStats {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct CorePromotionDurations {
+    lock_wait: Duration,
     lock_recovery: Duration,
     candidate_validation: Duration,
     previous_validation: Duration,
@@ -244,6 +246,7 @@ impl CorePromotionDurations {
         promoted_validation: PromotedValidation,
     ) -> CorePromotionStats {
         let total_ms = duration_ms(total);
+        let lock_wait_ms = duration_ms(self.lock_wait);
         let lock_recovery_ms = duration_ms(self.lock_recovery);
         let candidate_validation_ms = duration_ms(self.candidate_validation);
         let previous_validation_ms = duration_ms(self.previous_validation);
@@ -256,7 +259,8 @@ impl CorePromotionDurations {
         let promoted_validation_ms = duration_ms(self.promoted_validation);
         let committed_journal_ms = duration_ms(self.committed_journal);
         let cleanup_ms = duration_ms(self.cleanup);
-        let named_ms = lock_recovery_ms
+        let named_ms = lock_wait_ms
+            .saturating_add(lock_recovery_ms)
             .saturating_add(candidate_validation_ms)
             .saturating_add(previous_validation_ms)
             .saturating_add(rollback_backup_copy_ms.unwrap_or_default())
@@ -270,6 +274,7 @@ impl CorePromotionDurations {
             .saturating_add(cleanup_ms);
         CorePromotionStats {
             total_ms,
+            lock_wait_ms,
             lock_recovery_ms,
             candidate_validation_ms,
             previous_validation_ms,
@@ -6234,8 +6239,10 @@ impl Storage {
         let promotion_started = Instant::now();
         let mut durations = CorePromotionDurations::default();
 
-        let lock_recovery_started = Instant::now();
+        let lock_wait_started = Instant::now();
         let _promotion_lock = PromotionLock::acquire(live_path)?;
+        durations.lock_wait = lock_wait_started.elapsed();
+        let lock_recovery_started = Instant::now();
         recover_interrupted_promotion_locked(live_path)?;
         if promotion_artifacts_exist(live_path) {
             return Err(promotion_error(format!(

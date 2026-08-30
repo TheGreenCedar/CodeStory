@@ -385,6 +385,7 @@ pub(super) fn core_promotion_timings(
 ) -> CorePromotionTimings {
     CorePromotionTimings {
         total_ms: stats.total_ms,
+        lock_wait_ms: stats.lock_wait_ms,
         lock_recovery_ms: stats.lock_recovery_ms,
         candidate_validation_ms: stats.candidate_validation_ms,
         previous_validation_ms: stats.previous_validation_ms,

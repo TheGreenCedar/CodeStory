@@ -2980,6 +2980,97 @@ function benchmarkRunId(parts) {
   return parts.map(artifactNamePart).join("-");
 }
 
+function installedAgentTimingCohortId(dimensions) {
+  const requiredStrings = [
+    "execution_window_id",
+    "model",
+    "load_policy",
+    "task_id",
+  ];
+  for (const field of requiredStrings) {
+    if (typeof dimensions?.[field] !== "string" || !dimensions[field].trim()) {
+      throw new Error(`installed timing cohort ${field} is required`);
+    }
+  }
+  if (!Number.isInteger(dimensions?.repeat) || dimensions.repeat <= 0) {
+    throw new Error("installed timing cohort repeat must be a positive integer");
+  }
+  if (!dimensions.host || typeof dimensions.host !== "object" || Array.isArray(dimensions.host)) {
+    throw new Error("installed timing cohort host is required");
+  }
+  const host = Object.fromEntries([
+    "platform",
+    "arch",
+    "cpu_model",
+    "logical_cpu_count",
+    "total_memory_bytes",
+  ].map((field) => [field, dimensions.host[field] ?? null]));
+  return sha256Bytes(stableJsonForHash({
+    contract: "codestory.installed-agent-timing-cohort/v1",
+    execution_window_id: dimensions.execution_window_id,
+    host,
+    model: dimensions.model,
+    load_policy: dimensions.load_policy,
+    task_id: dimensions.task_id,
+    repeat: dimensions.repeat,
+  }));
+}
+
+function installedAgentTiming(values) {
+  if (!SHA256_PATTERN.test(String(values?.timing_cohort_id ?? ""))) {
+    throw new Error("installed timing cohort id must be a lowercase SHA-256 digest");
+  }
+  const fields = [
+    "agent_runner_ms",
+    "time_to_first_packet_ms",
+    "continuation_ms",
+    "whole_task_wall_ms",
+  ];
+  for (const field of fields) {
+    if (typeof values[field] !== "number" || !Number.isFinite(values[field]) || values[field] < 0) {
+      throw new Error(`installed timing ${field} must be finite and nonnegative`);
+    }
+  }
+  const reconciled = values.agent_runner_ms
+    + values.time_to_first_packet_ms
+    + values.continuation_ms;
+  if (Math.abs(reconciled - values.whole_task_wall_ms) > 0.5) {
+    throw new Error(
+      `installed timing does not reconcile: phases=${reconciled} wall=${values.whole_task_wall_ms}`,
+    );
+  }
+  return {
+    timing_cohort_id: values.timing_cohort_id,
+    agent_runner_ms: Math.round(values.agent_runner_ms),
+    time_to_first_packet_ms: Math.round(values.time_to_first_packet_ms),
+    continuation_ms: Math.round(values.continuation_ms),
+    time_to_final_packet_ms: Math.round(
+      values.time_to_first_packet_ms + values.continuation_ms,
+    ),
+    whole_task_wall_ms: Math.round(values.whole_task_wall_ms),
+  };
+}
+
+function timingIneligibleComparatorRow(row) {
+  const timing = row.installed_agent_timing;
+  return {
+    ...row,
+    ...(timing ? {
+      installed_agent_timing: Object.fromEntries([
+        "timing_cohort_id",
+        "agent_runner_ms",
+        "time_to_first_packet_ms",
+        "continuation_ms",
+        "time_to_final_packet_ms",
+        "whole_task_wall_ms",
+      ].map((field) => [field, timing[field]])),
+    } : {}),
+    comparative_wall_time_eligible: false,
+    installed_agent_timing_eligible: false,
+    installed_agent_timing_ineligibility_reason: "reused_comparator_row",
+  };
+}
+
 function parseJsonLines(stdout) {
   const parsed = [];
   const malformed = [];
@@ -4638,6 +4729,11 @@ function preludePublicFields(prelude) {
     signal: prelude.signal,
     error: prelude.error,
     wall_ms: prelude.wall_ms,
+    time_to_first_packet_ms: prelude.time_to_first_packet_ms,
+    continuation_ms: prelude.continuation_ms,
+    time_to_final_packet_ms: prelude.time_to_final_packet_ms,
+    packet_process_count: prelude.packet_process_count,
+    transport_cell: prelude.transport_cell,
     stdout_path: prelude.stdout_path,
     stderr_path: prelude.stderr_path,
     stdout_bytes: prelude.stdout_bytes,
@@ -5876,10 +5972,12 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   let commandFailure = packetCommandFailureEnvelope(parsedOutput);
   let commandFailureReason = packetCommandFailureReason(commandFailure);
   let packet = commandFailure ? null : parsedOutput;
+  const timeToFirstPacketMs = Math.round((performance.now() - started) * 1000) / 1000;
 
   let activeStdoutPath = stdoutPath;
   let activeStderrPath = stderrPath;
   let drillContinuation = false;
+  let packetProcessCount = 1;
   if (
     result.status === "pass" &&
     !parseError &&
@@ -5890,6 +5988,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
   ) {
     const drillArgs = drillPacketCommandArgs(repoConfig, run.task, opts, packet);
     if (drillArgs) {
+      packetProcessCount += 1;
       const drillStdoutPath = path.join(outDir, `${runId}.codestory-packet-drill.stdout.json`);
       const drillStderrPath = path.join(outDir, `${runId}.codestory-packet-drill.stderr.txt`);
       const drillResult = await runProcess(codestoryCli, drillArgs, {
@@ -5923,7 +6022,13 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     }
   }
 
-  const wallMs = Math.round((performance.now() - started) * 1000) / 1000;
+  const timeToFinalPacketMs = packetProcessCount > 1
+    ? Math.round((performance.now() - started) * 1000) / 1000
+    : timeToFirstPacketMs;
+  const continuationMs = Math.round(
+    Math.max(0, timeToFinalPacketMs - timeToFirstPacketMs) * 1000,
+  ) / 1000;
+  const wallMs = timeToFinalPacketMs;
   const manifestQuality = packetManifestQualitySummary(packet, run.task);
   const contractBlockers = parseError
     ? [`packet JSON parse failed: ${parseError}`]
@@ -5952,6 +6057,11 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     signal: result.signal,
     error: result.error ?? parseError ?? commandFailureReason ?? contractBlockers[0] ?? null,
     wall_ms: wallMs,
+    time_to_first_packet_ms: timeToFirstPacketMs,
+    continuation_ms: continuationMs,
+    time_to_final_packet_ms: timeToFinalPacketMs,
+    packet_process_count: packetProcessCount,
+    transport_cell: "fresh_cli_prelude",
     stdout_path: activeStdoutPath,
     stderr_path: activeStderrPath,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
@@ -6022,6 +6132,8 @@ async function recordedHarnessPreludeEvents(result, runDir) {
 }
 
 async function runOne(opts, run, outDir) {
+  opts.timingExecutionWindowId ??=
+    `${new Date().toISOString()}:${process.pid}:${path.resolve(outDir)}`;
   const repoConfig = ALL_REPOS[run.repo];
   const runId = benchmarkRunId([
     run.repo,
@@ -6104,6 +6216,21 @@ async function runOne(opts, run, outDir) {
   const runnerWallMs = shouldRunAgent ? Math.round((performance.now() - started) * 1000) / 1000 : 0;
   const preludeWallMs = (codestoryPrelude?.public.wall_ms ?? 0) + (baselinePrelude?.public.wall_ms ?? 0);
   const wallMs = Math.round((runnerWallMs + preludeWallMs) * 1000) / 1000;
+  const timingCohortId = installedAgentTimingCohortId({
+    execution_window_id: opts.timingExecutionWindowId,
+    host: benchmarkHostClass([]),
+    model: opts.model ?? DEFAULT_BENCHMARK_MODEL,
+    load_policy: opts.timingLoadPolicy ?? "fresh_agent_session",
+    task_id: run.task?.id ?? run.repo,
+    repeat: run.repeat,
+  });
+  const installedTiming = installedAgentTiming({
+    timing_cohort_id: timingCohortId,
+    agent_runner_ms: runnerWallMs + (baselinePrelude?.public.wall_ms ?? 0),
+    time_to_first_packet_ms: codestoryPrelude?.public.time_to_first_packet_ms ?? 0,
+    continuation_ms: codestoryPrelude?.public.continuation_ms ?? 0,
+    whole_task_wall_ms: wallMs,
+  });
   const stdoutPath = path.join(outDir, `${runId}.stdout.jsonl`);
   const stderrPath = path.join(outDir, `${runId}.stderr.txt`);
   await writeFile(stdoutPath, result.stdout, "utf8");
@@ -6194,6 +6321,10 @@ async function runOne(opts, run, outDir) {
       ? `CodeStory binary identity ${codestoryBinaryIdentity.status}`
       : result.error,
     wall_ms: wallMs,
+    installed_agent_timing: installedTiming,
+    installed_agent_timing_eligible: run.comparative_wall_time_eligible !== false,
+    installed_agent_timing_ineligibility_reason:
+      run.comparative_wall_time_eligible === false ? "preparation_overlap" : null,
     exact_candidate_timing: opts.exactCandidate
       ? {
           cold_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.preparation_wall_ms ?? 0,
@@ -6951,6 +7082,9 @@ function retrievalIndexWorkEvidence(stdout) {
     core_phase_timings: payload?.core_phase_timings ?? null,
     retrieval_phase_timings: payload?.retrieval_phase_timings ?? null,
     retrieval_component_work: payload?.retrieval_component_work ?? null,
+    ...(payload?.incremental_wall_receipt == null
+      ? {}
+      : { incremental_wall_receipt: payload.incremental_wall_receipt }),
   };
   return Object.values(evidence).some((value) => value != null) ? evidence : null;
 }
@@ -7002,6 +7136,22 @@ function candidateIncrementalRetrievalWorkBlockers(evidence) {
     for (const entry of evidence.retrieval_component_work) {
       if (entry.mode === "complete") {
         blockers.push(`${label} retrieval rebuilt ${entry.component} completely`);
+      }
+    }
+    const receipt = evidence.incremental_wall_receipt;
+    if (receipt != null) {
+      if (
+        receipt.contract !== "codestory.incremental-wall-receipt/v1"
+        || !Number.isFinite(receipt.total_ms)
+        || receipt.total_ms < 0
+        || receipt.accounted_ms !== receipt.total_ms
+        || !Number.isInteger(receipt.reconciliation_basis_points)
+        || receipt.reconciliation_basis_points < 9_900
+      ) {
+        blockers.push(`${label} wall receipt does not reconcile at least 99% of outer wall`);
+      }
+      if (!Array.isArray(receipt.scheduled_paths)) {
+        blockers.push(`${label} wall receipt is missing scheduled paths and reasons`);
       }
     }
   }
@@ -12666,7 +12816,7 @@ async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
     }
     const currentContract = benchmarkContractForRun(opts, planned);
     const currentPublished = opts.exactCandidatePackageByArm.get("published_0_17_4");
-    const result = {
+    const result = timingIneligibleComparatorRow({
       ...reanalyzed,
       ...(planned.arm === "published_0_17_4" ? {
         codestory_prelude_cli: currentPublished.cli_path,
@@ -12687,7 +12837,7 @@ async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
           : null,
         reanalyzed_with_current_scorer: true,
       },
-    };
+    });
     reusable.set(key, {
       ...result,
       resource_accounting: resourceAccountingForResult(result),
@@ -14315,6 +14465,8 @@ export {
   codestoryRetrievalStatusSnapshot,
   extractCommandExecutions,
   interactionTurnTelemetry,
+  installedAgentTiming,
+  installedAgentTimingCohortId,
   isPathInside,
   isTrustedPublishableRepoUrl,
   loadTaskForResult,
@@ -14406,6 +14558,7 @@ export {
   taskSnapshotForResult,
   taskShardIndex,
   tasksForShard,
+  timingIneligibleComparatorRow,
   runCodeStoryPacketPrelude,
   runAgentBenchmarkPipeline,
   runPlannedAgentRuns,
