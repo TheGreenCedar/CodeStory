@@ -34,6 +34,7 @@
 //   crate is forbidden to spell (`fs::write` is contract-banned there).
 pub(crate) mod nucleo_policy;
 pub(crate) mod orchestrator;
+pub(crate) mod packet_accuracy_stage_ledger;
 pub(crate) mod packet_batch;
 pub(crate) mod packet_budget;
 pub(crate) mod packet_candidate;

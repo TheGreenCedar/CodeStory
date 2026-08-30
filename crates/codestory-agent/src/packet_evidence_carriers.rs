@@ -364,6 +364,88 @@ pub fn citation_owns_client_request_method(citation: &AgentCitationDto) -> bool 
         )
 }
 
+/// The public client contract's verb-named method. This is distinct from a convenience
+/// implementation supplied by a base/default client type.
+pub fn citation_owns_client_public_interface_method(citation: &AgentCitationDto) -> bool {
+    if !citation_has_client_request_verb(citation) {
+        return false;
+    }
+    let owner = callable_owner_tokens(citation);
+    has_token(&owner, &["client", "http", "https", "session", "fetch"])
+        && !client_owner_is_unrelated(&owner)
+        && !has_token(
+            &owner,
+            &[
+                "adapter",
+                "base",
+                "convenience",
+                "default",
+                "helper",
+                "impl",
+                "implementation",
+                "internal",
+                "mixin",
+                "mock",
+                "test",
+                "transport",
+            ],
+        )
+}
+
+/// A verb-named convenience implementation supplied by a base/default client type. This is
+/// distinct from the method declared by the public client contract.
+pub fn citation_owns_client_convenience_method(citation: &AgentCitationDto) -> bool {
+    if !citation_has_client_request_verb(citation) {
+        return false;
+    }
+    let owner = callable_owner_tokens(citation);
+    !client_owner_is_unrelated(&owner)
+        && has_token(
+            &owner,
+            &["base", "convenience", "default", "helper", "mixin"],
+        )
+        && has_token(&owner, &["client", "http", "https", "session"])
+}
+
+fn citation_has_client_request_verb(citation: &AgentCitationDto) -> bool {
+    matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
+        && matches!(
+            terminal(citation).as_str(),
+            "request" | "get" | "post" | "put" | "patch" | "delete" | "head" | "options"
+        )
+}
+
+fn callable_owner_tokens(citation: &AgentCitationDto) -> Vec<String> {
+    let owner = citation
+        .display_name
+        .rsplit_once([':', '.', '#', '/', '\\'])
+        .map(|(owner, _)| owner)
+        .unwrap_or_default();
+    identifier_tokens(owner)
+}
+
+fn client_owner_is_unrelated(owner: &[String]) -> bool {
+    has_token(
+        owner,
+        &[
+            "cache",
+            "database",
+            "db",
+            "feature",
+            "flag",
+            "hook",
+            "metric",
+            "metrics",
+            "monitor",
+            "monitoring",
+            "queue",
+            "storage",
+            "store",
+            "telemetry",
+        ],
+    )
+}
+
 /// The package-level HTTP helper that opens the outbound-request lifecycle. A bare `request`
 /// citation is lawful here only on the public API module; the exact outgoing CALL to the following
 /// client/session request stage remains mandatory and is checked by the flow requirement.
@@ -377,16 +459,20 @@ pub fn citation_owns_client_public_facade_helper(citation: &AgentCitationDto) ->
         return false;
     }
     let path_tokens = path_tokens(citation);
-    let public_api_surface = has_token(&path_tokens, &["api"])
-        || path(citation)
+    let display_path = path(citation);
+    let library_relative = display_path.strip_prefix("lib/").or_else(|| {
+        display_path
             .rsplit_once("/lib/")
-            .is_some_and(|(_, relative)| {
-                !relative.contains('/')
-                    && has_token(
-                        &path_tokens,
-                        &["http", "https", "request", "requests", "client"],
-                    )
-            });
+            .map(|(_, relative)| relative)
+    });
+    let public_api_surface = has_token(&path_tokens, &["api"])
+        || library_relative.is_some_and(|relative| {
+            !relative.contains('/')
+                && has_token(
+                    &path_tokens,
+                    &["http", "https", "request", "requests", "client"],
+                )
+        });
     public_api_surface
         && !names_or_path_token(
             citation,
@@ -2346,7 +2432,19 @@ pub(crate) fn carrier_taxonomy_vocabulary() -> Vec<String> {
         .chain(SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS)
         .chain(SEARCH_EVIDENCE_OUTPUT_ACTIONS)
         .chain(COMMAND_LOOP_CARRIER_TAXONOMY)
-        .chain(["evidence"].iter())
+        .chain(
+            [
+                "convenience",
+                "evidence",
+                "feature",
+                "internal",
+                "mixin",
+                "mock",
+                "monitor",
+                "test",
+            ]
+            .iter(),
+        )
         .flat_map(|term| [(*term).to_string(), taxonomy_plural(term)])
         .collect::<Vec<_>>();
     vocabulary.sort();
@@ -2913,6 +3011,64 @@ mod tests {
             "src/storage.rs",
             NodeKind::METHOD,
         )));
+
+        for positive in ["Client.get", "HttpClient.request", "Session.post"] {
+            assert!(
+                citation_owns_client_public_interface_method(&citation(
+                    positive,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{positive} should carry the public client interface facet"
+            );
+        }
+        for negative in [
+            "BaseClient.get",
+            "DefaultHttpClient.post",
+            "DatabaseClient.get",
+            "CacheClient.get",
+            "Store.get",
+        ] {
+            assert!(
+                !citation_owns_client_public_interface_method(&citation(
+                    negative,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{negative} must not carry the public client interface facet"
+            );
+        }
+
+        for positive in [
+            "BaseClient.get",
+            "DefaultHttpClient.post",
+            "ClientMixin.head",
+        ] {
+            assert!(
+                citation_owns_client_convenience_method(&citation(
+                    positive,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{positive} should carry the convenience implementation facet"
+            );
+        }
+        for negative in [
+            "Client.get",
+            "HttpClient.request",
+            "DatabaseClient.get",
+            "CacheClient.get",
+            "StoreClient.get",
+        ] {
+            assert!(
+                !citation_owns_client_convenience_method(&citation(
+                    negative,
+                    "src/client.rs",
+                    NodeKind::METHOD,
+                )),
+                "{negative} must not carry the convenience implementation facet"
+            );
+        }
 
         for positive in ["Session.send", "HttpClient.send"] {
             assert!(citation_owns_client_request_dispatch(&citation(

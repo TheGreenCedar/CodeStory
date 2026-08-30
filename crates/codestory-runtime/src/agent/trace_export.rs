@@ -636,6 +636,10 @@ pub(crate) fn write_packet_step_trace_from_env(
     let trace_path =
         std::env::var(codestory_contracts::config_registry::PACKET_STEP_TRACE_OUT_ENV).ok()?;
     let mut trace = packet_step_trace_json(answer);
+    crate::agent::packet_accuracy_stage_ledger::restore_existing_ledger(
+        std::path::Path::new(&trace_path),
+        &mut trace,
+    );
     trace["obligation_proof_verdicts"] = obligation_proof_verdicts_json(obligations);
     // R6 session observability (gate round 4): the final promotion need-set
     // with per-id pattern and ROLE provenance, per-query admission decisions

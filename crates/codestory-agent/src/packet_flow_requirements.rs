@@ -4,40 +4,40 @@ use crate::packet_evidence_carriers::{
     SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
     citation_may_start_command_event_loop_exact_boundary, citation_owns_buffer_read_write,
     citation_owns_buffer_storage, citation_owns_client_adapter_selection,
-    citation_owns_client_public_facade_helper, citation_owns_client_request_dispatch,
+    citation_owns_client_convenience_method, citation_owns_client_public_facade_helper,
+    citation_owns_client_public_interface_method, citation_owns_client_request_dispatch,
     citation_owns_client_request_entrypoint, citation_owns_client_request_finalization,
-    citation_owns_client_request_method, citation_owns_client_response_materialization,
-    citation_owns_client_transport_send, citation_owns_command_event_loop_driver,
-    citation_owns_command_router, citation_owns_css_animation_entrypoint,
-    citation_owns_css_animation_structure, citation_owns_css_structure,
-    citation_owns_form_custom_validation, citation_owns_form_native_constraint,
-    citation_owns_form_submit_guard, citation_owns_format_arguments,
-    citation_owns_formatter_fallback, citation_owns_hook_cache_helper,
-    citation_owns_hook_key_serialization, citation_owns_hook_mutation_flow,
-    citation_owns_hook_public_export, citation_owns_html_app_shell,
-    citation_owns_log_handler_processing, citation_owns_log_record_creation,
-    citation_owns_mapper_configuration, citation_owns_mapper_execution,
-    citation_owns_search_argument_planning, citation_owns_search_candidate_traversal,
-    citation_owns_search_evidence_classification, citation_owns_search_evidence_output,
-    citation_owns_search_haystack_construction, citation_owns_search_matcher_setup,
-    citation_owns_search_printer_setup, citation_owns_search_searcher_setup,
-    citation_owns_search_worker_construction, citation_owns_server_request_dispatch,
-    citation_owns_server_request_entrypoint, citation_owns_server_request_handler_entrypoint,
-    citation_owns_server_response_terminal, citation_owns_server_route_match_dispatch,
-    citation_owns_server_route_registration, citation_owns_shell_completion,
-    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
-    citation_owns_site_lifecycle, citation_owns_site_reader, citation_owns_site_terminal,
-    citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
-    citation_owns_string_region_handoff, client_public_facade_successor_call_target,
-    client_request_dispatch_predecessor_call_source, client_request_dispatch_successor_call_target,
-    client_request_entrypoint_call_target, command_event_loop_driver_call_target,
-    command_router_call_target, flow_belongs_to_client_request, flow_belongs_to_command_server,
-    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
-    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
-    flow_belongs_to_url_session, server_handler_chain_call_target,
-    server_request_dispatch_call_target, server_request_entrypoint_call_target,
-    server_response_terminal_call_target, server_route_insertion_call_target,
-    server_route_lookup_call_target,
+    citation_owns_client_response_materialization, citation_owns_client_transport_send,
+    citation_owns_command_event_loop_driver, citation_owns_command_router,
+    citation_owns_css_animation_entrypoint, citation_owns_css_animation_structure,
+    citation_owns_css_structure, citation_owns_form_custom_validation,
+    citation_owns_form_native_constraint, citation_owns_form_submit_guard,
+    citation_owns_format_arguments, citation_owns_formatter_fallback,
+    citation_owns_hook_cache_helper, citation_owns_hook_key_serialization,
+    citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
+    citation_owns_html_app_shell, citation_owns_log_handler_processing,
+    citation_owns_log_record_creation, citation_owns_mapper_configuration,
+    citation_owns_mapper_execution, citation_owns_search_argument_planning,
+    citation_owns_search_candidate_traversal, citation_owns_search_evidence_classification,
+    citation_owns_search_evidence_output, citation_owns_search_haystack_construction,
+    citation_owns_search_matcher_setup, citation_owns_search_printer_setup,
+    citation_owns_search_searcher_setup, citation_owns_search_worker_construction,
+    citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
+    citation_owns_server_request_handler_entrypoint, citation_owns_server_response_terminal,
+    citation_owns_server_route_match_dispatch, citation_owns_server_route_registration,
+    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
+    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
+    citation_owns_site_reader, citation_owns_site_terminal, citation_owns_string_blank_predicate,
+    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
+    client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
+    client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
+    command_event_loop_driver_call_target, command_router_call_target,
+    flow_belongs_to_client_request, flow_belongs_to_command_server, flow_belongs_to_indexing,
+    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
+    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
+    server_handler_chain_call_target, server_request_dispatch_call_target,
+    server_request_entrypoint_call_target, server_response_terminal_call_target,
+    server_route_insertion_call_target, server_route_lookup_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -65,7 +65,7 @@ use crate::packet_terms::{
     packet_terms_indicate_url_session_request_flow, prompt_search_terms,
 };
 use codestory_contracts::api::{
-    AgentCitationDto, EdgeKind, GraphEdgeDto, NodeKind, PacketTaskClassDto,
+    AgentCitationDto, EdgeKind, GraphEdgeDto, NodeId, NodeKind, PacketTaskClassDto,
 };
 
 const CALLABLE_NODE_KINDS: &[NodeKind] = &[NodeKind::FUNCTION, NodeKind::METHOD, NodeKind::MACRO];
@@ -475,6 +475,40 @@ impl FlowRequirement {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PacketMaterialFacetCarrier {
+    pub facet_id: &'static str,
+    pub node_id: NodeId,
+}
+
+/// Select one source-bearing carrier for each material flow facet, preserving the requirement and
+/// citation rank order. Protection keeps a reported-but-unproven facet visible through the packet
+/// cap; it never changes that facet's proof disposition.
+pub fn packet_material_facet_carriers(
+    requirements: &[FlowRequirement],
+    citations: &[AgentCitationDto],
+) -> Vec<PacketMaterialFacetCarrier> {
+    let mut selected = Vec::new();
+    let mut selected_nodes = std::collections::HashSet::new();
+    for requirement in requirements {
+        let Some(citation) = citations.iter().find(|citation| {
+            !selected_nodes.contains(&citation.node_id)
+                && citation.file_path.is_some()
+                && citation.line.is_some()
+                && crate::packet_evidence::citation_sufficiency_eligible(citation)
+                && requirement.evidence.citation_proves(citation)
+        }) else {
+            continue;
+        };
+        selected_nodes.insert(citation.node_id.clone());
+        selected.push(PacketMaterialFacetCarrier {
+            facet_id: requirement.id,
+            node_id: citation.node_id.clone(),
+        });
+    }
+    selected
+}
+
 pub fn packet_flow_requirements_for_terms(
     terms: &[String],
     task_class: PacketTaskClassDto,
@@ -795,6 +829,7 @@ fn push_client_send_requirements_for_terms(
         "helpers",
     ]) && has_any(&["client", "clients", "http", "httpclient"])
     {
+        requirements.push(CLIENT_PUBLIC_INTERFACE_REQUIREMENT);
         requirements.push(CLIENT_INTERFACE_HELPERS_REQUIREMENT);
     }
     if has_any(&[
@@ -850,6 +885,7 @@ fn push_full_client_outbound_request_flow(
         "helper",
         "helpers",
     ]) {
+        requirements.push(CLIENT_PUBLIC_INTERFACE_REQUIREMENT);
         requirements.push(CLIENT_INTERFACE_HELPERS_REQUIREMENT);
     }
     requirements.push(CLIENT_REQUEST_DISPATCH_FLOW[0]);
@@ -1154,7 +1190,16 @@ const CLIENT_INTERFACE_HELPERS_REQUIREMENT: FlowRequirement = FlowRequirement {
     ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
-    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_request_method),
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_convenience_method),
+};
+
+const CLIENT_PUBLIC_INTERFACE_REQUIREMENT: FlowRequirement = FlowRequirement {
+    id: "client_public_interface",
+    role: FlowRole::Entrypoint,
+    query_seeds: &["public client method", "client interface declaration"],
+    coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
+    proof: FlowProofSpec::Legacy,
+    evidence: EvidencePredicate::CitedCarrier(citation_owns_client_public_interface_method),
 };
 
 const CLIENT_REQUEST_FINALIZATION_REQUIREMENT: FlowRequirement = FlowRequirement {
@@ -1814,6 +1859,7 @@ pub fn all_flow_requirement_groups() -> Vec<(&'static str, Vec<FlowRequirement>)
             "client_send",
             vec![
                 CLIENT_PUBLIC_FACADE_REQUIREMENT,
+                CLIENT_PUBLIC_INTERFACE_REQUIREMENT,
                 CLIENT_INTERFACE_HELPERS_REQUIREMENT,
                 CLIENT_REQUEST_FINALIZATION_REQUIREMENT,
                 CLIENT_TRANSPORT_SEND_REQUIREMENT,
@@ -1868,7 +1914,10 @@ mod tests {
     use crate::packet_evidence_carriers::carrier_taxonomy_vocabulary;
     use crate::packet_proof_atoms::FlowProofFormula;
     use crate::packet_terms::packet_probe_terms;
-    use codestory_contracts::api::{EdgeId, NodeId, NodeKind, SearchHitOrigin};
+    use codestory_contracts::api::{
+        EdgeId, NodeId, NodeKind, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
+        SearchHitOrigin,
+    };
     use std::collections::BTreeMap;
 
     /// Contract rev 5 scope table: exactly six requirement ids carry real
@@ -2001,10 +2050,76 @@ mod tests {
             ),
             vec![
                 "client_public_facade",
+                "client_public_interface",
                 "client_interface_helpers",
                 "client_request_finalization",
                 "client_transport_send",
                 "client_response_materialization",
+            ]
+        );
+    }
+
+    #[test]
+    fn material_client_facets_select_distinct_source_carriers_before_the_cap() {
+        let prompt = "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.";
+        let requirements = packet_flow_requirements_for_terms(
+            &packet_probe_terms(prompt),
+            PacketTaskClassDto::DataFlow,
+        );
+        assert_eq!(
+            requirements
+                .iter()
+                .map(|requirement| requirement.id)
+                .collect::<Vec<_>>(),
+            [
+                "client_public_facade",
+                "client_public_interface",
+                "client_interface_helpers",
+                "client_request_finalization",
+                "client_transport_send",
+            ]
+        );
+        let mut citations = vec![
+            witness(
+                "DatabaseClient.get",
+                "src/database_client.rs",
+                NodeKind::METHOD,
+            ),
+            witness(
+                "get",
+                "/private/tmp/fixtures/neutral-project/lib/http.dart",
+                NodeKind::FUNCTION,
+            ),
+            witness("Client.get", "lib/src/client.dart", NodeKind::METHOD),
+            witness(
+                "BaseClient.get",
+                "lib/src/base_client.dart",
+                NodeKind::METHOD,
+            ),
+            witness(
+                "BaseRequest.finalize",
+                "lib/src/base_request.dart",
+                NodeKind::METHOD,
+            ),
+            witness("IOClient.send", "lib/src/io_client.dart", NodeKind::METHOD),
+        ];
+        for citation in &mut citations {
+            citation.evidence_tier = Some(PacketEvidenceTierDto::ResolvedGraph);
+            citation.resolution_status = Some(PacketEvidenceResolutionDto::Resolved);
+        }
+
+        let selected = packet_material_facet_carriers(&requirements, &citations);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|carrier| (carrier.facet_id, carrier.node_id.0.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("client_public_facade", "get"),
+                ("client_public_interface", "Client.get"),
+                ("client_interface_helpers", "BaseClient.get"),
+                ("client_request_finalization", "BaseRequest.finalize"),
+                ("client_transport_send", "IOClient.send"),
             ]
         );
     }
@@ -2580,6 +2695,7 @@ mod tests {
         "buffered_storage | state_or_storage | AllowsSourceRange",
         "client_interface_helpers | entrypoint | RequiresResolvedSourceOrGraph",
         "client_public_facade | entrypoint | RequiresResolvedSourceOrGraph",
+        "client_public_interface | entrypoint | RequiresResolvedSourceOrGraph",
         "client_request_finalization | transform_or_validate | RequiresResolvedSourceOrGraph",
         "client_response_materialization | terminal_boundary | RequiresResolvedSourceOrGraph",
         "client_transport_send | terminal_boundary | RequiresResolvedSourceOrGraph",
@@ -2793,8 +2909,12 @@ mod tests {
                 witness("createClient", "lib/client.dart", NodeKind::FUNCTION),
             ),
             (
-                ("client_interface_helpers", "entrypoint"),
+                ("client_public_interface", "entrypoint"),
                 witness("Client.get", "lib/client.dart", NodeKind::METHOD),
+            ),
+            (
+                ("client_interface_helpers", "entrypoint"),
+                witness("BaseClient.get", "lib/base_client.dart", NodeKind::METHOD),
             ),
             (
                 ("client_request_finalization", "transform_or_validate"),
@@ -4081,7 +4201,6 @@ mod tests {
     /// sweep that only ever asked about `.ts` could not see the difference.
     const ONE_WORD_EVIDENCE_SURFACE: &[&str] = &[
         "buffered_storage | buffer",
-        "client_interface_helpers | request",
         "command_server_bootstrap | main",
         "css_animation_entrypoint | forward",
         "css_animation_entrypoint | import",
@@ -4751,8 +4870,6 @@ mod tests {
     /// Four of these are irreducible against a positive anchor that has the identical shape, and
     /// saying so is the point of recording them:
     ///
-    /// - `client_interface_helpers | request` — the real anchor is `Axios.prototype.request`, whose
-    ///   only client word *is* the verb. `FrameKind.request` cannot be told apart from it by name.
     /// - `buffered_storage | buffer` — a segment of a name that is nothing but "buffer" is the
     ///   buffer; okio's own wrapper is a function called `buffer`.
     /// - `hook_public_export | use` — `use` followed by a capital is the React hook convention, so
@@ -4786,7 +4903,6 @@ mod tests {
     /// still takes the path.
     const COMPOUND_EVIDENCE_SURFACE: &[&str] = &[
         "buffered_storage | buffer",
-        "client_interface_helpers | request",
         "css_animation_entrypoint | forward",
         "css_animation_entrypoint | import",
         "css_animation_entrypoint | use",

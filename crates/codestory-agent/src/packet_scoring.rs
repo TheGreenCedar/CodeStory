@@ -84,11 +84,7 @@ pub fn packet_citation_rank(
         score += 0.25;
     }
     if prefer_primary_sources {
-        let role = citation
-            .file_path
-            .as_deref()
-            .map(retrieval_file_role_from_path)
-            .unwrap_or(RetrievalFileRole::Source);
+        let role = packet_citation_file_role(citation);
         if role.is_non_primary() {
             score -= 100.0;
         }
@@ -809,10 +805,7 @@ fn packet_citation_is_primary_stylesheet(citation: &AgentCitationDto) -> bool {
 }
 
 fn packet_citation_is_non_primary_source(citation: &AgentCitationDto) -> bool {
-    citation
-        .file_path
-        .as_deref()
-        .is_some_and(|path| retrieval_file_role_from_path(path).is_non_primary())
+    citation.file_path.is_some() && packet_citation_file_role(citation).is_non_primary()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1133,12 +1126,19 @@ fn packet_question_wants_tests(terms: &[String]) -> bool {
 }
 
 fn packet_citation_is_test_source(citation: &AgentCitationDto) -> bool {
+    (citation.file_path.is_some() && packet_citation_file_role(citation) == RetrievalFileRole::Test)
+        || packet_path_is_test_segment(&packet_citation_display_path(citation))
+        || packet_display_name_is_test_like(&citation.display_name)
+}
+
+fn packet_citation_file_role(citation: &AgentCitationDto) -> RetrievalFileRole {
     citation
         .file_path
         .as_deref()
-        .is_some_and(|path| retrieval_file_role_from_path(path) == RetrievalFileRole::Test)
-        || packet_path_is_test_segment(&packet_citation_display_path(citation))
-        || packet_display_name_is_test_like(&citation.display_name)
+        .map(packet_display_path)
+        .as_deref()
+        .map(retrieval_file_role_from_path)
+        .unwrap_or(RetrievalFileRole::Source)
 }
 
 fn packet_citation_is_keyframe_rule(citation: &AgentCitationDto) -> bool {
@@ -2399,6 +2399,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn citation_rank_ignores_test_like_checkout_parent_directories() {
+        let terms = vec!["renderer".to_string(), "render".to_string()];
+        let relative_source = test_rank_citation("Renderer.render", "src/renderer.rs", 1.0);
+        let checked_out_source = test_rank_citation(
+            "Renderer.render",
+            "/private/tmp/fixtures/neutral-project/src/renderer.rs",
+            1.0,
+        );
+
+        assert_eq!(
+            packet_citation_rank(&checked_out_source, &terms, true),
+            packet_citation_rank(&relative_source, &terms, true),
+            "directories outside the repository must not change the source role"
+        );
+    }
+
     fn test_rank_citation(display_name: &str, file_path: &str, score: f32) -> AgentCitationDto {
         AgentCitationDto {
             node_id: NodeId(display_name.to_string()),
@@ -2788,6 +2805,28 @@ mod tests {
                     && !path.contains("/samples/")
             }),
             "unrequested tests and samples should drop: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn unrequested_test_filter_uses_project_relative_paths() {
+        let terms = vec!["renderer".to_string(), "render".to_string()];
+        let mut citations = vec![
+            test_rank_citation(
+                "Renderer.render",
+                "/private/tmp/fixtures/neutral-project/src/renderer.rs",
+                0.8,
+            ),
+            test_rank_citation("Renderer.render", "tests/renderer_test.rs", 0.9),
+            test_rank_citation("Renderer.snapshot", "src/fixtures/snapshot.rs", 0.7),
+        ];
+
+        packet_drop_unrequested_test_siblings(&mut citations, &terms);
+
+        assert_eq!(citations.len(), 1);
+        assert_eq!(
+            citations[0].file_path.as_deref(),
+            Some("/private/tmp/fixtures/neutral-project/src/renderer.rs")
         );
     }
 

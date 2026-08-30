@@ -129,7 +129,7 @@ use crate::{
 };
 #[cfg(test)]
 use codestory_agent::packet_command::quote_packet_command_value;
-use codestory_agent::packet_flow_requirements::FlowRequirement;
+use codestory_agent::packet_flow_requirements::{FlowRequirement, packet_material_facet_carriers};
 use codestory_agent::packet_proof_atoms::{
     DischargedFact, FlowProofFormula, FlowProofOutcome, ProofAtomId, ProofEndpointPattern,
     ProofFactPattern, SourceAspectKind, TrailCoverage, TrailDirection as ProofTrailDirection,
@@ -564,6 +564,7 @@ pub(crate) fn agent_packet(
         &rank_terms,
         &mut answer,
     )?;
+    normalize_packet_citation_paths(&project_root, &mut answer.citations);
     let phase_started = Instant::now();
     append_packet_non_trace_phase(&mut answer, "pre_rank_citations", phase_started);
     let phase_started = Instant::now();
@@ -575,6 +576,9 @@ pub(crate) fn agent_packet(
     maybe_append_cited_formatting_type_citations(&project_root, &question, &mut answer);
     maybe_append_cited_mapper_interface_citations(&project_root, &question, &mut answer);
     maybe_append_cited_client_relative_imports(&project_root, &question, &mut answer);
+    normalize_packet_citation_paths(&project_root, &mut answer.citations);
+    let pre_rank_citations =
+        crate::agent::trace_export::packet_step_trace_armed().then(|| answer.citations.clone());
     rank_packet_evidence(&question, &mut answer);
     maybe_annotate_packet_candidate_window(&question, &limits, &mut answer);
     append_packet_non_trace_phase(&mut answer, "rank_and_window", phase_started);
@@ -639,12 +643,34 @@ pub(crate) fn agent_packet(
         &pre_cap_extras,
         &proof_session,
     );
+    let material_facet_carriers =
+        packet_material_facet_carriers(&flow_requirements, &answer.citations);
+    let material_facet_node_ids = material_facet_carriers
+        .iter()
+        .map(|carrier| carrier.node_id.clone())
+        .collect::<Vec<_>>();
     let (protected_carrier_node_ids, protected_edge_ids) = select_protected_obligation_carriers(
         &answer,
+        &material_facet_node_ids,
         protected_packet_obligation_carrier_node_ids(&obligation_edge_proofs),
         protected_packet_obligation_edge_ids(&obligation_edge_proofs),
         &partial_protection,
     );
+    if let Some(diagnostic) =
+        crate::agent::packet_accuracy_stage_ledger::record_pre_projection_stages_from_env(
+            &plan,
+            pre_rank_citations.as_deref(),
+            &answer.citations,
+            &material_facet_carriers,
+            &protected_carrier_node_ids,
+            &protected_edge_ids,
+        )
+    {
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(diagnostic));
+    }
     let budget = apply_packet_budget_with_extra_and_obligation_carriers(
         &project_root,
         &question,
@@ -670,6 +696,17 @@ pub(crate) fn agent_packet(
         &proof_session,
         &protected_carrier_node_ids,
     );
+    if let Some(diagnostic) =
+        crate::agent::packet_accuracy_stage_ledger::record_source_support_stage_from_env(
+            &answer,
+            &source_support,
+        )
+    {
+        answer
+            .retrieval_trace
+            .annotations
+            .push(RetrievalAnnotationDto::observation(diagnostic));
+    }
 
     // Coverage belongs to the evidence that survives the real citation cap. Observing the
     // uncapped candidate set made a packet unavailable because of a partial file that the packet
@@ -693,6 +730,7 @@ pub(crate) fn agent_packet(
     // to read, then drop its now-unused coverage observation. User-requested exact paths stay in
     // the set and therefore continue to fail closed even when they produced no retained citation.
     demote_parser_partial_citations_without_source_receipts(
+        Some(&project_root),
         &mut answer.citations,
         &source_support,
         &answer.source_coverage,
@@ -708,10 +746,13 @@ pub(crate) fn agent_packet(
                 })
                 .filter_map(|citation| citation.file_path.clone()),
         )
-        .map(|path| packet_display_path(&path))
+        .map(|path| packet_project_relative_display_path(Some(&project_root), &path))
         .collect::<HashSet<_>>();
     answer.source_coverage.retain(|observation| {
-        retained_coverage_paths.contains(&packet_display_path(&observation.path))
+        retained_coverage_paths.contains(&packet_project_relative_display_path(
+            Some(&project_root),
+            &observation.path,
+        ))
     });
 
     let phase_started = Instant::now();
@@ -2483,7 +2524,32 @@ fn promote_verified_bounded_source_citation(citation: &mut AgentCitationDto) -> 
     true
 }
 
+fn normalize_packet_citation_paths(project_root: &Path, citations: &mut [AgentCitationDto]) {
+    for citation in citations {
+        let Some(path) = citation.file_path.as_deref() else {
+            continue;
+        };
+        citation.file_path = Some(packet_project_relative_display_path(
+            Some(project_root),
+            path,
+        ));
+    }
+}
+
+fn packet_project_relative_display_path(project_root: Option<&Path>, path: &str) -> String {
+    if let Some(project_root) = project_root {
+        let candidate = Path::new(path);
+        if let Ok(relative) = candidate.strip_prefix(project_root)
+            && !relative.as_os_str().is_empty()
+        {
+            return relative.to_string_lossy().replace('\\', "/");
+        }
+    }
+    packet_display_path(path)
+}
+
 fn demote_parser_partial_citations_without_source_receipts(
+    project_root: Option<&Path>,
     citations: &mut [AgentCitationDto],
     source_support: &[SupportUnitDto],
     source_coverage: &[SourceCoverageObservationDto],
@@ -2494,7 +2560,7 @@ fn demote_parser_partial_citations_without_source_receipts(
             observation.status == SourceCoverageStatusDto::Incomplete
                 && observation.reason == Some(FileCoverageReason::ParserPartial)
         })
-        .map(|observation| packet_display_path(&observation.path))
+        .map(|observation| packet_project_relative_display_path(project_root, &observation.path))
         .collect::<HashSet<_>>();
     let retained_receipts = source_support
         .iter()
@@ -2502,18 +2568,20 @@ fn demote_parser_partial_citations_without_source_receipts(
         .filter_map(|unit| {
             Some((
                 unit.symbol_id.clone()?,
-                packet_display_path(unit.path.as_deref()?),
+                packet_project_relative_display_path(project_root, unit.path.as_deref()?),
             ))
         })
         .collect::<HashSet<_>>();
     for citation in citations.iter_mut().filter(|citation| {
-        citation
-            .file_path
-            .as_deref()
-            .is_some_and(|path| parser_partial_paths.contains(&packet_display_path(path)))
+        citation.file_path.as_deref().is_some_and(|path| {
+            parser_partial_paths.contains(&packet_project_relative_display_path(project_root, path))
+        })
     }) {
         let has_receipt = citation.file_path.as_deref().is_some_and(|path| {
-            retained_receipts.contains(&(citation.node_id.0.clone(), packet_display_path(path)))
+            retained_receipts.contains(&(
+                citation.node_id.0.clone(),
+                packet_project_relative_display_path(project_root, path),
+            ))
         });
         if !has_receipt {
             citation.eligible_for_sufficiency = Some(false);
@@ -2949,8 +3017,9 @@ fn packet_partial_atom_protection_with_planned(
 }
 
 /// The selection step: deterministic weighted set cover over verified atoms
-/// for the citation cap's protected set. The snapshot's carriers (Legacy and
-/// fully-proven obligations) keep their existing priority and order; the
+/// for the citation cap's protected set. One best source-bearing carrier per
+/// material facet comes first. The snapshot's fully-proven carriers keep their
+/// existing priority and order after those facets; the
 /// partial-atom carriers are then ordered by greedy atom cover with the
 /// stated tie-breaks — verified tier, lower source-byte cost, existing rank,
 /// stable identity — and any remaining partial carriers fill the tail in
@@ -2959,6 +3028,7 @@ fn packet_partial_atom_protection_with_planned(
 /// cover order decides survival.
 fn select_protected_obligation_carriers(
     answer: &AgentAnswerDto,
+    material_facet_node_ids: &[NodeId],
     snapshot_carrier_node_ids: &[NodeId],
     snapshot_edge_ids: &[EdgeId],
     partial: &PacketPartialAtomProtection,
@@ -3015,6 +3085,11 @@ fn select_protected_obligation_carriers(
 
     let mut ordered = Vec::new();
     let mut seen = HashSet::new();
+    for node_id in material_facet_node_ids {
+        if seen.insert(node_id.clone()) {
+            ordered.push(node_id.clone());
+        }
+    }
     for node_id in snapshot_carrier_node_ids {
         if seen.insert(node_id.clone()) {
             ordered.push(node_id.clone());
@@ -3097,6 +3172,7 @@ fn append_packet_carrier_source_sections(
     let mut rendered = String::new();
     let mut steps = Vec::new();
     let mut source_support = Vec::new();
+    let project_root = controller.require_project_root().ok();
     let file_focus_text = packet_file_source_focus_text(question, answer);
     let load_sources = |citation: &AgentCitationDto| -> Vec<CarrierSourceRange> {
         let bounded_source_read = citation_needs_bounded_source_read(citation);
@@ -3157,6 +3233,18 @@ fn append_packet_carrier_source_sections(
                 .snippet_function_body_context(citation.node_id.clone(), 0)
                 .ok()
                 .map(|snippet| {
+                    if snippet.scope == SnippetScopeDto::LineContext {
+                        let focused = long_behavioral_function_source_ranges(
+                            controller,
+                            &file_focus_text,
+                            &snippet.path,
+                            snippet.line,
+                            snippet.node.end_line,
+                        );
+                        if !focused.is_empty() {
+                            return focused;
+                        }
+                    }
                     if let Some(end_line) =
                         carrier_source_line_context_end_line(snippet.scope, snippet.line)
                         && let Ok((path, bounded)) = controller.bounded_file_snippet_range(
@@ -3226,7 +3314,7 @@ fn append_packet_carrier_source_sections(
         rendered.push_str(&entry);
         let citation = &answer.citations[citation_index];
         if crate::agent::packet_evidence::citation_sufficiency_eligible(citation) {
-            let path = packet_display_path(&source.path);
+            let path = packet_project_relative_display_path(project_root.as_deref(), &source.path);
             let (start_line, end_line) =
                 source_receipt_line_range(retained_body, source.start_line);
             source_support.push(SupportUnitDto {
@@ -3483,8 +3571,10 @@ fn append_packet_atom_anchor_sources(
         outcome.budget_dropped = selected.len();
         return outcome;
     };
+    let project_root = controller.require_project_root().ok();
     verify_planned_atom_anchors(
         &selected,
+        project_root.as_deref(),
         &node_labels,
         limits,
         rendered,
@@ -3536,6 +3626,7 @@ fn append_packet_atom_anchor_sources(
 #[allow(clippy::too_many_arguments)]
 fn verify_planned_atom_anchors(
     selected: &[&PlannedAtomAnchor],
+    project_root: Option<&Path>,
     node_labels: &HashMap<String, String>,
     limits: &PacketBudgetLimitsDto,
     rendered: &mut String,
@@ -3589,7 +3680,7 @@ fn verify_planned_atom_anchors(
         // retained citation; for structural carriers without citations the
         // unit is display-honesty pre-compile — the residual is recorded in
         // the delivery report.)
-        let display_path = packet_display_path(&path);
+        let display_path = packet_project_relative_display_path(project_root, &path);
         source_support.push(SupportUnitDto {
             id: format!(
                 "atom-anchor:{:?}:{}:{start_line}",
@@ -3853,6 +3944,199 @@ fn focused_function_source_ranges(
                 })
         })
         .collect()
+}
+
+/// A parser may know a callable's end line while still returning declaration-only context. Keep
+/// that long callable's declaration, one material internal callsite, and its positive terminal
+/// behavior instead of treating the first 24 lines as the whole implementation.
+fn long_behavioral_function_source_ranges(
+    controller: &AppController,
+    question: &str,
+    path: &str,
+    start_line: u32,
+    end_line: Option<u32>,
+) -> Vec<CarrierSourceRange> {
+    let Ok(source) = controller.read_file_text(codestory_contracts::api::ReadFileTextRequest {
+        path: path.to_string(),
+    }) else {
+        return Vec::new();
+    };
+    let lines = source.text.lines().collect::<Vec<_>>();
+    let Some(end_line) = end_line
+        .filter(|end_line| *end_line > start_line)
+        .or_else(|| discover_braced_callable_end_line(&lines, start_line))
+        .filter(|end_line| {
+            *end_line
+                > start_line
+                    .saturating_add(CARRIER_SOURCE_DECLARATION_FALLBACK_LINES.saturating_sub(1))
+        })
+    else {
+        return Vec::new();
+    };
+    long_behavioral_function_source_lines(&lines, start_line, end_line, question)
+        .into_iter()
+        .filter_map(|focus_line| {
+            let range_start = focus_line
+                .saturating_sub(CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32)
+                .max(start_line);
+            controller
+                .bounded_file_snippet(
+                    path,
+                    focus_line,
+                    CARRIER_SOURCE_FOCUS_CONTEXT_LINES,
+                    CARRIER_SOURCE_FOCUSED_SNIPPET_BYTES,
+                    SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+                )
+                .ok()
+                .map(|(path, snippet)| CarrierSourceRange {
+                    path,
+                    start_line: range_start,
+                    body: snippet.markdown,
+                })
+        })
+        .collect()
+}
+
+fn discover_braced_callable_end_line(lines: &[&str], start_line: u32) -> Option<u32> {
+    let mut depth = 0_u32;
+    let mut saw_open = false;
+    let mut in_block_comment = false;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, line) in lines
+        .iter()
+        .enumerate()
+        .skip(start_line.saturating_sub(1) as usize)
+    {
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    chars.next();
+                    in_block_comment = false;
+                }
+                continue;
+            }
+            if let Some(delimiter) = quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'/') {
+                break;
+            }
+            if ch == '/' && chars.peek() == Some(&'*') {
+                chars.next();
+                in_block_comment = true;
+                continue;
+            }
+            if ch == '\'' || ch == '"' {
+                quote = Some(ch);
+                continue;
+            }
+            match ch {
+                '{' => {
+                    saw_open = true;
+                    depth = depth.saturating_add(1);
+                }
+                '}' if saw_open => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((index + 1) as u32);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn long_behavioral_function_source_lines(
+    lines: &[&str],
+    start_line: u32,
+    end_line: u32,
+    question: &str,
+) -> Vec<u32> {
+    if lines.is_empty() || start_line == 0 || end_line <= start_line {
+        return Vec::new();
+    }
+    let start_index = start_line.saturating_sub(1) as usize;
+    let end_index = (end_line as usize).min(lines.len());
+    if start_index >= end_index {
+        return Vec::new();
+    }
+    let context = CARRIER_SOURCE_FOCUS_CONTEXT_LINES as u32;
+    let declaration_focus = start_line.saturating_add(context).min(end_line);
+    let terminal_focus = (start_index..end_index)
+        .rev()
+        .find(|index| lines[*index].trim_start().starts_with("return "))
+        .or_else(|| {
+            (start_index..end_index).rev().find(|index| {
+                let line = lines[*index].trim_start();
+                line.starts_with("throw ")
+                    || line.starts_with("raise ")
+                    || line.starts_with("yield ")
+            })
+        })
+        .map(|index| (index + 1) as u32);
+    let question_terms = source_focus_terms(question);
+    let material_focus = (start_index..end_index)
+        .filter_map(|index| {
+            let line = lines[index];
+            let line_number = (index + 1) as u32;
+            if declaration_focus.abs_diff(line_number) <= context * 2
+                || terminal_focus
+                    .is_some_and(|terminal| terminal.abs_diff(line_number) <= context * 2)
+            {
+                return None;
+            }
+            let lower = line.to_ascii_lowercase();
+            let line_terms = source_focus_terms(line);
+            let question_overlap = question_terms
+                .iter()
+                .filter(|term| {
+                    line_terms
+                        .iter()
+                        .any(|line_term| source_focus_terms_match(term, line_term))
+                })
+                .count();
+            let awaited = usize::from(lower.contains("await "));
+            let call_shape = usize::from(lower.contains('(') && lower.contains(')'));
+            let material_action = usize::from(
+                [
+                    "commit", "connect", "dispatch", "execute", "finalize", "listen", "load",
+                    "open", "persist", "pipe", "publish", "read", "request", "response", "save",
+                    "send", "write",
+                ]
+                .iter()
+                .any(|action| line_terms.iter().any(|term| term == action)),
+            );
+            let score = question_overlap * 4 + awaited * 6 + material_action * 3 + call_shape;
+            (score > 0).then_some((score, index))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+        .map(|(_, index)| (index + 1) as u32);
+
+    let mut selected = vec![declaration_focus];
+    if let Some(material_focus) = material_focus {
+        selected.push(material_focus);
+    }
+    if let Some(terminal_focus) = terminal_focus
+        && selected
+            .iter()
+            .all(|selected| selected.abs_diff(terminal_focus) > context * 2)
+    {
+        selected.push(terminal_focus);
+    }
+    selected.truncate(CARRIER_SOURCE_MAX_FOCUSED_WINDOWS);
+    selected.sort_unstable();
+    selected
 }
 
 fn focused_function_source_lines(
@@ -8354,6 +8638,67 @@ mod tests {
     }
 
     #[test]
+    fn declaration_only_long_callable_keeps_declaration_callsite_and_terminal() {
+        let source = [
+            "Future<Result> execute(Request request) async {",
+            "  validate(request);",
+            "  configure(request);",
+            "  prepare(request);",
+            "  final stream = request.finalize();",
+            "  final connection = await transport.open(request.url);",
+            "  configureHeaders(connection);",
+            "  installCancellation(connection);",
+            "  recordAttempt();",
+            "  recordQueueDepth();",
+            "  prepareTrace();",
+            "  attachContext();",
+            "  updateDeadline();",
+            "  installHooks();",
+            "  await beforeSend();",
+            "  final response = await stream.pipe(connection);",
+            "  observe(response);",
+            "  transform(response);",
+            "  attachListeners(response);",
+            "  recordHeaders(response);",
+            "  finalizeMetrics(response);",
+            "  notifyObservers(response);",
+            "  updatePool(response);",
+            "  collectTrailers(response);",
+            "  recordCompletion(response);",
+            "  closeSpan(response);",
+            "  settleAccounting(response);",
+            "  return Result.from(response);",
+            "}",
+        ];
+
+        let focus = long_behavioral_function_source_lines(
+            &source,
+            1,
+            source.len() as u32,
+            "Explain execute send behavior.",
+        );
+
+        assert_eq!(focus, [6, 17, 28]);
+    }
+
+    #[test]
+    fn declaration_only_callable_end_ignores_comment_and_string_braces() {
+        let source = [
+            "Future<Result> execute() async {",
+            "  // A comment with } does not end the callable.",
+            "  final marker = '{';",
+            "  if (ready) {",
+            "    await run();",
+            "  }",
+            "  return Result();",
+            "}",
+            "void next() {}",
+        ];
+
+        assert_eq!(discover_braced_callable_end_line(&source, 1), Some(8));
+    }
+
+    #[test]
     fn source_focus_does_not_treat_control_flow_as_a_component_owner() {
         assert!(!source_focus_terms_match("matcher", "match"));
         assert!(!source_focus_terms_match("searcher", "search"));
@@ -8768,6 +9113,7 @@ mod tests {
         let mut citations = vec![retained, omitted, indexed];
 
         demote_parser_partial_citations_without_source_receipts(
+            None,
             &mut citations,
             &source_support,
             &coverage,
@@ -9279,6 +9625,29 @@ mod tests {
         assert_eq!(
             packet_display_path("target/repo-cache/repos/axios/lib/core/Axios.js"),
             "lib/core/Axios.js"
+        );
+    }
+
+    #[test]
+    fn packet_project_relative_path_preserves_nested_monorepo_packages() {
+        let project_root = Path::new("/private/tmp/fixtures/dart-lang-http");
+        assert_eq!(
+            packet_project_relative_display_path(
+                Some(project_root),
+                "/private/tmp/fixtures/dart-lang-http/pkgs/http/lib/src/client.dart",
+            ),
+            "pkgs/http/lib/src/client.dart"
+        );
+
+        let mut citation = test_packet_citation(
+            "Client.get",
+            "/private/tmp/fixtures/dart-lang-http/pkgs/http/lib/src/client.dart",
+            1.0,
+        );
+        normalize_packet_citation_paths(project_root, std::slice::from_mut(&mut citation));
+        assert_eq!(
+            citation.file_path.as_deref(),
+            Some("pkgs/http/lib/src/client.dart")
         );
     }
 
@@ -16117,6 +16486,7 @@ mod tests {
         let snapshot_edges = [EdgeId("edge-a".into())];
         let (ordered, edges) = select_protected_obligation_carriers(
             &answer,
+            &[],
             &snapshot_carriers,
             &snapshot_edges,
             &partial,
@@ -16137,6 +16507,7 @@ mod tests {
         // Determinism.
         let (again, _) = select_protected_obligation_carriers(
             &answer,
+            &[],
             &snapshot_carriers,
             &snapshot_edges,
             &partial,
@@ -16412,6 +16783,7 @@ mod tests {
         let mut source_support = Vec::new();
         verify_planned_atom_anchors(
             &selected,
+            None,
             &HashMap::new(),
             &limits,
             &mut rendered,
@@ -16479,6 +16851,7 @@ mod tests {
         };
         verify_planned_atom_anchors(
             &selected,
+            None,
             &HashMap::new(),
             &exhausted,
             &mut rendered,

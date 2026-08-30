@@ -1251,6 +1251,8 @@ fn packet_citation_is_exact_primary_file_probe_match(
         && citation
             .file_path
             .as_deref()
+            .map(packet_display_path)
+            .as_deref()
             .is_some_and(|path| retrieval_file_role_from_path(path) == RetrievalFileRole::Source)
         && packet_file_stem_matches_query(query, citation.file_path.as_deref())
 }
@@ -2724,6 +2726,18 @@ mod tests {
         assert_eq!(
             packet_citation_probe_match_rank("adapters", &indexed_file),
             Some(6)
+        );
+
+        let mut checked_out_file = test_packet_citation(
+            "transport registry",
+            "/private/tmp/tests/neutral-project/src/runtime/adapters.js",
+            0.1,
+        );
+        checked_out_file.kind = NodeKind::FILE;
+        assert_eq!(
+            packet_citation_probe_match_rank("adapters", &checked_out_file),
+            Some(6),
+            "directories outside the repository must not make an indexed source file non-primary"
         );
 
         for (label, citation) in [
