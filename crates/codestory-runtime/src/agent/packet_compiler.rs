@@ -19,7 +19,7 @@ use codestory_contracts::api::{
     PACKET_DRILL_MAX_OPTIONS, PacketClaimObligationDto, PacketClaimObligationKindDto,
     PacketDispositionDto, PacketDispositionKindDto, PacketObligationProofStatusDto, PacketPlanDto,
     PacketProbeResolutionStatusDto, PacketQueryCompletionDto, SourceCoverageStatusDto,
-    SupportUnitDto, SupportUnitKindDto, decode_drill_option_id,
+    SupportUnitDto, SupportUnitKindDto, decode_drill_option_id, encode_drill_option_id,
 };
 use codestory_contracts::graph::FileCoverageReason;
 use std::collections::BTreeSet;
@@ -492,6 +492,26 @@ fn collect_drill_options(
                 && obligation.proof_status != PacketObligationProofStatusDto::Proven
         })
     {
+        let named_schema_gap = obligation
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("named_sql_table_carriers_missing:"));
+        if obligation.kind != PacketClaimObligationKindDto::ExactProbe
+            && !named_schema_gap
+            && let Some(query) = obligation
+                .open_next_candidates
+                .iter()
+                .find(|candidate| !candidate.trim().is_empty())
+        {
+            let option = omitted_support_query_option(
+                format!("omitted-material:{}", obligation.id),
+                query.trim(),
+            );
+            if seen.insert(option.id.clone()) {
+                options.push(option);
+            }
+            continue;
+        }
         if let Some(edge_kind) = obligation.required_edge_kind
             && matches!(edge_kind, EdgeKind::CALL | EdgeKind::INHERITANCE)
             && obligation.carrier_edge_proofs.is_empty()
@@ -503,10 +523,6 @@ fn collect_drill_options(
                 options.push(option);
             }
         }
-        let named_schema_gap = obligation
-            .reason
-            .as_deref()
-            .is_some_and(|reason| reason.starts_with("named_sql_table_carriers_missing:"));
         if !named_schema_gap && let Some(node) = obligation.carrier_node_ids.first() {
             let option =
                 omitted_support_option(answer, format!("omitted-material:{}", obligation.id), node);
@@ -585,6 +601,24 @@ fn omitted_support_option(
     DrillOptionDto::omitted_symbol(gap_id, &node.0)
 }
 
+fn omitted_support_query_option(
+    gap_id: impl Into<String>,
+    query: impl Into<String>,
+) -> DrillOptionDto {
+    let query = query.into();
+    DrillOptionDto {
+        id: encode_drill_option_id(
+            codestory_contracts::api::DrillGapKindDto::OmittedMandatorySupport,
+            &format!("query:{query}"),
+        ),
+        gap_id: gap_id.into(),
+        kind: codestory_contracts::api::DrillGapKindDto::OmittedMandatorySupport,
+        path: None,
+        symbol_id: None,
+        query: Some(query),
+    }
+}
+
 pub fn apply_compiled_evidence(
     packet: &mut AgentPacketDto,
     request: Option<&AgentPacketRequestDto>,
@@ -642,6 +676,8 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
                             format!("omitted-source-path:{path}"),
                             path,
                         )
+                    } else if let Some(query) = target.strip_prefix("query:") {
+                        omitted_support_query_option(format!("omitted-query:{query}"), query)
                     } else {
                         let symbol = target.strip_prefix("symbol:").unwrap_or(&target);
                         DrillOptionDto::omitted_symbol(format!("omitted-symbol:{symbol}"), symbol)
@@ -869,6 +905,53 @@ mod tests {
         );
         assert_eq!(continuation.kind, PacketDispositionKindDto::Supported);
         assert!(continuation.is_terminal());
+    }
+
+    #[test]
+    fn unmet_flow_stage_drills_by_its_planned_query_with_or_without_a_current_carrier() {
+        for current_carrier in [None, Some("Downstream.handle")] {
+            let mut packet = test_packet("Explain the complete request lifecycle.", 98_304);
+            packet.answer.freshness = Some(fresh_index_observation());
+            let mut obligation = claim_obligation(
+                PacketClaimObligationKindDto::Dispatch,
+                PacketObligationProofStatusDto::Reported,
+            );
+            obligation.id = "upstream_public_stage".to_string();
+            obligation.open_next_candidates = vec!["public request registration".to_string()];
+            if let Some(carrier) = current_carrier {
+                packet.answer.citations = vec![eligible_citation(carrier, "src/downstream.rs")];
+                obligation.carrier_node_ids = vec![NodeId(carrier.to_string())];
+            }
+            packet.plan = empty_plan();
+            packet.plan.obligations.claim_obligations = vec![obligation];
+
+            let (_support, disposition) = compile_packet_evidence(
+                &packet.packet_id,
+                &packet.question,
+                &packet.plan,
+                &packet.answer,
+                None,
+            );
+            let options = disposition
+                .drill
+                .expect("an unmet planned stage must remain closable")
+                .options;
+
+            assert_eq!(options.len(), 1, "current carrier: {current_carrier:?}");
+            assert_eq!(
+                options[0].query.as_deref(),
+                Some("public request registration"),
+                "the continuation must not replay a downstream carrier: {current_carrier:?}"
+            );
+            assert!(options[0].symbol_id.is_none());
+            assert!(options[0].path.is_none());
+            let decoded = drill_options_from_ids(&[options[0].id.clone()]);
+            assert_eq!(decoded.len(), 1);
+            assert_eq!(decoded[0].kind, options[0].kind);
+            assert_eq!(decoded[0].query, options[0].query);
+            assert!(decoded[0].symbol_id.is_none());
+            assert!(decoded[0].path.is_none());
+        }
     }
 
     #[test]

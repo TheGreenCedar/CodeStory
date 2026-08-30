@@ -169,6 +169,14 @@ fn packet_evidence_selection(
     ranking_terms: &HashSet<String>,
     claim_obligations: &[PacketClaimObligationDto],
 ) -> PacketEvidenceSelectionV3 {
+    let mut planned_stage_terms = ranking_terms.clone();
+    for candidate in claim_obligations
+        .iter()
+        .filter(|obligation| obligation.material)
+        .flat_map(|obligation| &obligation.open_next_candidates)
+    {
+        planned_stage_terms.extend(packet_evidence_terms(candidate));
+    }
     let source_symbols = support
         .iter()
         .filter(|unit| {
@@ -210,7 +218,7 @@ fn packet_evidence_selection(
             distinct[existing_index].3.sort_unstable();
             distinct[existing_index].3.dedup();
         } else {
-            let relevance = packet_evidence_relevance(&row, ranking_terms);
+            let relevance = packet_evidence_relevance(&row, &planned_stage_terms);
             seen.insert(content_key, distinct.len());
             distinct.push((unit.kind, row, relevance, material_carrier_ranks));
         }
@@ -2113,6 +2121,42 @@ mod tests {
                 .count()
                 >= 12,
             "unreserved rows should prefer relevant source evidence over low-value duplicate locations"
+        );
+    }
+
+    #[test]
+    fn packet_evidence_ranks_the_planned_upstream_stage_before_downstream_repeats() {
+        let mut support = (0..PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3)
+            .map(|index| {
+                let mut unit = support_unit(SupportUnitKindDto::SourceRange);
+                unit.id = format!("downstream-{index}");
+                unit.path = Some(format!("src/downstream-{index}.rs"));
+                unit.symbol_id = Some(format!("Processor.handle{index}"));
+                unit.snippet = Some(format!("fn handle_{index}() {{ process(); }}"));
+                unit
+            })
+            .collect::<Vec<_>>();
+        let mut upstream = support_unit(SupportUnitKindDto::SourceRange);
+        upstream.id = "public-registration".to_owned();
+        upstream.path = Some("src/public-facade.rs".to_owned());
+        upstream.symbol_id = Some("PublicFacade.registerRequest".to_owned());
+        upstream.snippet = Some("fn register_request() { route.store(); }".to_owned());
+        support.push(upstream);
+
+        let mut obligation = material_obligation("public-upstream-stage");
+        obligation.open_next_candidates = vec!["public request registration".to_owned()];
+
+        let evidence = packet_evidence_rows_with_obligations(
+            &support,
+            "Explain the complete lifecycle.",
+            &[obligation],
+        );
+
+        assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
+        assert_eq!(
+            evidence[0].symbol_id.as_ref().map(|symbol| symbol.as_str()),
+            Some("PublicFacade.registerRequest"),
+            "the public envelope must spend a row on the planner's missing upstream stage before repeating downstream internals"
         );
     }
 
