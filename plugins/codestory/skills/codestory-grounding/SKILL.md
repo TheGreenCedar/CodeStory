@@ -96,8 +96,14 @@ plugin package to locate a documented field or excerpt.
   returned gap. Never turn `available` into authority for a claim the rows do
   not establish. When a returned gap leaves requested material unresolved, the
   final outcome remains unknown even if the result also contains useful evidence.
-- For every material stage named by a broad question, state one deterministic
-  conclusion supported by a cited evidence row, or name the exact returned gap.
+- For every requested material stage that a cited evidence row establishes,
+  state a direct subject-verb claim naming the subject and its established
+  action before discussing any gap. Do not substitute a heading, symbol
+  inventory, or adjacent partial observation for that supported claim, and do
+  not make the claim broader than the cited row. Then scope gaps only to the
+  requested stages or links the rows do not establish. A gap does not erase a
+  supported stage and does not authorize a source read unless it identifies the
+  exact focused path required by the direct-tool rule above.
 - A `context` evidence row matching the returned target `symbol_id` is focused
   identity and location evidence even when its optional `excerpt` is null.
   That null does not itself create an omission or an `unknown` outcome unless

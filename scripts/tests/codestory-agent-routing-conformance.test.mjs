@@ -2748,6 +2748,9 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher a
   assert.match(skill, /diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu);
   assert.match(skill, /transport.*tool absence.*source/isu);
   assert.match(skill, /context.*symbol_id.*excerpt.*null.*(?:does not|doesn't).*omission/isu);
+  assert.match(skill, /requested material stage.*direct subject-verb claim.*before.*gap/isu);
+  assert.match(skill, /heading.*symbol\s+(?:inventory|list).*partial observation/isu);
+  assert.match(skill, /gap.*(?:does not|never).*erase.*supported.*(?:does not|never).*authorize.*read/isu);
   assert.match(cursorRule, /canonical codestory-grounding skill.*sole source of truth.*adds no parallel instructions/isu);
   assert.doesNotMatch(cursorRule, /Routing contract:|Discovery leads come from|prove_call_path|Inspect source after a packet/u);
   assert.match(skill, /bounded command action.*cat.*sed.*exact authorized file.*before reporting.*unavailable/isu);

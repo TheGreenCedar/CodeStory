@@ -3036,6 +3036,7 @@ function validateRoutingGuidance(text, label) {
     [/typed `Unavailable`.*terminal/isu, "typed-unavailable terminal boundary"],
     [/diagnostics\.availability.*optional diagnostics.*never overrides.*top-level/isu, "diagnostics availability boundary"],
     [/transport.*tool absence.*source/isu, "transport-unavailable source fallback"],
+    [/requested material stage.*direct subject-verb claim.*before.*gap/isu, "supported material-stage claim boundary"],
   ];
   for (const [pattern, requirement] of requirements) {
     if (!pattern.test(text)) fail(`${label} is missing ${requirement}`);

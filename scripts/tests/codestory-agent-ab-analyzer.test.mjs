@@ -5220,6 +5220,10 @@ test("v3 benchmark routing treats projection bounds as descriptive rather than r
   assert.match(instruction, /broad flow question.*does not authorize/i);
   assert.match(instruction, /at most one bounded read per authorized path/i);
   assert.match(instruction, /Do not use shell search, Git, or free-form repository recovery/);
+  assert.match(instruction, /requested material stage.*direct subject-verb claim/iu);
+  assert.match(instruction, /before describing.*gaps/iu);
+  assert.match(instruction, /heading.*symbol inventory.*partial observation/iu);
+  assert.match(instruction, /claim.*no broader than.*evidence row/iu);
   assert.doesNotMatch(instruction, /direct source reads as packet recovery/);
 });
 
