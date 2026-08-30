@@ -7896,8 +7896,8 @@ mod tests {
                 json!({
                     "identity":{"evidence_id":format!("packet-evidence-{index:03}")},
                     "kind":if index < 12 { "exact_source" } else { "graph_relation" },
-                    "path":format!("src/{index}/{}-é.rs", "path-segment-".repeat(12)),
-                    "symbol_id":format!("qualified::symbol::{index}::{}", "member".repeat(16)),
+                    "path":format!("src/segment-{index}/source-é.rs"),
+                    "symbol_id":format!("qualified::symbol::{index}::member"),
                     "start_line":index + 1,
                     "end_line":index + 2,
                     "summary":format!("quote=\" slash=\\ control=\n {}", "evidence ".repeat(60))
@@ -7967,6 +7967,12 @@ mod tests {
 
             assert_eq!(root["kind"], "complete", "{revision:?}");
             assert_eq!(root["evidence"].as_array().unwrap().len(), 16);
+            assert!(root["evidence"].as_array().unwrap().iter().all(|row| {
+                row["path"].is_string()
+                    && row["symbol_id"].is_string()
+                    && row["start_line"].is_number()
+                    && row["end_line"].is_number()
+            }));
             assert_eq!(measured, emitted.len());
             assert!(measured <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3);
         }
@@ -8137,20 +8143,14 @@ mod tests {
                     assert!(result.get("structuredContent").is_none());
                 }
                 if target <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
-                    assert_eq!(root["kind"], "complete");
+                    assert_eq!(root["kind"], "complete", "{revision:?} target {target}");
                     assert_eq!(emitted.len(), target);
                 } else {
-                    assert_eq!(root["kind"], "complete");
+                    assert_eq!(root["kind"], "budget_exceeded");
                     assert_eq!(root["gaps"].as_array().unwrap().len(), 1);
                     assert_eq!(root["gaps"][0]["kind"], "output_budget_exceeded");
-                    assert_eq!(root["evidence"].as_array().unwrap().len(), 8);
-                    assert!(root["evidence"].as_array().unwrap().iter().any(|row| {
-                        row["path"].is_null()
-                            && row["symbol_id"].is_null()
-                            && row["start_line"].is_null()
-                            && row["end_line"].is_null()
-                            && row["summary"].is_null()
-                    }));
+                    assert!(root.get("evidence").is_none());
+                    assert!(root.get("continuation").is_none());
                 }
 
                 let diagnostic_bytes = vec![7; 123];
@@ -8192,7 +8192,14 @@ mod tests {
                         .expect("emitted JSON text mirror"),
                 )
                 .unwrap();
-                assert_eq!(actual_text["kind"], json!("complete"));
+                assert_eq!(
+                    actual_text["kind"],
+                    json!(if target <= STDIO_PACKET_PUBLIC_RESULT_MAX_BYTES_V3 {
+                        "complete"
+                    } else {
+                        "budget_exceeded"
+                    })
+                );
                 assert!(
                     actual_text
                         .pointer("/diagnostics/reference/wall_expiry_epoch_ms")
