@@ -1948,8 +1948,6 @@ pub fn citation_owns_command_event_loop_driver(citation: &AgentCitationDto) -> b
         &tokens,
         &[
             "client",
-            "config",
-            "configuration",
             "connection",
             "delete",
             "destroy",
@@ -1964,10 +1962,6 @@ pub fn citation_owns_command_event_loop_driver(citation: &AgentCitationDto) -> b
         return false;
     }
     let terminal = identifier_tokens(terminal_segment_raw(&citation.display_name));
-    // A main-shaped callable is only a candidate for the requirement's exact CALL-boundary
-    // receipt. `COMMAND_EVENT_LOOP_REQUIREMENT` has no role-only fallback, so this never proves
-    // the driver by name: the raw Certain edge still has to reach the declared event-loop target.
-    let main_boundary_candidate = terminal.last().is_some_and(|token| token == "main");
     let driver_action = has_token(
         &terminal,
         &[
@@ -1995,9 +1989,35 @@ pub fn citation_owns_command_event_loop_driver(citation: &AgentCitationDto) -> b
             let repeats = has_token(&source_tokens, &["for", "loop", "loops", "until", "while"]);
             names_loop && drives_loop && repeats
         });
-    main_boundary_candidate
-        || (driver_action
-            && (loop_owner || processes_events || event_runtime_main || source_backed_main))
+    driver_action && (loop_owner || processes_events || event_runtime_main || source_backed_main)
+}
+
+/// A callable whose name permits inspecting an exact outgoing event-loop boundary without making
+/// the citation a carrier by itself. The caller remains inert unless the raw edge and declared
+/// event-loop target both validate at the exact-boundary seam.
+pub fn citation_may_start_command_event_loop_exact_boundary(citation: &AgentCitationDto) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let tokens = name_tokens(citation);
+    let terminal = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    terminal.last().is_some_and(|token| token == "main")
+        && !has_token(
+            &tokens,
+            &[
+                "client",
+                "config",
+                "connection",
+                "delete",
+                "destroy",
+                "metric",
+                "metrics",
+                "monitoring",
+                "observability",
+                "rebind",
+                "telemetry",
+            ],
+        )
 }
 
 /// Typed CALL targets that perform one iteration of an event loop.
@@ -2446,12 +2466,20 @@ mod tests {
         }
         for main_boundary_candidate in ["main", "aeMain", "runtimeMain"] {
             assert!(
-                citation_owns_command_event_loop_driver(&citation(
+                citation_may_start_command_event_loop_exact_boundary(&citation(
                     main_boundary_candidate,
                     "src/runtime.c",
                     NodeKind::FUNCTION,
                 )),
                 "{main_boundary_candidate} may enter exact boundary discovery"
+            );
+            assert!(
+                !citation_owns_command_event_loop_driver(&citation(
+                    main_boundary_candidate,
+                    "src/runtime.c",
+                    NodeKind::FUNCTION,
+                )),
+                "{main_boundary_candidate} is not a carrier without its exact boundary"
             );
         }
         let mut source_backed_main = citation("runtimeMain", "src/runtime.c", NodeKind::FUNCTION);

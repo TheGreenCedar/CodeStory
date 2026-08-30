@@ -12,7 +12,8 @@ use crate::{
 };
 use anyhow::Error as AnyhowError;
 use codestory_agent::packet_flow_requirements::{
-    FlowRequirement, flow_requirement_call_receipt_is_valid,
+    FlowRequirement, flow_requirement_call_boundary_is_discoverable,
+    flow_requirement_call_receipt_is_valid,
 };
 use codestory_contracts::api::NodeKind as ApiNodeKind;
 use codestory_contracts::api::{
@@ -2615,17 +2616,7 @@ fn exact_call_boundary_graph_for_citation(
     let applicable = flow_requirements
         .iter()
         .filter(|requirement| requirement.proof.formula().is_none())
-        .filter(|requirement| requirement.evidence.citation_proves(citation))
-        .filter(|requirement| {
-            requirement
-                .evidence
-                .call_boundary_target(citation)
-                .is_some()
-                || requirement
-                    .evidence
-                    .ordered_call_boundary(citation)
-                    .is_some()
-        })
+        .filter(|requirement| flow_requirement_call_boundary_is_discoverable(requirement, citation))
         .collect::<Vec<_>>();
     if applicable.is_empty() {
         return Ok(None);

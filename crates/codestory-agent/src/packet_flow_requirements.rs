@@ -2,41 +2,42 @@
 
 use crate::packet_evidence_carriers::{
     SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS, SEARCH_EVIDENCE_OUTPUT_ACTIONS,
-    citation_owns_buffer_read_write, citation_owns_buffer_storage,
-    citation_owns_client_adapter_selection, citation_owns_client_public_facade_helper,
-    citation_owns_client_request_dispatch, citation_owns_client_request_entrypoint,
-    citation_owns_client_request_finalization, citation_owns_client_request_method,
-    citation_owns_client_response_materialization, citation_owns_client_transport_send,
-    citation_owns_command_event_loop_driver, citation_owns_command_router,
-    citation_owns_css_animation_entrypoint, citation_owns_css_animation_structure,
-    citation_owns_css_structure, citation_owns_form_custom_validation,
-    citation_owns_form_native_constraint, citation_owns_form_submit_guard,
-    citation_owns_format_arguments, citation_owns_formatter_fallback,
-    citation_owns_hook_cache_helper, citation_owns_hook_key_serialization,
-    citation_owns_hook_mutation_flow, citation_owns_hook_public_export,
-    citation_owns_html_app_shell, citation_owns_log_handler_processing,
-    citation_owns_log_record_creation, citation_owns_mapper_configuration,
-    citation_owns_mapper_execution, citation_owns_search_argument_planning,
-    citation_owns_search_candidate_traversal, citation_owns_search_evidence_classification,
-    citation_owns_search_evidence_output, citation_owns_search_haystack_construction,
-    citation_owns_search_matcher_setup, citation_owns_search_printer_setup,
-    citation_owns_search_searcher_setup, citation_owns_search_worker_construction,
-    citation_owns_server_request_dispatch, citation_owns_server_request_entrypoint,
-    citation_owns_server_request_handler_entrypoint, citation_owns_server_response_terminal,
-    citation_owns_server_route_match_dispatch, citation_owns_server_route_registration,
-    citation_owns_shell_completion, citation_owns_shell_function_dispatch,
-    citation_owns_shell_installer_bootstrap, citation_owns_site_lifecycle,
-    citation_owns_site_reader, citation_owns_site_terminal, citation_owns_string_blank_predicate,
-    citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
-    client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
-    client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
-    command_event_loop_driver_call_target, command_router_call_target,
-    flow_belongs_to_client_request, flow_belongs_to_command_server, flow_belongs_to_indexing,
-    flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
-    flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
-    server_handler_chain_call_target, server_request_dispatch_call_target,
-    server_request_entrypoint_call_target, server_response_terminal_call_target,
-    server_route_insertion_call_target, server_route_lookup_call_target,
+    citation_may_start_command_event_loop_exact_boundary, citation_owns_buffer_read_write,
+    citation_owns_buffer_storage, citation_owns_client_adapter_selection,
+    citation_owns_client_public_facade_helper, citation_owns_client_request_dispatch,
+    citation_owns_client_request_entrypoint, citation_owns_client_request_finalization,
+    citation_owns_client_request_method, citation_owns_client_response_materialization,
+    citation_owns_client_transport_send, citation_owns_command_event_loop_driver,
+    citation_owns_command_router, citation_owns_css_animation_entrypoint,
+    citation_owns_css_animation_structure, citation_owns_css_structure,
+    citation_owns_form_custom_validation, citation_owns_form_native_constraint,
+    citation_owns_form_submit_guard, citation_owns_format_arguments,
+    citation_owns_formatter_fallback, citation_owns_hook_cache_helper,
+    citation_owns_hook_key_serialization, citation_owns_hook_mutation_flow,
+    citation_owns_hook_public_export, citation_owns_html_app_shell,
+    citation_owns_log_handler_processing, citation_owns_log_record_creation,
+    citation_owns_mapper_configuration, citation_owns_mapper_execution,
+    citation_owns_search_argument_planning, citation_owns_search_candidate_traversal,
+    citation_owns_search_evidence_classification, citation_owns_search_evidence_output,
+    citation_owns_search_haystack_construction, citation_owns_search_matcher_setup,
+    citation_owns_search_printer_setup, citation_owns_search_searcher_setup,
+    citation_owns_search_worker_construction, citation_owns_server_request_dispatch,
+    citation_owns_server_request_entrypoint, citation_owns_server_request_handler_entrypoint,
+    citation_owns_server_response_terminal, citation_owns_server_route_match_dispatch,
+    citation_owns_server_route_registration, citation_owns_shell_completion,
+    citation_owns_shell_function_dispatch, citation_owns_shell_installer_bootstrap,
+    citation_owns_site_lifecycle, citation_owns_site_reader, citation_owns_site_terminal,
+    citation_owns_string_blank_predicate, citation_owns_string_empty_predicate,
+    citation_owns_string_region_handoff, client_public_facade_successor_call_target,
+    client_request_dispatch_predecessor_call_source, client_request_dispatch_successor_call_target,
+    client_request_entrypoint_call_target, command_event_loop_driver_call_target,
+    command_router_call_target, flow_belongs_to_client_request, flow_belongs_to_command_server,
+    flow_belongs_to_indexing, flow_belongs_to_network_input, flow_belongs_to_request_terminal,
+    flow_belongs_to_search, flow_belongs_to_server_request, flow_belongs_to_sql_schema,
+    flow_belongs_to_url_session, server_handler_chain_call_target,
+    server_request_dispatch_call_target, server_request_entrypoint_call_target,
+    server_response_terminal_call_target, server_route_insertion_call_target,
+    server_route_lookup_call_target,
 };
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management, packet_evidence_role,
@@ -297,6 +298,25 @@ pub fn ordinary_incident_call_receipt_is_valid(
         }
 }
 
+/// Whether the exact-boundary hydrator may inspect raw CALL rows for this citation. This does not
+/// make the citation evidence: discovery-only candidates still need a valid exact receipt before
+/// obligation finalization can retain them.
+pub fn flow_requirement_call_boundary_is_discoverable(
+    requirement: &FlowRequirement,
+    citation: &AgentCitationDto,
+) -> bool {
+    requirement
+        .evidence
+        .call_boundary_target(citation)
+        .is_some()
+        || requirement
+            .evidence
+            .ordered_call_boundary(citation)
+            .is_some()
+        || (requirement.id == "command_event_loop"
+            && citation_may_start_command_event_loop_exact_boundary(citation))
+}
+
 pub fn flow_requirement_call_receipt_is_valid(
     requirement: &FlowRequirement,
     citation: &AgentCitationDto,
@@ -322,6 +342,13 @@ pub fn flow_requirement_call_receipt_is_valid(
             return false;
         }
         Some(outgoing_target)
+    } else if requirement.id == "command_event_loop"
+        && citation_may_start_command_event_loop_exact_boundary(citation)
+    {
+        if edge.source != citation.node_id {
+            return false;
+        }
+        Some(command_event_loop_driver_call_target as SymbolPredicate)
     } else {
         if !requirement
             .evidence
@@ -3446,6 +3473,12 @@ mod tests {
             NodeKind::FUNCTION,
         ));
         let main_driver = witness("aeMain", "src/runtime.c", NodeKind::FUNCTION);
+        assert!(
+            !COMMAND_EVENT_LOOP_REQUIREMENT
+                .evidence
+                .citation_proves(&main_driver),
+            "a main-shaped entrypoint is outside the ordinary carrier vocabulary"
+        );
         assert!(
             !COMMAND_EVENT_LOOP_REQUIREMENT
                 .evidence

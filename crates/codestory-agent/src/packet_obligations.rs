@@ -1767,15 +1767,26 @@ fn finalize_claim_obligation(
     let mut matching_citations = answer
         .citations
         .iter()
-        .filter(|citation| requirement.evidence.citation_proves(citation))
+        .filter(|citation| {
+            citation_matches_requirement_or_exact_discovery_boundary(
+                obligation,
+                requirement,
+                citation,
+                answer,
+            )
+        })
         .collect::<Vec<_>>();
     rank_obligation_citations_by_context(obligation, &mut matching_citations);
     let mut reported_citations = answer
         .citations
         .iter()
         .filter(|citation| {
-            requirement.evidence.citation_proves(citation)
-                || citation_plausibly_reports_obligation(citation, obligation.kind)
+            citation_matches_requirement_or_exact_discovery_boundary(
+                obligation,
+                requirement,
+                citation,
+                answer,
+            ) || citation_plausibly_reports_obligation(citation, obligation.kind)
         })
         .collect::<Vec<_>>();
     rank_obligation_citations_by_context(obligation, &mut reported_citations);
@@ -1906,6 +1917,23 @@ fn finalize_claim_obligation(
     }
     obligation.proof_status = PacketObligationProofStatusDto::Proven;
     obligation.reason = None;
+}
+
+fn citation_matches_requirement_or_exact_discovery_boundary(
+    obligation: &PacketClaimObligationDto,
+    requirement: &FlowRequirement,
+    citation: &AgentCitationDto,
+    answer: &AgentAnswerDto,
+) -> bool {
+    requirement.evidence.citation_proves(citation)
+        || obligation.required_edge_kind == Some(EdgeKind::CALL)
+            && citation_edge_proof_for_flow_requirement(
+                citation,
+                EdgeKind::CALL,
+                requirement,
+                answer,
+            )
+            .is_some()
 }
 
 /// Finalizes one formula-bearing obligation. `proof_status` comes exclusively
