@@ -7,6 +7,7 @@ use crate::packet_evidence_carriers::{
     citation_owns_client_request_dispatch, citation_owns_client_request_entrypoint,
     citation_owns_client_request_finalization, citation_owns_client_request_method,
     citation_owns_client_response_materialization, citation_owns_client_transport_send,
+    citation_owns_command_event_loop_driver, citation_owns_command_router,
     citation_owns_css_animation_entrypoint, citation_owns_css_animation_structure,
     citation_owns_css_structure, citation_owns_form_custom_validation,
     citation_owns_form_native_constraint, citation_owns_form_submit_guard,
@@ -29,8 +30,8 @@ use crate::packet_evidence_carriers::{
     citation_owns_string_empty_predicate, citation_owns_string_region_handoff,
     client_public_facade_successor_call_target, client_request_dispatch_predecessor_call_source,
     client_request_dispatch_successor_call_target, client_request_entrypoint_call_target,
-    flow_belongs_to_client_request, flow_belongs_to_command_dispatch,
-    flow_belongs_to_command_server, flow_belongs_to_event_loop, flow_belongs_to_indexing,
+    command_event_loop_driver_call_target, command_router_call_target,
+    flow_belongs_to_client_request, flow_belongs_to_command_server, flow_belongs_to_indexing,
     flow_belongs_to_network_input, flow_belongs_to_request_terminal, flow_belongs_to_search,
     flow_belongs_to_server_request, flow_belongs_to_sql_schema, flow_belongs_to_url_session,
     server_handler_chain_call_target, server_request_dispatch_call_target,
@@ -1214,12 +1215,18 @@ const COMMAND_SERVER_BOOTSTRAP_REQUIREMENT: FlowRequirement = FlowRequirement {
 const COMMAND_EVENT_LOOP_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "command_event_loop",
     role: FlowRole::Dispatch,
-    query_seeds: &["event loop", "event loop source"],
+    query_seeds: &[
+        "event loop",
+        "event loop driver",
+        "process events callbacks",
+    ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
-    evidence: EvidencePredicate::CitedRoles {
-        subsystem: flow_belongs_to_event_loop,
-        roles: &[PacketEvidenceRole::EventLoop],
+    evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+        subsystem: flow_belongs_to_command_server,
+        roles: &[],
+        carrier: citation_owns_command_event_loop_driver,
+        call_target: Some(command_event_loop_driver_call_target),
     },
 };
 
@@ -1238,15 +1245,18 @@ const COMMAND_NETWORK_INPUT_REQUIREMENT: FlowRequirement = FlowRequirement {
 const COMMAND_DISPATCH_REQUIREMENT: FlowRequirement = FlowRequirement {
     id: "command_dispatch",
     role: FlowRole::Dispatch,
-    query_seeds: &["command dispatch", "command table dispatch"],
+    query_seeds: &[
+        "command dispatch",
+        "command table dispatch",
+        "command routing checks",
+    ],
     coverage_mode: CoverageMode::RequiresResolvedSourceOrGraph,
     proof: FlowProofSpec::Legacy,
-    evidence: EvidencePredicate::CitedRoles {
-        subsystem: flow_belongs_to_command_dispatch,
-        roles: &[
-            PacketEvidenceRole::CommandDispatch,
-            PacketEvidenceRole::RequestDispatch,
-        ],
+    evidence: EvidencePredicate::CitedRolesOrCallBoundary {
+        subsystem: flow_belongs_to_command_server,
+        roles: &[],
+        carrier: citation_owns_command_router,
+        call_target: Some(command_router_call_target),
     },
 };
 
@@ -3405,6 +3415,66 @@ mod tests {
             &self_loop,
             NodeKind::METHOD,
         ));
+    }
+
+    #[test]
+    fn command_loop_requirements_reject_role_shaped_helpers_and_require_exact_handoffs() {
+        let receipt = |id: &str, source: NodeId, target: NodeId| GraphEdgeDto {
+            id: EdgeId(id.to_string()),
+            source,
+            target,
+            kind: EdgeKind::CALL,
+            confidence: Some(1.0),
+            certainty: Some("certain".to_string()),
+            callsite_identity: Some("src/runtime.c:1".to_string()),
+            candidate_targets: Vec::new(),
+        };
+
+        let loop_driver = witness("EventLoop.run", "src/runtime.c", NodeKind::FUNCTION);
+        let loop_call = receipt(
+            "loop-driver",
+            loop_driver.node_id.clone(),
+            NodeId("EventLoop.processEvents".to_string()),
+        );
+        assert!(flow_requirement_call_receipt_is_valid(
+            &COMMAND_EVENT_LOOP_REQUIREMENT,
+            &loop_driver,
+            &loop_call,
+            "EventLoop.processEvents",
+            NodeKind::FUNCTION,
+        ));
+        let rebind = witness(
+            "Connection.rebindEventLoop",
+            "src/runtime.c",
+            NodeKind::FUNCTION,
+        );
+        assert!(
+            !COMMAND_EVENT_LOOP_REQUIREMENT
+                .evidence
+                .citation_proves(&rebind)
+        );
+
+        let command_router = witness("processCommand", "src/server.c", NodeKind::FUNCTION);
+        let routing_call = receipt(
+            "command-router",
+            command_router.node_id.clone(),
+            NodeId("rejectCommand".to_string()),
+        );
+        assert!(flow_requirement_call_receipt_is_valid(
+            &COMMAND_DISPATCH_REQUIREMENT,
+            &command_router,
+            &routing_call,
+            "rejectCommand",
+            NodeKind::FUNCTION,
+        ));
+        for helper in ["processCommandAndResetClient", "ModuleCommandDispatcher"] {
+            assert!(
+                !COMMAND_DISPATCH_REQUIREMENT
+                    .evidence
+                    .citation_proves(&witness(helper, "src/server.c", NodeKind::FUNCTION)),
+                "{helper} must not close central command routing"
+            );
+        }
     }
 
     #[test]

@@ -1931,6 +1931,178 @@ pub fn flow_belongs_to_command_dispatch(citation: &AgentCitationDto) -> bool {
     )
 }
 
+/// The callable that repeatedly drives an event loop, rather than a helper that creates,
+/// rebinds, destroys, or observes one.
+///
+/// Event-loop names are unusually prone to false coverage: `rebindEventLoop` and
+/// `deleteEventLoop` both earn the broad `EventLoop` evidence role while proving nothing about
+/// how registered work is driven. This carrier admits only a loop/reactor owner paired with a
+/// driver action, or a compound `processEvents`-style callable. The exact outgoing CALL is checked
+/// separately by `command_event_loop_driver_call_target`.
+pub fn citation_owns_command_event_loop_driver(citation: &AgentCitationDto) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let tokens = name_tokens(citation);
+    if has_token(
+        &tokens,
+        &[
+            "client",
+            "connection",
+            "delete",
+            "destroy",
+            "metric",
+            "metrics",
+            "monitoring",
+            "observability",
+            "rebind",
+            "telemetry",
+        ],
+    ) {
+        return false;
+    }
+    let terminal = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    let driver_action = has_token(
+        &terminal,
+        &[
+            "dispatch", "main", "poll", "process", "run", "serve", "wait",
+        ],
+    );
+    let loop_owner = has_token(&tokens, &["loop", "reactor"]);
+    let processes_events =
+        has_token(&terminal, &["process"]) && has_token(&terminal, &["event", "events"]);
+    let event_runtime_main = has_token(&terminal, &["main"])
+        && has_token(&tokens, &["event", "events"])
+        && has_token(&tokens, &["runtime"]);
+    let source_backed_main = has_token(&terminal, &["main"])
+        && citation.source_excerpt.as_deref().is_some_and(|source| {
+            let source_tokens = identifier_tokens(source);
+            let names_loop = (has_token(&source_tokens, &["event", "events"])
+                && has_token(&source_tokens, &["loop", "loops"]))
+                || has_token(&source_tokens, &["reactor"]);
+            let drives_loop = (has_token(&source_tokens, &["process"])
+                && has_token(&source_tokens, &["event", "events"]))
+                || has_token(
+                    &source_tokens,
+                    &["dispatch", "poll", "select", "tick", "wait"],
+                );
+            let repeats = has_token(&source_tokens, &["for", "loop", "loops", "until", "while"]);
+            names_loop && drives_loop && repeats
+        });
+    driver_action && (loop_owner || processes_events || event_runtime_main || source_backed_main)
+}
+
+/// Typed CALL targets that perform one iteration of an event loop.
+pub fn command_event_loop_driver_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    if has_token(
+        &tokens,
+        &[
+            "client",
+            "connection",
+            "delete",
+            "destroy",
+            "handler",
+            "metric",
+            "metrics",
+            "monitoring",
+            "observability",
+            "rebind",
+            "telemetry",
+        ],
+    ) {
+        return false;
+    }
+    let terminal = identifier_tokens(terminal_segment_raw(display_name));
+    let processes_events =
+        has_token(&terminal, &["process"]) && has_token(&terminal, &["event", "events"]);
+    let dispatches_events = has_token(&terminal, &["dispatch"])
+        && has_token(&terminal, &["event", "events", "callback", "callbacks"]);
+    let owner_count = tokens.len().saturating_sub(terminal.len());
+    let loop_owner = has_token(&tokens[..owner_count], &["loop", "poller", "reactor"]);
+    let loop_action = has_token(
+        &terminal,
+        &["dispatch", "poll", "process", "select", "tick", "wait"],
+    );
+    processes_events || dispatches_events || (loop_owner && loop_action)
+}
+
+/// The central command router. Wrapper cleanup, module/plugin callbacks, documentation, and
+/// observability helpers are deliberately excluded even when their names contain both "command"
+/// and a dispatch verb. The exact outgoing routing/check/handler CALL is validated separately.
+pub fn citation_owns_command_router(citation: &AgentCitationDto) -> bool {
+    if !owns_callable_behavior(citation) {
+        return false;
+    }
+    let tokens = name_tokens(citation);
+    if !has_token(&tokens, &["command", "commands"])
+        || has_token(
+            &tokens,
+            &[
+                "benchmark",
+                "cli",
+                "doc",
+                "docs",
+                "help",
+                "log",
+                "logger",
+                "metric",
+                "metrics",
+                "module",
+                "monitoring",
+                "observability",
+                "plugin",
+                "reset",
+                "telemetry",
+            ],
+        )
+    {
+        return false;
+    }
+    let terminal = identifier_tokens(terminal_segment_raw(&citation.display_name));
+    has_token(
+        &terminal,
+        &["dispatch", "execute", "handle", "process", "route"],
+    )
+}
+
+/// Typed CALL targets that perform command lookup, policy checks, rejection/queueing, or handler
+/// dispatch. Post-processing and command-adjacent module/help/metrics calls do not close the
+/// routing boundary.
+pub fn command_router_call_target(display_name: &str) -> bool {
+    let tokens = identifier_tokens(display_name);
+    if !has_token(&tokens, &["command", "commands"])
+        || has_token(
+            &tokens,
+            &[
+                "doc",
+                "docs",
+                "help",
+                "log",
+                "logger",
+                "metric",
+                "metrics",
+                "module",
+                "monitoring",
+                "observability",
+                "plugin",
+                "processed",
+                "telemetry",
+            ],
+        )
+    {
+        return false;
+    }
+    let terminal = identifier_tokens(terminal_segment_raw(display_name));
+    has_token(
+        &terminal,
+        &[
+            "check", "dispatch", "execute", "find", "handle", "invoke", "lookup", "queue",
+            "reject", "resolve", "route", "validate",
+        ],
+    )
+}
+
 /// Planning and running a search.
 pub fn flow_belongs_to_search(citation: &AgentCitationDto) -> bool {
     names_token(
@@ -2099,6 +2271,30 @@ fn taxonomy_plural(term: &str) -> String {
 }
 
 #[cfg(test)]
+const COMMAND_LOOP_CARRIER_TAXONOMY: &[&str] = &[
+    "benchmark",
+    "callback",
+    "callbacks",
+    "cli",
+    "destroy",
+    "doc",
+    "docs",
+    "for",
+    "help",
+    "metric",
+    "plugin",
+    "poller",
+    "processed",
+    "rebind",
+    "reject",
+    "reset",
+    "runtime",
+    "until",
+    "wait",
+    "while",
+];
+
+#[cfg(test)]
 pub(crate) fn carrier_taxonomy_vocabulary() -> Vec<String> {
     let mut vocabulary = INDEXING_SUBJECT_TOKENS
         .iter()
@@ -2121,6 +2317,7 @@ pub(crate) fn carrier_taxonomy_vocabulary() -> Vec<String> {
         .chain(SEARCH_EVIDENCE_CONTEXT_TOKENS)
         .chain(SEARCH_EVIDENCE_CLASSIFICATION_ACTIONS)
         .chain(SEARCH_EVIDENCE_OUTPUT_ACTIONS)
+        .chain(COMMAND_LOOP_CARRIER_TAXONOMY)
         .chain(["evidence"].iter())
         .flat_map(|term| [(*term).to_string(), taxonomy_plural(term)])
         .collect::<Vec<_>>();
@@ -2205,6 +2402,115 @@ mod tests {
                     NodeKind::FUNCTION,
                 )),
                 "{name} supplies only one carrier factor",
+            );
+        }
+    }
+
+    #[test]
+    fn command_loop_carriers_require_the_driver_and_central_router_boundaries() {
+        for positive in ["EventLoop.run", "Reactor.processEvents", "eventRuntimeMain"] {
+            assert!(
+                citation_owns_command_event_loop_driver(&citation(
+                    positive,
+                    "src/runtime.c",
+                    NodeKind::FUNCTION,
+                )),
+                "{positive} should own the event-loop driver boundary"
+            );
+        }
+        for negative in [
+            "Connection.rebindEventLoop",
+            "EventLoop.delete",
+            "EventHandler.dispatch",
+            "EventLoopMetrics.poll",
+        ] {
+            assert!(
+                !citation_owns_command_event_loop_driver(&citation(
+                    negative,
+                    "src/runtime.c",
+                    NodeKind::FUNCTION,
+                )),
+                "{negative} must not own the event-loop driver boundary"
+            );
+        }
+        let mut source_backed_main = citation("runtimeMain", "src/runtime.c", NodeKind::FUNCTION);
+        source_backed_main.source_excerpt = Some(
+            "void runtimeMain(EventLoop *event_loop) { while (!event_loop->stop) { processEvents(event_loop); } }"
+                .to_string(),
+        );
+        assert!(citation_owns_command_event_loop_driver(&source_backed_main));
+        for positive in [
+            "EventLoop.processEvents",
+            "Poller.poll",
+            "Reactor.dispatchEvents",
+        ] {
+            assert!(
+                command_event_loop_driver_call_target(positive),
+                "{positive} should be a lawful event-loop driver target"
+            );
+        }
+        for negative in [
+            "Connection.rebindEventLoop",
+            "EventLoop.delete",
+            "EventLoopMetrics.poll",
+            "EventHandler.dispatch",
+        ] {
+            assert!(
+                !command_event_loop_driver_call_target(negative),
+                "{negative} must not close the event-loop driver boundary"
+            );
+        }
+
+        for positive in [
+            "processCommand",
+            "CommandRouter.route",
+            "CommandHandler.execute",
+        ] {
+            assert!(
+                citation_owns_command_router(&citation(
+                    positive,
+                    "src/server.c",
+                    NodeKind::FUNCTION,
+                )),
+                "{positive} should own central command routing"
+            );
+        }
+        for negative in [
+            "processCommandAndResetClient",
+            "ModuleCommandDispatcher",
+            "CommandHelp.process",
+            "CommandMetrics.execute",
+        ] {
+            assert!(
+                !citation_owns_command_router(&citation(
+                    negative,
+                    "src/server.c",
+                    NodeKind::FUNCTION,
+                )),
+                "{negative} must not own central command routing"
+            );
+        }
+        for positive in [
+            "CommandTable.lookup",
+            "commandCheckArity",
+            "rejectCommand",
+            "CommandHandler.execute",
+            "queueCommand",
+        ] {
+            assert!(
+                command_router_call_target(positive),
+                "{positive} should be a lawful command-router target"
+            );
+        }
+        for negative in [
+            "commandProcessed",
+            "ModuleCommandDispatcher",
+            "CommandHelp.render",
+            "CommandMetrics.record",
+        ] {
+            assert!(
+                !command_router_call_target(negative),
+                "{negative} must not close the command-router boundary"
             );
         }
     }
