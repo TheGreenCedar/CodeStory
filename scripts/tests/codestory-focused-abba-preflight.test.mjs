@@ -42,6 +42,12 @@ test("focused timing preflight schedules five paired ABBA rows per arm and task"
 
 test("focused timing preflight gives paired arms the same cohort id", () => {
   const raw = {
+    agent_runner_wall_ms: 100.2,
+    wall_ms: 125.4,
+    codestory_harness_prelude: {
+      time_to_first_packet_ms: 20.1,
+      continuation_ms: 5.1,
+    },
     installed_agent_timing: {
       timing_cohort_id: "f".repeat(64),
       agent_runner_ms: 100,

@@ -74,12 +74,26 @@ function focusedAbbaTiming(rawRow, dimensions) {
   const raw = rawRow?.installed_agent_timing;
   if (!raw) throw new Error("focused ABBA row has no installed agent timing");
   const timingCohortId = installedAgentTimingCohortId(dimensions);
+  const prelude = rawRow.codestory_harness_prelude;
+  const baselineMs = rawRow.baseline_harness_prelude?.wall_ms ?? 0;
+  const agentRunnerMs = Number.isFinite(rawRow.agent_runner_wall_ms)
+    ? rawRow.agent_runner_wall_ms + baselineMs
+    : raw.agent_runner_ms;
+  const timeToFirstPacketMs = Number.isFinite(prelude?.time_to_first_packet_ms)
+    ? prelude.time_to_first_packet_ms
+    : raw.time_to_first_packet_ms;
+  const continuationMs = Number.isFinite(prelude?.continuation_ms)
+    ? prelude.continuation_ms
+    : raw.continuation_ms;
+  const wholeTaskWallMs = Number.isFinite(rawRow.wall_ms)
+    ? rawRow.wall_ms
+    : raw.whole_task_wall_ms;
   return installedAgentTiming({
     timing_cohort_id: timingCohortId,
-    agent_runner_ms: raw.agent_runner_ms,
-    time_to_first_packet_ms: raw.time_to_first_packet_ms,
-    continuation_ms: raw.continuation_ms,
-    whole_task_wall_ms: raw.whole_task_wall_ms,
+    agent_runner_ms: agentRunnerMs,
+    time_to_first_packet_ms: timeToFirstPacketMs,
+    continuation_ms: continuationMs,
+    whole_task_wall_ms: wholeTaskWallMs,
   });
 }
 
