@@ -602,6 +602,7 @@ function beginAction(state, id, action, allowOverlap = false) {
     fail(`tool call ${JSON.stringify(id)} started before ${JSON.stringify([...state.open.keys()][0])} completed`);
   }
   action.overlaps = [...state.open.values()];
+  action.transcript_action_index = state.actions.length;
   state.open.set(id, action);
   state.actions.push(action);
 }
@@ -762,6 +763,21 @@ function cursorStartedAction(callId, key, args) {
       cursor_args: args,
     };
   }
+  if (key === "awaitToolCall") {
+    if (!equalJson(Object.keys(args).sort(), ["blockUntilMs", "taskId"])
+        || args.taskId !== ""
+        || !Number.isSafeInteger(args.blockUntilMs)
+        || args.blockUntilMs < 1) {
+      fail("Cursor awaitToolCall is not a bounded delay-only preparing retry wait");
+    }
+    return {
+      kind: "cursor_retry_wait",
+      tool: "awaitToolCall",
+      args,
+      cursor_key: key,
+      cursor_args: args,
+    };
+  }
   return { kind: "external_tool", tool: key, args, cursor_key: key, cursor_args: args };
 }
 
@@ -867,6 +883,22 @@ function parseCursor(events) {
       }
       if (key === "readToolCall" && (!plainObject(success) || success.exceededLimit !== false)) {
         fail(`Cursor completed tool call ${JSON.stringify(callId)} contains a partial read`);
+      }
+      if (key === "awaitToolCall") {
+        const complete = success?.complete;
+        if (!plainObject(success)
+            || !equalJson(Object.keys(success), ["complete"])
+            || !plainObject(complete)
+            || !equalJson(Object.keys(complete).sort(), [
+              "outputFilePath", "outputLength", "regexRequested", "runtimeMs", "taskId",
+            ])
+            || complete.taskId !== ""
+            || complete.runtimeMs !== String(action.args.blockUntilMs)
+            || complete.outputFilePath !== ""
+            || complete.outputLength !== "0"
+            || complete.regexRequested !== false) {
+          fail("Cursor awaitToolCall is not a bounded delay-only preparing retry wait");
+        }
       }
       completeAction(state, callId, success, false);
       return;
@@ -1205,10 +1237,29 @@ function collapsePreparingRetries(actions, expectedIdentity, host) {
     }
     consecutivePreparing += 1;
     if (consecutivePreparing > 3) fail(`${action.tool} exceeded the bounded preparing retry limit`);
-    const retry = actions[index + 1];
+    let retryIndex = index + 1;
+    const wait = actions[retryIndex];
+    let expectedTranscriptActionIndex = action.transcript_action_index + 1;
+    if (wait?.kind === "cursor_retry_wait") {
+      const retryAfterMs = normalized.body.retry_after_ms;
+      if (host !== "cursor"
+          || !wait.completed
+          || wait.error
+          || wait.overlaps.length !== 0
+          || wait.transcript_action_index !== expectedTranscriptActionIndex
+          || wait.args.blockUntilMs < retryAfterMs
+          || wait.args.blockUntilMs > retryAfterMs * 2) {
+        fail(`${action.tool} preparing retry has an invalid bounded delay-only preparing retry wait`);
+      }
+      retryIndex += 1;
+      index += 1;
+      expectedTranscriptActionIndex += 1;
+    }
+    const retry = actions[retryIndex];
     if (!retry || retry.kind !== action.kind || retry.tool !== action.tool
+        || retry.transcript_action_index !== expectedTranscriptActionIndex
         || !equalJson(retry.args, action.args)) {
-      fail(`${action.tool} preparing result must be followed directly by the same tool and arguments`);
+      fail(`${action.tool} preparing result must be followed directly by the same tool and arguments, apart from at most one bounded retry wait`);
     }
   }
   return collapsed;

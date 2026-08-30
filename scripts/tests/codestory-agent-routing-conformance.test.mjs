@@ -838,6 +838,30 @@ function cursorJsonl(run) {
           },
         },
       };
+    } else if (step.kind === "cursor_retry_wait") {
+      const args = {
+        taskId: step.taskId ?? "",
+        blockUntilMs: step.blockUntilMs ?? 300,
+      };
+      wrapper = {
+        started: { awaitToolCall: { args } },
+        completed: {
+          awaitToolCall: {
+            args,
+            result: {
+              success: {
+                complete: {
+                  taskId: step.completedTaskId ?? args.taskId,
+                  runtimeMs: String(step.runtimeMs ?? args.blockUntilMs),
+                  outputFilePath: step.outputFilePath ?? "",
+                  outputLength: String(step.outputLength ?? 0),
+                  regexRequested: step.regexRequested ?? false,
+                },
+              },
+            },
+          },
+        },
+      };
     } else if (step.kind === "cursor_guidance_read") {
       const args = { path: step.path };
       const bytes = readFileSync(step.path);
@@ -1793,6 +1817,86 @@ test("installed hosts collapse only bounded identical preparing retries", () => 
     unbounded.steps.unshift(...repeats);
     assert.throws(() => validate(host, unbounded), /bounded preparing retry limit/u);
   }
+
+  const cursorWait = (overrides = {}) => ({
+    kind: "cursor_retry_wait",
+    blockUntilMs: 300,
+    ...overrides,
+  });
+  const cursorRunWithWait = () => {
+    const run = baseRun("exact_symbol_search");
+    const preparing = clone(run.steps[0]);
+    preparing.result = result(preparingBody);
+    run.steps.unshift(preparing, cursorWait());
+    return run;
+  };
+
+  assert.deepEqual(validate("cursor", cursorRunWithWait()).actions, ["search"]);
+
+  const wrongTool = cursorRunWithWait();
+  wrongTool.steps[2] = clone(baseRun("selected_target_context").steps[0]);
+  assert.throws(
+    () => validate("cursor", wrongTool),
+    /same tool and arguments/u,
+  );
+
+  const changedArgs = cursorRunWithWait();
+  changedArgs.steps[2].args.query = "changed";
+  assert.throws(
+    () => validate("cursor", changedArgs),
+    /same tool and arguments/u,
+  );
+
+  const extraAction = cursorRunWithWait();
+  extraAction.steps.splice(2, 0, { kind: "source_read", path: "src/unrelated.rs" });
+  assert.throws(
+    () => validate("cursor", extraAction),
+    /same tool and arguments/u,
+  );
+
+  const extraProviderAction = cursorRunWithWait();
+  extraProviderAction.steps.splice(2, 0, { kind: "cursor_tool_discovery", tool: "search" });
+  assert.throws(
+    () => validate("cursor", extraProviderAction),
+    /same tool and arguments/u,
+  );
+
+  const missingRetry = cursorRunWithWait();
+  missingRetry.steps.pop();
+  assert.throws(
+    () => validate("cursor", missingRetry),
+    /same tool and arguments/u,
+  );
+
+  const excessiveWait = cursorRunWithWait();
+  excessiveWait.steps.splice(2, 0, cursorWait());
+  assert.throws(
+    () => validate("cursor", excessiveWait),
+    /same tool and arguments|bounded preparing retry wait/u,
+  );
+
+  for (const hostileWait of [
+    cursorWait({ blockUntilMs: 249, runtimeMs: 249 }),
+    cursorWait({ blockUntilMs: 501, runtimeMs: 501 }),
+    cursorWait({ runtimeMs: 299 }),
+    cursorWait({ taskId: "background-task", completedTaskId: "background-task" }),
+    cursorWait({ outputFilePath: "/tmp/output", outputLength: 1 }),
+    cursorWait({ regexRequested: true }),
+  ]) {
+    const hostile = cursorRunWithWait();
+    hostile.steps[1] = hostileWait;
+    assert.throws(
+      () => validate("cursor", hostile),
+      /bounded delay-only preparing retry wait/u,
+    );
+  }
+
+  const unrelatedWait = baseRun("exact_symbol_search");
+  unrelatedWait.steps.unshift(cursorWait());
+  assert.throws(
+    () => validate("cursor", unrelatedWait),
+    /required action sequence|forbidden tool/u,
+  );
 });
 
 function mutateBody(run, index, mutate) {
