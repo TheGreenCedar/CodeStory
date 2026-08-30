@@ -3183,7 +3183,7 @@ fn append_packet_carrier_source_sections(
         if !bounded_source_read && !behavioral_source {
             return Vec::new();
         }
-        if bounded_source_read {
+        let sources = if bounded_source_read {
             let (Some(path), Some(line)) = (citation.file_path.as_deref(), citation.line) else {
                 return Vec::new();
             };
@@ -3286,7 +3286,8 @@ fn append_packet_carrier_source_sections(
                     }]
                 })
                 .unwrap_or_default()
-        }
+        };
+        attach_enclosing_type_source_context(controller, citation, sources)
     };
 
     // Spend one source slot on each exact material carrier first, then return to the original
@@ -3899,6 +3900,153 @@ fn source_receipt_line_range(markdown: &str, fallback_start: u32) -> (u32, u32) 
         start.unwrap_or(fallback_start),
         end.unwrap_or(fallback_start),
     )
+}
+
+const CARRIER_SOURCE_OWNER_CONTEXT_LOOKBACK_LINES: usize = 32;
+
+/// Keep the source-local type declaration with an owner-qualified method when it fits the same
+/// bounded window. A method body proves mechanics, while the adjacent declaration and comments
+/// often establish what kind of implementation owns those mechanics. This is a source expansion
+/// for every qualified method shape; it does not consult the prompt, requirement ids, or fixture
+/// vocabulary.
+fn attach_enclosing_type_source_context(
+    controller: &AppController,
+    citation: &AgentCitationDto,
+    mut sources: Vec<CarrierSourceRange>,
+) -> Vec<CarrierSourceRange> {
+    if citation.kind != NodeKind::METHOD || sources.is_empty() {
+        return sources;
+    }
+    let Some(anchor_line) = citation.line else {
+        return sources;
+    };
+    let first = &sources[0];
+    let (_, end_line) = source_receipt_line_range(&first.body, first.start_line);
+    let Ok(source) = controller.read_file_text(codestory_contracts::api::ReadFileTextRequest {
+        path: first.path.clone(),
+    }) else {
+        return sources;
+    };
+    let lines = source.text.lines().collect::<Vec<_>>();
+    let Some(start_line) = enclosing_type_context_start_line(
+        &lines,
+        anchor_line,
+        end_line,
+        &citation.display_name,
+        CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+    ) else {
+        return sources;
+    };
+    let Ok((path, bounded)) = controller.bounded_file_snippet_range(
+        &first.path,
+        crate::BoundedSnippetRangeOptions {
+            focus_line: anchor_line,
+            start_line,
+            end_line,
+            context_lines: 0,
+            max_bytes: CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+            truncation_suffix: SOURCE_SNIPPET_TRUNCATION_SUFFIX,
+        },
+    ) else {
+        return sources;
+    };
+    let rendered_range = source_receipt_line_range(&bounded.markdown, start_line);
+    if rendered_range.0 > start_line || rendered_range.1 < end_line {
+        return sources;
+    }
+    sources[0] = CarrierSourceRange {
+        path,
+        start_line,
+        body: bounded.markdown,
+    };
+    sources
+}
+
+fn enclosing_type_context_start_line(
+    lines: &[&str],
+    anchor_line: u32,
+    end_line: u32,
+    display_name: &str,
+    maximum_bytes: usize,
+) -> Option<u32> {
+    let owner = display_name
+        .rsplit(['.', ':', '#', '/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .nth(1)
+        .map(source_identifier_key)
+        .filter(|owner| !owner.is_empty())?;
+    let anchor_index = usize::try_from(anchor_line.saturating_sub(1)).ok()?;
+    let end_index = usize::try_from(end_line).ok()?.min(lines.len());
+    if anchor_index >= lines.len() || anchor_index >= end_index {
+        return None;
+    }
+    let search_start = anchor_index.saturating_sub(CARRIER_SOURCE_OWNER_CONTEXT_LOOKBACK_LINES);
+    let declaration_index = (search_start..anchor_index)
+        .rev()
+        .find(|index| source_line_declares_type_owner(lines[*index], &owner))?;
+
+    let mut comment_start = declaration_index;
+    while comment_start > search_start
+        && source_owner_comment_line(lines[comment_start.saturating_sub(1)])
+    {
+        comment_start -= 1;
+    }
+    for candidate in [comment_start, declaration_index] {
+        let line_count = end_index.saturating_sub(candidate);
+        let bytes = lines[candidate..end_index]
+            .iter()
+            .map(|line| line.len().saturating_add(1))
+            .sum::<usize>()
+            // `bounded_file_snippet_range` renders line numbers and a focus marker beside the
+            // source. Budget that framing here so owner context never truncates bytes already
+            // retained by the method's declaration window.
+            .saturating_add(line_count.saturating_mul(10))
+            .saturating_add(16);
+        if bytes <= maximum_bytes {
+            return u32::try_from(candidate.saturating_add(1)).ok();
+        }
+    }
+    None
+}
+
+fn source_line_declares_type_owner(line: &str, expected_owner: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("/*")
+    {
+        return false;
+    }
+    let tokens = line
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    tokens.iter().any(|token| token == expected_owner)
+        && tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "class" | "struct" | "interface" | "trait" | "record" | "object" | "impl"
+            )
+        })
+}
+
+fn source_owner_comment_line(line: &str) -> bool {
+    let line = line.trim();
+    !line.is_empty()
+        && (line.starts_with("//")
+            || line.starts_with("/*")
+            || line.starts_with('*')
+            || line.ends_with("*/"))
+}
+
+fn source_identifier_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// A long function is rarely best represented by its prologue. Select at most three bounded,
@@ -8871,6 +9019,74 @@ mod tests {
 
         assert_eq!(source_receipt_line_range(markdown, 42), (41, 43));
         assert_eq!(source_receipt_line_range("plain text", 42), (42, 42));
+    }
+
+    #[test]
+    fn qualified_method_source_keeps_a_fitting_owner_declaration_and_comments() {
+        let source = [
+            "import helper;",
+            "",
+            "/// Default sessions implement convenience operations through dispatch.",
+            "class DefaultSession implements Session {",
+            "  Result perform(Request request) {",
+            "    return dispatch(request);",
+            "  }",
+        ];
+
+        assert_eq!(
+            enclosing_type_context_start_line(
+                &source,
+                5,
+                7,
+                "DefaultSession.perform",
+                CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn qualified_method_source_falls_back_to_the_owner_declaration_when_docs_do_not_fit() {
+        let long_docs = format!("/// {}", "context ".repeat(300));
+        let source = [
+            long_docs.as_str(),
+            "class NativeSession {",
+            "  Result send(Request request) {",
+            "    return transport.send(request);",
+            "  }",
+        ];
+
+        assert_eq!(
+            enclosing_type_context_start_line(
+                &source,
+                3,
+                5,
+                "NativeSession.send",
+                CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+            ),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn qualified_method_source_never_borrows_an_unrelated_owner_declaration() {
+        let source = [
+            "class CacheClient {",
+            "  Result send(Request request) {",
+            "    return write(request);",
+            "  }",
+        ];
+
+        assert_eq!(
+            enclosing_type_context_start_line(
+                &source,
+                2,
+                4,
+                "NetworkClient.send",
+                CARRIER_SOURCE_MAX_SNIPPET_BYTES,
+            ),
+            None
+        );
     }
 
     struct EvalProbesGuard;
