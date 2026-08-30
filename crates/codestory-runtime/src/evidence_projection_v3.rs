@@ -1171,12 +1171,14 @@ const PACKET_MATERIAL_CARRIER_SUMMARY_MAX_BYTES_V3: usize = 2 * 1024;
 
 fn packet_evidence_summary(unit: &SupportUnitDto, material_carrier: bool) -> Option<SummaryTextV3> {
     let text = match unit.kind {
-        SupportUnitKindDto::SourceRange => unit
-            .snippet
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or(&unit.summary)
-            .to_owned(),
+        // A source row carries two independent facts: which qualified carrier the bytes belong
+        // to, and the exact bytes themselves. `SupportUnitDto` retains both, but the public v3
+        // projection used to replace the qualified source description with the snippet. Methods
+        // then reached the model as an opaque numeric symbol id plus an ownerless declaration,
+        // losing the identity that made the source material in the first place. Keep the rendered
+        // source identity beside the bytes. This exposes evidence already present in the support
+        // unit; it does not expose planner obligations, proof state, or ranking metadata.
+        SupportUnitKindDto::SourceRange => packet_source_evidence_summary(unit),
         SupportUnitKindDto::TypedGraphEdge => {
             match (
                 unit.from_symbol.as_deref(),
@@ -1196,6 +1198,22 @@ fn packet_evidence_summary(unit: &SupportUnitDto, material_carrier: bool) -> Opt
         PACKET_EVIDENCE_SUMMARY_MAX_BYTES_V3
     };
     Some(summary_text_bounded(&text, maximum))
+}
+
+fn packet_source_evidence_summary(unit: &SupportUnitDto) -> String {
+    let source = unit
+        .snippet
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    let identity = (!unit.summary.trim().is_empty()).then_some(unit.summary.trim());
+    match (identity, source) {
+        (Some(identity), Some(source)) if identity != source.trim() => {
+            format!("{identity}\n\n{source}")
+        }
+        (Some(identity), _) => identity.to_owned(),
+        (None, Some(source)) => source.to_owned(),
+        (None, None) => String::new(),
+    }
 }
 
 fn packet_symbol_location_summary(unit: &SupportUnitDto) -> String {
@@ -1547,7 +1565,7 @@ mod tests {
     fn packet_evidence_keeps_ranked_source_and_relation_context_in_compact_identities() {
         let mut source = support_unit(SupportUnitKindDto::SourceRange);
         source.id = "repository-shaped-source-id".to_owned();
-        source.summary = "source range".to_owned();
+        source.summary = "source for Useful.run at src/useful.rs:7-9".to_owned();
         source.snippet = Some(format!("fn useful() {{}}\n{}", "x".repeat(700)));
         source.path = Some("src/useful.rs".to_owned());
         let source = packet_evidence_row(7, &source, false).expect("source evidence");
@@ -1559,7 +1577,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .as_str()
-                .starts_with("fn useful()")
+                .starts_with("source for Useful.run at src/useful.rs:7-9\n\nfn useful()")
         );
 
         let mut relation = support_unit(SupportUnitKindDto::TypedGraphEdge);
@@ -1589,7 +1607,11 @@ mod tests {
             rows.iter()
                 .map(|row| row.summary.as_ref().unwrap().as_str())
                 .collect::<Vec<_>>(),
-            ["fn useful() {}", "caller -[CALL]-> callee", "location"]
+            [
+                "fixture\n\nfn useful() {}",
+                "caller -[CALL]-> callee",
+                "location"
+            ]
         );
         assert_eq!(
             rows.iter()
@@ -1664,7 +1686,7 @@ mod tests {
         assert_eq!(evidence[0].end_line, Some(150));
         assert_eq!(
             evidence[0].summary.as_ref().map(|summary| summary.as_str()),
-            Some("fn finalize() { prepare(); return body; }")
+            Some("fixture\n\nfn finalize() { prepare(); return body; }")
         );
     }
 
@@ -1686,7 +1708,7 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(
             evidence[0].summary.as_ref().unwrap().as_str(),
-            "public object Map(...) => MapCore(...);"
+            "fixture\n\npublic object Map(...) => MapCore(...);"
         );
     }
 
@@ -1774,22 +1796,22 @@ mod tests {
                 .filter_map(|row| row.summary.as_ref().map(|summary| summary.as_str()))
                 .collect::<Vec<_>>(),
             [
-                "fn source_0() {}",
-                "fn source_1() {}",
-                "fn source_2() {}",
-                "fn source_3() {}",
-                "fn source_4() {}",
-                "fn source_5() {}",
-                "fn source_6() {}",
-                "fn source_7() {}",
+                "fixture\n\nfn source_0() {}",
+                "fixture\n\nfn source_1() {}",
+                "fixture\n\nfn source_2() {}",
+                "fixture\n\nfn source_3() {}",
+                "fixture\n\nfn source_4() {}",
+                "fixture\n\nfn source_5() {}",
+                "fixture\n\nfn source_6() {}",
+                "fixture\n\nfn source_7() {}",
                 "caller-0 -[CALL]-> callee-0",
                 "caller-1 -[CALL]-> callee-1",
                 "caller-2 -[CALL]-> callee-2",
                 "caller-3 -[CALL]-> callee-3",
-                "fn source_8() {}",
-                "fn source_9() {}",
-                "fn source_10() {}",
-                "fn source_11() {}",
+                "fixture\n\nfn source_8() {}",
+                "fixture\n\nfn source_9() {}",
+                "fixture\n\nfn source_10() {}",
+                "fixture\n\nfn source_11() {}",
             ]
         );
         assert!(packet_evidence_was_bounded(&support));
