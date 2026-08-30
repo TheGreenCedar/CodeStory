@@ -6036,14 +6036,22 @@ mod tests {
         let secondary_proof_id = EdgeId("secondary-proof".to_string());
         let uncertain_proof_id = EdgeId("uncertain-proof".to_string());
         let context_edge_id = EdgeId("probable-wrapper-core".to_string());
+        let hostile_proof_id = EdgeId("hostile-proof".to_string());
+        let hostile_context_edge_id = EdgeId("probable-wrapper-hostile".to_string());
         let unproven_context_edge_id = EdgeId("probable-wrapper-unproven".to_string());
         let uncertain_context_edge_id = EdgeId("uncertain-wrapper-core".to_string());
         let mut primary = citation(
+            "CommandRouter.executeCommand",
+            "src/server.c",
+            NodeKind::FUNCTION,
+        );
+        primary.evidence_edge_ids = vec![primary_proof_id.clone()];
+        let mut hostile = citation(
             "executeCommandAndRecordMetrics",
             "src/networking.c",
             NodeKind::FUNCTION,
         );
-        primary.evidence_edge_ids = vec![primary_proof_id.clone()];
+        hostile.evidence_edge_ids = vec![hostile_proof_id.clone()];
         let unproven = citation(
             "executeCommandWithoutProof",
             "src/server.c",
@@ -6057,9 +6065,10 @@ mod tests {
         uncertain.evidence_edge_ids = vec![uncertain_proof_id.clone()];
         let mut secondary = citation("executeCommand", "src/server.c", NodeKind::FUNCTION);
         secondary.evidence_edge_ids = vec![secondary_proof_id.clone()];
-        let primary_target_id = NodeId("commandProcessed".to_string());
-        let secondary_target_id = NodeId("preprocessCommand".to_string());
-        let uncertain_target_id = NodeId("validateCommand".to_string());
+        let primary_target_id = NodeId("validateCommand".to_string());
+        let hostile_target_id = NodeId("commandProcessed".to_string());
+        let secondary_target_id = NodeId("queueCommand".to_string());
+        let uncertain_target_id = NodeId("rejectCommand".to_string());
         let graph_node = |id: NodeId, label: &str, depth: u32| GraphNodeDto {
             id,
             label: label.to_string(),
@@ -6075,6 +6084,7 @@ mod tests {
         };
         let mut answer = answer(vec![
             primary.clone(),
+            hostile.clone(),
             unproven.clone(),
             uncertain.clone(),
             secondary.clone(),
@@ -6087,12 +6097,14 @@ mod tests {
                 center_id: primary.node_id.clone(),
                 nodes: vec![
                     graph_node(primary.node_id.clone(), &primary.display_name, 0),
+                    graph_node(hostile.node_id.clone(), &hostile.display_name, 1),
                     graph_node(unproven.node_id.clone(), &unproven.display_name, 1),
                     graph_node(uncertain.node_id.clone(), &uncertain.display_name, 1),
                     graph_node(secondary.node_id.clone(), &secondary.display_name, 1),
-                    graph_node(primary_target_id.clone(), "commandProcessed", 1),
-                    graph_node(uncertain_target_id.clone(), "validateCommand", 2),
-                    graph_node(secondary_target_id.clone(), "preprocessCommand", 2),
+                    graph_node(primary_target_id.clone(), "validateCommand", 1),
+                    graph_node(hostile_target_id.clone(), "commandProcessed", 2),
+                    graph_node(uncertain_target_id.clone(), "rejectCommand", 2),
+                    graph_node(secondary_target_id.clone(), "queueCommand", 2),
                 ],
                 edges: vec![
                     GraphEdgeDto {
@@ -6103,6 +6115,26 @@ mod tests {
                         confidence: Some(1.0),
                         certainty: Some("certain".to_string()),
                         callsite_identity: Some("test:primary-proof".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: hostile_context_edge_id.clone(),
+                        source: primary.node_id.clone(),
+                        target: hostile.node_id.clone(),
+                        kind: EdgeKind::CALL,
+                        confidence: Some(0.8),
+                        certainty: Some("probable".to_string()),
+                        callsite_identity: Some("test:hostile-selection-context".to_string()),
+                        candidate_targets: Vec::new(),
+                    },
+                    GraphEdgeDto {
+                        id: hostile_proof_id.clone(),
+                        source: hostile.node_id.clone(),
+                        target: hostile_target_id,
+                        kind: EdgeKind::CALL,
+                        confidence: Some(1.0),
+                        certainty: Some("certain".to_string()),
+                        callsite_identity: Some("test:hostile-proof".to_string()),
                         candidate_targets: Vec::new(),
                     },
                     GraphEdgeDto {
@@ -6184,6 +6216,10 @@ mod tests {
             &[primary_proof_id, secondary_proof_id]
         );
         assert!(!protected_packet_obligation_edge_ids(&snapshot).contains(&context_edge_id));
+        assert!(
+            !protected_packet_obligation_edge_ids(&snapshot).contains(&hostile_context_edge_id)
+        );
+        assert!(!protected_packet_obligation_edge_ids(&snapshot).contains(&hostile_proof_id));
         assert!(
             !protected_packet_obligation_edge_ids(&snapshot).contains(&unproven_context_edge_id)
         );
