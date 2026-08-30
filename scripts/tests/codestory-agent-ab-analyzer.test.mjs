@@ -570,9 +570,11 @@ test("exact-candidate mode closes every option that can change freshness oracle 
     "--materialize-repos",
     "--repo-cache-dir", "/tmp/exact-repos",
     "--out-dir", "/tmp/exact-output",
+    "--resume-prefix-from", "/tmp/exact-prefix",
   ]));
   assert.equal(permitted.materializeRepos, true);
   assert.equal(permitted.diagnosticExtraProbesFromManifest, false);
+  assert.equal(permitted.resumePrefixFrom, "/tmp/exact-prefix");
 });
 
 test("exact-candidate planning balances deterministic arm position across 162 fresh rows", () => {
@@ -598,6 +600,104 @@ test("exact-candidate planning balances deterministic arm position across 162 fr
   for (const arm of EXACT_CANDIDATE_ARMS) {
     assert.deepEqual(positions[arm], [18, 18, 18]);
   }
+});
+
+test("exact-candidate resume accepts only an authenticated whole-task contiguous prefix", () => {
+  const tasks = [
+    { id: "task-1", repo: "repo-1" },
+    { id: "task-2", repo: "repo-2" },
+  ];
+  const candidate = {
+    contract: "codestory.agent-benchmark-source-cli/v1",
+    arm: "candidate_0_18",
+    package_version: "0.17.5",
+    cli_sha256: "1".repeat(64),
+    source_commit: "2".repeat(40),
+    source_tree: "3".repeat(40),
+    schema_version: 3,
+    protocol_revision: "2025-11-25",
+    discovery_contract_sha256: "4".repeat(64),
+    plugin_manifest_sha256: "5".repeat(64),
+    catalog_sha256: "6".repeat(64),
+  };
+  const published = {
+    contract: "codestory.agent-benchmark-exact-package/v1",
+    arm: "published_0_17_4",
+    package_version: "0.17.4",
+    package_sha256: "7".repeat(64),
+    cli_sha256: "8".repeat(64),
+    source_commit: "9".repeat(40),
+    source_tree: "a".repeat(40),
+    schema_version: 2,
+    protocol_revision: "2024-11-05",
+    discovery_contract_sha256: null,
+    trust_root: { kind: "official_published_checksum", sha256: "b".repeat(64) },
+  };
+  const opts = {
+    exactCandidate: true,
+    arms: EXACT_CANDIDATE_ARMS,
+    repeats: 3,
+    repos: null,
+    exactCandidatePackageByArm: new Map([
+      ["candidate_0_18", candidate],
+      ["published_0_17_4", published],
+    ]),
+  };
+  const planned = benchmarkHarness.planAgentRuns(opts, tasks);
+  const rows = planned.slice(0, 9).map((run) => ({
+    repo: run.repo,
+    task_id: run.task.id,
+    arm: run.arm,
+    repeat: run.repeat,
+    status: "pass",
+    task_manifest_snapshot: benchmarkHarness.taskSnapshotForResult(run.task),
+    package_identity: run.arm === "published_0_17_4"
+      ? {
+          contract: published.contract,
+          arm: published.arm,
+          package_version: published.package_version,
+          package_sha256: published.package_sha256,
+          cli_sha256: published.cli_sha256,
+          source_commit: published.source_commit,
+          source_tree: published.source_tree,
+          schema_version: published.schema_version,
+          protocol_revision: published.protocol_revision,
+          discovery_contract_sha256: null,
+          trust_root_kind: published.trust_root.kind,
+          trust_root_sha256: published.trust_root.sha256,
+        }
+      : null,
+    source_cli_identity: run.arm === "candidate_0_18"
+      ? { ...candidate, source_commit: "c".repeat(40), source_tree: "d".repeat(40) }
+      : null,
+  }));
+
+  assert.equal(
+    benchmarkHarness.validateExactCandidateResumePrefixRows(rows, planned, opts),
+    1,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateResumePrefixRows(rows.slice(0, 8), planned, opts),
+    /complete task boundary/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateResumePrefixRows(
+      [rows[1], rows[0], ...rows.slice(2)],
+      planned,
+      opts,
+    ),
+    /planned contiguous prefix/i,
+  );
+  assert.throws(
+    () => benchmarkHarness.validateExactCandidateResumePrefixRows(
+      rows.map((row) => row.arm === "candidate_0_18"
+        ? { ...row, source_cli_identity: { ...row.source_cli_identity, cli_sha256: "e".repeat(64) } }
+        : row),
+      planned,
+      opts,
+    ),
+    /candidate CLI or public contract identity changed/i,
+  );
 });
 
 async function makeExactArchive(root, name, {

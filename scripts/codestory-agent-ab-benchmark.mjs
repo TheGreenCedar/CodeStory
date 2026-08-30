@@ -276,6 +276,8 @@ Options:
   --jobs          Parallel jobs for independent packet-runtime cold-cli rows or independent agent repo groups. Default: 1.
   --reuse-baseline-from
                   Reuse matching without-CodeStory rows from an earlier run directory when the task snapshot is unchanged.
+  --resume-prefix-from
+                  Exact-candidate only: authenticate and reanalyze one complete-task prefix, then run only the remaining tasks.
   --exact-candidate
                   Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.4, and the frozen 0.18 candidate.
   --published-archive
@@ -359,6 +361,7 @@ function parseArgs(argv) {
       "timeout-ms": { type: "string" },
       jobs: { type: "string" },
       "reuse-baseline-from": { type: "string" },
+      "resume-prefix-from": { type: "string" },
       "exact-candidate": { type: "boolean" },
       "published-archive": { type: "string" },
       "published-checksum-manifest": { type: "string" },
@@ -403,6 +406,7 @@ function parseArgs(argv) {
     timeoutMs: 600000,
     jobs: 1,
     reuseBaselineFrom: null,
+    resumePrefixFrom: null,
     exactCandidate: false,
     publishedArchive: null,
     publishedChecksumManifest: null,
@@ -468,6 +472,7 @@ function parseArgs(argv) {
   opts.timeoutMs = values["timeout-ms"] == null ? opts.timeoutMs : Number.parseInt(values["timeout-ms"], 10);
   opts.jobs = values.jobs == null ? opts.jobs : Number.parseInt(values.jobs, 10);
   opts.reuseBaselineFrom = values["reuse-baseline-from"] ?? null;
+  opts.resumePrefixFrom = values["resume-prefix-from"] ?? null;
   opts.exactCandidate = values["exact-candidate"] === true;
   opts.publishedArchive = values["published-archive"] ?? null;
   opts.publishedChecksumManifest = values["published-checksum-manifest"] ?? null;
@@ -510,6 +515,7 @@ function parseArgs(argv) {
       "published-checksum-manifest",
       "published-checksum-sha256",
       "candidate-source-root",
+      "resume-prefix-from",
     ]);
     const forbiddenOptions = [...providedOptions].filter((name) => !exactOptionAllowlist.has(name));
     if (forbiddenOptions.length) {
@@ -629,6 +635,12 @@ function parseArgs(argv) {
   opts.repoCacheDir = path.resolve(opts.repoCacheDir ?? defaultRepoCacheRoot);
   if (opts.reuseBaselineFrom) {
     opts.reuseBaselineFrom = path.resolve(opts.reuseBaselineFrom);
+  }
+  if (opts.resumePrefixFrom) {
+    if (!opts.exactCandidate) {
+      throw new Error("--resume-prefix-from is available only in exact-candidate mode");
+    }
+    opts.resumePrefixFrom = path.resolve(opts.resumePrefixFrom);
   }
   if (opts.repos) {
     for (const name of opts.repos) {
@@ -12274,6 +12286,227 @@ async function loadReusableBaselines(opts, plannedRuns, outDir) {
   return reusable;
 }
 
+const EXACT_RESUME_CANDIDATE_IDENTITY_FIELDS = [
+  "contract", "arm", "package_version", "cli_sha256", "schema_version",
+  "protocol_revision", "discovery_contract_sha256", "plugin_manifest_sha256",
+  "catalog_sha256",
+];
+
+function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
+  if (!Array.isArray(rows) || rows.length === 0 || rows.length >= plannedRuns.length) {
+    throw new Error("exact resume must contain a non-empty proper prefix");
+  }
+  const runsPerTask = opts.repeats * opts.arms.length;
+  if (rows.length % runsPerTask !== 0) {
+    throw new Error("exact resume prefix must end at a complete task boundary");
+  }
+  const currentPublished = exactCandidatePackageIdentity(
+    opts.exactCandidatePackageByArm?.get("published_0_17_4"),
+    "published_0_17_4",
+  );
+  const currentCandidate = exactCandidateSourceCliIdentity(
+    opts.exactCandidatePackageByArm?.get("candidate_0_18"),
+    "candidate_0_18",
+  );
+  for (const [index, row] of rows.entries()) {
+    const planned = plannedRuns[index];
+    if (agentRunKey(row) !== agentRunKey(planned) || !taskSnapshotMatches(planned.task, row)) {
+      throw new Error(`exact resume row ${index + 1} is not the planned contiguous prefix`);
+    }
+    if (row.status !== "pass" || row.reanalysis_error) {
+      throw new Error(`exact resume row ${agentRunKey(row)} is not a complete passing row`);
+    }
+    if (row.arm === "published_0_17_4") {
+      if (stableJsonForHash(row.package_identity) !== stableJsonForHash(currentPublished)) {
+        throw new Error("exact resume published package identity does not match the authenticated package");
+      }
+    } else if (row.arm === "candidate_0_18") {
+      const previous = row.source_cli_identity;
+      if (
+        !previous || EXACT_RESUME_CANDIDATE_IDENTITY_FIELDS.some(
+          (field) => previous[field] !== currentCandidate?.[field],
+        )
+      ) {
+        throw new Error("exact resume candidate CLI or public contract identity changed");
+      }
+    } else if (row.package_identity != null || row.source_cli_identity != null) {
+      throw new Error("exact resume baseline row contains a CodeStory identity");
+    }
+  }
+  return rows.length / runsPerTask;
+}
+
+async function copyExactResumeRowArtifacts(row, sourceRunDir, outDir) {
+  const runId = row.benchmark_run_id;
+  const resumeArtifact = (artifactPath) => {
+    if (!artifactPath || !path.isAbsolute(artifactPath)) return artifactPath;
+    const absolute = path.resolve(artifactPath);
+    if (!isPathInside(sourceRunDir, absolute)) {
+      throw new Error(`exact resume artifact escapes its source run: ${artifactPath}`);
+    }
+    return path.relative(sourceRunDir, absolute);
+  };
+  const copied = {
+    ...row,
+    stdout_path: await copyResultArtifact(sourceRunDir, outDir, resumeArtifact(row.stdout_path), `${runId}.stdout.jsonl`),
+    stderr_path: await copyResultArtifact(sourceRunDir, outDir, resumeArtifact(row.stderr_path), `${runId}.stderr.txt`),
+  };
+  if (copied.baseline_harness_prelude?.context_path) {
+    copied.baseline_harness_prelude = {
+      ...copied.baseline_harness_prelude,
+      context_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        resumeArtifact(copied.baseline_harness_prelude.context_path),
+        `${runId}.baseline-context.json`,
+      ),
+      stderr_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        resumeArtifact(copied.baseline_harness_prelude.stderr_path),
+        `${runId}.baseline-context.stderr.txt`,
+      ),
+    };
+  }
+  if (copied.codestory_harness_prelude?.stdout_path) {
+    copied.codestory_harness_prelude = {
+      ...copied.codestory_harness_prelude,
+      stdout_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        resumeArtifact(copied.codestory_harness_prelude.stdout_path),
+        `${runId}.codestory-packet.stdout.json`,
+      ),
+      stderr_path: await copyResultArtifact(
+        sourceRunDir,
+        outDir,
+        resumeArtifact(copied.codestory_harness_prelude.stderr_path),
+        `${runId}.codestory-packet.stderr.txt`,
+      ),
+    };
+  }
+  return copied;
+}
+
+async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) {
+  if (!opts.resumePrefixFrom) {
+    return { rows: [], preparations: [], completedTaskCount: 0 };
+  }
+  const sourceRunDir = opts.resumePrefixFrom;
+  const runsPath = path.join(sourceRunDir, "runs.jsonl");
+  const preparationsPath = path.join(sourceRunDir, "preparations.jsonl");
+  if (!existsSync(runsPath) || !existsSync(preparationsPath)) {
+    throw new Error("--resume-prefix-from must contain runs.jsonl and preparations.jsonl");
+  }
+  const originalRows = await readJsonlRows(runsPath);
+  const taskCache = new Map();
+  const reanalyzed = [];
+  for (const row of originalRows) {
+    reanalyzed.push(await recomputeRunAnalysis(row, opts, sourceRunDir, taskCache));
+  }
+  const completedTaskCount = validateExactCandidateResumePrefixRows(
+    reanalyzed,
+    plannedRuns,
+    opts,
+  );
+  const currentCandidate = exactCandidateSourceCliIdentity(
+    opts.exactCandidatePackageByArm.get("candidate_0_18"),
+    "candidate_0_18",
+  );
+  const copiedRows = [];
+  for (const [index, row] of reanalyzed.entries()) {
+    const planned = plannedRuns[index];
+    const originalIdentity = row.source_cli_identity ?? row.package_identity ?? null;
+    const copied = await copyExactResumeRowArtifacts(row, sourceRunDir, outDir);
+    copiedRows.push({
+      ...copied,
+      ...(row.arm === "candidate_0_18" ? {
+        source_cli_identity: currentCandidate,
+        codestory_prelude_cli: opts.exactCandidatePackageByArm.get("candidate_0_18").cli_path,
+      } : {}),
+      benchmark_contract: benchmarkContractForRun(opts, planned),
+      promotion_eligible: true,
+      resume_provenance: {
+        contract: "codestory.agent-benchmark-exact-prefix-resume/v1",
+        source_run_dir: sourceRunDir,
+        original_benchmark_run_id: row.benchmark_run_id,
+        original_identity: originalIdentity,
+        authenticated_current_identity:
+          row.arm === "candidate_0_18"
+            ? currentCandidate
+            : row.arm === "published_0_17_4"
+              ? exactCandidatePackageIdentity(
+                  opts.exactCandidatePackageByArm.get("published_0_17_4"),
+                  "published_0_17_4",
+                )
+              : null,
+        artifact_cli_sha256: row.codestory_prelude_cli_sha256 ?? null,
+        reanalyzed_with_current_scorer: true,
+      },
+    });
+  }
+
+  const completedRepos = tasks.slice(0, completedTaskCount).map((task) => task.repo);
+  const preparationRows = (await readJsonlRows(preparationsPath))
+    .filter((row) => row.kind === "preparation" && completedRepos.includes(row.repo));
+  if (
+    preparationRows.length !== completedRepos.length ||
+    preparationRows.some((row, index) => row.repo !== completedRepos[index])
+  ) {
+    throw new Error("exact resume preparations do not match the completed task prefix");
+  }
+  const currentPublished = exactCandidatePackageIdentity(
+    opts.exactCandidatePackageByArm.get("published_0_17_4"),
+    "published_0_17_4",
+  );
+  const preparations = preparationRows.map((source) => {
+    const { kind: _kind, recorded_at: originalRecordedAt, ...row } = source;
+    const published = row.arm_preparations?.published_0_17_4;
+    const candidate = row.arm_preparations?.candidate_0_18;
+    if (
+      stableJsonForHash(published?.package_identity) !== stableJsonForHash(currentPublished) ||
+      EXACT_RESUME_CANDIDATE_IDENTITY_FIELDS.some(
+        (field) => candidate?.source_cli_identity?.[field] !== currentCandidate?.[field],
+      )
+    ) {
+      throw new Error(`exact resume preparation identity changed for ${row.repo}`);
+    }
+    return {
+      ...row,
+      source_cli_identity: currentCandidate,
+      arm_preparations: {
+        published_0_17_4: published,
+        candidate_0_18: { ...candidate, source_cli_identity: currentCandidate },
+      },
+      resume_provenance: {
+        contract: "codestory.agent-benchmark-exact-prefix-resume/v1",
+        source_run_dir: sourceRunDir,
+        original_recorded_at: originalRecordedAt,
+        original_candidate_identity: candidate.source_cli_identity,
+        authenticated_current_candidate_identity: currentCandidate,
+      },
+    };
+  });
+  for (const [index, row] of preparations.entries()) {
+    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      const blockers = cachePreparationCanaryBlockers(
+        row.arm_preparations[arm],
+        selectedBenchmarkChildEnv(opts, arm),
+      );
+      if (blockers.length) {
+        throw new Error(`exact resume ${arm} preparation is ineligible: ${blockers.join("; ")}`);
+      }
+    }
+    opts.cachePreparationByRepo.set(row.repo, row);
+    opts.exactCandidateLifecycle.preparation_order ??= [];
+    opts.exactCandidateLifecycle.preparation_order.push({
+      repo: row.repo,
+      arms: exactCandidatePreparationArmOrder(index),
+    });
+  }
+  return { rows: copiedRows, preparations, completedTaskCount };
+}
+
 async function runPlannedAgentRun(opts, run, outDir, reusableBaselines) {
   const reusable = reusableBaselines.get(agentRunKey(run));
   if (reusable) {
@@ -13429,6 +13662,7 @@ async function main() {
   );
   const reusableBaselines = await loadReusableBaselines(opts, plannedRuns, outDir);
   opts.cachePreparationByRepo = new Map();
+  let resumedPrefix = { rows: [], preparations: [], completedTaskCount: 0 };
   let agentCodexIsolation = null;
   let pipeline = null;
   let pipelineError = null;
@@ -13437,11 +13671,27 @@ async function main() {
     if (opts.exactCandidate) {
       await initializeExactCandidateState(opts);
       opts.exactCandidateLifecycle.cost_rates = opts.exactCandidateCostRates;
+      resumedPrefix = await loadExactCandidateResumePrefix(
+        opts,
+        tasks,
+        plannedRuns,
+        outDir,
+      );
+      for (const row of resumedPrefix.rows) {
+        await ledger.append(row);
+      }
+      for (const row of resumedPrefix.preparations) {
+        await preparationLedger.append({
+          kind: "preparation",
+          recorded_at: new Date().toISOString(),
+          ...row,
+        });
+      }
     }
     pipeline = await runAgentBenchmarkPipeline({
       opts,
-      tasks,
-      plannedRuns,
+      tasks: tasks.slice(resumedPrefix.completedTaskCount),
+      plannedRuns: plannedRuns.slice(resumedPrefix.rows.length),
       reusableBaselines,
       outDir,
       materializeGroup: async (group, signal) => {
@@ -13483,6 +13733,11 @@ async function main() {
         "utf8",
       ),
     });
+    pipeline.results = [...resumedPrefix.rows, ...pipeline.results];
+    pipeline.cachePreparation = [
+      ...resumedPrefix.preparations,
+      ...pipeline.cachePreparation,
+    ];
   } catch (error) {
     pipelineError = error;
   } finally {
@@ -13579,6 +13834,8 @@ async function main() {
     max_source_reads_after_packet: opts.maxSourceReadsAfterPacket,
     reuse_baseline_from: opts.reuseBaselineFrom,
     reused_baseline_runs: canonicalResults.filter((row) => row.reused_from).length,
+    resume_prefix_from: opts.resumePrefixFrom,
+    resumed_prefix_runs: canonicalResults.filter((row) => row.resume_provenance).length,
     allow_failures: opts.allowFailures,
     timeout_ms: opts.timeoutMs,
     sandbox: opts.sandbox,
@@ -13744,6 +14001,7 @@ export {
   packetV3EvidenceGapAccountingError,
   withExactSourceMutation,
   validateExactCandidateShape,
+  validateExactCandidateResumePrefixRows,
   repoProvenanceBlockers,
   repoProvenance,
   runnerCommand,
