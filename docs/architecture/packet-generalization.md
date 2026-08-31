@@ -25,14 +25,18 @@ public packet budget remains 16 evidence rows / 16 KiB.
 - Domain `PacketEvidenceRole` variants (for example `TransportAdapter`,
   `RequestDispatch`, `ClientFactory`) that steer capping, same-role replacement,
   or probe `role_rank`
-- Hardcoded holdout probe spellings in required-probe matchers (for example
-  `requestentrypoint`, `adapters`, `transportadapter`)
+- Hardcoded holdout probe spellings in required-probe matchers or capping
+  tables (compacted or space-separated forms such as `flag parsing` /
+  `flagparsing`, `transportsend`, `handlerchain`)
+- Required-probe multi-match limit tables and coverage-role alias tables keyed
+  by domain or historical probe vocabulary
 - Flow-template claims and holdout `expected_files` / `expected_symbols` anchors
 - Production dependencies on `benchmarks/`, `codestory-bench`, or eval manifests
 
 Production may retain only path-based structural labels such as
 `SourceEvidence` and `TestsAndRegressionCoverage`. Selection and sufficiency
-must follow repository-evidence objectives, not domain vocabulary.
+must follow repository-evidence objectives and exact path/symbol identity, not
+domain vocabulary.
 
 Historical 18-task / language-expansion holdout scores are
 `evidence_eligibility: contaminated_development` only. They are never a release

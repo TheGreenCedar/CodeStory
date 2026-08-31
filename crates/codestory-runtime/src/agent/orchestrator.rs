@@ -1593,7 +1593,7 @@ fn maybe_append_cited_mapper_interface_citations(
                     kind: NodeKind::INTERFACE,
                     line,
                     score: 45.0,
-                    coverage_role: "mapper public api",
+                    coverage_role: "source evidence",
                     producer: "packet_cited_mapper_interface",
                 },
             ) {
@@ -8917,7 +8917,8 @@ mod tests {
     }
 
     #[test]
-    fn packet_required_probe_promotion_keeps_multiple_sql_schema_scripts() {
+    fn packet_required_probe_promotion_keeps_one_best_sql_schema_match() {
+        // One best match per probe — no sql-schema multi_match_limit privilege.
         let mut sqlite = test_packet_citation("db/schema_sqlite.sql", "db/schema_sqlite.sql", 0.7);
         sqlite.kind = NodeKind::FILE;
         let mut mysql = test_packet_citation("db/schema_mysql.sql", "db/schema_mysql.sql", 0.6);
@@ -8931,21 +8932,14 @@ mod tests {
             vec![distractor, sqlite, mysql, postgres],
         );
 
-        promote_required_probe_citations(&mut answer, &["sql schema scripts".to_string()]);
+        promote_required_probe_citations(
+            &mut answer,
+            &["db/schema_sqlite.sql".to_string()],
+        );
 
-        let promoted_sql_paths = answer
-            .citations
-            .iter()
-            .take(3)
-            .filter_map(|citation| citation.file_path.as_deref())
-            .collect::<Vec<_>>();
         assert_eq!(
-            promoted_sql_paths,
-            vec![
-                "db/schema_sqlite.sql",
-                "db/schema_mysql.sql",
-                "db/schema_postgresql.sql"
-            ]
+            answer.citations[0].file_path.as_deref(),
+            Some("db/schema_sqlite.sql")
         );
     }
 

@@ -877,17 +877,6 @@ pub(crate) fn promote_required_probe_citations(
     let mut promoted_index_set = HashSet::new();
     for query in &required_probe_queries {
         let query = query.as_str();
-        if let Some(limit) = packet_required_probe_multi_match_limit(query) {
-            promote_distinct_required_probe_matches(
-                answer,
-                query,
-                limit,
-                &mut promoted_indices,
-                &mut promoted_index_set,
-                &focus_roots,
-            );
-            continue;
-        }
         if promoted_indices
             .iter()
             .any(|index| packet_citation_satisfies_required_probe(query, &answer.citations[*index]))
@@ -963,159 +952,6 @@ pub(crate) fn promote_required_probe_citations(
                 .replace('`', "'")
         )));
     protected_citation_keys
-}
-
-fn promote_distinct_required_probe_matches(
-    answer: &AgentAnswerDto,
-    query: &str,
-    limit: usize,
-    promoted_indices: &mut Vec<usize>,
-    promoted_index_set: &mut HashSet<usize>,
-    focus_roots: &[PacketCommandFocusRoot],
-) {
-    let mut promoted_paths = promoted_indices
-        .iter()
-        .filter(|index| packet_citation_satisfies_required_probe(query, &answer.citations[**index]))
-        .filter_map(|index| packet_citation_file_path_key(&answer.citations[*index]))
-        .collect::<HashSet<_>>();
-    let prefer_shared_source_set = !packet_query_mentions_platform_source_set(query);
-
-    while promoted_paths.len() < limit {
-        let promoted_source_set_score = promoted_indices
-            .iter()
-            .filter(|index| {
-                packet_citation_satisfies_required_probe(query, &answer.citations[**index])
-            })
-            .map(|index| packet_source_set_path_score(&answer.citations[*index]))
-            .max()
-            .unwrap_or_default();
-        let mut best_match = None;
-        for (index, citation) in answer.citations.iter().enumerate() {
-            if promoted_index_set.contains(&index) {
-                continue;
-            }
-            let Some(path) = packet_citation_file_path_key(citation) else {
-                continue;
-            };
-            if promoted_paths.contains(&path) {
-                continue;
-            }
-            if !packet_required_probe_multi_match_candidate(query, citation) {
-                continue;
-            }
-            if prefer_shared_source_set
-                && promoted_source_set_score >= 2
-                && packet_source_set_path_score(citation) < promoted_source_set_score
-            {
-                continue;
-            }
-            let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
-                continue;
-            };
-            if packet_display_name_is_import_literal(&citation.display_name.to_ascii_lowercase())
-                && !packet_citation_satisfies_required_probe(query, citation)
-            {
-                continue;
-            }
-            if best_match
-                .map(|(best_index, best_rank)| {
-                    packet_prefer_required_probe_match(
-                        query,
-                        citation,
-                        match_rank,
-                        &answer.citations[best_index],
-                        best_rank,
-                        focus_roots,
-                    )
-                })
-                .unwrap_or(true)
-            {
-                best_match = Some((index, match_rank));
-            }
-        }
-        let Some((index, _)) = best_match else {
-            break;
-        };
-        if let Some(path) = packet_citation_file_path_key(&answer.citations[index]) {
-            promoted_paths.insert(path);
-        }
-        if promoted_index_set.insert(index) {
-            promoted_indices.push(index);
-        }
-    }
-}
-
-fn packet_required_probe_multi_match_limit(query: &str) -> Option<usize> {
-    match normalize_identifier(query).as_str() {
-        "mapperpublicapi" | "mapperruntimeapi" | "mappingruntimeentrypoint" => Some(3),
-        "sqlschemascripts" | "schemadialectscripts" => Some(3),
-        "bufferedsource" | "bufferedsink" | "bufferedwrapper" | "sourcebuffer" | "sinkbuffer"
-        | "sourcereadbuffer" | "sinkwritebuffer" => Some(2),
-        "httptoplevelhelper"
-        | "publicclientfacade"
-        | "clientconveniencemethod"
-        | "clientinterfacemethod"
-        | "clientinterfacehelper"
-        | "requestfinalization"
-        | "transportreadyrequestobject"
-        | "clientsendimplementation"
-        | "transportsend"
-        | "requestresponse"
-        | "responsestreamboundary" => Some(2),
-        "htmlformrequiredconstraint"
-        | "htmlformpatternconstraint"
-        | "htmlformminmaxconstraints"
-        | "customformvalidationinput"
-        | "customvalidationvaliditystate"
-        | "customvalidationerrorrendering"
-        | "submitpreventdefault" => Some(2),
-        "sessionrequestcreation"
-        | "requestobjectcreation"
-        | "requestresumedispatch"
-        | "requestvalidationpipeline"
-        | "delegatecallbackhandling"
-        | "urlsessioncallbackboundary" => Some(2),
-        normalized if normalized.ends_with("requestvalidation") => Some(2),
-        "serverbootstrap"
-        | "commandserverentrypoint"
-        | "eventloopsource"
-        | "networkcommandinput"
-        | "commandtabledispatch"
-        | "commanddispatch" => Some(2),
-        _ => None,
-    }
-}
-
-fn packet_required_probe_multi_match_candidate(query: &str, citation: &AgentCitationDto) -> bool {
-    if query_mentions_non_primary_source(query) {
-        return true;
-    }
-    if packet_display_name_is_test_like(&citation.display_name) {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if path.is_empty() {
-        return true;
-    }
-    if retrieval_file_role_from_path(&path).is_non_primary() {
-        return false;
-    }
-    !path.contains("/test/")
-        && !path.contains("/tests/")
-        && !path.contains("/docs/")
-        && !path.contains("/doc/")
-        && !path.contains("/tools/")
-        && !path.contains("/tool/")
-        && !path.contains("/examples/")
-        && !path.contains("/example/")
-        && !path.contains("/third_party/")
-        && !path.contains("/vendor/")
-        && !path.contains("/node_modules/")
 }
 
 pub(crate) fn promote_focus_neighborhood_citations(
@@ -2071,7 +1907,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_match_required_probes_promote_distinct_primary_sources() {
+    fn required_probes_promote_one_best_match_per_probe() {
+        // Identity-only promotion: one best citation per probe (no multi_match_limit table).
         for (query, first_display, second_display) in [
             (
                 "client send implementation",
@@ -2116,44 +1953,65 @@ mod tests {
 
             assert_eq!(
                 protected_paths,
-                vec!["src/flow/primary.rs", "src/flow/secondary.rs"],
-                "query `{query}` should protect two primary-source matches before docs/tests: {protected_paths:?}"
+                vec!["src/flow/primary.rs"],
+                "query `{query}` should protect exactly one best match: {protected_paths:?}"
             );
             assert_eq!(
                 answer.citations[0].file_path.as_deref(),
                 Some("src/flow/primary.rs")
             );
+        }
+    }
+
+    #[test]
+    fn holdout_probe_spellings_do_not_privilege_capping_promotion() {
+        // Black-box: compacted/spaced holdout probe strings must not outrank an
+        // unrelated identifier with the same lexical overlap shape.
+        let holdout_queries = [
+            "transport send",
+            "transportsend",
+            "flag parsing",
+            "flagparsing",
+            "handler chain",
+            "form validation bypass",
+        ];
+        for query in holdout_queries {
+            let mut with_holdout = answer_fixture(vec![
+                citation("UnrelatedWidget", "src/widgets/widget.rs", 50.0),
+                citation("TransportAdapter", "src/transport/adapter.rs", 1.0),
+            ]);
+            let mut with_neutral = answer_fixture(vec![
+                citation("UnrelatedWidget", "src/widgets/widget.rs", 50.0),
+                citation("TransportAdapter", "src/transport/adapter.rs", 1.0),
+            ]);
+            let holdout_protected =
+                promote_required_probe_citations(&mut with_holdout, &[query.to_string()]);
+            let neutral_protected = promote_required_probe_citations(
+                &mut with_neutral,
+                &["zz_unrelated_probe_identity_xyz".to_string()],
+            );
+            // Holdout spelling must not create a protected set that a nonsense identity probe
+            // would not also fail to create via domain privilege — both leave widget first when
+            // neither probe has an exact identity match.
             assert_eq!(
-                answer.citations[1].file_path.as_deref(),
-                Some("src/flow/secondary.rs")
+                with_holdout.citations[0].display_name, "UnrelatedWidget",
+                "holdout query `{query}` must not reorder without identity match"
+            );
+            assert!(
+                holdout_protected.is_empty() || holdout_protected == neutral_protected,
+                "holdout `{query}` protected={holdout_protected:?} neutral={neutral_protected:?}"
             );
         }
 
-        let query = "data request validation";
+        // Exact identifier identity still promotes regardless of holdout history.
         let mut answer = answer_fixture(vec![
-            citation(&format!("{query} guide"), "docs/flow-guide.md", 100.0),
-            citation(&format!("{query} test"), "tests/flow_test.rs", 99.0),
-            citation("DataRequest.validate", "src/flow/primary.rs", 4.0),
-            citation(
-                "DataRequest.validationPipeline",
-                "src/flow/secondary.rs",
-                3.0,
-            ),
+            citation("UnrelatedWidget", "src/widgets/widget.rs", 50.0),
+            citation("TransportAdapter", "src/transport/adapter.rs", 1.0),
         ]);
-
-        let protected = promote_required_probe_citations(&mut answer, &[query.to_string()]);
-        let protected_paths = answer
-            .citations
-            .iter()
-            .filter(|citation| protected.contains(&packet_citation_key(citation)))
-            .filter_map(|citation| citation.file_path.as_deref())
-            .collect::<HashSet<_>>();
-
-        assert_eq!(
-            protected_paths,
-            HashSet::from(["src/flow/primary.rs", "src/flow/secondary.rs"]),
-            "query `{query}` should protect both primary-source validation matches before docs/tests: {protected_paths:?}"
-        );
+        let protected =
+            promote_required_probe_citations(&mut answer, &["TransportAdapter".to_string()]);
+        assert!(protected.contains(&packet_citation_key(&answer.citations[0])));
+        assert_eq!(answer.citations[0].display_name, "TransportAdapter");
     }
 
     #[test]

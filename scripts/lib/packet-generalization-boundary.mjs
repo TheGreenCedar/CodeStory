@@ -135,6 +135,59 @@ export const DELETED_HOLDOUT_PROBE_SPELLINGS = Object.freeze([
   "searchexecutionunit",
   "argumentplanning",
   "flagparsing",
+  // CX-R2 residual tables
+  "transportsend",
+  "clientsendimplementation",
+  "publicclientfacade",
+  "httptoplevelhelper",
+  "requestfinalization",
+  "commanddispatch",
+  "serverbootstrap",
+  "eventloopsource",
+  "sourcereadbuffer",
+  "sinkwritebuffer",
+  "htmlformrequiredconstraint",
+  "urlsessioncallbackboundary",
+  "mapperpublicapi",
+  "sqlschemascripts",
+  "handlerchain",
+  "handlerdispatch",
+  "requesthandler",
+  "contextnexthandlerchain",
+  "enginerequesthandler",
+  "routeregistration",
+  "enginecreationrouterstate",
+  "formvalidationbypass",
+  "indexingentrypoint",
+  "filediscovery",
+  "symbolextraction",
+  "clienttransportsend",
+  "commandserverbootstrap",
+  "commandeventloop",
+  "clientpublicfacade",
+  "clientrequestfinalization",
+  "formnativeconstraints",
+  "formcustomvalidation",
+  "sessioncallbacks",
+  "bufferedsource",
+  "bufferedsink",
+  "bufferedwrapper",
+]);
+
+/** Production APIs that encode domain probe / capping tables (CX-R2). */
+export const DELETED_PROBE_TABLE_APIS = Object.freeze([
+  "packet_required_probe_multi_match_limit",
+  "push_search_flow_probe_queries",
+  "push_indexing_flow_required_probe_queries",
+  "packet_citation_matches_route_dispatch_probe",
+  "packet_citation_matches_route_registration_probe",
+  "packet_citation_matches_route_engine_constructor_probe",
+  "packet_citation_matches_buffered_wrapper_implementation",
+  "packet_citation_matches_validation_bypass_probe",
+  "packet_citation_matches_sql_schema_scripts_probe",
+  "packet_citation_matches_public_api_surface_probe",
+  "packet_required_probe_needs_full_token_coverage",
+  "packet_required_probe_needs_buffered_wrapper_implementation",
 ]);
 
 /** Domain ownership predicate name patterns (CX-02). */
@@ -142,6 +195,13 @@ export const DOMAIN_OWNERSHIP_PREDICATE_PATTERNS = Object.freeze([
   /\bcitation_owns_[A-Za-z0-9_]+\b/g,
   /\bpacket_citation_owns_[A-Za-z0-9_]+\b/g,
 ]);
+
+/** Match production normalize_identifier: keep ASCII alphanumerics, lowercase. */
+export function normalizeIdentifier(value) {
+  return String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
 
 const PRODUCTION_SCAN_GLOBS = Object.freeze([
   "crates/codestory-agent/src",
@@ -284,15 +344,42 @@ export function maskCfgTestItems(source) {
     let k = j;
     while (k < source.length) {
       const ch = source[k];
-      if (ch === "{") depth += 1;
-      else if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          k += 1;
-          break;
+      // Skip line comments.
+      if (ch === "/" && source[k + 1] === "/") {
+        const nl = source.indexOf("\n", k + 2);
+        k = nl < 0 ? source.length : nl + 1;
+        continue;
+      }
+      // Skip block comments.
+      if (ch === "/" && source[k + 1] === "*") {
+        const end = source.indexOf("*/", k + 2);
+        k = end < 0 ? source.length : end + 2;
+        continue;
+      }
+      // Skip raw strings: r##"..."## or br"..." / cr#"..."#.
+      if (
+        ch === "r"
+        || ((ch === "b" || ch === "c") && source[k + 1] === "r")
+      ) {
+        let rawAt = ch === "r" ? k : k + 1;
+        if (source[rawAt] === "r") {
+          let hashes = 0;
+          let p = rawAt + 1;
+          while (source[p] === "#") {
+            hashes += 1;
+            p += 1;
+          }
+          if (source[p] === '"') {
+            const closer = `"${"#".repeat(hashes)}`;
+            const end = source.indexOf(closer, p + 1);
+            k = end < 0 ? source.length : end + closer.length;
+            continue;
+          }
         }
-      } else if (ch === '"') {
-        k += 1;
+      }
+      // Skip ordinary / byte / c strings.
+      if (ch === '"' || ((ch === "b" || ch === "c") && source[k + 1] === '"')) {
+        k = ch === '"' ? k + 1 : k + 2;
         while (k < source.length) {
           if (source[k] === "\\") {
             k += 2;
@@ -305,6 +392,27 @@ export function maskCfgTestItems(source) {
           k += 1;
         }
         continue;
+      }
+      // Skip char literals, including '"' / '}' / '\'' which otherwise break brace depth.
+      if (ch === "'") {
+        k += 1;
+        if (source[k] === "\\") {
+          k += 2;
+        } else {
+          k += 1;
+        }
+        if (source[k] === "'") {
+          k += 1;
+        }
+        continue;
+      }
+      if (ch === "{") depth += 1;
+      else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          k += 1;
+          break;
+        }
       }
       k += 1;
     }
@@ -380,15 +488,58 @@ export function findBoundaryViolations(source, { filePath = "<memory>", repoRoot
     }
 
     for (const spelling of DELETED_HOLDOUT_PROBE_SPELLINGS) {
-      // Match string arms like "requestentrypoint" => or 'adapters'
-      const re = new RegExp(`["']${spelling}["']`);
-      if (re.test(productionView)) {
+      // Match quoted literals in compacted or space-separated form after normalize.
+      const stringLitRe = /["']([^"']{2,120})["']/g;
+      let lit;
+      const seenSpell = new Set();
+      while ((lit = stringLitRe.exec(productionView)) != null) {
+        const normalized = normalizeIdentifier(lit[1]);
+        if (normalized === spelling && !seenSpell.has(spelling)) {
+          seenSpell.add(spelling);
+          findings.push({
+            kind: "holdout_probe_spelling",
+            file: relative,
+            detail: `${spelling} <= "${lit[1]}"`,
+          });
+        }
+      }
+      // Unquoted match-arm identifiers only (not prose): | transportsend => or | transportsend |
+      const armRe = new RegExp(
+        `(?:^|[^A-Za-z0-9_])(?:\\|\\s*)?${spelling}\\s*(?:\\||=>)`,
+      );
+      if (armRe.test(productionView) && !seenSpell.has(spelling)) {
         findings.push({
           kind: "holdout_probe_spelling",
           file: relative,
           detail: spelling,
         });
       }
+    }
+
+    for (const api of DELETED_PROBE_TABLE_APIS) {
+      const re = new RegExp(`\\b${api}\\b`);
+      if (re.test(productionView)) {
+        findings.push({
+          kind: "deleted_probe_table_api",
+          file: relative,
+          detail: api,
+        });
+      }
+    }
+
+    // Coverage-role alias table: clienttransportsend-style arms inside
+    // packet_citation_matches_required_coverage_role.
+    if (
+      /fn\s+packet_citation_matches_required_coverage_role\b/.test(productionView)
+      && /normalized_role\s*==\s*"clienttransportsend"|clienttransportsend|commandeventloop|formnativeconstraints/.test(
+        productionView,
+      )
+    ) {
+      findings.push({
+        kind: "coverage_role_alias_table",
+        file: relative,
+        detail: "packet_citation_matches_required_coverage_role holdout aliases",
+      });
     }
 
     for (const pattern of DOMAIN_OWNERSHIP_PREDICATE_PATTERNS) {

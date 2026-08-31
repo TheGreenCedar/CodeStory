@@ -2151,10 +2151,11 @@ fn rank_obligation_citations_by_context(
         // An exact event-loop boundary may have both the top-level driver and one lower-level
         // iteration routine. Protect the main-shaped caller first; it is still only a candidate,
         // and finalization still requires its declared exact outgoing CALL receipt.
-        let boundary_depth = if obligation.id == "command_event_loop"
-            && symbol_query_tokens(&citation.display_name)
-                .last()
-                .is_some_and(|token| token == "main")
+        // Prefer a main-shaped caller when the obligation asks for an exact event-loop
+        // boundary; identity still comes from the obligation query, not a holdout id table.
+        let boundary_depth = if symbol_query_tokens(&citation.display_name)
+            .last()
+            .is_some_and(|token| token == "main")
         {
             0
         } else {

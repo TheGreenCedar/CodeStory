@@ -544,47 +544,17 @@ pub fn packet_concrete_file_probe_queries_from_required(
 }
 
 fn packet_required_probe_file_query(query: &str) -> Option<String> {
-    if !packet_required_probe_needs_concrete_file(query) {
-        return None;
+    // Identity-only: only literal *.rs stems that look like file names, no domain keys.
+    let trimmed = query.trim();
+    if trimmed.ends_with(".rs") {
+        return Some(trimmed.to_string());
     }
-    let normalized_query = normalize_identifier(query);
-    if normalized_query == "eventoutputprocessor" {
-        return Some("event_output_processor.rs".to_string());
-    }
-    query
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-        .then(|| format!("{query}.rs"))
+    None
 }
 
-pub fn push_indexing_flow_required_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "indexing entrypoint",
-            "file discovery",
-            "symbol extraction",
-            "storage persistence",
-            "search projection",
-            "snapshot refresh",
-        ],
-    );
-}
 
-pub fn push_search_flow_probe_queries(queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "search entrypoint",
-            "flag parsing",
-            "argument planning",
-            "candidate file walk",
-            "search execution",
-            "parallel search",
-            "result printer",
-        ],
-    );
-}
+
+
 
 pub fn packet_probe_query_is_cited(query: &str, answer: &AgentAnswerDto) -> bool {
     answer
@@ -594,8 +564,12 @@ pub fn packet_probe_query_is_cited(query: &str, answer: &AgentAnswerDto) -> bool
 }
 
 pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCitationDto) -> bool {
+    // Identity-only (phase9-r3): no domain probe vocabulary tables.
     if packet_type_declaration_probe_subject_tokens(query).is_some() {
         return packet_citation_matches_type_declaration_probe(query, citation);
+    }
+    if packet_citation_matches_sql_table_identity(query, citation) {
+        return true;
     }
     if packet_citation_matches_required_coverage_role(query, citation) {
         return true;
@@ -605,49 +579,11 @@ pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCit
     {
         return matches_file_scoped_symbol;
     }
-    if packet_citation_matches_create_table_probe(query, citation) {
+    if packet_citation_is_exact_primary_file_probe_match(query, citation) {
         return true;
     }
-    if packet_citation_matches_sql_catalog_table_probe(query, citation) {
+    if packet_file_stem_matches_query(query, citation.file_path.as_deref()) {
         return true;
-    }
-    if packet_citation_matches_route_registration_probe(query, citation) {
-        return true;
-    }
-    if packet_citation_matches_route_engine_constructor_probe(query, citation) {
-        return true;
-    }
-    if packet_citation_matches_route_dispatch_probe(query, citation) {
-        return true;
-    }
-    if packet_citation_matches_argument_planning_probe(query, citation) {
-        return true;
-    }
-    if packet_required_probe_needs_buffered_wrapper_implementation(query) {
-        return packet_citation_matches_buffered_wrapper_implementation(query, citation);
-    }
-    if packet_required_probe_needs_concrete_file(query) {
-        return packet_file_stem_matches_query(query, citation.file_path.as_deref());
-    }
-    if packet_required_probe_needs_full_token_coverage(query) {
-        if packet_citation_probe_has_exact_identifier_match(query, citation) {
-            return true;
-        }
-        let tokens = packet_probe_match_tokens(query);
-        return !tokens.is_empty()
-            && packet_citation_probe_token_coverage(query, citation) >= tokens.len();
-    }
-    if packet_citation_matches_public_api_surface_probe(query, citation) {
-        return true;
-    }
-    if packet_citation_matches_validation_bypass_probe(query, citation) {
-        return true;
-    }
-    if packet_citation_matches_sql_schema_scripts_probe(query, citation) {
-        return true;
-    }
-    if packet_required_probe_needs_request_validation_anchor(query) {
-        return packet_citation_matches_request_validation_anchor(query, citation);
     }
     let Some(match_rank) = packet_citation_probe_match_rank(query, citation) else {
         return false;
@@ -656,30 +592,11 @@ pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCit
 }
 
 pub fn packet_required_probe_needs_exact_match(query: &str) -> bool {
-    let normalized_query = normalize_identifier(query);
+    // Qualified path/symbol and SQL table probes require exact identity matches.
     query.contains("::")
         || query.contains('.')
-        || normalized_query == "formvalidationbypass"
-        || (normalized_query.starts_with("createtable") && normalized_query != "createtable")
-}
-
-fn packet_required_probe_needs_concrete_file(query: &str) -> bool {
-    let normalized_query = normalize_identifier(query);
-    normalized_query.ends_with("events") || normalized_query == "eventoutputprocessor"
-}
-
-fn packet_required_probe_needs_full_token_coverage(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "indexingentrypoint"
-            | "filediscovery"
-            | "symbolextraction"
-            | "storagepersistence"
-            | "searchprojection"
-            | "snapshotrefresh"
-            | "sourcereadbuffer"
-            | "sinkwritebuffer"
-    )
+        || packet_create_table_probe_table(query).is_some()
+        || packet_public_catalog_probe_table(query).is_some()
 }
 
 fn packet_citation_probe_has_exact_identifier_match(
@@ -702,6 +619,15 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
     if packet_type_declaration_probe_subject_tokens(query).is_some() {
         return packet_citation_matches_type_declaration_probe(query, citation).then_some(6);
     }
+    if packet_citation_matches_sql_table_identity(query, citation) {
+        return Some(6);
+    }
+    if packet_create_table_probe_table(query).is_some()
+        || packet_public_catalog_probe_table(query).is_some()
+    {
+        // SQL table probes never fall through to shared CREATE/TABLE token coverage.
+        return None;
+    }
     if packet_citation_matches_required_coverage_role(query, citation) {
         return Some(6);
     }
@@ -723,21 +649,6 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
         } else {
             None
         }
-    } else if packet_citation_matches_create_table_probe(query, citation)
-        || packet_citation_matches_route_registration_probe(query, citation)
-        || packet_citation_matches_route_engine_constructor_probe(query, citation)
-        || packet_citation_matches_route_dispatch_probe(query, citation)
-        || packet_citation_matches_argument_planning_probe(query, citation)
-        || packet_citation_matches_buffered_wrapper_implementation(query, citation)
-        || packet_citation_matches_public_api_surface_probe(query, citation)
-    {
-        Some(6)
-    } else if packet_citation_matches_validation_bypass_probe(query, citation)
-        || packet_citation_matches_sql_schema_scripts_probe(query, citation)
-    {
-        Some(5)
-    } else if packet_required_probe_needs_request_validation_anchor(query) {
-        packet_citation_matches_request_validation_anchor(query, citation).then_some(5)
     } else if packet_file_stem_matches_query(query, citation.file_path.as_deref()) {
         Some(5)
     } else if normalized_display == normalized_query
@@ -807,32 +718,6 @@ fn packet_citation_is_exact_primary_file_probe_match(
         && packet_file_stem_matches_query(query, citation.file_path.as_deref())
 }
 
-fn packet_required_probe_needs_request_validation_anchor(query: &str) -> bool {
-    let normalized_query = normalize_identifier(query);
-    normalized_query.contains("request") && normalized_query.contains("validation")
-}
-
-fn packet_citation_matches_request_validation_anchor(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    let normalized_query = normalize_identifier(query);
-    let normalized_display = normalize_identifier(&citation.display_name);
-    let normalized_path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .map(|path| normalize_identifier(&path))
-        .unwrap_or_default();
-    let combined = format!("{normalized_display}{normalized_path}");
-    let requires_data = normalized_query.contains("data")
-        && normalized_query.contains("request")
-        && normalized_query.contains("validation");
-    combined.contains("request")
-        && combined.contains("validat")
-        && (!requires_data || combined.contains("data"))
-}
-
 fn packet_citation_matches_required_coverage_role(
     query: &str,
     citation: &AgentCitationDto,
@@ -840,114 +725,26 @@ fn packet_citation_matches_required_coverage_role(
     let Some(coverage_role) = citation.coverage_role.as_deref() else {
         return false;
     };
-    let normalized_role = normalize_identifier(coverage_role);
-    let normalized_query = normalize_identifier(query);
-    normalized_role == normalized_query
-        || match normalized_query.as_str() {
-            "serverbootstrap" | "commandserverentrypoint" => {
-                normalized_role == "commandserverbootstrap"
-            }
-            "eventloop" | "eventloopsource" => normalized_role == "commandeventloop",
-            "networkinput" | "networkcommandinput" => normalized_role == "commandnetworkinput",
-            "commanddispatch" | "commandtabledispatch" => normalized_role == "commanddispatch",
-            "httptoplevelhelper" | "publicclientfacade" => normalized_role == "clientpublicfacade",
-            "clientconveniencemethod" | "clientinterfacemethod" | "clientinterfacehelper" => {
-                normalized_role == "clientinterfacehelpers"
-            }
-            "requestfinalization" | "transportreadyrequestobject" => {
-                normalized_role == "clientrequestfinalization"
-            }
-            "clientsendimplementation" | "transportsend" => {
-                normalized_role == "clienttransportsend"
-            }
-            "requestresponse" | "responsestreamboundary" => {
-                normalized_role == "clientresponsematerialization"
-            }
-            "nativeformconstraints"
-            | "htmlconstraint"
-            | "htmlformrequiredconstraint"
-            | "htmlformpatternconstraint"
-            | "htmlformminmaxconstraints" => normalized_role == "formnativeconstraints",
-            "customvalidation"
-            | "customvalidationflow"
-            | "customformvalidationinput"
-            | "customvalidationvaliditystate" => normalized_role == "formcustomvalidation",
-            "customvalidationerrorrendering" | "customerrorrendering" => {
-                normalized_role == "formcustomvalidation"
-                    || normalized_role == "formcustomerrorrendering"
-            }
-            "submitpreventdefault" | "submitinvalidguard" => normalized_role == "formsubmitguard",
-            "delegatecallbackhandling" | "urlsessioncallbackboundary" | "urlsessioncallbacks" => {
-                normalized_role == "sessioncallbacks"
-            }
-            _ => {
-                normalized_role == "sessioncallbacks"
-                    && normalized_query.contains("session")
-                    && normalized_query.contains("delegate")
-                    && normalized_query.contains("callback")
-            }
-        }
+    // Exact normalized equality only — no holdout stage alias table (CX-R2-03).
+    normalize_identifier(coverage_role) == normalize_identifier(query)
 }
 
-fn packet_citation_matches_sql_schema_scripts_probe(
+fn packet_citation_matches_sql_table_identity(
     query: &str,
     citation: &AgentCitationDto,
 ) -> bool {
-    if !matches!(
-        normalize_identifier(query).as_str(),
-        "sqlschemascripts" | "schemadialectscripts"
-    ) {
+    // Only explicit SQL table probe forms — never treat arbitrary tokens as tables.
+    let Some(query_table) = packet_create_table_probe_table(query)
+        .or_else(|| packet_public_catalog_probe_table(query))
+    else {
         return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(citation.kind, NodeKind::FILE | NodeKind::ANNOTATION)
-        && path.ends_with(".sql")
-        && (path.contains("sqlite")
-            || path.contains("mysql")
-            || path.contains("postgres")
-            || path.contains("postgresql")
-            || path.contains("sqlserver")
-            || path.contains("oracle")
-            || path.contains("db2")
-            || normalize_identifier(&citation.display_name).contains("sqlschema"))
+    };
+    let citation_table = packet_create_table_probe_table(&citation.display_name)
+        .or_else(|| packet_public_catalog_probe_table(&citation.display_name))
+        .or_else(|| packet_sql_table_identity(&citation.display_name));
+    citation_table.is_some_and(|table| table == query_table)
 }
 
-fn packet_citation_matches_create_table_probe(query: &str, citation: &AgentCitationDto) -> bool {
-    let Some(expected_table) = packet_create_table_probe_table(query) else {
-        return false;
-    };
-    let Some(cited_table) = packet_sql_table_identity(&citation.display_name) else {
-        return false;
-    };
-    expected_table == cited_table
-}
-
-fn packet_citation_matches_sql_catalog_table_probe(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !path.ends_with(".sql") {
-        return false;
-    }
-    let Some(expected_table) = packet_public_catalog_probe_table(query) else {
-        return false;
-    };
-    let Some(cited_table) = packet_sql_table_identity(&citation.display_name) else {
-        return false;
-    };
-    expected_table == cited_table
-}
 
 fn packet_public_catalog_probe_table(query: &str) -> Option<String> {
     let trimmed = query.trim();
@@ -998,335 +795,12 @@ fn packet_sql_table_identity(display: &str) -> Option<String> {
     (normalized.len() >= 4).then_some(normalized)
 }
 
-fn packet_citation_matches_route_registration_probe(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    if normalize_identifier(query) != "routeregistration" {
-        return false;
-    }
-    if !matches!(
-        citation.kind,
-        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::ANNOTATION
-    ) {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if path.contains("/test/")
-        || path.contains("/tests/")
-        || path.starts_with("test/")
-        || path.starts_with("tests/")
-        || path.contains("\\test\\")
-        || path.contains("\\tests\\")
-        || path.starts_with("test\\")
-        || path.starts_with("tests\\")
-        || path.contains("_test.")
-        || path.contains("test.")
-    {
-        return false;
-    }
-
-    // Domain RouteHandling role removed; match register/route tokens on callables only.
-    if !matches!(
-        citation.kind,
-        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
-    ) {
-        return false;
-    }
-    let tokens = crate::text::symbol_query_tokens(&citation.display_name);
-    tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "register" | "registration" | "add" | "mount" | "use" | "route"
-        )
-    })
-}
-
-fn packet_citation_matches_route_engine_constructor_probe(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    if normalize_identifier(query) != "enginecreationrouterstate" {
-        return false;
-    }
-    if !matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if path.contains("/test/")
-        || path.contains("/tests/")
-        || path.starts_with("test/")
-        || path.starts_with("tests/")
-        || path.contains("\\test\\")
-        || path.contains("\\tests\\")
-        || path.starts_with("test\\")
-        || path.starts_with("tests\\")
-        || path.contains("_test.")
-        || path.contains("test.")
-    {
-        return false;
-    }
-    citation
-        .display_name
-        .rsplit(['.', ':', '#'])
-        .next()
-        .map(normalize_identifier)
-        .is_some_and(|tail| tail == "new")
-}
-
-fn packet_citation_matches_route_dispatch_probe(query: &str, citation: &AgentCitationDto) -> bool {
-    let normalized_query = normalize_identifier(query);
-    if !matches!(
-        normalized_query.as_str(),
-        "handlerchain"
-            | "handlerdispatch"
-            | "requesthandler"
-            | "contextnexthandlerchain"
-            | "enginerequesthandler"
-    ) {
-        return false;
-    }
-    if !matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD) {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if path.contains("/test/")
-        || path.contains("/tests/")
-        || path.starts_with("test/")
-        || path.starts_with("tests/")
-        || path.contains("\\test\\")
-        || path.contains("\\tests\\")
-        || path.starts_with("test\\")
-        || path.starts_with("tests\\")
-        || path.contains("_test.")
-        || path.contains("test.")
-    {
-        return false;
-    }
-
-    let normalized_display = normalize_identifier(&citation.display_name);
-    let display_tail = citation
-        .display_name
-        .rsplit(['.', ':', '#'])
-        .next()
-        .map(normalize_identifier)
-        .unwrap_or_default();
-    let route_context = normalized_display.contains("route")
-        || normalized_display.contains("router")
-        || path.contains("route")
-        || path.contains("router")
-        || path.contains("application");
-    let handles_http_request = normalized_display.contains("handle")
-        && (normalized_display.contains("request") || normalized_display.contains("http"));
-    let application_or_router_handle =
-        (display_tail == "handle" || normalized_display.ends_with("handle")) && route_context;
-    let dispatches_handler_or_route = normalized_display.contains("dispatch")
-        && (normalized_display.contains("handler")
-            || normalized_display.contains("route")
-            || normalized_display.contains("request"));
-    let handler_request_symbol =
-        normalized_display.contains("handler") && normalized_display.contains("request");
-    let handler_chain_symbol = normalized_display.contains("handler")
-        && (normalized_display.contains("chain")
-            || normalized_display.contains("stack")
-            || normalized_display.contains("next"));
-    let context_next_symbol = normalized_display.contains("next")
-        && (normalized_display.contains("context") || path.contains("context"));
-    let middleware_chain_symbol = route_context
-        && ((display_tail == "use" || normalized_display.ends_with("use"))
-            || normalized_display.contains("middleware")
-            || (normalized_display.contains("next") && normalized_display.contains("context")));
-
-    match normalized_query.as_str() {
-        "handlerchain" => handler_chain_symbol || middleware_chain_symbol,
-        "contextnexthandlerchain" => handler_chain_symbol || context_next_symbol,
-        "handlerdispatch" => {
-            handles_http_request || application_or_router_handle || dispatches_handler_or_route
-        }
-        "requesthandler" => {
-            handles_http_request || application_or_router_handle || handler_request_symbol
-        }
-        "enginerequesthandler" => {
-            (normalized_display.contains("engine") || path.contains("engine"))
-                && (handles_http_request || handler_request_symbol)
-        }
-        _ => false,
-    }
-}
-
-fn packet_citation_matches_argument_planning_probe(
-    _query: &str,
-    _citation: &AgentCitationDto,
-) -> bool {
-    // Holdout probe spelling and domain ownership removed (CX-03).
-    false
-}
-
-
-fn packet_citation_matches_public_api_surface_probe(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    if !matches!(
-        normalize_identifier(query).as_str(),
-        "api" | "apis" | "publicapi" | "publicapis"
-    ) {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if path.contains("/test/")
-        || path.contains("/tests/")
-        || path.starts_with("test/")
-        || path.starts_with("tests/")
-        || path.contains("\\test\\")
-        || path.contains("\\tests\\")
-        || path.starts_with("test\\")
-        || path.starts_with("tests\\")
-        || path.contains("_test.")
-        || path.contains("test.")
-    {
-        return false;
-    }
-
-    let normalized_display = normalize_identifier(&citation.display_name);
-    let normalized_path = normalize_identifier(&path);
-    let names_api_surface = normalized_display.contains("api")
-        || normalized_display.contains("public")
-        || normalized_path.contains("api")
-        || normalized_path.contains("public");
-    if names_api_surface {
-        return matches!(
-            citation.kind,
-            NodeKind::CLASS
-                | NodeKind::INTERFACE
-                | NodeKind::TYPEDEF
-                | NodeKind::FUNCTION
-                | NodeKind::METHOD
-        );
-    }
-
-    matches!(citation.kind, NodeKind::INTERFACE)
-        && citation
-            .display_name
-            .rsplit(['.', ':', '#'])
-            .next()
-            .is_some_and(packet_display_tail_has_interface_prefix)
-}
-
 fn packet_display_tail_has_interface_prefix(display_tail: &str) -> bool {
     let mut chars = display_tail.chars();
     if chars.next() != Some('I') {
         return false;
     }
     chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
-}
-
-pub fn packet_required_probe_needs_buffered_wrapper_implementation(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "sourcereadbuffer" | "sinkwritebuffer"
-    )
-}
-
-pub fn packet_citation_matches_buffered_wrapper_implementation(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    let normalized_query = normalize_identifier(query);
-    let needs_source = normalized_query == "sourcereadbuffer";
-    let needs_sink = normalized_query == "sinkwritebuffer";
-    if !needs_source && !needs_sink {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if path.contains("/test/")
-        || path.contains("/tests/")
-        || path.contains("\\test\\")
-        || path.contains("\\tests\\")
-        || path.contains("_test.")
-        || path.contains("test.")
-    {
-        return false;
-    }
-    let stem = path
-        .rsplit(['/', '\\'])
-        .next()
-        .and_then(|file_name| file_name.rsplit_once('.').map(|(stem, _)| stem))
-        .map(normalize_identifier)
-        .unwrap_or_default();
-    if stem.is_empty()
-        || !stem.contains("buffer")
-        || matches!(stem.as_str(), "bufferedsource" | "bufferedsink")
-    {
-        return false;
-    }
-    if needs_source && !stem.contains("source") {
-        return false;
-    }
-    if needs_sink && !stem.contains("sink") {
-        return false;
-    }
-
-    let normalized_display = normalize_identifier(&citation.display_name);
-    if needs_source {
-        normalized_display.contains("read")
-            || normalized_display.contains("buffer")
-            || stem.contains("source")
-    } else {
-        normalized_display.contains("write")
-            || normalized_display.contains("buffer")
-            || stem.contains("sink")
-    }
-}
-
-fn packet_citation_matches_validation_bypass_probe(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    let normalized_query = normalize_identifier(query);
-    if normalized_query != "formvalidationbypass" {
-        return false;
-    }
-    let normalized_display = normalize_identifier(&citation.display_name);
-    let normalized_path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .map(|path| normalize_identifier(&path))
-        .unwrap_or_default();
-    normalized_display.contains("validate")
-        && (normalized_display.starts_with("no")
-            || normalized_display.contains("disable")
-            || normalized_display.contains("bypass")
-            || normalized_display.contains("skip"))
-        && (normalized_path.contains("form")
-            || normalized_path.contains("validation")
-            || normalized_path.contains("constraint"))
 }
 
 fn packet_file_scoped_symbol_probe_matches(
@@ -1404,17 +878,9 @@ fn packet_probe_file_stem(file_name: &str) -> String {
     normalize_identifier(stem)
 }
 
-fn packet_probe_role_file_stem_matches(query_stem: &str, candidate_stem: &str) -> bool {
-    match query_stem {
-        "record" => candidate_stem.ends_with("record"),
-        "processinghandler" => {
-            candidate_stem.contains("processing") && candidate_stem.ends_with("handler")
-        }
-        "planbuilder" => candidate_stem.contains("plan") && candidate_stem.ends_with("builder"),
-        "requestobject" => candidate_stem.ends_with("request") && candidate_stem != "request",
-        "delegatecallbacks" => candidate_stem.ends_with("delegate"),
-        _ => false,
-    }
+fn packet_probe_role_file_stem_matches(_query_stem: &str, _candidate_stem: &str) -> bool {
+    // Domain role-file stem aliases removed (phase9-r3). File identity is stem equality only.
+    false
 }
 
 pub struct PacketFileScopedSymbolProbe {
@@ -1518,30 +984,6 @@ fn push_unique_terms(terms: &mut Vec<String>, values: &[&str]) {
 fn push_unique_owned_terms(terms: &mut Vec<String>, values: &[String]) {
     for value in values {
         push_unique_term(terms, value);
-    }
-}
-
-pub fn push_command_loop_source_probe_queries_for_terms(
-    _terms: &[String],
-    _queries: &mut Vec<String>,
-) {
-}
-
-pub fn push_sql_schema_required_probe_queries(terms: &[String], queries: &mut Vec<String>) {
-    push_unique_terms(
-        queries,
-        &[
-            "CREATE TABLE",
-            "referential constraint",
-            "REFERENCES",
-            "sql schema scripts",
-        ],
-    );
-    for table in packet_sql_schema_prompt_table_candidates(terms)
-        .into_iter()
-        .take(8)
-    {
-        push_unique_term(queries, &format!("CREATE TABLE {table}"));
     }
 }
 
@@ -1828,45 +1270,40 @@ mod tests {
 
     #[test]
     fn required_probe_queries_match_exact_coverage_role_ids() {
-        let mut citation = test_packet_citation("readClientInput", "src/networking.c", 40.0);
-        citation.coverage_role = Some("command_network_input".to_string());
-
+        // Exact normalized equality only — alias spellings must not match (CX-R2-03).
+        let mut citation = test_packet_citation("WidgetFactory", "crates/ui/widget.rs", 40.0);
+        citation.coverage_role = Some("source evidence".to_string());
         assert!(packet_citation_satisfies_required_probe(
+            "source evidence",
+            &citation
+        ));
+        assert_eq!(
+            packet_citation_probe_match_rank("source evidence", &citation),
+            Some(6)
+        );
+        assert!(packet_citation_satisfies_required_probe(
+            "Source Evidence",
+            &citation
+        ));
+
+        citation.coverage_role = Some("tests and regression coverage".to_string());
+        assert!(packet_citation_satisfies_required_probe(
+            "tests and regression coverage",
+            &citation
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
+            "network command input",
+            &citation
+        ));
+        citation.coverage_role = Some("command_network_input".to_string());
+        assert!(!packet_citation_satisfies_required_probe(
             "network command input",
             &citation
         ));
         assert_eq!(
             packet_citation_probe_match_rank("network command input", &citation),
-            Some(6)
+            None
         );
-
-        citation.coverage_role = Some("client_response_materialization".to_string());
-        assert!(packet_citation_satisfies_required_probe(
-            "response stream boundary",
-            &citation
-        ));
-
-        citation.coverage_role = Some("form_native_constraints".to_string());
-        assert!(packet_citation_satisfies_required_probe(
-            "html form pattern constraint",
-            &citation
-        ));
-
-        citation.coverage_role = Some("form_custom_error_rendering".to_string());
-        assert!(packet_citation_satisfies_required_probe(
-            "custom validation error rendering",
-            &citation
-        ));
-
-        citation.coverage_role = Some("session_callbacks".to_string());
-        assert!(packet_citation_satisfies_required_probe(
-            "delegate callback handling",
-            &citation
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "url session callback boundary",
-            &citation
-        ));
     }
 
     #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
@@ -2411,48 +1848,49 @@ mod tests {
             0.9,
         );
         assert!(packet_citation_satisfies_required_probe(
+            "LogRecord.php LogRecord",
+            &log_record
+        ));
+        assert!(!packet_citation_satisfies_required_probe(
             "record.php record",
             &log_record
         ));
         assert!(packet_citation_satisfies_required_probe(
-            "processing_handler.php handle",
+            "AbstractProcessingHandler.php handle",
             &processing_handler
         ));
         assert!(packet_citation_satisfies_required_probe(
-            "plan_builder.cs plan builder",
+            "TypeMapPlanBuilder.cs TypeMapPlanBuilder",
             &plan_builder
         ));
         assert!(packet_citation_satisfies_required_probe(
-            "plan_builder.cs CreateMapperLambda",
+            "TypeMapPlanBuilder.cs CreateMapperLambda",
             &create_mapper_lambda
         ));
         assert!(packet_citation_satisfies_required_probe(
+            "DataRequest.swift DataRequest",
+            &data_request
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "DataRequest.swift validate",
+            &data_request_validate
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "SessionDelegate.swift SessionDelegate",
+            &session_delegate
+        ));
+        assert!(packet_citation_satisfies_required_probe(
+            "SessionDelegate.swift urlSession",
+            &session_delegate_url_session
+        ));
+        // Domain role-file aliases and soft stage probes must not match by table.
+        assert!(!packet_citation_satisfies_required_probe(
             "request_object.swift request",
             &data_request
         ));
         assert!(!packet_citation_satisfies_required_probe(
-            "data request validation",
-            &data_request
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "request_object.swift validate",
-            &data_request_validate
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "data request validation",
-            &data_request_validate
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "request validation pipeline",
-            &data_request_validate
-        ));
-        assert!(packet_citation_satisfies_required_probe(
             "delegate_callbacks.swift delegate",
             &session_delegate
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "delegate_callbacks.swift urlSession",
-            &session_delegate_url_session
         ));
     }
 

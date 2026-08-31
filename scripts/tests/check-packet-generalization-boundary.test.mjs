@@ -7,9 +7,11 @@ import { fileURLToPath } from "node:url";
 import {
   DELETED_DOMAIN_EVIDENCE_ROLES,
   DELETED_HOLDOUT_PROBE_SPELLINGS,
+  DELETED_PROBE_TABLE_APIS,
   DELETED_TAXONOMY_APIS,
   decodeAsciiByteArrayLiterals,
   findBoundaryViolations,
+  normalizeIdentifier,
   runPacketGeneralizationBoundaryCheck,
 } from "../lib/packet-generalization-boundary.mjs";
 
@@ -173,15 +175,73 @@ fn rank(role: PacketEvidenceRole) -> u8 {
   assert.ok(DELETED_HOLDOUT_PROBE_SPELLINGS.includes("requestentrypoint"));
 });
 
+test("space-separated and CX-R2 probe tables fail the strengthened checker", () => {
+  assert.equal(normalizeIdentifier("flag parsing"), "flagparsing");
+  assert.equal(normalizeIdentifier("search entrypoint"), "searchentrypoint");
+  const leaked = `
+fn packet_required_probe_multi_match_limit(query: &str) -> Option<usize> {
+    match normalize_identifier(query).as_str() {
+        "transportsend" | "commanddispatch" => Some(2),
+        _ => None,
+    }
+}
+fn packet_citation_matches_required_coverage_role(q: &str, c: &()) -> bool {
+    let normalized_role = "clienttransportsend";
+    normalized_role == "clienttransportsend"
+}
+pub fn push_search_flow_probe_queries(queries: &mut Vec<String>) {
+    queries.push("flag parsing".to_string());
+    queries.push("search entrypoint".to_string());
+}
+`;
+  const findings = findBoundaryViolations(leaked, {
+    filePath: path.join(repositoryRoot, "crates/codestory-runtime/src/agent/packet_capping.rs"),
+    repoRoot: repositoryRoot,
+  });
+  const kinds = new Set(findings.map((f) => f.kind));
+  assert.ok(kinds.has("holdout_probe_spelling"), findings);
+  assert.ok(kinds.has("deleted_probe_table_api"), findings);
+  assert.ok(kinds.has("coverage_role_alias_table"), findings);
+  assert.ok(DELETED_PROBE_TABLE_APIS.includes("packet_required_probe_multi_match_limit"));
+});
+
+test("cfg(test) modules with char literals are masked from production scans", () => {
+  const source = `
+pub fn live() {}
+#[cfg(test)]
+mod legacy_source_scans {
+    fn packet_first_sql_identifier(input: &str) -> Option<String> {
+        let quote = match input.chars().next() {
+            Some('"') | Some('\\'') | Some(']') => Some(']'),
+            _ => None,
+        };
+        let _ = quote;
+        Some("client transport send".to_string())
+    }
+}
+pub fn also_live() {}
+`;
+  const findings = findBoundaryViolations(source, {
+    filePath: path.join(repositoryRoot, "crates/codestory-runtime/src/agent/orchestrator.rs"),
+    repoRoot: repositoryRoot,
+  });
+  assert.equal(
+    findings.filter((f) => f.kind === "holdout_probe_spelling").length,
+    0,
+    findings,
+  );
+});
+
 test("current production head must pass the strengthened boundary checker", () => {
   const result = runPacketGeneralizationBoundaryCheck(repositoryRoot);
   assert.equal(
     result.exitCode,
     0,
-    `r2 production head must pass the boundary checker: ${result.stderr}\n${JSON.stringify(result.findings, null, 2)}`,
+    `r3 production head must pass the boundary checker: ${result.stderr}\n${JSON.stringify(result.findings, null, 2)}`,
   );
   assert.equal(result.findings.length, 0);
   assert.ok(DELETED_TAXONOMY_APIS.length > 0, "banlist must remain non-empty");
   assert.ok(DELETED_DOMAIN_EVIDENCE_ROLES.length > 0);
   assert.ok(DELETED_HOLDOUT_PROBE_SPELLINGS.length > 0);
+  assert.ok(DELETED_PROBE_TABLE_APIS.length > 0);
 });
