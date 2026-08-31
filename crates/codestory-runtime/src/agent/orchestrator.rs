@@ -36,6 +36,7 @@ use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_claims::packet_supported_claims_with_telemetry;
 use crate::agent::packet_compiler::{
     apply_compiled_evidence_with_proof_reconciliation, drill_options_from_ids,
+    merge_repository_evidence_gaps_into_disposition,
 };
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
@@ -107,7 +108,8 @@ use codestory_agent::packet_proof_atoms::{
     VerifiedSourceAspectReceipt, match_flow_requirements,
 };
 use codestory_agent::repository_evidence_plan::{
-    DEFAULT_REPOSITORY_EVIDENCE_LIMITS, RepositoryEvidenceInput, build_repository_evidence_plan,
+    DEFAULT_REPOSITORY_EVIDENCE_LIMITS, RepositoryEvidenceInput, RepositoryEvidencePlan,
+    build_repository_evidence_plan,
 };
 use codestory_agent::text::symbol_query_tokens;
 use codestory_contracts::api::{
@@ -494,7 +496,6 @@ pub(crate) fn agent_packet(
                 "packet_initial_search_provenance hits={} selected={selected}",
                 initial_packet_hits.len()
             )));
-        maybe_annotate_repository_evidence_plan(&question, plan.task_class, &mut answer);
     }
     if !exact_probe_citations.is_empty() {
         answer
@@ -575,6 +576,13 @@ pub(crate) fn agent_packet(
     }
     promote_retained_schema_entity_probes(&question, &mut answer);
     let exact_probe_paths = exact_packet_probe_paths(&plan.probe_resolutions);
+    // Stage B: retain the repository-evidence plan after seed retrieval and
+    // bounded graphs exist, then drive hydrate roots / protect / cap / continue.
+    let repository_evidence_plan =
+        build_retained_repository_evidence_plan(&question, plan.task_class, &mut answer);
+    if let Some(evidence_plan) = repository_evidence_plan.as_ref() {
+        prefer_repository_evidence_hydrate_roots(&mut answer, &evidence_plan.material_node_ids);
+    }
     // R2 post-pass hydration (F3 REVISE): the remaining atom-kind trails and
     // the depth-2 FILE structural trails run HERE, over the retained
     // candidate set, after every sidecar query has finished — never on the
@@ -608,10 +616,21 @@ pub(crate) fn agent_packet(
         &pre_cap_extras,
         &proof_session,
     );
+    let mut snapshot_carrier_node_ids =
+        protected_packet_obligation_carrier_node_ids(&obligation_edge_proofs).to_vec();
+    let mut snapshot_edge_ids =
+        protected_packet_obligation_edge_ids(&obligation_edge_proofs).to_vec();
+    if let Some(evidence_plan) = repository_evidence_plan.as_ref() {
+        union_unique_node_ids(
+            &mut snapshot_carrier_node_ids,
+            &evidence_plan.material_node_ids,
+        );
+        union_unique_edge_ids(&mut snapshot_edge_ids, &evidence_plan.material_edge_ids);
+    }
     let (protected_carrier_node_ids, protected_edge_ids) = select_protected_obligation_carriers(
         &answer,
-        protected_packet_obligation_carrier_node_ids(&obligation_edge_proofs),
-        protected_packet_obligation_edge_ids(&obligation_edge_proofs),
+        &snapshot_carrier_node_ids,
+        &snapshot_edge_ids,
         &partial_protection,
     );
     let budget = apply_packet_budget_with_extra_and_obligation_carriers(
@@ -779,6 +798,9 @@ pub(crate) fn agent_packet(
     let reconcile_extras =
         build_packet_proof_evidence_extras(&packet.answer, &proof_session, anchored_receipts);
     apply_compiled_evidence_with_proof_reconciliation(&mut packet, Some(&req), &reconcile_extras);
+    if let Some(evidence_plan) = repository_evidence_plan.as_ref() {
+        apply_repository_evidence_gap_continuation(&mut packet, evidence_plan, &req);
+    }
 
     Ok(packet)
 }
@@ -2089,13 +2111,13 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
     });
 }
 
-fn maybe_annotate_repository_evidence_plan(
+fn build_retained_repository_evidence_plan(
     question: &str,
     task_class: PacketTaskClassDto,
     answer: &mut AgentAnswerDto,
-) {
+) -> Option<RepositoryEvidencePlan> {
     if answer.citations.is_empty() {
-        return;
+        return None;
     }
     let mut relations = Vec::new();
     for artifact in &answer.graphs {
@@ -2103,9 +2125,6 @@ fn maybe_annotate_repository_evidence_plan(
             continue;
         };
         relations.extend(graph.edges.iter().cloned());
-    }
-    if relations.is_empty() {
-        return;
     }
     let evidence_plan = build_repository_evidence_plan(
         RepositoryEvidenceInput {
@@ -2126,6 +2145,55 @@ fn maybe_annotate_repository_evidence_plan(
             evidence_plan.objectives.len(),
             evidence_plan.uncovered.len(),
         )));
+    Some(evidence_plan)
+}
+
+fn prefer_repository_evidence_hydrate_roots(
+    answer: &mut AgentAnswerDto,
+    material_node_ids: &[NodeId],
+) {
+    if material_node_ids.is_empty() || answer.citations.len() < 2 {
+        return;
+    }
+    let preferred: HashSet<&str> = material_node_ids
+        .iter()
+        .map(|node_id| node_id.0.as_str())
+        .collect();
+    answer.citations.sort_by(|left, right| {
+        preferred
+            .contains(right.node_id.0.as_str())
+            .cmp(&preferred.contains(left.node_id.0.as_str()))
+    });
+}
+
+fn union_unique_node_ids(target: &mut Vec<NodeId>, extra: &[NodeId]) {
+    for node_id in extra {
+        if !target.iter().any(|existing| existing == node_id) {
+            target.push(node_id.clone());
+        }
+    }
+}
+
+fn union_unique_edge_ids(target: &mut Vec<EdgeId>, extra: &[EdgeId]) {
+    for edge_id in extra {
+        if !target.iter().any(|existing| existing == edge_id) {
+            target.push(edge_id.clone());
+        }
+    }
+}
+
+fn apply_repository_evidence_gap_continuation(
+    packet: &mut AgentPacketDto,
+    evidence_plan: &RepositoryEvidencePlan,
+    request: &AgentPacketRequestDto,
+) {
+    let already_drilled =
+        request.parent_packet_id.is_some() || !request.option_ids.is_empty();
+    merge_repository_evidence_gaps_into_disposition(
+        packet,
+        &evidence_plan.uncovered,
+        already_drilled,
+    );
 }
 
 fn maybe_annotate_packet_candidate_window(
@@ -16150,6 +16218,104 @@ mod tests {
             &partial,
         );
         assert_eq!(ordered, again);
+    }
+
+    #[test]
+    fn repository_evidence_material_nodes_survive_packet_cap() {
+        let question = "Trace Alpha::run calling Beta::finish";
+        let mut citations = Vec::new();
+        for index in 0..20 {
+            citations.push(test_packet_citation(
+                &format!("noise-{index}"),
+                &format!("src/noise_{index}.rs"),
+                1.0 - (index as f32) * 0.01,
+            ));
+        }
+        let mut alpha = test_packet_citation("a", "src/alpha.rs", 0.2);
+        alpha.display_name = "Alpha::run".into();
+        let mut beta = test_packet_citation("b", "src/beta.rs", 0.1);
+        beta.display_name = "Beta::finish".into();
+        citations.push(alpha);
+        citations.push(beta);
+        let mut answer = packet_answer_fixture(question, citations);
+        answer.graphs = vec![GraphArtifactDto::Uml {
+            id: "g1".into(),
+            title: "repository-evidence".into(),
+            graph: GraphResponse {
+                center_id: NodeId("a".into()),
+                nodes: Vec::new(),
+                edges: vec![codestory_contracts::api::GraphEdgeDto {
+                    id: EdgeId("e1".into()),
+                    source: NodeId("a".into()),
+                    target: NodeId("b".into()),
+                    kind: EdgeKind::CALL,
+                    confidence: Some(1.0),
+                    certainty: Some("certain".into()),
+                    callsite_identity: None,
+                    candidate_targets: Vec::new(),
+                }],
+                truncated: false,
+                omitted_edge_count: 0,
+                canonical_layout: None,
+            },
+        }];
+        let evidence_plan = build_retained_repository_evidence_plan(
+            question,
+            PacketTaskClassDto::RouteTracing,
+            &mut answer,
+        )
+        .expect("repository evidence plan");
+        assert!(evidence_plan.material_node_ids.iter().any(|node| node.0 == "a"));
+        assert!(evidence_plan.material_node_ids.iter().any(|node| node.0 == "b"));
+        prefer_repository_evidence_hydrate_roots(&mut answer, &evidence_plan.material_node_ids);
+        assert_eq!(answer.citations[0].node_id.0, "a");
+        assert_eq!(answer.citations[1].node_id.0, "b");
+
+        let snapshot_nodes = evidence_plan.material_node_ids.clone();
+        let snapshot_edges = evidence_plan.material_edge_ids.clone();
+        let partial = PacketPartialAtomProtection::default();
+        let (protected_nodes, protected_edges) = select_protected_obligation_carriers(
+            &answer,
+            &snapshot_nodes,
+            &snapshot_edges,
+            &partial,
+        );
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 4,
+            max_files: 4,
+            max_snippets: 4,
+            max_trail_edges: 2,
+            max_output_bytes: 4_096,
+        };
+        let _budget = apply_packet_budget_with_extra_and_obligation_carriers(
+            packet_fixture_project_root(),
+            question,
+            PacketTaskClassDto::RouteTracing,
+            PacketBudgetModeDto::Compact,
+            limits,
+            &mut answer,
+            &[],
+            &protected_nodes,
+            &protected_edges,
+        );
+        let retained: Vec<_> = answer
+            .citations
+            .iter()
+            .map(|citation| citation.node_id.0.as_str())
+            .collect();
+        assert!(
+            retained.contains(&"a") && retained.contains(&"b"),
+            "material repository-evidence nodes must survive capping: {retained:?}"
+        );
+        assert!(
+            answer.graphs.iter().any(|artifact| match artifact {
+                GraphArtifactDto::Uml { graph, .. } => {
+                    graph.edges.iter().any(|edge| edge.id.0 == "e1")
+                }
+                _ => false,
+            }),
+            "material repository-evidence edges must survive capping"
+        );
     }
 
     /// The extras builder enforces the evidence-completeness obligation over

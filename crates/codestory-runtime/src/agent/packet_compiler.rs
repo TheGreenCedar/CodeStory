@@ -692,6 +692,112 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
         .collect()
 }
 
+
+/// Map Stage B uncovered gaps into DrillOnce options the compiler already
+/// understands. Unknown gaps stay observational — they must not assert absence.
+pub fn merge_repository_evidence_gaps_into_disposition(
+    packet: &mut AgentPacketDto,
+    gaps: &[codestory_agent::repository_evidence_plan::RepositoryEvidenceGap],
+    already_drilled: bool,
+) {
+    if already_drilled || gaps.is_empty() {
+        return;
+    }
+    if matches!(
+        packet.disposition.kind,
+        PacketDispositionKindDto::Unavailable
+    ) {
+        return;
+    }
+    let mut options = drill_options_from_repository_evidence_gaps(gaps);
+    if options.is_empty() {
+        return;
+    }
+    options.truncate(PACKET_DRILL_MAX_OPTIONS);
+
+    if let Some(drill) = packet.disposition.drill.as_mut() {
+        let mut seen = drill
+            .options
+            .iter()
+            .map(|option| option.id.clone())
+            .collect::<BTreeSet<_>>();
+        for option in options {
+            if seen.insert(option.id.clone()) {
+                drill.gap_ids.push(option.gap_id.clone());
+                drill.options.push(option);
+            }
+        }
+        drill.options.truncate(PACKET_DRILL_MAX_OPTIONS);
+        drill.gap_ids.truncate(PACKET_DRILL_MAX_OPTIONS);
+        return;
+    }
+
+    let gap_ids = options
+        .iter()
+        .map(|option| option.gap_id.clone())
+        .collect::<Vec<_>>();
+    let publication = packet.answer.retrieval_trace.retrieval_publication.as_ref();
+    packet.disposition = PacketDispositionDto::drill_once(
+        "repository evidence gaps remain closable by the listed options",
+        BoundedDrillPlanDto {
+            parent_packet_id: packet.packet_id.clone(),
+            core_generation_id: publication
+                .map(|publication| publication.core_generation_id.clone())
+                .unwrap_or_default(),
+            retrieval_generation: publication
+                .map(|publication| publication.retrieval_generation.clone()),
+            gap_ids,
+            options,
+            max_bytes: PACKET_DRILL_MAX_BYTES,
+            max_hits: PACKET_DRILL_MAX_HITS,
+            max_depth: PACKET_DRILL_MAX_DEPTH,
+            remaining_rounds: 1,
+        },
+    );
+}
+
+fn drill_options_from_repository_evidence_gaps(
+    gaps: &[codestory_agent::repository_evidence_plan::RepositoryEvidenceGap],
+) -> Vec<DrillOptionDto> {
+    use codestory_agent::repository_evidence_plan::RepositoryEvidenceGapKind;
+
+    let mut options = Vec::new();
+    let mut seen = BTreeSet::new();
+    for gap in gaps {
+        match gap.kind {
+            RepositoryEvidenceGapKind::Unknown => continue,
+            RepositoryEvidenceGapKind::UnresolvedAnchors
+            | RepositoryEvidenceGapKind::MissingRelation
+            | RepositoryEvidenceGapKind::TruncatedSearch => {}
+        }
+        for node_id in &gap.node_ids {
+            let option = DrillOptionDto::omitted_symbol(
+                format!("repository-evidence:{}", node_id.0),
+                &node_id.0,
+            );
+            if seen.insert(option.id.clone()) {
+                options.push(option);
+            }
+            if options.len() >= PACKET_DRILL_MAX_OPTIONS {
+                return options;
+            }
+        }
+        if gap.node_ids.is_empty() && !gap.detail.is_empty() {
+            let option = DrillOptionDto::deadline_lost_query(
+                format!("repository-evidence:{}", gap.detail),
+                gap.detail.clone(),
+            );
+            if seen.insert(option.id.clone()) {
+                options.push(option);
+            }
+        }
+        if options.len() >= PACKET_DRILL_MAX_OPTIONS {
+            break;
+        }
+    }
+    options
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
