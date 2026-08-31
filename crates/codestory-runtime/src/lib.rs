@@ -489,6 +489,9 @@ thread_local! {
     static ACTIVE_CORE_READ: RefCell<Option<ActiveCoreRead>> = const { RefCell::new(None) };
 }
 
+// Pinned is a cheap Rc; Owned holds the full Storage. Prefer the size skew over
+// boxing every owned open on the observational read path.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ReadStorage {
     Pinned(Rc<Storage>),
     Owned(Storage),

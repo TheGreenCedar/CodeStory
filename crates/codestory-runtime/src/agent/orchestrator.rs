@@ -1167,6 +1167,8 @@ fn maybe_append_cited_stylesheet_import_citations(
     _question: &str,
     answer: &mut AgentAnswerDto,
 ) {
+    // Intentionally disabled enrichment path; keep the body compiled for restore.
+    #[allow(clippy::nonminimal_bool)]
     if !false {
         return;
     }
@@ -1555,6 +1557,8 @@ fn maybe_append_cited_formatting_type_citations(
     _question: &str,
     answer: &mut AgentAnswerDto,
 ) {
+    // Intentionally disabled enrichment path; keep the body compiled for restore.
+    #[allow(clippy::nonminimal_bool)]
     if !false {
         return;
     }
@@ -1607,6 +1611,8 @@ fn maybe_append_cited_mapper_interface_citations(
     _question: &str,
     answer: &mut AgentAnswerDto,
 ) {
+    // Intentionally disabled enrichment path; keep the body compiled for restore.
+    #[allow(clippy::nonminimal_bool)]
     if !false {
         return;
     }
@@ -1650,6 +1656,8 @@ fn maybe_append_cited_client_relative_imports(
     _question: &str,
     answer: &mut AgentAnswerDto,
 ) {
+    // Intentionally disabled enrichment path; keep the body compiled for restore.
+    #[allow(clippy::nonminimal_bool)]
     if !false {
         return;
     }

@@ -143,6 +143,7 @@ pub(super) fn rematerialize_staged_proof_resolution_projection(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stage_core_publication_identity(
     staged: &mut StagedSnapshot,
     root: &Path,

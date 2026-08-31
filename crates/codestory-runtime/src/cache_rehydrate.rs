@@ -677,6 +677,7 @@ fn insufficient_space_output(
     output
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rehydrate_success_output(
     request: CacheRehydrateRequest<'_>,
     source_git: GitIdentity,

@@ -471,20 +471,19 @@ pub(super) fn probe_incremental_plan(
     probe
 }
 
+type IncrementalExecutionPlanParts = (
+    RefreshExecutionPlan,
+    Vec<OversizedSourceExclusionCandidate>,
+    Vec<IncrementalScheduledPathDto>,
+    Vec<PathBuf>,
+);
+
 fn incremental_execution_plan(
     staged: &mut StagedSnapshot,
     root: &Path,
     storage_path: &Path,
     source_index_policy: &SourceIndexPolicy,
-) -> Result<
-    (
-        RefreshExecutionPlan,
-        Vec<OversizedSourceExclusionCandidate>,
-        Vec<IncrementalScheduledPathDto>,
-        Vec<PathBuf>,
-    ),
-    ApiError,
-> {
+) -> Result<IncrementalExecutionPlanParts, ApiError> {
     let workspace = runtime_workspace_manifest(root, storage_path)
         .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
     let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
@@ -928,6 +927,11 @@ impl IncrementalCoreWallDurations {
 
 /// Either the staged republication is required, or the published core already
 /// satisfies the request and nothing may be written.
+///
+/// Unchanged carries probe+wall by value for the short-circuit path; Prepared is
+/// already boxed. Prefer the explicit size skew over an extra allocation on the
+/// hot unchanged return.
+#[allow(clippy::large_enum_variant)]
 enum IncrementalRefreshPreparation {
     Unchanged {
         probe: IncrementalPlanProbe,
@@ -1269,6 +1273,7 @@ fn prepare_incremental_refresh(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_incremental_indexing_common(
     root: &Path,
     storage_path: &Path,

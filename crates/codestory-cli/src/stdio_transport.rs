@@ -4608,20 +4608,18 @@ fn stdio_storage_modified(
         let core_root = parent.join("core");
         let publication_path = core_root.join("publication.json");
         paths.push(publication_path.clone());
-        if let Ok(bytes) = fs::read(&publication_path) {
-            if let Ok(pointer) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if let Some(generation_id) = pointer
-                    .pointer("/active/generation_id")
-                    .and_then(|value| value.as_str())
-                {
-                    let generation_db = core_root
-                        .join("generations")
-                        .join(generation_id)
-                        .join("codestory.db");
-                    paths.push(generation_db.with_extension("db-wal"));
-                    paths.push(generation_db);
-                }
-            }
+        if let Ok(bytes) = fs::read(&publication_path)
+            && let Ok(pointer) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(generation_id) = pointer
+                .pointer("/active/generation_id")
+                .and_then(|value| value.as_str())
+        {
+            let generation_db = core_root
+                .join("generations")
+                .join(generation_id)
+                .join("codestory.db");
+            paths.push(generation_db.with_extension("db-wal"));
+            paths.push(generation_db);
         }
     }
     let mut newest: Option<std::time::SystemTime> = None;
