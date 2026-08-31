@@ -1888,11 +1888,18 @@ pub(crate) fn load_fresh_scip_query_view(
         },
     )?;
     if data.index.revision != expected_revision
-        || data.index.generation != generation
         || !data.index.contract.is_fresh_for(expected_revision)
         || !data.index.has_required_proof_records()
         || data.index.symbols.is_empty()
     {
+        return Ok(None);
+    }
+    // JSON adjacency fixtures stamp the generation inside the artifact. A
+    // sealed SQLite component may be hard-linked across graph-equivalent
+    // generations and remapped by the request generation instead.
+    let component_is_json =
+        path.file_name().and_then(|name| name.to_str()) == Some(SCIP_SYMBOLS_FILE);
+    if component_is_json && data.index.generation != generation {
         return Ok(None);
     }
     Ok(Some(Arc::new(ScipQueryView::from_data(data, generation)?)))
