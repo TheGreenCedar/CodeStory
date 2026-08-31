@@ -11,7 +11,7 @@ CLI docs. Do not send CLI flags as MCP arguments.
 Live tools: `status`, `packet`, `search`, `ground`, `files`, `affected`,
 `symbol`, `trail`, `callers`, `callees`, `trace`, `get_node`, `neighbors`,
 `shortest_path`, `query_subgraph`, `definition`, `references`, `symbols`,
-`snippet`, `context`, `prove_call_path`.
+`snippet`, `context`, `verify_indexed_direct_calls`.
 
 There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 `bookmark`, `serve`, or `cache` tool. Product tools own activation.
@@ -40,7 +40,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
 | `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | After packet/search/graph selects targets. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
-| `prove_call_path` | `source_text`, `clauses`, `spec` | | Observational exact verification of a host-supplied typed contract. Never construct one from free English or invoke this tool automatically. |
+| `verify_indexed_direct_calls` | `source_text`, `clauses`, `spec` | | Observational exact verification of a host-supplied typed contract. Never construct one from free English or invoke this tool automatically. |
 
 ## Resources and prompts
 

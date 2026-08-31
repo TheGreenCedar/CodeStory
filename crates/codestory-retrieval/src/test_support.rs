@@ -195,14 +195,46 @@ pub fn publish_zero_dense_pinned_query_fixture(
             None,
             u32::try_from(embedding_dim).context("negative embedding dimension")?,
         )?;
-    let mut storage = Store::open(storage_path).context("open pinned query fixture storage")?;
-    let publication = storage
-        .get_complete_index_publication()
-        .context("load pinned query fixture publication")?
-        .context("pinned query fixture requires a complete core publication")?;
-    storage
-        .publish_dense_anchor_generation(&publication, crate::generation::SEMANTIC_POLICY_VERSION)
-        .context("publish pinned query fixture dense-anchor manifest")?;
+    // Published cores are immutable: Live `Store::open` becomes read-only once
+    // a generation pointer exists. Dense-anchor publication must already be
+    // sealed into that generation. Mutable opens remain only for pre-pointer
+    // fixture cores that still need an empty dense-anchor marker written.
+    // Retrieval manifests still publish through the external retrieval DB when
+    // a pointer is present.
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
+        .context("resolve pinned query fixture core layout")?;
+    let (mut storage, publication) = if layout
+        .read_pointer()
+        .context("read pinned query fixture publication pointer")?
+        .is_some()
+    {
+        let storage =
+            Store::open_read_only(storage_path).context("open sealed pinned query fixture")?;
+        let publication = storage
+            .get_complete_index_publication()
+            .context("load sealed pinned query fixture publication")?
+            .context("pinned query fixture requires a complete core publication")?;
+        storage
+            .validate_dense_anchor_publication(&publication)
+            .context(
+                "immutable core fixture requires a sealed dense-anchor publication from staging",
+            )?;
+        (storage, publication)
+    } else {
+        let mut storage =
+            Store::open(storage_path).context("open pinned query fixture storage")?;
+        let publication = storage
+            .get_complete_index_publication()
+            .context("load pinned query fixture publication")?
+            .context("pinned query fixture requires a complete core publication")?;
+        storage
+            .publish_dense_anchor_generation(
+                &publication,
+                crate::generation::SEMANTIC_POLICY_VERSION,
+            )
+            .context("publish pinned query fixture dense-anchor manifest")?;
+        (storage, publication)
+    };
     let input = crate::index::compute_sidecar_input_fingerprint(
         &storage,
         project_root,
