@@ -8,7 +8,8 @@ use crate::cache_clean::{CacheCleanPlan, plan_cache_clean};
 use crate::config::user_cache_root;
 use anyhow::{Context, Result};
 use codestory_contracts::owned_artifacts::{
-    ANNOTATIONS_SIDECAR_FILE, EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE,
+    ANNOTATIONS_SIDECAR_FILE, EMBEDDED_MODEL_CACHE_DIR, EMBEDDED_MODEL_DIGEST_DIR,
+    EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE,
 };
 use codestory_store::{SqliteDatabaseObservation, observe_sqlite_database};
 use serde::{Deserialize, Serialize};
@@ -456,7 +457,9 @@ fn classify_entry(relative: &str, path: &Path) -> CacheInventoryKind {
     if relative.contains("/core/staging/") {
         return CacheInventoryKind::Temporary;
     }
-    if relative.contains("embedded-models/sha256/") {
+    if relative.contains(&format!(
+        "{EMBEDDED_MODEL_CACHE_DIR}/{EMBEDDED_MODEL_DIGEST_DIR}/"
+    )) {
         return CacheInventoryKind::ModelDigest;
     }
     if relative.contains("vectors/")

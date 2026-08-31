@@ -1,6 +1,11 @@
 //! Immutable core-generation layout and publication pointer.
 
 use crate::StorageError;
+#[cfg(test)]
+pub(crate) use codestory_contracts::config_registry::{
+    TEST_CORE_PUBLICATION_ABORT_POINT_ENV as CORE_PUBLICATION_ABORT_POINT_ENV,
+    TEST_CORE_PUBLICATION_ABORT_SENTINEL_ENV as CORE_PUBLICATION_ABORT_SENTINEL_ENV,
+};
 use codestory_contracts::core_publication::{
     CORE_PUBLICATION_POINTER_SCHEMA_VERSION, CoreGenerationIdentityV1, CorePublicationPointerV1,
 };
@@ -22,13 +27,6 @@ pub const RETRIEVAL_PUBLICATION_FILE: &str = "retrieval-publication.sqlite3";
 /// Callers must escalate to a disposable complete-build rather than silently
 /// byte-copying the live database in production.
 pub const CORE_COPY_ON_WRITE_UNAVAILABLE: &str = "core_copy_on_write_unavailable";
-
-#[cfg(test)]
-pub(crate) const CORE_PUBLICATION_ABORT_POINT_ENV: &str =
-    "CODESTORY_TEST_CORE_PUBLICATION_ABORT_POINT";
-#[cfg(test)]
-pub(crate) const CORE_PUBLICATION_ABORT_SENTINEL_ENV: &str =
-    "CODESTORY_TEST_CORE_PUBLICATION_ABORT_SENTINEL";
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {

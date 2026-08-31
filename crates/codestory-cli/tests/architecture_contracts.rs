@@ -593,7 +593,7 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
 /// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
 /// that, so adding a module to the crate without extending this list fails
 /// loudly instead of silently escaping every contract built on it.
-const AGENT_PLANNING_MODULES: [&str; 28] = [
+const AGENT_PLANNING_MODULES: [&str; 29] = [
     "citation.rs",
     "packet_citations.rs",
     "packet_claim_profile_registry.rs",
@@ -620,6 +620,7 @@ const AGENT_PLANNING_MODULES: [&str; 28] = [
     "pinned_reader.rs",
     "planning.rs",
     "profiles.rs",
+    "repository_evidence_plan.rs",
     "text.rs",
     "trail.rs",
 ];
@@ -1158,7 +1159,12 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
     for (consumer, source) in [
         (
             "retrieval",
-            read_source_tree("crates/codestory-retrieval/src"),
+            // Fixture helpers rebind inherited store overlays when replacing a
+            // core; that is not a product retrieval consumer of proof facts.
+            read_source_tree_excluding_many(
+                "crates/codestory-retrieval/src",
+                &["test_support.rs"],
+            ),
         ),
         (
             "packet planner",
@@ -2542,14 +2548,14 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
         full_refresh.contains("SnapshotStore::open_disposable_full_refresh(storage_path)")
             && full_refresh.contains("staged.snapshots().finalize_staged()")
             && full_refresh.contains("staged.snapshots().refresh_detail()")
-            && commit.contains(".publish_with_stats(&self.storage_path)"),
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path)"),
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
         incremental_refresh.contains("SnapshotStore::clone_live_to_staged(storage_path)")
-            && incremental_refresh.contains(".snapshots()\n        .finalize_staged()")
-            && incremental_refresh.contains(".snapshots()\n        .refresh_detail()")
-            && commit.contains(".publish_with_stats(&self.storage_path)"),
+            && incremental_refresh.contains(".snapshots()\n            .finalize_staged()")
+            && incremental_refresh.contains(".snapshots()\n            .refresh_detail()")
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path)"),
         "incremental refresh should clone, finalize both snapshot tiers, and publish through the staged snapshot surface"
     );
     for forbidden in [
@@ -2586,7 +2592,7 @@ fn staged_publication_identity_and_fence_are_complete_before_publication() {
         commit.contains("pub(super) fn next_index_publication(")
             && commit.contains(".put_index_publication(publication)")
             && commit.contains(".finish_incremental_run()")
-            && commit.contains(".publish_with_stats(&self.storage_path)")
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path)")
             && full_refresh.contains("next_index_publication(")
             && full_refresh.contains("stage_core_publication_identity(")
             && full_refresh.contains("CoreCommitMode::Full")
