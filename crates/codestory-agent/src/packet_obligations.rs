@@ -3,8 +3,8 @@
 use super::packet_evidence::citation_sufficiency_eligible;
 use super::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use super::packet_flow_requirements::{
-    CoverageMode, EvidencePredicate, FlowRequirement, FlowRole,
-    flow_requirement_call_receipt_is_valid, ordinary_incident_call_receipt_is_valid,
+    CoverageMode, FlowRequirement, FlowRole, flow_requirement_call_receipt_is_valid,
+    ordinary_incident_call_receipt_is_valid,
 };
 use super::packet_proof_atoms::{
     DischargedFact, FlowProofFormula, FlowProofOutcome, PacketProofEvidence, TrailCoverage,
@@ -940,8 +940,8 @@ pub fn refinalize_packet_obligation_plan_after_rebuild(
 /// then re-run the disposition computation on the post-demotion state so
 /// `packet.disposition` and the obligations agree at return.
 pub fn reconcile_packet_proof_obligations_after_compile(
-    question: &str,
-    task_class: PacketTaskClassDto,
+    _question: &str,
+    _task_class: PacketTaskClassDto,
     plan: &mut PacketObligationPlanDto,
     answer: &AgentAnswerDto,
     compiled_support: &[SupportUnitDto],

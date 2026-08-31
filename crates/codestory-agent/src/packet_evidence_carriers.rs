@@ -3,7 +3,7 @@
 //! only. This module retains a zeroed rank-bonus stub so call sites compile
 //! without reintroducing ownership predicates.
 
-use codestory_contracts::api::{AgentCitationDto, NodeId, NodeKind, SearchHitOrigin};
+use codestory_contracts::api::AgentCitationDto;
 
 /// Always zero — no domain vocabulary may boost ranking.
 pub fn packet_server_dispatch_callable_rank_bonus(
@@ -16,6 +16,7 @@ pub fn packet_server_dispatch_callable_rank_bonus(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::{NodeId, NodeKind, SearchHitOrigin};
 
     #[test]
     fn rank_bonus_is_always_zero() {

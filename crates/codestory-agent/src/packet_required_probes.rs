@@ -1,6 +1,5 @@
 #[cfg(any(test, feature = "test-support"))]
 use crate::eval_probes::{eval_probes_enabled, push_prompt_concept_derived_symbol_probes};
-use crate::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use crate::packet_scoring::{
     normalize_identifier, packet_display_path, packet_file_stem_matches_query,
     packet_query_stop_term,
@@ -595,18 +594,6 @@ pub fn packet_required_probe_needs_exact_match(query: &str) -> bool {
         || packet_public_catalog_probe_table(query).is_some()
 }
 
-fn packet_citation_probe_has_exact_identifier_match(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    let normalized_query = normalize_identifier(query);
-    if normalized_query.is_empty() {
-        return false;
-    }
-    let normalized_display = normalize_identifier(&citation.display_name);
-    normalized_display == normalized_query || normalized_display.ends_with(&normalized_query)
-}
-
 pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto) -> Option<u8> {
     let normalized_query = normalize_identifier(query);
     if normalized_query.is_empty() {
@@ -772,14 +759,6 @@ fn packet_sql_table_identity(display: &str) -> Option<String> {
         .trim_matches(|ch: char| matches!(ch, '[' | ']' | '"' | '\'' | '`' | '(' | ')' | ';'));
     let normalized = normalize_identifier(token);
     (normalized.len() >= 4).then_some(normalized)
-}
-
-fn packet_display_tail_has_interface_prefix(display_tail: &str) -> bool {
-    let mut chars = display_tail.chars();
-    if chars.next() != Some('I') {
-        return false;
-    }
-    chars.next().is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
 fn packet_file_scoped_symbol_probe_matches(
@@ -954,142 +933,10 @@ fn push_unique_term(terms: &mut Vec<String>, value: &str) {
     }
 }
 
-fn push_unique_terms(terms: &mut Vec<String>, values: &[&str]) {
-    for value in values {
-        push_unique_term(terms, value);
-    }
-}
-
 fn push_unique_owned_terms(terms: &mut Vec<String>, values: &[String]) {
     for value in values {
         push_unique_term(terms, value);
     }
-}
-
-fn packet_sql_schema_prompt_table_candidates(terms: &[String]) -> Vec<String> {
-    let mut candidates = Vec::new();
-    for window in terms.windows(2) {
-        let [left, right] = window else {
-            continue;
-        };
-        if !packet_sql_schema_compound_suffix(right) {
-            continue;
-        }
-        let Some(left) = packet_sql_schema_prompt_table_part(left, true) else {
-            continue;
-        };
-        let Some(right) = packet_sql_schema_prompt_table_part(right, true) else {
-            continue;
-        };
-        push_unique_term(&mut candidates, &format!("{left}{right}"));
-    }
-
-    for term in terms {
-        let Some(table) = packet_sql_schema_prompt_table_part(term, false) else {
-            continue;
-        };
-        push_unique_term(&mut candidates, &table);
-    }
-
-    candidates
-}
-
-fn packet_sql_schema_compound_suffix(term: &str) -> bool {
-    matches!(
-        normalize_identifier(term).as_str(),
-        "line" | "lines" | "item" | "items" | "detail" | "details"
-    )
-}
-
-fn packet_sql_schema_prompt_table_part(term: &str, allow_singular: bool) -> Option<String> {
-    let normalized = normalize_identifier(term);
-    if normalized.len() < 4
-        || packet_sql_schema_prompt_table_stop_term(&normalized)
-        || normalized.chars().any(|ch| !ch.is_ascii_alphanumeric())
-    {
-        return None;
-    }
-    if !allow_singular && packet_sql_schema_compound_suffix(&normalized) {
-        return None;
-    }
-    if !allow_singular
-        && !normalized.ends_with('s')
-        && !matches!(
-            normalized.as_str(),
-            "line" | "lines" | "item" | "items" | "detail" | "details"
-        )
-    {
-        return None;
-    }
-    let singular = packet_sql_schema_singular_table_term(&normalized);
-    if singular.len() < 4 || packet_sql_schema_prompt_table_stop_term(&singular) {
-        return None;
-    }
-    Some(packet_sql_schema_pascal_identifier(&singular))
-}
-
-fn packet_sql_schema_singular_table_term(term: &str) -> String {
-    term.strip_suffix("ies")
-        .map(|prefix| format!("{prefix}y"))
-        .or_else(|| term.strip_suffix('s').map(str::to_string))
-        .unwrap_or_else(|| term.to_string())
-}
-
-fn packet_sql_schema_pascal_identifier(term: &str) -> String {
-    let mut value = String::new();
-    let mut chars = term.chars();
-    if let Some(first) = chars.next() {
-        value.push(first.to_ascii_uppercase());
-        value.extend(chars.map(|ch| ch.to_ascii_lowercase()));
-    }
-    value
-}
-
-fn packet_sql_schema_prompt_table_stop_term(term: &str) -> bool {
-    matches!(
-        term,
-        "across"
-            | "between"
-            | "constraint"
-            | "constraints"
-            | "core"
-            | "create"
-            | "database"
-            | "databases"
-            | "definition"
-            | "definitions"
-            | "dialect"
-            | "dialects"
-            | "explain"
-            | "file"
-            | "files"
-            | "foreign"
-            | "reference"
-            | "references"
-            | "relation"
-            | "relations"
-            | "relationship"
-            | "relationships"
-            | "schema"
-            | "schemas"
-            | "script"
-            | "scripts"
-            | "seed"
-            | "seeds"
-            | "sqlite"
-            | "source"
-            | "sources"
-            | "mysql"
-            | "name"
-            | "names"
-            | "postgres"
-            | "postgresql"
-            | "sql"
-            | "support"
-            | "supporting"
-            | "table"
-            | "tables"
-    )
 }
 
 #[cfg(test)]

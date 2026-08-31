@@ -7,7 +7,7 @@
 use crate::packet_scoring::{
     normalize_identifier, packet_display_name_is_test_like, packet_display_path,
 };
-use codestory_contracts::api::{AgentCitationDto, NodeId, NodeKind, SearchHitOrigin};
+use codestory_contracts::api::{AgentCitationDto, NodeKind, SearchHitOrigin};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PacketEvidenceRole {
@@ -88,6 +88,7 @@ fn path_contains_test_segment(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::api::NodeId;
 
     fn citation(display: &str, path: &str, kind: NodeKind) -> AgentCitationDto {
         AgentCitationDto {

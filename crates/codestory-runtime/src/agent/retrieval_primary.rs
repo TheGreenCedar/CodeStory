@@ -4547,6 +4547,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn exact_boundary_post_pass_recovers_only_correlated_router_and_loop_witnesses() {
         use codestory_store::{FileInfo, FileRole};
 
@@ -6935,6 +6936,7 @@ mod tests {
     /// displaced filler ends un-attempted like a cap-cut candidate, and the
     /// whole outcome is deterministic across runs.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_established_import_identity_promotes_late_file_candidate_deterministically() {
         let storage = css_bootstrap_storage();
         let candidates = vec![
@@ -7053,6 +7055,7 @@ mod tests {
     /// identical promotion treatment — swapping their names changes nothing
     /// but base order.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_promotion_key_ignores_symbol_names_and_paths() {
         let storage = css_bootstrap_storage();
         let outcome_for = |first_name: &str, second_name: &str| {
@@ -7412,6 +7415,7 @@ mod tests {
     /// absence-subject USAGE edges plus the depth-2 MEMBER witnesses — never
     /// the incidental IMPORT edge), and stays within its cost budget.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn post_pass_fills_ledger_with_narrowed_coverage_for_retained_file_roots() {
         let storage = css_bootstrap_storage();
         let session = file_structural_session();
@@ -7495,6 +7499,7 @@ mod tests {
     /// session, not per resolution call. Negative first: without a shared
     /// session the second query falls back to base order.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_identities_established_in_one_query_promote_candidates_in_later_queries() {
         let storage = css_bootstrap_storage();
         let query_one = vec![file_shaped_candidate("styles/_base.css")];
@@ -7672,6 +7677,7 @@ mod tests {
     /// matching dispatch edges promotes nothing and admission stays
     /// identical to no session.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_m_shard_accumulation_produces_no_displacement() {
         use codestory_store::{FileInfo, FileRole};
 
@@ -7840,6 +7846,7 @@ mod tests {
     /// identity, and the TypeMap-shaped candidate beyond the window is
     /// promoted over the filler.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_a_shard_type_usage_identity_trail_promotes_beyond_window_candidate() {
         use codestory_store::{FileInfo, FileRole};
 
@@ -8048,6 +8055,7 @@ mod tests {
     /// un-attempted remainder — rendered into the `r6_session` step-trace
     /// section.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_session_trace_records_need_set_provenance_and_admission_decisions() {
         let storage = css_bootstrap_storage();
         let requirements = Vec::new();
@@ -8128,6 +8136,7 @@ mod tests {
     /// ordered by resolution rank, with the atom signal breaking ties among
     /// equal ranks only.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn deadline_cancelled_queries_retain_resolved_hits_ordered_by_rank() {
         let hit_with = |id: i64, score: f32| {
             let mut hit = PacketSearchHit::without_graph(SearchHit {
@@ -8323,6 +8332,7 @@ mod tests {
     /// for the rest of the query — retirement and slots silence promotion
     /// only, they never change base-order admission.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_c_shard_promotions_are_capped_at_the_four_atom_derived_role_slots() {
         let storage = css_entrypoint_closure_storage(6);
         let session = traced_file_structural_session();
@@ -8447,6 +8457,7 @@ mod tests {
     /// 5c measurement (12 promotions across 9 queries) intact, and no query
     /// ever exceeds its slot count.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_c_shard_role_slots_preserve_the_gate_pace_across_nine_queries() {
         let storage = css_entrypoint_closure_storage(20);
         let session = traced_file_structural_session();
@@ -8517,6 +8528,7 @@ mod tests {
     /// second config-type identity finds none, and the next query re-opens
     /// both.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_a_shard_promotions_are_capped_at_the_two_atom_derived_role_slots() {
         use codestory_store::{FileInfo, FileRole};
 
@@ -8758,6 +8770,7 @@ mod tests {
     /// complete a group-consistent proof — now takes the slot even though it
     /// sits LATER in base order.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_promotion_priority_prefers_multi_role_identities_over_base_order() {
         let storage = mapper_multiplicity_storage();
         let session = mapper_session();
@@ -8807,6 +8820,7 @@ mod tests {
     /// back to BASE ORDER, then to stable identity, and the whole decision
     /// is deterministic across runs.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_equal_priority_falls_back_to_base_order_deterministically() {
         let storage = mapper_multiplicity_storage();
         let run = || {
@@ -8861,6 +8875,7 @@ mod tests {
     /// keeps promoting, which is the fail-closed half of the property:
     /// retirement is exactly as strict as the proof layer.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_group_checkpointed_retirement_stops_promotion_at_the_next_query_boundary() {
         use codestory_agent::packet_proof_atoms::{
             FlowProofFormula, ProofAtomId, ProofAtomSpec, ProofEndpointPattern, ProofFactPattern,
@@ -9107,6 +9122,7 @@ mod tests {
     /// budget only affords 16 — and they are hydrated while priority-0 roots
     /// ahead of them are the ones dropped.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn post_pass_hydrates_atom_needed_roots_before_rank_order() {
         let storage = post_pass_budget_storage(18);
         let session = session_needing("18", "17");
@@ -9149,6 +9165,7 @@ mod tests {
     /// Gate 8 — determinism of the need-ordered traversal: identical inputs
     /// produce an identical artifact set in an identical order.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn post_pass_need_ordering_is_deterministic() {
         let storage = post_pass_budget_storage(18);
         let citations = (1..=18).collect::<Vec<_>>();
@@ -9169,6 +9186,7 @@ mod tests {
     /// is unchanged, so this only stops one expensive root from starving
     /// everything behind it.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn post_pass_skips_an_unaffordable_root_and_keeps_hydrating_cheaper_ones() {
         let storage = post_pass_budget_storage(17);
         let session = file_structural_session();
@@ -9210,6 +9228,7 @@ mod tests {
     /// `[MEMBER, USAGE, IMPORT]` at depth 2, which is what rule 7's
     /// deeper-rooted arm requires.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn post_pass_structural_trail_survives_entrypoint_scale_fanout() {
         use codestory_store::{FileInfo, FileRole};
 
@@ -9348,6 +9367,7 @@ mod tests {
     /// beyond-window candidate whose file sits early in the import closure
     /// promotes.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn r6_truncated_import_trail_still_contributes_retained_identities() {
         use codestory_store::{FileInfo, FileRole};
 

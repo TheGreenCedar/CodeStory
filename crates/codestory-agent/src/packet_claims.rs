@@ -1,5 +1,5 @@
 #[cfg(any(test, feature = "test-support"))]
-use crate::eval_probes::{eval_citation_shaped_claim, eval_supporting_claim_flow_sentence};
+use crate::eval_probes::eval_citation_shaped_claim;
 use crate::packet_evidence::{
     citation_sufficiency_eligible, evidence_resolution_for_citation, evidence_tier_for_citation,
 };
@@ -9,8 +9,7 @@ use crate::packet_evidence_roles::{
 use crate::packet_plan::packet_rank_terms;
 use crate::packet_profile_telemetry::{PacketClaimSource, PacketClaimTelemetry};
 use crate::packet_scoring::{
-    normalize_identifier, packet_adjacent_query_stop_term, packet_claim_carry_rank,
-    packet_display_path, packet_query_stop_term, sort_by_cached_rank_desc,
+    normalize_identifier, packet_claim_carry_rank, packet_display_path, sort_by_cached_rank_desc,
 };
 use crate::text::query_mentions_non_primary_source;
 use codestory_contracts::api::{
@@ -218,42 +217,6 @@ pub fn packet_claim_for_role(
             format!("`{symbol}` in `{path}` is cited source evidence for this question.")
         }
     }
-}
-
-fn packet_source_evidence_flow_sentence(prompt: &str, focus: &str) -> String {
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        let normalized_prompt = normalize_identifier(prompt);
-        if let Some(sentence) = eval_supporting_claim_flow_sentence(&normalized_prompt, focus) {
-            return sentence;
-        }
-    }
-    let _ = prompt;
-    format!("ties {focus} in this flow to cited definitions and adjacent ownership")
-}
-
-fn packet_claim_flow_terms(rank_terms: &[String], citation: &AgentCitationDto) -> Vec<String> {
-    let display = normalize_identifier(&citation.display_name);
-    let path = normalize_identifier(citation.file_path.as_deref().unwrap_or_default());
-    let mut terms = Vec::new();
-    for term in rank_terms {
-        if term.len() < 4 || packet_query_stop_term(term) || packet_adjacent_query_stop_term(term) {
-            continue;
-        }
-        let normalized = normalize_identifier(term);
-        if normalized.is_empty() {
-            continue;
-        }
-        if (display.contains(&normalized) || path.contains(&normalized))
-            && terms.iter().all(|existing| existing != &normalized)
-        {
-            terms.push(normalized);
-        }
-        if terms.len() >= 4 {
-            break;
-        }
-    }
-    terms
 }
 
 fn packet_citation_shaped_claim(citation: &AgentCitationDto, prompt: &str) -> Option<String> {

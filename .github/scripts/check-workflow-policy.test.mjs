@@ -58,7 +58,7 @@ import {
 } from "./qualification-driver-artifact.mjs";
 
 const fullSha = "0123456789abcdef0123456789abcdef01234567";
-const proofTopology = "proof5-v1-64015a841a2f69f33f7c9ce284f671ad27b3923a58db865fd4806d86230df6c5";
+const proofTopology = "proof5-v1-f1f03863d1fa5a61a86f02f1e1ca06bc2a619a401ab0f557ec2d74964f34fef0";
 const cacheManifestIdentity = "${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'vendor/**/Cargo.toml') }}";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 

@@ -80,9 +80,9 @@ use crate::agent::packet_scoring::{
     packet_sql_schema_file_is_variant_copy, packet_stage_citation_carry_limit,
     sort_by_cached_rank_desc,
 };
+use crate::agent::packet_terms::prompt_search_terms;
 #[cfg(test)]
-use crate::agent::packet_terms::packet_terms_have_any;
-use crate::agent::packet_terms::{packet_probe_terms, prompt_search_terms};
+use crate::agent::packet_terms::{packet_probe_terms, packet_terms_have_any};
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
@@ -120,16 +120,14 @@ use codestory_contracts::api::{
     IndexFreshnessDto, IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId,
     NodeKind, NodeOccurrencesRequest, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto, PacketEvidenceResolutionDto,
-    PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto, PacketProbeDto,
-    PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit,
-    SearchHitOrigin, SearchRepoTextMode, SearchRequest, SnippetScopeDto,
+    PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto, PacketPlanQueryDto,
+    PacketProbeDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
+    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SnippetScopeDto,
     SourceCoverageObservationDto, SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto,
     TrailConfigDto, TrailFilterOptionsDto,
 };
 #[cfg(test)]
-use codestory_contracts::api::{
-    PacketPlanQueryDto, RetrievalAnnotationKindDto, SearchMatchQualityDto,
-};
+use codestory_contracts::api::{RetrievalAnnotationKindDto, SearchMatchQualityDto};
 use codestory_contracts::graph::FileCoverageReason;
 use std::cmp::Ordering;
 #[cfg(test)]
@@ -1144,10 +1142,9 @@ fn push_cited_source_shape_citation(
 
 fn maybe_append_cited_stylesheet_import_citations(
     project_root: &Path,
-    question: &str,
+    _question: &str,
     answer: &mut AgentAnswerDto,
 ) {
-    let terms = packet_probe_terms(question);
     if !false {
         return;
     }
@@ -1533,10 +1530,9 @@ fn packet_first_css_class_display(source: &str) -> Option<(String, u32)> {
 
 fn maybe_append_cited_formatting_type_citations(
     project_root: &Path,
-    question: &str,
+    _question: &str,
     answer: &mut AgentAnswerDto,
 ) {
-    let terms = packet_probe_terms(question);
     if !false {
         return;
     }
@@ -1586,10 +1582,9 @@ fn maybe_append_cited_formatting_type_citations(
 
 fn maybe_append_cited_mapper_interface_citations(
     project_root: &Path,
-    question: &str,
+    _question: &str,
     answer: &mut AgentAnswerDto,
 ) {
-    let terms = packet_probe_terms(question);
     if !false {
         return;
     }
@@ -1630,10 +1625,9 @@ fn maybe_append_cited_mapper_interface_citations(
 
 fn maybe_append_cited_client_relative_imports(
     project_root: &Path,
-    question: &str,
+    _question: &str,
     answer: &mut AgentAnswerDto,
 ) {
-    let terms = packet_probe_terms(question);
     if !false {
         return;
     }
@@ -8885,7 +8879,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_required_probe_promotion_prefers_command_focus_root_matches() {
+    fn packet_required_probe_promotion_does_not_prefer_soft_command_focus_phrases() {
         let mut run_main = test_packet_citation(
             "acme_deploy::run_main",
             "crates/acme-deploy/src/main.rs",
@@ -8907,11 +8901,11 @@ mod tests {
         let protected =
             promote_required_probe_citations(&mut answer, &["jsonl event output".to_string()]);
 
-        assert!(protected.contains(&packet_citation_key(&answer.citations[0])));
-        assert_eq!(
-            answer.citations[0].file_path.as_deref(),
-            Some("crates/acme-deploy/src/event_processor_with_jsonl_output.rs")
+        assert!(
+            protected.is_empty(),
+            "soft command-focus phrases must not privilege capping: {protected:?}"
         );
+        assert_eq!(answer.citations[0].display_name, "jsonl");
     }
 
     #[test]
