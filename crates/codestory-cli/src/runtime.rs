@@ -428,9 +428,7 @@ impl RuntimeContext {
                             self.project_root.clone(),
                             self.storage_path.clone(),
                         )
-                        .map_err(|error| {
-                            map_api_error_for_project(error, &self.project_root)
-                        })?;
+                        .map_err(|error| map_api_error_for_project(error, &self.project_root))?;
                 } else {
                     self.open_project_summary()?;
                 }

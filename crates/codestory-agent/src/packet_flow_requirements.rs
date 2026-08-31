@@ -75,7 +75,10 @@ impl EvidencePredicate {
         false
     }
 
-    pub fn call_boundary_target(self, _citation: &AgentCitationDto) -> Option<CallBoundaryNamePredicate> {
+    pub fn call_boundary_target(
+        self,
+        _citation: &AgentCitationDto,
+    ) -> Option<CallBoundaryNamePredicate> {
         None
     }
 

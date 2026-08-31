@@ -4865,12 +4865,15 @@ impl Storage {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
-        if version > SCHEMA_VERSION {
-            return Err(StorageError::Other(format!(
-                "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
-            )));
-        }
         if version != SCHEMA_VERSION {
+            // The incomplete-run fence stamps a sentinel above the current
+            // schema number; keep the ordinary mismatch wording so callers can
+            // distinguish it from a true forward-incompatible cache.
+            if version > SCHEMA_VERSION && version != INCOMPLETE_INCREMENTAL_SCHEMA_VERSION {
+                return Err(StorageError::Other(format!(
+                    "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
+                )));
+            }
             return Err(StorageError::Other(format!(
                 "Read-only storage requires schema version {SCHEMA_VERSION}, found {version}"
             )));

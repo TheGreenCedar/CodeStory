@@ -138,9 +138,11 @@ fn render_index_markdown_includes_rich_timing_breakdown_when_available() {
             "core_promotion_ms: total=89 lock_wait=0 legacy_recovery=1 candidate_validation=11 previous_pointer_resolution=12 generation_install=5 pointer_publication=2 cleanup=1 unattributed=1"
         ));
     assert!(markdown.contains(
-            "core_promotion_bytes: candidate=2048 previous_live=1024 rollback_generation=1024"
-        ));
-    assert!(markdown.contains("core_promotion_fence: promoted_validation=reused_candidate_receipt"));
+        "core_promotion_bytes: candidate=2048 previous_live=1024 rollback_generation=1024"
+    ));
+    assert!(
+        markdown.contains("core_promotion_fence: promoted_validation=reused_candidate_receipt")
+    );
     assert!(markdown.contains("setup_ms: existing_projection_ids=11 seed_symbol_table=12"));
     assert!(
             markdown.contains(
