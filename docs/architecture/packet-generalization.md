@@ -20,9 +20,19 @@ public packet budget remains 16 evidence rows / 16 KiB.
 - Prompt → domain-flow classifiers (including ASCII byte-array encodings of
   brand or holdout terms such as `[115, 119, 114]` → `swr`)
 - Fixed stage lists and flow-requirement dispatchers keyed by those classifiers
-- Domain evidence-carrier predicates and post-rank sibling cleanup passes
+- Domain evidence-carrier predicates (`citation_owns_*` /
+  `packet_citation_owns_*`) and post-rank sibling cleanup passes
+- Domain `PacketEvidenceRole` variants (for example `TransportAdapter`,
+  `RequestDispatch`, `ClientFactory`) that steer capping, same-role replacement,
+  or probe `role_rank`
+- Hardcoded holdout probe spellings in required-probe matchers (for example
+  `requestentrypoint`, `adapters`, `transportadapter`)
 - Flow-template claims and holdout `expected_files` / `expected_symbols` anchors
 - Production dependencies on `benchmarks/`, `codestory-bench`, or eval manifests
+
+Production may retain only path-based structural labels such as
+`SourceEvidence` and `TestsAndRegressionCoverage`. Selection and sufficiency
+must follow repository-evidence objectives, not domain vocabulary.
 
 Historical 18-task / language-expansion holdout scores are
 `evidence_eligibility: contaminated_development` only. They are never a release

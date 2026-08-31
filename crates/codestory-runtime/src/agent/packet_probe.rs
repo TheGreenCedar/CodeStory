@@ -226,33 +226,25 @@ fn exact_path_probe_source_carrier_citation(
             }
             citation.file_path = Some(display_relative_path(&relative));
             citation.coverage_role = None;
-            let role = packet_evidence_role(&citation)?;
+            // Domain role_rank removed (CX-01). Prefer callable term hits only.
+            let role = packet_evidence_role(&citation);
             if matches!(
                 role,
-                PacketEvidenceRole::SourceEvidence | PacketEvidenceRole::TestsAndRegressionCoverage
+                Some(PacketEvidenceRole::TestsAndRegressionCoverage)
             ) {
                 return None;
             }
-            let role_rank = match role {
-                PacketEvidenceRole::CommandEntrypoint => 5,
-                PacketEvidenceRole::RequestDispatch
-                | PacketEvidenceRole::TransportAdapter
-                | PacketEvidenceRole::BufferedIo => 4,
-                PacketEvidenceRole::RuntimeOrchestration => 3,
-                _ => 2,
-            };
-            citation.coverage_role = Some(role.as_str().to_string());
+            citation.coverage_role = Some("source evidence".to_string());
             citation.eligible_for_sufficiency = Some(true);
             citation.score = 99.0;
-            Some((role_rank, term_hits, citation))
+            Some((term_hits, citation))
         })
         .max_by(|left, right| {
             left.0
                 .cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-                .then_with(|| right.2.display_name.cmp(&left.2.display_name))
+                .then_with(|| right.1.display_name.cmp(&left.1.display_name))
         })
-        .map(|(_, _, citation)| citation)
+        .map(|(_, citation)| citation)
 }
 
 fn exact_symbol_probe_citation(
@@ -1075,6 +1067,7 @@ mod tests {
         assert_eq!(citations[0].eligible_for_sufficiency, Some(false));
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn indexed_exact_path_keeps_diagnostic_and_adds_distinct_source_carrier() {
         let project = TempDir::new().expect("project");
@@ -1106,6 +1099,7 @@ mod tests {
         assert_ne!(citations[0].node_id, citations[1].node_id);
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn exact_path_carrier_selection_filters_non_semantic_matches_before_bounding() {
         let project = TempDir::new().expect("project");

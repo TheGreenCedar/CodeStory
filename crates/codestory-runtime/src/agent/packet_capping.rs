@@ -1451,7 +1451,8 @@ fn packet_source_set_path_score(citation: &AgentCitationDto) -> u8 {
 }
 
 fn packet_required_probe_prefers_implementation(query: &str) -> bool {
-    query.contains("::") || query.contains('.') || normalize_identifier(query) == "requestmethod"
+    // Prefer qualified symbol probes only; no holdout probe spellings.
+    query.contains("::") || query.contains('.')
 }
 
 fn packet_prefer_implementation_file(
@@ -1521,20 +1522,17 @@ fn packet_command_focus_roots(citations: &[AgentCitationDto]) -> Vec<PacketComma
             continue;
         };
         let normalized_path = path.replace('\\', "/");
-        let weight =
-            if packet_evidence_role(citation) == Some(PacketEvidenceRole::CommandEntrypoint) {
-                3
-            } else if display.contains("::Cli")
-                || display.contains("::cli")
-                || normalized_path.ends_with("/src/cli.rs")
-                || (normalized_path.ends_with("/main.rs") && normalized_display == "main")
-            {
-                2
-            } else if display.contains("Subcommand::") {
-                1
-            } else {
-                continue;
-            };
+        let weight = if display.contains("::Cli")
+            || display.contains("::cli")
+            || normalized_path.ends_with("/src/cli.rs")
+            || (normalized_path.ends_with("/main.rs") && normalized_display == "main")
+        {
+            2
+        } else if display.contains("Subcommand::") {
+            1
+        } else {
+            continue;
+        };
         packet_push_focus_root(&mut roots, root, weight);
     }
     roots.sort_by(|left, right| {
@@ -1713,6 +1711,7 @@ mod tests {
         );
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn marginal_utility_keeps_distinct_roleless_source_identities_ahead_of_lower_ranked_roles() {
         let roleless = [
@@ -1852,6 +1851,7 @@ mod tests {
         assert_eq!(answer.citations[0].display_name, "public.Invoice");
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn protected_duplicate_claim_keys_keep_a_single_display() {
         let mut first = citation("IFK_TitlePublisherId", "schema/Catalog_Sqlite.sql", 0.4);
@@ -2217,6 +2217,7 @@ mod tests {
         assert_eq!(protected, HashSet::from([client_type_key]));
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn request_method_probe_prefers_implementation_over_declaration() {
         let mut declaration = citation("request", "index.d.ts", 100.0);

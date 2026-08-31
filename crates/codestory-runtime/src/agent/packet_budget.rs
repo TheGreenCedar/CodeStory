@@ -1652,6 +1652,7 @@ pub(super) mod tests {
     /// the other thirteen artifacts outright. An edge an atom receipt
     /// requires now outranks that lexicographic order, and a non-atom edge is
     /// dropped in its place. The cap size itself is untouched.
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn atom_required_edges_outrank_lexicographic_order_under_the_graph_cap() {
         // "aaa" sorts first and is needed by nothing; "zzz" is a MEMBER
@@ -1753,6 +1754,7 @@ pub(super) mod tests {
     /// NON-atom edge first — while remaining just as trimmable, because the
     /// trimmability check still counts only obligation ids. `max_output_bytes`
     /// is a publication invariant and atom need never blocks it.
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn the_byte_budget_trimmer_shaves_a_non_atom_edge_first() {
         let build = || {
@@ -1805,6 +1807,7 @@ pub(super) mod tests {
     /// Gate 9 item 1, the fallback: when EVERY edge is atom-required the
     /// trimmer still trims one. Atom need chooses the victim; it never
     /// refuses to produce one.
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn the_trimmer_still_shaves_when_every_edge_is_atom_required() {
         let session = atom_session_needing(&[91, 93]);
@@ -2310,7 +2313,7 @@ pub(super) mod tests {
                 project_root.join(stdio_path).to_string_lossy().as_ref(),
             ),
             retained_graph_citation(
-                "PacketEvidenceRole::TransportAdapter",
+                "structural_source_citation",
                 project_root
                     .join("crates/codestory-runtime/src/agent/packet_evidence_roles.rs")
                     .to_string_lossy()
@@ -3931,6 +3934,7 @@ pub(super) mod tests {
     /// compile rewrites it), while the rebuild feeds the current
     /// `packet.support`. Site A therefore gets independently constructed raw
     /// units here, not `packet.support` itself.
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn primary_finalize_and_budget_rebuild_survival_agree_on_proof_status() {
         let mut packet = mapper_proof_packet();

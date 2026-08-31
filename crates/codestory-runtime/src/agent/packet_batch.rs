@@ -781,9 +781,14 @@ fn reserve_architecture_main_anchor_probe(
     required_probes: &HashSet<String>,
     queries: &mut Vec<String>,
 ) {
-    if plan.task_class != PacketTaskClassDto::ArchitectureExplanation
-        || !required_probes.contains("searchentrypoint")
-    {
+    // Holdout probe spelling removed; reserve main only for architecture tasks with
+    // an explicit "main" required probe or query term.
+    let wants_main = required_probes.iter().any(|q| normalize_identifier(q) == "main")
+        || plan
+            .queries
+            .iter()
+            .any(|q| normalize_identifier(&q.query) == "main");
+    if plan.task_class != PacketTaskClassDto::ArchitectureExplanation || !wants_main {
         return;
     }
     queries.retain(|query| normalize_identifier(query) != "main");

@@ -173,8 +173,8 @@ pub fn append_ranked_citation_claims(
                     continue;
                 }
             }
-            Some(PacketEvidenceRole::SourceEvidence) | None => continue,
-            Some(role) => role,
+            Some(PacketEvidenceRole::SourceEvidence) => PacketEvidenceRole::SourceEvidence,
+            None => continue,
         };
         let claim_key = packet_claim_key_for_citation(role, citation);
         if !seen_claims.insert(claim_key.clone()) {
@@ -188,10 +188,7 @@ pub fn append_ranked_citation_claims(
             required_evidence_role: None,
             citations: vec![citation.clone()],
             coverage_role: Some(role.as_str().to_string()),
-            eligible_for_sufficiency: Some(
-                role != PacketEvidenceRole::SourceEvidence
-                    && citation_sufficiency_eligible(citation),
-            ),
+            eligible_for_sufficiency: Some(citation_sufficiency_eligible(citation)),
         });
         if claims.len() >= 18 {
             break;
@@ -203,7 +200,7 @@ pub fn packet_claim_for_role(
     role: PacketEvidenceRole,
     citation: &AgentCitationDto,
     prompt: &str,
-    rank_terms: &[String],
+    _rank_terms: &[String],
 ) -> String {
     if let Some(shaped) = packet_citation_shaped_claim(citation, prompt) {
         return shaped;
@@ -215,98 +212,15 @@ pub fn packet_claim_for_role(
         .map(packet_display_path)
         .unwrap_or_default();
     match role {
-        PacketEvidenceRole::CommandEntrypoint => format!(
-            "The command or public entrypoint for this flow is `{symbol}`, which starts downstream coordination."
-        ),
-        PacketEvidenceRole::ClientFactory => {
-            format!("`{symbol}` creates client instances or binds request methods for this flow.")
-        }
-        PacketEvidenceRole::InterceptorManagement => {
-            format!("`{symbol}` is interceptor-related evidence for this request flow.")
-        }
-        PacketEvidenceRole::RequestDispatch => format!(
-            "`{symbol}` dispatches requests by transforming config and handing off to an adapter or handler."
-        ),
-        PacketEvidenceRole::TransportAdapter => format!(
-            "`{symbol}` is the transport adapter boundary for environment-specific sending."
-        ),
-        PacketEvidenceRole::EventLoop => format!(
-            "`{symbol}` polls event-loop state and dispatches readable or writable file events."
-        ),
-        PacketEvidenceRole::NetworkCommandInput => {
-            format!("`{symbol}` reads network or socket input into command-buffer processing.")
-        }
-        PacketEvidenceRole::CommandDispatch => format!(
-            "`{symbol}` dispatches commands through lookup, validation, execution, or propagation."
-        ),
-        PacketEvidenceRole::ArgumentPlanning => format!(
-            "`{symbol}` plans arguments by constructing walker, matcher, searcher, or printer behavior."
-        ),
-        PacketEvidenceRole::SearchDriver => format!(
-            "`{symbol}` routes search entrypoint behavior into sequential or parallel execution."
-        ),
-        PacketEvidenceRole::SearchExecutionUnit => {
-            format!("`{symbol}` executes per-candidate matcher, searcher, or printer work.")
-        }
-        PacketEvidenceRole::RuntimeOrchestration => format!(
-            "`{symbol}` coordinates runtime state transitions and downstream service calls."
-        ),
-        PacketEvidenceRole::WorkspaceDiscoveryAndPlanning => format!(
-            "`{symbol}` handles workspace file selection, manifests, or execution-plan behavior."
-        ),
-        PacketEvidenceRole::IndexInputConfiguration => {
-            format!("`{symbol}` maps project settings into indexing inputs.")
-        }
-        PacketEvidenceRole::IndexingWorkQueue => format!(
-            "`{symbol}` turns build-index commands into parser handoff or source-file work items."
-        ),
-        PacketEvidenceRole::SymbolExtraction => {
-            format!("`{symbol}` extracts nodes, edges, occurrences, or file-level symbol data.")
-        }
-        PacketEvidenceRole::PersistenceAndSearchProjection => {
-            format!("`{symbol}` persists or projects durable graph/search state.")
-        }
-        PacketEvidenceRole::SnapshotRefresh => {
-            format!("`{symbol}` refreshes post-write summaries or cache state.")
-        }
-        PacketEvidenceRole::RouteHandling => {
-            format!("`{symbol}` handles route dispatch or handler ownership for the request path.")
-        }
-        PacketEvidenceRole::BufferedIo => {
-            format!("`{symbol}` connects buffered read/write state with Source or Sink handoff.")
-        }
-        PacketEvidenceRole::CollectionConfiguration => {
-            format!("`{symbol}` defines collection schema fields, hooks, or access rules.")
-        }
-        PacketEvidenceRole::EventOutputProcessing => {
-            format!("`{symbol}` serializes typed runtime events for JSON/event output.")
-        }
-        PacketEvidenceRole::AppServerRequestProtocol => {
-            format!("`{symbol}` defines app-server thread or turn start request protocol shape.")
-        }
         PacketEvidenceRole::TestsAndRegressionCoverage => {
-            format!("`{symbol}` covers regression behavior for focused verification choices.")
+            format!("`{symbol}` in `{path}` is test or regression coverage evidence.")
         }
         PacketEvidenceRole::SourceEvidence => {
-            let flow_terms = packet_claim_flow_terms(rank_terms, citation);
-            let focus = if flow_terms.is_empty() {
-                "this flow".to_string()
-            } else {
-                flow_terms.join(", ")
-            };
-            format!(
-                "`{symbol}` in `{path}` {}.",
-                packet_source_evidence_flow_sentence(prompt, &focus)
-            )
-        }
-        PacketEvidenceRole::SqlTableDefinition
-        | PacketEvidenceRole::SqlRelationshipConstraint
-        | PacketEvidenceRole::SqlSchemaFile
-        | PacketEvidenceRole::CandidateFileConstruction => {
-            format!("Schema or candidate-file evidence identifies `{symbol}` as part of this flow.")
+            format!("`{symbol}` in `{path}` is cited source evidence for this question.")
         }
     }
 }
+
 
 fn packet_source_evidence_flow_sentence(prompt: &str, focus: &str) -> String {
     #[cfg(any(test, feature = "test-support"))]
@@ -539,6 +453,7 @@ mod tests {
         }
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn sql_relationship_claims_attach_to_retained_foreign_key_citations() {
         let answer = test_answer(
@@ -582,6 +497,7 @@ mod tests {
         );
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn sql_relationship_claims_can_attach_to_retained_references_citations() {
         let answer = test_answer(

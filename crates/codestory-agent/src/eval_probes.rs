@@ -510,31 +510,9 @@ pub fn eval_indexing_storage_flow_template_claims(
         return Vec::new();
     }
 
-    let mut claims = Vec::new();
-    let source_group = citations.iter().find(|citation| {
-        packet_evidence_role(citation) == Some(PacketEvidenceRole::IndexInputConfiguration)
-    });
-    let indexing_work = citations.iter().find(|citation| {
-        packet_evidence_role(citation) == Some(PacketEvidenceRole::IndexingWorkQueue)
-    });
-    if let Some(source_group) = source_group
-        && let Some(indexing_work) = indexing_work
-    {
-        claims.push((
-            "Source-group configuration and indexing command evidence describe how repository configuration becomes indexing work.".to_string(),
-            vec![source_group.clone(), indexing_work.clone()],
-        ));
-    }
-
-    if let Some(persistence) = citations.iter().find(|citation| {
-        packet_evidence_role(citation) == Some(PacketEvidenceRole::PersistenceAndSearchProjection)
-    }) {
-        claims.push((
-            "Persistence/search-projection evidence describes how indexed data remains available to later application reads.".to_string(),
-            vec![persistence.clone()],
-        ));
-    }
-    claims
+    // Domain role-shaped eval claims removed with PacketEvidenceRole taxonomy.
+    let _ = citations;
+    Vec::new()
 }
 
 pub fn push_eval_architecture_flow_probe_terms(lower_prompt: &str, terms: &mut Vec<String>) {

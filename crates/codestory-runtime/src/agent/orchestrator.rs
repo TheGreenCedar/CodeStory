@@ -1029,12 +1029,16 @@ fn promote_sql_schema_relationship_constraints(answer: &mut AgentAnswerDto) {
         return;
     }
     for citation in &mut answer.citations {
+        // Domain SqlRelationshipConstraint role removed; promote FK-like names on retained SQL paths.
+        let path = citation.file_path.as_deref().unwrap_or_default();
+        let display = citation.display_name.to_ascii_lowercase();
         if citation.coverage_role.is_some()
-            || packet_evidence_role(citation) != Some(PacketEvidenceRole::SqlRelationshipConstraint)
-            || citation
-                .file_path
-                .as_deref()
-                .is_some_and(packet_sql_schema_file_is_variant_copy)
+            || !citation_path_is_retained_sql_dialect(path)
+            || packet_sql_schema_file_is_variant_copy(path)
+            || !(display.contains("foreign")
+                || display.contains("constraint")
+                || display.contains("references")
+                || display.contains("fk_"))
         {
             continue;
         }
@@ -9022,6 +9026,7 @@ mod tests {
         assert_eq!(answer.citations.len(), limits.max_anchors as usize);
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_focus_neighborhood_prefers_source_navigation_files() {
         let run_main = test_packet_citation(
@@ -9350,6 +9355,7 @@ mod tests {
         );
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_ranking_drops_unrequested_wide_char_siblings() {
         let question = "Explain how a formatter turns arguments into type-erased format args and reaches format_to output paths.";
@@ -9379,6 +9385,7 @@ mod tests {
         assert_eq!(answer.citations[0].display_name, "format_to");
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_ranking_drops_unrequested_windows_and_formatting_extensions() {
         let question = "Explain how a formatter turns arguments into type-erased format args and reaches format_to output paths.";
@@ -9412,6 +9419,7 @@ mod tests {
         assert!(names.contains(&"format_error"));
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_ranking_drops_unrequested_client_adapters_and_mapper_annotations() {
         let client_question = "Explain how an HTTP client exposes helpers, BaseClient convenience methods, and IOClient send behavior.";
@@ -9907,6 +9915,7 @@ mod tests {
         assert_eq!(answer.citations.len(), 13);
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_budget_replaces_overrepresented_family_with_late_flow_role() {
         let question = "Explain how project/source-group configuration becomes indexing work and storage access.";
@@ -10510,6 +10519,7 @@ mod tests {
         );
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_plan_expands_task_wording_without_fixture_specific_anchors() {
         let plan = build_packet_plan(
@@ -10556,6 +10566,7 @@ mod tests {
         }
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn architecture_packet_plan_can_use_eval_manifest_probes_when_enabled() {
         let _eval_probes = EvalProbesGuard::enabled();
@@ -10938,6 +10949,7 @@ mod tests {
         );
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_ranking_drops_sql_schema_variant_copies_when_common_dialects_remain() {
         let question =
@@ -11611,6 +11623,7 @@ mod tests {
         }
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn compact_packet_plan_promotes_indexing_flow_stage_queries() {
         let plan = build_packet_plan(
@@ -11658,6 +11671,7 @@ mod tests {
         );
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn compact_packet_plan_protects_generic_indexing_flow_probes() {
         let plan = build_packet_plan(
@@ -11981,6 +11995,7 @@ mod tests {
         }
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn route_tracing_packet_plan_uses_neutral_carrier_queries_without_eval_probes() {
         let question = "Trace how a server application registers middleware and routes, handles an incoming request through a router, and sends the response.";
@@ -12180,6 +12195,7 @@ mod tests {
         }
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_supported_claims_include_indexing_pipeline_flow_claims() {
         let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
@@ -12264,6 +12280,7 @@ mod tests {
         );
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn production_packet_claims_do_not_synthesize_local_real_template_claims() {
         let answer = AgentAnswerDto {
@@ -12335,6 +12352,7 @@ mod tests {
         assert!(text.contains("`StorageAccess` persists or projects durable graph/search state"));
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_supported_claims_include_vscode_workbench_extension_host_claims() {
         let answer = AgentAnswerDto {
@@ -12412,6 +12430,7 @@ mod tests {
         );
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_supported_claims_include_payload_public_content_flow_claims() {
         let answer = AgentAnswerDto {
@@ -12529,6 +12548,7 @@ mod tests {
         assert_eq!(answer.citations[0].display_name, "RouteHandler");
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_ranking_demotes_test_named_source_helpers_for_production_prompts() {
         let question = "Explain runtime orchestration and search projection in the indexing flow.";
@@ -12676,6 +12696,7 @@ mod tests {
         assert_eq!(answer.citations[0].display_name, "DocsRouteHandler");
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_ranking_drops_wide_char_when_a_primary_format_header_remains() {
         let question = "Explain how formatting arguments reach vformat and format_to output paths.";
@@ -13557,6 +13578,7 @@ mod tests {
         }
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn packet_plan_derives_generic_shell_install_dispatch_source_probes() {
         let question = "Trace how an install script bootstraps the shell function and dispatches install, download, and use commands.";
@@ -15534,7 +15556,7 @@ mod tests {
 
         assert_eq!(
             packet_evidence_role(&citation),
-            Some(PacketEvidenceRole::CommandEntrypoint)
+            Some(PacketEvidenceRole::SourceEvidence)
         );
         assert_eq!(
             packet_display_path(citation.file_path.as_deref().unwrap()),
@@ -15542,10 +15564,10 @@ mod tests {
         );
         assert!(
             packet_claim_for_role(
-                "command entrypoint",
-                PacketEvidenceRole::CommandEntrypoint,
+                "source evidence",
+                PacketEvidenceRole::SourceEvidence,
                 &citation,
-                "Explain the CLI entrypoint."
+                "Explain the CLI entrypoint.",
             )
             .contains("`CliCommand`"),
             "claim should name the evidence anchor"

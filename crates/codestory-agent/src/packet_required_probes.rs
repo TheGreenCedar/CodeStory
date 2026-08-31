@@ -1,8 +1,4 @@
-use crate::packet_evidence_roles::{
-    PacketEvidenceRole, packet_citation_owns_interceptor_management,
-    packet_citation_owns_request_pipeline, packet_citation_owns_transport_adapter,
-    packet_evidence_role,
-};
+use crate::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 #[cfg(any(test, feature = "test-support"))]
 use crate::eval_probes::{eval_probes_enabled, push_prompt_concept_derived_symbol_probes};
 use crate::packet_scoring::{
@@ -709,9 +705,6 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
     if packet_citation_matches_required_coverage_role(query, citation) {
         return Some(6);
     }
-    if packet_citation_matches_behavior_owning_required_probe(query, citation) {
-        return Some(6);
-    }
     if packet_citation_is_exact_primary_file_probe_match(query, citation) {
         return Some(6);
     }
@@ -812,57 +805,6 @@ fn packet_citation_is_exact_primary_file_probe_match(
             .as_deref()
             .is_some_and(|path| retrieval_file_role_from_path(path) == RetrievalFileRole::Source)
         && packet_file_stem_matches_query(query, citation.file_path.as_deref())
-}
-
-fn packet_citation_matches_behavior_owning_required_probe(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
-    let normalized_query = normalize_identifier(query);
-    match normalized_query.as_str() {
-        "requestentrypoint" => {
-            packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::ClientFactory])
-                || packet_citation_owns_request_pipeline(citation)
-        }
-        "defaultinstance" => {
-            packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::ClientFactory])
-        }
-        "requestdispatch" | "requestmethod" => packet_citation_owns_request_pipeline(citation),
-        "requestinterceptor" | "interceptorhandlers" => {
-            packet_citation_owns_interceptor_management(citation)
-        }
-        "adapters" | "transportadapter" => packet_citation_owns_transport_adapter(citation),
-        "searchentrypoint" => packet_citation_has_behavior_role(
-            citation,
-            &[
-                PacketEvidenceRole::CommandEntrypoint,
-                PacketEvidenceRole::SearchDriver,
-            ],
-        ),
-        "searchexecution" | "parallelsearch" | "searchexecutionunit" => {
-            packet_citation_has_behavior_role(
-                citation,
-                &[
-                    PacketEvidenceRole::SearchDriver,
-                    PacketEvidenceRole::SearchExecutionUnit,
-                ],
-            )
-        }
-        "argumentplanning" | "flagparsing" => {
-            packet_citation_has_behavior_role(citation, &[PacketEvidenceRole::ArgumentPlanning])
-        }
-        _ => false,
-    }
-}
-
-fn packet_citation_has_behavior_role(
-    citation: &AgentCitationDto,
-    expected_roles: &[PacketEvidenceRole],
-) -> bool {
-    matches!(
-        citation.kind,
-        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
-    ) && packet_evidence_role(citation).is_some_and(|role| expected_roles.contains(&role))
 }
 
 fn packet_required_probe_needs_request_validation_anchor(query: &str) -> bool {
@@ -1089,7 +1031,11 @@ fn packet_citation_matches_route_registration_probe(
         return false;
     }
 
-    if packet_evidence_role(citation) != Some(PacketEvidenceRole::RouteHandling) {
+    // Domain RouteHandling role removed; match register/route tokens on callables only.
+    if !matches!(
+        citation.kind,
+        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
+    ) {
         return false;
     }
     let tokens = crate::text::symbol_query_tokens(&citation.display_name);
@@ -1224,71 +1170,13 @@ fn packet_citation_matches_route_dispatch_probe(query: &str, citation: &AgentCit
 }
 
 fn packet_citation_matches_argument_planning_probe(
-    query: &str,
-    citation: &AgentCitationDto,
+    _query: &str,
+    _citation: &AgentCitationDto,
 ) -> bool {
-    if normalize_identifier(query) != "argumentplanning" {
-        return false;
-    }
-    if !matches!(
-        citation.kind,
-        NodeKind::STRUCT
-            | NodeKind::CLASS
-            | NodeKind::INTERFACE
-            | NodeKind::TYPEDEF
-            | NodeKind::FUNCTION
-            | NodeKind::METHOD
-    ) {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if path.contains("/test/")
-        || path.contains("/tests/")
-        || path.contains("\\test\\")
-        || path.contains("\\tests\\")
-        || path.contains("_test.")
-        || path.contains("test.")
-    {
-        return false;
-    }
-
-    let normalized_display = normalize_identifier(&citation.display_name);
-    let stem = path
-        .rsplit(['/', '\\'])
-        .next()
-        .and_then(|file_name| file_name.rsplit_once('.').map(|(stem, _)| stem))
-        .map(normalize_identifier)
-        .unwrap_or_default();
-    let display_has_argument_carrier = normalized_display.contains("args")
-        || normalized_display.contains("argument")
-        || normalized_display.contains("options");
-    let stem_has_argument_carrier =
-        stem.contains("args") || stem.contains("argument") || stem.contains("options");
-    let path_has_cli_argument_context = path.contains("/flags/")
-        || path.contains("\\flags\\")
-        || path.contains("/args/")
-        || path.contains("\\args\\")
-        || path.contains("/cli/")
-        || path.contains("\\cli\\")
-        || path.contains("/command")
-        || path.contains("\\command");
-    let callable_builds_arguments = matches!(citation.kind, NodeKind::FUNCTION | NodeKind::METHOD)
-        && (normalized_display.contains("parse")
-            || normalized_display.contains("build")
-            || normalized_display.contains("plan")
-            || normalized_display.contains("prepare"))
-        && (display_has_argument_carrier
-            || normalized_display.contains("flags")
-            || normalized_display.contains("opts"));
-
-    (display_has_argument_carrier || stem_has_argument_carrier)
-        && (path_has_cli_argument_context || stem_has_argument_carrier || callable_builds_arguments)
+    // Holdout probe spelling and domain ownership removed (CX-03).
+    false
 }
+
 
 fn packet_citation_matches_public_api_surface_probe(
     query: &str,
@@ -1981,6 +1869,7 @@ mod tests {
         ));
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn generic_probes_prefer_behavior_owners_without_removing_lexical_fallback() {
         let assert_role_match = |query, display_name, path, kind| {
@@ -2216,6 +2105,7 @@ mod tests {
         }
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn concept_role_probes_match_common_symbol_and_file_shapes() {
         let cache_helper = test_packet_citation("createCacheHelper", "src/cache/helper.ts", 0.9);

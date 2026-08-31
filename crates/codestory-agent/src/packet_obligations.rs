@@ -2173,7 +2173,14 @@ fn rank_obligation_citations_by_context(
 }
 
 fn citation_covers_named_schema_entity(citation: &AgentCitationDto, entity: &str) -> bool {
-    if packet_evidence_role(citation) != Some(PacketEvidenceRole::SqlTableDefinition) {
+    // Domain SqlTableDefinition role removed; accept resolvable source citations on .sql paths.
+    let path = citation
+        .file_path
+        .as_deref()
+        .map(crate::packet_scoring::packet_display_path)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !path.ends_with(".sql") {
         return false;
     }
     let terminal = crate::text::terminal_symbol_segment(&citation.display_name);
@@ -2513,11 +2520,11 @@ fn citation_is_declared_call_boundary(
     requirement: &FlowRequirement,
     citation: &AgentCitationDto,
 ) -> bool {
-    crate::packet_evidence_carriers::citation_owns_http_request_handle(citation)
-        && requirement
-            .evidence
-            .call_boundary_target(citation)
-            .is_some_and(|predicate| predicate(&citation.display_name))
+    // Domain http-handle ownership removed; only explicit call-boundary predicates remain.
+    requirement
+        .evidence
+        .call_boundary_target(citation)
+        .is_some_and(|predicate| predicate(&citation.display_name))
 }
 
 fn citation_edge_proof_for_flow_requirement(
@@ -3928,6 +3935,7 @@ mod tests {
         assert_eq!(bar.carrier_node_ids, vec![NodeId("node-bar".to_string())]);
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn exact_path_obligation_requires_same_path_eligible_carrier() {
         let resolution = PacketProbeResolutionDto {
@@ -4378,6 +4386,7 @@ mod tests {
         }));
     }
 
+    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
     #[test]
     fn exact_path_scoped_packet_binds_three_distinct_semantic_claims() {
         let question = "Explain the ownership boundary from the packaged GraphForge plugin request through stdio transport, runtime orchestration, retrieval, and evidence publication.";

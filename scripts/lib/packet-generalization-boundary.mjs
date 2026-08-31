@@ -84,6 +84,65 @@ export const HISTORICAL_EXPECTED_ANCHORS = Object.freeze([
   "dart-lang-http",
 ]);
 
+/**
+ * Domain PacketEvidenceRole variants that steered capping / probe rank on the
+ * failed freeze. Production may retain only structural path-based labels
+ * (SourceEvidence, TestsAndRegressionCoverage).
+ */
+export const DELETED_DOMAIN_EVIDENCE_ROLES = Object.freeze([
+  "SqlTableDefinition",
+  "SqlRelationshipConstraint",
+  "SqlSchemaFile",
+  "IndexInputConfiguration",
+  "IndexingWorkQueue",
+  "InterceptorManagement",
+  "RequestDispatch",
+  "TransportAdapter",
+  "ClientFactory",
+  "EventLoop",
+  "NetworkCommandInput",
+  "CommandDispatch",
+  "ArgumentPlanning",
+  "SearchExecutionUnit",
+  "CandidateFileConstruction",
+  "SearchDriver",
+  "CommandEntrypoint",
+  "EventOutputProcessing",
+  "AppServerRequestProtocol",
+  "RuntimeOrchestration",
+  "WorkspaceDiscoveryAndPlanning",
+  "SnapshotRefresh",
+  "PersistenceAndSearchProjection",
+  "SymbolExtraction",
+  "RouteHandling",
+  "BufferedIo",
+  "CollectionConfiguration",
+]);
+
+/** Hardcoded holdout probe spellings that must not grade ownership in production. */
+export const DELETED_HOLDOUT_PROBE_SPELLINGS = Object.freeze([
+  "requestentrypoint",
+  "defaultinstance",
+  "requestdispatch",
+  "requestmethod",
+  "requestinterceptor",
+  "interceptorhandlers",
+  "adapters",
+  "transportadapter",
+  "searchentrypoint",
+  "searchexecution",
+  "parallelsearch",
+  "searchexecutionunit",
+  "argumentplanning",
+  "flagparsing",
+]);
+
+/** Domain ownership predicate name patterns (CX-02). */
+export const DOMAIN_OWNERSHIP_PREDICATE_PATTERNS = Object.freeze([
+  /\bcitation_owns_[A-Za-z0-9_]+\b/g,
+  /\bpacket_citation_owns_[A-Za-z0-9_]+\b/g,
+]);
+
 const PRODUCTION_SCAN_GLOBS = Object.freeze([
   "crates/codestory-agent/src",
   "crates/codestory-runtime/src/agent",
@@ -293,6 +352,56 @@ export function findBoundaryViolations(source, { filePath = "<memory>", repoRoot
           kind: "deleted_taxonomy_api",
           file: relative,
           detail: api,
+        });
+      }
+    }
+
+    for (const role of DELETED_DOMAIN_EVIDENCE_ROLES) {
+      const re = new RegExp(`\\bPacketEvidenceRole::${role}\\b|\\bSelf::${role}\\b`);
+      if (re.test(productionView)) {
+        findings.push({
+          kind: "domain_evidence_role",
+          file: relative,
+          detail: role,
+        });
+      }
+      // Enum variant definitions also ban reintroduction.
+      const enumRe = new RegExp(`\\b${role}\\b\\s*[,{]`);
+      if (
+        /enum\s+PacketEvidenceRole\b/.test(productionView)
+        && enumRe.test(productionView)
+      ) {
+        findings.push({
+          kind: "domain_evidence_role",
+          file: relative,
+          detail: `enum variant ${role}`,
+        });
+      }
+    }
+
+    for (const spelling of DELETED_HOLDOUT_PROBE_SPELLINGS) {
+      // Match string arms like "requestentrypoint" => or 'adapters'
+      const re = new RegExp(`["']${spelling}["']`);
+      if (re.test(productionView)) {
+        findings.push({
+          kind: "holdout_probe_spelling",
+          file: relative,
+          detail: spelling,
+        });
+      }
+    }
+
+    for (const pattern of DOMAIN_OWNERSHIP_PREDICATE_PATTERNS) {
+      pattern.lastIndex = 0;
+      let match;
+      const seen = new Set();
+      while ((match = pattern.exec(productionView)) != null) {
+        if (seen.has(match[0])) continue;
+        seen.add(match[0]);
+        findings.push({
+          kind: "domain_ownership_predicate",
+          file: relative,
+          detail: match[0],
         });
       }
     }

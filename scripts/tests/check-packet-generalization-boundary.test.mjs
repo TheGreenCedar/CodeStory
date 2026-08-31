@@ -5,6 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  DELETED_DOMAIN_EVIDENCE_ROLES,
+  DELETED_HOLDOUT_PROBE_SPELLINGS,
   DELETED_TAXONOMY_APIS,
   decodeAsciiByteArrayLiterals,
   findBoundaryViolations,
@@ -138,13 +140,48 @@ test("isolated contaminated fixture repository fails the live scanner", () => {
   }
 });
 
-test("current decontaminated head passes the live boundary checker", () => {
+test("fixture with domain carriers, roles, and holdout probe spellings fails", () => {
+  const leaked = `
+pub enum PacketEvidenceRole {
+    TransportAdapter,
+    SourceEvidence,
+}
+pub fn packet_citation_owns_transport_adapter(c: &()) -> bool { true }
+pub fn citation_owns_client_request_entrypoint(c: &()) -> bool { true }
+fn match_probe(q: &str) -> bool {
+    match q {
+        "requestentrypoint" | "adapters" | "transportadapter" => true,
+        _ => false,
+    }
+}
+fn rank(role: PacketEvidenceRole) -> u8 {
+    match role {
+        PacketEvidenceRole::TransportAdapter => 4,
+        _ => 1,
+    }
+}
+`;
+  const findings = findBoundaryViolations(leaked, {
+    filePath: path.join(repositoryRoot, "crates/codestory-agent/src/packet_evidence_roles.rs"),
+    repoRoot: repositoryRoot,
+  });
+  const kinds = new Set(findings.map((f) => f.kind));
+  assert.ok(kinds.has("domain_ownership_predicate"), findings);
+  assert.ok(kinds.has("domain_evidence_role"), findings);
+  assert.ok(kinds.has("holdout_probe_spelling"), findings);
+  assert.ok(DELETED_DOMAIN_EVIDENCE_ROLES.includes("TransportAdapter"));
+  assert.ok(DELETED_HOLDOUT_PROBE_SPELLINGS.includes("requestentrypoint"));
+});
+
+test("current production head must pass the strengthened boundary checker", () => {
   const result = runPacketGeneralizationBoundaryCheck(repositoryRoot);
   assert.equal(
     result.exitCode,
     0,
-    `clean production head must pass the boundary checker: ${result.stderr}\n${JSON.stringify(result.findings, null, 2)}`,
+    `r2 production head must pass the boundary checker: ${result.stderr}\n${JSON.stringify(result.findings, null, 2)}`,
   );
   assert.equal(result.findings.length, 0);
   assert.ok(DELETED_TAXONOMY_APIS.length > 0, "banlist must remain non-empty");
+  assert.ok(DELETED_DOMAIN_EVIDENCE_ROLES.length > 0);
+  assert.ok(DELETED_HOLDOUT_PROBE_SPELLINGS.length > 0);
 });
