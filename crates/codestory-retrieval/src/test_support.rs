@@ -42,6 +42,9 @@ pub fn publish_complete_core_fixture(
         )
         .context("publish empty source policy exclusion fixture")?;
     storage
+        .publish_dense_anchor_generation(publication, crate::generation::SEMANTIC_POLICY_VERSION)
+        .context("publish empty dense-anchor fixture")?;
+    storage
         .put_index_publication(publication)
         .context("publish complete core fixture")?;
     Ok(())

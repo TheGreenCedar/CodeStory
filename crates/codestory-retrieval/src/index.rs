@@ -5079,6 +5079,12 @@ mod tests {
             .upsert_dense_anchor_inputs_batch(&[doc])
             .expect("second doc");
         drop(concurrent);
+        storage
+            .publish_dense_anchor_generation(
+                &second_publication,
+                crate::generation::SEMANTIC_POLICY_VERSION,
+            )
+            .expect("republish dense-anchor after content drift");
         let second = compute_sidecar_input_fingerprint(
             &storage,
             project.path(),

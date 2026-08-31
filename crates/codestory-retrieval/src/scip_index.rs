@@ -1888,6 +1888,7 @@ pub(crate) fn load_fresh_scip_query_view(
         },
     )?;
     if data.index.revision != expected_revision
+        || data.index.generation != generation
         || !data.index.contract.is_fresh_for(expected_revision)
         || !data.index.has_required_proof_records()
         || data.index.symbols.is_empty()
