@@ -3074,6 +3074,60 @@ pub(crate) mod activation_tests {
     };
     use crate::test_support::git;
     use std::fs;
+    use std::path::Path;
+
+    /// Must match `codestory_store`'s incomplete incremental schema sentinel.
+    const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
+
+    /// Hostile fixture writes belong on the active generation file via a direct
+    /// SQLite connection, never through live `Store::open` (read-only once a
+    /// publication pointer exists) and never through `Store::open_build` (which
+    /// re-inits schema on the sealed image). Checkpoint and reseal afterward so
+    /// observational immutable opens keep seeing the mutated image.
+    fn mutate_active_generation_sql(storage_path: &Path, sql: &str) {
+        let generation_db = codestory_store::resolve_core_database_path(storage_path)
+            .expect("resolve active immutable generation");
+        let metadata = fs::metadata(&generation_db).expect("generation metadata");
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        {
+            permissions.set_readonly(false);
+        }
+        fs::set_permissions(&generation_db, permissions).expect("make generation owner-writable");
+        {
+            let connection = rusqlite::Connection::open(&generation_db)
+                .expect("open active generation for hostile fixture");
+            connection
+                .execute_batch(sql)
+                .expect("apply hostile fixture mutation");
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("checkpoint hostile generation writes");
+        }
+        for suffix in ["-wal", "-journal", "-shm"] {
+            let mut sidecar = generation_db.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(sidecar));
+        }
+        let metadata = fs::metadata(&generation_db).expect("generation metadata after mutate");
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() & !0o222);
+        }
+        #[cfg(not(unix))]
+        {
+            permissions.set_readonly(true);
+        }
+        fs::set_permissions(&generation_db, permissions)
+            .expect("reseal active generation as immutable");
+    }
 
     pub(crate) struct ReadyActivationFixture {
         pub(crate) project: tempfile::TempDir,
@@ -4038,14 +4092,17 @@ pub(crate) mod activation_tests {
     fn ready_lease_revalidation_rejects_manifest_change_after_initial_capture() {
         let fixture = ready_activation_fixture();
         let service = fixture.runtime.activation_service();
-        Store::open(&fixture.storage_path)
-            .expect("open fixture storage")
-            .get_connection()
-            .execute(
-                "UPDATE retrieval_index_manifest \
-                 SET built_at_epoch_ms = built_at_epoch_ms + 1",
-                [],
-            )
+        // Retrieval identity lives in the external publication DB, which remains
+        // writable after the core generation seals.
+        let mut storage = Store::open(&fixture.storage_path).expect("open fixture storage");
+        let project_id = fixture.lease.retrieval.manifest.project_id.clone();
+        let mut manifest = storage
+            .get_retrieval_index_manifest(&project_id)
+            .expect("read retrieval manifest")
+            .expect("ready fixture retrieval manifest");
+        manifest.built_at_epoch_ms += 1;
+        storage
+            .upsert_retrieval_index_manifest(&manifest)
             .expect("mutate retrieval pointer after initial capture");
 
         let error = service
@@ -4064,10 +4121,9 @@ pub(crate) mod activation_tests {
         let fixture = ready_activation_fixture();
         let service = fixture.runtime.activation_service();
         let ready = service.snapshot().expect("ready snapshot");
-        Store::open(&fixture.storage_path)
-            .expect("open fixture storage")
-            .get_connection()
-            .execute("DELETE FROM retrieval_index_manifest", [])
+        let mut storage = Store::open(&fixture.storage_path).expect("open fixture storage");
+        storage
+            .clear_retrieval_index_manifests()
             .expect("remove retrieval identity pointer");
 
         let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -4807,12 +4863,12 @@ pub(crate) mod activation_tests {
             .index_service()
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish complete core");
-        let publication = Store::database_index_publication(&storage_path)
+        let previous = Store::database_index_publication(&storage_path)
             .expect("read core publication")
             .expect("complete core publication");
-        let search_path = search_index_path_for_publication(&storage_path, Some(&publication))
+        let previous_search = search_index_path_for_publication(&storage_path, Some(&previous))
             .expect("search generation path");
-        fs::remove_dir_all(&search_path).expect("remove completed search generation");
+        fs::remove_dir_all(&previous_search).expect("remove completed search generation");
 
         let runtime = Runtime::new();
         let error = runtime
@@ -4830,8 +4886,18 @@ pub(crate) mod activation_tests {
             snapshot.capabilities.local_navigation,
             ActivationCapabilityState::Ready
         );
+        let current = Store::database_index_publication(&storage_path)
+            .expect("read repaired publication")
+            .expect("repaired complete publication");
+        assert_eq!(current.generation, previous.generation + 1);
+        assert_eq!(
+            current.mode,
+            codestory_store::IndexPublicationMode::Incremental
+        );
+        let current_search = search_index_path_for_publication(&storage_path, Some(&current))
+            .expect("repaired search generation path");
         assert!(
-            read_search_generation_completion(&search_path, &publication.generation_id).is_some(),
+            read_search_generation_completion(&current_search, &current.generation_id).is_some(),
             "activation must publish a completion marker for the repaired generation"
         );
         runtime
@@ -4869,11 +4935,7 @@ pub(crate) mod activation_tests {
         let previous_search = search_index_path_for_publication(&storage_path, Some(&previous))
             .expect("search generation path");
         fs::remove_dir_all(previous_search).expect("remove completed search generation");
-        Store::open(&storage_path)
-            .expect("open migrated core")
-            .get_connection()
-            .execute("DELETE FROM dense_anchor_publication", [])
-            .expect("remove dense-anchor publication marker");
+        mutate_active_generation_sql(&storage_path, "DELETE FROM dense_anchor_publication;");
 
         let runtime = Runtime::new();
         runtime
@@ -5117,12 +5179,16 @@ pub(crate) mod activation_tests {
             .index_service()
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish complete core");
-        {
-            let storage = Store::open(&storage_path).expect("open published storage");
-            storage
-                .begin_incremental_run()
-                .expect("install durable incomplete fence");
-        }
+        mutate_active_generation_sql(
+            &storage_path,
+            &format!(
+                "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
+                 VALUES (1, 1)
+                 ON CONFLICT(id) DO UPDATE SET
+                    started_at_epoch_ms = excluded.started_at_epoch_ms;
+                 PRAGMA user_version = {INCOMPLETE_INCREMENTAL_SCHEMA_VERSION};"
+            ),
+        );
 
         runtime
             .activation_service()

@@ -135,17 +135,37 @@ impl AppController {
         root: PathBuf,
         storage_path: PathBuf,
     ) -> Result<ProjectSummary, ApiError> {
-        let storage = open_storage_for_read(&storage_path)?;
-        let snapshot = storage.read_snapshot().map_err(|error| {
-            ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
-        })?;
-        let summary =
-            self.project_summary_from_storage(&root, &storage_path, snapshot.storage())?;
-        snapshot.finish().map_err(|error| {
+        // Incomplete-run fences use the incomplete schema sentinel. Ordinary
+        // live/read-only opens reject that sentinel, and freshness observation
+        // already pins one deferred transaction, so skip a nested read_snapshot.
+        let summary = if codestory_store::core_database_exists(&storage_path).map_err(|error| {
             ApiError::internal(format!(
-                "Failed to finish project summary snapshot: {error}"
+                "Failed to resolve core publication for project summary: {error}"
             ))
-        })?;
+        })? && Storage::database_has_incomplete_incremental_run(&storage_path)
+            .unwrap_or(false)
+        {
+            let storage =
+                Storage::open_freshness_observational(&storage_path).map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to open fenced storage for project summary: {error}"
+                    ))
+                })?;
+            self.project_summary_from_storage(&root, &storage_path, &storage)?
+        } else {
+            let storage = open_storage_for_read(&storage_path)?;
+            let snapshot = storage.read_snapshot().map_err(|error| {
+                ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
+            })?;
+            let summary =
+                self.project_summary_from_storage(&root, &storage_path, snapshot.storage())?;
+            snapshot.finish().map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to finish project summary snapshot: {error}"
+                ))
+            })?;
+            summary
+        };
 
         let changed = {
             let mut s = self.state.lock();
