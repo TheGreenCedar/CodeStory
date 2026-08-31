@@ -746,6 +746,8 @@ pub(crate) enum CacheAction {
         about = "Report, and optionally reclaim, cache state no live workspace or model can claim."
     )]
     Clean(CacheCleanCommand),
+    #[command(about = "Report CodeStory-owned cache state without mutating it.")]
+    Inventory(CacheInventoryCommand),
     #[command(
         about = "Quarantine this project's derived cache so it can be rebuilt.",
         long_about = "Quarantine this project's derived cache so it can be rebuilt.\n\nDerived state is moved into a quarantine directory beside the cache, never deleted, and user-authored annotations are preserved in place. Use this after rolling a CodeStory release back onto a cache written by a newer schema; the reindex step is printed on completion."
@@ -760,6 +762,18 @@ pub(crate) struct CacheCleanCommand {
         help = "Reclaim the proven candidates in the plan. Omit for a dry-run plan that leaves the cache tree untouched."
     )]
     pub(crate) apply: bool,
+    #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
+    pub(crate) format: OutputFormat,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write command output to this file instead of stdout. The parent directory must already exist."
+    )]
+    pub(crate) output_file: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct CacheInventoryCommand {
     #[arg(long, value_name = "FORMAT", value_parser = parse_read_output_format, default_value = "json")]
     pub(crate) format: OutputFormat,
     #[arg(
@@ -2694,6 +2708,19 @@ mod tests {
             panic!("expected cache clean command");
         };
         assert!(applied.apply);
+    }
+
+    #[test]
+    fn cache_inventory_defaults_to_json_observation_only() {
+        let inventory = Cli::try_parse_from(["codestory-cli", "cache", "inventory"])
+            .expect("cache inventory should parse without flags");
+        let Command::Cache(CacheCommand {
+            action: CacheAction::Inventory(parsed),
+        }) = inventory.command
+        else {
+            panic!("expected cache inventory command");
+        };
+        assert_eq!(parsed.format, OutputFormat::Json);
     }
 
     #[test]

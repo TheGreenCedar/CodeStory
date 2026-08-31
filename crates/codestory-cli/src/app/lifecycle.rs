@@ -15,9 +15,7 @@ pub(super) fn embedding_client_transport_mode(
 ) -> Option<embedding_server_transport::ClientTransportMode> {
     match command {
         Command::Ground(_) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
-        Command::ProveCallPath(_) => {
-            Some(embedding_server_transport::ClientTransportMode::ObserveOnly)
-        }
+        Command::ProveCallPath(_) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
         Command::Retrieval(args::RetrievalCommand {
             action: args::RetrievalAction::Status(_),
         }) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
@@ -113,6 +111,7 @@ pub(super) fn run_cache(cmd: CacheCommand) -> Result<()> {
         CacheAction::Identity(cmd) => run_cache_identity(cmd),
         CacheAction::Rehydrate(cmd) => run_cache_rehydrate(cmd),
         CacheAction::Clean(cmd) => run_cache_clean(cmd),
+        CacheAction::Inventory(cmd) => run_cache_inventory(cmd),
 
         CacheAction::Reset(cmd) => crate::cache_reset::run_cache_reset(cmd),
     }
@@ -130,6 +129,48 @@ fn run_cache_clean(cmd: args::CacheCleanCommand) -> Result<()> {
     let plan = codestory_runtime::plan_cache_clean().context("cache clean plan")?;
     let markdown = render_cache_clean_plan_markdown(&plan);
     emit(cmd.format, &plan, markdown, cmd.output_file.as_deref())
+}
+
+fn run_cache_inventory(cmd: args::CacheInventoryCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "cache inventory")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    crate::sidecar_runtime::prepare_cache_access();
+    let report = codestory_runtime::cache_inventory().context("cache inventory")?;
+    let markdown = render_cache_inventory_markdown(&report);
+    emit(cmd.format, &report, markdown, cmd.output_file.as_deref())
+}
+
+fn render_cache_inventory_markdown(report: &codestory_runtime::CacheInventoryReport) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Cache Inventory");
+    let _ = writeln!(markdown, "dry_run: `{}`", report.dry_run);
+    let _ = writeln!(markdown, "cache_root: `{}`", report.cache_root);
+    let _ = writeln!(markdown, "ownership_scope: `{}`", report.ownership_scope);
+    let _ = writeln!(markdown, "apparent_bytes: {}", report.apparent_bytes);
+    let _ = writeln!(markdown, "unique_bytes: {}", report.unique_bytes);
+    let _ = writeln!(
+        markdown,
+        "hardlink_deduplicated_bytes: {}",
+        report.hardlink_deduplicated_bytes
+    );
+    let _ = writeln!(markdown, "required_bytes: {}", report.required_bytes);
+    let _ = writeln!(markdown, "reclaimable_bytes: {}", report.reclaimable_bytes);
+    let _ = writeln!(markdown, "blocked_bytes: {}", report.blocked_bytes);
+    let _ = writeln!(markdown, "\n## Top Consumers");
+    for consumer in &report.top_consumers {
+        let _ = writeln!(
+            markdown,
+            "- `{}` ({:?}): {} bytes",
+            consumer.relative_path, consumer.kind, consumer.apparent_bytes
+        );
+    }
+    if !report.errors.is_empty() {
+        let _ = writeln!(markdown, "\n## Errors");
+        for error in &report.errors {
+            let _ = writeln!(markdown, "- {error}");
+        }
+    }
+    markdown
 }
 
 fn render_cache_clean_plan_markdown(plan: &codestory_runtime::CacheCleanPlan) -> String {

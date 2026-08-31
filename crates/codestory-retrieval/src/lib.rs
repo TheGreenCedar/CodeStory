@@ -11,6 +11,7 @@
 
 mod cache;
 mod cache_clean;
+mod cache_inventory;
 mod candidate;
 mod capabilities;
 mod config;
@@ -247,6 +248,10 @@ pub use cache_clean::{
     CACHE_CLEAN_SCHEMA_VERSION, CacheCleanCandidate, CacheCleanKind, CacheCleanPlan,
     CacheCleanRefusal, CacheCleanRemoval, CacheCleanReport, CacheCleanRetained, apply_cache_clean,
     plan_cache_clean,
+};
+pub use cache_inventory::{
+    CACHE_INVENTORY_SCHEMA_VERSION, CacheCloneSharing, CacheConsumer, CacheHardlinkGroup,
+    CacheInventoryEntry, CacheInventoryKind, CacheInventoryReport, cache_inventory,
 };
 pub use candidate::{
     CandidateGraphDirection, CandidateGraphEvidence, CandidateHit, CandidateLane,

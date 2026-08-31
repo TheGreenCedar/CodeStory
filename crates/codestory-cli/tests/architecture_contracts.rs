@@ -365,6 +365,7 @@ fn ordinary_cli_retrieval_operations_route_through_runtime() {
         "codestory_retrieval::observe_retained_rollback_generation(",
         "codestory_retrieval::sidecar_inventory_with_storage(",
         "codestory_retrieval::sidecar_gc_apply_with_storage(",
+        "codestory_retrieval::cache_inventory(",
         "codestory_retrieval::execute_retrieval_query_with_cache_for_runtime(",
         "codestory_retrieval::finalize_index_for_runtime_with_cancel(",
     ];
@@ -881,7 +882,7 @@ fn public_exact_verifier_uses_the_revision_native_transport_once() {
 
     let args = read("crates/codestory-cli/src/args.rs");
     assert_eq!(
-        args.matches("ProveCallPath(ProveCallPathCommand)").count(),
+        args.matches("VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand)").count(),
         1,
         "the public CLI verifier command must be registered exactly once"
     );
@@ -1245,7 +1246,7 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
 fn public_call_path_release_surfaces_are_unique_and_legacy_unreachable() {
     let args = read("crates/codestory-cli/src/args.rs");
     assert_eq!(
-        args.matches("ProveCallPath(ProveCallPathCommand)").count(),
+        args.matches("VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand)").count(),
         1
     );
 
@@ -1261,9 +1262,10 @@ fn public_call_path_release_surfaces_are_unique_and_legacy_unreachable() {
     let stdio_catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
     let legacy_tools = source_between(&stdio_catalog, "static TOOLS:", "static RESOURCES:");
     assert!(!legacy_tools.contains("prove_call_path"));
+    assert!(!legacy_tools.contains("verify_indexed_direct_calls"));
     let public_proof = source_between(
         &dispatcher,
-        "if name == \"prove_call_path\"",
+        "if crate::prove_call_path::is_proof_tool_name(name)",
         "// Public-operation retry belongs",
     );
     assert_eq!(

@@ -11,6 +11,7 @@ mod core_generation;
 mod file_store;
 mod projection_store;
 mod snapshot_store;
+mod sqlite_observation;
 mod sqlite_path;
 mod storage_impl;
 
@@ -32,6 +33,11 @@ pub use projection_store::{ProjectionBatch, ProjectionStore};
 pub use snapshot_store::{
     SnapshotRefreshStats, SnapshotStore, StagedSnapshot, StagedSnapshotFinalizeStats,
     StagedSnapshotPublishStats,
+};
+pub use sqlite_observation::{
+    SqliteDatabaseObservation, SqliteVacuumIntoStats, available_filesystem_bytes,
+    compact_candidate_size_limit, compact_rehydrate_space_required, observe_sqlite_database,
+    vacuum_into_database,
 };
 pub use storage_impl::{
     BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundRetrievalIndexManifest,

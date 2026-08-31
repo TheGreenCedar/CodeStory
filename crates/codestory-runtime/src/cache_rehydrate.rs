@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use codestory_store::{CURRENT_SCHEMA_VERSION, RehydratedCacheRebaseStats, Store};
+use codestory_store::{CURRENT_SCHEMA_VERSION, RehydratedCacheRebaseStats, Store, vacuum_into_database};
 use codestory_workspace::{
     RefreshInputs, SourceIndexPolicy, WorkspaceInventory, WorkspaceInventoryOutcome,
     WorkspaceManifest,
@@ -441,9 +441,10 @@ fn publish_rehydrated_database(
         let (candidate_path, candidate_file) =
             create_unique_temp_file(target_db, "rehydrate-publish")?;
         drop(candidate_file);
+        remove_database_temp(&candidate_path).context("prepare compact rehydrate candidate")?;
         publish_path = Some(candidate_path.clone());
-        Store::copy_database_snapshot(&stage_path, &candidate_path)
-            .context("seal rehydrate stage into publish candidate")?;
+        vacuum_into_database(&stage_path, &candidate_path)
+            .context("compact rehydrate stage with VACUUM INTO")?;
         remove_database_temp(&stage_path).context("remove rehydrate stage")?;
         validate_rehydrated_database(&candidate_path)
             .context("validate rehydrate publish candidate")?;
@@ -1326,6 +1327,38 @@ mod tests {
             !target_cache_path.exists(),
             "nested target should not be created before the guard skips"
         );
+    }
+
+    #[test]
+    fn compact_rehydrate_publishes_zero_freelist_database() {
+        let Some((source_project, target_project)) = matching_git_projects() else {
+            return;
+        };
+        let source_cache = tempdir().expect("source cache");
+        let target_cache = tempdir().expect("target cache");
+        let target_cache_path = target_cache.path().join("empty");
+        fs::create_dir_all(&target_cache_path).expect("create target cache");
+        fs::write(target_cache_path.join("codestory.index-writer.lock"), b"")
+            .expect("seed persistent target lock");
+        let source_db = source_cache.path().join("codestory.db");
+        seed_cache(&source_db, source_project.path());
+
+        let output = rehydrate_cache(CacheRehydrateRequest {
+            source_project: source_project.path(),
+            source_cache_dir: source_cache.path(),
+            target_project: target_project.path(),
+            target_cache_dir: &target_cache_path,
+            dry_run: false,
+        })
+        .expect("rehydrate");
+
+        assert_eq!(output.status, "rehydrated");
+        let observation =
+            codestory_store::observe_sqlite_database(&target_cache_path.join("codestory.db"))
+                .expect("observe compact rehydrate target");
+        assert_eq!(observation.freelist_count, 0);
+        assert_eq!(observation.wal_bytes, 0);
+        assert_eq!(observation.shm_bytes, 0);
     }
 
     fn matching_git_projects() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
