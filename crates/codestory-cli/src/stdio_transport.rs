@@ -4596,10 +4596,34 @@ fn stdio_packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str
 fn stdio_storage_modified(
     storage_path: &std::path::Path,
 ) -> std::io::Result<std::time::SystemTime> {
-    let paths = [
+    // Immutable core generations publish by writing `core/publication.json` and a
+    // generation database. The legacy live `codestory.db` path can remain an empty
+    // compatibility stub whose mtime does not advance on republish, so dirty-marker
+    // freshness must consider the published core surfaces too.
+    let mut paths = vec![
         storage_path.to_path_buf(),
         storage_path.with_extension("db-wal"),
     ];
+    if let Some(parent) = storage_path.parent() {
+        let core_root = parent.join("core");
+        let publication_path = core_root.join("publication.json");
+        paths.push(publication_path.clone());
+        if let Ok(bytes) = fs::read(&publication_path) {
+            if let Ok(pointer) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(generation_id) = pointer
+                    .pointer("/active/generation_id")
+                    .and_then(|value| value.as_str())
+                {
+                    let generation_db = core_root
+                        .join("generations")
+                        .join(generation_id)
+                        .join("codestory.db");
+                    paths.push(generation_db.with_extension("db-wal"));
+                    paths.push(generation_db);
+                }
+            }
+        }
+    }
     let mut newest: Option<std::time::SystemTime> = None;
     for path in paths {
         let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {

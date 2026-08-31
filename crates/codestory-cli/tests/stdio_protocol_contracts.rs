@@ -1343,7 +1343,7 @@ fn proof_canonical_id(fixture: &StdioFixture, name: &str) -> String {
             fixture.workspace.path(),
         ))
         .join("codestory.db");
-    let db_path = [direct, nested]
+    let storage_path = [direct, nested]
         .into_iter()
         .find(|path| path.exists())
         .unwrap_or_else(|| {
@@ -1352,6 +1352,9 @@ fn proof_canonical_id(fixture: &StdioFixture, name: &str) -> String {
                 fixture.cache_dir.path().display()
             )
         });
+    // Immutable core keeps graph rows in the published generation database; the
+    // legacy live path may exist as an empty compatibility stub.
+    let db_path = published_core_database_path(&storage_path).unwrap_or(storage_path);
     let connection = rusqlite::Connection::open(&db_path).expect("open indexed proof fixture");
     connection
         .query_row(
@@ -1360,6 +1363,21 @@ fn proof_canonical_id(fixture: &StdioFixture, name: &str) -> String {
             |row| row.get(0),
         )
         .unwrap_or_else(|error| panic!("fixture function {name} in {}: {error}", db_path.display()))
+}
+
+fn published_core_database_path(storage_path: &Path) -> Option<PathBuf> {
+    let parent = storage_path.parent()?;
+    let core_root = parent.join("core");
+    let pointer_bytes = fs::read(core_root.join("publication.json")).ok()?;
+    let pointer: Value = serde_json::from_slice(&pointer_bytes).ok()?;
+    let generation_id = pointer
+        .pointer("/active/generation_id")
+        .and_then(Value::as_str)?;
+    let path = core_root
+        .join("generations")
+        .join(generation_id)
+        .join("codestory.db");
+    path.is_file().then_some(path)
 }
 
 fn exact_proof_arguments(fixture: &StdioFixture) -> Value {
