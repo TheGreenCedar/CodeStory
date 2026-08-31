@@ -2422,6 +2422,30 @@ fn outside_file_node_predicate(qualifier: &str, file_param: &str) -> String {
     format!("({qualifier}file_node_id IS NULL OR {qualifier}file_node_id != {file_param})")
 }
 
+/// Drop the inherited proof facts that reference edges a projection cleanup is
+/// about to delete.
+///
+/// `proof_resolution_fact.edge_id` is a foreign key into `edge`, and
+/// `begin_incremental_run` deliberately keeps inherited facts so a
+/// source-identity-only refresh can rebind them. Every caller of this helper is
+/// a graph change, which forces a full proof rematerialization afterwards, so
+/// the dependent facts are stale rather than rebindable. `edge_predicate` must
+/// be the exact predicate the edge delete uses, with `?1` bound to the file
+/// node id.
+fn delete_proof_facts_for_removed_edges_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    edge_predicate: &str,
+    file_node_id: i64,
+) -> Result<usize, StorageError> {
+    Ok(tx.execute(
+        &format!(
+            "DELETE FROM proof_resolution_fact
+             WHERE edge_id IN (SELECT id FROM edge WHERE {edge_predicate})"
+        ),
+        params![file_node_id],
+    )?)
+}
+
 fn get_index_artifact_cache_from_connection(
     connection: &Connection,
     path: &Path,
@@ -8920,15 +8944,16 @@ impl Storage {
         // indexer counts the same two kinds, and anything else is fenced by the
         // file-structural row instead; the three definitions have to agree or a
         // delta leaves a row nothing rewrote.
+        let removed_edge_predicate = format!(
+            "file_node_id = ?1
+             AND source_node_id IN (SELECT caller_id FROM {CALLER_CLEANUP_IDS_TABLE})
+             AND kind IN ({}, {})",
+            EdgeKind::CALL as i32,
+            EdgeKind::USAGE as i32
+        );
+        delete_proof_facts_for_removed_edges_in_tx(&tx, &removed_edge_predicate, file_id)?;
         let removed_edges = tx.execute(
-            &format!(
-                "DELETE FROM edge
-                 WHERE file_node_id = ?1
-                 AND source_node_id IN (SELECT caller_id FROM {CALLER_CLEANUP_IDS_TABLE})
-                 AND kind IN ({}, {})",
-                EdgeKind::CALL as i32,
-                EdgeKind::USAGE as i32
-            ),
+            &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
             params![file_id],
         )?;
 
@@ -9024,20 +9049,21 @@ impl Storage {
         // two kinds the caller-scoped cleanup rewrites *and* a projected
         // callable of this file sources it. Scoped to `file_node_id` because
         // that is the set this file's parse re-emits.
+        let removed_edge_predicate = format!(
+            "file_node_id = ?1
+             AND NOT (
+                kind IN ({}, {})
+                AND source_node_id IN (
+                    SELECT node_id FROM callable_projection_state
+                    WHERE file_id = ?1 AND node_id <> ?1
+                )
+             )",
+            EdgeKind::CALL as i32,
+            EdgeKind::USAGE as i32
+        );
+        delete_proof_facts_for_removed_edges_in_tx(&tx, &removed_edge_predicate, file_node_id)?;
         let removed_edges = tx.execute(
-            &format!(
-                "DELETE FROM edge
-                 WHERE file_node_id = ?1
-                 AND NOT (
-                    kind IN ({}, {})
-                    AND source_node_id IN (
-                        SELECT node_id FROM callable_projection_state
-                        WHERE file_id = ?1 AND node_id <> ?1
-                    )
-                 )",
-                EdgeKind::CALL as i32,
-                EdgeKind::USAGE as i32
-            ),
+            &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
             params![file_node_id],
         )?;
 
@@ -13408,13 +13434,28 @@ impl Storage {
             params![file_node_id],
         )?;
 
-        let removed_edges = tx.execute(
+        let removed_edge_predicate = format!(
+            "source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+             OR target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+             OR file_node_id = ?1"
+        );
+
+        // Inherited proof facts hold foreign keys into the edge, node, and file
+        // rows removed below, so they have to go first.
+        delete_proof_facts_for_removed_edges_in_tx(tx, &removed_edge_predicate, file_node_id)?;
+        tx.execute(
             &format!(
-                "DELETE FROM edge
-                 WHERE source_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
+                "DELETE FROM proof_resolution_fact
+                 WHERE file_id = ?1
+                 OR caller_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
                  OR target_node_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})
-                 OR file_node_id = ?1"
+                 OR raw_edge_target_id IN (SELECT node_id FROM {RELATED_NODE_IDS_TABLE})"
             ),
+            params![file_node_id],
+        )?;
+
+        let removed_edges = tx.execute(
+            &format!("DELETE FROM edge WHERE {removed_edge_predicate}"),
             params![file_node_id],
         )?;
 
