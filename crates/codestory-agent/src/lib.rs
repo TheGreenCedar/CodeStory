@@ -99,6 +99,7 @@ pub mod packet_terms;
 pub mod pinned_reader;
 pub mod planning;
 pub mod profiles;
+pub mod repository_evidence_plan;
 pub mod text;
 pub mod trail;
 pub use pinned_reader::{ContinuationRefusal, PinnedReader, admit_continuation_probe};
