@@ -19,7 +19,6 @@ use super::packet_trace::{
 #[cfg(test)]
 use super::trace::field;
 use crate::{AppController, clamp_u128_to_u32};
-use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
 use codestory_agent::packet_obligations::{
     PacketProofEvidenceExtras, preview_packet_obligation_plan_before_budget,
 };
@@ -266,7 +265,7 @@ pub(crate) fn run_packet_planned_subqueries(
         include_evidence,
         rank_terms,
         stage_carry_limit,
-        &packet_flow_requirements_for_terms(&packet_probe_terms(question), plan.task_class),
+        &Vec::new(),
     );
     packet_latency.apply_to_trace(answer);
     Ok(())

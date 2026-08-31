@@ -1,40 +1,15 @@
-#[cfg(test)]
-use crate::eval_probes::push_eval_required_probe_queries;
-#[cfg(any(test, feature = "test-support"))]
-use crate::eval_probes::{eval_probes_enabled, push_prompt_concept_derived_symbol_probes};
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_citation_owns_interceptor_management,
     packet_citation_owns_request_pipeline, packet_citation_owns_transport_adapter,
     packet_evidence_role,
 };
-use crate::packet_flow_requirements::packet_flow_requirement_queries_for_terms;
+#[cfg(any(test, feature = "test-support"))]
+use crate::eval_probes::{eval_probes_enabled, push_prompt_concept_derived_symbol_probes};
 use crate::packet_scoring::{
     normalize_identifier, packet_display_path, packet_file_stem_matches_query,
     packet_query_stop_term,
 };
-use crate::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_command_dispatch_flow,
-    packet_terms_indicate_command_event_loop_flow,
-    packet_terms_indicate_command_server_bootstrap_flow,
-    packet_terms_indicate_network_command_input_flow,
-};
-#[cfg(test)]
-use crate::packet_terms::{
-    packet_terms_have, packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
-    packet_terms_indicate_client_send_flow, packet_terms_indicate_event_loop_command_flow,
-    packet_terms_indicate_form_validation_flow,
-    packet_terms_indicate_html_css_template_structure_flow, packet_terms_indicate_indexing_flow,
-    packet_terms_indicate_log_record_handler_flow,
-    packet_terms_indicate_mapper_configuration_plan_flow,
-    packet_terms_indicate_prepared_session_adapter_flow,
-    packet_terms_indicate_request_dispatch_flow, packet_terms_indicate_route_tree_dispatch_flow,
-    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
-    packet_terms_indicate_server_request_dispatch_flow,
-    packet_terms_indicate_server_route_dispatch_flow,
-    packet_terms_indicate_shell_install_dispatch_flow, packet_terms_indicate_site_build_phase_flow,
-    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_stylesheet_animation_flow,
-    packet_terms_indicate_url_session_request_flow,
-};
+use crate::packet_terms::packet_probe_terms;
 use crate::text::exact_symbol_query_terms;
 use crate::text::{RetrievalFileRole, retrieval_file_role_from_path};
 use codestory_contracts::api::{
@@ -350,7 +325,7 @@ pub fn packet_sufficiency_required_probe_queries_with_extra(
 }
 
 pub fn packet_sufficiency_required_probe_queries_from_terms(
-    terms: &[String],
+    _terms: &[String],
     task_class: PacketTaskClassDto,
 ) -> Vec<String> {
     if !matches!(
@@ -363,423 +338,7 @@ pub fn packet_sufficiency_required_probe_queries_from_terms(
     ) {
         return Vec::new();
     }
-    packet_flow_requirement_queries_for_terms(terms, task_class)
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn legacy_packet_sufficiency_required_probe_queries_from_terms(
-    terms: &[String],
-    task_class: PacketTaskClassDto,
-) -> Vec<String> {
-    if !matches!(
-        task_class,
-        PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::EditPlanning
-    ) {
-        return Vec::new();
-    }
-
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-    let mut queries = Vec::new();
-    push_unique_owned_terms(
-        &mut queries,
-        &packet_flow_requirement_queries_for_terms(terms, task_class),
-    );
-
-    #[cfg(any(test, feature = "test-support"))]
-    if eval_probes_enabled() {
-        push_eval_required_probe_queries(terms, &mut queries);
-    }
-
-    if has("exec") && has_any(&["runtime", "session"]) {
-        push_unique_terms(&mut queries, &["exec runtime", "exec session"]);
-    }
-    if has("exec") && has_any(&["cli", "command", "subcommand"]) {
-        push_unique_terms(&mut queries, &["exec cli", "exec command"]);
-    }
-    if has_any(&["json", "jsonl"]) && has_any(&["event", "events", "output"]) {
-        push_unique_terms(&mut queries, &["json event output", "jsonl event output"]);
-    }
-    if has("thread") && has_any(&["start", "starts", "started"]) {
-        push_unique_term(&mut queries, "thread start");
-    }
-    if has("turn") && has_any(&["start", "starts", "started"]) {
-        push_unique_term(&mut queries, "turn start");
-    }
-    if has_any(&["storage", "persistent"]) || (has("data") && has_any(&["access", "accessed"])) {
-        push_unique_terms(&mut queries, &["storage access", "persistent storage"]);
-    }
-    if packet_terms_indicate_indexing_flow(terms) {
-        push_indexing_flow_required_probe_queries(&mut queries);
-    }
-    if packet_terms_indicate_request_dispatch_flow(terms) {
-        push_unique_terms(
-            &mut queries,
-            &[
-                "request interceptor",
-                "request dispatch",
-                "transport adapter",
-            ],
-        );
-    }
-    if packet_terms_indicate_server_request_dispatch_flow(terms) {
-        push_server_request_dispatch_source_probe_queries(&mut queries);
-        push_unique_terms(
-            &mut queries,
-            &[
-                "server request dispatch",
-                "request context",
-                "view function dispatch",
-                "response finalization",
-            ],
-        );
-    }
-    if packet_terms_indicate_client_send_flow(terms) {
-        push_client_send_source_probe_queries(&mut queries);
-        push_unique_terms(
-            &mut queries,
-            &[
-                "client convenience methods",
-                "top level helpers",
-                "request finalization",
-                "transport send",
-                "request response",
-            ],
-        );
-    }
-    if packet_terms_indicate_event_loop_command_flow(terms) {
-        push_command_loop_source_probe_queries_for_terms(terms, &mut queries);
-    }
-    if packet_terms_indicate_url_session_request_flow(terms) {
-        push_url_session_request_source_probe_queries(&mut queries);
-        push_unique_terms(
-            &mut queries,
-            &[
-                "session request creation",
-                "request task resume",
-                "data request validation",
-                "urlsession callbacks",
-            ],
-        );
-    }
-    if packet_terms_indicate_sql_schema_flow(terms) {
-        push_sql_schema_required_probe_queries(terms, &mut queries);
-    }
-    if packet_terms_indicate_html_css_template_structure_flow(terms) {
-        push_html_css_template_structure_probe_queries(&mut queries);
-        push_unique_terms(
-            &mut queries,
-            &[
-                "html app shell",
-                "module script entry",
-                "css theme defaults",
-                "css layout selectors",
-                "interactive element styles",
-            ],
-        );
-    }
-    if packet_terms_indicate_prepared_session_adapter_flow(terms) {
-        push_unique_terms(
-            &mut queries,
-            &[
-                "request preparation",
-                "prepared request prepare method",
-                "transport-ready request object",
-                "session request",
-                "session send",
-                "adapter send",
-                "adapter send method",
-                "transport adapter send method",
-                "adapter selection",
-            ],
-        );
-    }
-    if has("event") && has("loop") {
-        push_unique_terms(
-            &mut queries,
-            &[
-                "event loop",
-                "event dispatch",
-                "network input",
-                "command dispatch",
-            ],
-        );
-    }
-    if has("call") && has_any(&["command", "commands", "dispatch", "dispatches"]) {
-        push_unique_terms(&mut queries, &["command dispatch", "command handler"]);
-    }
-    if packet_terms_indicate_search_execution_flow(terms) {
-        push_search_flow_probe_queries(&mut queries);
-    }
-    if has_any(&["indexing", "indexed", "indexer"])
-        && (has_any(&["storage", "persistent", "project", "configuration", "group"])
-            || has_any(&["command", "commands"]))
-    {
-        push_unique_terms(
-            &mut queries,
-            &["build index", "source group indexing", "indexer command"],
-        );
-    }
-    push_prompt_concept_role_probe_queries(terms, &mut queries);
-
-    queries
-}
-
-#[cfg(test)]
-fn push_prompt_concept_role_probe_queries(terms: &[String], queries: &mut Vec<String>) {
-    let has = |term: &str| packet_terms_have(terms, term);
-    let has_any = |needles: &[&str]| packet_terms_have_any(terms, needles);
-
-    if has_any(&["serialize", "serializes", "serialized", "serialization"]) {
-        push_unique_term(queries, "serialize");
-    }
-    if has_any(&["cache", "caches"]) && has_any(&["helper", "helpers"]) {
-        push_unique_term(queries, "cache helper");
-    }
-    if has_any(&["middleware", "middlewares"]) {
-        push_unique_term(queries, "middleware");
-    }
-
-    if has_any(&["handler", "handlers"]) {
-        if has_any(&[
-            "record",
-            "records",
-            "process",
-            "processing",
-            "write",
-            "writes",
-        ]) {
-            push_unique_term(queries, "handler processing");
-        }
-        if has_any(&["dispatch", "dispatches", "route", "routes"]) {
-            push_unique_term(queries, "handler dispatch");
-        }
-    }
-    if packet_terms_indicate_server_route_dispatch_flow(terms) {
-        push_unique_terms(
-            queries,
-            &["route registration", "request handler", "handler chain"],
-        );
-    }
-    if packet_terms_indicate_route_tree_dispatch_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "router group",
-                "route tree",
-                "route tree add route",
-                "router group handle route",
-                "engine request handler",
-                "context next handler chain",
-                "engine creation",
-                "engine creation router state",
-            ],
-        );
-    }
-    if packet_terms_indicate_server_request_dispatch_flow(terms) {
-        push_server_request_dispatch_source_probe_queries(queries);
-        push_unique_terms(
-            queries,
-            &[
-                "server request dispatch",
-                "request context",
-                "view function dispatch",
-                "response finalization",
-            ],
-        );
-    }
-
-    if has_any(&["validation", "validate", "validates", "validity", "invalid"]) {
-        if has_any(&["form", "forms", "input", "inputs", "html"]) {
-            push_unique_term(queries, "form validation");
-        }
-        if has_any(&["constraint", "constraints", "native"]) {
-            push_unique_term(queries, "constraint validation");
-        }
-        if has("html") && has_any(&["constraint", "constraints", "native"]) {
-            push_unique_term(queries, "html constraint");
-        }
-        if has("html")
-            && has_any(&["constraint", "constraints", "native"])
-            && has_any(&["form", "forms", "input", "inputs"])
-        {
-            push_unique_term(queries, "pattern");
-        }
-        if has_any(&["javascript", "script", "scripts", "js"]) {
-            push_unique_term(queries, "javascript validation");
-        }
-        if has_any(&["custom", "message", "messages", "error", "errors"]) {
-            push_unique_term(queries, "custom validation");
-        }
-        if has("custom") && has("html") && has_any(&["javascript", "script", "scripts", "js"]) {
-            push_unique_term(queries, "custom validation flow");
-            push_unique_term(queries, "validity state");
-        }
-        if has_any(&["validity", "state", "states"]) {
-            push_unique_term(queries, "validity state");
-        }
-    }
-    if packet_terms_indicate_form_validation_flow(terms) {
-        push_form_validation_source_probe_queries(queries);
-        push_unique_terms(
-            queries,
-            &[
-                "native form constraints",
-                "custom error rendering",
-                "validity state",
-                "submit prevent default",
-            ],
-        );
-    }
-    if packet_terms_indicate_stylesheet_animation_flow(terms) {
-        push_stylesheet_animation_source_probe_queries(queries);
-        push_unique_terms(
-            queries,
-            &[
-                "css animation variables",
-                "css animation base class",
-                "css keyframes",
-                "css animation imports",
-            ],
-        );
-    }
-    if packet_terms_indicate_html_css_template_structure_flow(terms) {
-        push_html_css_template_structure_probe_queries(queries);
-        push_unique_terms(
-            queries,
-            &[
-                "html app shell",
-                "module script entry",
-                "css theme defaults",
-                "css layout selectors",
-                "interactive element styles",
-            ],
-        );
-    }
-    if packet_terms_indicate_url_session_request_flow(terms) {
-        push_url_session_request_source_probe_queries(queries);
-        push_unique_terms(
-            queries,
-            &[
-                "session request creation",
-                "request task resume",
-                "data request validation",
-                "urlsession callbacks",
-            ],
-        );
-    }
-    if packet_terms_indicate_sql_schema_flow(terms) {
-        push_sql_schema_required_probe_queries(terms, queries);
-        push_unique_terms(
-            queries,
-            &[
-                "sql table definitions",
-                "foreign key relationships",
-                "schema dialect scripts",
-            ],
-        );
-    }
-    if packet_terms_indicate_shell_install_dispatch_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "shell installer bootstrap",
-                "shell function dispatch",
-                "install download helpers",
-                "conditional version use",
-                "shell completion",
-            ],
-        );
-    }
-
-    if has_any(&["mapper", "mappers", "mapping", "map", "maps"]) {
-        if has_any(&["configuration", "config", "profile", "profiles"]) {
-            push_unique_term(queries, "mapper configuration");
-        }
-        if has("type") || has_any(&["types", "typemap", "typemaps"]) {
-            push_unique_term(queries, "type map");
-        }
-        if has_any(&["plan", "plans", "execution", "expression", "lambda"]) {
-            push_unique_term(queries, "mapping plan");
-        }
-    }
-
-    if has_any(&["buffer", "buffers", "buffered"]) {
-        if has_any(&["source", "sources", "read", "reads", "reader"]) {
-            push_unique_term(queries, "buffered source");
-        }
-        if has_any(&["sink", "sinks", "write", "writes", "writer"]) {
-            push_unique_term(queries, "buffered sink");
-        }
-    }
-    if packet_terms_indicate_buffered_io_flow(terms) {
-        push_unique_terms(
-            queries,
-            &[
-                "source sink buffer",
-                "buffer storage",
-                "buffered wrapper",
-                "source read buffer",
-                "sink write buffer",
-                "source buffer",
-                "sink buffer",
-            ],
-        );
-    }
-    if packet_terms_indicate_log_record_handler_flow(terms) {
-        push_log_record_handler_source_probe_queries(queries);
-        push_unique_terms(
-            queries,
-            &[
-                "logger record",
-                "record creation",
-                "handler registration",
-                "handler processing",
-                "handler interface",
-            ],
-        );
-    }
-    if packet_terms_indicate_site_build_phase_flow(terms) {
-        push_site_build_phase_source_probe_queries(queries);
-        push_unique_terms(
-            queries,
-            &[
-                "site build lifecycle",
-                "site process phases",
-                "read generate render write",
-                "reader read",
-                "renderer render",
-            ],
-        );
-    }
-    if packet_terms_indicate_mapper_configuration_plan_flow(terms) {
-        push_mapper_configuration_plan_source_probe_queries(queries);
-        push_unique_terms(
-            queries,
-            &[
-                "mapper runtime api",
-                "mapper configuration",
-                "type map plan",
-                "mapping execution plan",
-                "source destination mapping",
-            ],
-        );
-    }
-    if packet_terms_indicate_runtime_formatting_flow(terms) {
-        push_runtime_formatting_source_probe_queries(queries);
-    }
-
-    if has_any(&["client", "clients"]) && has_any(&["send", "sends", "sending"]) {
-        push_unique_term(queries, "client send");
-    }
-    if has_any(&["request", "requests"]) && has_any(&["response", "responses"]) {
-        push_unique_term(queries, "request response");
-    }
+    Vec::new()
 }
 
 pub fn packet_prompt_exact_symbol_probe_queries(
@@ -2168,21 +1727,9 @@ fn push_client_send_source_probe_queries(queries: &mut Vec<String>) {
 }
 
 pub fn push_command_loop_source_probe_queries_for_terms(
-    terms: &[String],
-    queries: &mut Vec<String>,
+    _terms: &[String],
+    _queries: &mut Vec<String>,
 ) {
-    if packet_terms_indicate_command_server_bootstrap_flow(terms) {
-        push_unique_terms(queries, &["server bootstrap", "command server entrypoint"]);
-    }
-    if packet_terms_indicate_command_event_loop_flow(terms) {
-        push_unique_terms(queries, &["event loop source"]);
-    }
-    if packet_terms_indicate_network_command_input_flow(terms) {
-        push_unique_terms(queries, &["network command input"]);
-    }
-    if packet_terms_indicate_command_dispatch_flow(terms) {
-        push_unique_terms(queries, &["command table dispatch"]);
-    }
 }
 
 #[cfg(test)]
@@ -2798,41 +2345,39 @@ mod tests {
     }
 
     #[test]
-    fn prompt_concept_roles_generate_general_production_probes() {
+    fn prompt_concept_roles_do_not_generate_domain_specific_production_probes() {
         let hook_queries = packet_sufficiency_required_probe_queries(
             "Explain how the public hook serializes keys, connects cache helpers, and composes middleware.",
             PacketTaskClassDto::ArchitectureExplanation,
         );
-        for expected in ["public hook export", "key serialization", "cache helper"] {
+        for banned in [
+            "public hook export",
+            "key serialization",
+            "cache helper",
+            "native form constraints",
+            "route registration",
+            "request dispatch",
+        ] {
             assert!(
-                hook_queries.iter().any(|query| query == expected),
-                "expected {expected:?} in {hook_queries:?}"
+                !hook_queries.iter().any(|query| query == banned),
+                "production probes must not emit domain flow probes: {hook_queries:?}"
             );
         }
-        assert!(
-            !hook_queries.iter().any(|query| query.contains("_internal")),
-            "production probes must not use benchmark-specific paths: {hook_queries:?}"
-        );
 
         let flow_queries = packet_sufficiency_required_probe_queries(
             "Trace native HTML form constraint validation, custom JavaScript validation, handler processing, mapper configuration, type map plans, and buffered source/sink behavior.",
             PacketTaskClassDto::ArchitectureExplanation,
         );
-        for expected in [
+        for banned in [
             "native form constraints",
-            "constraint validation",
-            "custom validation",
-            "submit prevent default",
-            "mapper runtime api",
-            "mapping execution plan",
-            "buffer storage",
-            "source sink buffer",
-            "source read buffer",
-            "sink write buffer",
+            "mapper configuration",
+            "handler processing",
+            "buffered source",
+            "type map plan",
         ] {
             assert!(
-                flow_queries.iter().any(|query| query == expected),
-                "expected {expected:?} in {flow_queries:?}"
+                !flow_queries.iter().any(|query| query == banned),
+                "flow-term expansion probes must stay decontaminated: {flow_queries:?}"
             );
         }
 
@@ -2840,15 +2385,10 @@ mod tests {
             "Trace how an HTTP route registration reaches request handler dispatch through a router engine.",
             PacketTaskClassDto::RouteTracing,
         );
-        for expected in [
-            "application use",
-            "route registration",
-            "application handle",
-            "request dispatch",
-        ] {
+        for banned in ["route registration", "request dispatch", "router engine"] {
             assert!(
-                route_queries.iter().any(|query| query == expected),
-                "expected {expected:?} in {route_queries:?}"
+                !route_queries.iter().any(|query| query == banned),
+                "route flow probes must stay decontaminated: {route_queries:?}"
             );
         }
     }
@@ -3204,7 +2744,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_schema_required_probes_are_compositional() {
+    fn sql_schema_required_probes_from_terms_are_decontaminated() {
         let terms = packet_probe_terms(
             "Explain SQL table definitions and referential relationships across schema seed scripts.",
         );
@@ -3213,18 +2753,10 @@ mod tests {
             PacketTaskClassDto::DataFlow,
         );
 
-        for expected in [
-            "sql table definitions",
-            "CREATE TABLE",
-            "referential relationships",
-            "schema constraints",
-        ] {
-            assert!(
-                queries.iter().any(|query| query == expected),
-                "expected SQL schema probe `{expected}` in {queries:?}"
-            );
-        }
-        assert_eq!(queries.len(), 4, "the flow emits only typed general probes");
+        assert!(
+            queries.is_empty(),
+            "domain flow probes should not expand from terms alone: {queries:?}"
+        );
     }
 
     #[test]

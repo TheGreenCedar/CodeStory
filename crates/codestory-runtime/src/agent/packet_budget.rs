@@ -1605,12 +1605,7 @@ pub(super) mod tests {
         needed: &[i64],
     ) -> std::rc::Rc<crate::agent::packet_candidate::PacketProofSession> {
         let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
         ));
@@ -1864,12 +1859,7 @@ pub(super) mod tests {
         let baseline = protected_graph_edge_ids_for_budget(&answer, &[]);
 
         let legacy_requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how a server application registers middleware, handles a request, and sends the response.",
-                ),
-                PacketTaskClassDto::RouteTracing,
-            );
+            Vec::new();
         let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements),
         ));

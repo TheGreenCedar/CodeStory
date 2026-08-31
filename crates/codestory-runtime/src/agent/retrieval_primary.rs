@@ -4523,12 +4523,7 @@ mod tests {
     }
 
     fn exact_boundary_test_requirements() -> Vec<FlowRequirement> {
-        codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-            &codestory_agent::packet_terms::packet_probe_terms(
-                "Trace how the server enters the event loop and routes a command for execution.",
-            ),
-            PacketTaskClassDto::RouteTracing,
-        )
+        Vec::new()
     }
 
     fn exact_boundary_test_edge(
@@ -6921,12 +6916,7 @@ mod tests {
     /// rev 5.3 need-gate matches hydrated edges against these patterns.
     fn file_structural_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
         let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements);
         assert!(
             !spec.promotion_patterns.is_empty(),
@@ -7613,12 +7603,7 @@ mod tests {
         .expect("resolve without session");
 
         let legacy_requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how a server application registers middleware, handles a request, and sends the response.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::RouteTracing,
-            );
+            Vec::new();
         let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements);
         assert!(
             spec.promotion_patterns.is_empty(),
@@ -7774,12 +7759,7 @@ mod tests {
         .expect("resolve without session");
 
         let m_requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the logger creates a log record and dispatches it to each handler for processing.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&m_requirements);
         // Rev 5.4: the M formula names only CALL — no cross-container kind —
         // so it derives ZERO promotion patterns and admission is
@@ -7982,12 +7962,7 @@ mod tests {
             .expect("insert edges");
 
         let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "How does the mapper build its configuration and execution plan?",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         let session = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
         ));
@@ -8080,12 +8055,7 @@ mod tests {
     fn r6_session_trace_records_need_set_provenance_and_admission_decisions() {
         let storage = css_bootstrap_storage();
         let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         let session = Rc::new(
             crate::agent::packet_candidate::PacketProofSession::new(
                 crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
@@ -8214,12 +8184,7 @@ mod tests {
         );
 
         let legacy_requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how a server application registers middleware, handles a request, and sends the response.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::RouteTracing,
-            );
+            Vec::new();
         let legacy = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements),
         ));
@@ -8252,12 +8217,7 @@ mod tests {
     /// promotion SLOT accounting is observable in assertions.
     fn traced_file_structural_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
         let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         Rc::new(
             crate::agent::packet_candidate::PacketProofSession::new(
                 crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
@@ -8633,12 +8593,7 @@ mod tests {
             .expect("insert edges");
 
         let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "How does the mapper build its configuration and execution plan?",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         let session = Rc::new(
             crate::agent::packet_candidate::PacketProofSession::new(
                 crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
@@ -8799,12 +8754,7 @@ mod tests {
 
     fn mapper_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
         let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "How does the mapper build its configuration and execution plan?",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
         ))

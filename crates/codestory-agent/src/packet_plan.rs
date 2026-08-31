@@ -1,29 +1,18 @@
 #[cfg(any(test, feature = "test-support"))]
-use crate::eval_probes::{
-    eval_probes_enabled, push_eval_architecture_flow_probe_terms,
-    push_prompt_named_file_probe_queries,
-};
-use crate::packet_flow_requirements::{
-    packet_flow_requirement_context_queries_for_prompt, packet_flow_requirement_queries_for_terms,
-};
+use crate::eval_probes::{eval_probes_enabled, push_prompt_named_file_probe_queries};
 use crate::packet_obligations::build_packet_obligation_plan;
 use crate::packet_required_probes::{
-    packet_concrete_file_probe_queries_from_required, packet_named_schema_entity_symbol_queries,
-    packet_prompt_exact_symbol_probe_queries, packet_prompt_explicit_source_path_queries,
+    packet_concrete_file_probe_queries_from_required, packet_prompt_exact_symbol_probe_queries,
+    packet_prompt_explicit_source_path_queries,
 };
 use crate::packet_scoring::{
     normalize_identifier, packet_adjacent_query_stop_term, packet_query_stop_term,
 };
-use crate::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_shell_install_dispatch_flow,
-    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_url_session_request_flow,
-    prompt_search_terms,
-};
+use crate::packet_terms::{packet_probe_terms, prompt_search_terms};
 use crate::planning::{
     PACKET_ADJACENT_VARIANT_QUERY_PURPOSE, PACKET_CONCRETE_FILE_QUERY_PURPOSE,
-    PACKET_EXACT_SYMBOL_QUERY_PURPOSE, PACKET_FLOW_ROLE_QUERY_PURPOSE,
-    PACKET_GENERIC_TERM_QUERY_PURPOSE, dedupe_packet_plan_queries,
-    packet_plan_query_is_exact_symbol_identity,
+    PACKET_EXACT_SYMBOL_QUERY_PURPOSE, PACKET_GENERIC_TERM_QUERY_PURPOSE,
+    dedupe_packet_plan_queries, packet_plan_query_is_exact_symbol_identity,
 };
 use crate::text::{
     exact_symbol_query_terms, is_non_primary_source_term, looks_like_standalone_symbol_query,
@@ -49,11 +38,6 @@ pub fn build_packet_plan_with_extra(
     extra_probes: &[String],
 ) -> PacketPlanDto {
     let task_class = requested.unwrap_or_else(|| infer_packet_task_class(question));
-    let question_terms = packet_probe_terms(question);
-    let shell_install_dispatch_flow =
-        packet_terms_indicate_shell_install_dispatch_flow(&question_terms);
-    let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&question_terms);
-    let sql_schema_flow = packet_terms_indicate_sql_schema_flow(&question_terms);
     let mut queries = Vec::new();
     if looks_like_standalone_symbol_query(question) {
         push_exact_symbol_packet_query(&mut queries, question);
@@ -87,12 +71,7 @@ pub fn build_packet_plan_with_extra(
     for (query, purpose) in packet_symbol_probe_query_specs(question, task_class, budget) {
         push_packet_query(&mut queries, &query, purpose);
     }
-    for query in task_class_seed_queries(
-        task_class,
-        shell_install_dispatch_flow,
-        url_session_request_flow,
-        sql_schema_flow,
-    ) {
+    for query in task_class_seed_queries(task_class) {
         push_packet_query(&mut queries, query, "task-class retrieval seed");
     }
     for query in packet_concept_queries(question) {
@@ -486,26 +465,6 @@ fn packet_symbol_probe_query_specs(
             PACKET_CONCRETE_FILE_QUERY_PURPOSE,
         );
     }
-    push_unique_query_specs(
-        &mut queries,
-        &packet_flow_requirement_context_queries_for_prompt(question, &terms, task_class)
-            .into_iter()
-            .map(|(_, query)| query)
-            .collect::<Vec<_>>(),
-        PACKET_FLOW_ROLE_QUERY_PURPOSE,
-    );
-    push_unique_query_specs(
-        &mut queries,
-        &packet_flow_requirement_queries_for_terms(&terms, task_class),
-        PACKET_FLOW_ROLE_QUERY_PURPOSE,
-    );
-    if packet_terms_indicate_sql_schema_flow(&terms) {
-        push_unique_query_specs(
-            &mut queries,
-            &packet_named_schema_entity_symbol_queries(question),
-            PACKET_FLOW_ROLE_QUERY_PURPOSE,
-        );
-    }
     let query_values = queries
         .iter()
         .map(|(query, _)| query.clone())
@@ -700,9 +659,6 @@ pub fn extract_packet_query_terms(question: &str) -> Vec<String> {
     for term in exact_symbol_query_terms(question) {
         push_unique_term(&mut terms, &term);
     }
-    for term in packet_architecture_flow_probe_terms(question) {
-        push_unique_term(&mut terms, &term);
-    }
 
     for token in question.split_whitespace() {
         let token = token.trim_matches(|ch: char| {
@@ -795,12 +751,7 @@ pub fn push_unique_term(terms: &mut Vec<String>, value: &str) {
     }
 }
 
-fn task_class_seed_queries(
-    task_class: PacketTaskClassDto,
-    shell_install_dispatch_flow: bool,
-    url_session_request_flow: bool,
-    sql_schema_flow: bool,
-) -> &'static [&'static str] {
+fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
     match task_class {
         PacketTaskClassDto::ArchitectureExplanation => &[
             "architecture entrypoint",
@@ -811,17 +762,8 @@ fn task_class_seed_queries(
         ],
         PacketTaskClassDto::BugLocalization => &["error path", "failure handling"],
         PacketTaskClassDto::ChangeImpact => &["affected symbols", "impacted tests"],
-        PacketTaskClassDto::RouteTracing if shell_install_dispatch_flow => &["references"],
-        PacketTaskClassDto::RouteTracing if url_session_request_flow => {
-            &["request lifecycle", "references"]
-        }
         PacketTaskClassDto::RouteTracing => &["route handler endpoint", "references"],
         PacketTaskClassDto::SymbolOwnership => &["definition references", "callers"],
-        PacketTaskClassDto::DataFlow if sql_schema_flow => &[
-            "table definitions",
-            "referential relationships",
-            "schema dialect scripts",
-        ],
         PacketTaskClassDto::DataFlow => &["pipeline flow", "storage handoff"],
         PacketTaskClassDto::EditPlanning => &["edit candidates", "test coverage"],
     }
@@ -870,50 +812,6 @@ pub fn packet_plan_annotation(plan: &PacketPlanDto) -> String {
         "packet_plan task_class={:?} inferred={} queries={}",
         plan.task_class, plan.inferred_task_class, queries
     )
-}
-
-fn packet_architecture_flow_probe_terms(prompt: &str) -> Vec<String> {
-    let lower = prompt.to_ascii_lowercase();
-    let mut terms = Vec::new();
-    if prompt_mentions_indexing_flow(&lower) {
-        for term in [
-            "index service",
-            "workspace execution plan",
-            "workspace indexer",
-            "symbol extraction indexer",
-            "search projection",
-            "snapshot refresh",
-        ] {
-            push_unique_term(&mut terms, term);
-        }
-    }
-    #[cfg(any(test, feature = "test-support"))]
-    push_eval_architecture_flow_probe_terms(&lower, &mut terms);
-    terms
-}
-
-fn prompt_mentions_indexing_flow(lower: &str) -> bool {
-    contains_any(lower, &["indexing", "indexer", "indexed", " index "])
-        && contains_any(
-            lower,
-            &[
-                "cli",
-                "command",
-                "discovery",
-                "extraction",
-                "file",
-                "persistence",
-                "projection",
-                "refresh",
-                "runtime",
-                "search",
-                "snapshot",
-                "storage",
-                "store",
-                "symbol",
-                "workspace",
-            ],
-        )
 }
 
 #[cfg(test)]

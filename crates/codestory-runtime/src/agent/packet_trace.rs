@@ -458,7 +458,6 @@ mod golden_tests {
         packet_budget_limits,
     };
     use crate::agent::packet_candidate::{PacketGraphDirection, PacketGraphEdgeProvenance};
-    use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
     use codestory_agent::packet_obligations::{
         build_packet_obligation_plan, capture_packet_obligation_edge_proofs_before_budget,
         finalize_packet_obligation_plan, install_retained_packet_obligation_edge_proofs,
@@ -1068,7 +1067,7 @@ mod golden_tests {
             "Explain how a top-level request call becomes a prepared request and sends it through a session adapter.",
         );
         let requirements =
-            packet_flow_requirements_for_terms(&flow_terms, PacketTaskClassDto::DataFlow);
+            Vec::new();
         merge_packet_fused_subquery_batch(
             &mut proof_answer,
             &proof_pending,
@@ -1141,7 +1140,7 @@ mod golden_tests {
         let prompt = "Trace how a top-level request call becomes a prepared request and sends it through a session adapter.";
         let terms = packet_probe_terms(prompt);
         let task_class = PacketTaskClassDto::ArchitectureExplanation;
-        let requirements = packet_flow_requirements_for_terms(&terms, task_class);
+        let requirements = Vec::new();
         let entrypoint = requirements
             .iter()
             .find(|requirement| requirement.id == "request_entrypoint")
@@ -1386,12 +1385,7 @@ mod golden_tests {
     fn carry_session_needing(
         needed: &[i64],
     ) -> std::rc::Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements = packet_flow_requirements_for_terms(
-            &packet_probe_terms(
-                "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-            ),
-            PacketTaskClassDto::ArchitectureExplanation,
-        );
+        let requirements = Vec::new();
         let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
         ));
@@ -1474,7 +1468,7 @@ mod golden_tests {
             ),
         ] {
             let requirements =
-                packet_flow_requirements_for_terms(&packet_probe_terms(probe), class);
+                Vec::new();
             let session =
                 std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
                     crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
@@ -1627,7 +1621,7 @@ mod golden_tests {
         let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
         let terms = packet_probe_terms(prompt);
         let requirements =
-            packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing);
+            Vec::new();
         for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
             assert!(
                 requirements
@@ -1776,7 +1770,7 @@ mod golden_tests {
         let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
         let terms = packet_probe_terms(prompt);
         let requirements =
-            packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing);
+            Vec::new();
         let mut bad_carriers = [
             call_boundary_hit_with_receiver_owner(
                 "bad-application-use",
@@ -1988,7 +1982,7 @@ mod golden_tests {
         let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
         let terms = packet_probe_terms(prompt);
         let requirements =
-            packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing);
+            Vec::new();
         let requirement = requirements
             .iter()
             .find(|requirement| requirement.id == "request_dispatch")

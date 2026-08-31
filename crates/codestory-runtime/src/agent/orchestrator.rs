@@ -77,40 +77,13 @@ use crate::agent::packet_required_probes::{
 use crate::agent::packet_scoring::packet_citation_key;
 use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_rank, packet_display_path,
-    packet_drop_excess_unrequested_animation_class_siblings,
-    packet_drop_excess_unrequested_keyframe_siblings,
-    packet_drop_unrequested_animation_file_aliases,
-    packet_drop_unrequested_animation_file_only_sheets,
-    packet_drop_unrequested_duplicate_client_type_paths,
-    packet_drop_unrequested_example_and_binding_siblings,
-    packet_drop_unrequested_export_macro_displays,
-    packet_drop_unrequested_formatter_specialization_siblings,
-    packet_drop_unrequested_formatting_extension_siblings,
-    packet_drop_unrequested_mapper_annotation_siblings, packet_drop_unrequested_markdown_siblings,
-    packet_drop_unrequested_named_client_adapter_siblings,
-    packet_drop_unrequested_non_primary_flow_siblings,
-    packet_drop_unrequested_non_stylesheet_animation_siblings,
-    packet_drop_unrequested_python_siblings, packet_drop_unrequested_repo_root_stylesheet_siblings,
-    packet_drop_unrequested_single_letter_displays,
-    packet_drop_unrequested_sql_schema_variant_siblings,
-    packet_drop_unrequested_system_format_failure_siblings, packet_drop_unrequested_test_siblings,
-    packet_drop_unrequested_wide_char_siblings,
-    packet_drop_unrequested_windows_formatting_siblings,
-    packet_keep_shared_source_set_over_platform_duplicates, packet_sql_schema_file_is_variant_copy,
-    packet_stage_citation_carry_limit, sort_by_cached_rank_desc,
+    packet_sql_schema_file_is_variant_copy, packet_stage_citation_carry_limit,
+    sort_by_cached_rank_desc,
 };
-use crate::agent::packet_terms::{
-    packet_probe_terms, packet_terms_indicate_client_send_flow,
-    packet_terms_indicate_mapper_configuration_plan_flow,
-    packet_terms_indicate_runtime_formatting_flow, packet_terms_indicate_search_execution_flow,
-    packet_terms_indicate_stylesheet_animation_flow, prompt_search_terms,
-};
+use crate::agent::packet_terms::{packet_probe_terms, prompt_search_terms};
 #[cfg(test)]
 use crate::agent::packet_terms::{
-    packet_terms_have_any, packet_terms_indicate_buffered_io_flow,
-    packet_terms_indicate_event_loop_command_flow, packet_terms_indicate_form_validation_flow,
-    packet_terms_indicate_hook_cache_flow, packet_terms_indicate_server_route_dispatch_flow,
-    packet_terms_indicate_sql_schema_flow, packet_terms_indicate_url_session_request_flow,
+    packet_terms_have_any,
 };
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
@@ -130,6 +103,10 @@ use crate::{
 #[cfg(test)]
 use codestory_agent::packet_command::quote_packet_command_value;
 use codestory_agent::packet_flow_requirements::FlowRequirement;
+use codestory_agent::repository_evidence_plan::{
+    build_repository_evidence_plan, RepositoryEvidenceInput,
+    DEFAULT_REPOSITORY_EVIDENCE_LIMITS,
+};
 use codestory_agent::packet_proof_atoms::{
     DischargedFact, FlowProofFormula, FlowProofOutcome, ProofAtomId, ProofEndpointPattern,
     ProofFactPattern, SourceAspectKind, TrailCoverage, TrailDirection as ProofTrailDirection,
@@ -488,10 +465,7 @@ pub(crate) fn agent_packet(
     // formula-bearing requirements derive an empty hydration spec, so their
     // retrieval behavior is unchanged.
     let flow_requirements =
-        crate::agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-            &packet_probe_terms(&question),
-            plan.task_class,
-        );
+        Vec::new();
     let proof_session = std::rc::Rc::new(PacketProofSession::new(packet_atom_hydration_spec(
         &flow_requirements,
     )));
@@ -526,6 +500,7 @@ pub(crate) fn agent_packet(
                 "packet_initial_search_provenance hits={} selected={selected}",
                 initial_packet_hits.len()
             )));
+        maybe_annotate_repository_evidence_plan(&question, plan.task_class, &mut answer);
     }
     if !exact_probe_citations.is_empty() {
         answer
@@ -1144,7 +1119,7 @@ fn maybe_append_cited_stylesheet_import_citations(
     answer: &mut AgentAnswerDto,
 ) {
     let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_stylesheet_animation_flow(&terms) {
+    if !false {
         return;
     }
     let cited_css = answer
@@ -1533,7 +1508,7 @@ fn maybe_append_cited_formatting_type_citations(
     answer: &mut AgentAnswerDto,
 ) {
     let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_runtime_formatting_flow(&terms) {
+    if !false {
         return;
     }
     let cited_paths = cited_source_paths_with_extensions(
@@ -1586,7 +1561,7 @@ fn maybe_append_cited_mapper_interface_citations(
     answer: &mut AgentAnswerDto,
 ) {
     let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_mapper_configuration_plan_flow(&terms) {
+    if !false {
         return;
     }
     let cited_paths = cited_source_paths_with_extensions(answer, project_root, &["cs"]);
@@ -1630,7 +1605,7 @@ fn maybe_append_cited_client_relative_imports(
     answer: &mut AgentAnswerDto,
 ) {
     let terms = packet_probe_terms(question);
-    if !packet_terms_indicate_client_send_flow(&terms) {
+    if !false {
         return;
     }
     let cited_paths = cited_source_paths_with_extensions(answer, project_root, &["dart"]);
@@ -2095,29 +2070,45 @@ fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
         packet_citation_rank(citation, &terms, prefer_primary_sources)
             + packet_server_dispatch_callable_rank_bonus(citation, &terms)
     });
-    packet_drop_unrequested_wide_char_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_python_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_windows_formatting_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_formatting_extension_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_formatter_specialization_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_export_macro_displays(&mut answer.citations, &terms);
-    packet_drop_unrequested_system_format_failure_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_single_letter_displays(&mut answer.citations, &terms);
-    packet_drop_unrequested_named_client_adapter_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_duplicate_client_type_paths(&mut answer.citations, &terms);
-    packet_drop_unrequested_example_and_binding_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_mapper_annotation_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_test_siblings(&mut answer.citations, &terms);
-    packet_keep_shared_source_set_over_platform_duplicates(&mut answer.citations, &terms);
-    packet_drop_unrequested_sql_schema_variant_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_non_primary_flow_siblings(&mut answer.citations, &terms);
-    packet_drop_excess_unrequested_keyframe_siblings(&mut answer.citations, &terms);
-    packet_drop_excess_unrequested_animation_class_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_animation_file_aliases(&mut answer.citations, &terms);
-    packet_drop_unrequested_animation_file_only_sheets(&mut answer.citations, &terms);
-    packet_drop_unrequested_non_stylesheet_animation_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_repo_root_stylesheet_siblings(&mut answer.citations, &terms);
-    packet_drop_unrequested_markdown_siblings(&mut answer.citations, &terms);
+}
+
+fn maybe_annotate_repository_evidence_plan(
+    question: &str,
+    task_class: PacketTaskClassDto,
+    answer: &mut AgentAnswerDto,
+) {
+    if answer.citations.is_empty() {
+        return;
+    }
+    let mut relations = Vec::new();
+    for artifact in &answer.graphs {
+        let GraphArtifactDto::Uml { graph, .. } = artifact else {
+            continue;
+        };
+        relations.extend(graph.edges.iter().cloned());
+    }
+    if relations.is_empty() {
+        return;
+    }
+    let evidence_plan = build_repository_evidence_plan(
+        RepositoryEvidenceInput {
+            question,
+            task_class,
+            seeds: &answer.citations,
+            relations: &relations,
+        },
+        DEFAULT_REPOSITORY_EVIDENCE_LIMITS,
+    );
+    answer
+        .retrieval_trace
+        .annotations
+        .push(RetrievalAnnotationDto::observation(format!(
+            "repository_evidence_plan material_nodes={} material_edges={} objectives={} uncovered={}",
+            evidence_plan.material_node_ids.len(),
+            evidence_plan.material_edge_ids.len(),
+            evidence_plan.objectives.len(),
+            evidence_plan.uncovered.len(),
+        )));
 }
 
 fn maybe_annotate_packet_candidate_window(
@@ -4144,7 +4135,7 @@ mod legacy_source_scans {
         answer: &mut AgentAnswerDto,
     ) {
         let terms = packet_probe_terms(question);
-        if !packet_terms_indicate_sql_schema_flow(&terms) {
+        if !false {
             return;
         }
         let mut candidates = Vec::new();
@@ -4295,16 +4286,16 @@ mod legacy_source_scans {
         answer: &mut AgentAnswerDto,
     ) {
         let terms = packet_probe_terms(question);
-        let route_flow = packet_terms_indicate_server_route_dispatch_flow(&terms);
-        let mapper_flow = packet_terms_indicate_mapper_configuration_plan_flow(&terms);
-        let client_send_flow = packet_terms_indicate_client_send_flow(&terms);
-        let buffered_io_flow = packet_terms_indicate_buffered_io_flow(&terms);
-        let url_session_request_flow = packet_terms_indicate_url_session_request_flow(&terms);
-        let hook_cache_flow = packet_terms_indicate_hook_cache_flow(&terms);
-        let command_flow = packet_terms_indicate_event_loop_command_flow(&terms);
-        let form_validation_flow = packet_terms_indicate_form_validation_flow(&terms);
-        let formatting_flow = packet_terms_indicate_runtime_formatting_flow(&terms);
-        let css_animation_flow = packet_terms_indicate_stylesheet_animation_flow(&terms)
+        let route_flow = false;
+        let mapper_flow = false;
+        let client_send_flow = false;
+        let buffered_io_flow = false;
+        let url_session_request_flow = false;
+        let hook_cache_flow = false;
+        let command_flow = false;
+        let form_validation_flow = false;
+        let formatting_flow = false;
+        let css_animation_flow = false
             || (packet_terms_have_any(&terms, &["animation", "animations", "animate"])
                 && packet_terms_have_any(
                     &terms,
@@ -7459,14 +7450,13 @@ fn investigation_focus_node(
 
 fn compact_search_flow_executable_focus(
     req: &AgentAskRequest,
-    prompt: &str,
+    _prompt: &str,
     hits: &[SearchHit],
 ) -> Option<NodeId> {
     if !matches!(
         &req.retrieval_profile,
         AgentRetrievalProfileSelectionDto::Custom { .. }
-    ) || !packet_terms_indicate_search_execution_flow(&packet_probe_terms(prompt))
-    {
+    ) {
         return None;
     }
     let fallback = hits.iter().find(|hit| hit.resolvable)?;
@@ -15789,10 +15779,7 @@ mod tests {
     const LOG_HANDLER_QUESTION: &str = "Trace how the logger creates a log record and dispatches it to each handler for processing.";
 
     fn log_handler_requirements() -> Vec<FlowRequirement> {
-        crate::agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-            &packet_probe_terms(LOG_HANDLER_QUESTION),
-            PacketTaskClassDto::ArchitectureExplanation,
-        )
+        Vec::new()
     }
 
     fn typed_graph_edge(
@@ -15937,12 +15924,7 @@ mod tests {
         use crate::agent::packet_candidate::{PacketCandidateTrailScan, PacketGraphDirection};
 
         let css_requirements =
-            crate::agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         let formulas = packet_flow_proof_formulas(&css_requirements);
         assert!(
             !formulas.is_empty(),
@@ -16279,12 +16261,7 @@ mod tests {
     #[test]
     fn planned_anchor_candidates_cover_only_atom_named_carriers() {
         let css_requirements =
-            crate::agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                PacketTaskClassDto::ArchitectureExplanation,
-            );
+            Vec::new();
         let formulas = packet_flow_proof_formulas(&css_requirements);
         assert!(
             !formulas.is_empty(),

@@ -138,21 +138,13 @@ test("isolated contaminated fixture repository fails the live scanner", () => {
   }
 });
 
-test("current integration head is contaminated (gate: fail-on-contaminated-head)", () => {
+test("current decontaminated head passes the live boundary checker", () => {
   const result = runPacketGeneralizationBoundaryCheck(repositoryRoot);
-  assert.equal(result.exitCode, 1, "contaminated production head must fail the boundary checker");
-  assert.ok(result.findings.length > 0);
-  const apis = new Set(
-    result.findings.filter((f) => f.kind === "deleted_taxonomy_api").map((f) => f.detail),
+  assert.equal(
+    result.exitCode,
+    0,
+    `clean production head must pass the boundary checker: ${result.stderr}\n${JSON.stringify(result.findings, null, 2)}`,
   );
-  assert.ok(apis.has("packet_flow_requirements_for_terms"));
-  assert.ok(apis.has("packet_terms_indicate_hook_cache_flow"));
-  assert.ok(
-    DELETED_TAXONOMY_APIS.some((api) => apis.has(api)),
-    "at least one deleted taxonomy API must still be present on contaminated head",
-  );
-  assert.ok(
-    result.findings.some((f) => f.kind === "encoded_brand_literal"),
-    "encoded SWR detector must be visible on contaminated head",
-  );
+  assert.equal(result.findings.length, 0);
+  assert.ok(DELETED_TAXONOMY_APIS.length > 0, "banlist must remain non-empty");
 });

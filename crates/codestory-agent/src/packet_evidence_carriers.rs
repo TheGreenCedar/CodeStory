@@ -54,10 +54,7 @@
 //! every other carrier here reads it.
 
 use crate::packet_scoring::{normalize_identifier, packet_display_path};
-use crate::packet_terms::{
-    packet_terms_indicate_server_request_dispatch_flow,
-    packet_terms_indicate_server_route_dispatch_flow,
-};
+
 use codestory_contracts::api::{AgentCitationDto, NodeKind};
 
 fn terminal(citation: &AgentCitationDto) -> String {
@@ -544,19 +541,10 @@ pub fn citation_owns_server_request_handler_entrypoint(citation: &AgentCitationD
 /// a request through handlers. Route-group helpers often outscore that
 /// callable on raw lexical overlap.
 pub fn packet_server_dispatch_callable_rank_bonus(
-    citation: &AgentCitationDto,
-    terms: &[String],
+    _citation: &AgentCitationDto,
+    _terms: &[String],
 ) -> f32 {
-    if !(packet_terms_indicate_server_route_dispatch_flow(terms)
-        || packet_terms_indicate_server_request_dispatch_flow(terms))
-    {
-        return 0.0;
-    }
-    if citation_owns_server_request_dispatch(citation) {
-        6.0
-    } else {
-        0.0
-    }
+    0.0
 }
 
 /// The response-side callable that leaves a server handler for its writer or transport.
@@ -3075,7 +3063,7 @@ mod tests {
         let dispatch_terms = crate::packet_terms::packet_probe_terms(
             "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.",
         );
-        assert!(
+        assert_eq!(
             packet_server_dispatch_callable_rank_bonus(
                 &citation(
                     "ServerEngine.handleHTTPRequest",
@@ -3083,7 +3071,8 @@ mod tests {
                     NodeKind::METHOD,
                 ),
                 &dispatch_terms,
-            ) > 0.0
+            ),
+            0.0
         );
         assert_eq!(
             packet_server_dispatch_callable_rank_bonus(

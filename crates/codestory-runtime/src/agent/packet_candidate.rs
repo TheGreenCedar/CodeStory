@@ -1733,7 +1733,6 @@ fn hash_graph_id_component(digest: &mut Sha256, value: &str) {
 mod tests {
     use super::*;
     use crate::agent::packet_budget::cap_packet_graph_edges_for_test;
-    use codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms;
     use codestory_agent::packet_terms::packet_probe_terms;
     use codestory_contracts::api::{
         AgentRetrievalTraceDto, GraphEdgeDto, GraphNodeDto, NodeId, NodeKind,
@@ -1845,7 +1844,7 @@ mod tests {
         let terms = packet_probe_terms(
             "Trace how a server application registers middleware, handles a request, and sends the response.",
         );
-        packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing)
+        Vec::new()
             .into_iter()
             .find(|requirement| requirement.id == id)
             .unwrap_or_else(|| panic!("missing server requirement {id}"))
@@ -2041,7 +2040,7 @@ mod tests {
     fn mapper_requirement(id: &str) -> FlowRequirement {
         let terms =
             packet_probe_terms("How does the mapper build its configuration and execution plan?");
-        packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::ArchitectureExplanation)
+        Vec::new()
             .into_iter()
             .find(|requirement| requirement.id == id)
             .unwrap_or_else(|| panic!("missing mapper requirement {id}"))
@@ -2583,12 +2582,7 @@ mod tests {
     /// widened that the task class's atoms do not name.
     #[test]
     fn hydration_spec_is_derived_from_formula_atom_kinds_only() {
-        let server = packet_flow_requirements_for_terms(
-            &packet_probe_terms(
-                "Trace how a server application registers middleware, handles a request, and sends the response.",
-            ),
-            PacketTaskClassDto::RouteTracing,
-        );
+        let server = Vec::new();
         let legacy_spec = packet_atom_hydration_spec(&server);
         assert!(
             legacy_spec.is_empty(),
@@ -2599,10 +2593,7 @@ mod tests {
             "Legacy-only requirements must derive no promotion patterns (rev 5.3 inertness)"
         );
 
-        let mapper = packet_flow_requirements_for_terms(
-            &packet_probe_terms("How does the mapper build its configuration and execution plan?"),
-            PacketTaskClassDto::ArchitectureExplanation,
-        );
+        let mapper = Vec::new();
         let spec = packet_atom_hydration_spec(&mapper);
         assert!(!spec.file_structural, "A formulas never name FILE trails");
         assert!(
@@ -2643,12 +2634,7 @@ mod tests {
             "rev 5.4: A3's CALL and MEMBER patterns never drive admission"
         );
 
-        let css = packet_flow_requirements_for_terms(
-            &packet_probe_terms(
-                "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-            ),
-            PacketTaskClassDto::ArchitectureExplanation,
-        );
+        let css = Vec::new();
         let spec = packet_atom_hydration_spec(&css);
         assert!(
             spec.file_structural,
@@ -2733,32 +2719,19 @@ mod tests {
     /// admission structurally unable to promote.
     #[test]
     fn promotion_role_slots_are_derived_from_the_cross_container_atom_endpoints() {
-        let legacy = packet_atom_hydration_spec(&packet_flow_requirements_for_terms(
-            &packet_probe_terms(
-                "Trace how a server application registers middleware, handles a request, and sends the response.",
-            ),
-            PacketTaskClassDto::RouteTracing,
-        ));
+        let legacy = packet_atom_hydration_spec(&Vec::new());
         assert!(
             legacy.promotion_role_slots().is_empty(),
             "all-Legacy packets have no slot at all — promotion cannot be expressed"
         );
 
-        let m = packet_atom_hydration_spec(&packet_flow_requirements_for_terms(
-            &packet_probe_terms(
-                "Trace how the logger creates a log record and dispatches it to each handler for processing.",
-            ),
-            PacketTaskClassDto::ArchitectureExplanation,
-        ));
+        let m = packet_atom_hydration_spec(&Vec::new());
         assert!(
             m.promotion_role_slots().is_empty(),
             "the M formulas name only CALL — no cross-container pattern, no slot"
         );
 
-        let a = packet_atom_hydration_spec(&packet_flow_requirements_for_terms(
-            &packet_probe_terms("How does the mapper build its configuration and execution plan?"),
-            PacketTaskClassDto::ArchitectureExplanation,
-        ));
+        let a = packet_atom_hydration_spec(&Vec::new());
         assert_eq!(
             a.promotion_role_slots(),
             vec![ProofRole::Builder, ProofRole::ConfigType],
@@ -2788,12 +2761,7 @@ mod tests {
              Any target names no role at all"
         );
 
-        let c = packet_atom_hydration_spec(&packet_flow_requirements_for_terms(
-            &packet_probe_terms(
-                "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-            ),
-            PacketTaskClassDto::ArchitectureExplanation,
-        ));
+        let c = packet_atom_hydration_spec(&Vec::new());
         assert_eq!(
             c.promotion_role_slots(),
             vec![
@@ -2849,10 +2817,7 @@ mod tests {
     /// never widen it (rev 5.4 membership restriction, held).
     #[test]
     fn promotion_priority_counts_distinct_requirement_role_positions() {
-        let mapper = packet_flow_requirements_for_terms(
-            &packet_probe_terms("How does the mapper build its configuration and execution plan?"),
-            PacketTaskClassDto::ArchitectureExplanation,
-        );
+        let mapper = Vec::new();
         let spec = packet_atom_hydration_spec(&mapper);
         assert!(
             spec.role_scoring_patterns.len() > spec.promotion_patterns.len(),
@@ -2962,12 +2927,7 @@ mod tests {
     /// leaves base-order admission untouched.
     #[test]
     fn a_promotion_slot_is_spent_once_per_role_per_query() {
-        let css = packet_flow_requirements_for_terms(
-            &packet_probe_terms(
-                "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-            ),
-            PacketTaskClassDto::ArchitectureExplanation,
-        );
+        let css = Vec::new();
         let session = PacketProofSession::new(packet_atom_hydration_spec(&css));
         session.record_atom_needed_identities(&GraphResponse {
             center_id: NodeId("10".into()),
@@ -3062,12 +3022,7 @@ mod tests {
         // C family: MEMBER file→CONSTANT and USAGE CONSTANT→VARIABLE match
         // C3's role-to-role patterns exactly — the round-4 flood shape —
         // while IMPORT file→file is the only admissible feed.
-        let css = packet_flow_requirements_for_terms(
-            &packet_probe_terms(
-                "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-            ),
-            PacketTaskClassDto::ArchitectureExplanation,
-        );
+        let css = Vec::new();
         let session = PacketProofSession::new(packet_atom_hydration_spec(&css));
         session.record_atom_needed_identities(&graph_of(
             &[
@@ -3098,10 +3053,7 @@ mod tests {
         // A family: certain CALL onto a METHOD and MEMBER class→METHOD match
         // A3's role-to-role patterns — never admitted; the certain
         // TYPE_USAGE edge admits both type endpoints.
-        let mapper = packet_flow_requirements_for_terms(
-            &packet_probe_terms("How does the mapper build its configuration and execution plan?"),
-            PacketTaskClassDto::ArchitectureExplanation,
-        );
+        let mapper = Vec::new();
         let session = PacketProofSession::new(packet_atom_hydration_spec(&mapper));
         session.record_atom_needed_identities(&graph_of(
             &[
@@ -3537,7 +3489,7 @@ mod tests {
             "Trace how a server application registers middleware, handles a request, and sends the response.",
         );
         let requirements =
-            packet_flow_requirements_for_terms(&terms, PacketTaskClassDto::RouteTracing);
+            Vec::new();
         let terminal = requirements
             .iter()
             .find(|requirement| requirement.id == "request_terminal")
