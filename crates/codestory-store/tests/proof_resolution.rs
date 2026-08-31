@@ -1878,10 +1878,13 @@ fn failed_replacement_and_stale_validation_preserve_the_previous_complete_public
 }
 
 #[test]
-fn incremental_fence_invalidates_proof_overlay_before_graph_mutation() {
+fn incremental_begin_keeps_proof_overlay_on_unpublished_stage() {
+    // Staged generations are unpublished: begin marks incompleteness without
+    // deleting the inherited proof overlay (reader-safety is publication, not
+    // an eager 80k-fact wipe). Callers rebind or replace proof before promotion.
     let mut store = Store::new_in_memory().unwrap();
     seed_exact_graph(&mut store);
-    store
+    let proof = store
         .replace_proof_resolution_projection(
             &publication(),
             &projection(vec![exact_fact(EdgeId(7))]),
@@ -1890,12 +1893,12 @@ fn incremental_fence_invalidates_proof_overlay_before_graph_mutation() {
 
     store.begin_incremental_run().unwrap();
 
-    assert_eq!(store.get_proof_resolution_publication().unwrap(), None);
-    assert_eq!(store.proof_resolution_fact_count().unwrap(), 0);
-    store
-        .get_connection()
-        .execute("DELETE FROM edge WHERE id = 7", [])
-        .expect("the staged graph may mutate after proof invalidation");
+    assert!(store.has_incomplete_incremental_run().unwrap());
+    assert_eq!(
+        store.get_proof_resolution_publication().unwrap(),
+        Some(proof)
+    );
+    assert_eq!(store.proof_resolution_fact_count().unwrap(), 1);
 }
 
 #[test]
