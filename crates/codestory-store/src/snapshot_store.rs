@@ -1,9 +1,12 @@
 use crate::{
-    CorePromotionStats, DatabaseSnapshotCopyStats, GroundingSnapshotMetadata, StorageError,
-    StorageOpenMode, Store,
+    CorePromotionStats, CorePublicationLayout, DatabaseSnapshotCopyStats,
+    DenseAnchorPublicationManifest, DenseAnchorPublicationValidation, GroundingSnapshotMetadata,
+    IndexPublicationRecord, ProofResolutionPublication, ProofResolutionPublicationValidation,
+    StorageError, StorageOpenMode, Store, StructuralTextPublicationValidation,
+    StructuralTextUnitPublicationManifest,
 };
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 /// Timings for rebuilding both grounding snapshot layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,9 @@ pub struct StagedSnapshot {
     path: PathBuf,
     store: Store,
     snapshot_copy: Option<DatabaseSnapshotCopyStats>,
+    inherited_dense_anchor_validation: Option<DenseAnchorPublicationValidation>,
+    inherited_structural_text_validation: Option<StructuralTextPublicationValidation>,
+    inherited_proof_resolution_validation: Option<ProofResolutionPublicationValidation>,
 }
 
 impl<'a> SnapshotStore<'a> {
@@ -52,16 +58,8 @@ impl<'a> SnapshotStore<'a> {
     }
 
     /// Build a unique SQLite path beside the intended live database.
-    pub fn staged_path(live_path: &Path) -> PathBuf {
-        let epoch_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
-        codestory_contracts::owned_artifacts::staged_snapshot_path(
-            live_path,
-            std::process::id(),
-            epoch_ns,
-        )
+    pub fn staged_path(live_path: &Path) -> Result<PathBuf, StorageError> {
+        CorePublicationLayout::from_storage_path(live_path)?.create_staging_database_path()
     }
 
     /// Open a fresh staged database in build mode.
@@ -185,40 +183,96 @@ impl<'a> SnapshotStore<'a> {
 
 impl StagedSnapshot {
     fn open(live_path: &Path) -> Result<Self, StorageError> {
-        let path = SnapshotStore::staged_path(live_path);
+        let path = SnapshotStore::staged_path(live_path)?;
         let store = Store::open_build(&path)?;
         Ok(Self {
             path,
             store,
             snapshot_copy: None,
+            inherited_dense_anchor_validation: None,
+            inherited_structural_text_validation: None,
+            inherited_proof_resolution_validation: None,
         })
     }
 
     fn open_disposable_full_refresh(live_path: &Path) -> Result<Self, StorageError> {
-        let path = SnapshotStore::staged_path(live_path);
+        let path = SnapshotStore::staged_path(live_path)?;
         let store = Store::open_disposable_full_build(&path)?;
         Ok(Self {
             path,
             store,
             snapshot_copy: None,
+            inherited_dense_anchor_validation: None,
+            inherited_structural_text_validation: None,
+            inherited_proof_resolution_validation: None,
         })
     }
 
     fn clone_live(live_path: &Path) -> Result<Self, StorageError> {
-        let path = SnapshotStore::staged_path(live_path);
-        Store::discard_staged_snapshot(&path)?;
-        let snapshot_copy = match Store::copy_database_snapshot(live_path, &path) {
-            Ok(stats) => stats,
-            Err(error) => {
-                let _ = Store::discard_staged_snapshot(&path);
-                return Err(error);
-            }
+        let layout = CorePublicationLayout::from_storage_path(live_path)?;
+        let source = layout.resolve_active_database()?.ok_or_else(|| {
+            StorageError::Other(format!(
+                "No published core database exists for incremental clone: {}",
+                live_path.display()
+            ))
+        })?;
+        let inherited_validations = if layout.read_pointer()?.is_some() {
+            Store::open_immutable_generation(&source)
+                .ok()
+                .and_then(|source_store| {
+                    source_store
+                        .get_complete_index_publication()
+                        .ok()
+                        .flatten()
+                        .and_then(|publication| {
+                            Some((
+                                source_store
+                                    .validate_dense_anchor_publication_sealed(&source, &publication)
+                                    .ok(),
+                                source_store
+                                    .load_structural_text_rebind_validation(&source, &publication)
+                                    .ok(),
+                                source_store
+                                    .load_proof_resolution_rebind_validation(&source, &publication)
+                                    .ok(),
+                            ))
+                        })
+                })
+        } else {
+            None
         };
-        match Store::open_with_mode(&path, StorageOpenMode::Build) {
+        let (
+            inherited_dense_anchor_validation,
+            inherited_structural_text_validation,
+            inherited_proof_resolution_validation,
+        ) = inherited_validations.unwrap_or((None, None, None));
+        let path = SnapshotStore::staged_path(live_path)?;
+        let copy_started = Instant::now();
+        let cloned = crate::core_generation::clone_file_copy_on_write(&source, &path)?;
+        if !cloned {
+            let _ = crate::core_generation::remove_staging_database(&path);
+            return Err(StorageError::Other(format!(
+                "core_copy_on_write_unavailable: incremental refresh cannot clone {} without a foreground full copy",
+                source.display()
+            )));
+        }
+        crate::core_generation::make_file_owner_writable(&path)?;
+        let source_bytes = crate::storage_impl::database_logical_bytes_at_path(&source)?;
+        let target_bytes = crate::storage_impl::database_logical_bytes_at_path(&path)?;
+        let snapshot_copy = DatabaseSnapshotCopyStats {
+            copy_ms: clamp_u128_to_u32(copy_started.elapsed().as_millis()),
+            source_bytes,
+            target_bytes,
+        };
+        let opened = Store::open_with_mode(&path, StorageOpenMode::Build);
+        match opened {
             Ok(store) => Ok(Self {
                 path,
                 store,
                 snapshot_copy: Some(snapshot_copy),
+                inherited_dense_anchor_validation,
+                inherited_structural_text_validation,
+                inherited_proof_resolution_validation,
             }),
             Err(error) => {
                 let _ = Store::discard_staged_snapshot(&path);
@@ -237,6 +291,57 @@ impl StagedSnapshot {
         &mut self.store
     }
 
+    /// Rebind the validated dense-anchor contents inherited from the immutable
+    /// predecessor. Returns `None` when the predecessor was legacy, failed its
+    /// deep validation, or no longer matches the requested publication.
+    pub fn rebind_inherited_dense_anchor_generation(
+        &mut self,
+        previous: &IndexPublicationRecord,
+        publication: &IndexPublicationRecord,
+        policy_version: &str,
+    ) -> Result<Option<DenseAnchorPublicationManifest>, StorageError> {
+        let Some(inherited) = self.inherited_dense_anchor_validation.as_ref() else {
+            return Ok(None);
+        };
+        self.store
+            .rebind_dense_anchor_generation(inherited, previous, publication, policy_version)
+    }
+
+    pub fn rebind_inherited_structural_text_generation(
+        &mut self,
+        previous: &IndexPublicationRecord,
+        publication: &IndexPublicationRecord,
+        changed_file_ids: &[i64],
+    ) -> Result<Option<StructuralTextUnitPublicationManifest>, StorageError> {
+        let Some(inherited) = self.inherited_structural_text_validation.as_ref() else {
+            return Ok(None);
+        };
+        self.store.rebind_structural_text_unit_generation(
+            inherited,
+            previous,
+            publication,
+            changed_file_ids,
+        )
+    }
+
+    pub fn rebind_inherited_proof_resolution_source_identities(
+        &mut self,
+        previous: &IndexPublicationRecord,
+        publication: &IndexPublicationRecord,
+        changed_file_ids: &[i64],
+    ) -> Result<Option<ProofResolutionPublication>, StorageError> {
+        let Some(inherited) = self.inherited_proof_resolution_validation.as_ref() else {
+            return Ok(None);
+        };
+        self.store
+            .rebind_validated_proof_resolution_source_identities(
+                inherited,
+                previous,
+                publication,
+                changed_file_ids,
+            )
+    }
+
     /// Access snapshot operations for the staged store.
     pub fn snapshots(&self) -> SnapshotStore<'_> {
         self.store.snapshots()
@@ -246,7 +351,8 @@ impl StagedSnapshot {
     pub fn discard(self) -> Result<(), StorageError> {
         let path = self.path;
         drop(self.store);
-        SnapshotStore::discard_staged(&path)
+        SnapshotStore::discard_staged(&path)?;
+        crate::core_generation::remove_staging_database(&path)
     }
 
     /// Seal, close, and promote the staged database to `live_path`.
@@ -264,6 +370,33 @@ impl StagedSnapshot {
         let snapshot_copy = self.snapshot_copy;
         drop(self.store);
         let core_promotion = SnapshotStore::promote_staged(&path, live_path)?;
+        Ok(StagedSnapshotPublishStats {
+            sqlite_wal_autocheckpoint_bytes: seal_stats
+                .as_ref()
+                .map(|stats| stats.wal_autocheckpoint_bytes),
+            sqlite_checkpoint_ms: seal_stats.as_ref().map(|stats| stats.checkpoint_ms),
+            sqlite_sync_ms: seal_stats.as_ref().map(|stats| stats.sync_ms),
+            snapshot_copy,
+            core_promotion,
+        })
+    }
+
+    /// Publish a candidate whose owning pipeline already validated every
+    /// complete component receipt. The closed SQLite image is sealed to native
+    /// identity before promotion, so the publisher can reuse those validations
+    /// instead of replaying repository-scale proof and projection scans.
+    pub fn publish_receipted_with_stats(
+        self,
+        live_path: &Path,
+    ) -> Result<StagedSnapshotPublishStats, StorageError> {
+        let seal_stats = self.store.seal_disposable_full_build()?;
+        let receipt = self.store.mint_core_candidate_receipt()?;
+        let path = self.path;
+        let snapshot_copy = self.snapshot_copy;
+        drop(self.store);
+        let receipt = crate::storage_impl::seal_core_candidate_receipt(&path, receipt)?;
+        let core_promotion =
+            Store::promote_staged_snapshot_with_receipt(&path, live_path, receipt)?;
         Ok(StagedSnapshotPublishStats {
             sqlite_wal_autocheckpoint_bytes: seal_stats
                 .as_ref()
@@ -320,9 +453,13 @@ mod tests {
     }
 
     fn logical_database_bytes(path: &Path) -> u64 {
-        let connection =
-            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .expect("open database for logical byte count");
+        let resolved =
+            crate::resolve_core_database_path(path).unwrap_or_else(|_| path.to_path_buf());
+        let connection = rusqlite::Connection::open_with_flags(
+            resolved,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open database for logical byte count");
         let page_count: i64 = connection
             .query_row("PRAGMA page_count", [], |row| row.get(0))
             .expect("read database page count");
@@ -368,6 +505,8 @@ mod tests {
             .saturating_add(stats.staged_to_live_restore_ms)
             .saturating_add(stats.promoted_validation_ms)
             .saturating_add(stats.committed_journal_ms)
+            .saturating_add(stats.generation_install_ms)
+            .saturating_add(stats.pointer_publication_ms)
             .saturating_add(stats.cleanup_ms)
     }
 
@@ -453,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn full_replacement_reports_backup_and_restore_without_incremental_clone() {
+    fn full_replacement_publishes_generation_pointer_without_backup_or_restore() {
         let temp = fresh_temp_root("full-replacement-telemetry");
         let live_path = temp.join("live.sqlite");
         {
@@ -516,13 +655,14 @@ mod tests {
             publish_stats
                 .core_promotion
                 .rollback_backup_copy_ms
-                .is_some()
+                .is_none()
         );
-        assert!(publish_stats.core_promotion.backup_validation_ms.is_some());
+        assert!(publish_stats.core_promotion.backup_validation_ms.is_none());
         assert_eq!(
             publish_stats.core_promotion.previous_live_bytes,
-            publish_stats.core_promotion.rollback_backup_bytes
+            publish_stats.core_promotion.rollback_generation_bytes
         );
+        assert!(publish_stats.core_promotion.rollback_backup_bytes.is_none());
         assert!(
             publish_stats.core_promotion.previous_live_bytes.is_some(),
             "full replacement must report the previous live image"
@@ -532,19 +672,27 @@ mod tests {
             publish_stats.core_promotion.candidate_bytes,
             logical_database_bytes(&live_path)
         );
+        let pointer = crate::CorePublicationLayout::from_storage_path(&live_path)
+            .expect("core layout")
+            .read_pointer()
+            .expect("read pointer")
+            .expect("published pointer");
+        assert_eq!(pointer.active.generation_id, "new-generation");
+        assert_eq!(
+            pointer.rollback.expect("rollback").generation_id,
+            "old-generation"
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }
 
-    /// Whole-database restore is what makes the post-restore identity fence
-    /// cheap: the published file is the validated candidate's bytes, so the
-    /// candidate's receipt covers it. This pins the claim against the files
-    /// themselves, so the reported fence cannot drift from what was published.
+    /// Renaming the sealed stage into its generation preserves the exact
+    /// candidate bytes; publication moves only the small pointer.
     #[test]
     fn promotion_receipt_is_backed_by_the_published_and_candidate_bytes() {
         let temp = fresh_temp_root("receipt-bytes");
         let live_path = temp.join("live.sqlite");
-        let staged_path = SnapshotStore::staged_path(&live_path);
+        let staged_path = SnapshotStore::staged_path(&live_path).expect("staged path");
         let publication = crate::IndexPublicationRecord {
             generation: 1,
             generation_id: "receipt-generation".to_string(),
@@ -580,31 +728,24 @@ mod tests {
             stats.promoted_validation,
             crate::PromotedValidation::ReusedCandidateReceipt
         );
-        let published_bytes = fs::read(&live_path).expect("read published bytes");
+        let published_path =
+            crate::resolve_core_database_path(&live_path).expect("resolve published generation");
+        let published_bytes = fs::read(&published_path).expect("read published bytes");
         assert_eq!(
             published_bytes.len(),
             candidate_bytes.len(),
             "a claimed receipt must describe a published file of the candidate's size"
         );
-        // Only SQLite's own header bookkeeping may differ; every content byte
-        // has to match, or the receipt claimed an identity that does not hold.
-        const SQLITE_HEADER_BYTES: usize = 100;
-        assert_eq!(
-            &published_bytes[SQLITE_HEADER_BYTES..],
-            &candidate_bytes[SQLITE_HEADER_BYTES..],
-            "a claimed receipt must describe the candidate's pages"
-        );
+        assert_eq!(published_bytes, candidate_bytes);
 
         let _ = fs::remove_dir_all(&temp);
     }
 
-    /// The post-restore fence may only claim the candidate receipt when the
-    /// promotion can actually prove the published file byte-identical to the
-    /// validated candidate. A staged image with live content outside the main
-    /// file is unprovable, and the promotion must report the weaker claim
-    /// instead of asserting an identity it never established.
+    /// An immutable generation cannot carry live SQLite content outside its
+    /// database file. A pinned WAL rejects publication before the pointer can
+    /// move.
     #[test]
-    fn promotion_reports_revalidated_when_the_candidate_image_is_unprovable() {
+    fn promotion_rejects_a_candidate_with_live_wal_content() {
         let temp = fresh_temp_root("unprovable-candidate-image");
         let live_path = temp.join("live.sqlite");
         let mut staged = SnapshotStore::open_staged(&live_path).expect("open staged");
@@ -651,24 +792,18 @@ mod tests {
             "fixture must leave staged content outside the main database file"
         );
 
-        let publish_stats = staged
+        let error = staged
             .publish_with_stats(&live_path)
-            .expect("promote an unprovable staged candidate");
-
-        assert_eq!(
-            publish_stats.core_promotion.promoted_validation,
-            crate::PromotedValidation::Revalidated,
-            "an unprovable candidate image must not claim the byte-identity receipt"
-        );
-        let live = Store::open(&live_path).expect("open promoted live store");
-        assert_eq!(
-            live.get_complete_index_publication()
-                .expect("read promoted publication"),
-            Some(publication),
-            "the weaker fence still has to publish the candidate"
+            .expect_err("live WAL candidate must not publish");
+        assert!(error.to_string().contains("retains SQLite content"));
+        assert!(
+            crate::CorePublicationLayout::from_storage_path(&live_path)
+                .expect("layout")
+                .read_pointer()
+                .expect("observe pointer")
+                .is_none()
         );
 
-        drop(live);
         drop(staged_reader);
         let _ = Store::discard_staged_snapshot(&staged_path);
         let _ = fs::remove_dir_all(&temp);
@@ -833,6 +968,12 @@ mod tests {
         );
         assert!(publish_stats.core_promotion.backup_validation_ms.is_none());
         assert!(publish_stats.core_promotion.rollback_backup_bytes.is_none());
+        assert!(
+            publish_stats
+                .core_promotion
+                .rollback_generation_bytes
+                .is_none()
+        );
         assert_promotion_reconciles(&publish_stats.core_promotion);
         assert_eq!(
             publish_stats.core_promotion.candidate_bytes,
@@ -1252,16 +1393,17 @@ mod tests {
             Some(snapshot_copy.source_bytes)
         );
         assert_eq!(
-            publish_stats.core_promotion.rollback_backup_bytes,
+            publish_stats.core_promotion.rollback_generation_bytes,
             publish_stats.core_promotion.previous_live_bytes
         );
+        assert!(publish_stats.core_promotion.rollback_backup_bytes.is_none());
         assert!(
             publish_stats
                 .core_promotion
                 .rollback_backup_copy_ms
-                .is_some()
+                .is_none()
         );
-        assert!(publish_stats.core_promotion.backup_validation_ms.is_some());
+        assert!(publish_stats.core_promotion.backup_validation_ms.is_none());
         assert_promotion_reconciles(&publish_stats.core_promotion);
         assert_eq!(
             publish_stats.core_promotion.candidate_bytes,

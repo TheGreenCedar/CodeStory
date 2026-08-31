@@ -7,6 +7,7 @@
 //! upgrade structural source proof into parser-backed graph evidence.
 
 mod annotations;
+mod core_generation;
 mod file_store;
 mod projection_store;
 mod snapshot_store;
@@ -21,6 +22,11 @@ pub use annotations::{
     NativeRootBinding, OrphanReason, ResolutionStatus, anchor_evidence, legacy_bookmark_uuid,
     resolve_bookmark,
 };
+pub use core_generation::{
+    CORE_DATABASE_FILE, CORE_DIRECTORY, CORE_GENERATIONS_DIRECTORY, CORE_PUBLICATION_FILE,
+    CORE_STAGING_DIRECTORY, CorePublicationLayout, core_database_exists,
+    resolve_core_database_path, resolve_core_generation_database_path,
+};
 pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};
 pub use snapshot_store::{
@@ -28,11 +34,12 @@ pub use snapshot_store::{
     StagedSnapshotPublishStats,
 };
 pub use storage_impl::{
-    BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundedRawCallEdges,
-    BuildNodeLookup, CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary, CorePromotionStats,
-    DENSE_ANCHOR_MIGRATION_STATE_NATIVE, DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION,
-    DatabaseSnapshotCopyStats, DenseAnchorInput, DenseAnchorInputReuseMetadata,
-    DenseAnchorInputStats, DenseAnchorPublicationManifest, DenseReasonCounts,
+    BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundRetrievalIndexManifest,
+    BoundedRawCallEdges, BuildNodeLookup, CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary,
+    CorePromotionStats, DENSE_ANCHOR_MIGRATION_STATE_NATIVE,
+    DENSE_ANCHOR_PUBLICATION_SCHEMA_VERSION, DatabaseSnapshotCopyStats, DenseAnchorContentIdentity,
+    DenseAnchorInput, DenseAnchorInputReuseMetadata, DenseAnchorInputStats,
+    DenseAnchorPublicationManifest, DenseAnchorPublicationValidation, DenseReasonCounts,
     ExactCallEdgeProjection, FileContentHash, FileInfo, FileProjectionRemovalSummary, FileRole,
     GroundingCallDegree, GroundingEdgeKindCount, GroundingFileSummary, GroundingNodeRecord,
     GroundingSnapshotMetadata, GroundingSnapshotState, IndexArtifactCacheEntry,
@@ -40,7 +47,7 @@ pub use storage_impl::{
     IndexPublicationRecord, LlmSymbolDoc, LlmSymbolDocReuseMetadata, LlmSymbolDocStats,
     ProjectionFlushBreakdown, ProjectionPersistenceFamilyStats, ProjectionPersistenceStats,
     PromotedValidation, ProofResolutionPublication, RehydratedCacheRebaseStats,
-    RetrievalIndexManifest, RetrievalIndexRollbackRecord,
+    RetrievalCoreGenerationBinding, RetrievalIndexManifest, RetrievalIndexRollbackRecord,
     SOURCE_POLICY_EXCLUSION_PUBLICATION_SCHEMA_VERSION, STRUCTURAL_TEXT_UNIT_DESCRIPTOR_VERSION,
     STRUCTURAL_TEXT_UNIT_MIGRATION_STATE_NATIVE, STRUCTURAL_TEXT_UNIT_PUBLICATION_SCHEMA_VERSION,
     SearchSymbolProjection, SearchSymbolProjectionDetail, SourcePolicyExclusionManifest,
@@ -56,6 +63,9 @@ pub use storage_impl::{
 pub use storage_impl::{
     BashStoreResolutionWork, bash_store_resolution_work, reset_bash_store_resolution_work,
     reset_store_replay_work, store_replay_work,
+};
+pub(crate) use storage_impl::{
+    ProofResolutionPublicationValidation, StructuralTextPublicationValidation,
 };
 
 impl Store {

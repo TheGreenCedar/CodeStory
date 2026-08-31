@@ -26,7 +26,8 @@ pub(in crate::app) fn build_doctor_output(
     }
     let project = display::clean_path_string(&summary.root);
     let storage_path = display::clean_path_string(&runtime.storage_path.to_string_lossy());
-    let storage_exists = runtime.storage_path.exists();
+    let storage_exists =
+        codestory_runtime::core_database_exists(&runtime.storage_path).unwrap_or(false);
     let sidecar_retrieval = doctor_sidecar_status(runtime);
     let readiness_sidecar = agent_readiness_status(runtime, None);
     let readiness = build_summary_readiness(
