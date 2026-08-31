@@ -87,7 +87,9 @@ fn graph_disposition_from_disposition(disposition: &Value) -> &'static str {
     match disposition.get("kind").and_then(Value::as_str) {
         Some("contract_proven") => "proven",
         Some("contract_refuted") => {
-            if disposition.pointer("/refutation/kind").and_then(Value::as_str)
+            if disposition
+                .pointer("/refutation/kind")
+                .and_then(Value::as_str)
                 == Some("certified_absence")
             {
                 "unknown"
@@ -531,7 +533,10 @@ mod tests {
         let public = project_public_verification_result(internal)
             .expect("project public verification result");
         assert_eq!(public["graph_disposition"], "unknown");
-        assert_eq!(public.pointer("/disposition/kind"), Some(&json!("unavailable")));
+        assert_eq!(
+            public.pointer("/disposition/kind"),
+            Some(&json!("unavailable"))
+        );
         assert_ne!(
             public.pointer("/disposition/refutation/kind"),
             Some(&json!("certified_absence"))

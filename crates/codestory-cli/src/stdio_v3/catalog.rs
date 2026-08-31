@@ -508,12 +508,7 @@ fn proof_step_schema_v3() -> Value {
         ("step_index", unsigned_integer_schema_v3()),
         (
             "status",
-            enum_schema_v3(&[
-                "proven",
-                "positive_contradiction",
-                "unavailable",
-                "unknown",
-            ]),
+            enum_schema_v3(&["proven", "positive_contradiction", "unavailable", "unknown"]),
         ),
         ("receipt", nullable_schema_v3(unsigned_integer_schema_v3())),
     ])
@@ -1185,8 +1180,7 @@ mod tests {
                 );
                 for activation_capable in ["packet", "search", "ground", "context"] {
                     assert_eq!(
-                        tool(&tools, activation_capable)
-                            .pointer("/annotations/readOnlyHint"),
+                        tool(&tools, activation_capable).pointer("/annotations/readOnlyHint"),
                         Some(&json!(true)),
                         "activation-capable {activation_capable} must emit readOnlyHint=true"
                     );

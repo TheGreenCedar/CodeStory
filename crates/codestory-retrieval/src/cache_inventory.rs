@@ -234,8 +234,11 @@ impl InventoryState {
             "{CLONE_CAPABILITY_PROBE_DIR_PREFIX}{}",
             std::process::id()
         ));
-        let relative = relative_path(&self.cache_root, &probe_dir)
-            .unwrap_or_else(|_| CLONE_CAPABILITY_PROBE_DIR_PREFIX.trim_end_matches('-').into());
+        let relative = relative_path(&self.cache_root, &probe_dir).unwrap_or_else(|_| {
+            CLONE_CAPABILITY_PROBE_DIR_PREFIX
+                .trim_end_matches('-')
+                .into()
+        });
         let _ = std::fs::remove_dir_all(&probe_dir);
         if let Err(error) = std::fs::create_dir_all(&probe_dir) {
             self.clone_sharing.push(CacheCloneSharing {
@@ -561,7 +564,9 @@ mod tests {
             "sqlite databases should be observed"
         );
         assert!(
-            !after.keys().any(|path| path.contains(CLONE_CAPABILITY_PROBE_DIR_PREFIX)),
+            !after
+                .keys()
+                .any(|path| path.contains(CLONE_CAPABILITY_PROBE_DIR_PREFIX)),
             "capability probe directory must be removed: {:?}",
             after.keys().collect::<Vec<_>>()
         );

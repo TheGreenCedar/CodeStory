@@ -23,20 +23,22 @@ pub use annotations::{
     NativeRootBinding, OrphanReason, ResolutionStatus, anchor_evidence, legacy_bookmark_uuid,
     resolve_bookmark,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use core_generation::with_core_clone_disabled;
 pub use core_generation::{
     CORE_COPY_ON_WRITE_UNAVAILABLE, CORE_DATABASE_FILE, CORE_DIRECTORY, CORE_GENERATIONS_DIRECTORY,
     CORE_PUBLICATION_FILE, CORE_STAGING_DIRECTORY, CorePublicationLayout, core_database_exists,
     is_core_copy_on_write_unavailable, resolve_core_database_path,
     resolve_core_generation_database_path,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use core_generation::with_core_clone_disabled;
 pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};
 pub use snapshot_store::{
     SnapshotRefreshStats, SnapshotStore, StagedSnapshot, StagedSnapshotFinalizeStats,
     StagedSnapshotPublishStats,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use sqlite_observation::with_available_filesystem_bytes_override;
 pub use sqlite_observation::{
     CompactRehydratePeakSpace, SqliteDatabaseObservation, SqliteVacuumIntoStats,
     available_filesystem_bytes, compact_candidate_size_limit,
@@ -45,8 +47,6 @@ pub use sqlite_observation::{
     is_insufficient_compact_rehydrate_space, measure_compact_rehydrate_peak_space,
     observe_sqlite_database, vacuum_into_database,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use sqlite_observation::with_available_filesystem_bytes_override;
 pub use storage_impl::{
     BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundRetrievalIndexManifest,
     BoundedRawCallEdges, BuildNodeLookup, CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary,

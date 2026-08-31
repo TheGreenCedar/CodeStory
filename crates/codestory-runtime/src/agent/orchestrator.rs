@@ -2187,8 +2187,7 @@ fn apply_repository_evidence_gap_continuation(
     evidence_plan: &RepositoryEvidencePlan,
     request: &AgentPacketRequestDto,
 ) {
-    let already_drilled =
-        request.parent_packet_id.is_some() || !request.option_ids.is_empty();
+    let already_drilled = request.parent_packet_id.is_some() || !request.option_ids.is_empty();
     merge_repository_evidence_gaps_into_disposition(
         packet,
         &evidence_plan.uncovered,
@@ -16265,8 +16264,18 @@ mod tests {
             &mut answer,
         )
         .expect("repository evidence plan");
-        assert!(evidence_plan.material_node_ids.iter().any(|node| node.0 == "a"));
-        assert!(evidence_plan.material_node_ids.iter().any(|node| node.0 == "b"));
+        assert!(
+            evidence_plan
+                .material_node_ids
+                .iter()
+                .any(|node| node.0 == "a")
+        );
+        assert!(
+            evidence_plan
+                .material_node_ids
+                .iter()
+                .any(|node| node.0 == "b")
+        );
         prefer_repository_evidence_hydrate_roots(&mut answer, &evidence_plan.material_node_ids);
         assert_eq!(answer.citations[0].node_id.0, "a");
         assert_eq!(answer.citations[1].node_id.0, "b");

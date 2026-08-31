@@ -1158,11 +1158,11 @@ mod tests {
             .expect("seed live file");
         }
 
-        let error = crate::with_core_clone_disabled(|| match SnapshotStore::clone_live_to_staged(
-            &live_path,
-        ) {
-            Ok(_) => panic!("CoW must fail closed when clone is disabled"),
-            Err(error) => error,
+        let error = crate::with_core_clone_disabled(|| {
+            match SnapshotStore::clone_live_to_staged(&live_path) {
+                Ok(_) => panic!("CoW must fail closed when clone is disabled"),
+                Err(error) => error,
+            }
         });
         assert!(
             crate::is_core_copy_on_write_unavailable(&error),

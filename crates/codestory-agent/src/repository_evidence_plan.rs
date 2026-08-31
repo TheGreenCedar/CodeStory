@@ -656,7 +656,12 @@ mod tests {
             .flat_map(|o| o.node_ids.iter().map(|n| n.0.as_str()))
             .collect();
         assert_eq!(anchors, vec!["a", "b"]);
-        assert!(!plan.material_node_ids.iter().any(|n| n.0.starts_with("noise_")));
+        assert!(
+            !plan
+                .material_node_ids
+                .iter()
+                .any(|n| n.0.starts_with("noise_"))
+        );
         assert!(plan.material_edge_ids.iter().any(|e| e.0 == "e1"));
     }
 
@@ -711,12 +716,10 @@ mod tests {
                 .iter()
                 .any(|o| o.kind == RepositoryEvidenceObjectiveKind::RelationPath)
         );
-        assert!(
-            !plan.objectives.iter().any(|o| {
-                o.kind == RepositoryEvidenceObjectiveKind::RelationPath
-                    && o.edge_ids.iter().any(|e| e.0 == "reverse_only")
-            })
-        );
+        assert!(!plan.objectives.iter().any(|o| {
+            o.kind == RepositoryEvidenceObjectiveKind::RelationPath
+                && o.edge_ids.iter().any(|e| e.0 == "reverse_only")
+        }));
         assert!(plan.uncovered.iter().any(|g| {
             g.kind == RepositoryEvidenceGapKind::MissingRelation
                 && g.node_ids.iter().any(|n| n.0 == "a")

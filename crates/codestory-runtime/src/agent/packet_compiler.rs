@@ -692,7 +692,6 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
         .collect()
 }
 
-
 /// Map Stage B uncovered gaps into DrillOnce options the compiler already
 /// understands. Unknown gaps stay observational — they must not assert absence.
 pub fn merge_repository_evidence_gaps_into_disposition(

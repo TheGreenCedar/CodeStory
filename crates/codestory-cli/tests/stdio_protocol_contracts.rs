@@ -733,11 +733,7 @@ fn public_exact_proof_cold_project_returns_preparing_with_retry() {
     match content.get("kind").and_then(Value::as_str) {
         Some("preparing") => {
             assert_eq!(content["state"], json!("preparing"));
-            assert!(
-                content["retry_after_ms"]
-                    .as_u64()
-                    .is_some_and(|ms| ms > 0)
-            );
+            assert!(content["retry_after_ms"].as_u64().is_some_and(|ms| ms > 0));
             assert!(content["operation"].is_object());
         }
         Some("complete" | "budget_exceeded") => {
@@ -1356,8 +1352,7 @@ fn proof_canonical_id(fixture: &StdioFixture, name: &str) -> String {
                 fixture.cache_dir.path().display()
             )
         });
-    let connection =
-        rusqlite::Connection::open(&db_path).expect("open indexed proof fixture");
+    let connection = rusqlite::Connection::open(&db_path).expect("open indexed proof fixture");
     connection
         .query_row(
             "SELECT canonical_id FROM node WHERE serialized_name = ?1 AND kind = 13 AND canonical_id IS NOT NULL ORDER BY id LIMIT 1",
