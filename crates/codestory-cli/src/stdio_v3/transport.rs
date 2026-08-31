@@ -5,7 +5,7 @@ use super::{
     profile::{BatchPolicyV3, McpRevisionV3},
 };
 
-pub(crate) const PROOF_TOOL_RESULT_MAX_BYTES_V3: usize = 64 * 1024;
+pub(crate) const PROOF_TOOL_RESULT_MAX_BYTES_V3: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FrameResponseV3 {
@@ -147,6 +147,14 @@ pub(crate) fn build_tool_result_v3(
     tool_name: &str,
     root: &Value,
 ) -> Result<Value, StdioV3InternalError> {
+    if crate::prove_call_path::is_proof_tool_name(tool_name) {
+        return build_tool_result_for_surface_v3(
+            revision,
+            crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
+            root,
+            V3SurfaceSet::WithProof,
+        );
+    }
     build_tool_result_for_surface_v3(revision, tool_name, root, V3SurfaceSet::EvidenceOnly)
 }
 
@@ -721,6 +729,8 @@ mod tests {
     fn result_profiles_are_revision_native_and_keep_typed_uncertainty_successful() {
         for disposition in ["unknown", "unavailable"] {
             let root = proof_root(disposition);
+            let public = crate::prove_call_path::project_public_verification_result(root.clone())
+                .expect("project public verification result");
             for revision in McpRevisionV3::all() {
                 let result = build_proof_tool_result_v3(*revision, &root).unwrap_or_else(|error| {
                     panic!("{disposition} {revision:?} tool result: {error:?}")
@@ -730,9 +740,9 @@ mod tests {
                     .pointer("/content/0/text")
                     .and_then(Value::as_str)
                     .unwrap();
-                assert_eq!(serde_json::from_str::<Value>(text).unwrap(), root);
+                assert_eq!(serde_json::from_str::<Value>(text).unwrap(), public);
                 if revision.profile().structured_content {
-                    assert_eq!(result["structuredContent"], root);
+                    assert_eq!(result["structuredContent"], public);
                     assert_eq!(
                         result.pointer("/_meta/com.thegreencedar.codestory~1protocolRevision"),
                         Some(&json!(revision.as_str()))
@@ -752,7 +762,14 @@ mod tests {
         invalid["undeclared"] = json!(true);
         let error = build_proof_tool_result_v3(McpRevisionV3::June2025, &invalid)
             .expect_err("undeclared output must fail closed");
-        assert_eq!(error, StdioV3InternalError::OutputSchemaViolation);
+        assert!(
+            matches!(
+                error,
+                StdioV3InternalError::OutputSchemaViolation
+                    | StdioV3InternalError::InvalidProjection(_)
+            ),
+            "undeclared proof fields must fail closed: {error:?}"
+        );
         let response = jsonrpc_internal_error_v3(json!(7), &error);
         assert_eq!(response.pointer("/error/code"), Some(&json!(-32603)));
         assert!(response.pointer("/error/data/structuredContent").is_none());

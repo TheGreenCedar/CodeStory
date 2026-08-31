@@ -706,10 +706,10 @@ impl ActivationService {
     }
 
     /// Configure the controller around an existing complete core publication
-    /// without repairing source freshness. This admission path is for
-    /// operations that explain drift from that publication. Cold or partial
-    /// state still runs normal activation; corrupt observational reads fail
-    /// directly and are never reclassified as a cold cache.
+    /// without repairing source freshness. Warm complete cores stay bind-only
+    /// observational. Cold or fenced state starts normal activation so callers
+    /// can return `preparing` plus `retry_after_ms`; corrupt observational
+    /// reads fail directly and are never reclassified as a cold cache.
     pub fn ensure_complete_core_for_observation(
         &self,
         project_root: &Path,
@@ -743,9 +743,10 @@ impl ActivationService {
     }
 
     /// Bind an already-complete core publication without starting managed
-    /// activation. Strictly observational tools use this path so a cold or
-    /// fenced cache stays unavailable instead of triggering indexing or
-    /// retrieval preparation.
+    /// activation. Reserved for callers that must keep a cold or fenced cache
+    /// unavailable instead of triggering indexing or retrieval preparation.
+    /// Exact-proof admission uses [`Self::ensure_complete_core_for_observation`]
+    /// so cold projects return preparing plus retry instead of a terminal miss.
     pub fn bind_existing_complete_core_for_observation(
         &self,
         project_root: &Path,

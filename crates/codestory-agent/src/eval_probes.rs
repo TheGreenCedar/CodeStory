@@ -493,8 +493,6 @@ pub fn eval_indexing_storage_flow_template_claims(
     prompt: &str,
     citations: &[AgentCitationDto],
 ) -> Vec<(String, Vec<AgentCitationDto>)> {
-    use crate::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
-
     if !eval_probes_enabled() {
         return Vec::new();
     }

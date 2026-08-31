@@ -1735,15 +1735,10 @@ fn handle_stdio_request(
                     });
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
                 }
-                let activation = if crate::prove_call_path::is_proof_tool_name(name) {
-                    runtime
-                        .activation
-                        .bind_existing_complete_core_for_observation(
-                            &runtime.project_root,
-                            &runtime.storage_path,
-                            Arc::clone(cancelled),
-                        )
-                } else if observes_complete_core {
+                // Exact proof and affected share complete-core admission: a warm
+                // complete publication stays observational, while cold/fenced
+                // state starts managed preparation and returns preparing+retry.
+                let activation = if observes_complete_core {
                     runtime.activation.ensure_complete_core_for_observation(
                         &runtime.project_root,
                         &runtime.storage_path,

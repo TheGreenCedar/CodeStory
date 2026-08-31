@@ -23,7 +23,7 @@ pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsComma
     let runtime = RuntimeContext::new_inspect_only(&project)?;
     runtime
         .activation
-        .bind_existing_complete_core_for_observation(
+        .ensure_complete_core_for_observation(
             &runtime.project_root,
             &runtime.storage_path,
             Arc::new(AtomicBool::new(false)),
