@@ -8,6 +8,8 @@
 use crate::packet_proof_atoms::FlowProofSpec;
 use codestory_contracts::api::{AgentCitationDto, EdgeKind, GraphEdgeDto, NodeKind};
 
+type CallBoundaryNamePredicate = fn(&str) -> bool;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlowRole {
     Entrypoint,
@@ -73,14 +75,14 @@ impl EvidencePredicate {
         false
     }
 
-    pub fn call_boundary_target(self, _citation: &AgentCitationDto) -> Option<fn(&str) -> bool> {
+    pub fn call_boundary_target(self, _citation: &AgentCitationDto) -> Option<CallBoundaryNamePredicate> {
         None
     }
 
     pub fn ordered_call_boundary(
         self,
         _citation: &AgentCitationDto,
-    ) -> Option<(fn(&str) -> bool, fn(&str) -> bool)> {
+    ) -> Option<(CallBoundaryNamePredicate, CallBoundaryNamePredicate)> {
         None
     }
 

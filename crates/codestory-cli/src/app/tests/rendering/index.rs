@@ -135,13 +135,12 @@ fn render_index_markdown_includes_rich_timing_breakdown_when_available() {
         markdown.contains("staged_snapshot_copy: copy_ms=13 source_bytes=1024 target_bytes=1024")
     );
     assert!(markdown.contains(
-            "core_promotion_ms: total=89 lock_recovery=1 candidate_validation=11 previous_validation=12 rollback_backup_copy=13 backup_validation=14 prepared_journal_write=2 prepared_journal_file_sync=3 prepared_journal_directory_sync=4 staged_to_live_restore=15 promoted_validation=10 committed_journal=2 cleanup=1 unattributed=1"
+            "core_promotion_ms: total=89 lock_wait=0 legacy_recovery=1 candidate_validation=11 previous_pointer_resolution=12 generation_install=5 pointer_publication=2 cleanup=1 unattributed=1"
         ));
-    assert!(
-        markdown.contains(
-            "core_promotion_bytes: candidate=2048 previous_live=1024 rollback_backup=1024"
-        )
-    );
+    assert!(markdown.contains(
+            "core_promotion_bytes: candidate=2048 previous_live=1024 rollback_generation=1024"
+        ));
+    assert!(markdown.contains("core_promotion_fence: promoted_validation=reused_candidate_receipt"));
     assert!(markdown.contains("setup_ms: existing_projection_ids=11 seed_symbol_table=12"));
     assert!(
             markdown.contains(

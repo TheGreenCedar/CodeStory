@@ -419,8 +419,21 @@ impl RuntimeContext {
     ) -> Result<OpenedProject> {
         let mut phase_timings = None;
         if let Some(mode) = decision.effective_mode {
+            // Compatibility recovery has no safe pre-refresh summary; bind the
+            // project paths without opening the live core, then rebuild.
             if summary.is_none() {
-                self.open_project_summary()?;
+                if decision.reason.is_some() {
+                    self.index
+                        .bind_project_paths_for_refresh(
+                            self.project_root.clone(),
+                            self.storage_path.clone(),
+                        )
+                        .map_err(|error| {
+                            map_api_error_for_project(error, &self.project_root)
+                        })?;
+                } else {
+                    self.open_project_summary()?;
+                }
             }
             phase_timings = Some(
                 self.index
@@ -1263,17 +1276,60 @@ mod tests {
         let storage_path = seed.storage_path.clone();
         drop(seed);
 
-        // Stamp the cache one version past whatever this build wrote, which is
-        // exactly the shape a rolled-back CLI meets in the field.
-        let stamp = rusqlite::Connection::open(&storage_path).expect("open cache for stamping");
-        let supported: i64 = stamp
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("read the supported schema version");
-        assert!(supported > 0, "the seeded cache must record a version");
-        stamp
-            .pragma_update(None, "user_version", supported + 1)
-            .expect("stamp a newer schema version");
-        drop(stamp);
+        // Stamp the active immutable generation one version past whatever this
+        // build wrote, which is exactly the shape a rolled-back CLI meets.
+        let generation_path = codestory_runtime::resolve_core_database_path(&storage_path)
+            .expect("resolve active immutable generation");
+        for suffix in ["-wal", "-journal", "-shm"] {
+            let mut sidecar = generation_path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let _ = fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&generation_path, fs::Permissions::from_mode(0o644))
+                .expect("make generation writable");
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = fs::metadata(&generation_path).expect("generation metadata");
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(false);
+            fs::set_permissions(&generation_path, permissions).expect("make generation writable");
+        }
+        {
+            let stamp =
+                rusqlite::Connection::open(&generation_path).expect("open cache for stamping");
+            let supported: i64 = stamp
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("read the supported schema version");
+            assert!(supported > 0, "the seeded cache must record a version");
+            stamp
+                .pragma_update(None, "user_version", supported + 1)
+                .expect("stamp a newer schema version");
+            stamp
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("checkpoint schema stamp");
+        }
+        for suffix in ["-wal", "-journal", "-shm"] {
+            let mut sidecar = generation_path.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let _ = fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&generation_path, fs::Permissions::from_mode(0o444))
+                .expect("reseal generation");
+        }
+        #[cfg(not(unix))]
+        {
+            let metadata = fs::metadata(&generation_path).expect("generation metadata after stamp");
+            let mut permissions = metadata.permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(&generation_path, permissions).expect("reseal generation");
+        }
 
         let runtime = RuntimeContext::new_inspect_only(&args).expect("resolve runtime paths");
         let error = runtime

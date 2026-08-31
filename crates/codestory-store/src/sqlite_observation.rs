@@ -254,7 +254,11 @@ fn available_filesystem_bytes_platform(path: &Path) -> Result<u64, StorageError>
         )));
     }
     let stat = unsafe { stat.assume_init() };
+    // libc field widths differ by target (`fsblkcnt_t` is u32 on Darwin and
+    // `c_ulong` on Linux). Keep an explicit widening conversion for both.
+    #[allow(clippy::useless_conversion)]
     let block_size = u64::from(stat.f_frsize);
+    #[allow(clippy::useless_conversion)]
     let available = u64::from(stat.f_bavail);
     block_size
         .checked_mul(available)

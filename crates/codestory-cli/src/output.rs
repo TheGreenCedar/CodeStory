@@ -4282,7 +4282,8 @@ mod tests {
                 total_ms: 9,
                 candidate_validation_ms: 2,
                 previous_validation_ms: 1,
-                staged_to_live_restore_ms: 3,
+                generation_install_ms: 3,
+                pointer_publication_ms: 1,
                 promoted_validation_ms: 2,
                 unattributed_ms: 1,
                 candidate_bytes: 4_096,
@@ -4294,10 +4295,13 @@ mod tests {
 
         append_index_phase_timings(&mut markdown, &timings);
 
-        assert!(markdown.contains("rollback_backup_copy=none backup_validation=none"));
         assert!(markdown.contains(
-            "core_promotion_bytes: candidate=4096 previous_live=none rollback_backup=none"
+            "core_promotion_ms: total=9 lock_wait=0 legacy_recovery=0 candidate_validation=2 previous_pointer_resolution=1 generation_install=3 pointer_publication=1 cleanup=0 unattributed=1"
         ));
+        assert!(markdown.contains(
+            "core_promotion_bytes: candidate=4096 previous_live=none rollback_generation=none"
+        ));
+        assert!(!markdown.contains("rollback_backup"));
         assert!(!markdown.contains("staged_snapshot_copy:"));
     }
 

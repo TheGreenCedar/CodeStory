@@ -2624,6 +2624,15 @@ impl IndexService {
             .run_indexing_blocking_without_runtime_refresh(mode)
     }
 
+    pub fn bind_project_paths_for_refresh(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<(), ApiError> {
+        self.controller
+            .bind_project_paths_for_refresh(root, storage_path)
+    }
+
     pub fn run_indexing_blocking_without_runtime_refresh_with_cancel(
         &self,
         mode: IndexMode,

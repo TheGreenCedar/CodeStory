@@ -69,6 +69,12 @@ pub fn core_database_exists(storage_path: &Path) -> Result<bool, ApiError> {
         .map_err(|error| ApiError::internal(format!("Failed to resolve core storage: {error}")))
 }
 
+/// Resolve the active published core database for a logical storage path.
+pub fn resolve_core_database_path(storage_path: &Path) -> Result<PathBuf, ApiError> {
+    codestory_store::resolve_core_database_path(storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to resolve core storage: {error}")))
+}
+
 mod affected;
 mod agent;
 mod evidence_projection_v3;

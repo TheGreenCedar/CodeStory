@@ -961,6 +961,49 @@ impl AppController {
         self.run_indexing_blocking_inner(mode, false, None)
     }
 
+    /// Bind project/storage paths for a recovery refresh without opening the
+    /// live core. Compatibility recovery (schema upgrade, incomplete fence)
+    /// must not call read-only open before the replacement generation exists.
+    pub fn bind_project_paths_for_refresh(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<(), ApiError> {
+        if !root.is_dir() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist or is not a directory: {}",
+                root.display()
+            )));
+        }
+        let changed = {
+            let mut state = self.state.lock();
+            let changed =
+                state.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || state.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                });
+            if changed {
+                state.node_names.clear();
+                clear_search_engine(&mut state);
+                state.observed_core_publication = None;
+            }
+            state.project_root = Some(root);
+            state.storage_path = Some(storage_path);
+            changed
+        };
+        if changed {
+            self.sidecar_query_cache.lock().clear();
+            #[cfg(any(
+                test,
+                feature = "test-support",
+                feature = "proof-qualification-support"
+            ))]
+            self.clear_proof_publication_validation_cache();
+        }
+        Ok(())
+    }
+
     pub fn run_indexing_blocking_without_runtime_refresh_with_cancel(
         &self,
         mode: IndexMode,

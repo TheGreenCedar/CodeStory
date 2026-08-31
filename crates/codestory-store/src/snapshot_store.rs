@@ -224,8 +224,8 @@ impl StagedSnapshot {
                         .get_complete_index_publication()
                         .ok()
                         .flatten()
-                        .and_then(|publication| {
-                            Some((
+                        .map(|publication| {
+                            (
                                 source_store
                                     .validate_dense_anchor_publication_sealed(&source, &publication)
                                     .ok(),
@@ -235,7 +235,7 @@ impl StagedSnapshot {
                                 source_store
                                     .load_proof_resolution_rebind_validation(&source, &publication)
                                     .ok(),
-                            ))
+                            )
                         })
                 })
         } else {

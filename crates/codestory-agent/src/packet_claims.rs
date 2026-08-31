@@ -128,7 +128,6 @@ fn packet_citation_is_diagnostic_only(citation: &AgentCitationDto) -> bool {
 
 /// Counts claims one assembly layer actually added, so `claim_source` totals describe the
 /// packet that shipped rather than what a layer offered before dedupe and the claim cap.
-
 pub fn append_ranked_citation_claims(
     prompt: &str,
     citations: &[AgentCitationDto],

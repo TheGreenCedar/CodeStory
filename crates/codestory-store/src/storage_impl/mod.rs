@@ -4865,6 +4865,11 @@ impl Storage {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let version = version.max(0) as u32;
+        if version > SCHEMA_VERSION {
+            return Err(StorageError::Other(format!(
+                "Unsupported database schema version: {version} (max supported: {SCHEMA_VERSION})"
+            )));
+        }
         if version != SCHEMA_VERSION {
             return Err(StorageError::Other(format!(
                 "Read-only storage requires schema version {SCHEMA_VERSION}, found {version}"
@@ -4970,7 +4975,7 @@ impl Storage {
         let logical_path = path;
         let layout = crate::CorePublicationLayout::from_storage_path(logical_path)?;
         let pointer = layout.read_pointer()?;
-        if pointer.is_none() && promotion_artifacts_exist(logical_path) {
+        if promotion_artifacts_exist(logical_path) {
             return Err(StorageError::Other(format!(
                 "Observational storage cannot inspect {} while promotion recovery is pending",
                 logical_path.display()
