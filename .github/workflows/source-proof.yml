@@ -918,8 +918,14 @@ jobs:
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
+      - name: Packet generalization boundary
+        run: node scripts/check-packet-generalization-boundary.mjs
+
       - name: Generalization lint hostile matrix
         run: node --test scripts/tests/lint-retrieval-generalization.test.mjs
+
+      - name: Packet generalization boundary hostile matrix
+        run: node --test scripts/tests/check-packet-generalization-boundary.test.mjs
 
   windows-native-contracts:
     name: windows-native-contracts

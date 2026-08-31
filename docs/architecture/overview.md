@@ -160,5 +160,6 @@ for measurement.
 - Per-request orchestration: [runtime-execution-path.md](runtime-execution-path.md)
 - Core indexing: [indexing-pipeline.md](indexing-pipeline.md)
 - Retrieval publication and readiness: [retrieval-design.md](retrieval-design.md)
+- Packet generalization boundary: [packet-generalization.md](packet-generalization.md)
 - Language claim tiers: [language-support.md](language-support.md)
 - Crate ownership: [subsystems/](subsystems/)

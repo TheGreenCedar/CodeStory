@@ -43,10 +43,14 @@ on:
       - scripts/lint-retrieval-generalization.mjs
       - scripts/lib/retrieval-generalization-lint.mjs
       - scripts/tests/lint-retrieval-generalization.test.mjs
+      - scripts/check-packet-generalization-boundary.mjs
+      - scripts/lib/packet-generalization-boundary.mjs
+      - scripts/tests/check-packet-generalization-boundary.test.mjs
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
       - docs/testing/retrieval-architecture.md
+      - docs/architecture/packet-generalization.md
   # Base-branch runs seed caches that sibling PRs are allowed to restore.
   push:
     branches:
@@ -88,10 +92,14 @@ on:
       - scripts/lint-retrieval-generalization.mjs
       - scripts/lib/retrieval-generalization-lint.mjs
       - scripts/tests/lint-retrieval-generalization.test.mjs
+      - scripts/check-packet-generalization-boundary.mjs
+      - scripts/lib/packet-generalization-boundary.mjs
+      - scripts/tests/check-packet-generalization-boundary.test.mjs
       - scripts/prepare-embedded-model.mjs
       - docs/contributors/testing-matrix.md
       - docs/ops/retrieval-engine.md
       - docs/testing/retrieval-architecture.md
+      - docs/architecture/packet-generalization.md
   workflow_dispatch:
 
 permissions:
@@ -118,8 +126,14 @@ jobs:
       - name: Generalization lint (production paths)
         run: node scripts/lint-retrieval-generalization.mjs
 
+      - name: Packet generalization boundary
+        run: node scripts/check-packet-generalization-boundary.mjs
+
       - name: Generalization lint hostile matrix
         run: node --test scripts/tests/lint-retrieval-generalization.test.mjs
+
+      - name: Packet generalization boundary hostile matrix
+        run: node --test scripts/tests/check-packet-generalization-boundary.test.mjs
 
       - name: Release evidence gate contracts
         run: node --test scripts/tests/codestory-release-evidence-gate.test.mjs
