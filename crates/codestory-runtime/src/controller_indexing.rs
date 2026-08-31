@@ -1,8 +1,7 @@
 use crate::index_commit::{IndexWriterGuard, index_publication_dto};
 use crate::index_coverage::indexed_files_from_storage;
 use crate::index_freshness::{
-    CachedIndexFreshness, FreshnessObservation, index_freshness_cache_ttl_secs,
-    index_freshness_from_storage_with_policy, open_storage_for_read, storage_fingerprint,
+    FreshnessObservation, index_freshness_from_storage_with_policy, open_storage_for_read,
     workspace_member_index_summaries, workspace_member_storage_summaries,
 };
 use crate::index_full::index_full_for_runtime;
@@ -49,7 +48,7 @@ use codestory_store::{CURRENT_SCHEMA_VERSION, IndexPublicationRecord, Store, Sym
 use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 pub(crate) struct ActivationIndexingEvidence {
     pub(crate) phase_timings: IndexingPhaseTimings,
@@ -1339,47 +1338,19 @@ impl AppController {
         workspace: &WorkspaceManifest,
         storage: &Storage,
     ) -> IndexFreshnessDto {
-        if !matches!(storage.has_incomplete_incremental_run(), Ok(false)) {
-            self.state.lock().index_freshness_cache = None;
-            return index_freshness_from_storage_with_policy(
-                root,
-                workspace,
-                storage,
-                &self.source_index_policy,
-                FreshnessObservation::Unobserved,
-            );
-        }
-        let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
-        let storage_fingerprint = storage_fingerprint(storage_path);
-        {
-            let state = self.state.lock();
-            if let Some(cached) = state.index_freshness_cache.as_ref()
-                && cached.root == root
-                && cached.storage_path == storage_path
-                && cached.storage_fingerprint == storage_fingerprint
-                && cached.cached_at.elapsed() < ttl
-            {
-                return cached.value.clone();
-            }
-        }
-
-        // The cached project summary feeds observational surfaces. They read what already
-        // exists and never create observers.
-        let freshness = index_freshness_from_storage_with_policy(
+        // Observational status/doctor must re-compare source against the pinned
+        // core on every read. Caching a source-drift verdict behind a storage
+        // mtime fingerprint is incorrect for immutable generations: sealed
+        // cores no longer churn WAL/SHM mtimes on read, so a warmup status
+        // would otherwise hide later working-tree edits for the full TTL.
+        let _ = storage_path;
+        self.state.lock().index_freshness_cache = None;
+        index_freshness_from_storage_with_policy(
             root,
             workspace,
             storage,
             &self.source_index_policy,
             FreshnessObservation::Unobserved,
-        );
-        let mut state = self.state.lock();
-        state.index_freshness_cache = Some(CachedIndexFreshness {
-            root: root.to_path_buf(),
-            storage_path: storage_path.to_path_buf(),
-            storage_fingerprint,
-            value: freshness.clone(),
-            cached_at: Instant::now(),
-        });
-        freshness
+        )
     }
 }

@@ -987,6 +987,7 @@ pub(super) fn workspace_member_storage_summaries(
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(super) struct CachedIndexFreshness {
     pub(super) root: PathBuf,
     pub(super) storage_path: PathBuf,
@@ -995,6 +996,7 @@ pub(super) struct CachedIndexFreshness {
     pub(super) cached_at: Instant,
 }
 
+#[allow(dead_code)]
 pub(super) fn index_freshness_cache_ttl_secs() -> u64 {
     std::env::var("CODESTORY_INDEX_FRESHNESS_TTL_SECS")
         .ok()
@@ -1003,6 +1005,7 @@ pub(super) fn index_freshness_cache_ttl_secs() -> u64 {
         .unwrap_or(INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS)
 }
 
+#[allow(dead_code)]
 pub(super) fn storage_fingerprint(path: &Path) -> String {
     [
         storage_path_fingerprint(path),

@@ -5013,11 +5013,23 @@ impl Storage {
                 path.display()
             )));
         }
-        if policy == NonmutatingOpenPolicy::ProofValidation && !wal_exists {
-            return Err(StorageError::Other(format!(
-                "Proof validation requires an existing complete WAL sidecar pair: {}",
-                path.display()
-            )));
+        if policy == NonmutatingOpenPolicy::ProofValidation {
+            // Sealed immutable generations cannot host a persistent non-immutable
+            // WAL observer. Accidental `-wal`/`-shm` beside a published generation
+            // must not reopen a mutable proof fence; callers fall through to the
+            // Direct/Unavailable single-shot validation path instead.
+            if pointer.is_some() {
+                return Err(StorageError::Other(format!(
+                    "Proof validation observer is unavailable for immutable core generation: {}",
+                    path.display()
+                )));
+            }
+            if !wal_exists {
+                return Err(StorageError::Other(format!(
+                    "Proof validation requires an existing complete WAL sidecar pair: {}",
+                    path.display()
+                )));
+            }
         }
         // `immutable=1` guarantees that a standalone database cannot acquire
         // locks or sidecars, but it intentionally ignores committed WAL state.

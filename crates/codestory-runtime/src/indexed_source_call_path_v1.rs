@@ -301,7 +301,11 @@ impl AppController {
         let observer = match Store::open_proof_validation_observer(&storage_path) {
             Ok(observer) => observer,
             Err(_) => {
-                cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
+                // Sealed immutable generations and other observer refusals cannot
+                // host a persistent WAL fence. Leave `prepared` unset so the
+                // active-snapshot path uses Direct validation with the real
+                // proof-projection availability bit instead of forcing
+                // Unavailable.
                 return Ok(());
             }
         };
