@@ -275,6 +275,19 @@ fn select_packet_evidence_indices(
         }
     }
 
+    // A typed edge can be the only public witness for a material transition. Keep one such
+    // witness immediately after the best source carrier for each obligation. The transport
+    // compactor retains a relevance-ordered summary prefix, so putting mandatory relations after
+    // every repeated source window can preserve the edge locator while erasing the edge text.
+    for index in &relation_order {
+        if selected.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
+            break;
+        }
+        if mandatory_relation_indices.contains(index) && selected_indices.insert(*index) {
+            selected.push(*index);
+        }
+    }
+
     // Material callables can need more than one disjoint source window: the declaration, a
     // prompt-relevant internal callsite, and the terminal behavior may be far apart. Keep every
     // selected material window ahead of optional path diversity so byte compaction preserves the
@@ -297,7 +310,10 @@ fn select_packet_evidence_indices(
         })
         .collect::<HashSet<_>>();
 
-    let mut source_count = selected.len();
+    let mut source_count = selected
+        .iter()
+        .filter(|index| distinct[**index].0 == SupportUnitKindDto::SourceRange)
+        .count();
     for index in &source_order {
         if source_count >= PACKET_PUBLIC_SOURCE_ROWS_TARGET_V3 {
             break;
@@ -368,13 +384,16 @@ fn select_packet_evidence_indices(
                 || packet_relation_connects_selected_material_source(distinct, *index, &selected)
         })
         .collect::<Vec<_>>();
+    let selected_relation_count = selected
+        .iter()
+        .filter(|index| distinct[**index].0 == SupportUnitKindDto::TypedGraphEdge)
+        .count();
+    let desired_relation_count = qualified_relation_order
+        .len()
+        .min(PACKET_PUBLIC_RELATION_ROWS_TARGET_V3);
     let relation_floor = selected
         .len()
-        .saturating_add(
-            qualified_relation_order
-                .len()
-                .min(PACKET_PUBLIC_RELATION_ROWS_TARGET_V3),
-        )
+        .saturating_add(desired_relation_count.saturating_sub(selected_relation_count))
         .min(PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
     for index in &qualified_relation_order {
         if selected.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
@@ -1946,8 +1965,9 @@ mod tests {
             "a material source carrier must retain more than the optional 512-byte prefix"
         );
         assert_eq!(
-            evidence[8].summary.as_ref().unwrap().as_str(),
-            "Flow.dispatch -[CALL]-> Router.handle"
+            evidence[2].summary.as_ref().unwrap().as_str(),
+            "Flow.dispatch -[CALL]-> Router.handle",
+            "the material edge follows the best material source carriers before optional fill"
         );
         assert_eq!(
             evidence.len(),
@@ -2055,9 +2075,13 @@ mod tests {
 
         assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
         assert_eq!(
-            evidence[11].kind,
+            evidence[1].kind,
             EvidenceKindV3Dto::GraphRelation,
-            "the mandatory relation remains ahead of optional source fill"
+            "the mandatory relation remains immediately after the best material source so output compaction cannot erase its witness text"
+        );
+        assert_eq!(
+            evidence[1].summary.as_ref().map(|summary| summary.as_str()),
+            Some("IOClient.send -[CALL]-> Transport.send")
         );
         assert_eq!(
             evidence[12..]
