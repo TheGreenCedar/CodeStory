@@ -4196,6 +4196,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: true,
+      readOnlyHint: true,
     });
     const coldStatusTool = responses[2].result.tools.find((tool) => tool.name === "status");
     assert.deepEqual(coldStatusTool.annotations, {
