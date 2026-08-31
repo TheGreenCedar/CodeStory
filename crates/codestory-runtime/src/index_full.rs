@@ -331,6 +331,8 @@ fn run_full_refresh_indexer(
     });
     #[cfg(test)]
     run_source_policy_after_plan_hook();
+    // Fresh empty stage (not a live byte-copy). Incremental refresh also
+    // escalates here when core CoW cloning is unavailable.
     let staged = SnapshotStore::open_disposable_full_refresh(storage_path)
         .map_err(|error| ApiError::internal(format!("Failed to open staged storage: {error}")))?;
     let mut preparation = StagedPreparation::new(staged);

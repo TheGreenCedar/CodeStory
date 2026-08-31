@@ -24,10 +24,13 @@ pub use annotations::{
     resolve_bookmark,
 };
 pub use core_generation::{
-    CORE_DATABASE_FILE, CORE_DIRECTORY, CORE_GENERATIONS_DIRECTORY, CORE_PUBLICATION_FILE,
-    CORE_STAGING_DIRECTORY, CorePublicationLayout, core_database_exists,
-    resolve_core_database_path, resolve_core_generation_database_path,
+    CORE_COPY_ON_WRITE_UNAVAILABLE, CORE_DATABASE_FILE, CORE_DIRECTORY, CORE_GENERATIONS_DIRECTORY,
+    CORE_PUBLICATION_FILE, CORE_STAGING_DIRECTORY, CorePublicationLayout, core_database_exists,
+    is_core_copy_on_write_unavailable, resolve_core_database_path,
+    resolve_core_generation_database_path,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use core_generation::with_core_clone_disabled;
 pub use file_store::FileStore;
 pub use projection_store::{ProjectionBatch, ProjectionStore};
 pub use snapshot_store::{

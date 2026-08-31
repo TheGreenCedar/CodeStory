@@ -104,7 +104,9 @@ use codestory_contracts::graph::{
     ResolutionCertainty, SourceLocation,
 };
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
-use codestory_store::{IndexPublicationMode, SnapshotStore, SourcePolicyExclusionRecord};
+use codestory_store::{
+    IndexPublicationMode, SnapshotStore, SourcePolicyExclusionRecord, with_core_clone_disabled,
+};
 use codestory_workspace::{OversizedSourceExclusionCandidate, RefreshMode, project_identity_v3};
 use crossbeam_channel::unbounded;
 use sha2::{Digest, Sha256};
@@ -2404,6 +2406,50 @@ fn publishing_incremental_refresh_rebinds_the_complete_dense_anchor_generation()
             .expect("legacy docs")
             .is_empty()
     );
+}
+
+#[test]
+fn incremental_escalates_to_complete_build_when_core_cow_is_unavailable() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    write_reindex_semantic_fixture(workspace.path(), "cow escalate baseline");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("baseline full index");
+    let baseline = controller
+        .index_publication()
+        .expect("read baseline publication")
+        .expect("baseline publication");
+    assert_eq!(baseline.mode, IndexPublicationMode::Full);
+
+    write_reindex_semantic_fixture(workspace.path(), "cow escalate changed");
+    let timings = with_core_clone_disabled(|| {
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental must recover via disposable complete-build")
+    });
+    assert!(
+        timings.full_refresh_wall.is_some(),
+        "CoW-unavailable incremental must run the complete-build wall path"
+    );
+    assert!(
+        timings.incremental_core_wall.is_none(),
+        "escalated refresh must not report an incremental core wall"
+    );
+    let published = controller
+        .index_publication()
+        .expect("read escalated publication")
+        .expect("escalated publication");
+    assert_eq!(published.mode, IndexPublicationMode::Full);
+    assert_ne!(published.generation_id, baseline.generation_id);
 }
 
 #[test]

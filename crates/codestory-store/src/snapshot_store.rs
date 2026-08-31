@@ -252,7 +252,8 @@ impl StagedSnapshot {
         if !cloned {
             let _ = crate::core_generation::remove_staging_database(&path);
             return Err(StorageError::Other(format!(
-                "core_copy_on_write_unavailable: incremental refresh cannot clone {} without a foreground full copy",
+                "{}: incremental refresh cannot clone {} without a foreground full copy",
+                crate::core_generation::CORE_COPY_ON_WRITE_UNAVAILABLE,
                 source.display()
             )));
         }
@@ -1134,6 +1135,39 @@ mod tests {
         assert!(!staged_path.exists());
         assert!(!PathBuf::from(format!("{}-wal", staged_path.display())).exists());
         assert!(!PathBuf::from(format!("{}-shm", staged_path.display())).exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn clone_live_reports_cow_unavailable_when_clone_is_disabled() {
+        let temp = fresh_temp_root("clone-live-cow-disabled");
+        let live_path = temp.join("live.sqlite");
+        {
+            let mut live = Store::open(&live_path).expect("open live");
+            live.insert_files_batch(&[crate::FileInfo {
+                id: 1,
+                path: PathBuf::from("old.rs"),
+                language: "rust".to_string(),
+                modification_time: 1,
+                indexed: true,
+                complete: true,
+                line_count: 1,
+                file_role: crate::FileRole::Source,
+            }])
+            .expect("seed live file");
+        }
+
+        let error = crate::with_core_clone_disabled(|| match SnapshotStore::clone_live_to_staged(
+            &live_path,
+        ) {
+            Ok(_) => panic!("CoW must fail closed when clone is disabled"),
+            Err(error) => error,
+        });
+        assert!(
+            crate::is_core_copy_on_write_unavailable(&error),
+            "expected core_copy_on_write_unavailable, got {error}"
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }

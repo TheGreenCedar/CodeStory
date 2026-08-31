@@ -17,12 +17,58 @@ pub const CORE_DATABASE_FILE: &str = "codestory.db";
 pub const CORE_PUBLICATION_FILE: &str = "publication.json";
 pub const RETRIEVAL_PUBLICATION_FILE: &str = "retrieval-publication.sqlite3";
 
+/// Prefix for StorageError messages when block cloning cannot stage a core image.
+///
+/// Callers must escalate to a disposable complete-build rather than silently
+/// byte-copying the live database in production.
+pub const CORE_COPY_ON_WRITE_UNAVAILABLE: &str = "core_copy_on_write_unavailable";
+
 #[cfg(test)]
 pub(crate) const CORE_PUBLICATION_ABORT_POINT_ENV: &str =
     "CODESTORY_TEST_CORE_PUBLICATION_ABORT_POINT";
 #[cfg(test)]
 pub(crate) const CORE_PUBLICATION_ABORT_SENTINEL_ENV: &str =
     "CODESTORY_TEST_CORE_PUBLICATION_ABORT_SENTINEL";
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static CORE_CLONE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Force core CoW clones to report unavailable for the duration of `action`.
+///
+/// Production stays fail-closed without CoW. Tests normally get a test-only
+/// `fs::copy` fallback on non-reflink filesystems; this helper disables that
+/// fallback so callers can prove the complete-build escalate path.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_core_clone_disabled<T>(action: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CORE_CLONE_DISABLED.set(self.0);
+        }
+    }
+
+    CORE_CLONE_DISABLED.with(|disabled| {
+        let restore = Restore(disabled.replace(true));
+        let result = action();
+        drop(restore);
+        result
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn core_clone_disabled() -> bool {
+    CORE_CLONE_DISABLED.get()
+}
+
+/// True when incremental staging failed because the filesystem cannot CoW-clone.
+pub fn is_core_copy_on_write_unavailable(error: &StorageError) -> bool {
+    match error {
+        StorageError::Other(message) => message.starts_with(CORE_COPY_ON_WRITE_UNAVAILABLE),
+        _ => false,
+    }
+}
 
 const MAX_POINTER_BYTES: u64 = 16 * 1024;
 const MAX_GENERATION_ID_BYTES: usize = 128;
@@ -228,7 +274,7 @@ impl CorePublicationLayout {
         if !cloned {
             let _ = remove_staging_database(&staged);
             return Err(StorageError::Other(format!(
-                "core_copy_on_write_unavailable: the filesystem cannot materialize immutable core generation {generation_id} without a foreground full copy"
+                "{CORE_COPY_ON_WRITE_UNAVAILABLE}: the filesystem cannot materialize immutable core generation {generation_id} without a foreground full copy"
             )));
         }
         make_file_owner_writable(&staged)?;
@@ -294,12 +340,17 @@ pub(crate) fn clone_file_copy_on_write(
         fs::create_dir_all(parent)
             .map_err(|error| core_path_error("create clone parent", parent, error))?;
     }
+    #[cfg(any(test, feature = "test-support"))]
+    if core_clone_disabled() {
+        return Ok(false);
+    }
     let cloned = clone_file_copy_on_write_platform(source, destination)?;
     if cloned {
         return Ok(true);
     }
     // Production stays fail-closed without CoW. Tests still need to exercise
     // publication atomicity on filesystems (ext4 CI) that cannot reflink.
+    // `with_core_clone_disabled` skips this fallback so escalate paths can run.
     #[cfg(any(test, feature = "test-support"))]
     {
         fs::copy(source, destination)
@@ -861,6 +912,27 @@ mod tests {
         assert_eq!(
             fs::read(destination).expect("stage bytes"),
             b"candidate generation"
+        );
+    }
+
+    #[test]
+    fn clone_disabled_never_silent_copies_and_reports_unavailable() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let source = root.path().join("source.db");
+        let destination = root.path().join("stage.db");
+        fs::write(&source, b"immutable generation").expect("source");
+
+        let cloned = with_core_clone_disabled(|| {
+            clone_file_copy_on_write(&source, &destination).expect("clone probe")
+        });
+
+        assert!(
+            !cloned,
+            "disabled CoW must return Ok(false), not a silent full copy"
+        );
+        assert!(
+            !destination.exists(),
+            "disabled CoW must not materialize a destination via fs::copy"
         );
     }
 }
