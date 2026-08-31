@@ -1161,10 +1161,7 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
             "retrieval",
             // Fixture helpers rebind inherited store overlays when replacing a
             // core; that is not a product retrieval consumer of proof facts.
-            read_source_tree_excluding_many(
-                "crates/codestory-retrieval/src",
-                &["test_support.rs"],
-            ),
+            read_source_tree_excluding_many("crates/codestory-retrieval/src", &["test_support.rs"]),
         ),
         (
             "packet planner",
