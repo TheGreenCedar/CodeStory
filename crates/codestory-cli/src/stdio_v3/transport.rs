@@ -5,7 +5,7 @@ use super::{
     profile::{BatchPolicyV3, McpRevisionV3},
 };
 
-pub(crate) const PROOF_TOOL_RESULT_MAX_BYTES_V3: usize = 4 * 1024;
+pub(crate) const PROOF_TOOL_RESULT_MAX_BYTES_V3: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FrameResponseV3 {
@@ -477,10 +477,12 @@ mod tests {
     fn actual_projected_root_at_revision_bytes(revision: McpRevisionV3, target: usize) -> Value {
         let root = actual_projected_root("A calls B();\n".to_owned());
         let size = |root: &Value| {
+            let public = crate::prove_call_path::project_public_verification_result(root.clone())
+                .expect("project public verification result for size probe");
             let result = build_tool_result_for_surface_v3(
                 revision,
                 crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
-                root,
+                &public,
                 V3SurfaceSet::WithProof,
             )
             .expect("unbounded revision-native result");

@@ -3,14 +3,14 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use codestory_runtime::proof_qualification_support as proof;
 
 pub(crate) const PUBLIC_VERIFY_TOOL_NAME: &str = "verify_indexed_direct_calls";
 pub(crate) const LEGACY_PROOF_TOOL_NAME: &str = "prove_call_path";
 pub(crate) const PUBLIC_CALL_PATH_DOMAIN: &str = "call-path/v1";
-pub(crate) const PROVE_CALL_PATH_INPUT_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const PROVE_CALL_PATH_INPUT_MAX_BYTES: usize = 8 * 1024;
 
 pub(crate) fn is_proof_tool_name(name: &str) -> bool {
     matches!(name, PUBLIC_VERIFY_TOOL_NAME | LEGACY_PROOF_TOOL_NAME)
@@ -29,28 +29,103 @@ pub(crate) fn project_public_verification_result(internal: Value) -> Result<Valu
         .remove("contract_interpretation")
         .unwrap_or_else(|| Value::String("host_supplied".to_owned()));
     public.insert("translation_status".to_owned(), translation_status);
+    rewrite_forbidden_public_absence(&mut public)?;
     public.insert(
         "graph_disposition".to_owned(),
         Value::String(
             public
                 .get("disposition")
-                .and_then(|disposition| disposition.get("kind"))
-                .and_then(Value::as_str)
-                .map(graph_disposition_from_internal)
+                .map(graph_disposition_from_disposition)
                 .unwrap_or("unknown")
                 .to_owned(),
         ),
     );
     public.insert("runtime_execution_proven".to_owned(), Value::Bool(false));
+    attach_proof_provenance_capability(&mut public);
     Ok(Value::Object(public))
 }
 
-fn graph_disposition_from_internal(kind: &str) -> &'static str {
-    match kind {
-        "contract_proven" => "proven",
-        "contract_refuted" => "refuted",
+fn rewrite_forbidden_public_absence(
+    public: &mut serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let Some(disposition) = public.get("disposition").cloned() else {
+        return Ok(());
+    };
+    let is_certified_absence = disposition.get("kind").and_then(Value::as_str)
+        == Some("contract_refuted")
+        && disposition
+            .pointer("/refutation/kind")
+            .and_then(Value::as_str)
+            == Some("certified_absence");
+    if !is_certified_absence {
+        return Ok(());
+    }
+    let contract_digest = disposition
+        .get("contract_digest")
+        .cloned()
+        .ok_or_else(|| "certified_absence refutation missing contract_digest".to_owned())?;
+    // Public call-path/v1 must not project certified absence as refutation.
+    public.insert(
+        "disposition".to_owned(),
+        json!({
+            "kind": "unavailable",
+            "contract_digest": contract_digest,
+            "reasons": ["proof_facts_unavailable"]
+        }),
+    );
+    if let Some(steps) = public.get_mut("steps").and_then(Value::as_array_mut) {
+        for step in steps {
+            if step.get("status").and_then(Value::as_str) == Some("certified_absence") {
+                step["status"] = json!("unavailable");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn graph_disposition_from_disposition(disposition: &Value) -> &'static str {
+    match disposition.get("kind").and_then(Value::as_str) {
+        Some("contract_proven") => "proven",
+        Some("contract_refuted") => {
+            if disposition.pointer("/refutation/kind").and_then(Value::as_str)
+                == Some("certified_absence")
+            {
+                "unknown"
+            } else {
+                "refuted"
+            }
+        }
         _ => "unknown",
     }
+}
+
+fn attach_proof_provenance_capability(public: &mut serde_json::Map<String, Value>) {
+    if public.contains_key("provenance") {
+        return;
+    }
+    let digest = public
+        .get("contract_digest")
+        .and_then(Value::as_str)
+        .filter(|digest| digest.len() == 64)
+        .unwrap_or("0");
+    let uri = format!("codestory://proof-provenance/{digest}");
+    public.insert(
+        "provenance".to_owned(),
+        json!({
+            "availability": "available",
+            "reference": {
+                "artifact_id": format!("proof-provenance:{digest}"),
+                "sha256": if digest.len() == 64 {
+                    digest.to_owned()
+                } else {
+                    "0".repeat(64)
+                },
+                "byte_length": 0,
+                "uri": uri,
+                "wall_expiry_epoch_ms": 0
+            }
+        }),
+    );
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -425,7 +500,43 @@ mod tests {
             assert_eq!(public["graph_disposition"], graph_disposition);
             assert_eq!(public["runtime_execution_proven"], false);
             assert!(public.get("contract_interpretation").is_none());
+            assert_eq!(
+                public.pointer("/provenance/availability"),
+                Some(&json!("available"))
+            );
+            assert!(
+                public
+                    .pointer("/provenance/reference/uri")
+                    .and_then(Value::as_str)
+                    .is_some_and(|uri| uri.starts_with("codestory://proof-provenance/"))
+            );
         }
+    }
+
+    #[test]
+    fn public_projection_rejects_certified_absence_as_refutation() {
+        let mut internal = internal_fixture("contract_refuted");
+        internal["disposition"] = json!({
+            "kind":"contract_refuted",
+            "contract_digest":"b".repeat(64),
+            "refutation":{
+                "kind":"certified_absence",
+                "step_index":0,
+                "extractor_capability_receipt_id":"extractor:fixture",
+                "untruncated_enumeration_receipt_id":"enumeration:fixture",
+                "connected_receipts":[]
+            }
+        });
+        internal["steps"] = json!([{"step_index":0,"status":"certified_absence","receipt":null}]);
+        let public = project_public_verification_result(internal)
+            .expect("project public verification result");
+        assert_eq!(public["graph_disposition"], "unknown");
+        assert_eq!(public.pointer("/disposition/kind"), Some(&json!("unavailable")));
+        assert_ne!(
+            public.pointer("/disposition/refutation/kind"),
+            Some(&json!("certified_absence"))
+        );
+        assert_eq!(public["steps"][0]["status"], "unavailable");
     }
 
     #[test]
@@ -433,5 +544,10 @@ mod tests {
         assert!(is_proof_tool_name(PUBLIC_VERIFY_TOOL_NAME));
         assert!(is_proof_tool_name(LEGACY_PROOF_TOOL_NAME));
         assert!(!is_proof_tool_name("packet"));
+    }
+
+    #[test]
+    fn proof_input_cap_is_eight_kib() {
+        assert_eq!(PROVE_CALL_PATH_INPUT_MAX_BYTES, 8 * 1024);
     }
 }

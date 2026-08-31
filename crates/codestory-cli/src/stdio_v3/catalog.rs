@@ -1367,8 +1367,8 @@ mod tests {
                 }
             },
             "disposition": {"kind":"unknown","contract_digest":"b".repeat(64),"gaps":[{"kind":"output_budget_exceeded"}]},
-            "cap_bytes": 4096,
-            "required_complete_size": 4097
+            "cap_bytes": 8192,
+            "required_complete_size": 8193
         });
         let schema = proof_output_schema_v3();
         assert_eq!(
