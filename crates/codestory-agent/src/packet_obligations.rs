@@ -728,15 +728,10 @@ fn flow_requirement_is_material(requirement: &FlowRequirement) -> bool {
 }
 
 fn flow_requirement_requires_call_edge(requirement: &FlowRequirement) -> bool {
-    matches!(
-        requirement.coverage_mode,
-        CoverageMode::RequiresResolvedSourceOrGraph
-    ) && matches!(
-        requirement.evidence,
-        EvidencePredicate::CitedRoles { .. }
-            | EvidencePredicate::CitedRolesOrCallBoundary { .. }
-            | EvidencePredicate::CitedRolesOrOrderedCallBoundary { .. }
-    )
+    // Domain role/carrier predicates were deleted; empty requirements never
+    // require a call-edge receipt from taxonomy.
+    let _ = requirement;
+    false
 }
 
 fn push_query_obligation(
@@ -3494,37 +3489,6 @@ mod tests {
         }
     }
 
-    fn query_diagnostic(
-        query: &str,
-        completion: PacketQueryCompletionDto,
-    ) -> PacketSidecarQueryDiagnosticDto {
-        PacketSidecarQueryDiagnosticDto {
-            query: query.to_string(),
-            completion,
-            retrieval_mode: "full".to_string(),
-            sidecar_query_ms: Some(1),
-            candidate_resolution_ms: Some(0),
-            total_elapsed_ms: Some(1),
-            sidecar_stage_count: 1,
-            sidecar_stage_total_ms: Some(1),
-            batch_query_wall_ms: Some(1),
-            candidate_count: 0,
-            resolved_hit_count: 0,
-            unresolved_candidate_count: 0,
-            blocking_unresolved_candidate_count: 0,
-            semantic_stage_timeout_zero_hits: false,
-            semantic_abstained: false,
-            diagnostic: None,
-        }
-    }
-
-    fn lexical_citation(name: &str, path: &str, kind: NodeKind) -> AgentCitationDto {
-        let mut citation = citation(name, path, kind);
-        citation.evidence_tier = Some(PacketEvidenceTierDto::LexicalSource);
-        citation.resolution_status = Some(PacketEvidenceResolutionDto::SourceRangeOnly);
-        citation
-    }
-
     #[test]
     fn obligation_carriers_preserve_ranked_input_order_instead_of_node_id_order() {
         let mut best = citation("best", "src/best.rs", NodeKind::FUNCTION);
@@ -3600,299 +3564,6 @@ mod tests {
             },
         });
         answer
-    }
-
-    #[derive(Clone, Copy)]
-    struct FlowBoundaryCase {
-        label: &'static str,
-        question: &'static str,
-        task_class: PacketTaskClassDto,
-        obligation_id: &'static str,
-        carrier_name: &'static str,
-        carrier_path: &'static str,
-        carrier_kind: NodeKind,
-        lawful_target: &'static str,
-        role_only_name: &'static str,
-        role_only_path: &'static str,
-        role_only_kind: NodeKind,
-    }
-
-    fn evaluate_flow_boundary(
-        case: FlowBoundaryCase,
-        target_name: &str,
-        outgoing: bool,
-    ) -> (
-        PacketObligationProofStatusDto,
-        Option<String>,
-        Vec<NodeId>,
-        Vec<EdgeId>,
-    ) {
-        let edge_id = EdgeId(format!("{}-call", case.obligation_id));
-        let mut carrier = citation(case.carrier_name, case.carrier_path, case.carrier_kind);
-        carrier.evidence_edge_ids = vec![edge_id.clone()];
-        let target = citation(target_name, "src/boundary_target.rs", NodeKind::METHOD);
-        let (source, destination) = if outgoing {
-            (carrier.node_id.clone(), target.node_id.clone())
-        } else {
-            (target.node_id.clone(), carrier.node_id.clone())
-        };
-        let mut carried_answer = answer(vec![carrier, target]);
-        carried_answer.prompt = case.question.to_string();
-        carried_answer.graphs.push(GraphArtifactDto::Uml {
-            id: format!("{}-flow", case.obligation_id),
-            title: format!("{} flow", case.label),
-            graph: GraphResponse {
-                center_id: source.clone(),
-                nodes: Vec::new(),
-                edges: vec![GraphEdgeDto {
-                    id: edge_id,
-                    source,
-                    target: destination,
-                    kind: EdgeKind::CALL,
-                    confidence: Some(1.0),
-                    certainty: Some("certain".to_string()),
-                    callsite_identity: Some(format!("test:{}", case.obligation_id)),
-                    candidate_targets: Vec::new(),
-                }],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        });
-        let mut plan = build_packet_obligation_plan(case.question, case.task_class, &[]);
-        plan.claim_obligations
-            .retain(|obligation| obligation.id == case.obligation_id);
-        plan.query_obligations.clear();
-        assert_eq!(
-            plan.claim_obligations.len(),
-            1,
-            "{}: question did not select exactly one {} obligation",
-            case.label,
-            case.obligation_id
-        );
-
-        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
-            case.question,
-            case.task_class,
-            &plan,
-            &carried_answer,
-            &PacketProofEvidenceExtras::default(),
-        );
-        let protected_carriers = protected_packet_obligation_carrier_node_ids(&snapshot).to_vec();
-        let protected_edges = protected_packet_obligation_edge_ids(&snapshot).to_vec();
-        finalize_packet_obligation_plan(
-            case.question,
-            case.task_class,
-            &mut plan,
-            &carried_answer,
-            &budget(),
-            &[],
-            &PacketProofEvidenceExtras::default(),
-        );
-        let obligation = &plan.claim_obligations[0];
-        (
-            obligation.proof_status,
-            obligation.reason.clone(),
-            protected_carriers,
-            protected_edges,
-        )
-    }
-
-    fn raw_server_dispatch_answer(
-        target_label: &str,
-        target_kind: NodeKind,
-        certainty: Option<&str>,
-        confidence: Option<f32>,
-        callsite_identity: Option<&str>,
-        outgoing: bool,
-    ) -> AgentAnswerDto {
-        let mut carrier = citation("app.handle", "lib/application.js", NodeKind::METHOD);
-        carrier.evidence_edge_ids = vec![EdgeId("dispatch-call".to_string())];
-        let target_id = NodeId("dispatch-target".to_string());
-        let (source, target) = if outgoing {
-            (carrier.node_id.clone(), target_id.clone())
-        } else {
-            (target_id.clone(), carrier.node_id.clone())
-        };
-        let mut answer = answer(vec![carrier]);
-        answer.prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.".to_string();
-        answer.graphs.push(GraphArtifactDto::Uml {
-            id: "dispatch-flow".to_string(),
-            title: "Dispatch flow".to_string(),
-            graph: GraphResponse {
-                center_id: source.clone(),
-                nodes: vec![GraphNodeDto {
-                    id: target_id,
-                    label: target_label.to_string(),
-                    kind: target_kind,
-                    depth: 1,
-                    label_policy: None,
-                    badge_visible_members: None,
-                    badge_total_members: None,
-                    merged_symbol_examples: Vec::new(),
-                    file_path: Some("lib/tiny.js".to_string()),
-                    qualified_name: None,
-                    member_access: None,
-                }],
-                edges: vec![GraphEdgeDto {
-                    id: EdgeId("dispatch-call".to_string()),
-                    source,
-                    target,
-                    kind: EdgeKind::CALL,
-                    confidence,
-                    certainty: certainty.map(str::to_string),
-                    callsite_identity: callsite_identity.map(str::to_string),
-                    candidate_targets: Vec::new(),
-                }],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        });
-        answer
-    }
-
-    fn raw_server_receipt_answer(
-        carrier_name: &str,
-        target_label: &str,
-        receiver_owner: &str,
-        edge_id: &str,
-    ) -> AgentAnswerDto {
-        let mut carrier = citation(carrier_name, "lib/server.js", NodeKind::METHOD);
-        carrier.evidence_edge_ids = vec![EdgeId(edge_id.to_string())];
-        let target_id = NodeId(format!("{edge_id}-target"));
-        let mut answer = answer(vec![carrier.clone()]);
-        answer.prompt =
-            "Trace how a server routes an incoming request through a handler and sends the response."
-                .to_string();
-        answer.graphs.push(GraphArtifactDto::Uml {
-            id: format!("{edge_id}-graph"),
-            title: "Server flow".to_string(),
-            graph: GraphResponse {
-                center_id: carrier.node_id.clone(),
-                nodes: vec![GraphNodeDto {
-                    id: target_id.clone(),
-                    label: target_label.to_string(),
-                    kind: NodeKind::UNKNOWN,
-                    depth: 1,
-                    label_policy: None,
-                    badge_visible_members: None,
-                    badge_total_members: None,
-                    merged_symbol_examples: Vec::new(),
-                    file_path: Some("lib/server.js".to_string()),
-                    qualified_name: None,
-                    member_access: None,
-                }],
-                edges: vec![GraphEdgeDto {
-                    id: EdgeId(edge_id.to_string()),
-                    source: carrier.node_id,
-                    target: target_id,
-                    kind: EdgeKind::CALL,
-                    confidence: None,
-                    certainty: None,
-                    callsite_identity: Some(format!(
-                        "lib/server.js:1|syntax:js-member-call|receiver-owner:{receiver_owner}"
-                    )),
-                    candidate_targets: Vec::new(),
-                }],
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        });
-        answer
-    }
-
-    fn finalize_server_dispatch_answer(
-        answer: &AgentAnswerDto,
-    ) -> (
-        PacketObligationProofStatusDto,
-        Option<String>,
-        Vec<NodeId>,
-        Vec<EdgeId>,
-    ) {
-        let question = answer.prompt.as_str();
-        let mut plan =
-            build_packet_obligation_plan(question, PacketTaskClassDto::RouteTracing, &[]);
-        plan.claim_obligations
-            .retain(|obligation| obligation.id == "request_dispatch");
-        plan.query_obligations.clear();
-        let snapshot = capture_packet_obligation_edge_proofs_before_budget(
-            question,
-            PacketTaskClassDto::RouteTracing,
-            &plan,
-            answer,
-            &PacketProofEvidenceExtras::default(),
-        );
-        finalize_packet_obligation_plan(
-            question,
-            PacketTaskClassDto::RouteTracing,
-            &mut plan,
-            answer,
-            &budget(),
-            &[],
-            &PacketProofEvidenceExtras::default(),
-        );
-        let obligation = &plan.claim_obligations[0];
-        (
-            obligation.proof_status,
-            obligation.reason.clone(),
-            protected_packet_obligation_carrier_node_ids(&snapshot).to_vec(),
-            protected_packet_obligation_edge_ids(&snapshot).to_vec(),
-        )
-    }
-
-    fn finalized_server_receipt_claim(
-        answer: &AgentAnswerDto,
-        obligation_id: &str,
-    ) -> (PacketObligationPlanDto, PacketClaimDto) {
-        let mut plan =
-            build_packet_obligation_plan(&answer.prompt, PacketTaskClassDto::RouteTracing, &[]);
-        plan.claim_obligations
-            .retain(|obligation| obligation.id == obligation_id);
-        assert_eq!(plan.claim_obligations.len(), 1, "missing {obligation_id}");
-        plan.query_obligations.clear();
-        finalize_packet_obligation_plan(
-            &answer.prompt,
-            PacketTaskClassDto::RouteTracing,
-            &mut plan,
-            answer,
-            &budget(),
-            &[],
-            &PacketProofEvidenceExtras::default(),
-        );
-        let claims = packet_claims_with_obligation_receipts(
-            answer,
-            PacketTaskClassDto::RouteTracing,
-            &plan,
-            (Vec::new(), ()),
-        );
-        assert_eq!(claims.len(), 1);
-        (plan, claims.into_iter().next().expect("receipt claim"))
-    }
-
-    fn indexing_entrypoint_plan() -> PacketObligationPlanDto {
-        let mut plan = build_packet_obligation_plan(
-            INDEXING_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &[],
-        );
-        plan.claim_obligations
-            .retain(|obligation| obligation.id == "indexing_entrypoint");
-        plan.query_obligations.clear();
-        plan
-    }
-
-    fn indexing_obligation_plan(id: &str) -> PacketObligationPlanDto {
-        let mut plan = build_packet_obligation_plan(
-            INDEXING_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &[],
-        );
-        plan.claim_obligations
-            .retain(|obligation| obligation.id == id);
-        plan.query_obligations.clear();
-        plan
     }
 
     #[test]
@@ -5326,10 +4997,6 @@ mod tests {
     // Stage 2: typed-proof receipts at the finalize seam
     // -----------------------------------------------------------------------
 
-    /// Triggers `MAPPER_PLAN_FLOW` (mapper + configuration + plan/execution
-    /// intent) without complete-discovery phrasing.
-    const MAPPER_QUESTION: &str = "How does the mapper build its configuration and execution plan?";
-
     fn graph_node(citation: &AgentCitationDto) -> GraphNodeDto {
         GraphNodeDto {
             id: citation.node_id.clone(),
@@ -5411,24 +5078,6 @@ mod tests {
             to_symbol: None,
             query: None,
         }
-    }
-
-    fn mapper_obligation_plan() -> PacketObligationPlanDto {
-        build_packet_obligation_plan(
-            MAPPER_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &[],
-        )
-    }
-
-    fn mapper_obligation<'a>(
-        plan: &'a PacketObligationPlanDto,
-        id: &str,
-    ) -> &'a PacketClaimObligationDto {
-        plan.claim_obligations
-            .iter()
-            .find(|obligation| obligation.id == id)
-            .unwrap_or_else(|| panic!("missing obligation {id}"))
     }
 
     /// R1(a) negative-first: a carrier that satisfies the requirement's
@@ -5786,40 +5435,6 @@ mod tests {
             matches!(proved, FlowProofOutcome::Proved(_)),
             "the anchored extras receipt discharges C2: {proved:?}"
         );
-    }
-
-    /// A finalized-and-proven mapper plan for the survival tests: receipts are
-    /// the certain TYPE_USAGE edge plus the configuration source range.
-    fn proven_mapper_state() -> (PacketObligationPlanDto, AgentAnswerDto, Vec<SupportUnitDto>) {
-        let builder = citation("PlanBuilder", "src/plan_builder.cs", NodeKind::CLASS);
-        let config = citation(
-            "MapperConfiguration",
-            "src/mapper_configuration.cs",
-            NodeKind::CLASS,
-        );
-        let mut answer = answer(vec![builder.clone(), config.clone()]);
-        answer
-            .graphs
-            .push(mapper_type_usage_graph(&builder, &config));
-        let support = vec![config_source_range_unit(
-            "MapperConfiguration",
-            "public class MapperConfiguration {}",
-        )];
-        let mut plan = mapper_obligation_plan();
-        finalize_packet_obligation_plan(
-            MAPPER_QUESTION,
-            PacketTaskClassDto::ArchitectureExplanation,
-            &mut plan,
-            &answer,
-            &budget(),
-            &support,
-            &PacketProofEvidenceExtras::default(),
-        );
-        assert_eq!(
-            mapper_obligation(&plan, "mapper_config").proof_status,
-            PacketObligationProofStatusDto::Proven
-        );
-        (plan, answer, support)
     }
 
     /// Survival demotes when a recorded edge receipt is missing from the

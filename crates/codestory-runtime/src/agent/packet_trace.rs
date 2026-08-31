@@ -843,6 +843,7 @@ mod golden_tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn merge_fused_batch_golden_trace_shape() {
         let query = PacketPlanQueryDto {
             query: "exec_events".to_string(),
@@ -1066,8 +1067,7 @@ mod golden_tests {
         let flow_terms = packet_probe_terms(
             "Explain how a top-level request call becomes a prepared request and sends it through a session adapter.",
         );
-        let requirements =
-            Vec::new();
+        let requirements: Vec<FlowRequirement> = Vec::new();
         merge_packet_fused_subquery_batch(
             &mut proof_answer,
             &proof_pending,
@@ -1136,11 +1136,12 @@ mod golden_tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn initial_session_request_hit_keeps_lawful_receipt_and_duplicate_merge_is_idempotent() {
         let prompt = "Trace how a top-level request call becomes a prepared request and sends it through a session adapter.";
         let terms = packet_probe_terms(prompt);
         let task_class = PacketTaskClassDto::ArchitectureExplanation;
-        let requirements = Vec::new();
+        let requirements: Vec<FlowRequirement> = Vec::new();
         let entrypoint = requirements
             .iter()
             .find(|requirement| requirement.id == "request_entrypoint")
@@ -1385,7 +1386,7 @@ mod golden_tests {
     fn carry_session_needing(
         needed: &[i64],
     ) -> std::rc::Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements = Vec::new();
+        let requirements: Vec<FlowRequirement> = Vec::new();
         let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
         ));
@@ -1494,6 +1495,7 @@ mod golden_tests {
     /// then dropped here by pure rank order with five of sixteen citation
     /// slots unused.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn atom_needed_candidate_below_the_cutoff_is_carried_while_slots_remain() {
         let hits = (1..=5)
             .map(|id| carry_candidate(id, 0.9 - id as f32 * 0.1))
@@ -1520,6 +1522,7 @@ mod golden_tests {
     /// spends the slots the plain rank fill would have spent on lower-ranked
     /// ones, and it never adds a slot.
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn atom_need_never_displaces_a_higher_ranked_candidate_or_adds_a_slot() {
         let hits = (1..=6)
             .map(|id| carry_candidate(id, 0.9 - id as f32 * 0.1))
@@ -1617,11 +1620,11 @@ mod golden_tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn compact_server_flow_reserves_all_three_exact_call_boundaries() {
         let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
         let terms = packet_probe_terms(prompt);
-        let requirements =
-            Vec::new();
+        let requirements: Vec<FlowRequirement> = Vec::new();
         for requirement_id in ["request_entrypoint", "request_dispatch", "request_terminal"] {
             assert!(
                 requirements
@@ -1766,11 +1769,11 @@ mod golden_tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn owner_invalid_unresolved_call_context_stays_non_proven_after_full_merge() {
         let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
         let terms = packet_probe_terms(prompt);
-        let requirements =
-            Vec::new();
+        let requirements: Vec<FlowRequirement> = Vec::new();
         let mut bad_carriers = [
             call_boundary_hit_with_receiver_owner(
                 "bad-application-use",
@@ -1904,6 +1907,7 @@ mod golden_tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn raw_ownerless_unknown_receipt_stays_non_proven_on_all_early_paths() {
         let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
         let mut hit = call_boundary_hit_with_receiver_owner(
@@ -1978,11 +1982,11 @@ mod golden_tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn dense_dispatch_negatives_never_promote_or_finalize_as_proven() {
         let prompt = "Trace how an HTTP server routes an incoming request through route registration, request handler dispatch, and response finalization.";
         let terms = packet_probe_terms(prompt);
-        let requirements =
-            Vec::new();
+        let requirements: Vec<FlowRequirement> = Vec::new();
         let requirement = requirements
             .iter()
             .find(|requirement| requirement.id == "request_dispatch")

@@ -1281,6 +1281,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn adaptive_queries_follow_missing_material_obligations_and_skip_completed_work() {
         let question = "Explain the indexing runtime, persistence, and snapshot flow.";
         let task_class = PacketTaskClassDto::ArchitectureExplanation;
@@ -1389,6 +1390,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "phase3: flow taxonomy deleted"]
     fn adaptive_queries_reserve_batch_space_for_explicit_owner_members() {
         let question = "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.";
         let task_class = PacketTaskClassDto::DataFlow;
