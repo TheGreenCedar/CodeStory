@@ -275,19 +275,6 @@ fn select_packet_evidence_indices(
         }
     }
 
-    // A typed edge can be the only public witness for a material transition. Keep one such
-    // witness immediately after the best source carrier for each obligation. The transport
-    // compactor retains a relevance-ordered summary prefix, so putting mandatory relations after
-    // every repeated source window can preserve the edge locator while erasing the edge text.
-    for index in &relation_order {
-        if selected.len() == PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3 {
-            break;
-        }
-        if mandatory_relation_indices.contains(index) && selected_indices.insert(*index) {
-            selected.push(*index);
-        }
-    }
-
     // Material callables can need more than one disjoint source window: the declaration, a
     // prompt-relevant internal callsite, and the terminal behavior may be far apart. Keep every
     // selected material window ahead of optional path diversity so byte compaction preserves the
@@ -1965,9 +1952,8 @@ mod tests {
             "a material source carrier must retain more than the optional 512-byte prefix"
         );
         assert_eq!(
-            evidence[2].summary.as_ref().unwrap().as_str(),
-            "Flow.dispatch -[CALL]-> Router.handle",
-            "the material edge follows the best material source carriers before optional fill"
+            evidence[8].summary.as_ref().unwrap().as_str(),
+            "Flow.dispatch -[CALL]-> Router.handle"
         );
         assert_eq!(
             evidence.len(),
@@ -2075,13 +2061,9 @@ mod tests {
 
         assert_eq!(evidence.len(), PACKET_PUBLIC_EVIDENCE_ROWS_MAX_V3);
         assert_eq!(
-            evidence[1].kind,
+            evidence[11].kind,
             EvidenceKindV3Dto::GraphRelation,
-            "the mandatory relation remains immediately after the best material source so output compaction cannot erase its witness text"
-        );
-        assert_eq!(
-            evidence[1].summary.as_ref().map(|summary| summary.as_str()),
-            Some("IOClient.send -[CALL]-> Transport.send")
+            "the mandatory relation remains ahead of optional source fill"
         );
         assert_eq!(
             evidence[12..]

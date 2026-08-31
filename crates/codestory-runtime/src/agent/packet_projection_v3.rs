@@ -8,11 +8,12 @@ use codestory_contracts::packet_projection_v3::{
     BoundViolationV3, BoundedVecV3, ContextEvidenceRowV3Dto, ContextProjectionKindV3Dto,
     ContextProjectionV3Dto, ContextTargetV3Dto, DIAGNOSTIC_ROWS_MAX_V3,
     DiagnosticArtifactKindV3Dto, DiagnosticArtifactV3Dto, DiagnosticReferenceV3Dto,
-    DiagnosticRowV3Dto, DiagnosticsCapabilityV3Dto, EvidenceAvailabilityV3Dto, GAP_ROWS_MAX_V3,
-    GapIdentityV3Dto, GapKindV3Dto, IdentityTextV3, PACKET_PROJECTION_V3_SCHEMA_VERSION,
-    PacketProjectionV3Dto, PacketRequestIdentityV3Dto, ProjectionGapRowV3Dto,
-    PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
-    SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SearchProjectionV3Dto, Sha256DigestV3Dto,
+    DiagnosticRowV3Dto, DiagnosticsCapabilityV3Dto, EvidenceAvailabilityV3Dto, EvidenceKindV3Dto,
+    GAP_ROWS_MAX_V3, GapIdentityV3Dto, GapKindV3Dto, IdentityTextV3,
+    PACKET_PROJECTION_V3_SCHEMA_VERSION, PacketProjectionV3Dto, PacketRequestIdentityV3Dto,
+    ProjectionGapRowV3Dto, PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto,
+    RetrievalStateV3Dto, SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SearchProjectionV3Dto,
+    Sha256DigestV3Dto,
 };
 use sha2::{Digest, Sha256};
 
@@ -316,7 +317,14 @@ fn compact_packet_candidate_v3(
 ) -> Result<PacketProjectionV3Dto, ProjectionBuildErrorV3> {
     let mut evidence = original_evidence.to_vec();
     for row in evidence.iter_mut().skip(detailed_rows) {
-        row.summary = None;
+        // Source and symbol locators retain useful path/range identity after optional prose is
+        // removed. A graph relation does not: without its summary, the target and edge kind
+        // disappear and the row becomes a contentless source-symbol locator. Selected relations
+        // have already passed the evidence policy, so retain their bounded semantic text and
+        // compact source prose around them instead.
+        if row.kind != EvidenceKindV3Dto::GraphRelation {
+            row.summary = None;
+        }
     }
     let mut gaps = original_gaps.to_vec();
     for row in &mut gaps {
@@ -715,7 +723,7 @@ mod tests {
             EvidenceKindV3Dto, GapIdentityV3Dto, GapKindV3Dto, IdentityTextV3, MessageTextV3,
             PacketEvidenceRowV3Dto, PacketProjectionV3Dto, PathTextV3, ProjectionGapRowV3Dto,
             PublicationIdentityV3Dto, RetrievalStateDescriptorV3Dto, RetrievalStateV3Dto,
-            SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3,
+            SearchEvidenceRowV3Dto, SearchProjectionKindV3Dto, SummaryTextV3, SymbolIdTextV3,
         },
     };
 
@@ -792,6 +800,16 @@ mod tests {
             end_line: Some(7),
             summary: summary.map(|summary| SummaryTextV3::new(summary).unwrap()),
         }
+    }
+
+    fn packet_relation_evidence(id: &str, summary: &str) -> PacketEvidenceRowV3Dto {
+        let mut row = packet_evidence(id, Some(summary));
+        row.kind = EvidenceKindV3Dto::GraphRelation;
+        row.path = Some(PathTextV3::new("src/main.rs").unwrap());
+        row.symbol_id = Some(SymbolIdTextV3::new("main").unwrap());
+        row.start_line = None;
+        row.end_line = None;
+        row
     }
 
     fn projection_gap(
@@ -1091,6 +1109,59 @@ mod tests {
         assert_eq!(
             record, before,
             "budget projection must not mutate its record"
+        );
+    }
+
+    #[test]
+    fn packet_projection_v3_never_compacts_a_relation_into_a_contentless_locator() {
+        let record = record_fixture_with(
+            "retain the material relation witness",
+            PacketBudgetModeDto::Compact,
+            PacketProfileV3::Callflow,
+            vec![
+                packet_evidence("evidence-a", Some("first source summary")),
+                packet_evidence("evidence-b", Some("second source summary")),
+                packet_relation_evidence("evidence-z", "main -[CALL]-> run"),
+            ],
+            Vec::new(),
+            None,
+            RetrievalStateDescriptorV3Dto {
+                state: RetrievalStateV3Dto::Full,
+                generation_id: Some(identity("retrieval-generation-1")),
+            },
+            Vec::new(),
+            true,
+        );
+        let projection =
+            build_packet_projection_v3(&record, diagnostics_capability_fixture(), |candidate| {
+                match candidate {
+                    PacketProjectionV3Dto::Complete { evidence, .. }
+                        if evidence
+                            .as_slice()
+                            .iter()
+                            .filter(|row| {
+                                row.kind == EvidenceKindV3Dto::ExactSource && row.summary.is_some()
+                            })
+                            .count()
+                            > 1 =>
+                    {
+                        Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3 + 1)
+                    }
+                    _ => Ok(PACKET_PUBLIC_RESULT_MAX_BYTES_V3),
+                }
+            })
+            .expect("relation text should fit by compacting optional source prose");
+        let PacketProjectionV3Dto::Complete { evidence, .. } = projection else {
+            panic!("relation-preserving compaction should remain complete");
+        };
+
+        assert_eq!(
+            evidence.as_slice()[2]
+                .summary
+                .as_ref()
+                .map(|summary| summary.as_str()),
+            Some("main -[CALL]-> run"),
+            "a relation row has no usable target or edge semantics without its summary"
         );
     }
 
