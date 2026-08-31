@@ -1908,37 +1908,17 @@ mod tests {
 
     #[test]
     fn required_probes_promote_one_best_match_per_probe() {
-        // Identity-only promotion: one best citation per probe (no multi_match_limit table).
+        // Identity-only promotion: one best citation per exact identifier probe.
         for (query, first_display, second_display) in [
-            (
-                "client send implementation",
-                "Client send implementation",
-                "Client send implementation adapter",
-            ),
-            (
-                "submit prevent default",
-                "Submit prevent default guard",
-                "Submit prevent default handler",
-            ),
-            (
-                "session request creation",
-                "Session request creation",
-                "Session request creation builder",
-            ),
-            (
-                "network command input",
-                "Network command input",
-                "Network command input reader",
-            ),
-            (
-                "source read buffer",
-                "RealBufferedSource.read",
-                "BufferedSource.readIntoBuffer",
-            ),
+            ("ClientSend", "ClientSend", "ClientSendAdapter"),
+            ("SubmitGuard", "SubmitGuard", "SubmitGuardHandler"),
+            ("SessionRequest", "SessionRequest", "SessionRequestBuilder"),
+            ("NetworkInput", "NetworkInput", "NetworkInputReader"),
+            ("RealBufferedSource", "RealBufferedSource", "BufferedSource"),
         ] {
             let mut answer = answer_fixture(vec![
-                citation(&format!("{query} guide"), "docs/flow-guide.md", 100.0),
-                citation(&format!("{query} test"), "tests/flow_test.rs", 99.0),
+                citation(&format!("{query}Guide"), "docs/flow-guide.md", 100.0),
+                citation(&format!("{query}Test"), "tests/flow_test.rs", 99.0),
                 citation(first_display, "src/flow/primary.rs", 4.0),
                 citation(second_display, "src/flow/secondary.rs", 3.0),
             ]);
@@ -1961,6 +1941,24 @@ mod tests {
                 Some("src/flow/primary.rs")
             );
         }
+    }
+
+    #[test]
+    fn soft_seed_phrases_do_not_promote_via_token_coverage() {
+        let mut answer = answer_fixture(vec![
+            citation("architecture entrypoint guide", "docs/arch.md", 100.0),
+            citation("Main", "src/architecture/entrypoint.rs", 1.0),
+        ]);
+        let protected =
+            promote_required_probe_citations(&mut answer, &["architecture entrypoint".to_string()]);
+        assert!(
+            protected.is_empty(),
+            "task-class seed phrases must not privilege capping: {protected:?}"
+        );
+        assert_eq!(
+            answer.citations[0].display_name,
+            "architecture entrypoint guide"
+        );
     }
 
     #[test]

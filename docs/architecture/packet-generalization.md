@@ -30,13 +30,16 @@ public packet budget remains 16 evidence rows / 16 KiB.
   `flagparsing`, `transportsend`, `handlerchain`)
 - Required-probe multi-match limit tables and coverage-role alias tables keyed
   by domain or historical probe vocabulary
+- Task-class fixed seed tables (`task_class_seed_queries`) and elevating those
+  seeds into required-probe / sufficiency capping via soft token coverage
 - Flow-template claims and holdout `expected_files` / `expected_symbols` anchors
 - Production dependencies on `benchmarks/`, `codestory-bench`, or eval manifests
 
 Production may retain only path-based structural labels such as
 `SourceEvidence` and `TestsAndRegressionCoverage`. Selection and sufficiency
 must follow repository-evidence objectives and exact path/symbol identity, not
-domain vocabulary.
+domain vocabulary. Required-probe match and capping promotion use path,
+qualified symbol, file-scoped symbol, or exact identifier only.
 
 Historical 18-task / language-expansion holdout scores are
 `evidence_eligibility: contaminated_development` only. They are never a release

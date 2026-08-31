@@ -71,9 +71,6 @@ pub fn build_packet_plan_with_extra(
     for (query, purpose) in packet_symbol_probe_query_specs(question, task_class, budget) {
         push_packet_query(&mut queries, &query, purpose);
     }
-    for query in task_class_seed_queries(task_class) {
-        push_packet_query(&mut queries, query, "task-class retrieval seed");
-    }
     for query in packet_concept_queries(question) {
         push_packet_query(
             &mut queries,
@@ -748,24 +745,6 @@ pub fn push_unique_term(terms: &mut Vec<String>, value: &str) {
     let duplicate = terms.iter().any(|term| term.eq_ignore_ascii_case(value));
     if !duplicate {
         terms.push(value.to_string());
-    }
-}
-
-fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
-    match task_class {
-        PacketTaskClassDto::ArchitectureExplanation => &[
-            "architecture entrypoint",
-            "runtime flow",
-            "main",
-            "run",
-            "entrypoint",
-        ],
-        PacketTaskClassDto::BugLocalization => &["error path", "failure handling"],
-        PacketTaskClassDto::ChangeImpact => &["affected symbols", "impacted tests"],
-        PacketTaskClassDto::RouteTracing => &["route handler endpoint", "references"],
-        PacketTaskClassDto::SymbolOwnership => &["definition references", "callers"],
-        PacketTaskClassDto::DataFlow => &["pipeline flow", "storage handoff"],
-        PacketTaskClassDto::EditPlanning => &["edit candidates", "test coverage"],
     }
 }
 

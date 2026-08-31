@@ -631,12 +631,6 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
         return Some(6);
     }
     let normalized_display = normalize_identifier(&citation.display_name);
-    let normalized_path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .map(|path| normalize_identifier(&path))
-        .unwrap_or_default();
     if let Some(matches_file_scoped_symbol) =
         packet_file_scoped_symbol_probe_matches(query, citation)
     {
@@ -649,16 +643,9 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
         Some(5)
     } else if normalized_display == normalized_query
         || normalized_display.ends_with(&normalized_query)
-        || (!packet_required_probe_needs_exact_match(query)
-            && packet_citation_probe_token_coverage(query, citation) >= 2)
     {
+        // Identity-only: exact / suffix identifier match only (CX-R3-01).
         Some(4)
-    } else if normalized_path.contains(&normalized_query) {
-        Some(3)
-    } else if normalized_display.contains(&normalized_query) {
-        Some(2)
-    } else if !normalized_display.is_empty() && normalized_query.contains(&normalized_display) {
-        Some(1)
     } else {
         None
     }
@@ -1199,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_probe_match_rank_uses_multi_token_path_coverage() {
+    fn packet_probe_match_rank_does_not_privilege_soft_token_coverage() {
         let mut citation = test_packet_citation(
             "std::collections::HashMap",
             "codex-rs/exec/src/event_processor_with_jsonl_output.rs",
@@ -1207,13 +1194,18 @@ mod tests {
         );
         citation.kind = NodeKind::MODULE;
 
+        // Soft multi-token overlap must not award required-probe rank (CX-R3-01).
         assert_eq!(
             packet_citation_probe_match_rank("jsonl event output", &citation),
-            Some(4)
+            None
         );
         assert_eq!(
             packet_citation_probe_token_coverage("jsonl event output", &citation),
             3
+        );
+        assert_eq!(
+            packet_citation_probe_match_rank("event_processor_with_jsonl_output", &citation),
+            Some(5)
         );
     }
 

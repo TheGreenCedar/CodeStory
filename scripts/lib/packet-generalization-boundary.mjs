@@ -174,9 +174,10 @@ export const DELETED_HOLDOUT_PROBE_SPELLINGS = Object.freeze([
   "bufferedwrapper",
 ]);
 
-/** Production APIs that encode domain probe / capping tables (CX-R2). */
+/** Production APIs that encode domain probe / capping tables (CX-R2 / CX-R3). */
 export const DELETED_PROBE_TABLE_APIS = Object.freeze([
   "packet_required_probe_multi_match_limit",
+  "task_class_seed_queries",
   "push_search_flow_probe_queries",
   "push_indexing_flow_required_probe_queries",
   "packet_citation_matches_route_dispatch_probe",
@@ -188,6 +189,22 @@ export const DELETED_PROBE_TABLE_APIS = Object.freeze([
   "packet_citation_matches_public_api_surface_probe",
   "packet_required_probe_needs_full_token_coverage",
   "packet_required_probe_needs_buffered_wrapper_implementation",
+]);
+
+/** Fixed task-class retrieval seed phrases that steered required-probe capping (CX-R3). */
+export const DELETED_TASK_CLASS_SEED_SPELLINGS = Object.freeze([
+  "architectureentrypoint",
+  "runtimeflow",
+  "routehandlerendpoint",
+  "pipelineflow",
+  "storagehandoff",
+  "errorpath",
+  "failurehandling",
+  "affectedsymbols",
+  "impactedtests",
+  "definitionreferences",
+  "editcandidates",
+  "testcoverage",
 ]);
 
 /** Domain ownership predicate name patterns (CX-02). */
@@ -525,6 +542,34 @@ export function findBoundaryViolations(source, { filePath = "<memory>", repoRoot
           detail: api,
         });
       }
+    }
+
+    for (const spelling of DELETED_TASK_CLASS_SEED_SPELLINGS) {
+      const stringLitRe = /["']([^"']{2,120})["']/g;
+      let lit;
+      const seen = new Set();
+      while ((lit = stringLitRe.exec(productionView)) != null) {
+        const normalized = normalizeIdentifier(lit[1]);
+        if (normalized === spelling && !seen.has(spelling)) {
+          seen.add(spelling);
+          findings.push({
+            kind: "task_class_seed_spelling",
+            file: relative,
+            detail: `${spelling} <= "${lit[1]}"`,
+          });
+        }
+      }
+    }
+
+    if (
+      /task-class retrieval seed/i.test(productionView)
+      || /purpose:\s*"task-class retrieval seed"/i.test(productionView)
+    ) {
+      findings.push({
+        kind: "task_class_seed_purpose",
+        file: relative,
+        detail: "task-class retrieval seed",
+      });
     }
 
     // Coverage-role alias table: clienttransportsend-style arms inside

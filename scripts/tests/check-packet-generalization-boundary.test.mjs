@@ -205,6 +205,31 @@ pub fn push_search_flow_probe_queries(queries: &mut Vec<String>) {
   assert.ok(DELETED_PROBE_TABLE_APIS.includes("packet_required_probe_multi_match_limit"));
 });
 
+test("task-class seed tables that elevate into required probes fail the checker", () => {
+  const leaked = `
+fn task_class_seed_queries(task_class: PacketTaskClassDto) -> &'static [&'static str] {
+    match task_class {
+        PacketTaskClassDto::RouteTracing => &["route handler endpoint", "references"],
+        PacketTaskClassDto::ArchitectureExplanation => &["architecture entrypoint"],
+        PacketTaskClassDto::DataFlow => &["pipeline flow"],
+        _ => &[],
+    }
+}
+fn build_plan() {
+    push_packet_query(&mut queries, "route handler endpoint", "task-class retrieval seed");
+}
+`;
+  const findings = findBoundaryViolations(leaked, {
+    filePath: path.join(repositoryRoot, "crates/codestory-agent/src/packet_plan.rs"),
+    repoRoot: repositoryRoot,
+  });
+  const kinds = new Set(findings.map((f) => f.kind));
+  assert.ok(kinds.has("deleted_probe_table_api"), findings);
+  assert.ok(kinds.has("task_class_seed_spelling"), findings);
+  assert.ok(kinds.has("task_class_seed_purpose"), findings);
+  assert.ok(DELETED_PROBE_TABLE_APIS.includes("task_class_seed_queries"));
+});
+
 test("cfg(test) modules with char literals are masked from production scans", () => {
   const source = `
 pub fn live() {}

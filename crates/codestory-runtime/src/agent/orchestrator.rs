@@ -815,15 +815,44 @@ fn packet_plan_sufficiency_extra_probes(
     plan: &PacketPlanDto,
     _explicit_extra_probes: &[String],
 ) -> Vec<String> {
+    // Identity-only (CX-R3-01): never elevate task-class / concept / prompt seed
+    // phrases into required-probe capping. Explicit request probes stay request-owned
+    // and are not auto-promoted into sufficiency requirements either.
     let mut probes = Vec::new();
     for query in &plan.queries {
-        if !query.purpose.contains("explicit")
-            && packet_plan_query_can_gate_sufficiency(&query.query)
-        {
-            push_packet_sufficiency_extra_probe(&mut probes, &query.query);
+        if !packet_plan_query_is_identity_sufficiency_probe(query) {
+            continue;
         }
+        push_packet_sufficiency_extra_probe(&mut probes, &query.query);
     }
     probes
+}
+
+fn packet_plan_query_is_identity_sufficiency_probe(query: &PacketPlanQueryDto) -> bool {
+    let purpose = query.purpose.to_ascii_lowercase();
+    if purpose.contains("task-class")
+        || purpose.contains("concept")
+        || purpose.contains("explicit")
+        || purpose.contains("original task")
+        || purpose.contains("retrieval seed")
+    {
+        return false;
+    }
+    packet_plan_query_looks_like_identity(&query.query)
+}
+
+fn packet_plan_query_looks_like_identity(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    trimmed.contains("::")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || (trimmed.contains('.')
+            && trimmed
+                .chars()
+                .any(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit()))
 }
 
 fn promote_retained_owner_member_probes(
@@ -1963,12 +1992,6 @@ fn packet_dart_declared_type_name(source: &str) -> Option<(String, u32)> {
         }
     }
     None
-}
-
-fn packet_plan_query_can_gate_sufficiency(query: &str) -> bool {
-    packet_probe_terms(query)
-        .iter()
-        .any(|term| term.len() >= 4 && !crate::agent::packet_scoring::packet_query_stop_term(term))
 }
 
 fn push_packet_sufficiency_extra_probe(probes: &mut Vec<String>, probe: &str) {
@@ -10499,10 +10522,11 @@ mod tests {
         assert_eq!(plan.task_class, PacketTaskClassDto::ChangeImpact);
         assert!(!plan.inferred_task_class);
         assert!(
-            plan.queries
+            !plan
+                .queries
                 .iter()
-                .any(|query| query.query.contains("affected")),
-            "change impact plans should seed affected-symbol queries: {plan:?}"
+                .any(|query| query.query == "affected symbols"),
+            "requested task class must not inject holdout seed tables: {plan:?}"
         );
     }
 
@@ -11782,8 +11806,8 @@ mod tests {
 
         assert_eq!(plan.task_class, PacketTaskClassDto::ArchitectureExplanation);
         assert!(
-            queries.contains(&"architecture entrypoint"),
-            "architecture packets should keep architecture seeds: {queries:?}"
+            !queries.contains(&"architecture entrypoint"),
+            "architecture packets must not inject task-class seed tables: {queries:?}"
         );
         assert!(
             !queries.contains(&"affected symbols"),
@@ -11810,8 +11834,8 @@ mod tests {
                 "{question}"
             );
             assert!(
-                queries.contains(&"affected symbols"),
-                "specific risk-of-change prompts should keep change-impact seeds: {queries:?}"
+                !queries.contains(&"affected symbols"),
+                "change-impact packets must not inject task-class seed tables: {queries:?}"
             );
         }
     }
