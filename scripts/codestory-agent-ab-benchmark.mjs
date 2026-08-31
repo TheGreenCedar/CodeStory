@@ -2980,6 +2980,101 @@ function benchmarkRunId(parts) {
   return parts.map(artifactNamePart).join("-");
 }
 
+
+function installedAgentTimingCohortId(dimensions) {
+  const requiredStrings = [
+    "execution_window_id",
+    "model",
+    "load_policy",
+    "task_id",
+  ];
+  for (const field of requiredStrings) {
+    if (typeof dimensions?.[field] !== "string" || !dimensions[field].trim()) {
+      throw new Error(`installed timing cohort ${field} is required`);
+    }
+  }
+  if (!Number.isInteger(dimensions?.repeat) || dimensions.repeat <= 0) {
+    throw new Error("installed timing cohort repeat must be a positive integer");
+  }
+  if (!dimensions.host || typeof dimensions.host !== "object" || Array.isArray(dimensions.host)) {
+    throw new Error("installed timing cohort host is required");
+  }
+  const host = Object.fromEntries([
+    "platform",
+    "arch",
+    "cpu_model",
+    "logical_cpu_count",
+    "total_memory_bytes",
+  ].map((field) => [field, dimensions.host[field] ?? null]));
+  return sha256Bytes(stableJsonForHash({
+    contract: "codestory.installed-agent-timing-cohort/v1",
+    execution_window_id: dimensions.execution_window_id,
+    host,
+    model: dimensions.model,
+    load_policy: dimensions.load_policy,
+    task_id: dimensions.task_id,
+    repeat: dimensions.repeat,
+  }));
+}
+
+
+function installedAgentTiming(values) {
+  if (!SHA256_PATTERN.test(String(values?.timing_cohort_id ?? ""))) {
+    throw new Error("installed timing cohort id must be a lowercase SHA-256 digest");
+  }
+  const fields = [
+    "agent_runner_ms",
+    "time_to_first_packet_ms",
+    "continuation_ms",
+    "whole_task_wall_ms",
+  ];
+  for (const field of fields) {
+    if (typeof values[field] !== "number" || !Number.isFinite(values[field]) || values[field] < 0) {
+      throw new Error(`installed timing ${field} must be finite and nonnegative`);
+    }
+  }
+  const reconciled = values.agent_runner_ms
+    + values.time_to_first_packet_ms
+    + values.continuation_ms;
+  if (Math.abs(reconciled - values.whole_task_wall_ms) > 0.5) {
+    throw new Error(
+      `installed timing does not reconcile: phases=${reconciled} wall=${values.whole_task_wall_ms}`,
+    );
+  }
+  return {
+    timing_cohort_id: values.timing_cohort_id,
+    agent_runner_ms: Math.round(values.agent_runner_ms),
+    time_to_first_packet_ms: Math.round(values.time_to_first_packet_ms),
+    continuation_ms: Math.round(values.continuation_ms),
+    time_to_final_packet_ms: Math.round(
+      values.time_to_first_packet_ms + values.continuation_ms,
+    ),
+    whole_task_wall_ms: Math.round(values.whole_task_wall_ms),
+  };
+}
+
+
+function timingIneligibleComparatorRow(row) {
+  const timing = row.installed_agent_timing;
+  return {
+    ...row,
+    ...(timing ? {
+      installed_agent_timing: Object.fromEntries([
+        "timing_cohort_id",
+        "agent_runner_ms",
+        "time_to_first_packet_ms",
+        "continuation_ms",
+        "time_to_final_packet_ms",
+        "whole_task_wall_ms",
+      ].map((field) => [field, timing[field]])),
+    } : {}),
+    comparative_wall_time_eligible: false,
+    installed_agent_timing_eligible: false,
+    installed_agent_timing_ineligibility_reason: "reused_comparator_row",
+  };
+}
+
+
 function parseJsonLines(stdout) {
   const parsed = [];
   const malformed = [];
@@ -6104,6 +6199,28 @@ async function runOne(opts, run, outDir) {
   const runnerWallMs = shouldRunAgent ? Math.round((performance.now() - started) * 1000) / 1000 : 0;
   const preludeWallMs = (codestoryPrelude?.public.wall_ms ?? 0) + (baselinePrelude?.public.wall_ms ?? 0);
   const wallMs = Math.round((runnerWallMs + preludeWallMs) * 1000) / 1000;
+  const timingCohortId = installedAgentTimingCohortId({
+    execution_window_id: opts.timingExecutionWindowId ?? opts.executionWindowId ?? "local-dev-window",
+    host: benchmarkHostClass([]),
+    model: opts.model ?? DEFAULT_BENCHMARK_MODEL,
+    load_policy: opts.timingLoadPolicy ?? "fresh_agent_session",
+    task_id: run.task?.id ?? run.repo,
+    repeat: run.repeat,
+  });
+  const codestoryPreludeWallMs = codestoryPrelude?.public.wall_ms ?? 0;
+  const timeToFirstPacketMs = Number.isFinite(codestoryPrelude?.public.time_to_first_packet_ms)
+    ? codestoryPrelude.public.time_to_first_packet_ms
+    : 0;
+  const continuationMs = Number.isFinite(codestoryPrelude?.public.continuation_ms)
+    ? codestoryPrelude.public.continuation_ms
+    : Math.max(0, codestoryPreludeWallMs - timeToFirstPacketMs);
+  const installedTiming = installedAgentTiming({
+    timing_cohort_id: timingCohortId,
+    agent_runner_ms: runnerWallMs + (baselinePrelude?.public.wall_ms ?? 0),
+    time_to_first_packet_ms: timeToFirstPacketMs,
+    continuation_ms: continuationMs,
+    whole_task_wall_ms: wallMs,
+  });
   const stdoutPath = path.join(outDir, `${runId}.stdout.jsonl`);
   const stderrPath = path.join(outDir, `${runId}.stderr.txt`);
   await writeFile(stdoutPath, result.stdout, "utf8");
@@ -6194,12 +6311,17 @@ async function runOne(opts, run, outDir) {
       ? `CodeStory binary identity ${codestoryBinaryIdentity.status}`
       : result.error,
     wall_ms: wallMs,
+    installed_agent_timing: installedTiming,
+    installed_agent_timing_eligible: run.comparative_wall_time_eligible !== false,
+    installed_agent_timing_ineligibility_reason:
+      run.comparative_wall_time_eligible === false ? "preparation_overlap" : null,
     exact_candidate_timing: opts.exactCandidate
       ? {
           cold_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.preparation_wall_ms ?? 0,
-          warm_ms: wallMs,
+          // Whole-task warm/all-in come from InstalledAgentTimingV1, not a raw wallMs alias.
+          warm_ms: installedTiming.whole_task_wall_ms,
           incremental_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.incremental_wall_ms ?? 0,
-          all_in_ms: wallMs,
+          all_in_ms: installedTiming.whole_task_wall_ms,
         }
       : null,
     agent_runner_wall_ms: runnerWallMs,
@@ -14297,6 +14419,9 @@ export {
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
+  installedAgentTiming,
+  installedAgentTimingCohortId,
+  timingIneligibleComparatorRow,
   benchmarkContractEnvironmentSha256,
   benchmarkContractForRun,
   benchmarkHostClass,

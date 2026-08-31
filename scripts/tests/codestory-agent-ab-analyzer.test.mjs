@@ -36,6 +36,9 @@ import {
   gitCheckedOutput,
   isTrustedPublishableRepoUrl,
   isPathInside,
+  installedAgentTiming,
+  installedAgentTimingCohortId,
+  timingIneligibleComparatorRow,
   interactionTurnTelemetry,
   loadTaskForResult,
   loadReleaseEvidenceCorpusContract,
@@ -9057,4 +9060,89 @@ test("buildQualityDebugPayload preserves packet sufficiency diagnostics", () => 
     ],
     1,
   );
+});
+
+test("installed timing cohorts match only inside one host, model, load-policy, task, repeat, and window", () => {
+  const dimensions = {
+    execution_window_id: "window-2026-08-30T12:00:00Z",
+    host: {
+      platform: "darwin",
+      arch: "arm64",
+      cpu_model: "Apple M4 Max",
+      logical_cpu_count: 16,
+      total_memory_bytes: 64 * 1024 ** 3,
+    },
+    model: "gpt-5.6-sol",
+    load_policy: "fresh_agent_session",
+    task_id: "dart-http-client-flow",
+    repeat: 2,
+  };
+  const cohort = installedAgentTimingCohortId(dimensions);
+  assert.match(cohort, /^[0-9a-f]{64}$/);
+  assert.equal(installedAgentTimingCohortId({ ...dimensions, arm: "published_0_17_5" }), cohort);
+  assert.equal(installedAgentTimingCohortId({ ...dimensions, arm: "candidate_0_18" }), cohort);
+  for (const [field, value] of [
+    ["execution_window_id", "next-window"],
+    ["model", "gpt-5.6-terra"],
+    ["load_policy", "persistent_agent_session"],
+    ["task_id", "c-redis-command-loop"],
+    ["repeat", 3],
+  ]) {
+    assert.notEqual(installedAgentTimingCohortId({ ...dimensions, [field]: value }), cohort, field);
+  }
+  assert.notEqual(
+    installedAgentTimingCohortId({
+      ...dimensions,
+      host: { ...dimensions.host, logical_cpu_count: 12 },
+    }),
+    cohort,
+  );
+});
+
+test("installed timing separates runner, first packet, continuation, final packet, and whole task", () => {
+  const timing = installedAgentTiming({
+    timing_cohort_id: "a".repeat(64),
+    agent_runner_ms: 1_201.4,
+    time_to_first_packet_ms: 410.6,
+    continuation_ms: 92.2,
+    whole_task_wall_ms: 1_704.2,
+  });
+  assert.deepEqual(timing, {
+    timing_cohort_id: "a".repeat(64),
+    agent_runner_ms: 1_201,
+    time_to_first_packet_ms: 411,
+    continuation_ms: 92,
+    time_to_final_packet_ms: 503,
+    whole_task_wall_ms: 1_704,
+  });
+  assert.throws(
+    () => installedAgentTiming({
+      timing_cohort_id: "a".repeat(64),
+      agent_runner_ms: 10,
+      time_to_first_packet_ms: 20,
+      continuation_ms: 30,
+      whole_task_wall_ms: 59,
+    }),
+    /does not reconcile/,
+  );
+});
+
+test("reused comparator rows are always timing-ineligible", () => {
+  const row = timingIneligibleComparatorRow({
+    arm: "published_0_17_5",
+    comparative_wall_time_eligible: true,
+    installed_agent_timing: {
+      timing_cohort_id: "b".repeat(64),
+      agent_runner_ms: 100,
+      time_to_first_packet_ms: 10,
+      continuation_ms: 5,
+      time_to_final_packet_ms: 15,
+      whole_task_wall_ms: 115,
+      timing_eligible: true,
+    },
+  });
+  assert.equal(row.comparative_wall_time_eligible, false);
+  assert.equal(row.installed_agent_timing_eligible, false);
+  assert.equal(row.installed_agent_timing_ineligibility_reason, "reused_comparator_row");
+  assert.equal(Object.keys(row.installed_agent_timing).length, 6);
 });

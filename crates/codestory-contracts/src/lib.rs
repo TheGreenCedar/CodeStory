@@ -17,6 +17,7 @@ pub mod core_publication;
 pub mod events;
 pub mod graph;
 pub mod grounding;
+pub mod installed_agent_timing;
 pub mod language_support;
 pub mod owned_artifacts;
 pub mod packet_projection_v3;
