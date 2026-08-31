@@ -56,7 +56,12 @@ fn proof_common_fields_v3(kind: &str) -> Vec<(&str, Value)> {
                 ("run_id", string_schema_v3()),
             ]),
         ),
+        ("provenance", proof_provenance_capability_schema_v3()),
     ]
+}
+
+fn proof_provenance_capability_schema_v3() -> Value {
+    diagnostics_capability_schema_v3()
 }
 
 fn proof_complete_schema_v3() -> Value {
@@ -179,13 +184,6 @@ fn proof_refutation_schema_v3() -> Value {
                 ("kind", enum_schema_v3(&["prohibited_scope_traversal"])),
                 ("step_index", json!({"type":"integer","minimum":0,"maximum":5})),
                 ("prohibition_index", json!({"type":"integer","minimum":0,"maximum":255})),
-                ("connected_receipts", connected_receipts()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["certified_absence"])),
-                ("step_index", json!({"type":"integer","minimum":0,"maximum":5})),
-                ("extractor_capability_receipt_id", string_schema_v3()),
-                ("untruncated_enumeration_receipt_id", string_schema_v3()),
                 ("connected_receipts", connected_receipts()),
             ]),
         ]
@@ -513,7 +511,6 @@ fn proof_step_schema_v3() -> Value {
             enum_schema_v3(&[
                 "proven",
                 "positive_contradiction",
-                "certified_absence",
                 "unavailable",
                 "unknown",
             ]),
@@ -583,15 +580,15 @@ fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
 }
 
 fn annotations_v3(activates: bool) -> Value {
-    let mut annotations = Map::from_iter([
-        ("destructiveHint".to_string(), json!(false)),
-        ("idempotentHint".to_string(), json!(true)),
-        ("openWorldHint".to_string(), json!(activates)),
-    ]);
-    if !activates {
-        annotations.insert("readOnlyHint".to_string(), json!(true));
-    }
-    Value::Object(annotations)
+    // Match stdio_catalog policy: readOnlyHint is true for every tool, including
+    // those that activate managed cache state. None write the repository; managed
+    // activation is disclosed through openWorldHint and vendor safety metadata.
+    json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": activates
+    })
 }
 
 fn output_schema_for_tool_v3(name: &str, source: &Value, activates: bool) -> Value {
@@ -605,7 +602,7 @@ fn output_schema_for_tool_v3(name: &str, source: &Value, activates: bool) -> Val
             .cloned()
             .unwrap_or_else(|| json!({"type":"object"})),
     };
-    if activates {
+    if activates || name == "verify_indexed_direct_calls" {
         successful_with_preparing_schema_v3(success)
     } else {
         success
@@ -951,9 +948,9 @@ pub(crate) fn proof_tool_source_v3() -> Value {
         "inputSchema": proof_input_schema_v3(),
         "outputSchema": proof_output_schema_v3(),
         "safety": {
-            "effect": "read_only",
-            "activatesProject": false,
-            "sideEffects": false
+            "effect": "managed_activation",
+            "activatesProject": true,
+            "sideEffects": true
         }
     })
 }
@@ -1187,11 +1184,11 @@ mod tests {
                     Some(&json!(true))
                 );
                 for activation_capable in ["packet", "search", "ground", "context"] {
-                    assert!(
+                    assert_eq!(
                         tool(&tools, activation_capable)
-                            .pointer("/annotations/readOnlyHint")
-                            .is_none(),
-                        "activation-capable {activation_capable} must omit readOnlyHint"
+                            .pointer("/annotations/readOnlyHint"),
+                        Some(&json!(true)),
+                        "activation-capable {activation_capable} must emit readOnlyHint=true"
                     );
                 }
             }
@@ -1294,7 +1291,7 @@ mod tests {
                 "retry_after_ms":250,
                 "operation":{"stage":"publication"}
             });
-            for name in ["packet", "context", "search"] {
+            for name in ["packet", "context", "search", "verify_indexed_direct_calls"] {
                 assert!(
                     crate::stdio_arguments::validate_structured_content(
                         &tool(&tools, name)["outputSchema"],
@@ -1327,6 +1324,16 @@ mod tests {
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
+            "provenance": {
+                "availability":"available",
+                "reference":{
+                    "artifact_id":"proof-provenance:b".to_string() + &"b".repeat(63),
+                    "sha256":"b".repeat(64),
+                    "byte_length":0,
+                    "uri":"codestory://proof-provenance/".to_string() + &"b".repeat(64),
+                    "wall_expiry_epoch_ms":0
+                }
+            },
             "identities": {"files":[],"symbols":[],"provenance_profiles":[],"evidence":[]},
             "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[{"relation":"direct_outgoing_call","target":{"kind":"canonical_id","canonical_id":"B"}}],"prohibit_traversal_through":[],"exclude_from_projection":[]},
             "clauses": [{
@@ -1349,9 +1356,19 @@ mod tests {
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
+            "provenance": {
+                "availability":"available",
+                "reference":{
+                    "artifact_id":"proof-provenance:b".to_string() + &"b".repeat(63),
+                    "sha256":"b".repeat(64),
+                    "byte_length":0,
+                    "uri":"codestory://proof-provenance/".to_string() + &"b".repeat(64),
+                    "wall_expiry_epoch_ms":0
+                }
+            },
             "disposition": {"kind":"unknown","contract_digest":"b".repeat(64),"gaps":[{"kind":"output_budget_exceeded"}]},
-            "cap_bytes": 65536,
-            "required_complete_size": 65537
+            "cap_bytes": 4096,
+            "required_complete_size": 4097
         });
         let schema = proof_output_schema_v3();
         assert_eq!(
@@ -1399,7 +1416,8 @@ mod tests {
         certified_absence["steps"][0]["status"] = json!("certified_absence");
         assert!(
             crate::stdio_arguments::validate_structured_content(&schema, &certified_absence)
-                .is_ok()
+                .is_err(),
+            "public call-path schema must reject certified_absence refutation"
         );
 
         let mut invalid = complete;
