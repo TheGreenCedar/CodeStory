@@ -642,7 +642,7 @@ fn prove_call_path_cli_keeps_file_stdin_dto_parity_and_caps_before_deserializati
     assert_eq!(file_root, stdin_root);
     assert_eq!(
         file_root.pointer("/disposition/kind"),
-        Some(&json!("unavailable"))
+        Some(&json!("unknown"))
     );
     assert_eq!(file_root["domain"], "call-path/v1");
     assert_eq!(file_root["translation_status"], "host_supplied");
