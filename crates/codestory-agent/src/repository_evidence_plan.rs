@@ -4,6 +4,8 @@
 //! graph, this module selects material nodes/edges from repository structure
 //! alone. It never invents domain stage taxonomies from prompt vocabulary.
 
+use crate::packet_required_probes::packet_prompt_explicit_source_path_queries;
+use crate::text::exact_symbol_query_terms;
 use codestory_contracts::api::{
     AgentCitationDto, EdgeId, EdgeKind, GraphEdgeDto, NodeId, PacketTaskClassDto,
 };
@@ -92,10 +94,10 @@ pub fn build_repository_evidence_plan(
     input: RepositoryEvidenceInput<'_>,
     limits: RepositoryEvidenceLimits,
 ) -> RepositoryEvidencePlan {
-    let _question = input.question; // retained for future generic anchor parsing only
     let mut plan = RepositoryEvidencePlan::default();
 
-    let seed_nodes = unique_seed_nodes(input.seeds, limits.max_seed_nodes);
+    let seed_nodes =
+        resolve_prompt_anchor_nodes(input.question, input.seeds, limits.max_seed_nodes);
     if seed_nodes.is_empty() {
         plan.uncovered.push(RepositoryEvidenceGap {
             kind: RepositoryEvidenceGapKind::UnresolvedAnchors,
@@ -217,9 +219,33 @@ pub fn build_repository_evidence_plan(
     plan
 }
 
-fn unique_seed_nodes(seeds: &[AgentCitationDto], max_seed_nodes: usize) -> Vec<NodeId> {
+/// Prefer seeds whose path, display name, or node identity appears exactly in
+/// the prompt. When the prompt carries no matching identities, fall back to
+/// retrieval order so seed-only fixtures still resolve anchors.
+fn resolve_prompt_anchor_nodes(
+    question: &str,
+    seeds: &[AgentCitationDto],
+    max_seed_nodes: usize,
+) -> Vec<NodeId> {
+    let identities = prompt_path_and_symbol_identities(question);
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
+    for seed in seeds {
+        if !(seed_mentioned_verbatim_in_question(seed, question)
+            || seed_matches_prompt_identity(seed, &identities))
+        {
+            continue;
+        }
+        if seen.insert(seed.node_id.clone()) {
+            out.push(seed.node_id.clone());
+        }
+        if out.len() >= max_seed_nodes {
+            return out;
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
     for seed in seeds {
         if seen.insert(seed.node_id.clone()) {
             out.push(seed.node_id.clone());
@@ -229,6 +255,95 @@ fn unique_seed_nodes(seeds: &[AgentCitationDto], max_seed_nodes: usize) -> Vec<N
         }
     }
     out
+}
+
+fn seed_mentioned_verbatim_in_question(seed: &AgentCitationDto, question: &str) -> bool {
+    if !seed.display_name.is_empty() && question.contains(&seed.display_name) {
+        return true;
+    }
+    if let Some(path) = seed.file_path.as_deref()
+        && !path.is_empty()
+        && question.contains(path)
+    {
+        return true;
+    }
+    false
+}
+
+fn prompt_path_and_symbol_identities(question: &str) -> Vec<String> {
+    let mut identities = packet_prompt_explicit_source_path_queries(question);
+    let mut seen: HashSet<String> = identities.iter().cloned().collect();
+    for term in exact_symbol_query_terms(question) {
+        if seen.insert(term.clone()) {
+            identities.push(term);
+        }
+    }
+    identities
+}
+
+fn seed_matches_prompt_identity(seed: &AgentCitationDto, identities: &[String]) -> bool {
+    identities.iter().any(|identity| {
+        let normalized = identity.trim_end_matches(['?', '!', '.', ',', ';']);
+        seed_path_matches_identity(seed.file_path.as_deref(), identity)
+            || (!normalized.is_empty()
+                && normalized != identity
+                && seed_path_matches_identity(seed.file_path.as_deref(), normalized))
+            || seed_symbol_matches_identity(&seed.display_name, identity)
+            || (!normalized.is_empty()
+                && normalized != identity
+                && seed_symbol_matches_identity(&seed.display_name, normalized))
+            || seed.node_id.0 == *identity
+            || (!normalized.is_empty() && seed.node_id.0 == normalized)
+    })
+}
+
+fn seed_path_matches_identity(file_path: Option<&str>, identity: &str) -> bool {
+    let Some(path) = file_path.map(str::trim).filter(|path| !path.is_empty()) else {
+        return false;
+    };
+    let identity = identity.trim();
+    if identity.is_empty() {
+        return false;
+    }
+    path == identity
+        || path.ends_with(identity)
+        || identity.ends_with(path)
+        || path_file_name(path) == Some(identity)
+        || path_file_name(identity) == Some(path)
+}
+
+fn path_file_name(path: &str) -> Option<&str> {
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty() && *name != path)
+}
+
+fn seed_symbol_matches_identity(display_name: &str, identity: &str) -> bool {
+    let display = display_name.trim();
+    let identity = identity.trim();
+    if display.is_empty() || identity.is_empty() {
+        return false;
+    }
+    if display == identity {
+        return true;
+    }
+    let display_segments = identity_segments(display);
+    let identity_segments = identity_segments(identity);
+    if identity_segments.is_empty() || display_segments.len() < identity_segments.len() {
+        return false;
+    }
+    let suffix_start = display_segments.len() - identity_segments.len();
+    display_segments[suffix_start..] == identity_segments[..]
+        || display_segments[..identity_segments.len()] == identity_segments[..]
+}
+
+fn identity_segments(value: &str) -> Vec<&str> {
+    value
+        .split([':', '.', '#', '/', '\\'])
+        .map(str::trim)
+        .map(|segment| segment.strip_suffix("()").unwrap_or(segment))
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 fn preferred_edge_kinds(task_class: PacketTaskClassDto) -> HashSet<EdgeKind> {
@@ -287,17 +402,16 @@ fn is_implementation_kind(kind: EdgeKind, task_class: PacketTaskClassDto) -> boo
         )
 }
 
-fn inbound_preferred(task_class: PacketTaskClassDto) -> bool {
-    matches!(
-        task_class,
-        PacketTaskClassDto::ChangeImpact | PacketTaskClassDto::EditPlanning
-    )
-}
-
 #[derive(Debug, Clone)]
 struct AdjEdge {
     to: NodeId,
     edge_id: EdgeId,
+}
+
+/// Directed kinds keep source→target only. Reverse insertion would let a stored
+/// `B→A` CALL satisfy an `A→B` route search. No current `EdgeKind` is undirected.
+fn edge_kind_is_undirected(_kind: EdgeKind) -> bool {
+    false
 }
 
 fn build_adjacency(
@@ -314,15 +428,13 @@ fn build_adjacency(
             to: edge.target.clone(),
             edge_id: edge.id.clone(),
         });
-        // Undirected expansion for ownership/impact unless strictly ordered CALL
-        // route tracing, which still benefits from reverse edges when searching
-        // paths between anchors.
-        adj.entry(edge.target.clone()).or_default().push(AdjEdge {
-            to: edge.source.clone(),
-            edge_id: edge.id.clone(),
-        });
+        if edge_kind_is_undirected(edge.kind) {
+            adj.entry(edge.target.clone()).or_default().push(AdjEdge {
+                to: edge.source.clone(),
+                edge_id: edge.id.clone(),
+            });
+        }
     }
-    let _ = inbound_preferred; // direction ranking reserved for future scoring
     adj
 }
 
@@ -516,5 +628,120 @@ mod tests {
             g.kind,
             RepositoryEvidenceGapKind::MissingRelation | RepositoryEvidenceGapKind::Unknown
         )));
+    }
+
+    #[test]
+    fn prompt_identity_selects_anchors_not_retrieval_order() {
+        let seeds = [
+            citation("noise_a", "NoiseA::run"),
+            citation("noise_b", "NoiseB::run"),
+            citation("a", "Alpha::run"),
+            citation("b", "Beta::finish"),
+            citation("noise_c", "NoiseC::run"),
+        ];
+        let relations = [call_edge("e1", "a", "b")];
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Beta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        let anchors: Vec<_> = plan
+            .objectives
+            .iter()
+            .filter(|o| o.kind == RepositoryEvidenceObjectiveKind::ResolvedAnchor)
+            .flat_map(|o| o.node_ids.iter().map(|n| n.0.as_str()))
+            .collect();
+        assert_eq!(anchors, vec!["a", "b"]);
+        assert!(!plan.material_node_ids.iter().any(|n| n.0.starts_with("noise_")));
+        assert!(plan.material_edge_ids.iter().any(|e| e.0 == "e1"));
+    }
+
+    #[test]
+    fn prompt_path_identity_selects_matching_seed_anchors() {
+        let seeds = [
+            citation("noise", "Other"),
+            citation("left", "Alpha"),
+            citation("right", "Beta"),
+        ];
+        // Override paths to match the prompt.
+        let mut seeds = seeds;
+        seeds[0].file_path = Some("src/noise.rs".into());
+        seeds[1].file_path = Some("src/alpha.rs".into());
+        seeds[2].file_path = Some("src/beta.rs".into());
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Inspect src/alpha.rs and src/beta.rs relationship",
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                seeds: &seeds,
+                relations: &[],
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        let anchors: Vec<_> = plan
+            .objectives
+            .iter()
+            .filter(|o| o.kind == RepositoryEvidenceObjectiveKind::ResolvedAnchor)
+            .flat_map(|o| o.node_ids.iter().map(|n| n.0.as_str()))
+            .collect();
+        assert_eq!(anchors, vec!["left", "right"]);
+        assert!(!plan.material_node_ids.iter().any(|n| n.0 == "noise"));
+    }
+
+    #[test]
+    fn directed_call_does_not_satisfy_reverse_route() {
+        let seeds = [citation("a", "Alpha::run"), citation("b", "Beta::finish")];
+        // Stored edge is B→A only; searching A→B must not invent a reverse path.
+        let relations = [call_edge("reverse_only", "b", "a")];
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Beta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        assert!(
+            !plan
+                .objectives
+                .iter()
+                .any(|o| o.kind == RepositoryEvidenceObjectiveKind::RelationPath)
+        );
+        assert!(
+            !plan.objectives.iter().any(|o| {
+                o.kind == RepositoryEvidenceObjectiveKind::RelationPath
+                    && o.edge_ids.iter().any(|e| e.0 == "reverse_only")
+            })
+        );
+        assert!(plan.uncovered.iter().any(|g| {
+            g.kind == RepositoryEvidenceGapKind::MissingRelation
+                && g.node_ids.iter().any(|n| n.0 == "a")
+                && g.node_ids.iter().any(|n| n.0 == "b")
+        }));
+    }
+
+    #[test]
+    fn directed_call_forward_route_still_selects_path() {
+        let seeds = [citation("a", "Alpha::run"), citation("b", "Beta::finish")];
+        let relations = [call_edge("forward", "a", "b")];
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Beta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        assert!(
+            plan.objectives
+                .iter()
+                .any(|o| o.kind == RepositoryEvidenceObjectiveKind::RelationPath)
+        );
+        assert!(plan.material_edge_ids.iter().any(|e| e.0 == "forward"));
     }
 }

@@ -41,6 +41,11 @@ must follow repository-evidence objectives and exact path/symbol identity, not
 domain vocabulary. Required-probe match and capping promotion use path,
 qualified symbol, file-scoped symbol, or exact identifier only.
 
+The Stage B repository evidence planner resolves prompt anchors from exact
+path/symbol/identity matches against retrieved seeds (not every citation in
+retrieval order) and traverses directed relationship kinds such as `CALL`
+without inventing reverse edges.
+
 Historical 18-task / language-expansion holdout scores are
 `evidence_eligibility: contaminated_development` only. They are never a release
 or generalization gate.
