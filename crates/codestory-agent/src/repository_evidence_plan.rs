@@ -9,8 +9,8 @@ use codestory_contracts::api::{
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
-/// Initial planner constants. Mutable only during the visible metamorphic
-/// phase; freeze before sealed holdout creation.
+/// Frozen planner constants after visible metamorphic suite green.
+/// Do not mutate without a new Phase-4 suite run and holdout invalidation.
 pub const DEFAULT_REPOSITORY_EVIDENCE_LIMITS: RepositoryEvidenceLimits = RepositoryEvidenceLimits {
     max_seed_nodes: 12,
     max_candidate_nodes: 256,
