@@ -1449,9 +1449,11 @@ fn test_incremental_indexing() -> Result<()> {
     };
 
     let first_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+    storage.put_resolution_support_snapshot(7_001, b"sealed graph support")?;
     let reused_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
 
     assert_eq!(first_stats.parser_artifact_cache.misses, 1);
+    assert!(first_stats.graph_projection_changed);
     assert_eq!(
         reused_stats.parser_artifact_cache.policy,
         ArtifactCachePolicy::ReadThrough
@@ -1461,6 +1463,19 @@ fn test_incremental_indexing() -> Result<()> {
     assert_eq!(reused_stats.parser_artifact_cache.hits, 1);
     assert_eq!(reused_stats.parser_artifact_cache.misses, 0);
     assert_eq!(reused_stats.parser_artifact_cache.reader_opens, 0);
+    assert!(!reused_stats.graph_projection_changed);
+    assert_eq!(reused_stats.source_identity_only_files, 1);
+    assert!(
+        !reused_stats.resolution_ran,
+        "an unchanged graph cannot require a global resolution pass"
+    );
+    assert_eq!(reused_stats.flush_nodes_ms, 0);
+    assert_eq!(reused_stats.flush_edges_ms, 0);
+    assert_eq!(
+        storage.get_resolution_support_snapshot(7_001)?,
+        Some(b"sealed graph support".to_vec()),
+        "source-identity-only persistence must retain graph-derived support"
+    );
 
     let file_id = WorkspaceIndexer::canonical_file_node_id_for_path(&f1);
     assert_eq!(
@@ -1468,6 +1483,26 @@ fn test_incremental_indexing() -> Result<()> {
         Some(source_content_hash(source.as_bytes()).as_str())
     );
     assert_eq!(reused_stats.artifact_cache_hits, 1);
+
+    let graph_before_lf = (storage.get_nodes()?.len(), storage.get_edges()?.len());
+    let source_with_appended_lf = format!("{source}\n");
+    fs::write(&f1, &source_with_appended_lf)?;
+    let appended_lf_stats = indexer.run_incremental(&mut storage, &refresh_info, &bus, None)?;
+    assert!(!appended_lf_stats.graph_projection_changed);
+    assert_eq!(appended_lf_stats.source_identity_only_files, 1);
+    assert!(
+        !appended_lf_stats.resolution_ran,
+        "source-identity-only refresh must retain resolved edges as-is"
+    );
+    assert_eq!(
+        (storage.get_nodes()?.len(), storage.get_edges()?.len()),
+        graph_before_lf,
+        "an appended line feed cannot rewrite an equivalent graph"
+    );
+    assert_eq!(
+        storage.get_file_content_hash(file_id)?.as_deref(),
+        Some(source_content_hash(source_with_appended_lf.as_bytes()).as_str())
+    );
 
     // Check verification
     let nodes = storage.get_nodes().unwrap();
@@ -1557,6 +1592,38 @@ fn incremental_incomplete_result_preserves_previous_projection() -> Result<()> {
             && error.message.contains("Skipped oversized source file")
             && error.coverage_reason == Some(FileCoverageReason::Oversized)
     }));
+    Ok(())
+}
+
+#[test]
+fn parser_partial_append_lf_reuses_the_equivalent_graph_projection() -> Result<()> {
+    use codestory_workspace::RefreshInfo;
+
+    let dir = tempdir()?;
+    let path = dir.path().join("partial.c");
+    let source = "int helper(void) { return 1; }\nint broken( { return helper(); }\n";
+    std::fs::write(&path, source)?;
+    let refresh = RefreshInfo {
+        mode: codestory_workspace::BuildMode::Incremental,
+        files_to_index: vec![path.clone()],
+        files_to_remove: Vec::new(),
+        existing_file_ids: HashMap::new(),
+    };
+    let mut storage = Storage::new_in_memory()?;
+    let indexer = WorkspaceIndexer::new(dir.path().to_path_buf());
+    indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+    assert!(!storage.get_file_by_path(&path)?.unwrap().complete);
+    let graph_before = (storage.get_nodes()?.len(), storage.get_edges()?.len());
+
+    std::fs::write(&path, format!("{source}\n"))?;
+    let stats = indexer.run_incremental(&mut storage, &refresh, &EventBus::new(), None)?;
+    assert!(!stats.graph_projection_changed);
+    assert_eq!(stats.source_identity_only_files, 1);
+    assert!(!stats.resolution_ran);
+    assert_eq!(
+        (storage.get_nodes()?.len(), storage.get_edges()?.len()),
+        graph_before
+    );
     Ok(())
 }
 
@@ -3639,6 +3706,75 @@ fn test_full_refresh_writer_failure_disconnects_producer_without_deadlock() -> R
         .expect_err("injected writer failure must propagate");
     handle.join().expect("indexing thread must not panic");
     assert!(error.contains("forced pipeline cache failure"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn companion_source_without_evidence_producer_persists_inventory_identity_only() -> Result<()> {
+    use codestory_store::Store as Storage;
+    use codestory_workspace::{RefreshInfo, RefreshInputs, WorkspaceManifest};
+
+    let dir = tempdir()?;
+    let companion = dir.path().join("maintenance.lua");
+    std::fs::write(&companion, "return { enabled = true }\n")?;
+
+    let mut storage = Storage::new_in_memory()?;
+    WorkspaceIndexer::new(dir.path().to_path_buf()).run_incremental(
+        &mut storage,
+        &RefreshInfo {
+            mode: codestory_workspace::BuildMode::Incremental,
+            files_to_index: vec![companion.clone()],
+            files_to_remove: Vec::new(),
+            existing_file_ids: HashMap::new(),
+        },
+        &EventBus::new(),
+        None,
+    )?;
+
+    let file = storage
+        .get_file_by_path(&companion)?
+        .expect("companion inventory row");
+    assert_eq!(file.language, "lua");
+    assert!(file.indexed);
+    assert!(
+        !file.complete,
+        "inventory-only rows cannot prove graph absence"
+    );
+    assert!(storage.get_file_content_hash(file.id)?.is_some());
+    assert!(
+        storage
+            .get_errors(None)?
+            .iter()
+            .all(|error| error.file_id != Some(NodeId(file.id))),
+        "inventory-only coverage is stable, not a retryable collector failure"
+    );
+    let nodes = storage.get_nodes()?;
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node.file_node_id == Some(NodeId(file.id)))
+            .count(),
+        0,
+        "inventory-only sources cannot emit non-file graph nodes"
+    );
+    assert!(storage.get_edges()?.is_empty());
+
+    let manifest = WorkspaceManifest::open(dir.path().to_path_buf())?;
+    let inventory = storage.files().inventory()?;
+    let clean = manifest.build_execution_plan(&RefreshInputs {
+        stored_files: inventory.clone(),
+        policy_exclusions: Vec::new(),
+        inventory: codestory_workspace::WorkspaceInventory::default(),
+    })?;
+    assert!(clean.files_to_index.is_empty());
+
+    std::fs::write(&companion, "return { enabled = false }\n")?;
+    let changed = manifest.build_execution_plan(&RefreshInputs {
+        stored_files: inventory,
+        policy_exclusions: Vec::new(),
+        inventory: codestory_workspace::WorkspaceInventory::default(),
+    })?;
+    assert_eq!(changed.files_to_index, vec![companion]);
     Ok(())
 }
 

@@ -294,10 +294,12 @@ pub use health::{
     probe_infrastructure_health, probe_sidecar_health,
 };
 pub use index::{
-    FinalizeComponentWork, FinalizeIndexOutcome, FinalizePhaseTiming, RetrievalIndexCancelled,
-    SidecarInputChanged, finalize_index, finalize_index_for_runtime,
+    FinalizeComponentWork, FinalizeIndexOutcome, FinalizePhaseTiming,
+    IncrementalRetrievalRefreshReceipt, RetrievalIndexCancelled, SidecarInputChanged,
+    clear_incremental_retrieval_refresh_receipt, finalize_index, finalize_index_for_runtime,
     finalize_index_for_runtime_with_cancel, finalize_index_for_runtime_with_progress,
-    finalize_index_for_runtime_with_progress_and_cancel, is_retrieval_index_cancelled,
+    finalize_index_for_runtime_with_progress_and_cancel,
+    install_incremental_retrieval_refresh_receipt, is_retrieval_index_cancelled,
     is_sidecar_input_changed, project_id_for_root, sidecar_project_id_for_root,
 };
 pub use inventory::{

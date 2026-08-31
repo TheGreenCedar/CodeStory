@@ -246,3 +246,57 @@ fn a_store_from_the_previous_release_upgrades_without_a_reprojection_wave() {
         "a legacy row carries no identity, so its fence moving is still churn"
     );
 }
+
+#[test]
+fn duplicate_callable_keys_compare_in_the_same_last_row_shape_sqlite_stores() {
+    let file_id = NodeId(1);
+    let nodes = vec![
+        Node {
+            id: file_id,
+            kind: NodeKind::FILE,
+            serialized_name: "duplicates.c".into(),
+            start_line: Some(1),
+            start_col: Some(1),
+            end_line: Some(4),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(2),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "helper".into(),
+            qualified_name: Some("helper".into()),
+            file_node_id: Some(file_id),
+            start_line: Some(1),
+            start_col: Some(1),
+            end_line: Some(1),
+            ..Default::default()
+        },
+        Node {
+            id: NodeId(3),
+            kind: NodeKind::FUNCTION,
+            serialized_name: "helper".into(),
+            qualified_name: Some("helper".into()),
+            file_node_id: Some(file_id),
+            start_line: Some(3),
+            start_col: Some(1),
+            end_line: Some(3),
+            ..Default::default()
+        },
+    ];
+
+    let states = build_callable_projection_states(&nodes, &[], &[]);
+    assert_eq!(states.len(), 2, "one callable row plus the file fence");
+    let callable = states
+        .iter()
+        .find(|state| state.symbol_key != FILE_STRUCTURAL_SYMBOL_KEY)
+        .expect("canonical callable row");
+    assert_eq!(
+        callable.node_id,
+        NodeId(3),
+        "SQLite UPSERT keeps the last row"
+    );
+    assert_eq!(
+        classify_projection_update(&states, &states),
+        ProjectionUpdateMode::NoChanges
+    );
+}

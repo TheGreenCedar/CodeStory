@@ -81,6 +81,7 @@ pub(super) fn with_index_freshness_caps_for_test<T>(
 /// one, because their verdict is the thing an observer can keep honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FreshnessObservationPolicy {
+    #[allow(dead_code)]
     Unobserved,
     ObserveSourceRoot,
 }

@@ -52,7 +52,9 @@ struct FullIndexLiveState {
 }
 
 fn incomplete_live_index_requires_recovery(storage_path: &Path) -> Result<bool, ApiError> {
-    if !storage_path.exists() {
+    if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+        ApiError::internal(format!("Failed to resolve live core publication: {error}"))
+    })? {
         return Ok(false);
     }
     match Store::database_schema_version(storage_path) {
@@ -131,15 +133,18 @@ fn inspect_full_index_live_state(
     storage_path: &Path,
     source_index_policy: &SourceIndexPolicy,
 ) -> Result<FullIndexLiveState, ApiError> {
-    let previous_publication = if storage_path.exists() {
-        Store::database_index_publication(storage_path).map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to inspect live publication identity: {error}"
-            ))
-        })?
-    } else {
-        None
-    };
+    let previous_publication =
+        if codestory_store::core_database_exists(storage_path).map_err(|error| {
+            ApiError::internal(format!("Failed to resolve live core publication: {error}"))
+        })? {
+            Store::database_index_publication(storage_path).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to inspect live publication identity: {error}"
+                ))
+            })?
+        } else {
+            None
+        };
     let publication = next_index_publication(
         previous_publication.as_ref(),
         IndexPublicationMode::Full,
@@ -468,7 +473,7 @@ fn prepare_full_refresh(
     validate_full_refresh_coverage(root, preparation.staged_mut(), &live_state)?;
     wall_durations.coverage_validation = coverage_started.elapsed();
     let copy_started = Instant::now();
-    if !live_state.recovering_incomplete_run && storage_path.exists() {
+    if !live_state.recovering_incomplete_run && live_state.previous_publication.is_some() {
         copy_forward_full_refresh_artifacts(preparation.staged_mut(), storage_path);
     }
     wall_durations.copy_forward = copy_started.elapsed();
@@ -546,6 +551,8 @@ pub(super) fn index_full_for_runtime(
         publication,
         &policy_exclusions,
         source_index_policy,
+        None,
+        None,
         cancel_token,
     ) {
         let _ = staged.discard();

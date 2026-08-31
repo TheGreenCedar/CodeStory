@@ -7,8 +7,8 @@ use crate::index_timings::{
     IndexingRunSummary, core_indexing_phase_timings, incremental_plan_probe_timings,
 };
 use crate::search_publication::{
-    discard_unpublished_search_generation, read_search_generation_completion,
-    search_index_path_for_publication,
+    discard_unpublished_search_generation, materialize_equivalent_search_generation,
+    read_search_generation_completion, search_index_path_for_publication,
 };
 use crate::search_state_cache::{
     ensure_indexing_active, indexing_cancelled_error, is_indexing_cancelled,
@@ -29,16 +29,19 @@ use crate::{
 use crate::{publication::run_incremental_staged_store_hook, test_sidecar_runtime_from_env};
 use codestory_contracts::api::{
     ApiError, ApiErrorDetails, AppEventPayload, FileCoverageDiagnosticDto,
-    IncrementalPlanProbeOutcomeDto, IndexingPhaseTimings,
+    IncrementalCoreWallTimings, IncrementalPlanProbeOutcomeDto, IncrementalScheduledPathActionDto,
+    IncrementalScheduledPathDto, IncrementalScheduledPathReasonDto, IndexingPhaseTimings,
 };
 use codestory_contracts::events::{Event, EventBus};
 use codestory_contracts::graph::FileCoverageReason;
+use codestory_contracts::validation_receipts::ArtifactSeal;
 use codestory_indexer::{
     CancellationToken, IncrementalIndexingStats, WorkspaceIndexer as V2WorkspaceIndexer,
 };
 use codestory_store::{
     CURRENT_SCHEMA_VERSION, IndexPublicationMode, IndexPublicationRecord, SnapshotStore,
-    SourcePolicyExclusionRecord, StagedSnapshot, StagedSnapshotFinalizeStats, Store,
+    SourcePolicyExclusionRecord, StagedSnapshot, StagedSnapshotFinalizeStats,
+    StagedSnapshotPublishStats, Store,
 };
 use codestory_workspace::{
     OversizedSourceExclusionCandidate, RefreshExecutionPlan, SourceIndexPolicy,
@@ -46,8 +49,8 @@ use codestory_workspace::{
 };
 use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -81,6 +84,29 @@ pub(super) fn index_incremental_for_runtime(
     source_index_policy: &SourceIndexPolicy,
     _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
 ) -> Result<IndexingRunSummary, ApiError> {
+    index_incremental_for_runtime_with_probe(
+        root,
+        storage_path,
+        events_tx,
+        cancel_token,
+        runtime,
+        source_index_policy,
+        _annotations_owned,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn index_incremental_for_runtime_with_probe(
+    root: &Path,
+    storage_path: &Path,
+    events_tx: &Sender<AppEventPayload>,
+    cancel_token: Option<&CancellationToken>,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+    source_index_policy: &SourceIndexPolicy,
+    _annotations_owned: &crate::controller_bookmarks::AnnotationsOwned,
+    precomputed_probe: Option<IncrementalPlanProbe>,
+) -> Result<IndexingRunSummary, ApiError> {
     run_incremental_indexing_common(
         root,
         storage_path,
@@ -88,6 +114,7 @@ pub(super) fn index_incremental_for_runtime(
         cancel_token,
         runtime,
         source_index_policy,
+        precomputed_probe,
     )
 }
 
@@ -160,7 +187,11 @@ pub(super) fn ensure_incremental_refresh_compatible(
     root: &Path,
     storage_path: &Path,
 ) -> Result<(), ApiError> {
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to resolve incremental core publication: {error}"
+        ))
+    })? {
         return Err(full_refresh_required_error(
             root,
             "complete_core_publication_missing",
@@ -234,7 +265,7 @@ pub(super) fn ensure_incremental_refresh_compatible(
 /// staged image, promotion copies the previous live image into the rollback
 /// backup, and promotion restores the staged image over live. Skipping the
 /// staged pipeline avoids all three.
-pub(super) const INCREMENTAL_PUBLICATION_DATABASE_COPIES: u32 = 3;
+pub(super) const INCREMENTAL_PUBLICATION_DATABASE_COPIES: u32 = 0;
 
 /// Read-only verdict on whether an incremental refresh has any work to do.
 ///
@@ -249,11 +280,24 @@ pub(super) struct IncrementalPlanProbe {
     pub(super) live_database_file_bytes: u64,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(super) publication: Option<IndexPublicationRecord>,
+    execution_plan: Option<RefreshExecutionPlan>,
+    policy_exclusions: Option<Vec<OversizedSourceExclusionCandidate>>,
+    source_seals: Option<Vec<ArtifactSeal>>,
+    scheduled_paths: Vec<IncrementalScheduledPathDto>,
 }
 
 impl IncrementalPlanProbe {
     pub(super) fn short_circuited(&self) -> bool {
         self.outcome == IncrementalPlanProbeOutcomeDto::ShortCircuited
+    }
+
+    /// The probe completed the unbounded source inventory and sealed every
+    /// admitted source it planned against. An activation may carry this fact
+    /// forward only while the same filesystem observer epoch remains stable.
+    pub(super) fn has_complete_source_inventory(&self) -> bool {
+        self.execution_plan.is_some()
+            && self.policy_exclusions.is_some()
+            && self.source_seals.is_some()
     }
 }
 
@@ -318,6 +362,11 @@ fn evaluate_incremental_plan_probe(
     if policy_refresh.refresh.inventory_outcome != WorkspaceInventoryOutcome::Complete {
         return IncrementalPlanProbeOutcomeDto::InventoryIncomplete;
     }
+    probe.source_seals = ArtifactSeal::observe_all(&policy_refresh.inventory_files).ok();
+    probe.scheduled_paths =
+        incremental_scheduled_paths(root, &refresh_inputs, &policy_refresh.refresh.plan);
+    probe.execution_plan = Some(policy_refresh.refresh.plan.clone());
+    probe.policy_exclusions = Some(policy_refresh.policy_exclusions.clone());
     if probe.files_to_index != 0 || probe.files_to_remove != 0 {
         return IncrementalPlanProbeOutcomeDto::PlanNotEmpty;
     }
@@ -396,7 +445,9 @@ pub(super) fn probe_incremental_plan(
     source_index_policy: &SourceIndexPolicy,
 ) -> IncrementalPlanProbe {
     let started = Instant::now();
-    let live_database_file_bytes = std::fs::metadata(storage_path)
+    let live_database_file_bytes = codestory_store::resolve_core_database_path(storage_path)
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok())
         .map(|metadata| metadata.len())
         .unwrap_or_default();
     let mut probe = IncrementalPlanProbe {
@@ -406,6 +457,10 @@ pub(super) fn probe_incremental_plan(
         files_to_remove: 0,
         live_database_file_bytes,
         publication: None,
+        execution_plan: None,
+        policy_exclusions: None,
+        source_seals: None,
+        scheduled_paths: Vec::new(),
     };
     probe.outcome =
         evaluate_incremental_plan_probe(root, storage_path, source_index_policy, &mut probe);
@@ -418,7 +473,15 @@ fn incremental_execution_plan(
     root: &Path,
     storage_path: &Path,
     source_index_policy: &SourceIndexPolicy,
-) -> Result<(RefreshExecutionPlan, Vec<OversizedSourceExclusionCandidate>), ApiError> {
+) -> Result<
+    (
+        RefreshExecutionPlan,
+        Vec<OversizedSourceExclusionCandidate>,
+        Vec<IncrementalScheduledPathDto>,
+        Vec<PathBuf>,
+    ),
+    ApiError,
+> {
     let workspace = runtime_workspace_manifest(root, storage_path)
         .map_err(|error| ApiError::internal(format!("Failed to open project: {error}")))?;
     let refresh_inputs = workspace_refresh_inputs(staged.store_mut())?;
@@ -426,9 +489,13 @@ fn incremental_execution_plan(
         .build_execution_outcome_with_policy(&refresh_inputs, source_index_policy)
         .map_err(|error| ApiError::internal(format!("Failed to generate refresh info: {error}")))?;
     if policy_refresh.refresh.inventory_outcome == WorkspaceInventoryOutcome::Complete {
+        let scheduled_paths =
+            incremental_scheduled_paths(root, &refresh_inputs, &policy_refresh.refresh.plan);
         return Ok((
             policy_refresh.refresh.plan,
             policy_refresh.policy_exclusions,
+            scheduled_paths,
+            policy_refresh.inventory_files,
         ));
     }
     let reason =
@@ -466,6 +533,68 @@ fn incremental_execution_plan(
         ),
         gaps,
     ))
+}
+
+fn incremental_scheduled_paths(
+    root: &Path,
+    refresh_inputs: &codestory_contracts::workspace::RefreshInputs,
+    execution_plan: &RefreshExecutionPlan,
+) -> Vec<IncrementalScheduledPathDto> {
+    let stored = refresh_inputs.inventory_map();
+    let stored_by_path = stored
+        .values()
+        .map(|state| (runtime_relative_path(root, &state.path), state))
+        .collect::<HashMap<_, _>>();
+    let stored_by_id = stored
+        .values()
+        .map(|state| (state.id, state))
+        .collect::<HashMap<_, _>>();
+    let mut scheduled = execution_plan
+        .files_to_index
+        .iter()
+        .map(|path| {
+            let path = runtime_relative_path(root, path);
+            let reason = match stored_by_path.get(&path) {
+                None => IncrementalScheduledPathReasonDto::NewFile,
+                Some(state) if state.retry_required => {
+                    IncrementalScheduledPathReasonDto::RetryRequired
+                }
+                Some(state) if !state.indexed => IncrementalScheduledPathReasonDto::NotIndexed,
+                // Completeness alone does not schedule a refresh. If an indexed,
+                // non-retryable partial file reached this plan, its verified
+                // source identity changed.
+                Some(state) if !state.complete => {
+                    IncrementalScheduledPathReasonDto::SourceIdentityChanged
+                }
+                Some(_) => IncrementalScheduledPathReasonDto::SourceIdentityChanged,
+            };
+            IncrementalScheduledPathDto {
+                path,
+                action: IncrementalScheduledPathActionDto::Index,
+                reason,
+            }
+        })
+        .collect::<Vec<_>>();
+    scheduled.extend(execution_plan.files_to_remove.iter().map(|file_id| {
+        IncrementalScheduledPathDto {
+            path: stored_by_id
+                .get(file_id)
+                .map(|state| runtime_relative_path(root, &state.path))
+                .unwrap_or_else(|| format!("file-id:{file_id}")),
+            action: IncrementalScheduledPathActionDto::Remove,
+            reason: IncrementalScheduledPathReasonDto::VerifiedAbsent,
+        }
+    }));
+    scheduled.sort_by(|left, right| {
+        let action_rank = |action| match action {
+            IncrementalScheduledPathActionDto::Index => 0_u8,
+            IncrementalScheduledPathActionDto::Remove => 1_u8,
+        };
+        left.path
+            .cmp(&right.path)
+            .then_with(|| action_rank(left.action).cmp(&action_rank(right.action)))
+    });
+    scheduled
 }
 
 struct IncrementalSemanticPlan {
@@ -690,19 +819,117 @@ fn incremental_semantic_refresh_scope(
 struct PreparedIncrementalRefresh {
     staged: StagedSnapshot,
     publication: IndexPublicationRecord,
+    previous_publication: Option<IndexPublicationRecord>,
     stats: IncrementalIndexingStats,
     finalize_stats: StagedSnapshotFinalizeStats,
     detail_snapshot_ms: u32,
     semantic_stats: SemanticProjectionStats,
+    reused_dense_anchor_projection: bool,
+    source_identity_file_ids: Option<Vec<i64>>,
+    retrieval_refresh_receipt: Option<codestory_retrieval::IncrementalRetrievalRefreshReceipt>,
     semantic_refresh_scope: HashSet<codestory_contracts::graph::NodeId>,
     policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     probe: IncrementalPlanProbe,
+    wall: IncrementalCoreWallDurations,
+    derived_timings: IncrementalDerivedStageTimings,
+}
+
+#[derive(Debug, Default)]
+struct IncrementalDerivedStageTimings {
+    coverage_validation_ms: u32,
+    proof_projection_ms: u32,
+    semantic_scope_ms: u32,
+    semantic_projection_ms: u32,
+    grounding_snapshot_ms: u32,
+    publication_identity_ms: u32,
+    search_generation_ms: u32,
+}
+
+#[derive(Debug, Default)]
+struct IncrementalCoreWallDurations {
+    discovery_and_scheduling: Duration,
+    stage_open: Duration,
+    parse_and_extraction: Duration,
+    core_staging_and_mutation: Duration,
+    candidate_sealing: Duration,
+    scheduled_paths: Vec<IncrementalScheduledPathDto>,
+}
+
+impl IncrementalCoreWallDurations {
+    fn finish(
+        mut self,
+        core_refresh: Duration,
+        commit: Option<(Duration, &StagedSnapshotPublishStats)>,
+    ) -> IncrementalCoreWallTimings {
+        let mut pointer_publication = Duration::ZERO;
+        let mut lock_wait = Duration::ZERO;
+        let mut process_and_ipc = Duration::ZERO;
+        if let Some((commit_wall, publish_stats)) = commit {
+            let seal_ms = publish_stats
+                .sqlite_checkpoint_ms
+                .unwrap_or_default()
+                .saturating_add(publish_stats.sqlite_sync_ms.unwrap_or_default())
+                .saturating_add(publish_stats.core_promotion.candidate_validation_ms)
+                .saturating_add(publish_stats.core_promotion.generation_install_ms);
+            self.candidate_sealing = self
+                .candidate_sealing
+                .saturating_add(Duration::from_millis(u64::from(seal_ms)));
+            lock_wait = Duration::from_millis(u64::from(publish_stats.core_promotion.lock_wait_ms));
+            pointer_publication = Duration::from_millis(u64::from(
+                publish_stats.core_promotion.pointer_publication_ms,
+            ));
+            process_and_ipc = commit_wall
+                .saturating_sub(Duration::from_millis(u64::from(seal_ms)))
+                .saturating_sub(lock_wait)
+                .saturating_sub(pointer_publication);
+        }
+        let named = self
+            .discovery_and_scheduling
+            .saturating_add(self.stage_open)
+            .saturating_add(self.parse_and_extraction)
+            .saturating_add(self.core_staging_and_mutation)
+            .saturating_add(self.candidate_sealing)
+            .saturating_add(pointer_publication)
+            .saturating_add(lock_wait)
+            .saturating_add(process_and_ipc);
+        let mut receipt = IncrementalCoreWallTimings {
+            core_refresh_ms: clamp_u128_to_u32(core_refresh.as_millis()),
+            discovery_and_scheduling_ms: clamp_u128_to_u32(
+                self.discovery_and_scheduling.as_millis(),
+            ),
+            stage_open_ms: clamp_u128_to_u32(self.stage_open.as_millis()),
+            parse_and_extraction_ms: clamp_u128_to_u32(self.parse_and_extraction.as_millis()),
+            core_staging_and_mutation_ms: clamp_u128_to_u32(
+                self.core_staging_and_mutation.as_millis(),
+            ),
+            candidate_sealing_ms: clamp_u128_to_u32(self.candidate_sealing.as_millis()),
+            pointer_publication_ms: clamp_u128_to_u32(pointer_publication.as_millis()),
+            lock_wait_ms: clamp_u128_to_u32(lock_wait.as_millis()),
+            process_and_ipc_ms: clamp_u128_to_u32(process_and_ipc.as_millis()),
+            unattributed_ms: clamp_u128_to_u32(core_refresh.saturating_sub(named).as_millis()),
+            scheduled_paths: self.scheduled_paths,
+        };
+        let named_ms = receipt
+            .discovery_and_scheduling_ms
+            .saturating_add(receipt.stage_open_ms)
+            .saturating_add(receipt.parse_and_extraction_ms)
+            .saturating_add(receipt.core_staging_and_mutation_ms)
+            .saturating_add(receipt.candidate_sealing_ms)
+            .saturating_add(receipt.pointer_publication_ms)
+            .saturating_add(receipt.lock_wait_ms)
+            .saturating_add(receipt.process_and_ipc_ms);
+        receipt.unattributed_ms = receipt.core_refresh_ms.saturating_sub(named_ms);
+        receipt
+    }
 }
 
 /// Either the staged republication is required, or the published core already
 /// satisfies the request and nothing may be written.
 enum IncrementalRefreshPreparation {
-    Unchanged(IncrementalPlanProbe),
+    Unchanged {
+        probe: IncrementalPlanProbe,
+        wall: IncrementalCoreWallDurations,
+    },
     Prepared(Box<PreparedIncrementalRefresh>),
 }
 
@@ -713,21 +940,30 @@ fn prepare_incremental_refresh(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
+    precomputed_probe: Option<IncrementalPlanProbe>,
 ) -> Result<IncrementalRefreshPreparation, ApiError> {
+    let mut wall = IncrementalCoreWallDurations::default();
+    let mut derived_timings = IncrementalDerivedStageTimings::default();
+    let discovery_started = Instant::now();
     ensure_incremental_refresh_compatible(root, storage_path)?;
     ensure_indexing_active(cancel_token)?;
-    let probe = probe_incremental_plan(root, storage_path, source_index_policy);
+    let mut probe = precomputed_probe
+        .unwrap_or_else(|| probe_incremental_plan(root, storage_path, source_index_policy));
     // Cancellation raised during the probe still cancels the request, so a
     // short-circuit never reports success for an abandoned refresh.
     ensure_indexing_active(cancel_token)?;
+    wall.discovery_and_scheduling = discovery_started.elapsed();
     if probe.short_circuited() {
-        return Ok(IncrementalRefreshPreparation::Unchanged(probe));
+        return Ok(IncrementalRefreshPreparation::Unchanged { probe, wall });
     }
+    let stage_open_started = Instant::now();
     let staged = SnapshotStore::clone_live_to_staged(storage_path).map_err(|error| {
         ApiError::internal(format!(
             "Failed to clone live storage for incremental build: {error}"
         ))
     })?;
+    wall.stage_open = stage_open_started.elapsed();
+    let staging_started = Instant::now();
     let mut preparation = StagedPreparation::new(staged);
     let previous_publication = preparation
         .staged_mut()
@@ -754,6 +990,22 @@ fn prepare_incremental_refresh(
         &Uuid::new_v4().to_string(),
     )?;
     let source_identity = format!("core:{}:{}", publication.generation_id, publication.run_id);
+    let inherited_grounding_snapshots_ready = preparation
+        .staged_mut()
+        .snapshots()
+        .has_ready_summary()
+        .and_then(|summary| {
+            preparation
+                .staged_mut()
+                .snapshots()
+                .has_ready_detail()
+                .map(|detail| summary && detail)
+        })
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to inspect inherited grounding snapshots: {error}"
+            ))
+        })?;
     preparation
         .staged_mut()
         .store_mut()
@@ -763,23 +1015,54 @@ fn prepare_incremental_refresh(
                 "Failed to persist staged incomplete index marker: {error}"
             ))
         })?;
-    preparation
-        .staged_mut()
-        .store_mut()
-        .invalidate_grounding_snapshots()
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to invalidate staged derived index snapshots: {error}"
-            ))
-        })?;
-    let (execution_plan, mut policy_exclusions) = incremental_execution_plan(
-        preparation.staged_mut(),
-        root,
-        storage_path,
-        source_index_policy,
-    )?;
+    wall.core_staging_and_mutation = staging_started.elapsed();
+    let retained_plan_matches_stage = probe.publication.as_ref() == previous_publication.as_ref()
+        && probe.execution_plan.is_some()
+        && probe.policy_exclusions.is_some()
+        && probe.source_seals.is_some();
+    let (execution_plan, mut policy_exclusions, source_seals, scheduled_paths) =
+        if retained_plan_matches_stage {
+            (
+                probe
+                    .execution_plan
+                    .take()
+                    .expect("retained plan was checked above"),
+                probe
+                    .policy_exclusions
+                    .take()
+                    .expect("retained exclusions were checked above"),
+                probe
+                    .source_seals
+                    .take()
+                    .expect("retained source seals were checked above"),
+                std::mem::take(&mut probe.scheduled_paths),
+            )
+        } else {
+            let discovery_started = Instant::now();
+            let plan = incremental_execution_plan(
+                preparation.staged_mut(),
+                root,
+                storage_path,
+                source_index_policy,
+            )?;
+            wall.discovery_and_scheduling = wall
+                .discovery_and_scheduling
+                .saturating_add(discovery_started.elapsed());
+            let source_seals = ArtifactSeal::observe_all(&plan.3).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to seal complete incremental source inventory: {error}"
+                ))
+            })?;
+            (plan.0, plan.1, source_seals, plan.2)
+        };
+    wall.scheduled_paths = scheduled_paths;
+    let staging_started = Instant::now();
     let mut semantic_plan =
         plan_incremental_semantics(preparation.staged_mut(), root, &execution_plan)?;
+    wall.core_staging_and_mutation = wall
+        .core_staging_and_mutation
+        .saturating_add(staging_started.elapsed());
+    let parse_started = Instant::now();
     let stats = run_incremental_indexer(
         preparation.staged_mut(),
         IncrementalIndexerContext {
@@ -792,61 +1075,185 @@ fn prepare_incremental_refresh(
         &mut semantic_plan,
         &mut policy_exclusions,
     )?;
+    wall.parse_and_extraction = parse_started.elapsed();
+    let staging_started = Instant::now();
+    let coverage_started = Instant::now();
     validate_incremental_refresh_coverage(preparation.staged_mut(), root)?;
-    rematerialize_staged_proof_resolution_projection(
-        preparation.staged_mut(),
-        &publication,
-        cancel_token,
-    )?;
+    derived_timings.coverage_validation_ms =
+        clamp_u128_to_u32(coverage_started.elapsed().as_millis());
+    let source_identity_file_ids = (!stats.graph_projection_changed)
+        .then(|| {
+            execution_plan
+                .files_to_index
+                .iter()
+                .filter_map(|path| execution_plan.existing_file_ids.get(path).copied())
+                .collect::<Vec<_>>()
+        })
+        .filter(|file_ids| file_ids.len() == execution_plan.files_to_index.len());
+    let retrieval_refresh_receipt = previous_publication.as_ref().and_then(|previous| {
+        if stats.graph_projection_changed
+            || !execution_plan.files_to_remove.is_empty()
+            || execution_plan.files_to_index.is_empty()
+            || execution_plan
+                .files_to_index
+                .iter()
+                .any(|path| !execution_plan.existing_file_ids.contains_key(path))
+        {
+            return None;
+        }
+        let mut changed_existing_sources = execution_plan
+            .files_to_index
+            .iter()
+            .map(|path| runtime_relative_path(root, path))
+            .collect::<Vec<_>>();
+        changed_existing_sources.sort();
+        changed_existing_sources.dedup();
+        (changed_existing_sources.len() == execution_plan.files_to_index.len()).then(|| {
+            codestory_retrieval::IncrementalRetrievalRefreshReceipt {
+                project_root: root.to_path_buf(),
+                storage_path: storage_path.to_path_buf(),
+                previous_core: previous.clone(),
+                current_core: publication.clone(),
+                changed_existing_sources,
+                source_seals: source_seals.clone(),
+                source_policy: source_index_policy.clone(),
+                graph_projection_changed: false,
+            }
+        })
+    });
+    let proof_started = Instant::now();
+    let proof_rebound = match (
+        previous_publication.as_ref(),
+        source_identity_file_ids.as_deref(),
+    ) {
+        (Some(previous), Some(file_ids)) => preparation
+            .staged_mut()
+            .rebind_inherited_proof_resolution_source_identities(previous, &publication, file_ids)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to rebind source-identical proof resolution facts: {error}"
+                ))
+            })?
+            .is_some(),
+        _ => false,
+    };
+    if !proof_rebound {
+        rematerialize_staged_proof_resolution_projection(
+            preparation.staged_mut(),
+            &publication,
+            cancel_token,
+        )?;
+    }
+    derived_timings.proof_projection_ms = clamp_u128_to_u32(proof_started.elapsed().as_millis());
+    let semantic_scope_started = Instant::now();
     let semantic_refresh_scope = incremental_semantic_refresh_scope(
         preparation.staged_mut(),
         root,
         &execution_plan,
         &semantic_plan,
     )?;
-    let semantic_stats = finalize_staged_semantic_docs_for_runtime(
-        preparation.staged_mut().store_mut(),
-        (!rebuild_complete_dense_anchor_set).then_some(&semantic_refresh_scope),
-        (!rebuild_complete_dense_anchor_set).then_some(&semantic_plan.component_reports),
-        &source_identity,
-        cancel_token,
-        runtime,
-        SemanticProjectionDocumentSource::SourceFiles {
-            max_file_bytes: source_index_policy.byte_cap,
-        },
-    )?;
+    derived_timings.semantic_scope_ms =
+        clamp_u128_to_u32(semantic_scope_started.elapsed().as_millis());
+    let semantic_projection_started = Instant::now();
+    let reused_dense_anchor_projection =
+        !stats.graph_projection_changed && !rebuild_complete_dense_anchor_set;
+    let semantic_stats = if reused_dense_anchor_projection {
+        // Callable, structural, and file fences proved the semantic projection
+        // unchanged. The publication stage still rebinds the complete dense
+        // anchor manifest to the new core identity; rebuilding selection and
+        // graph context for every repository node cannot change any document.
+        SemanticProjectionStats::default()
+    } else {
+        finalize_staged_semantic_docs_for_runtime(
+            preparation.staged_mut().store_mut(),
+            (!rebuild_complete_dense_anchor_set).then_some(&semantic_refresh_scope),
+            (!rebuild_complete_dense_anchor_set).then_some(&semantic_plan.component_reports),
+            &source_identity,
+            cancel_token,
+            runtime,
+            SemanticProjectionDocumentSource::SourceFiles {
+                max_file_bytes: source_index_policy.byte_cap,
+            },
+        )?
+    };
+    derived_timings.semantic_projection_ms =
+        clamp_u128_to_u32(semantic_projection_started.elapsed().as_millis());
     ensure_indexing_active(cancel_token)?;
-    let finalize_stats = preparation
-        .staged_mut()
-        .snapshots()
-        .finalize_staged()
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to finalize staged incremental storage: {error}"
-            ))
-        })?;
-    let detail_started = Instant::now();
-    preparation
-        .staged_mut()
-        .snapshots()
-        .refresh_detail()
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to refresh staged grounding detail snapshot: {error}"
-            ))
-        })?;
+    wall.core_staging_and_mutation = wall
+        .core_staging_and_mutation
+        .saturating_add(staging_started.elapsed());
+    let sealing_started = Instant::now();
+    let grounding_started = Instant::now();
+    let reused_grounding_snapshots = inherited_grounding_snapshots_ready
+        && !stats.graph_projection_changed
+        && source_identity_file_ids.is_some();
+    let (finalize_stats, detail_snapshot_ms) = if reused_grounding_snapshots {
+        preparation
+            .staged_mut()
+            .store_mut()
+            .rebind_grounding_file_snapshots(
+                source_identity_file_ids
+                    .as_deref()
+                    .expect("reused snapshot path requires source identity files"),
+            )
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to rebind source-identical grounding snapshots: {error}"
+                ))
+            })?;
+        (
+            StagedSnapshotFinalizeStats {
+                deferred_indexes_ms: 0,
+                summary_snapshot_ms: 0,
+            },
+            0,
+        )
+    } else {
+        let finalize_stats = preparation
+            .staged_mut()
+            .snapshots()
+            .finalize_staged()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to finalize staged incremental storage: {error}"
+                ))
+            })?;
+        let detail_started = Instant::now();
+        preparation
+            .staged_mut()
+            .snapshots()
+            .refresh_detail()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to refresh staged grounding detail snapshot: {error}"
+                ))
+            })?;
+        (
+            finalize_stats,
+            clamp_u128_to_u32(detail_started.elapsed().as_millis()),
+        )
+    };
+    derived_timings.grounding_snapshot_ms =
+        clamp_u128_to_u32(grounding_started.elapsed().as_millis());
     ensure_indexing_active(cancel_token)?;
+    wall.candidate_sealing = sealing_started.elapsed();
     Ok(IncrementalRefreshPreparation::Prepared(Box::new(
         PreparedIncrementalRefresh {
             staged: preparation.release(),
             publication,
+            previous_publication,
             stats,
             finalize_stats,
-            detail_snapshot_ms: clamp_u128_to_u32(detail_started.elapsed().as_millis()),
+            detail_snapshot_ms,
             semantic_stats,
+            reused_dense_anchor_projection,
+            source_identity_file_ids,
+            retrieval_refresh_receipt,
             semantic_refresh_scope,
             policy_exclusions,
             probe,
+            wall,
+            derived_timings,
         },
     )))
 }
@@ -858,7 +1265,9 @@ fn run_incremental_indexing_common(
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
+    precomputed_probe: Option<IncrementalPlanProbe>,
 ) -> Result<IndexingRunSummary, ApiError> {
+    let core_started = Instant::now();
     let prepared = prepare_incremental_refresh(
         root,
         storage_path,
@@ -866,24 +1275,35 @@ fn run_incremental_indexing_common(
         cancel_token,
         runtime,
         source_index_policy,
+        precomputed_probe,
     )?;
     let prepared = match prepared {
-        IncrementalRefreshPreparation::Unchanged(probe) => {
-            return Ok(unchanged_incremental_run_summary(probe));
+        IncrementalRefreshPreparation::Unchanged { probe, wall } => {
+            return Ok(unchanged_incremental_run_summary(
+                probe,
+                wall.finish(core_started.elapsed(), None),
+            ));
         }
         IncrementalRefreshPreparation::Prepared(prepared) => prepared,
     };
     let PreparedIncrementalRefresh {
         mut staged,
         publication,
+        previous_publication,
         stats: index_stats,
         finalize_stats: staged_finalize_stats,
         detail_snapshot_ms,
         semantic_stats: staged_semantic_stats,
+        reused_dense_anchor_projection,
+        source_identity_file_ids,
+        retrieval_refresh_receipt,
         semantic_refresh_scope: llm_refresh_scope,
         policy_exclusions,
         probe,
+        mut wall,
+        mut derived_timings,
     } = *prepared;
+    let staging_started = Instant::now();
     let workspace = match runtime_workspace_manifest(root, storage_path) {
         Ok(workspace) => workspace,
         Err(error) => {
@@ -893,6 +1313,7 @@ fn run_incremental_indexing_common(
             )));
         }
     };
+    let publication_identity_started = Instant::now();
     if let Err(error) = stage_core_publication_identity(
         &mut staged,
         root,
@@ -900,10 +1321,22 @@ fn run_incremental_indexing_common(
         &publication,
         &policy_exclusions,
         source_index_policy,
+        reused_dense_anchor_projection
+            .then_some(previous_publication.as_ref())
+            .flatten(),
+        source_identity_file_ids.as_deref(),
         cancel_token,
     ) {
         let _ = staged.discard();
         return Err(error);
+    }
+    derived_timings.publication_identity_ms =
+        clamp_u128_to_u32(publication_identity_started.elapsed().as_millis());
+    let search_generation_started = Instant::now();
+    if !index_stats.graph_projection_changed
+        && let Some(previous) = previous_publication.as_ref()
+    {
+        materialize_equivalent_search_generation(storage_path, previous, &publication)?;
     }
     let prepared_search_state = match rebuild_search_state_from_storage_for_runtime(
         staged.store_mut(),
@@ -921,6 +1354,8 @@ fn run_incremental_indexing_common(
             return Err(error);
         }
     };
+    derived_timings.search_generation_ms =
+        clamp_u128_to_u32(search_generation_started.elapsed().as_millis());
     if is_indexing_cancelled(cancel_token) {
         drop(prepared_search_state);
         let _ = staged.discard();
@@ -929,8 +1364,22 @@ fn run_incremental_indexing_common(
     }
     let prepared_commit =
         PreparedCoreCommit::new(staged, prepared_search_state, storage_path, &publication);
+    wall.core_staging_and_mutation = wall
+        .core_staging_and_mutation
+        .saturating_add(staging_started.elapsed());
+    let commit_started = Instant::now();
     let (prepared_search_state, staged_publish_stats, publish_duration) =
         prepared_commit.commit(CoreCommitMode::Incremental, cancel_token)?;
+    if let Some(receipt) = retrieval_refresh_receipt {
+        codestory_retrieval::install_incremental_retrieval_refresh_receipt(receipt).map_err(
+            |error| {
+                ApiError::internal(format!(
+                    "Failed to retain bounded retrieval refresh evidence: {error}"
+                ))
+            },
+        )?;
+    }
+    let commit_wall = commit_started.elapsed();
     let mut phase_timings = core_indexing_phase_timings(
         &index_stats,
         staged_finalize_stats,
@@ -940,6 +1389,18 @@ fn run_incremental_indexing_common(
         staged_semantic_stats.semantic_context_index_ms,
     );
     phase_timings.incremental_plan_probe = Some(incremental_plan_probe_timings(&probe));
+    phase_timings.incremental_coverage_validation_ms = Some(derived_timings.coverage_validation_ms);
+    phase_timings.incremental_proof_projection_ms = Some(derived_timings.proof_projection_ms);
+    phase_timings.incremental_semantic_scope_ms = Some(derived_timings.semantic_scope_ms);
+    phase_timings.incremental_semantic_projection_ms = Some(derived_timings.semantic_projection_ms);
+    phase_timings.incremental_grounding_snapshot_ms = Some(derived_timings.grounding_snapshot_ms);
+    phase_timings.incremental_publication_identity_ms =
+        Some(derived_timings.publication_identity_ms);
+    phase_timings.incremental_search_generation_ms = Some(derived_timings.search_generation_ms);
+    phase_timings.incremental_core_wall = Some(wall.finish(
+        core_started.elapsed(),
+        Some((commit_wall, &staged_publish_stats)),
+    ));
     Ok(IndexingRunSummary {
         phase_timings,
         staged_semantic_stats,
@@ -954,9 +1415,13 @@ fn run_incremental_indexing_common(
 /// Summarize a refresh that proved the published core already satisfied the
 /// request. No staged image was opened, so no publication or search generation
 /// was written and the previous ones stay pinned.
-fn unchanged_incremental_run_summary(probe: IncrementalPlanProbe) -> IndexingRunSummary {
+fn unchanged_incremental_run_summary(
+    probe: IncrementalPlanProbe,
+    wall: IncrementalCoreWallTimings,
+) -> IndexingRunSummary {
     let phase_timings = IndexingPhaseTimings {
         incremental_plan_probe: Some(incremental_plan_probe_timings(&probe)),
+        incremental_core_wall: Some(wall),
         ..IndexingPhaseTimings::default()
     };
     IndexingRunSummary {

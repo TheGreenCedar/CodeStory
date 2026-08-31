@@ -423,7 +423,11 @@ pub(super) fn semantic_projection_republish_for_runtime(
     ApiError,
 > {
     ensure_indexing_active(cancel_token)?;
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to resolve semantic projection core publication: {error}"
+        ))
+    })? {
         return Err(ApiError::new(
             "semantic_projection_core_missing",
             "Semantic projection republish requires an existing complete core publication.",

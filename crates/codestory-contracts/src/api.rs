@@ -85,6 +85,11 @@ pub use errors::{
     EmbeddingCapacityPressureDto, EmbeddingRetryStateDto,
 };
 pub use events::{
+    IncrementalCoreWallTimings,
+    IncrementalScheduledPathActionDto,
+    IncrementalScheduledPathDto,
+    IncrementalScheduledPathReasonDto,
+
     AppEventPayload, ArtifactCacheAccessTimings, ArtifactCachePolicyDto, CorePromotionTimings,
     DatabaseSnapshotCopyTimings, FullRefreshWallTimings, IncrementalPlanProbeOutcomeDto,
     IncrementalPlanProbeTimings, IndexingPhaseTimings, ProjectionPersistenceFamilyTimings,

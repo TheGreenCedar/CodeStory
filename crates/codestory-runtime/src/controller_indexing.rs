@@ -7,7 +7,8 @@ use crate::index_freshness::{
 };
 use crate::index_full::index_full_for_runtime;
 use crate::index_incremental::{
-    ensure_incremental_refresh_compatible, index_incremental_for_runtime,
+    IncrementalPlanProbe, ensure_incremental_refresh_compatible, index_incremental_for_runtime,
+    index_incremental_for_runtime_with_probe, probe_incremental_plan,
 };
 use crate::index_timings::IndexingRunSummary;
 #[cfg(test)]
@@ -22,17 +23,21 @@ use crate::search_state_cache::{
     indexing_cancelled_error, publish_prepared_search_state,
     rebuild_search_state_from_storage_for_runtime, refresh_caches, workspace_refresh_inputs,
 };
+#[cfg(test)]
+use crate::semantic_projection::LLM_SYMBOL_DOC_SCHEMA_VERSION;
 use crate::semantic_projection::{
-    CacheRefreshStats, LLM_SYMBOL_DOC_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
-    SemanticProjectionRepublishOutcome, apply_cache_refresh_stats, summarize_symbol_doc,
+    CacheRefreshStats, SEMANTIC_POLICY_VERSION, SemanticProjectionRepublishOutcome,
+    apply_cache_refresh_stats, summarize_symbol_doc,
 };
 use crate::semantic_republish::semantic_projection_republish_for_runtime;
 use crate::support::{clamp_i64_to_u32, clamp_u128_to_u32};
+#[cfg(test)]
+use crate::validate_source_policy_exclusions;
 use crate::workspace_state::runtime_workspace_manifest;
 use crate::{
     AppController, Storage, clear_search_engine, current_epoch_ms,
     full_refresh_execution_plan_with_coverage, no_project_error, publish_search_engine,
-    runtime_relative_path, validate_source_policy_exclusions,
+    runtime_relative_path,
 };
 use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexDryRunDto, IndexFreshnessDto, IndexMode, IndexPublicationDto,
@@ -45,6 +50,12 @@ use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+pub(crate) struct ActivationIndexingEvidence {
+    pub(crate) phase_timings: IndexingPhaseTimings,
+    pub(crate) publication: IndexPublicationDto,
+    pub(crate) stats: StorageStatsDto,
+}
 
 impl AppController {
     pub(crate) fn project_summary_from_storage(
@@ -102,7 +113,11 @@ impl AppController {
         &self,
         storage_path: &Path,
     ) -> Result<Option<IndexPublicationDto>, ApiError> {
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve complete core publication: {error}"
+            ))
+        })? {
             return Ok(None);
         }
         Store::open_observational(storage_path)
@@ -305,7 +320,11 @@ impl AppController {
                 root.display()
             )));
         }
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve observational core publication: {error}"
+            ))
+        })? {
             return Ok(None);
         }
         let storage = Storage::open_observational(&storage_path).map_err(|error| {
@@ -439,6 +458,21 @@ impl AppController {
         refresh_runtime_caches: bool,
         cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner_with_probe(
+            mode,
+            refresh_runtime_caches,
+            cancel_token,
+            None,
+        )
+    }
+
+    fn run_indexing_blocking_inner_with_probe(
+        &self,
+        mode: IndexMode,
+        refresh_runtime_caches: bool,
+        cancel_token: Option<&CancellationToken>,
+        precomputed_probe: Option<IncrementalPlanProbe>,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
             if s.is_indexing {
@@ -496,7 +530,7 @@ impl AppController {
                 &self.source_index_policy,
                 &annotations_owned,
             ),
-            IndexMode::Incremental => index_incremental_for_runtime(
+            IndexMode::Incremental => index_incremental_for_runtime_with_probe(
                 &root,
                 &storage_path,
                 &self.events_tx,
@@ -504,6 +538,7 @@ impl AppController {
                 &self.runtime_config,
                 &self.source_index_policy,
                 &annotations_owned,
+                precomputed_probe,
             ),
         };
 
@@ -740,11 +775,16 @@ impl AppController {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_core_requires_publication_repair(
         &self,
         storage_path: &Path,
     ) -> Result<bool, ApiError> {
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve core publication readiness: {error}"
+            ))
+        })? {
             return Ok(false);
         }
         let storage = Store::open_read_only(storage_path).map_err(|error| {
@@ -817,6 +857,81 @@ impl AppController {
         cancel_token: &CancellationToken,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.run_indexing_blocking_inner(mode, true, Some(cancel_token))
+    }
+
+    /// Complete one activation-owned refresh and return the exact committed
+    /// core facts that the staged publication already validated. Activation
+    /// uses this receipt instead of rebuilding a broad project summary and
+    /// revalidating the same derived publications before retrieval can start.
+    pub(crate) fn run_indexing_blocking_with_cancel_for_activation(
+        &self,
+        mode: IndexMode,
+        cancel_token: &CancellationToken,
+        precomputed_probe: Option<IncrementalPlanProbe>,
+    ) -> Result<ActivationIndexingEvidence, ApiError> {
+        let phase_timings = self.run_indexing_blocking_inner_with_probe(
+            mode,
+            true,
+            Some(cancel_token),
+            precomputed_probe,
+        )?;
+        let storage_path = self.require_storage_path()?;
+        let storage = Store::open_read_only(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to open the committed activation core: {error}"
+            ))
+        })?;
+        let publication = storage
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read the committed activation publication: {error}"
+                ))
+            })?
+            .map(index_publication_dto)
+            .ok_or_else(|| {
+                ApiError::new(
+                    "publication_changed",
+                    "the successful activation refresh has no complete core publication",
+                )
+            })?;
+        let stats = storage.get_stats().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read the committed activation core statistics: {error}"
+            ))
+        })?;
+        let file_count = if stats.file_count > 0 {
+            stats.file_count
+        } else {
+            storage.get_file_node_count().map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read the committed activation file count: {error}"
+                ))
+            })?
+        };
+        Ok(ActivationIndexingEvidence {
+            phase_timings,
+            publication,
+            stats: StorageStatsDto {
+                node_count: clamp_i64_to_u32(stats.node_count),
+                edge_count: clamp_i64_to_u32(stats.edge_count),
+                file_count: clamp_i64_to_u32(file_count),
+                error_count: clamp_i64_to_u32(stats.error_count),
+                fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
+            },
+        })
+    }
+
+    pub(crate) fn probe_incremental_plan_for_activation(
+        &self,
+    ) -> Result<IncrementalPlanProbe, ApiError> {
+        let root = self.require_project_root()?;
+        let storage_path = self.require_storage_path()?;
+        Ok(probe_incremental_plan(
+            &root,
+            &storage_path,
+            &self.source_index_policy,
+        ))
     }
 
     pub fn run_indexing_blocking_without_runtime_refresh(
@@ -955,27 +1070,30 @@ impl AppController {
         }
         let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-        let refresh_inputs = if storage_path.exists() {
-            let schema_version = Store::database_schema_version_observational(&storage_path)
-                .map_err(|error| {
-                    ApiError::internal(format!(
-                        "Failed to inspect dry-run storage without recovery: {error}"
-                    ))
-                })?;
-            if schema_version < CURRENT_SCHEMA_VERSION {
-                RefreshInputs::default()
-            } else {
-                let store =
-                    Store::open_freshness_observational(&storage_path).map_err(|error| {
+        let refresh_inputs =
+            if codestory_store::core_database_exists(&storage_path).map_err(|error| {
+                ApiError::internal(format!("Failed to resolve dry-run core storage: {error}"))
+            })? {
+                let schema_version = Store::database_schema_version_observational(&storage_path)
+                    .map_err(|error| {
                         ApiError::internal(format!(
-                            "Failed to inspect dry-run storage without mutation: {error}"
+                            "Failed to inspect dry-run storage without recovery: {error}"
                         ))
                     })?;
-                workspace_refresh_inputs(&store)?
-            }
-        } else {
-            RefreshInputs::default()
-        };
+                if schema_version < CURRENT_SCHEMA_VERSION {
+                    RefreshInputs::default()
+                } else {
+                    let store =
+                        Store::open_freshness_observational(&storage_path).map_err(|error| {
+                            ApiError::internal(format!(
+                                "Failed to inspect dry-run storage without mutation: {error}"
+                            ))
+                        })?;
+                    workspace_refresh_inputs(&store)?
+                }
+            } else {
+                RefreshInputs::default()
+            };
         let execution_plan = match mode {
             IndexMode::Full => {
                 full_refresh_execution_plan_with_coverage(

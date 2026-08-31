@@ -123,7 +123,7 @@ impl ScipClient {
         let Some(view) = load_fresh_scip_query_view(&project_dir, &revision, generation)? else {
             return Ok(Vec::new());
         };
-        let Some(provenance) = view.index().contract.provenance_label() else {
+        let Some(provenance) = view.contract().provenance_label() else {
             return Ok(Vec::new());
         };
         let profile = ScipQueryProfile::new(query);
@@ -207,7 +207,7 @@ impl ScipClient {
         let Some(view) = load_fresh_scip_query_view(&project_dir, &revision, generation)? else {
             return Ok(Vec::new());
         };
-        let Some(provenance) = view.index().contract.provenance_label() else {
+        let Some(provenance) = view.contract().provenance_label() else {
             return Ok(Vec::new());
         };
 
@@ -678,7 +678,7 @@ fn scip_artifact_status(project_dir: &Path, revision: &str, generation: &str) ->
         .ok()
         .flatten()
         .map_or("scip_stale", |view| {
-            if view.index().contract.evidence_source == SCIP_GRAPH_PROJECTION_PROVENANCE {
+            if view.contract().evidence_source == SCIP_GRAPH_PROJECTION_PROVENANCE {
                 SCIP_READY_STATUS
             } else {
                 "scip_imported_diagnostic_only"

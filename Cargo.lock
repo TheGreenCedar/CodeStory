@@ -718,6 +718,7 @@ version = "0.17.5"
 dependencies = [
  "anyhow",
  "codestory-contracts",
+ "libc",
  "parking_lot",
  "rusqlite",
  "serde",

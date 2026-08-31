@@ -6360,6 +6360,8 @@ fn read_stdio_status_resource(
     local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     index_publication: serde_json::Value,
 ) -> Result<serde_json::Value> {
+    let storage_exists = codestory_runtime::core_database_exists(&runtime.storage_path)
+        .map_err(|error| anyhow::anyhow!(error.message))?;
     let retrieval_status = crate::doctor_sidecar_status(runtime);
     let (server_executable, server_executable_sha256, server_warnings) =
         stdio_server_executable_status();
@@ -6389,7 +6391,7 @@ fn read_stdio_status_resource(
         "warnings": server_warnings,
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
-        "storage_exists": runtime.storage_path.exists(),
+        "storage_exists": storage_exists,
         "retrieval_mode": retrieval_status.retrieval_mode,
         "degraded_reason": retrieval_status.degraded_reason,
         "live_ready": stdio_status_is_live_ready(

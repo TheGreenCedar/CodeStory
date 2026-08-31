@@ -200,7 +200,9 @@ pub fn observe_retained_rollback_generation(
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<Option<RetainedRollbackObservation>> {
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path)
+        .context("resolve core publication for retained rollback observation")?
+    {
         return Ok(None);
     }
     let project_id = sidecar_project_id_for_runtime(project_root, runtime)
@@ -368,6 +370,7 @@ fn validate_retained_rollback(
     crate::embedded_vector::validate_generation_evidence_for_publication(
         &runtime.layout,
         &storage,
+        None,
         &candidate,
         &core_publication,
         runtime,

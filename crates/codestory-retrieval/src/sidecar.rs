@@ -103,7 +103,9 @@ pub fn ready_retrieval_identity_for_runtime(
     storage_path: &Path,
     runtime: &SidecarRuntimeConfig,
 ) -> Result<Option<ReadyRetrievalIdentity>> {
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path)
+        .context("resolve core publication for ready retrieval identity")?
+    {
         return Ok(None);
     }
     let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
@@ -122,7 +124,9 @@ pub fn observe_ready_retrieval_identity_for_project_id(
     runtime: &SidecarRuntimeConfig,
     project_id: &str,
 ) -> Result<Option<ReadyRetrievalIdentity>> {
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path)
+        .context("resolve core publication for retained retrieval identity")?
+    {
         return Ok(None);
     }
     let embedding_snapshot = crate::embeddings::embedding_engine_snapshot_for_runtime(runtime);
@@ -266,6 +270,7 @@ fn status_with_runtime(
                     crate::embedded_vector::validate_generation_evidence_for_publication(
                         &layout,
                         &storage,
+                        None,
                         manifest,
                         &publication,
                         &runtime,

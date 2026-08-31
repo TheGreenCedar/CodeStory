@@ -606,7 +606,7 @@ pub(crate) fn sidecar_primary_blocks_nucleo_supplement(
 }
 
 fn retrieval_manifest_exists(storage_path: &Path, project_root: &Path) -> bool {
-    if !storage_path.exists() {
+    if !codestory_store::core_database_exists(storage_path).unwrap_or(false) {
         return false;
     }
     let Ok(storage) = Store::open(storage_path) else {

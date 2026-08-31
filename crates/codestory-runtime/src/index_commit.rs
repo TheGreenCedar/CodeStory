@@ -150,19 +150,39 @@ pub(super) fn stage_core_publication_identity(
     publication: &IndexPublicationRecord,
     policy_exclusions: &[OversizedSourceExclusionCandidate],
     source_index_policy: &SourceIndexPolicy,
+    graph_equivalent_predecessor: Option<&IndexPublicationRecord>,
+    source_identity_file_ids: Option<&[i64]>,
     cancel_token: Option<&CancellationToken>,
 ) -> Result<(), ApiError> {
     ensure_indexing_active(cancel_token)?;
     #[cfg(test)]
     publication_test_checkpoint(PublicationTestBoundary::Identity, cancel_token)?;
-    staged
-        .store_mut()
-        .publish_dense_anchor_generation(publication, SEMANTIC_POLICY_VERSION)
+    let rebound = graph_equivalent_predecessor
+        .map(|previous| {
+            staged.rebind_inherited_dense_anchor_generation(
+                previous,
+                publication,
+                SEMANTIC_POLICY_VERSION,
+            )
+        })
+        .transpose()
         .map_err(|error| {
             ApiError::internal(format!(
-                "Failed to publish complete dense anchor inputs: {error}"
+                "Failed to rebind graph-equivalent dense anchor inputs: {error}"
             ))
-        })?;
+        })?
+        .flatten()
+        .is_some();
+    if !rebound {
+        staged
+            .store_mut()
+            .publish_dense_anchor_generation(publication, SEMANTIC_POLICY_VERSION)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to publish complete dense anchor inputs: {error}"
+                ))
+            })?;
+    }
     #[cfg(test)]
     run_source_policy_before_revalidate_hook();
     let exclusions =
@@ -174,14 +194,27 @@ pub(super) fn stage_core_publication_identity(
         &exclusions,
         source_index_policy,
     )?;
-    staged
-        .store_mut()
-        .publish_structural_text_unit_generation(publication)
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to publish complete structural text units: {error}"
-            ))
-        })?;
+    let structural_rebound = match (graph_equivalent_predecessor, source_identity_file_ids) {
+        (Some(previous), Some(file_ids)) => staged
+            .rebind_inherited_structural_text_generation(previous, publication, file_ids)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to rebind graph-equivalent structural text units: {error}"
+                ))
+            })?
+            .is_some(),
+        _ => false,
+    };
+    if !structural_rebound {
+        staged
+            .store_mut()
+            .publish_structural_text_unit_generation(publication)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to publish complete structural text units: {error}"
+                ))
+            })?;
+    }
     ensure_indexing_active(cancel_token)?;
     let mode = match publication.mode {
         IndexPublicationMode::Full => "full",
@@ -276,7 +309,7 @@ impl PreparedCoreCommit {
             .expect("prepared core commit must own staged storage");
         let publish_started = Instant::now();
         let publish_stats = staged
-            .publish_with_stats(&self.storage_path)
+            .publish_receipted_with_stats(&self.storage_path)
             .map_err(|error| {
                 let publication = match mode {
                     CoreCommitMode::Full { .. } => "storage",

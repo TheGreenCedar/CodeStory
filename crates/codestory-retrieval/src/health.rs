@@ -521,10 +521,12 @@ fn has_real_scip_artifact(project_dir: &Path, generation: &str) -> bool {
         && !project_dir
             .join(crate::scip_index::SCIP_STUB_MARKER_FILE)
             .is_file()
-        && crate::scip_index::load_fresh_scip_symbols(project_dir, &revision, generation)
+        && crate::scip_index::load_fresh_scip_query_view(project_dir, &revision, generation)
             .ok()
             .flatten()
-            .is_some_and(|index| !index.symbols.is_empty())
+            .is_some_and(|view| {
+                view.generation() == generation && view.symbol_count() > 0
+            })
 }
 
 pub fn probe_sidecar_health(
@@ -623,7 +625,6 @@ pub fn probe_sidecar_health_for_runtime(
             capabilities: SidecarCapabilities::NONE,
         },
     };
-
     let current_embedding_backend = crate::embeddings::embedding_runtime_id_for_runtime(runtime);
     let dense_anchor_count = manifest
         .dense_projection_count
@@ -685,7 +686,6 @@ pub fn probe_sidecar_health_for_runtime(
             },
         }
     };
-
     let scip_project_dir = layout.scip_project_dir(sidecar_generation);
     let scip_probe = ScipClient::health_probe(layout, sidecar_generation);
     let scip_capabilities = scip_capabilities(
@@ -712,7 +712,6 @@ pub fn probe_sidecar_health_for_runtime(
         degraded_reason: scip_degraded.or_else(|| scip_stub.then_some("scip_stub".into())),
         capabilities: scip_capabilities,
     };
-
     let (live_mode, degraded_reason) =
         crate::mode::derive_degraded_mode(&lexical, &semantic, &scip);
     let retrieval_mode = if manifest_classifies_full(&manifest) {

@@ -63,6 +63,12 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// Resolve whether the logical project storage path has a published core.
+pub fn core_database_exists(storage_path: &Path) -> Result<bool, ApiError> {
+    codestory_store::core_database_exists(storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to resolve core storage: {error}")))
+}
+
 mod affected;
 mod agent;
 mod evidence_projection_v3;

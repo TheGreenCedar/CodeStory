@@ -144,6 +144,88 @@ pub(super) fn write_search_generation_completion(
     write_result
 }
 
+/// Materialize a new immutable search generation from a graph-equivalent
+/// predecessor. Tantivy segment files are immutable after completion, so
+/// same-filesystem hard links preserve exact bytes without a foreground scan
+/// or copy. Lock files remain generation-local.
+pub(super) fn materialize_equivalent_search_generation(
+    storage_path: &Path,
+    previous: &IndexPublicationRecord,
+    next: &IndexPublicationRecord,
+) -> Result<bool, ApiError> {
+    let previous_path = search_index_path_for_publication(storage_path, Some(previous))?;
+    let next_path = search_index_path_for_publication(storage_path, Some(next))?;
+    let Some(previous_marker) =
+        read_search_generation_completion(&previous_path, previous.generation_id.as_str())
+    else {
+        return Ok(false);
+    };
+    let _catalog_guard = SearchGenerationCatalogGuard::acquire(storage_path)?;
+    if read_search_generation_completion(&next_path, next.generation_id.as_str()).is_some() {
+        return Ok(true);
+    }
+    if next_path.exists() {
+        return Err(ApiError::internal(format!(
+            "Equivalent search generation destination already exists without a valid receipt: {}",
+            next_path.display()
+        )));
+    }
+    std::fs::create_dir_all(&next_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to create equivalent search generation {}: {error}",
+            next_path.display()
+        ))
+    })?;
+    let result = (|| -> Result<(), ApiError> {
+        for entry in std::fs::read_dir(&previous_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to enumerate completed search generation {}: {error}",
+                previous_path.display()
+            ))
+        })? {
+            let entry = entry.map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read completed search generation entry: {error}"
+                ))
+            })?;
+            let file_type = entry.file_type().map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to inspect completed search generation entry {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            let name = entry.file_name();
+            let name_text = name.to_string_lossy();
+            if name_text == SEARCH_GENERATION_COMPLETION_FILE || name_text.ends_with(".lock") {
+                continue;
+            }
+            if !file_type.is_file() {
+                return Err(ApiError::internal(format!(
+                    "Completed search generation contains a non-file component: {}",
+                    entry.path().display()
+                )));
+            }
+            std::fs::hard_link(entry.path(), next_path.join(&name)).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to reference immutable search component {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+        }
+        write_search_generation_completion(
+            &next_path,
+            next,
+            usize::try_from(previous_marker.symbol_count).unwrap_or(usize::MAX),
+            usize::try_from(previous_marker.tantivy_doc_count).unwrap_or(usize::MAX),
+        )
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_dir_all(&next_path);
+        return Err(error);
+    }
+    Ok(true)
+}
+
 pub(super) struct SearchGenerationCatalogGuard {
     file: std::fs::File,
     path: PathBuf,

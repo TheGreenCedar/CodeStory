@@ -21,7 +21,10 @@ use crate::sidecar::validate_strict_sidecar_readiness_for_runtime;
 use crate::sidecar_search::{LiveSidecarSearch, SearchExecutionContext, SidecarSearch};
 use anyhow::{Context, Result, bail};
 use codestory_contracts::graph::NodeId;
-use codestory_store::{FileRole, RetrievalIndexManifest, Store};
+use codestory_store::{
+    BoundRetrievalIndexManifest, FileRole, RetrievalIndexManifest, Store, core_database_exists,
+    resolve_core_generation_database_path,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -149,7 +152,7 @@ impl PinnedQuerySession {
         storage_path: &Path,
         runtime: &SidecarRuntimeConfig,
     ) -> Result<Self> {
-        if !storage_path.exists() {
+        if !core_database_exists(storage_path).context("resolve core publication for query")? {
             let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
             bail!(
                 "retrieval sidecar storage is missing; run retrieval index for project {project_id}"
@@ -158,26 +161,43 @@ impl PinnedQuerySession {
 
         let project_id = sidecar_project_id_for_runtime(project_root, runtime)?;
         let generation_lease = GenerationRetentionLease::acquire_for_query(runtime, &project_id)?;
-        let storage = Store::open_read_only(storage_path).context("open storage for query")?;
-        storage
-            .get_connection()
-            .execute_batch("BEGIN DEFERRED TRANSACTION")
-            .context("pin core publication for retrieval query")?;
-
-        let manifest = storage
-            .get_retrieval_index_manifest(&project_id)
-            .context("load retrieval manifest")?
+        let publication_storage =
+            Store::open_read_only(storage_path).context("open retrieval publication pointer")?;
+        let bound_manifest = publication_storage
+            .get_bound_retrieval_index_manifest(&project_id)
+            .context("load core-bound retrieval manifest")?
             .with_context(|| {
                 format!(
                     "retrieval sidecar manifest is missing; run retrieval index for project {project_id}"
                 )
             })?;
+        let core_path =
+            resolve_core_generation_database_path(storage_path, &bound_manifest.core.generation_id)
+                .context("resolve retrieval publication core generation")?;
+        drop(publication_storage);
+        let storage = Store::open_immutable_generation(&core_path)
+            .context("open exact core generation for retrieval query")?;
+        storage
+            .get_connection()
+            .execute_batch("BEGIN DEFERRED TRANSACTION")
+            .context("pin core publication for retrieval query")?;
+
+        let manifest = bound_manifest.manifest.clone();
         if let Some(reason) =
             manifest_unavailable_reason_for_runtime(&project_id, &storage, &manifest, runtime)
         {
             bail!(
                 "retrieval sidecar manifest is unavailable ({reason}); run retrieval index for project {project_id}"
             );
+        }
+        let core_publication = storage
+            .get_complete_index_publication()
+            .context("load pinned core publication for retrieval query")?
+            .context("pinned retrieval query requires a complete core publication")?;
+        if core_publication.generation_id != bound_manifest.core.generation_id
+            || core_publication.run_id != bound_manifest.core.run_id
+        {
+            bail!("retrieval publication core binding does not match immutable core contents");
         }
 
         // Acquire residency before strict readiness and keep it through candidate resolution.
@@ -211,15 +231,11 @@ impl PinnedQuerySession {
                     .collect()
             })
             .unwrap_or_default();
-        let publication_identity =
-            retrieval_publication_identity_from_storage(&storage, &project_id)?;
-        let core_publication = storage
-            .get_complete_index_publication()
-            .context("load pinned core publication for vector evidence")?
-            .context("pinned retrieval query requires a complete core publication")?;
+        let publication_identity = retrieval_publication_identity_from_bound(&bound_manifest)?;
         crate::embedded_vector::validate_generation_evidence_for_publication(
             &runtime.layout,
             &storage,
+            Some(&core_path),
             &manifest,
             &core_publication,
             runtime,
@@ -373,17 +389,7 @@ impl PinnedQuerySession {
         let current = Store::open_read_only(&self.storage_path)
             .context("open current retrieval publication")
             .and_then(|storage| {
-                let snapshot = storage
-                    .read_snapshot()
-                    .context("pin current retrieval publication")?;
-                let identity = retrieval_publication_identity_from_storage(
-                    snapshot.storage(),
-                    &self.project_id,
-                );
-                snapshot
-                    .finish()
-                    .context("finish current retrieval publication")?;
-                identity
+                retrieval_publication_identity_from_storage(&storage, &self.project_id)
             });
         let current = current.map_err(|error| {
             RetrievalPublicationChanged::unreadable(
@@ -935,27 +941,34 @@ pub fn retrieval_publication_identity_from_storage(
     storage: &Store,
     project_id: &str,
 ) -> Result<RetrievalPublicationIdentity> {
-    let publication = storage
-        .get_complete_index_publication()
-        .context("load complete core publication")?
-        .context("complete core publication is missing")?;
-    let manifest = storage
-        .get_retrieval_index_manifest(project_id)
-        .context("load retrieval manifest identity")?
+    let bound = storage
+        .get_bound_retrieval_index_manifest(project_id)
+        .context("load core-bound retrieval manifest identity")?
         .context("retrieval manifest is missing")?;
+    retrieval_publication_identity_from_bound(&bound)
+}
+
+fn retrieval_publication_identity_from_bound(
+    bound: &BoundRetrievalIndexManifest,
+) -> Result<RetrievalPublicationIdentity> {
+    let manifest = &bound.manifest;
     Ok(RetrievalPublicationIdentity {
-        core_generation_id: publication.generation_id,
-        core_run_id: publication.run_id,
+        core_generation_id: bound.core.generation_id.clone(),
+        core_run_id: bound.core.run_id.clone(),
         sidecar_generation: manifest
             .sidecar_generation
+            .as_deref()
             .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
             .context("retrieval manifest sidecar generation is missing")?,
         sidecar_input_hash: manifest
             .sidecar_input_hash
+            .as_deref()
             .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
             .context("retrieval manifest input hash is missing")?,
         semantic_generation: (!manifest.semantic_generation.trim().is_empty())
-            .then_some(manifest.semantic_generation)
+            .then(|| manifest.semantic_generation.clone())
             .context("retrieval manifest semantic generation is missing")?,
     })
 }

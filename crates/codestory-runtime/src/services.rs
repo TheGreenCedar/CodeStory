@@ -777,8 +777,14 @@ impl ActivationService {
         project_root: &Path,
         storage_path: &Path,
     ) -> CompleteCoreAdmission {
-        if !storage_path.is_file() {
-            return CompleteCoreAdmission::Cold;
+        match codestory_store::core_database_exists(storage_path) {
+            Ok(true) => {}
+            Ok(false) => return CompleteCoreAdmission::Cold,
+            Err(error) => {
+                return CompleteCoreAdmission::Corrupt(ApiError::internal(format!(
+                    "Failed to resolve core publication admission: {error}"
+                )));
+            }
         }
         let freshness = match Store::open_freshness_observational(storage_path) {
             Ok(storage) => storage,
@@ -813,7 +819,11 @@ impl ActivationService {
         &self,
         storage_path: &Path,
     ) -> Result<Option<IndexPublicationDto>, ApiError> {
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve retained core publication: {error}"
+            ))
+        })? {
             return Ok(None);
         }
         let storage = Store::open_read_only(storage_path).map_err(|error| {
@@ -1112,10 +1122,12 @@ impl ActivationService {
         let retained_core_publication =
             self.retained_core_publication(storage_path).unwrap_or(None);
         let core_matches = retained_core_publication.as_ref() == Some(&lease.core_publication);
+        let source_matches =
+            self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref());
         ReadyLeaseProbe {
             admissible: configuration_matches
                 && lease.source.is_admissible_snapshot()
-                && self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref())
+                && source_matches
                 && retrieval_matches
                 && core_matches,
             retained_core_publication,
@@ -1419,28 +1431,44 @@ impl ActivationService {
         project_root: PathBuf,
         storage_path: PathBuf,
     ) -> Result<(), ApiError> {
+        let activation_started = Instant::now();
+        // One activation owns the observations used to build and admit its
+        // ready lease. Retrieval finalization seeds this memo with the exact
+        // pinned sidecar input, so the validation immediately following it
+        // and later packet calls do not rescan the repository or projection
+        // tables. A failed activation drops the memo with this scope.
+        let source_freshness_memo = codestory_workspace::SourceFreshnessMemo::default();
+        let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter_with_memo(
+            source_freshness_memo.clone(),
+        );
         operation.ensure_not_cancelled("project discovery")?;
-        let mut summary = self
+        // Arm before the complete incremental probe. If this exact observer
+        // epoch still holds after both publications commit, the probe's
+        // complete inventory plus the source seals revalidated at the
+        // retrieval fence are a current source snapshot; another repository
+        // walk would prove the same thing again.
+        let source_observer_before_probe = self.controller.observed_source_epoch(&project_root);
+        let summary = self
             .controller
             .open_project_summary_with_storage_path(project_root.clone(), storage_path.clone())?;
-        summary.freshness = Some(
-            self.controller
-                .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)?,
-        );
+        let mut precomputed_core_probe = (summary.publication.is_some()
+            && summary.stats.node_count > 0)
+            .then(|| self.controller.probe_incremental_plan_for_activation())
+            .transpose()?;
+        let complete_incremental_source_inventory = precomputed_core_probe
+            .as_ref()
+            .is_some_and(|probe| probe.has_complete_source_inventory());
+        let preflight_ms =
+            u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         operation.set_stage(ActivationStage::CoreFreshness);
+        let core_refresh_started = Instant::now();
+        let mut refreshed_core = None;
         let core_stale = summary.publication.is_none()
             || summary.stats.node_count == 0
-            || self
-                .controller
-                .complete_core_requires_publication_repair(&storage_path)?
-            // A bounded freshness check cannot prove drift either way, so treating it as stale
-            // would rebuild the whole index on every activation of a large repository and never
-            // reach a different answer.
-            || summary
-                .freshness
+            || precomputed_core_probe
                 .as_ref()
-                .is_none_or(|freshness| !index_freshness_admits_operation(freshness));
+                .is_none_or(|probe| !probe.short_circuited());
         if core_stale {
             let mode = if summary.publication.is_none() || summary.stats.node_count == 0 {
                 IndexMode::Full
@@ -1448,34 +1476,39 @@ impl ActivationService {
                 IndexMode::Incremental
             };
             let token = CancellationToken::from_shared_flag(Arc::clone(&operation.cancelled));
-            self.controller
-                .run_indexing_blocking_with_cancel(mode, &token)?;
-            operation.ensure_not_cancelled("core publication validation")?;
-            summary = self.controller.open_project_summary_with_storage_path(
-                project_root.clone(),
-                storage_path.clone(),
-            )?;
-            summary.freshness = Some(
-                self.controller
-                    .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)?,
-            );
-        }
-        let local_ready = summary.publication.is_some()
-            && summary.stats.node_count > 0
-            && summary.stats.fatal_error_count == 0
-            && !self
+            let evidence = self
                 .controller
-                .complete_core_requires_publication_repair(&storage_path)?
-            && summary
-                .freshness
-                .as_ref()
-                .is_some_and(index_freshness_admits_operation);
+                .run_indexing_blocking_with_cancel_for_activation(
+                    mode,
+                    &token,
+                    (mode == IndexMode::Incremental)
+                        .then(|| precomputed_core_probe.take())
+                        .flatten(),
+                )?;
+            tracing::debug!(
+                target: "codestory::activation",
+                phase_timings = ?evidence.phase_timings,
+                "managed core refresh completed"
+            );
+            operation.ensure_not_cancelled("core publication validation")?;
+            refreshed_core = Some((evidence.publication, evidence.stats));
+        }
+        let local_ready = match refreshed_core.as_ref() {
+            Some((_, stats)) => stats.node_count > 0 && stats.fatal_error_count == 0,
+            None => {
+                summary.publication.is_some()
+                    && summary.stats.node_count > 0
+                    && summary.stats.fatal_error_count == 0
+                    && precomputed_core_probe
+                        .as_ref()
+                        .is_some_and(|probe| probe.short_circuited())
+            }
+        };
+        let core_refresh_ms =
+            u64::try_from(core_refresh_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if !local_ready {
             if summary.stats.node_count > 0
                 && summary.stats.fatal_error_count == 0
-                && !self
-                    .controller
-                    .complete_core_requires_publication_repair(&storage_path)?
                 && let Some(publication) = summary.publication.clone()
             {
                 operation.set_retained_local_publication(publication);
@@ -1485,39 +1518,56 @@ impl ActivationService {
                 "activation did not produce a fresh complete core publication",
             ));
         }
-        let local_publication = summary
-            .publication
-            .clone()
+        let local_publication = refreshed_core
+            .as_ref()
+            .map(|(publication, _)| publication.clone())
+            .or_else(|| summary.publication.clone())
             .expect("fresh complete core has a publication identity");
         operation.set_local_publication(local_publication.clone());
 
         operation.ensure_not_cancelled("search preparation")?;
         operation.set_stage(ActivationStage::SearchPreparation);
+        let search_preparation_started = Instant::now();
         let token = CancellationToken::from_shared_flag(Arc::clone(&operation.cancelled));
         self.controller
             .prepare_search_state_for_activation(&token)?;
+        let search_preparation_ms =
+            u64::try_from(search_preparation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         operation.ensure_not_cancelled("dense preparation")?;
         operation.set_stage(ActivationStage::DensePreparation);
+        let dense_preparation_started = Instant::now();
         self.record_preparation_phase(ActivationPreparationPhase::NativeEmbedding)?;
         codestory_retrieval::ensure_product_embedding_backend_for_runtime(
             &self.controller.runtime_config,
         )
         .map_err(map_activation_error)?;
+        let dense_preparation_ms =
+            u64::try_from(dense_preparation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         operation.ensure_not_cancelled("retrieval publication")?;
         operation.set_stage(ActivationStage::Publication);
         self.record_preparation_phase(ActivationPreparationPhase::RetrievalFinalization)?;
+        let retrieval_finalization_started = Instant::now();
         if self.should_finalize_retrieval_for_activation() {
-            codestory_retrieval::finalize_index_for_runtime_with_cancel(
+            let outcome = codestory_retrieval::finalize_index_for_runtime_with_cancel(
                 &project_root,
                 &storage_path,
                 &self.controller.runtime_config,
                 operation.cancelled.as_ref(),
             )
             .map_err(map_activation_error)?;
+            tracing::debug!(
+                target: "codestory::activation",
+                phase_timings = ?outcome.phase_timings,
+                component_work = ?outcome.component_work,
+                "managed retrieval finalization completed"
+            );
         }
+        let retrieval_finalization_ms =
+            u64::try_from(retrieval_finalization_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         operation.ensure_not_cancelled("retrieval validation")?;
         operation.set_stage(ActivationStage::Validation);
+        let validation_started = Instant::now();
         let retrieval = codestory_retrieval::ready_retrieval_identity_for_runtime(
             &project_root,
             &storage_path,
@@ -1542,19 +1592,37 @@ impl ActivationService {
                 "retrieval publication is not live-ready after activation",
             ));
         }
-        // Read the epoch *before* the scan, not after: a mutation that lands while the scan runs
-        // has to fall outside the lease's recorded epoch, or the lease would vouch for the very
-        // window the observer just proved was contested.
-        let source_observer = self.controller.observed_source_epoch(&project_root);
-        let source_freshness = self
+        let observer_after_publication = self
             .controller
-            .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?;
+            .observed_source_epoch_if_armed(&project_root);
+        let observed_refresh_file_count =
+            refreshed_core.as_ref().map(|(_, stats)| stats.file_count);
+        let observed_source_freshness = source_freshness_from_observed_incremental_refresh(
+            source_observer_before_probe.as_ref(),
+            observer_after_publication.as_ref(),
+            complete_incremental_source_inventory,
+            observed_refresh_file_count,
+        );
+        let source_validation_mode = if observed_source_freshness.is_some() {
+            "observer_receipt"
+        } else {
+            "content_scan"
+        };
+        let source_freshness = if let Some(freshness) = observed_source_freshness {
+            freshness
+        } else {
+            self.controller
+                .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?
+        };
         if !index_freshness_admits_operation(&source_freshness) {
             return Err(ApiError::new(
                 "publication_changed",
                 index_freshness_block_message("activation", &source_freshness),
             ));
         }
+        let source_observer = self
+            .controller
+            .observed_source_epoch_if_armed(&project_root);
         let core_publication = self
             .retained_core_publication(&storage_path)?
             .ok_or_else(|| {
@@ -1595,10 +1663,32 @@ impl ActivationService {
             core_publication: revalidated_core,
             retrieval,
             source: ReadySourceIdentity::from(&source_freshness),
-            source_freshness_memo: codestory_workspace::SourceFreshnessMemo::default(),
+            source_freshness_memo,
             source_observer,
         });
         operation.set_capability(true, ActivationCapabilityState::Ready);
+        let validation_ms =
+            u64::try_from(validation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let total_ms = u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let attributed_ms = preflight_ms
+            .saturating_add(core_refresh_ms)
+            .saturating_add(search_preparation_ms)
+            .saturating_add(dense_preparation_ms)
+            .saturating_add(retrieval_finalization_ms)
+            .saturating_add(validation_ms);
+        tracing::warn!(
+            target: "codestory::activation",
+            preflight_ms,
+            core_refresh_ms,
+            search_preparation_ms,
+            dense_preparation_ms,
+            retrieval_finalization_ms,
+            validation_ms,
+            source_validation_mode,
+            unattributed_ms = total_ms.saturating_sub(attributed_ms),
+            total_ms,
+            "managed activation wall receipt"
+        );
         Ok(())
     }
 }
@@ -1626,6 +1716,30 @@ fn index_freshness_admits_operation(freshness: &IndexFreshnessDto) -> bool {
             Some(IndexFreshnessNotCheckedCauseDto::BoundedInventory)
         ),
     }
+}
+
+fn source_freshness_from_observed_incremental_refresh(
+    before: Option<&ObservedSourceEpoch>,
+    after: Option<&ObservedSourceEpoch>,
+    complete_inventory: bool,
+    refreshed_file_count: Option<u32>,
+) -> Option<IndexFreshnessDto> {
+    let file_count = refreshed_file_count?;
+    if !complete_inventory || before.is_none() || before != after {
+        return None;
+    }
+    Some(IndexFreshnessDto {
+        status: IndexFreshnessStatusDto::Fresh,
+        changed_file_count: 0,
+        new_file_count: 0,
+        removed_file_count: 0,
+        checked_file_count: file_count,
+        indexed_file_count: file_count,
+        duration_ms: 0,
+        reason: None,
+        not_checked_cause: None,
+        samples: Vec::new(),
+    })
 }
 
 fn index_freshness_block_message(operation: &str, freshness: &IndexFreshnessDto) -> String {
@@ -2808,6 +2922,52 @@ mod embedding_start_classification_tests {
 #[cfg(test)]
 mod freshness_gate_tests {
     use super::*;
+
+    fn observed_epoch(session_id: &str, epoch: u64) -> ObservedSourceEpoch {
+        ObservedSourceEpoch {
+            session_id: session_id.to_string(),
+            backend: "injected",
+            epoch,
+        }
+    }
+
+    #[test]
+    fn only_one_stable_observer_epoch_admits_the_complete_refresh_receipt() {
+        let before = observed_epoch("session-a", 7);
+        let same = observed_epoch("session-a", 7);
+        let advanced = observed_epoch("session-a", 8);
+        let rearmed = observed_epoch("session-b", 7);
+
+        let fresh = source_freshness_from_observed_incremental_refresh(
+            Some(&before),
+            Some(&same),
+            true,
+            Some(42),
+        )
+        .expect("stable observer carries the complete refresh receipt");
+        assert_eq!(fresh.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(fresh.checked_file_count, 42);
+        assert_eq!(fresh.indexed_file_count, 42);
+
+        for (after, complete, count) in [
+            (Some(&advanced), true, Some(42)),
+            (Some(&rearmed), true, Some(42)),
+            (None, true, Some(42)),
+            (Some(&same), false, Some(42)),
+            (Some(&same), true, None),
+        ] {
+            assert!(
+                source_freshness_from_observed_incremental_refresh(
+                    Some(&before),
+                    after,
+                    complete,
+                    count,
+                )
+                .is_none(),
+                "changed, lost, incomplete, or refresh-free evidence must fall back to a scan",
+            );
+        }
+    }
 
     #[test]
     fn dark_indexed_call_path_builder_remains_core_only() {
