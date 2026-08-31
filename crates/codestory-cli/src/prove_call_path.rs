@@ -7,7 +7,51 @@ use serde_json::Value;
 
 use codestory_runtime::proof_qualification_support as proof;
 
+pub(crate) const PUBLIC_VERIFY_TOOL_NAME: &str = "verify_indexed_direct_calls";
+pub(crate) const LEGACY_PROOF_TOOL_NAME: &str = "prove_call_path";
+pub(crate) const PUBLIC_CALL_PATH_DOMAIN: &str = "call-path/v1";
 pub(crate) const PROVE_CALL_PATH_INPUT_MAX_BYTES: usize = 64 * 1024;
+
+pub(crate) fn is_proof_tool_name(name: &str) -> bool {
+    matches!(name, PUBLIC_VERIFY_TOOL_NAME | LEGACY_PROOF_TOOL_NAME)
+}
+
+pub(crate) fn project_public_verification_result(internal: Value) -> Result<Value, String> {
+    let object = internal
+        .as_object()
+        .ok_or_else(|| "proof projection root must be an object".to_owned())?;
+    let mut public = object.clone();
+    public.insert(
+        "domain".to_owned(),
+        Value::String(PUBLIC_CALL_PATH_DOMAIN.to_owned()),
+    );
+    let translation_status = public
+        .remove("contract_interpretation")
+        .unwrap_or_else(|| Value::String("host_supplied".to_owned()));
+    public.insert("translation_status".to_owned(), translation_status);
+    public.insert(
+        "graph_disposition".to_owned(),
+        Value::String(
+            public
+                .get("disposition")
+                .and_then(|disposition| disposition.get("kind"))
+                .and_then(Value::as_str)
+                .map(graph_disposition_from_internal)
+                .unwrap_or("unknown")
+                .to_owned(),
+        ),
+    );
+    public.insert("runtime_execution_proven".to_owned(), Value::Bool(false));
+    Ok(Value::Object(public))
+}
+
+fn graph_disposition_from_internal(kind: &str) -> &'static str {
+    match kind {
+        "contract_proven" => "proven",
+        "contract_refuted" => "refuted",
+        _ => "unknown",
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -340,4 +384,54 @@ fn read_bounded(reader: impl Read, source: &str) -> Result<Vec<u8>> {
         );
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn internal_fixture(disposition_kind: &str) -> Value {
+        json!({
+            "kind": "complete",
+            "schema_version": 1,
+            "domain": "indexed_source_call_path_v1",
+            "contract_interpretation": "host_supplied",
+            "guard_version": "clause_guard_v1",
+            "source_text_sha256": "a".repeat(64),
+            "contract_digest": "b".repeat(64),
+            "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
+            "disposition": {"kind": disposition_kind, "contract_digest":"b".repeat(64), "gaps":[{"kind":"direct_call_missing","step_index":0}], "connected_receipts":[]},
+            "identities": {"files":[],"symbols":[],"provenance_profiles":[],"evidence":[]},
+            "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[{"relation":"direct_outgoing_call","target":{"kind":"canonical_id","canonical_id":"B"}}],"prohibit_traversal_through":[],"exclude_from_projection":[]},
+            "clauses": [{"start":0,"end":1,"clause_id":"c","quote":"x","classification":"resolved_material","fields":[{"kind":"start"}],"reason":null,"non_material_kind":null}],
+            "steps": [{"step_index":0,"status":"unknown","receipt":null}],
+            "receipts": []
+        })
+    }
+
+    #[test]
+    fn public_projection_exposes_phase6_verification_fields() {
+        for (internal_kind, graph_disposition) in [
+            ("contract_proven", "proven"),
+            ("contract_refuted", "refuted"),
+            ("unknown", "unknown"),
+            ("unavailable", "unknown"),
+        ] {
+            let public = project_public_verification_result(internal_fixture(internal_kind))
+                .expect("project public verification result");
+            assert_eq!(public["domain"], "call-path/v1");
+            assert_eq!(public["translation_status"], "host_supplied");
+            assert_eq!(public["graph_disposition"], graph_disposition);
+            assert_eq!(public["runtime_execution_proven"], false);
+            assert!(public.get("contract_interpretation").is_none());
+        }
+    }
+
+    #[test]
+    fn proof_tool_names_accept_legacy_and_public_aliases() {
+        assert!(is_proof_tool_name(PUBLIC_VERIFY_TOOL_NAME));
+        assert!(is_proof_tool_name(LEGACY_PROOF_TOOL_NAME));
+        assert!(!is_proof_tool_name("packet"));
+    }
 }

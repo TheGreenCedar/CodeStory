@@ -110,9 +110,12 @@ pub(crate) fn validate_evidence_only_surface_v3() -> Result<(), String> {
     ];
     for revision in McpRevisionV3::all() {
         let tools = catalog::tools_for_surface_v3(*revision, V3SurfaceSet::EvidenceOnly);
-        if tools.iter().any(|tool| tool["name"] == "prove_call_path") {
+        if tools.iter().any(|tool| {
+            let name = tool["name"].as_str().unwrap_or_default();
+            name == "prove_call_path" || name == "verify_indexed_direct_calls"
+        }) {
             return Err(format!(
-                "evidence-only {} advertised prove_call_path",
+                "evidence-only {} advertised a proof verification tool",
                 revision.as_str()
             ));
         }

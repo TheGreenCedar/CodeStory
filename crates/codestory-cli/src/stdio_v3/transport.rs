@@ -85,22 +85,27 @@ fn jsonrpc_error_v3(id: Value, code: i64, message: &str) -> Value {
 
 pub(crate) fn build_proof_tool_result_v3(
     revision: McpRevisionV3,
-    root: &Value,
+    internal_root: &Value,
 ) -> Result<Value, StdioV3InternalError> {
+    let tool_name = crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME;
+    codestory_runtime::proof_qualification_support::validate_compact_projection(internal_root)
+        .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
+    let public_root = crate::prove_call_path::project_public_verification_result(
+        internal_root.clone(),
+    )
+    .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
     if crate::stdio_arguments::validate_structured_content(
         &super::catalog::proof_output_schema_v3(),
-        root,
+        &public_root,
     )
     .is_err()
     {
         return Err(StdioV3InternalError::OutputSchemaViolation);
     }
-    codestory_runtime::proof_qualification_support::validate_compact_projection(root)
-        .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let result = build_tool_result_for_surface_v3(
         revision,
-        "prove_call_path",
-        root,
+        tool_name,
+        &public_root,
         V3SurfaceSet::WithProof,
     )?;
     let bytes = crate::stdio_transport::v3_serialize_call_tool_result(&result)
@@ -109,21 +114,23 @@ pub(crate) fn build_proof_tool_result_v3(
         return Ok(result);
     }
 
-    let fallback = proof_budget_fallback_v3(root, bytes.len())?;
+    let fallback_internal = proof_budget_fallback_v3(internal_root, bytes.len())?;
+    let fallback_public = crate::prove_call_path::project_public_verification_result(
+        fallback_internal,
+    )
+    .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
     if crate::stdio_arguments::validate_structured_content(
         &super::catalog::proof_output_schema_v3(),
-        &fallback,
+        &fallback_public,
     )
     .is_err()
     {
         return Err(StdioV3InternalError::OutputSchemaViolation);
     }
-    codestory_runtime::proof_qualification_support::validate_compact_projection(&fallback)
-        .map_err(|_| StdioV3InternalError::InvalidProjection("prove_call_path".to_owned()))?;
     let fallback_result = build_tool_result_for_surface_v3(
         revision,
-        "prove_call_path",
-        &fallback,
+        tool_name,
+        &fallback_public,
         V3SurfaceSet::WithProof,
     )?;
     let fallback_bytes = crate::stdio_transport::v3_serialize_call_tool_result(&fallback_result)
@@ -436,17 +443,19 @@ mod tests {
     #[cfg(feature = "proof-qualification-support")]
     #[test]
     fn actual_projected_root_round_trips_through_all_revision_profiles() {
-        let root = actual_projected_root("A calls B();\n".to_owned());
+        let internal = actual_projected_root("A calls B();\n".to_owned());
+        let public = crate::prove_call_path::project_public_verification_result(internal.clone())
+            .expect("project public verification result");
         for revision in McpRevisionV3::all() {
-            let result = build_proof_tool_result_v3(*revision, &root)
+            let result = build_proof_tool_result_v3(*revision, &internal)
                 .unwrap_or_else(|error| panic!("{revision:?}: {error:?}"));
             assert_eq!(
                 serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
                     .unwrap(),
-                root
+                public
             );
             if revision.profile().structured_content {
-                assert_eq!(result["structuredContent"], root);
+                assert_eq!(result["structuredContent"], public);
             }
         }
     }
@@ -464,7 +473,7 @@ mod tests {
         let size = |root: &Value| {
             let result = build_tool_result_for_surface_v3(
                 revision,
-                "prove_call_path",
+                crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
                 root,
                 V3SurfaceSet::WithProof,
             )
@@ -531,11 +540,14 @@ mod tests {
                 *revision,
                 PROOF_TOOL_RESULT_MAX_BYTES_V3 + 1,
             );
+            let oversized_public =
+                crate::prove_call_path::project_public_verification_result(oversized.clone())
+                    .expect("project oversized public verification result");
             let expected_size = crate::stdio_transport::v3_serialize_call_tool_result(
                 &build_tool_result_for_surface_v3(
                     *revision,
-                    "prove_call_path",
-                    &oversized,
+                    crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME,
+                    &oversized_public,
                     V3SurfaceSet::WithProof,
                 )
                 .unwrap(),
@@ -551,12 +563,8 @@ mod tests {
                     .unwrap();
             assert_eq!(fallback_root["kind"], "budget_exceeded");
             assert_eq!(fallback_root["required_complete_size"], expected_size);
-            assert!(
-                codestory_runtime::proof_qualification_support::validate_compact_projection(
-                    &fallback_root
-                )
-                .is_ok()
-            );
+            assert_eq!(fallback_root["domain"], "call-path/v1");
+            assert_eq!(fallback_root["runtime_execution_proven"], false);
             if revision.profile().structured_content {
                 assert_eq!(fallback["structuredContent"], fallback_root);
             }

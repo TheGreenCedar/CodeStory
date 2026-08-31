@@ -13,7 +13,7 @@ Root usage: `codestory-cli <COMMAND>`
 | `report` | `codestory-cli report [OPTIONS]` |
 | `context` | `codestory-cli context [OPTIONS] <--id <NODE_ID>|--query <QUERY>|--bookmark <BOOKMARK_ID>>` |
 | `packet` | `codestory-cli packet [OPTIONS] --question <QUESTION>` |
-| `prove-call-path` | `codestory-cli prove-call-path --project <ROOT> --spec <PATH>` |
+| `verify-indexed-direct-calls` | `codestory-cli verify-indexed-direct-calls --project <ROOT> --spec <PATH>` |
 | `task` | `codestory-cli task <COMMAND>` |
 | `doctor` | `codestory-cli doctor [OPTIONS]` |
 | `ready` | `codestory-cli ready [OPTIONS]` |

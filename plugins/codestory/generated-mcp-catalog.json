@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "5a84ba490ea74bb9eb9fe6afcfdd8f493e2e861a8cb5e378bf644f7fe7238289",
-      "2025-03-26": "947a069f04d533ab74c85782db85ae514ff77688ce26c6a7b92cfc8bfc825111",
-      "2025-06-18": "03bbc62254963de6aa9af39983c5f175637f144685a370d628259436560764d7",
-      "2025-11-25": "fdbf164afa86f84684069ade2304905acca820b6424dacd0aa61346f1dd759b4"
+      "2024-11-05": "61f151616f1e92192c5d04f29e1cd83aa44a712b7323ab3cd5d154440a99395e",
+      "2025-03-26": "550dd6b581b783b45f23dabb3e73dab9f5eef2e156d3247d5a80055e25a05a92",
+      "2025-06-18": "8f08aea1a05def56f7c9ade3ead8085a93cb11d58cf0ca1fd1fee035aa7097b5",
+      "2025-11-25": "299b6271d4fe5ea070be56fcbff16fd5f60f9bb37f0e9465e6494d0d84785499"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "5a84ba490ea74bb9eb9fe6afcfdd8f493e2e861a8cb5e378bf644f7fe7238289",
+      "discoveryContractSha256": "61f151616f1e92192c5d04f29e1cd83aa44a712b7323ab3cd5d154440a99395e",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -2441,7 +2441,7 @@
             ],
             "type": "object"
           },
-          "name": "prove_call_path"
+          "name": "verify_indexed_direct_calls"
         }
       ],
       "resources": [
@@ -2509,7 +2509,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "947a069f04d533ab74c85782db85ae514ff77688ce26c6a7b92cfc8bfc825111",
+      "discoveryContractSha256": "550dd6b581b783b45f23dabb3e73dab9f5eef2e156d3247d5a80055e25a05a92",
       "tools": [
         {
           "annotations": {
@@ -5039,7 +5039,7 @@
             ],
             "type": "object"
           },
-          "name": "prove_call_path"
+          "name": "verify_indexed_direct_calls"
         }
       ],
       "resources": [
@@ -5107,7 +5107,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "03bbc62254963de6aa9af39983c5f175637f144685a370d628259436560764d7",
+      "discoveryContractSha256": "8f08aea1a05def56f7c9ade3ead8085a93cb11d58cf0ca1fd1fee035aa7097b5",
       "tools": [
         {
           "_meta": {
@@ -13965,7 +13965,7 @@
             ],
             "type": "object"
           },
-          "name": "prove_call_path",
+          "name": "verify_indexed_direct_calls",
           "outputSchema": {
             "oneOf": [
               {
@@ -14115,12 +14115,6 @@
                   "contract_digest": {
                     "maxLength": 64,
                     "minLength": 64,
-                    "type": "string"
-                  },
-                  "contract_interpretation": {
-                    "enum": [
-                      "host_supplied"
-                    ],
                     "type": "string"
                   },
                   "core_publication": {
@@ -14699,7 +14693,15 @@
                   },
                   "domain": {
                     "enum": [
-                      "indexed_source_call_path_v1"
+                      "call-path/v1"
+                    ],
+                    "type": "string"
+                  },
+                  "graph_disposition": {
+                    "enum": [
+                      "proven",
+                      "refuted",
+                      "unknown"
                     ],
                     "type": "string"
                   },
@@ -15092,6 +15094,12 @@
                     },
                     "maxItems": 6,
                     "type": "array"
+                  },
+                  "runtime_execution_proven": {
+                    "enum": [
+                      false
+                    ],
+                    "type": "boolean"
                   },
                   "schema_version": {
                     "enum": [
@@ -15676,13 +15684,21 @@
                     },
                     "maxItems": 6,
                     "type": "array"
+                  },
+                  "translation_status": {
+                    "enum": [
+                      "host_supplied"
+                    ],
+                    "type": "string"
                   }
                 },
                 "required": [
                   "kind",
                   "schema_version",
                   "domain",
-                  "contract_interpretation",
+                  "translation_status",
+                  "graph_disposition",
+                  "runtime_execution_proven",
                   "guard_version",
                   "source_text_sha256",
                   "contract_digest",
@@ -15706,12 +15722,6 @@
                   "contract_digest": {
                     "maxLength": 64,
                     "minLength": 64,
-                    "type": "string"
-                  },
-                  "contract_interpretation": {
-                    "enum": [
-                      "host_supplied"
-                    ],
                     "type": "string"
                   },
                   "core_publication": {
@@ -15778,7 +15788,15 @@
                   },
                   "domain": {
                     "enum": [
-                      "indexed_source_call_path_v1"
+                      "call-path/v1"
+                    ],
+                    "type": "string"
+                  },
+                  "graph_disposition": {
+                    "enum": [
+                      "proven",
+                      "refuted",
+                      "unknown"
                     ],
                     "type": "string"
                   },
@@ -15798,6 +15816,12 @@
                     "minimum": 1,
                     "type": "integer"
                   },
+                  "runtime_execution_proven": {
+                    "enum": [
+                      false
+                    ],
+                    "type": "boolean"
+                  },
                   "schema_version": {
                     "enum": [
                       1
@@ -15808,13 +15832,21 @@
                     "maxLength": 64,
                     "minLength": 64,
                     "type": "string"
+                  },
+                  "translation_status": {
+                    "enum": [
+                      "host_supplied"
+                    ],
+                    "type": "string"
                   }
                 },
                 "required": [
                   "kind",
                   "schema_version",
                   "domain",
-                  "contract_interpretation",
+                  "translation_status",
+                  "graph_disposition",
+                  "runtime_execution_proven",
                   "guard_version",
                   "source_text_sha256",
                   "contract_digest",
@@ -15828,7 +15860,7 @@
             ],
             "type": "object"
           },
-          "title": "Prove Call Path"
+          "title": "Verify Indexed Direct Calls"
         }
       ],
       "resources": [
@@ -15896,7 +15928,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "fdbf164afa86f84684069ade2304905acca820b6424dacd0aa61346f1dd759b4",
+      "discoveryContractSha256": "299b6271d4fe5ea070be56fcbff16fd5f60f9bb37f0e9465e6494d0d84785499",
       "tools": [
         {
           "_meta": {
@@ -24754,7 +24786,7 @@
             ],
             "type": "object"
           },
-          "name": "prove_call_path",
+          "name": "verify_indexed_direct_calls",
           "outputSchema": {
             "oneOf": [
               {
@@ -24904,12 +24936,6 @@
                   "contract_digest": {
                     "maxLength": 64,
                     "minLength": 64,
-                    "type": "string"
-                  },
-                  "contract_interpretation": {
-                    "enum": [
-                      "host_supplied"
-                    ],
                     "type": "string"
                   },
                   "core_publication": {
@@ -25488,7 +25514,15 @@
                   },
                   "domain": {
                     "enum": [
-                      "indexed_source_call_path_v1"
+                      "call-path/v1"
+                    ],
+                    "type": "string"
+                  },
+                  "graph_disposition": {
+                    "enum": [
+                      "proven",
+                      "refuted",
+                      "unknown"
                     ],
                     "type": "string"
                   },
@@ -25881,6 +25915,12 @@
                     },
                     "maxItems": 6,
                     "type": "array"
+                  },
+                  "runtime_execution_proven": {
+                    "enum": [
+                      false
+                    ],
+                    "type": "boolean"
                   },
                   "schema_version": {
                     "enum": [
@@ -26465,13 +26505,21 @@
                     },
                     "maxItems": 6,
                     "type": "array"
+                  },
+                  "translation_status": {
+                    "enum": [
+                      "host_supplied"
+                    ],
+                    "type": "string"
                   }
                 },
                 "required": [
                   "kind",
                   "schema_version",
                   "domain",
-                  "contract_interpretation",
+                  "translation_status",
+                  "graph_disposition",
+                  "runtime_execution_proven",
                   "guard_version",
                   "source_text_sha256",
                   "contract_digest",
@@ -26495,12 +26543,6 @@
                   "contract_digest": {
                     "maxLength": 64,
                     "minLength": 64,
-                    "type": "string"
-                  },
-                  "contract_interpretation": {
-                    "enum": [
-                      "host_supplied"
-                    ],
                     "type": "string"
                   },
                   "core_publication": {
@@ -26567,7 +26609,15 @@
                   },
                   "domain": {
                     "enum": [
-                      "indexed_source_call_path_v1"
+                      "call-path/v1"
+                    ],
+                    "type": "string"
+                  },
+                  "graph_disposition": {
+                    "enum": [
+                      "proven",
+                      "refuted",
+                      "unknown"
                     ],
                     "type": "string"
                   },
@@ -26587,6 +26637,12 @@
                     "minimum": 1,
                     "type": "integer"
                   },
+                  "runtime_execution_proven": {
+                    "enum": [
+                      false
+                    ],
+                    "type": "boolean"
+                  },
                   "schema_version": {
                     "enum": [
                       1
@@ -26597,13 +26653,21 @@
                     "maxLength": 64,
                     "minLength": 64,
                     "type": "string"
+                  },
+                  "translation_status": {
+                    "enum": [
+                      "host_supplied"
+                    ],
+                    "type": "string"
                   }
                 },
                 "required": [
                   "kind",
                   "schema_version",
                   "domain",
-                  "contract_interpretation",
+                  "translation_status",
+                  "graph_disposition",
+                  "runtime_execution_proven",
                   "guard_version",
                   "source_text_sha256",
                   "contract_digest",
@@ -26617,7 +26681,7 @@
             ],
             "type": "object"
           },
-          "title": "Prove Call Path"
+          "title": "Verify Indexed Direct Calls"
         }
       ],
       "resources": [
@@ -35542,7 +35606,7 @@
         ],
         "type": "object"
       },
-      "name": "prove_call_path",
+      "name": "verify_indexed_direct_calls",
       "outputSchema": {
         "oneOf": [
           {
@@ -35692,12 +35756,6 @@
               "contract_digest": {
                 "maxLength": 64,
                 "minLength": 64,
-                "type": "string"
-              },
-              "contract_interpretation": {
-                "enum": [
-                  "host_supplied"
-                ],
                 "type": "string"
               },
               "core_publication": {
@@ -36276,7 +36334,15 @@
               },
               "domain": {
                 "enum": [
-                  "indexed_source_call_path_v1"
+                  "call-path/v1"
+                ],
+                "type": "string"
+              },
+              "graph_disposition": {
+                "enum": [
+                  "proven",
+                  "refuted",
+                  "unknown"
                 ],
                 "type": "string"
               },
@@ -36669,6 +36735,12 @@
                 },
                 "maxItems": 6,
                 "type": "array"
+              },
+              "runtime_execution_proven": {
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
               },
               "schema_version": {
                 "enum": [
@@ -37253,13 +37325,21 @@
                 },
                 "maxItems": 6,
                 "type": "array"
+              },
+              "translation_status": {
+                "enum": [
+                  "host_supplied"
+                ],
+                "type": "string"
               }
             },
             "required": [
               "kind",
               "schema_version",
               "domain",
-              "contract_interpretation",
+              "translation_status",
+              "graph_disposition",
+              "runtime_execution_proven",
               "guard_version",
               "source_text_sha256",
               "contract_digest",
@@ -37283,12 +37363,6 @@
               "contract_digest": {
                 "maxLength": 64,
                 "minLength": 64,
-                "type": "string"
-              },
-              "contract_interpretation": {
-                "enum": [
-                  "host_supplied"
-                ],
                 "type": "string"
               },
               "core_publication": {
@@ -37355,7 +37429,15 @@
               },
               "domain": {
                 "enum": [
-                  "indexed_source_call_path_v1"
+                  "call-path/v1"
+                ],
+                "type": "string"
+              },
+              "graph_disposition": {
+                "enum": [
+                  "proven",
+                  "refuted",
+                  "unknown"
                 ],
                 "type": "string"
               },
@@ -37375,6 +37457,12 @@
                 "minimum": 1,
                 "type": "integer"
               },
+              "runtime_execution_proven": {
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              },
               "schema_version": {
                 "enum": [
                   1
@@ -37385,13 +37473,21 @@
                 "maxLength": 64,
                 "minLength": 64,
                 "type": "string"
+              },
+              "translation_status": {
+                "enum": [
+                  "host_supplied"
+                ],
+                "type": "string"
               }
             },
             "required": [
               "kind",
               "schema_version",
               "domain",
-              "contract_interpretation",
+              "translation_status",
+              "graph_disposition",
+              "runtime_execution_proven",
               "guard_version",
               "source_text_sha256",
               "contract_digest",
@@ -37405,7 +37501,7 @@
         ],
         "type": "object"
       },
-      "title": "Prove Call Path"
+      "title": "Verify Indexed Direct Calls"
     }
   ],
   "resources": [

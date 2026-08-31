@@ -161,7 +161,7 @@ fn public_v3_outcome_a_negotiates_revision_native_discovery_with_exact_proof() {
             .as_array()
             .expect("tools array");
         assert_eq!(tools.len(), 21);
-        for route in ["packet", "context", "search", "prove_call_path"] {
+        for route in ["packet", "context", "search", "verify_indexed_direct_calls"] {
             assert_eq!(
                 tools.iter().filter(|tool| tool["name"] == route).count(),
                 1,
@@ -170,7 +170,7 @@ fn public_v3_outcome_a_negotiates_revision_native_discovery_with_exact_proof() {
         }
         let proof = tools
             .iter()
-            .find(|tool| tool["name"] == "prove_call_path")
+            .find(|tool| tool["name"] == "verify_indexed_direct_calls")
             .expect("exact proof tool");
         assert!(proof.get("safety").is_none());
         if revision >= "2025-03-26" {
@@ -292,6 +292,11 @@ fn public_exact_proof_call_is_revision_native_and_keeps_uncertainty_successful()
             Some(&json!("contract_proven")),
             "{text_root}"
         );
+        assert_eq!(text_root["domain"], "call-path/v1");
+        assert_eq!(text_root["translation_status"], "host_supplied");
+        assert_eq!(text_root["graph_disposition"], "proven");
+        assert_eq!(text_root["runtime_execution_proven"], false);
+        assert!(text_root.get("contract_interpretation").is_none());
         if revision >= "2025-06-18" {
             assert_eq!(result["structuredContent"], text_root);
         } else {
@@ -528,15 +533,15 @@ fn public_v3_cli_exposes_exact_proof_without_packet_proof_switches() {
     assert!(!help.contains("prove-call-path"), "{help}");
 
     let output = test_support::cli_command()
-        .args(["prove-call-path", "--help"])
+        .args(["verify-indexed-direct-calls", "--help"])
         .output()
-        .expect("run prove-call-path help");
+        .expect("run verify-indexed-direct-calls help");
     assert!(
         output.status.success(),
-        "prove-call-path help failed: {}",
+        "verify-indexed-direct-calls help failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let help = String::from_utf8(output.stdout).expect("UTF-8 prove-call-path help");
+    let help = String::from_utf8(output.stdout).expect("UTF-8 verify-indexed-direct-calls help");
     assert!(help.contains("--project <ROOT>"), "{help}");
     assert!(help.contains("--spec <PATH>"), "{help}");
     for forbidden in [
@@ -548,6 +553,19 @@ fn public_v3_cli_exposes_exact_proof_without_packet_proof_switches() {
     ] {
         assert!(!help.contains(forbidden), "{help}");
     }
+
+    let output = test_support::cli_command()
+        .args(["prove-call-path", "--help"])
+        .output()
+        .expect("run prove-call-path alias help");
+    assert!(
+        output.status.success(),
+        "prove-call-path alias help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let alias_help = String::from_utf8(output.stdout).expect("UTF-8 prove-call-path alias help");
+    assert!(alias_help.contains("--project <ROOT>"), "{alias_help}");
+    assert!(alias_help.contains("--spec <PATH>"), "{alias_help}");
 }
 
 #[test]
@@ -623,8 +641,12 @@ fn prove_call_path_cli_keeps_file_stdin_dto_parity_and_caps_before_deserializati
     assert_eq!(file_root, stdin_root);
     assert_eq!(
         file_root.pointer("/disposition/kind"),
-        Some(&json!("unknown"))
+        Some(&json!("unavailable"))
     );
+    assert_eq!(file_root["domain"], "call-path/v1");
+    assert_eq!(file_root["translation_status"], "host_supplied");
+    assert_eq!(file_root["graph_disposition"], "unknown");
+    assert_eq!(file_root["runtime_execution_proven"], false);
 
     let mut capped = unknown_proof_spec();
     capped["padding"] = json!("");
@@ -1781,7 +1803,7 @@ fn project_resource_uri(base_uri: &str, project: &Path) -> String {
 
 fn assert_tool_safety_metadata(tool: &Value) {
     let name = tool["name"].as_str().expect("tool name");
-    let observational = matches!(name, "status" | "prove_call_path");
+    let observational = matches!(name, "status" | "verify_indexed_direct_calls");
     let safety = tool
         .pointer("/_meta/com.thegreencedar.codestory~1safety")
         .unwrap_or_else(|| panic!("{name} should include namespaced safety metadata: {tool}"));
@@ -2782,7 +2804,6 @@ fn tool_catalog_keeps_stable_product_tool_names() {
             "ground",
             "neighbors",
             "packet",
-            "prove_call_path",
             "query_subgraph",
             "references",
             "search",
@@ -2793,6 +2814,7 @@ fn tool_catalog_keeps_stable_product_tool_names() {
             "symbols",
             "trace",
             "trail",
+            "verify_indexed_direct_calls",
         ],
         "stdio product tool names should stay stable: {tools}"
     );

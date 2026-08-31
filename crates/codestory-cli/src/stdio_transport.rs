@@ -1665,7 +1665,7 @@ fn handle_stdio_request(
                     "Invalid params: missing tool name",
                 ));
             };
-            if !is_stdio_tool_name(name) && name != "prove_call_path" {
+            if !is_stdio_tool_name(name) && !crate::prove_call_path::is_proof_tool_name(name) {
                 return Some(stdio_jsonrpc_error(
                     id,
                     -32602,
@@ -1688,7 +1688,7 @@ fn handle_stdio_request(
             }
             let prepared = match prepare_stdio_tool_call(session, name, &request) {
                 Ok(prepared) => prepared,
-                Err(error) if name == "prove_call_path" => {
+                Err(error) if crate::prove_call_path::is_proof_tool_name(name) => {
                     return Some(crate::stdio_v3::jsonrpc_invalid_params_v3(
                         id,
                         &error.message,
@@ -1735,7 +1735,7 @@ fn handle_stdio_request(
                     });
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
                 }
-                let activation = if name == "prove_call_path" {
+                let activation = if crate::prove_call_path::is_proof_tool_name(name) {
                     runtime
                         .activation
                         .bind_existing_complete_core_for_observation(
@@ -1870,7 +1870,7 @@ fn handle_stdio_request(
                 }
                 state.status_cache = None;
             }
-            if name == "prove_call_path" {
+            if crate::prove_call_path::is_proof_tool_name(name) {
                 let PreparedStdioToolCall::ProveCallPath(proof_request) = &prepared else {
                     return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
                 };
@@ -2664,7 +2664,7 @@ fn stdio_tool_reads_publication(name: &str) -> bool {
 }
 
 fn stdio_tool_observes_complete_core(name: &str) -> bool {
-    matches!(name, "affected" | "prove_call_path")
+    name == "affected" || crate::prove_call_path::is_proof_tool_name(name)
 }
 
 fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -> &'a str {
@@ -3511,7 +3511,7 @@ fn prepare_stdio_tool_call(
             Ok(PreparedStdioToolCall::Affected(affected))
         }
         "snippet" => stdio_snippet_request(request).map(PreparedStdioToolCall::Snippet),
-        "prove_call_path" => {
+        name if crate::prove_call_path::is_proof_tool_name(name) => {
             let mut arguments = request
                 .pointer("/params/arguments")
                 .cloned()

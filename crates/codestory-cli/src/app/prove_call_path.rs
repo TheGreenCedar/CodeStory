@@ -3,14 +3,15 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 
-use crate::args::{OutputFormat, ProjectArgs, ProveCallPathCommand};
+use crate::args::{OutputFormat, ProjectArgs, VerifyIndexedDirectCallsCommand};
 use crate::output::emit;
 use crate::prove_call_path::{
-    internal_projection_root, parse_request, projection_root, read_bounded_spec, validate_request,
+    internal_projection_root, parse_request, project_public_verification_result, projection_root,
+    read_bounded_spec, validate_request,
 };
 use crate::runtime::{RuntimeContext, map_api_error};
 
-pub(super) fn run_prove_call_path(cmd: ProveCallPathCommand) -> Result<()> {
+pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsCommand) -> Result<()> {
     let bytes = read_bounded_spec(&cmd.spec)?;
     let value = serde_json::from_slice(&bytes).context("parse proof spec JSON")?;
     let request = parse_request(value).map_err(anyhow::Error::msg)?;
@@ -64,5 +65,6 @@ pub(super) fn run_prove_call_path(cmd: ProveCallPathCommand) -> Result<()> {
             internal_projection_root(&operation.value)
         }
     };
-    emit(OutputFormat::Json, &root, String::new(), None)
+    let public = project_public_verification_result(root).map_err(anyhow::Error::msg)?;
+    emit(OutputFormat::Json, &public, String::new(), None)
 }

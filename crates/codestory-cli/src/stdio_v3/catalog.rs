@@ -35,11 +35,13 @@ fn proof_common_fields_v3(kind: &str) -> Vec<(&str, Value)> {
     vec![
         ("kind", enum_schema_v3(&[kind])),
         ("schema_version", json!({"type":"integer","enum":[1]})),
-        ("domain", enum_schema_v3(&["indexed_source_call_path_v1"])),
+        ("domain", enum_schema_v3(&["call-path/v1"])),
+        ("translation_status", enum_schema_v3(&["host_supplied"])),
         (
-            "contract_interpretation",
-            enum_schema_v3(&["host_supplied"]),
+            "graph_disposition",
+            enum_schema_v3(&["proven", "refuted", "unknown"]),
         ),
+        ("runtime_execution_proven", json!({"type":"boolean","enum":[false]})),
         ("guard_version", enum_schema_v3(&["clause_guard_v1"])),
         ("source_text_sha256", sha256_schema_v3()),
         ("contract_digest", sha256_schema_v3()),
@@ -591,7 +593,7 @@ fn annotations_v3(activates: bool) -> Value {
 
 fn output_schema_for_tool_v3(name: &str, source: &Value, activates: bool) -> Value {
     let success = match name {
-        "prove_call_path" => proof_output_schema_v3(),
+        "verify_indexed_direct_calls" => proof_output_schema_v3(),
         "packet" => packet_output_schema_v3(),
         "context" => context_output_schema_v3(),
         "search" => search_output_schema_v3(),
@@ -941,7 +943,7 @@ fn successful_with_preparing_schema_v3(success: Value) -> Value {
 
 pub(crate) fn proof_tool_source_v3() -> Value {
     json!({
-        "name": "prove_call_path",
+        "name": "verify_indexed_direct_calls",
         "description": "Verify one host-translated exact indexed source call-path contract against a pinned publication.",
         "inputSchema": proof_input_schema_v3(),
         "outputSchema": proof_output_schema_v3(),
@@ -1136,6 +1138,7 @@ mod tests {
                 .map(|tool| tool["name"].as_str().expect("tool name"))
                 .collect::<BTreeSet<_>>();
             assert!(!names.contains("prove_call_path"));
+            assert!(!names.contains("verify_indexed_direct_calls"));
             for required in ["packet", "context", "search"] {
                 assert!(names.contains(required), "missing evidence tool {required}");
             }
@@ -1176,7 +1179,7 @@ mod tests {
                     Some(&json!(true))
                 );
                 assert_eq!(
-                    tool(&tools, "prove_call_path").pointer("/annotations/readOnlyHint"),
+                    tool(&tools, "verify_indexed_direct_calls").pointer("/annotations/readOnlyHint"),
                     Some(&json!(true))
                 );
                 for activation_capable in ["packet", "search", "ground", "context"] {
@@ -1312,8 +1315,10 @@ mod tests {
         let complete = json!({
             "kind": "complete",
             "schema_version": 1,
-            "domain": "indexed_source_call_path_v1",
-            "contract_interpretation": "host_supplied",
+            "domain": "call-path/v1",
+            "translation_status": "host_supplied",
+            "graph_disposition": "unknown",
+            "runtime_execution_proven": false,
             "guard_version": "clause_guard_v1",
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
@@ -1332,8 +1337,10 @@ mod tests {
         let budget = json!({
             "kind": "budget_exceeded",
             "schema_version": 1,
-            "domain": "indexed_source_call_path_v1",
-            "contract_interpretation": "host_supplied",
+            "domain": "call-path/v1",
+            "translation_status": "host_supplied",
+            "graph_disposition": "unknown",
+            "runtime_execution_proven": false,
             "guard_version": "clause_guard_v1",
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),

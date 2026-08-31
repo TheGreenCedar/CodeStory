@@ -95,7 +95,7 @@ pub(crate) fn validate_tool_arguments(
     arguments: Option<&Value>,
 ) -> Result<(), Vec<ArgumentViolation>> {
     let proof_schema;
-    let schema = if tool == "prove_call_path" {
+    let schema = if crate::prove_call_path::is_proof_tool_name(tool) {
         proof_schema = crate::stdio_v3::catalog::proof_tool_source_v3();
         proof_schema
             .get("inputSchema")
