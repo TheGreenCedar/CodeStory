@@ -52,6 +52,11 @@ pub struct CacheHardlinkGroup {
     pub paths: Vec<String>,
 }
 
+/// One-shot report of copy-on-write clone *capability* under the cache root.
+///
+/// This is not a claim that extents are already shared across generations.
+/// Proven sharing is reported via [`CacheInventoryReport::hardlink_deduplicated_bytes`]
+/// / [`CacheInventoryReport::clone_shared_bytes`] from native file identity groups.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheCloneSharing {
     pub relative_path: String,
@@ -108,6 +113,7 @@ fn build_cache_inventory(cache_root: &Path) -> Result<CacheInventoryReport> {
     let mut state = InventoryState::new(cache_root);
     if cache_root.is_dir() {
         state.scan_tree(cache_root, cache_root)?;
+        state.probe_clone_capability_under_cache_root();
     } else {
         state.errors.push(format!(
             "cache root does not exist: {}",
@@ -117,6 +123,8 @@ fn build_cache_inventory(cache_root: &Path) -> Result<CacheInventoryReport> {
     state.observe_sqlite_databases()?;
     state.finalize(clean_plan)
 }
+
+const CLONE_CAPABILITY_PROBE_DIR_PREFIX: &str = ".codestory-inventory-cow-probe-";
 
 struct InventoryState {
     cache_root: PathBuf,
@@ -216,24 +224,54 @@ impl InventoryState {
             });
         group.link_count = group.link_count.saturating_add(1);
         group.paths.push(relative.to_string());
-        if record.link_count == 1 {
-            let probe = std::env::temp_dir().join(format!(
-                "codestory-inventory-clone-probe-{}-{relative}",
-                std::process::id()
-            ));
-            if crate::copy_on_write::clone_file(self.cache_root.join(relative).as_path(), &probe)
-                .unwrap_or(false)
-            {
-                let _ = std::fs::remove_file(probe);
-                self.clone_sharing.push(CacheCloneSharing {
-                    relative_path: relative.to_string(),
-                    apparent_bytes,
-                    provable: true,
-                    detail: "copy-on-write clone succeeded during inventory probe".into(),
-                });
-            }
-        }
         Ok(())
+    }
+
+    /// Probe CoW clone capability once under the cache root, then remove the
+    /// probe tree. Never writes outside the process cache root.
+    fn probe_clone_capability_under_cache_root(&mut self) {
+        let probe_dir = self.cache_root.join(format!(
+            "{CLONE_CAPABILITY_PROBE_DIR_PREFIX}{}",
+            std::process::id()
+        ));
+        let relative = relative_path(&self.cache_root, &probe_dir)
+            .unwrap_or_else(|_| CLONE_CAPABILITY_PROBE_DIR_PREFIX.trim_end_matches('-').into());
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        if let Err(error) = std::fs::create_dir_all(&probe_dir) {
+            self.clone_sharing.push(CacheCloneSharing {
+                relative_path: relative,
+                apparent_bytes: 0,
+                provable: false,
+                detail: format!("could not create cache-root CoW capability probe: {error}"),
+            });
+            return;
+        }
+        let source = probe_dir.join("source.bin");
+        let destination = probe_dir.join("clone.bin");
+        let capability = match std::fs::write(&source, b"codestory-inventory-cow-probe") {
+            Ok(()) => crate::copy_on_write::clone_file(&source, &destination).unwrap_or(false),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&probe_dir);
+                self.clone_sharing.push(CacheCloneSharing {
+                    relative_path: relative,
+                    apparent_bytes: 0,
+                    provable: false,
+                    detail: format!("could not seed cache-root CoW capability probe: {error}"),
+                });
+                return;
+            }
+        };
+        let _ = std::fs::remove_dir_all(&probe_dir);
+        self.clone_sharing.push(CacheCloneSharing {
+            relative_path: relative,
+            apparent_bytes: 0,
+            provable: capability,
+            detail: if capability {
+                "copy-on-write clone capability available under cache root".into()
+            } else {
+                "copy-on-write clone capability unavailable under cache root".into()
+            },
+        });
     }
 
     fn observe_sqlite_databases(&mut self) -> Result<()> {
@@ -265,12 +303,9 @@ impl InventoryState {
                     .saturating_mul(group.link_count.saturating_sub(1))
             })
             .sum();
-        let clone_shared_bytes = self
-            .clone_sharing
-            .iter()
-            .filter(|entry| entry.provable)
-            .map(|entry| entry.apparent_bytes)
-            .sum();
+        // Proven sharing only: hardlink / native-identity groups. A successful
+        // CoW capability probe is not evidence that extents are already shared.
+        let clone_shared_bytes = hardlink_deduplicated_bytes;
 
         let mut top_consumers = self
             .entries
@@ -316,15 +351,17 @@ impl InventoryState {
             .map(|entry| entry.apparent_bytes)
             .sum();
         let reclaimable_bytes = clean_plan.reclaimable_bytes;
-        let blocked_bytes = clean_plan
-            .retained
+        // Clean plan retains workspace/model *directories*; inventory entries
+        // are files. Roll up every entry under each retained prefix.
+        let blocked_bytes = self
+            .entries
             .iter()
-            .filter_map(|retained| {
-                self.entries
-                    .iter()
-                    .find(|entry| entry.relative_path == retained.relative_path)
-                    .map(|entry| entry.apparent_bytes)
+            .filter(|entry| {
+                clean_plan.retained.iter().any(|retained| {
+                    path_is_under_retained(&entry.relative_path, &retained.relative_path)
+                })
             })
+            .map(|entry| entry.apparent_bytes)
             .sum();
 
         Ok(CacheInventoryReport {
@@ -389,6 +426,11 @@ fn relative_path(root: &Path, path: &Path) -> Result<String> {
             )
         })
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn path_is_under_retained(entry_relative: &str, retained_relative: &str) -> bool {
+    entry_relative == retained_relative
+        || entry_relative.starts_with(&format!("{retained_relative}/"))
 }
 
 fn classify_entry(relative: &str, path: &Path) -> CacheInventoryKind {
@@ -460,8 +502,9 @@ fn native_file_identity(metadata: &std::fs::Metadata) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::with_test_cache_root;
-    use codestory_store::Store;
+    use crate::config::{RETRIEVAL_STATE_FILE, with_test_cache_root};
+    use crate::retention::{GenerationRetentionMarker, write_retention_marker};
+    use codestory_store::{RetrievalIndexManifest, Store};
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
@@ -475,13 +518,33 @@ mod tests {
         let store = Store::open(&storage).expect("create store");
         drop(store);
         let before = snapshot_tree(cache.path());
+        let before_temp = inventory_temp_probe_names();
 
         let report = with_test_cache_root(cache.path(), cache_inventory).expect("inventory");
         let after = snapshot_tree(cache.path());
+        let after_temp = inventory_temp_probe_names();
 
         assert_eq!(before, after, "inventory must not mutate the cache tree");
+        assert_eq!(
+            before_temp, after_temp,
+            "inventory must not write CoW probes into the system temp directory"
+        );
         assert!(report.dry_run);
         assert_eq!(report.ownership_scope, "process_cache_root");
+        assert_eq!(
+            report.clone_sharing.len(),
+            1,
+            "inventory should report CoW capability once: {:?}",
+            report.clone_sharing
+        );
+        assert_eq!(
+            report.clone_sharing[0].apparent_bytes, 0,
+            "capability probes must not claim shared bytes"
+        );
+        assert_eq!(
+            report.clone_shared_bytes, report.hardlink_deduplicated_bytes,
+            "clone_shared_bytes must equal identity-proven hardlink sharing"
+        );
         assert!(
             report
                 .entries
@@ -496,6 +559,11 @@ mod tests {
                 .iter()
                 .any(|db| db.path.ends_with("codestory.db")),
             "sqlite databases should be observed"
+        );
+        assert!(
+            !after.keys().any(|path| path.contains(CLONE_CAPABILITY_PROBE_DIR_PREFIX)),
+            "capability probe directory must be removed: {:?}",
+            after.keys().collect::<Vec<_>>()
         );
     }
 
@@ -527,6 +595,23 @@ mod tests {
         }
     }
 
+    fn inventory_temp_probe_names() -> BTreeMap<String, u64> {
+        let mut names = BTreeMap::new();
+        let Ok(read_dir) = std::fs::read_dir(std::env::temp_dir()) else {
+            return names;
+        };
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().replace('\\', "/");
+            if name.contains("codestory-inventory-clone-probe")
+                || name.contains("codestory-inventory-cow-probe")
+            {
+                let len = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                names.insert(name, len);
+            }
+        }
+        names
+    }
+
     #[test]
     fn hardlink_deduplication_is_reported() {
         let cache = tempdir().expect("cache root");
@@ -542,6 +627,101 @@ mod tests {
             report.hardlink_deduplicated_bytes >= 8,
             "hardlink dedup should be reported: {:?}",
             report.hardlink_groups
+        );
+        assert_eq!(
+            report.clone_shared_bytes, report.hardlink_deduplicated_bytes,
+            "shared bytes must come from identity groups, not CoW capability probes"
+        );
+        assert!(
+            report
+                .clone_sharing
+                .iter()
+                .all(|entry| entry.apparent_bytes == 0),
+            "capability entries must not inflate shared bytes: {:?}",
+            report.clone_sharing
+        );
+    }
+
+    #[test]
+    fn blocked_bytes_rolls_up_retained_workspace_directory() {
+        let cache = tempdir().expect("cache root");
+        let worktree = tempdir().expect("live worktree");
+        let workspace_id = "00112233445566aa";
+        let project_cache = cache.path().join(workspace_id);
+        std::fs::create_dir_all(&project_cache).expect("create project cache");
+        let payload = b"retained-workspace-payload-bytes";
+        std::fs::write(project_cache.join("codestory.db"), payload).expect("write database");
+        std::fs::write(project_cache.join("extra.bin"), b"extra-bytes").expect("write extra");
+
+        let marker = GenerationRetentionMarker::next(
+            workspace_id,
+            worktree.path(),
+            RetrievalIndexManifest {
+                project_id: "repo-v1-project".into(),
+                lexical_version: "v1".into(),
+                semantic_generation: "codestory_repo-v1-project_aaaaaaaaaaaaaaaa".into(),
+                scip_revision: Some("graph-aaaaaaaaaaaaaaaa".into()),
+                built_at_epoch_ms: 1,
+                disk_bytes: None,
+                degraded_modes_json: "[]".into(),
+                embedding_backend: Some(crate::embeddings::PRODUCT_EMBEDDING_RUNTIME_ID.into()),
+                embedding_dim: Some(768),
+                sidecar_schema_version: Some(2),
+                sidecar_input_hash: Some("aaaaaaaaaaaaaaaa".repeat(1)),
+                sidecar_generation: Some("repo-v1-project-aaaaaaaaaaaaaaaa".into()),
+                projection_count: Some(1),
+                symbol_doc_count: Some(1),
+                dense_projection_count: Some(1),
+                semantic_policy_version: Some(crate::generation::SEMANTIC_POLICY_VERSION.into()),
+                graph_artifact_hash: Some("graph".into()),
+                dense_reason_counts_json: Some("{}".into()),
+                precise_semantic_import_status: None,
+                precise_semantic_import_reason: None,
+                precise_semantic_import_revision: None,
+                precise_semantic_import_producer: None,
+            },
+            None,
+            1,
+        )
+        .expect("registration marker");
+        write_retention_marker(&cache.path().join(RETRIEVAL_STATE_FILE), &marker)
+            .expect("write marker");
+
+        let before_temp = inventory_temp_probe_names();
+        let report = with_test_cache_root(cache.path(), cache_inventory).expect("inventory");
+        let after_temp = inventory_temp_probe_names();
+
+        assert_eq!(
+            before_temp, after_temp,
+            "inventory must not leave CoW probes in system temp"
+        );
+        assert!(
+            report
+                .clean_plan
+                .retained
+                .iter()
+                .any(|retained| retained.relative_path == workspace_id),
+            "live workspace directory should be retained: {:?}",
+            report.clean_plan.retained
+        );
+        let expected_blocked = payload.len() as u64 + b"extra-bytes".len() as u64;
+        assert!(
+            report.blocked_bytes >= expected_blocked,
+            "blocked_bytes should roll up files under retained directory; got {} want >= {expected_blocked}; entries={:?}",
+            report.blocked_bytes,
+            report.entries
+        );
+        assert_eq!(
+            path_is_under_retained("00112233445566aa/codestory.db", "00112233445566aa"),
+            true
+        );
+        assert_eq!(
+            path_is_under_retained("00112233445566aa", "00112233445566aa"),
+            true
+        );
+        assert_eq!(
+            path_is_under_retained("00112233445566ab/codestory.db", "00112233445566aa"),
+            false
         );
     }
 }
