@@ -294,7 +294,20 @@ pub(crate) fn clone_file_copy_on_write(
         fs::create_dir_all(parent)
             .map_err(|error| core_path_error("create clone parent", parent, error))?;
     }
-    clone_file_copy_on_write_platform(source, destination)
+    let cloned = clone_file_copy_on_write_platform(source, destination)?;
+    if cloned {
+        return Ok(true);
+    }
+    // Production stays fail-closed without CoW. Store unit tests still need to
+    // exercise publication atomicity on filesystems (ext4 CI) that cannot reflink.
+    #[cfg(test)]
+    {
+        fs::copy(source, destination)
+            .map_err(|error| core_path_error("test-only full copy stage", destination, error))?;
+        return Ok(true);
+    }
+    #[cfg(not(test))]
+    Ok(false)
 }
 
 pub(crate) fn make_file_owner_writable(path: &Path) -> Result<(), StorageError> {

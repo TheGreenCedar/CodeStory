@@ -1604,8 +1604,7 @@ pub(super) mod tests {
     fn atom_session_needing(
         needed: &[i64],
     ) -> std::rc::Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements =
-            Vec::new();
+        let requirements = Vec::new();
         let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
         ));
@@ -1861,8 +1860,7 @@ pub(super) mod tests {
         answer.graphs = vec![artifact];
         let baseline = protected_graph_edge_ids_for_budget(&answer, &[]);
 
-        let legacy_requirements =
-            Vec::new();
+        let legacy_requirements = Vec::new();
         let session = std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements),
         ));

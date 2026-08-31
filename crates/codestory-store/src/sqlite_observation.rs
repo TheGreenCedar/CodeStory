@@ -80,7 +80,9 @@ fn pragma_u64(connection: &Connection, name: &str) -> Result<u64, StorageError> 
         .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
         .map_err(StorageError::from)?;
     u64::try_from(value).map_err(|_| {
-        promotion_error(format!("SQLite reported an invalid negative {name}: {value}"))
+        promotion_error(format!(
+            "SQLite reported an invalid negative {name}: {value}"
+        ))
     })
 }
 
@@ -284,7 +286,10 @@ fn available_filesystem_bytes_platform(_path: &Path) -> Result<u64, StorageError
 }
 
 /// Seal `source`, preflight space, and write a standalone compact database at `destination`.
-pub fn vacuum_into_database(source: &Path, destination: &Path) -> Result<SqliteVacuumIntoStats, StorageError> {
+pub fn vacuum_into_database(
+    source: &Path,
+    destination: &Path,
+) -> Result<SqliteVacuumIntoStats, StorageError> {
     if destination.exists() {
         return Err(promotion_error(format!(
             "compact destination already exists: {}",
@@ -303,11 +308,8 @@ pub fn vacuum_into_database(source: &Path, destination: &Path) -> Result<SqliteV
     let stage_upper = database_upper_bound(source)?;
     let candidate_upper = source_observation.logical_bytes;
     let peak_space_required_bytes = compact_rehydrate_space_required(stage_upper, candidate_upper);
-    let available_bytes = available_filesystem_bytes(
-        destination
-            .parent()
-            .unwrap_or_else(|| Path::new(".")),
-    )?;
+    let available_bytes =
+        available_filesystem_bytes(destination.parent().unwrap_or_else(|| Path::new(".")))?;
     if available_bytes < peak_space_required_bytes {
         return Err(promotion_error(format!(
             "insufficient space for compact rehydrate: need at least {peak_space_required_bytes} bytes, available {available_bytes} bytes"
@@ -315,13 +317,8 @@ pub fn vacuum_into_database(source: &Path, destination: &Path) -> Result<SqliteV
     }
     seal_database_for_vacuum(source)?;
     let connection = Connection::open(source).map_err(StorageError::from)?;
-    let sql = format!(
-        "VACUUM INTO '{}'",
-        escape_sqlite_path(destination)
-    );
-    connection
-        .execute_batch(&sql)
-        .map_err(StorageError::from)?;
+    let sql = format!("VACUUM INTO '{}'", escape_sqlite_path(destination));
+    connection.execute_batch(&sql).map_err(StorageError::from)?;
     drop(connection);
     let mut stats = validate_compact_candidate(&source_observation, destination)?;
     stats.peak_space_required_bytes = peak_space_required_bytes;
@@ -379,7 +376,9 @@ mod tests {
         create_database(&source, 8);
         let stats = vacuum_into_database(&source, &destination).expect("vacuum into");
         assert_eq!(stats.candidate_freelist_count, 0);
-        assert!(stats.candidate_file_bytes <= compact_candidate_size_limit(stats.source_logical_bytes));
+        assert!(
+            stats.candidate_file_bytes <= compact_candidate_size_limit(stats.source_logical_bytes)
+        );
         assert!(destination.is_file());
     }
 

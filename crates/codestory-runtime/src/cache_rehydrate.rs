@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail};
-use codestory_store::{CURRENT_SCHEMA_VERSION, RehydratedCacheRebaseStats, Store, vacuum_into_database};
+use codestory_store::{
+    CURRENT_SCHEMA_VERSION, RehydratedCacheRebaseStats, Store, vacuum_into_database,
+};
 use codestory_workspace::{
     RefreshInputs, SourceIndexPolicy, WorkspaceInventory, WorkspaceInventoryOutcome,
     WorkspaceManifest,

@@ -57,12 +57,8 @@ fn domain_nouns_do_not_create_fixed_flow_obligations() {
     for noun in nouns {
         let question = domain_noun_prompt(noun);
         let _terms = packet_probe_terms(&question);
-        let plan = build_packet_plan_with_extra(
-            &question,
-            None,
-            PacketBudgetModeDto::Standard,
-            &[],
-        );
+        let plan =
+            build_packet_plan_with_extra(&question, None, PacketBudgetModeDto::Standard, &[]);
         let obligations = build_packet_obligation_plan(&question, plan.task_class, &plan.queries);
         let taxonomy_shaped = obligations.claim_obligations.iter().any(|obligation| {
             let id = obligation.id.to_ascii_lowercase();
@@ -88,8 +84,7 @@ fn domain_nouns_do_not_create_fixed_flow_obligations() {
     let contaminated = "Explain how the client cache formatter mapper request animation works";
     let terms = packet_probe_terms(contaminated);
     assert!(packet_terms_have(&terms, "client"));
-    let plan =
-        build_packet_plan_with_extra(contaminated, None, PacketBudgetModeDto::Standard, &[]);
+    let plan = build_packet_plan_with_extra(contaminated, None, PacketBudgetModeDto::Standard, &[]);
     let obligations = build_packet_obligation_plan(contaminated, plan.task_class, &plan.queries);
     assert!(
         obligations.claim_obligations.iter().all(|obligation| {
@@ -111,7 +106,11 @@ fn prompt_vocabulary_cannot_invoke_deleted_cleanup_passes() {
     let markdown = citation("README", "README.md", NodeKind::FILE);
     let code = citation("format", "src/format.rs", NodeKind::METHOD);
     let rows = vec![markdown, code];
-    assert_eq!(rows.len(), 2, "retrieved evidence must remain intact without cleanup APIs");
+    assert_eq!(
+        rows.len(),
+        2,
+        "retrieved evidence must remain intact without cleanup APIs"
+    );
 }
 
 #[test]

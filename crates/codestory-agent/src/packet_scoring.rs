@@ -186,7 +186,6 @@ pub fn packet_citation_rank(
             score -= 16.0;
         }
     }
-    
 
     score
 }
@@ -583,4 +582,3 @@ fn path_after_named_repo_root(normalized: &str) -> Option<String> {
     }
     best_match.map(|(_, path)| path)
 }
-

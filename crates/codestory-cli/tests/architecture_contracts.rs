@@ -882,7 +882,8 @@ fn public_exact_verifier_uses_the_revision_native_transport_once() {
 
     let args = read("crates/codestory-cli/src/args.rs");
     assert_eq!(
-        args.matches("VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand)").count(),
+        args.matches("VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand)")
+            .count(),
         1,
         "the public CLI verifier command must be registered exactly once"
     );
@@ -1246,7 +1247,8 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
 fn public_call_path_release_surfaces_are_unique_and_legacy_unreachable() {
     let args = read("crates/codestory-cli/src/args.rs");
     assert_eq!(
-        args.matches("VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand)").count(),
+        args.matches("VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand)")
+            .count(),
         1
     );
 

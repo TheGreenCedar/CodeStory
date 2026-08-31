@@ -80,11 +80,9 @@ use crate::agent::packet_scoring::{
     packet_sql_schema_file_is_variant_copy, packet_stage_citation_carry_limit,
     sort_by_cached_rank_desc,
 };
-use crate::agent::packet_terms::{packet_probe_terms, prompt_search_terms};
 #[cfg(test)]
-use crate::agent::packet_terms::{
-    packet_terms_have_any,
-};
+use crate::agent::packet_terms::packet_terms_have_any;
+use crate::agent::packet_terms::{packet_probe_terms, prompt_search_terms};
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
@@ -103,14 +101,13 @@ use crate::{
 #[cfg(test)]
 use codestory_agent::packet_command::quote_packet_command_value;
 use codestory_agent::packet_flow_requirements::FlowRequirement;
-use codestory_agent::repository_evidence_plan::{
-    build_repository_evidence_plan, RepositoryEvidenceInput,
-    DEFAULT_REPOSITORY_EVIDENCE_LIMITS,
-};
 use codestory_agent::packet_proof_atoms::{
     DischargedFact, FlowProofFormula, FlowProofOutcome, ProofAtomId, ProofEndpointPattern,
     ProofFactPattern, SourceAspectKind, TrailCoverage, TrailDirection as ProofTrailDirection,
     VerifiedSourceAspectReceipt, match_flow_requirements,
+};
+use codestory_agent::repository_evidence_plan::{
+    DEFAULT_REPOSITORY_EVIDENCE_LIMITS, RepositoryEvidenceInput, build_repository_evidence_plan,
 };
 use codestory_agent::text::symbol_query_tokens;
 use codestory_contracts::api::{
@@ -464,8 +461,7 @@ pub(crate) fn agent_packet(
     // proof-evidence extras builder reads. Task classes without
     // formula-bearing requirements derive an empty hydration spec, so their
     // retrieval behavior is unchanged.
-    let flow_requirements =
-        Vec::new();
+    let flow_requirements = Vec::new();
     let proof_session = std::rc::Rc::new(PacketProofSession::new(packet_atom_hydration_spec(
         &flow_requirements,
     )));
@@ -8932,10 +8928,7 @@ mod tests {
             vec![distractor, sqlite, mysql, postgres],
         );
 
-        promote_required_probe_citations(
-            &mut answer,
-            &["db/schema_sqlite.sql".to_string()],
-        );
+        promote_required_probe_citations(&mut answer, &["db/schema_sqlite.sql".to_string()]);
 
         assert_eq!(
             answer.citations[0].file_path.as_deref(),
@@ -15939,8 +15932,7 @@ mod tests {
     fn css_structure_partial_proof_protects_narrowed_scan_coverage_sets() {
         use crate::agent::packet_candidate::{PacketCandidateTrailScan, PacketGraphDirection};
 
-        let css_requirements =
-            Vec::new();
+        let css_requirements = Vec::new();
         let formulas = packet_flow_proof_formulas(&css_requirements);
         assert!(
             !formulas.is_empty(),
@@ -16276,8 +16268,7 @@ mod tests {
     /// without a declaration line are skipped (fail closed).
     #[test]
     fn planned_anchor_candidates_cover_only_atom_named_carriers() {
-        let css_requirements =
-            Vec::new();
+        let css_requirements = Vec::new();
         let formulas = packet_flow_proof_formulas(&css_requirements);
         assert!(
             !formulas.is_empty(),

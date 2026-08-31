@@ -126,8 +126,13 @@ pub fn build_repository_evidence_plan(
                 truncated = true;
                 break;
             }
-            match shortest_path(start, end, &adjacency, limits.max_depth, limits.max_candidate_nodes)
-            {
+            match shortest_path(
+                start,
+                end,
+                &adjacency,
+                limits.max_depth,
+                limits.max_candidate_nodes,
+            ) {
                 Some(path) => {
                     path_count += 1;
                     for node in &path.nodes {
@@ -163,7 +168,9 @@ pub fn build_repository_evidence_plan(
         if !is_implementation_kind(edge.kind, input.task_class) {
             continue;
         }
-        let touches_seed = seed_nodes.iter().any(|n| n == &edge.source || n == &edge.target);
+        let touches_seed = seed_nodes
+            .iter()
+            .any(|n| n == &edge.source || n == &edge.target);
         if !touches_seed {
             continue;
         }
@@ -303,21 +310,17 @@ fn build_adjacency(
         if !preferred.contains(&edge.kind) {
             continue;
         }
-        adj.entry(edge.source.clone())
-            .or_default()
-            .push(AdjEdge {
-                to: edge.target.clone(),
-                edge_id: edge.id.clone(),
-            });
+        adj.entry(edge.source.clone()).or_default().push(AdjEdge {
+            to: edge.target.clone(),
+            edge_id: edge.id.clone(),
+        });
         // Undirected expansion for ownership/impact unless strictly ordered CALL
         // route tracing, which still benefits from reverse edges when searching
         // paths between anchors.
-        adj.entry(edge.target.clone())
-            .or_default()
-            .push(AdjEdge {
-                to: edge.source.clone(),
-                edge_id: edge.id.clone(),
-            });
+        adj.entry(edge.target.clone()).or_default().push(AdjEdge {
+            to: edge.source.clone(),
+            edge_id: edge.id.clone(),
+        });
     }
     let _ = inbound_preferred; // direction ranking reserved for future scoring
     adj
@@ -509,11 +512,9 @@ mod tests {
                 .all(|o| o.kind == RepositoryEvidenceObjectiveKind::ResolvedAnchor)
         );
         assert!(plan.material_edge_ids.is_empty());
-        assert!(
-            plan.uncovered.iter().any(|g| matches!(
-                g.kind,
-                RepositoryEvidenceGapKind::MissingRelation | RepositoryEvidenceGapKind::Unknown
-            ))
-        );
+        assert!(plan.uncovered.iter().any(|g| matches!(
+            g.kind,
+            RepositoryEvidenceGapKind::MissingRelation | RepositoryEvidenceGapKind::Unknown
+        )));
     }
 }

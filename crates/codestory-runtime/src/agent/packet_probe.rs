@@ -228,10 +228,7 @@ fn exact_path_probe_source_carrier_citation(
             citation.coverage_role = None;
             // Domain role_rank removed (CX-01). Prefer callable term hits only.
             let role = packet_evidence_role(&citation);
-            if matches!(
-                role,
-                Some(PacketEvidenceRole::TestsAndRegressionCoverage)
-            ) {
+            if matches!(role, Some(PacketEvidenceRole::TestsAndRegressionCoverage)) {
                 return None;
             }
             citation.coverage_role = Some("source evidence".to_string());

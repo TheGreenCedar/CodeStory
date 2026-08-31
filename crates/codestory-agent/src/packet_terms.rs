@@ -148,7 +148,14 @@ mod tests {
         let terms = packet_probe_terms(
             "Explain how the client cache formatter mapper request animation works.",
         );
-        for expected in ["client", "cache", "formatter", "mapper", "request", "animation"] {
+        for expected in [
+            "client",
+            "cache",
+            "formatter",
+            "mapper",
+            "request",
+            "animation",
+        ] {
             assert!(
                 terms.iter().any(|term| term == expected),
                 "expected {expected:?} in {terms:?}"

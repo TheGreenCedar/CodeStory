@@ -5,7 +5,7 @@ use super::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use super::packet_flow_requirements::{
     CoverageMode, EvidencePredicate, FlowRequirement, FlowRole,
     flow_requirement_call_receipt_is_valid, ordinary_incident_call_receipt_is_valid,
-    };
+};
 use super::packet_proof_atoms::{
     DischargedFact, FlowProofFormula, FlowProofOutcome, PacketProofEvidence, TrailCoverage,
     VerifiedFlowProof, VerifiedSourceAspectReceipt, VerifiedTypedRelationReceipt,
@@ -68,8 +68,7 @@ pub fn build_packet_obligation_plan(
 ) -> PacketObligationPlanDto {
     let terms = packet_probe_terms(question);
     let requirements = Vec::new();
-    let contextual_queries =
-        Vec::<(&'static str, String)>::new();
+    let contextual_queries = Vec::<(&'static str, String)>::new();
     let requires_complete_discovery =
         packet_question_requires_complete_discovery(question, task_class);
     let exact_symbol_queries =
@@ -948,8 +947,7 @@ pub fn reconcile_packet_proof_obligations_after_compile(
     compiled_support: &[SupportUnitDto],
     extras: &PacketProofEvidenceExtras,
 ) -> bool {
-    let requirements =
-        HashMap::<&str, FlowRequirement>::new();
+    let requirements = HashMap::<&str, FlowRequirement>::new();
     if requirements.is_empty() {
         return false;
     }

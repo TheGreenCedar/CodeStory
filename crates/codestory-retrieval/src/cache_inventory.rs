@@ -197,12 +197,13 @@ impl InventoryState {
         metadata: std::fs::Metadata,
     ) -> Result<()> {
         let identity = native_file_identity(&metadata)?;
-        let record = self.file_identities.entry(identity.clone()).or_insert_with(|| {
-            FileIdentityRecord {
+        let record = self
+            .file_identities
+            .entry(identity.clone())
+            .or_insert_with(|| FileIdentityRecord {
                 apparent_bytes,
                 link_count: 0,
-            }
-        });
+            });
         record.link_count = record.link_count.saturating_add(1);
         let group = self
             .hardlink_groups
@@ -258,7 +259,11 @@ impl InventoryState {
             .hardlink_groups
             .values()
             .filter(|group| group.link_count > 1)
-            .map(|group| group.apparent_bytes.saturating_mul(group.link_count.saturating_sub(1)))
+            .map(|group| {
+                group
+                    .apparent_bytes
+                    .saturating_mul(group.link_count.saturating_sub(1))
+            })
             .sum();
         let clone_shared_bytes = self
             .clone_sharing
@@ -363,7 +368,10 @@ impl InventoryState {
     }
 }
 
-fn filter_kind(entries: &[CacheInventoryEntry], kind: CacheInventoryKind) -> Vec<CacheInventoryEntry> {
+fn filter_kind(
+    entries: &[CacheInventoryEntry],
+    kind: CacheInventoryKind,
+) -> Vec<CacheInventoryEntry> {
     entries
         .iter()
         .filter(|entry| entry.kind == kind)
@@ -385,7 +393,10 @@ fn relative_path(root: &Path, path: &Path) -> Result<String> {
 
 fn classify_entry(relative: &str, path: &Path) -> CacheInventoryKind {
     let components: Vec<_> = relative.split('/').collect();
-    if components.iter().any(|component| component.contains("quarantine")) {
+    if components
+        .iter()
+        .any(|component| component.contains("quarantine"))
+    {
         return CacheInventoryKind::Quarantine;
     }
     if relative.contains(EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE) {

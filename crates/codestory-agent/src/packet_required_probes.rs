@@ -1,6 +1,6 @@
-use crate::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 #[cfg(any(test, feature = "test-support"))]
 use crate::eval_probes::{eval_probes_enabled, push_prompt_concept_derived_symbol_probes};
+use crate::packet_evidence_roles::{PacketEvidenceRole, packet_evidence_role};
 use crate::packet_scoring::{
     normalize_identifier, packet_display_path, packet_file_stem_matches_query,
     packet_query_stop_term,
@@ -552,10 +552,6 @@ fn packet_required_probe_file_query(query: &str) -> Option<String> {
     None
 }
 
-
-
-
-
 pub fn packet_probe_query_is_cited(query: &str, answer: &AgentAnswerDto) -> bool {
     answer
         .citations
@@ -729,13 +725,10 @@ fn packet_citation_matches_required_coverage_role(
     normalize_identifier(coverage_role) == normalize_identifier(query)
 }
 
-fn packet_citation_matches_sql_table_identity(
-    query: &str,
-    citation: &AgentCitationDto,
-) -> bool {
+fn packet_citation_matches_sql_table_identity(query: &str, citation: &AgentCitationDto) -> bool {
     // Only explicit SQL table probe forms — never treat arbitrary tokens as tables.
-    let Some(query_table) = packet_create_table_probe_table(query)
-        .or_else(|| packet_public_catalog_probe_table(query))
+    let Some(query_table) =
+        packet_create_table_probe_table(query).or_else(|| packet_public_catalog_probe_table(query))
     else {
         return false;
     };
@@ -744,7 +737,6 @@ fn packet_citation_matches_sql_table_identity(
         .or_else(|| packet_sql_table_identity(&citation.display_name));
     citation_table.is_some_and(|table| table == query_table)
 }
-
 
 fn packet_public_catalog_probe_table(query: &str) -> Option<String> {
     let trimmed = query.trim();

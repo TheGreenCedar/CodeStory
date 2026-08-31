@@ -221,8 +221,7 @@ pub fn publish_zero_dense_pinned_query_fixture(
             )?;
         (storage, publication)
     } else {
-        let mut storage =
-            Store::open(storage_path).context("open pinned query fixture storage")?;
+        let mut storage = Store::open(storage_path).context("open pinned query fixture storage")?;
         let publication = storage
             .get_complete_index_publication()
             .context("load pinned query fixture publication")?

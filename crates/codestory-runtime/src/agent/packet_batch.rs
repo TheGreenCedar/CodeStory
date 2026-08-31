@@ -783,7 +783,9 @@ fn reserve_architecture_main_anchor_probe(
 ) {
     // Holdout probe spelling removed; reserve main only for architecture tasks with
     // an explicit "main" required probe or query term.
-    let wants_main = required_probes.iter().any(|q| normalize_identifier(q) == "main")
+    let wants_main = required_probes
+        .iter()
+        .any(|q| normalize_identifier(q) == "main")
         || plan
             .queries
             .iter()

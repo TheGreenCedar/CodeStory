@@ -58,7 +58,6 @@ pub fn packet_supported_claims_with_telemetry(
     let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
     let citations = answer.citations.clone();
 
-    
     let before_role_claims = claims.len();
     append_ranked_citation_claims(
         &answer.prompt,
@@ -220,7 +219,6 @@ pub fn packet_claim_for_role(
         }
     }
 }
-
 
 fn packet_source_evidence_flow_sentence(prompt: &str, focus: &str) -> String {
     #[cfg(any(test, feature = "test-support"))]

@@ -245,12 +245,10 @@ fn truncated_and_partial_graphs_report_gaps_not_absence() {
         },
         DEFAULT_REPOSITORY_EVIDENCE_LIMITS,
     );
-    assert!(
-        plan.uncovered.iter().any(|g| matches!(
-            g.kind,
-            RepositoryEvidenceGapKind::MissingRelation | RepositoryEvidenceGapKind::Unknown
-        ))
-    );
+    assert!(plan.uncovered.iter().any(|g| matches!(
+        g.kind,
+        RepositoryEvidenceGapKind::MissingRelation | RepositoryEvidenceGapKind::Unknown
+    )));
 
     let tight = RepositoryEvidenceLimits {
         max_seed_nodes: 2,
@@ -327,7 +325,9 @@ fn seed_plan_paraphrase_keeps_explicit_path_anchors() {
     for question in questions {
         let plan = build_packet_plan_with_extra(question, None, PacketBudgetModeDto::Standard, &[]);
         assert!(
-            plan.queries.iter().any(|q| q.query.contains("src/alpha.rs")),
+            plan.queries
+                .iter()
+                .any(|q| q.query.contains("src/alpha.rs")),
             "missing path seed for {question}: {:?}",
             plan.queries
         );

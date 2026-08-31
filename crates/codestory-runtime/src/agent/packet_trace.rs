@@ -1468,8 +1468,7 @@ mod golden_tests {
                 PacketTaskClassDto::ArchitectureExplanation,
             ),
         ] {
-            let requirements =
-                Vec::new();
+            let requirements = Vec::new();
             let session =
                 std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
                     crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),

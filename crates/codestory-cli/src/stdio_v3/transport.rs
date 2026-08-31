@@ -90,10 +90,9 @@ pub(crate) fn build_proof_tool_result_v3(
     let tool_name = crate::prove_call_path::PUBLIC_VERIFY_TOOL_NAME;
     codestory_runtime::proof_qualification_support::validate_compact_projection(internal_root)
         .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
-    let public_root = crate::prove_call_path::project_public_verification_result(
-        internal_root.clone(),
-    )
-    .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
+    let public_root =
+        crate::prove_call_path::project_public_verification_result(internal_root.clone())
+            .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
     if crate::stdio_arguments::validate_structured_content(
         &super::catalog::proof_output_schema_v3(),
         &public_root,
@@ -115,10 +114,9 @@ pub(crate) fn build_proof_tool_result_v3(
     }
 
     let fallback_internal = proof_budget_fallback_v3(internal_root, bytes.len())?;
-    let fallback_public = crate::prove_call_path::project_public_verification_result(
-        fallback_internal,
-    )
-    .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
+    let fallback_public =
+        crate::prove_call_path::project_public_verification_result(fallback_internal)
+            .map_err(|_| StdioV3InternalError::InvalidProjection(tool_name.to_owned()))?;
     if crate::stdio_arguments::validate_structured_content(
         &super::catalog::proof_output_schema_v3(),
         &fallback_public,

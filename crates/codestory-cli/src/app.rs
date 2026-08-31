@@ -202,7 +202,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Report(cmd) => report::run_report(cmd),
         Command::Context(cmd) => agent_context::run_context(cmd),
         Command::Packet(cmd) => agent_context::run_packet(cmd),
-        Command::VerifyIndexedDirectCalls(cmd) => prove_call_path::run_verify_indexed_direct_calls(cmd),
+        Command::VerifyIndexedDirectCalls(cmd) => {
+            prove_call_path::run_verify_indexed_direct_calls(cmd)
+        }
         Command::Task(cmd) => agent_context::run_task(cmd),
         Command::Doctor(cmd) => readiness_commands::run_doctor(cmd),
         Command::Ready(cmd) => readiness_commands::run_ready(cmd),

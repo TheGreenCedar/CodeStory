@@ -6915,8 +6915,7 @@ mod tests {
     /// from the css question exactly as the orchestrator derives it — the
     /// rev 5.3 need-gate matches hydrated edges against these patterns.
     fn file_structural_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements =
-            Vec::new();
+        let requirements = Vec::new();
         let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements);
         assert!(
             !spec.promotion_patterns.is_empty(),
@@ -7602,8 +7601,7 @@ mod tests {
         )
         .expect("resolve without session");
 
-        let legacy_requirements =
-            Vec::new();
+        let legacy_requirements = Vec::new();
         let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements);
         assert!(
             spec.promotion_patterns.is_empty(),
@@ -7758,8 +7756,7 @@ mod tests {
         )
         .expect("resolve without session");
 
-        let m_requirements =
-            Vec::new();
+        let m_requirements = Vec::new();
         let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&m_requirements);
         // Rev 5.4: the M formula names only CALL — no cross-container kind —
         // so it derives ZERO promotion patterns and admission is
@@ -7961,8 +7958,7 @@ mod tests {
             ])
             .expect("insert edges");
 
-        let requirements =
-            Vec::new();
+        let requirements = Vec::new();
         let session = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
         ));
@@ -8054,8 +8050,7 @@ mod tests {
     #[test]
     fn r6_session_trace_records_need_set_provenance_and_admission_decisions() {
         let storage = css_bootstrap_storage();
-        let requirements =
-            Vec::new();
+        let requirements = Vec::new();
         let session = Rc::new(
             crate::agent::packet_candidate::PacketProofSession::new(
                 crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
@@ -8183,8 +8178,7 @@ mod tests {
              the single-query path's semantics"
         );
 
-        let legacy_requirements =
-            Vec::new();
+        let legacy_requirements = Vec::new();
         let legacy = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements),
         ));
@@ -8216,8 +8210,7 @@ mod tests {
     /// A C-family session with the R6 trace armed, so the per-query
     /// promotion SLOT accounting is observable in assertions.
     fn traced_file_structural_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements =
-            Vec::new();
+        let requirements = Vec::new();
         Rc::new(
             crate::agent::packet_candidate::PacketProofSession::new(
                 crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
@@ -8592,8 +8585,7 @@ mod tests {
             )
             .expect("insert edges");
 
-        let requirements =
-            Vec::new();
+        let requirements = Vec::new();
         let session = Rc::new(
             crate::agent::packet_candidate::PacketProofSession::new(
                 crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
@@ -8753,8 +8745,7 @@ mod tests {
     }
 
     fn mapper_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements =
-            Vec::new();
+        let requirements = Vec::new();
         Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
             crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
         ))

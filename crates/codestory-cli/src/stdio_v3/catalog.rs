@@ -41,7 +41,10 @@ fn proof_common_fields_v3(kind: &str) -> Vec<(&str, Value)> {
             "graph_disposition",
             enum_schema_v3(&["proven", "refuted", "unknown"]),
         ),
-        ("runtime_execution_proven", json!({"type":"boolean","enum":[false]})),
+        (
+            "runtime_execution_proven",
+            json!({"type":"boolean","enum":[false]}),
+        ),
         ("guard_version", enum_schema_v3(&["clause_guard_v1"])),
         ("source_text_sha256", sha256_schema_v3()),
         ("contract_digest", sha256_schema_v3()),
@@ -1179,7 +1182,8 @@ mod tests {
                     Some(&json!(true))
                 );
                 assert_eq!(
-                    tool(&tools, "verify_indexed_direct_calls").pointer("/annotations/readOnlyHint"),
+                    tool(&tools, "verify_indexed_direct_calls")
+                        .pointer("/annotations/readOnlyHint"),
                     Some(&json!(true))
                 );
                 for activation_capable in ["packet", "search", "ground", "context"] {
