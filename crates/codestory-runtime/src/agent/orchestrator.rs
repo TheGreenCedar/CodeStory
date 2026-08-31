@@ -4139,7 +4139,7 @@ fn carrier_source_identity(display_name: &str, anchor_line: Option<u32>, end_lin
             .nth(1)
     {
         return format!(
-            "implementation context for enclosing {owner} type that owns {display_name}"
+            "implementation context of enclosing {owner} type that owns {display_name}"
         );
     }
     display_name.to_owned()
@@ -9147,7 +9147,7 @@ mod tests {
         assert_eq!(source_identifier_words("Client"), ["client"]);
         assert_eq!(
             carrier_source_identity("DefaultSession.perform", Some(5), 4),
-            "implementation context for enclosing DefaultSession type that owns DefaultSession.perform"
+            "implementation context of enclosing DefaultSession type that owns DefaultSession.perform"
         );
         assert_eq!(
             carrier_source_identity("DefaultSession.perform", Some(5), 7),
