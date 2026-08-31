@@ -488,15 +488,15 @@ where
     pub fn reuse_sealed(&self, key: &K, artifacts: &[PathBuf]) -> Option<V> {
         let observed = ArtifactSeal::observe_all(artifacts).ok()?;
         let mut entries = self.locked_entries();
-        let Some(receipt) = entries.get_mut(key) else {
-            return None;
-        };
-        if receipt.seals != observed {
-            entries.remove(key);
-            return None;
+        {
+            let receipt = entries.get_mut(key)?;
+            if receipt.seals == observed {
+                receipt.stats.reuses = receipt.stats.reuses.saturating_add(1);
+                return Some(receipt.value.clone());
+            }
         }
-        receipt.stats.reuses = receipt.stats.reuses.saturating_add(1);
-        Some(receipt.value.clone())
+        entries.remove(key);
+        None
     }
 
     /// Transfer a deep-validation fact to paths just proven to be hard links

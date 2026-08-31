@@ -4,7 +4,7 @@ version = "0.17.5"
 edition = "2024"
 
 [features]
-test-support = []
+test-support = ["codestory-store/test-support"]
 # Measurement-only surface for the offline vector-backend bake-off. No product
 # binary enables this.
 benchmark-support = []

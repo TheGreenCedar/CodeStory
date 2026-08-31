@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
 use codestory_contracts::owned_artifacts::embedded_model_digest_root;
 use codestory_store::{
-    RetrievalIndexManifest, RetrievalIndexRollbackRecord, SourcePolicyExclusionPolicyIdentity,
-    Store,
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord, SnapshotStore,
+    SourcePolicyExclusionPolicyIdentity, Store,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -399,54 +399,60 @@ pub fn publish_replacement_core_and_zero_dense_fixture(
     generation_id: &str,
     run_id: &str,
 ) -> Result<RetrievalIndexManifest> {
-    let mut storage = Store::open(storage_path).context("open replacement core fixture storage")?;
-    let source_policy = storage
-        .get_source_policy_exclusion_manifest()
-        .context("load replacement core source policy manifest")?
-        .context("replacement core fixture requires a source policy manifest")?;
-    let source_policy_candidates = storage
-        .get_source_policy_exclusions()
-        .context("load replacement core source policy exclusions")?
-        .into_iter()
-        .map(
-            |record| codestory_workspace::OversizedSourceExclusionCandidate {
-                normalized_path: record.normalized_path,
-                content_hash: record.content_hash,
-                observed_size: record.observed_size,
-                observed_unit_count: record.observed_unit_count,
-                policy_version: record.policy_version,
-                byte_cap: record.byte_cap,
-                structural_unit_cap: record.structural_unit_cap,
-            },
-        )
-        .collect::<Vec<_>>();
-    let publication = codestory_store::IndexPublicationRecord {
-        generation,
-        generation_id: generation_id.into(),
-        run_id: run_id.into(),
-        mode: codestory_store::IndexPublicationMode::Full,
-        published_at_epoch_ms: 2,
-    };
-    storage
-        .publish_structural_text_unit_generation(&publication)
-        .context("publish replacement core structural text unit manifest")?;
-    storage
-        .publish_source_policy_exclusion_generation(
-            &publication,
-            &source_policy.project_id,
-            &source_policy.workspace_id,
-            SourcePolicyExclusionPolicyIdentity::new(
-                &source_policy.policy_version,
-                source_policy.byte_cap,
-                source_policy.structural_unit_cap,
-            ),
-            &source_policy_candidates,
-        )
-        .context("publish replacement core source policy manifest")?;
-    storage
-        .put_index_publication(&publication)
-        .context("publish replacement core fixture identity")?;
-    drop(storage);
+    let mut staged = SnapshotStore::clone_live_to_staged(storage_path)
+        .context("clone live core for replacement fixture")?;
+    {
+        let storage = staged.store_mut();
+        let source_policy = storage
+            .get_source_policy_exclusion_manifest()
+            .context("load replacement core source policy manifest")?
+            .context("replacement core fixture requires a source policy manifest")?;
+        let source_policy_candidates = storage
+            .get_source_policy_exclusions()
+            .context("load replacement core source policy exclusions")?
+            .into_iter()
+            .map(
+                |record| codestory_workspace::OversizedSourceExclusionCandidate {
+                    normalized_path: record.normalized_path,
+                    content_hash: record.content_hash,
+                    observed_size: record.observed_size,
+                    observed_unit_count: record.observed_unit_count,
+                    policy_version: record.policy_version,
+                    byte_cap: record.byte_cap,
+                    structural_unit_cap: record.structural_unit_cap,
+                },
+            )
+            .collect::<Vec<_>>();
+        let publication = codestory_store::IndexPublicationRecord {
+            generation,
+            generation_id: generation_id.into(),
+            run_id: run_id.into(),
+            mode: codestory_store::IndexPublicationMode::Full,
+            published_at_epoch_ms: 2,
+        };
+        storage
+            .publish_structural_text_unit_generation(&publication)
+            .context("publish replacement core structural text unit manifest")?;
+        storage
+            .publish_source_policy_exclusion_generation(
+                &publication,
+                &source_policy.project_id,
+                &source_policy.workspace_id,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    &source_policy.policy_version,
+                    source_policy.byte_cap,
+                    source_policy.structural_unit_cap,
+                ),
+                &source_policy_candidates,
+            )
+            .context("publish replacement core source policy manifest")?;
+        storage
+            .put_index_publication(&publication)
+            .context("publish replacement core fixture identity")?;
+    }
+    staged
+        .publish(storage_path)
+        .context("publish replacement core fixture")?;
     publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)
 }
 

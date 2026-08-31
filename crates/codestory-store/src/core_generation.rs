@@ -298,15 +298,15 @@ pub(crate) fn clone_file_copy_on_write(
     if cloned {
         return Ok(true);
     }
-    // Production stays fail-closed without CoW. Store unit tests still need to
-    // exercise publication atomicity on filesystems (ext4 CI) that cannot reflink.
-    #[cfg(test)]
+    // Production stays fail-closed without CoW. Tests still need to exercise
+    // publication atomicity on filesystems (ext4 CI) that cannot reflink.
+    #[cfg(any(test, feature = "test-support"))]
     {
         fs::copy(source, destination)
             .map_err(|error| core_path_error("test-only full copy stage", destination, error))?;
         return Ok(true);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     Ok(false)
 }
 
