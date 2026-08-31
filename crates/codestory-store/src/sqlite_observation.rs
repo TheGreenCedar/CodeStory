@@ -36,6 +36,15 @@ pub struct SqliteVacuumIntoStats {
     pub available_bytes: u64,
 }
 
+/// Peak free-space observation for compact rehydrate before any stage mutation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompactRehydratePeakSpace {
+    pub stage_upper_bytes: u64,
+    pub candidate_upper_bytes: u64,
+    pub peak_space_required_bytes: u64,
+    pub available_bytes: u64,
+}
+
 fn promotion_error(message: impl Into<String>) -> StorageError {
     StorageError::Other(message.into())
 }
@@ -123,6 +132,11 @@ pub fn compact_rehydrate_space_required(stage_upper_bytes: u64, candidate_upper_
     working.saturating_add(margin)
 }
 
+/// Remaining free-space requirement after the stage copy already occupies disk.
+pub fn compact_rehydrate_remaining_space_required(candidate_upper_bytes: u64) -> u64 {
+    compact_rehydrate_space_required(0, candidate_upper_bytes)
+}
+
 /// Maximum acceptable on-disk size for a compact rehydrate candidate.
 pub fn compact_candidate_size_limit(source_logical_bytes: u64) -> u64 {
     source_logical_bytes.saturating_add(ONE_MIB.max(source_logical_bytes / 20))
@@ -157,7 +171,8 @@ fn seal_database_for_vacuum(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn database_upper_bound(path: &Path) -> Result<u64, StorageError> {
+/// Upper bound of on-disk bytes for a database file plus live sidecars.
+pub fn database_upper_bound(path: &Path) -> Result<u64, StorageError> {
     let observation = observe_sqlite_database(path)?;
     Ok(observation
         .file_bytes
@@ -210,6 +225,10 @@ fn validate_compact_candidate(
 
 /// Available bytes on the filesystem hosting `path`.
 pub fn available_filesystem_bytes(path: &Path) -> Result<u64, StorageError> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(bytes) = test_available_filesystem_bytes_override() {
+        return Ok(bytes);
+    }
     available_filesystem_bytes_platform(path)
 }
 
@@ -285,7 +304,60 @@ fn available_filesystem_bytes_platform(_path: &Path) -> Result<u64, StorageError
     ))
 }
 
-/// Seal `source`, preflight space, and write a standalone compact database at `destination`.
+/// Observe peak stage+candidate space for compact rehydrate without mutating.
+pub fn measure_compact_rehydrate_peak_space(
+    source: &Path,
+    destination_parent: &Path,
+) -> Result<CompactRehydratePeakSpace, StorageError> {
+    let source_observation = observe_sqlite_database(source)?;
+    let stage_upper_bytes = database_upper_bound(source)?;
+    let candidate_upper_bytes = source_observation.logical_bytes;
+    let peak_space_required_bytes =
+        compact_rehydrate_space_required(stage_upper_bytes, candidate_upper_bytes);
+    let available_bytes = available_filesystem_bytes(destination_parent)?;
+    Ok(CompactRehydratePeakSpace {
+        stage_upper_bytes,
+        candidate_upper_bytes,
+        peak_space_required_bytes,
+        available_bytes,
+    })
+}
+
+/// Fail closed when peak stage+candidate space is unavailable, before mutation.
+pub fn ensure_compact_rehydrate_peak_space(
+    source: &Path,
+    destination_parent: &Path,
+) -> Result<CompactRehydratePeakSpace, StorageError> {
+    let measured = measure_compact_rehydrate_peak_space(source, destination_parent)?;
+    if measured.available_bytes < measured.peak_space_required_bytes {
+        return Err(insufficient_space_error(
+            measured.peak_space_required_bytes,
+            measured.available_bytes,
+        ));
+    }
+    Ok(measured)
+}
+
+fn insufficient_space_error(required: u64, available: u64) -> StorageError {
+    promotion_error(format!(
+        "insufficient space for compact rehydrate: need at least {required} bytes, available {available} bytes"
+    ))
+}
+
+/// True when `error` is the compact-rehydrate free-space preflight failure.
+pub fn is_insufficient_compact_rehydrate_space(error: &StorageError) -> bool {
+    match error {
+        StorageError::Other(message) => {
+            message.starts_with("insufficient space for compact rehydrate:")
+        }
+        _ => false,
+    }
+}
+
+/// Seal `source`, preflight remaining candidate space, and write a compact database.
+///
+/// The source/stage is assumed to already occupy disk. Remaining free-space
+/// accounting therefore covers only the compact candidate plus safety margin.
 pub fn vacuum_into_database(
     source: &Path,
     destination: &Path,
@@ -305,15 +377,15 @@ pub fn vacuum_into_database(
         })?;
     }
     let source_observation = observe_sqlite_database(source)?;
-    let stage_upper = database_upper_bound(source)?;
     let candidate_upper = source_observation.logical_bytes;
-    let peak_space_required_bytes = compact_rehydrate_space_required(stage_upper, candidate_upper);
+    let peak_space_required_bytes = compact_rehydrate_remaining_space_required(candidate_upper);
     let available_bytes =
         available_filesystem_bytes(destination.parent().unwrap_or_else(|| Path::new(".")))?;
     if available_bytes < peak_space_required_bytes {
-        return Err(promotion_error(format!(
-            "insufficient space for compact rehydrate: need at least {peak_space_required_bytes} bytes, available {available_bytes} bytes"
-        )));
+        return Err(insufficient_space_error(
+            peak_space_required_bytes,
+            available_bytes,
+        ));
     }
     seal_database_for_vacuum(source)?;
     let connection = Connection::open(source).map_err(StorageError::from)?;
@@ -325,6 +397,37 @@ pub fn vacuum_into_database(
     stats.available_bytes = available_bytes;
     Ok(stats)
 }
+
+#[cfg(any(test, feature = "test-support"))]
+mod available_override {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AVAILABLE_BYTES_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn test_available_filesystem_bytes_override() -> Option<u64> {
+        AVAILABLE_BYTES_OVERRIDE.with(Cell::get)
+    }
+
+    /// Force `available_filesystem_bytes` for the duration of `f`.
+    pub fn with_available_filesystem_bytes_override<R>(bytes: u64, f: impl FnOnce() -> R) -> R {
+        AVAILABLE_BYTES_OVERRIDE.with(|cell| {
+            let previous = cell.replace(Some(bytes));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            cell.set(previous);
+            match result {
+                Ok(value) => value,
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+use available_override::test_available_filesystem_bytes_override;
+#[cfg(any(test, feature = "test-support"))]
+pub use available_override::with_available_filesystem_bytes_override;
 
 #[cfg(test)]
 mod tests {
@@ -380,6 +483,10 @@ mod tests {
             stats.candidate_file_bytes <= compact_candidate_size_limit(stats.source_logical_bytes)
         );
         assert!(destination.is_file());
+        assert_eq!(
+            stats.peak_space_required_bytes,
+            compact_rehydrate_remaining_space_required(stats.source_logical_bytes)
+        );
     }
 
     #[test]
@@ -392,5 +499,52 @@ mod tests {
             compact_rehydrate_space_required(ONE_MIB, ONE_MIB),
             (2 * ONE_MIB) + COMPACT_SAFETY_FLOOR_BYTES
         );
+        assert_eq!(
+            compact_rehydrate_remaining_space_required(ONE_MIB),
+            ONE_MIB + COMPACT_SAFETY_FLOOR_BYTES
+        );
+    }
+
+    #[test]
+    fn ensure_compact_rehydrate_peak_space_rejects_before_destination_exists() {
+        let root = tempdir().expect("tempdir");
+        let source = root.path().join("source.sqlite3");
+        let destination_parent = root.path().join("dest");
+        fs::create_dir_all(&destination_parent).expect("create dest parent");
+        create_database(&source, 4);
+        let measured =
+            measure_compact_rehydrate_peak_space(&source, &destination_parent).expect("measure");
+        assert!(measured.peak_space_required_bytes >= measured.stage_upper_bytes);
+        let error = with_available_filesystem_bytes_override(0, || {
+            ensure_compact_rehydrate_peak_space(&source, &destination_parent)
+        })
+        .expect_err("insufficient space");
+        assert!(is_insufficient_compact_rehydrate_space(&error));
+        let entries: Vec<_> = fs::read_dir(&destination_parent)
+            .expect("read dest")
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "preflight must not create destination files"
+        );
+    }
+
+    #[test]
+    fn vacuum_into_remaining_space_does_not_require_stage_again() {
+        let root = tempdir().expect("tempdir");
+        let source = root.path().join("source.sqlite3");
+        let destination = root.path().join("compact.sqlite3");
+        create_database(&source, 8);
+        let stage_upper = database_upper_bound(&source).expect("stage upper");
+        let observation = observe_sqlite_database(&source).expect("observe");
+        let full_peak = compact_rehydrate_space_required(stage_upper, observation.logical_bytes);
+        let remaining = compact_rehydrate_remaining_space_required(observation.logical_bytes);
+        assert!(remaining < full_peak);
+        let stats = with_available_filesystem_bytes_override(remaining, || {
+            vacuum_into_database(&source, &destination)
+        })
+        .expect("vacuum with remaining-only budget");
+        assert_eq!(stats.peak_space_required_bytes, remaining);
+        assert!(destination.is_file());
     }
 }

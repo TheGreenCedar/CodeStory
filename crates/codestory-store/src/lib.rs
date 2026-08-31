@@ -38,10 +38,15 @@ pub use snapshot_store::{
     StagedSnapshotPublishStats,
 };
 pub use sqlite_observation::{
-    SqliteDatabaseObservation, SqliteVacuumIntoStats, available_filesystem_bytes,
-    compact_candidate_size_limit, compact_rehydrate_space_required, observe_sqlite_database,
-    vacuum_into_database,
+    CompactRehydratePeakSpace, SqliteDatabaseObservation, SqliteVacuumIntoStats,
+    available_filesystem_bytes, compact_candidate_size_limit,
+    compact_rehydrate_remaining_space_required, compact_rehydrate_space_required,
+    database_upper_bound, ensure_compact_rehydrate_peak_space,
+    is_insufficient_compact_rehydrate_space, measure_compact_rehydrate_peak_space,
+    observe_sqlite_database, vacuum_into_database,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use sqlite_observation::with_available_filesystem_bytes_override;
 pub use storage_impl::{
     BUILD_EDGE_SEED_BATCH_SIZE, BatchProjectionRemovalSummary, BoundRetrievalIndexManifest,
     BoundedRawCallEdges, BuildNodeLookup, CURRENT_SCHEMA_VERSION, CallerProjectionRemovalSummary,

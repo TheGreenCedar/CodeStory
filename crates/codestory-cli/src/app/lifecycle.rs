@@ -391,6 +391,33 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
         "carried_policy_exclusion_rows: `{}`",
         output.carried_policy_exclusion_rows
     );
+    if let Some(bytes) = output.peak_space_required_bytes {
+        let _ = writeln!(markdown, "peak_space_required_bytes: `{bytes}`");
+    }
+    if let Some(bytes) = output.available_bytes {
+        let _ = writeln!(markdown, "available_bytes: `{bytes}`");
+    }
+    if let Some(bytes) = output.source_logical_bytes {
+        let _ = writeln!(markdown, "source_logical_bytes: `{bytes}`");
+    }
+    if let Some(bytes) = output.source_file_bytes {
+        let _ = writeln!(markdown, "source_file_bytes: `{bytes}`");
+    }
+    if let Some(count) = output.source_freelist_count {
+        let _ = writeln!(markdown, "source_freelist_count: `{count}`");
+    }
+    if let Some(bytes) = output.candidate_logical_bytes {
+        let _ = writeln!(markdown, "candidate_logical_bytes: `{bytes}`");
+    }
+    if let Some(bytes) = output.candidate_file_bytes {
+        let _ = writeln!(markdown, "candidate_file_bytes: `{bytes}`");
+    }
+    if let Some(count) = output.candidate_freelist_count {
+        let _ = writeln!(markdown, "candidate_freelist_count: `{count}`");
+    }
+    if let Some(count) = output.freelist_pages_reclaimed {
+        let _ = writeln!(markdown, "freelist_pages_reclaimed: `{count}`");
+    }
     let _ = writeln!(markdown, "retrieval: {}", output.retrieval);
     let _ = writeln!(markdown, "retrieval_status: `{}`", output.retrieval_status);
     let _ = writeln!(markdown, "retrieval_reason: {}", output.retrieval_reason);
