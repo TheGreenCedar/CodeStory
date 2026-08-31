@@ -5,6 +5,7 @@ import {
   ARMS,
   REQUIRED_TASK_IDS,
   abbaRunPlan,
+  focusedAbbaReceiptTimingClaims,
   focusedAbbaTiming,
   transientEmbeddingServerTransition,
 } from "../codestory-focused-abba-preflight.mjs";
@@ -105,4 +106,11 @@ test("focused timing preflight retries only a zero-row embedding-server transiti
     }),
     false,
   );
+});
+
+test("focused ABBA receipt does not claim an unmeasured persistent MCP cell", () => {
+  const claims = focusedAbbaReceiptTimingClaims();
+  assert.equal(Object.hasOwn(claims, "persistent_installed_mcp_measured"), false);
+  assert.deepEqual(claims.timing_cells_measured, ["fresh_cli_fresh_agent_session"]);
+  assert.equal(claims.load_policy, "fresh_cli_fresh_agent_session");
 });

@@ -245,6 +245,18 @@ async function runRawRow(opts, planned, sequence, cli) {
   throw new Error("focused ABBA transition retry exhausted without a receipt");
 }
 
+function focusedAbbaTimingCellsMeasured() {
+  // Persistent installed MCP is a separate cell and is not measured here.
+  return ["fresh_cli_fresh_agent_session"];
+}
+
+function focusedAbbaReceiptTimingClaims() {
+  return {
+    load_policy: "fresh_cli_fresh_agent_session",
+    timing_cells_measured: focusedAbbaTimingCellsMeasured(),
+  };
+}
+
 async function runFocusedAbba(opts) {
   const plan = abbaRunPlan();
   if (opts.listPlan) {
@@ -323,8 +335,7 @@ async function runFocusedAbba(opts) {
     task_ids: REQUIRED_TASK_IDS,
     repeats_per_arm: 5,
     ordering: "ABBAABBAAB per task",
-    load_policy: "fresh_cli_fresh_agent_session",
-    persistent_installed_mcp_measured: false,
+    ...focusedAbbaReceiptTimingClaims(),
     cli_identities: identities,
     rows,
   };
@@ -338,7 +349,9 @@ export {
   ARMS,
   REQUIRED_TASK_IDS,
   abbaRunPlan,
+  focusedAbbaReceiptTimingClaims,
   focusedAbbaTiming,
+  focusedAbbaTimingCellsMeasured,
   parseArgs,
   runFocusedAbba,
   transientEmbeddingServerTransition,

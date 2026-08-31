@@ -3053,6 +3053,39 @@ function installedAgentTiming(values) {
   };
 }
 
+function installedAgentTimingPhaseWarmMs(timing) {
+  if (!timing) return null;
+  return timing.agent_runner_ms
+    + timing.time_to_first_packet_ms
+    + timing.continuation_ms;
+}
+
+function exactCandidateTimingFromInstalledPhases(installedTiming, { cold_ms = 0, incremental_ms = 0 } = {}) {
+  const warmMs = installedAgentTimingPhaseWarmMs(installedTiming);
+  if (!Number.isFinite(warmMs) || warmMs < 0) {
+    throw new Error("exact-candidate warm timing requires InstalledAgentTimingV1 phase fields");
+  }
+  if (warmMs !== installedTiming.whole_task_wall_ms) {
+    throw new Error(
+      `exact-candidate warm phases do not reconcile to whole_task_wall_ms: phases=${warmMs} wall=${installedTiming.whole_task_wall_ms}`,
+    );
+  }
+  return {
+    cold_ms,
+    // Whole-task warm is the phase sum, never a raw wall_ms or whole_task_wall_ms field copy.
+    warm_ms: warmMs,
+    incremental_ms,
+    // Per-row all-in tracks whole-task warm; cold/incremental join only in aggregate totals.
+    all_in_ms: warmMs,
+  };
+}
+
+function timingEligibleExactCandidateRow(row) {
+  return row?.installed_agent_timing_eligible !== false
+    && row?.installed_agent_timing_ineligibility_reason == null
+    && !row?.comparator_reuse_provenance;
+}
+
 
 function timingIneligibleComparatorRow(row) {
   const timing = row.installed_agent_timing;
@@ -6316,13 +6349,10 @@ async function runOne(opts, run, outDir) {
     installed_agent_timing_ineligibility_reason:
       run.comparative_wall_time_eligible === false ? "preparation_overlap" : null,
     exact_candidate_timing: opts.exactCandidate
-      ? {
+      ? exactCandidateTimingFromInstalledPhases(installedTiming, {
           cold_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.preparation_wall_ms ?? 0,
-          // Whole-task warm/all-in come from InstalledAgentTimingV1, not a raw wallMs alias.
-          warm_ms: installedTiming.whole_task_wall_ms,
           incremental_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.incremental_wall_ms ?? 0,
-          all_in_ms: installedTiming.whole_task_wall_ms,
-        }
+        })
       : null,
     agent_runner_wall_ms: runnerWallMs,
     baseline_harness_prelude: baselinePrelude?.public ?? null,
@@ -11731,7 +11761,8 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     }
   }
 
-  const sum = (arm, selector) => byArm[arm].reduce((total, row) => {
+  const sum = (arm, selector, { timingEligibleOnly = false } = {}) => byArm[arm].reduce((total, row) => {
+    if (timingEligibleOnly && !timingEligibleExactCandidateRow(row)) return total;
     const value = Number(selector(row));
     return total + (Number.isFinite(value) ? value : 0);
   }, 0);
@@ -11753,6 +11784,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   const uniqueRepoTiming = (arm, field) => {
     const byRepo = new Map();
     for (const row of byArm[arm]) {
+      if (!timingEligibleExactCandidateRow(row)) continue;
       const value = row.exact_candidate_timing?.[field];
       if (byRepo.has(row.repo) && byRepo.get(row.repo) !== value) {
         reasons.push(`${arm} ${field} timing disagrees across repeats for ${row.repo}`);
@@ -11763,9 +11795,34 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   };
   const lifecycleMs = (arm) => lifecycle?.package_authentication_ms?.[arm] ?? 0;
   const modelInitializationMs = (arm) => lifecycle?.model_initialization_ms?.[arm] ?? 0;
+  const timingEligibleCounts = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [
+    arm,
+    byArm[arm].filter(timingEligibleExactCandidateRow).length,
+  ]));
+  if (EXACT_CANDIDATE_ARMS.some((arm) => timingEligibleCounts[arm] !== byArm[arm].length)) {
+    reasons.push(
+      `timing-ineligible rows cannot support exact-candidate warm/all-in gates: ${
+        EXACT_CANDIDATE_ARMS.map((arm) => `${arm}=${timingEligibleCounts[arm]}/${byArm[arm].length}`).join(" ")
+      }`,
+    );
+  }
+  for (const taskId of taskIds) {
+    for (const repeat of [1, 2, 3]) {
+      const cohortByArm = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => {
+        const row = byArm[arm].find((entry) => entry.task_id === taskId && entry.repeat === repeat);
+        return [arm, timingEligibleExactCandidateRow(row) ? row?.installed_agent_timing?.timing_cohort_id ?? null : null];
+      }));
+      const present = Object.values(cohortByArm).filter(Boolean);
+      if (present.length >= 2 && new Set(present).size > 1) {
+        reasons.push(
+          `timing cohort ids disagree across arms for ${taskId} repeat ${repeat}`,
+        );
+      }
+    }
+  }
   const timingTotals = {};
   for (const arm of EXACT_CANDIDATE_ARMS) {
-    const warm = sum(arm, (row) => row.exact_candidate_timing?.warm_ms);
+    const warm = sum(arm, (row) => row.exact_candidate_timing?.warm_ms, { timingEligibleOnly: true });
     const measuredCold = arm === "without_codestory" ? 0 : uniqueRepoTiming(arm, "cold_ms");
     const oneTimeModel = arm === "without_codestory" ? 0 : modelInitializationMs(arm);
     const cold = Math.max(0, measuredCold - oneTimeModel);
@@ -11817,8 +11874,16 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
         reasons.push(`missing ${field} timing for ${row.task_id}/${row.arm}/${row.repeat}`);
       }
     }
-    if (!finiteNonnegative(row.wall_ms) || row.exact_candidate_timing?.warm_ms !== row.wall_ms) {
-      reasons.push(`whole-task warm timing does not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
+    const phaseWarmMs = installedAgentTimingPhaseWarmMs(row.installed_agent_timing);
+    if (
+      !finiteNonnegative(phaseWarmMs)
+      || row.exact_candidate_timing?.warm_ms !== phaseWarmMs
+      || row.exact_candidate_timing?.warm_ms !== row.installed_agent_timing?.whole_task_wall_ms
+      || phaseWarmMs !== row.installed_agent_timing?.whole_task_wall_ms
+    ) {
+      reasons.push(
+        `whole-task warm timing does not reconcile to InstalledAgentTimingV1 phases for ${row.task_id}/${row.arm}/${row.repeat}`,
+      );
     }
     if (row.exact_candidate_timing?.all_in_ms !== row.exact_candidate_timing?.warm_ms) {
       reasons.push(`row all-in timing must equal whole-task warm timing for ${row.task_id}/${row.arm}/${row.repeat}`);
@@ -12810,10 +12875,10 @@ async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
         reanalyzed_with_current_scorer: true,
       },
     };
-    reusable.set(key, {
+    reusable.set(key, timingIneligibleComparatorRow({
       ...result,
       resource_accounting: resourceAccountingForResult(result),
-    });
+    }));
   }
   if ([...reusable.values()].some((row) => row.arm === "candidate_0_18")) {
     throw new Error("comparator reuse attempted to import a candidate row");
@@ -14421,6 +14486,9 @@ export {
   benchmarkRunId,
   installedAgentTiming,
   installedAgentTimingCohortId,
+  installedAgentTimingPhaseWarmMs,
+  exactCandidateTimingFromInstalledPhases,
+  timingEligibleExactCandidateRow,
   timingIneligibleComparatorRow,
   benchmarkContractEnvironmentSha256,
   benchmarkContractForRun,
