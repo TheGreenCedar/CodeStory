@@ -425,6 +425,7 @@ impl VectorGenerationManifest {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_generation_evidence_for_publication(
     layout: &SidecarLayout,
     storage: &Store,
@@ -526,6 +527,7 @@ pub(crate) fn validate_generation_evidence_for_publication(
     Ok(vector_manifest)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_sealed_generation_evidence_for_publication(
     layout: &SidecarLayout,
     storage: &Store,
@@ -2000,7 +2002,7 @@ fn validate_health_database(
     )?;
     let metadata = &contents.metadata;
     let envelope_matches =
-        vector_publication_envelope_matches(path, &metadata, generation, input_hash)?;
+        vector_publication_envelope_matches(path, metadata, generation, input_hash)?;
     if metadata.schema_version != VECTOR_INDEX_SCHEMA_VERSION
         || !envelope_matches
         || metadata.embedding_backend != embedding_backend

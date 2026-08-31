@@ -2444,7 +2444,8 @@ fn lexical_state_digest(
     let mut hasher = Sha256::new();
     hasher.update(b"codestory-lexical-state-v1\0");
     hasher.update(fingerprint.file_count.to_le_bytes());
-    for value in [fingerprint.hash.as_str()] {
+    {
+        let value = fingerprint.hash.as_str();
         hasher.update((value.len() as u64).to_le_bytes());
         hasher.update(value.as_bytes());
     }

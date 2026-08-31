@@ -808,15 +808,17 @@ fn lexical_inventory_files(
         .iter()
         .map(|candidate| candidate.normalized_path.as_str())
         .collect::<HashSet<_>>();
-    inventory
+    Ok(inventory
         .discovered_files
         .iter()
-        .filter_map(|path| match normalized_policy_path(&root, path) {
-            Ok(relative) if !excluded.contains(relative.as_str()) => Some(Ok(path.clone())),
-            Ok(_) => None,
-            Err(error) => Some(Err(error)),
+        .filter(|path| match normalized_policy_path(&root, path) {
+            // Policy exclusions are UTF-8 relative paths; a non-normalizable
+            // source cannot match one and must stay in the lexical inventory.
+            Ok(relative) => !excluded.contains(relative.as_str()),
+            Err(_) => true,
         })
-        .collect()
+        .cloned()
+        .collect())
 }
 
 impl WorkspaceDiscovery {
