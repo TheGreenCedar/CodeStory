@@ -5129,6 +5129,184 @@ mod tests {
         std::path::Path::new("C:/workspace/project root")
     }
 
+    /// Mechanical substitution over every identifier and filename in a fixture. Applied
+    /// longest-first so a short token cannot rewrite part of a longer one.
+    fn rename_fixture_text(text: &str, renames: &[(&str, &str)]) -> String {
+        let mut ordered = renames.to_vec();
+        ordered.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+        let mut renamed = text.to_string();
+        for (from, to) in ordered {
+            renamed = renamed.replace(from, to);
+        }
+        renamed
+    }
+
+    fn rename_fixture_citations(
+        citations: &[AgentCitationDto],
+        renames: &[(&str, &str)],
+    ) -> Vec<AgentCitationDto> {
+        citations
+            .iter()
+            .map(|citation| {
+                let mut renamed = citation.clone();
+                renamed.display_name = rename_fixture_text(&citation.display_name, renames);
+                renamed.file_path = citation
+                    .file_path
+                    .as_deref()
+                    .map(|path| rename_fixture_text(path, renames));
+                renamed.node_id = NodeId(rename_fixture_text(&citation.node_id.0, renames));
+                renamed
+            })
+            .collect()
+    }
+
+    fn citation_identities(answer: &AgentAnswerDto) -> Vec<String> {
+        answer
+            .citations
+            .iter()
+            .map(|citation| {
+                format!(
+                    "{}\t{}",
+                    citation.display_name,
+                    citation.file_path.as_deref().unwrap_or_default()
+                )
+            })
+            .collect()
+    }
+
+    /// The order packet ranking puts the evidence in, before any budget cap.
+    fn ranked_citation_identities(question: &str, citations: Vec<AgentCitationDto>) -> Vec<String> {
+        let mut answer = packet_answer_fixture(question, citations);
+        rank_packet_evidence(question, &mut answer);
+        citation_identities(&answer)
+    }
+
+    /// The citation identities that survive the budget cap.
+    fn selected_citation_identities(
+        question: &str,
+        citations: Vec<AgentCitationDto>,
+    ) -> Vec<String> {
+        let mut answer = packet_answer_fixture(question, citations);
+        rank_packet_evidence(question, &mut answer);
+        let limits = PacketBudgetLimitsDto {
+            max_anchors: 4,
+            max_files: 4,
+            max_snippets: 4,
+            max_trail_edges: 4,
+            max_output_bytes: 16 * 1024,
+        };
+        cap_citations(&mut answer, &limits);
+        citation_identities(&answer)
+    }
+
+    /// The lowest-ranked entries deliberately carry the vocabulary retired heuristics keyed
+    /// on (`cache`, `handler`, `cli`, `sql`), so any such rule changes which citations
+    /// survive the cap rather than merely reordering the survivors.
+    fn invariance_fixture_citations() -> Vec<AgentCitationDto> {
+        vec![
+            test_packet_citation("Alpha.dispatch", "src/alpha/dispatch.rs", 0.91),
+            test_packet_citation("Beta.receive", "src/beta/receive.rs", 0.74),
+            test_packet_citation("GammaStore.load", "src/gamma/store.rs", 0.63),
+            test_packet_citation("ZetaProbe.append", "src/zeta/probe.rs", 0.52),
+            test_packet_citation("DeltaCache.evict", "src/delta/cache.rs", 0.30),
+            test_packet_citation("EpsilonHandler.render", "src/epsilon/cli.rs", 0.22),
+        ]
+    }
+
+    const INVARIANCE_FIXTURE_QUESTION: &str =
+        "Explain how Alpha.dispatch reaches Beta.receive through GammaStore.load.";
+
+    /// The property the deleted domain heuristics violated: selection must depend on the
+    /// structure of the prompt and the evidence, never on the particular words used.
+    #[test]
+    fn citation_selection_is_invariant_under_mechanical_renaming() {
+        const RENAMES: &[(&str, &str)] = &[
+            ("Alpha", "Quernal"),
+            ("Beta", "Tovsk"),
+            ("GammaStore", "Fenwick"),
+            ("DeltaCache", "Morrow"),
+            ("EpsilonHandler", "Halcyon"),
+            ("ZetaProbe", "Perrin"),
+            ("alpha", "quernal"),
+            ("beta", "tovsk"),
+            ("gamma", "fenwick"),
+            ("delta", "morrow"),
+            ("epsilon", "halcyon"),
+            ("zeta", "perrin"),
+            ("dispatch", "wrangle"),
+            ("receive", "gather"),
+            ("store", "vault"),
+            ("cache", "larder"),
+            ("cli", "pane"),
+            ("probe", "ledger"),
+        ];
+
+        let original = selected_citation_identities(
+            INVARIANCE_FIXTURE_QUESTION,
+            invariance_fixture_citations(),
+        );
+        assert!(
+            original.len() < invariance_fixture_citations().len(),
+            "the cap must exclude some evidence, or renaming cannot change the outcome"
+        );
+
+        let renamed_question = rename_fixture_text(INVARIANCE_FIXTURE_QUESTION, RENAMES);
+        let renamed_citations = rename_fixture_citations(&invariance_fixture_citations(), RENAMES);
+
+        let renamed = selected_citation_identities(&renamed_question, renamed_citations.clone());
+        let expected = original
+            .iter()
+            .map(|identity| rename_fixture_text(identity, RENAMES))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            renamed, expected,
+            "renaming every identifier and filename must not change which citations are selected"
+        );
+
+        let ranked =
+            ranked_citation_identities(INVARIANCE_FIXTURE_QUESTION, invariance_fixture_citations())
+                .iter()
+                .map(|identity| rename_fixture_text(identity, RENAMES))
+                .collect::<Vec<_>>();
+        assert_eq!(
+            ranked_citation_identities(&renamed_question, renamed_citations),
+            ranked,
+            "renaming every identifier and filename must not change the ranked evidence order"
+        );
+    }
+
+    #[test]
+    fn citation_selection_is_invariant_under_citation_order() {
+        let original = selected_citation_identities(
+            INVARIANCE_FIXTURE_QUESTION,
+            invariance_fixture_citations(),
+        );
+
+        let mut permuted = invariance_fixture_citations();
+        permuted.reverse();
+        let reversed = selected_citation_identities(INVARIANCE_FIXTURE_QUESTION, permuted);
+        assert_eq!(
+            reversed, original,
+            "reversing the retrieval order must not change which citations are selected"
+        );
+
+        let mut rotated = invariance_fixture_citations();
+        rotated.rotate_left(3);
+        let rotated = selected_citation_identities(INVARIANCE_FIXTURE_QUESTION, rotated);
+        assert_eq!(
+            rotated, original,
+            "rotating the retrieval order must not change which citations are selected"
+        );
+
+        let mut reversed_input = invariance_fixture_citations();
+        reversed_input.reverse();
+        assert_eq!(
+            ranked_citation_identities(INVARIANCE_FIXTURE_QUESTION, reversed_input),
+            ranked_citation_identities(INVARIANCE_FIXTURE_QUESTION, invariance_fixture_citations()),
+            "reversing the retrieval order must not change the ranked evidence order"
+        );
+    }
+
     #[test]
     fn packet_rank_demotes_lib_module_facade_below_concrete_module_file() {
         let terms = vec!["jsonl".to_string(), "event".to_string()];

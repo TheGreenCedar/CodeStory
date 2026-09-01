@@ -3371,6 +3371,71 @@ mod tests {
 
     const INDEXING_QUESTION: &str = "Explain the indexing runtime, persistence, and snapshot flow.";
 
+    /// Obligation planning must key on prompt structure, not on the particular nouns used.
+    /// A renamed prompt has to yield the renamed plan and nothing else.
+    #[test]
+    fn obligation_plan_is_invariant_under_mechanical_renaming() {
+        const RENAMES: &[(&str, &str)] = &[
+            ("Alpha", "Quernal"),
+            ("Beta", "Tovsk"),
+            ("Gamma", "Fenwick"),
+            ("dispatch", "wrangle"),
+            ("receive", "gather"),
+            ("load", "hoist"),
+        ];
+
+        fn rename(text: &str) -> String {
+            let mut ordered = RENAMES.to_vec();
+            ordered.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
+            let mut renamed = text.to_string();
+            for (from, to) in ordered {
+                renamed = renamed.replace(from, to);
+            }
+            renamed
+        }
+
+        fn plan_queries(question: &str) -> Vec<String> {
+            let plan = build_packet_obligation_plan(
+                question,
+                PacketTaskClassDto::DataFlow,
+                &[PacketPlanQueryDto {
+                    query: question.to_string(),
+                    purpose: "original task phrasing".to_string(),
+                }],
+            );
+            let mut queries = plan
+                .claim_obligations
+                .iter()
+                .flat_map(|obligation| obligation.binding_terms.iter().cloned())
+                .chain(
+                    plan.query_obligations
+                        .iter()
+                        .map(|obligation| obligation.query.clone()),
+                )
+                .collect::<Vec<_>>();
+            queries.sort();
+            queries
+        }
+
+        let question = "Explain how Alpha.dispatch reaches Beta.receive through Gamma.load.";
+        let original = plan_queries(question);
+        assert!(
+            !original.is_empty(),
+            "fixture prompt must plan some obligations for the comparison to mean anything"
+        );
+
+        let mut expected = original
+            .iter()
+            .map(|query| rename(query))
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(
+            plan_queries(&rename(question)),
+            expected,
+            "renaming every identifier must rename the plan and change nothing else"
+        );
+    }
+
     fn fresh_index_observation() -> IndexFreshnessDto {
         IndexFreshnessDto {
             status: IndexFreshnessStatusDto::Fresh,
