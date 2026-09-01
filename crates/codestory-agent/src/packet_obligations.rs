@@ -1803,31 +1803,6 @@ fn finalize_claim_obligation(
         );
         return;
     }
-    if obligation.id == "sql_tables" && !obligation.binding_terms.is_empty() {
-        let missing = obligation
-            .binding_terms
-            .iter()
-            .filter(|entity| {
-                !allowed_citations
-                    .iter()
-                    .any(|citation| citation_covers_named_schema_entity(citation, entity))
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            record_obligation_carriers(
-                obligation,
-                allowed_citations.iter().copied(),
-                evidence_view.max_carriers,
-            );
-            obligation.proof_status = PacketObligationProofStatusDto::Reported;
-            obligation.reason = Some(format!(
-                "named_sql_table_carriers_missing:{}",
-                missing.join(",")
-            ));
-            return;
-        }
-    }
     let proven_citations = allowed_citations
         .iter()
         .copied()
@@ -2138,25 +2113,6 @@ fn rank_obligation_citations_by_context(
             .count();
         (boundary_depth, std::cmp::Reverse(overlap))
     });
-}
-
-fn citation_covers_named_schema_entity(citation: &AgentCitationDto, entity: &str) -> bool {
-    // Domain SqlTableDefinition role removed; accept resolvable source citations on .sql paths.
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(crate::packet_scoring::packet_display_path)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !path.ends_with(".sql") {
-        return false;
-    }
-    let terminal = crate::text::terminal_symbol_segment(&citation.display_name);
-    let normalized = normalize_identifier(&terminal);
-    let normalized = normalized
-        .strip_prefix("createtable")
-        .unwrap_or(normalized.as_str());
-    normalized == normalize_identifier(entity)
 }
 
 fn finalize_default_profile_obligation(
@@ -3319,7 +3275,7 @@ mod tests {
         IndexFreshnessStatusDto, NodeId, PACKET_PROBE_CONTRACT_VERSION, PacketBudgetLimitsDto,
         PacketBudgetModeDto, PacketBudgetUsageDto, PacketEvidenceResolutionDto,
         PacketEvidenceTierDto, PacketProbeAmbiguityCandidateDto, PacketProbeRejectionDto,
-        PacketSidecarQueryDiagnosticDto, SearchHitOrigin,
+        SearchHitOrigin,
     };
 
     const INDEXING_QUESTION: &str = "Explain the indexing runtime, persistence, and snapshot flow.";

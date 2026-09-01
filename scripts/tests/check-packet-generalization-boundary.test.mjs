@@ -437,6 +437,65 @@ fn edge_kind_label(kind: EdgeKind) -> &'static str {
   assert.ok(!kinds.has("schema_noun_cluster"), [...kinds].join(","));
 });
 
+test("site 3 counterexample: SQL DDL probe forms in required-probe matching", () => {
+  // crates/codestory-agent/src/packet_required_probes.rs. This carve-out
+  // recognized "CREATE TABLE X" and "public.X" as the same probe identity and
+  // suppressed generic matching for anything spelled like DDL.
+  const deleted = `
+fn packet_sql_table_identity(display: &str) -> Option<String> {
+    let trimmed = display.trim();
+    let without_create = trimmed
+        .strip_prefix("CREATE TABLE")
+        .or_else(|| {
+            let lower = trimmed.to_ascii_lowercase();
+            let index = lower.find("create table")?;
+            Some(&trimmed[index + "create table".len()..])
+        })
+        .unwrap_or(trimmed)
+        .trim();
+    let token = without_create.rsplit(['.', ' ']).next()?;
+    let normalized = normalize_identifier(token);
+    (normalized.len() >= 4).then_some(normalized)
+}
+
+fn packet_public_catalog_probe_table(query: &str) -> Option<String> {
+    let remainder = query.trim().strip_prefix("public.")?;
+    packet_sql_table_identity(remainder)
+}
+`;
+  const kinds = kindsFor(deleted, agentFile("packet_required_probes.rs"));
+  assert.ok(kinds.has("sql_syntax_phrase"), [...kinds].join(","));
+});
+
+test("site 3 counterexample: the orphaned sql_tables obligation branch", () => {
+  // crates/codestory-agent/src/packet_obligations.rs. Recognizing a DDL prefix
+  // on a citation's display name is reading a known corpus, not a repository.
+  const deleted = `
+fn citation_covers_named_schema_entity(citation: &AgentCitationDto, entity: &str) -> bool {
+    let path = citation.file_path.as_deref().unwrap_or_default().to_ascii_lowercase();
+    if !path.ends_with(".sql") {
+        return false;
+    }
+    let normalized = normalize_identifier(&citation.display_name);
+    let normalized = normalized
+        .strip_prefix("createtable")
+        .unwrap_or(normalized.as_str());
+    normalized == normalize_identifier(entity)
+}
+`;
+  const kinds = kindsFor(deleted, agentFile("packet_obligations.rs"));
+  assert.ok(kinds.has("sql_syntax_phrase"), [...kinds].join(","));
+});
+
+test("a single SQL syntax phrase is enough to fail", () => {
+  // No cluster needed: packet planning has no reason to recognize DDL at all.
+  for (const phrase of ["CREATE TABLE", "FOREIGN KEY", "PRIMARY KEY", "ALTER TABLE"]) {
+    const source = `fn detect(display: &str) -> bool { display.contains("${phrase}") }\n`;
+    const kinds = kindsFor(source, agentFile("packet_scoring.rs"));
+    assert.ok(kinds.has("sql_syntax_phrase"), `${phrase}: ${[...kinds]}`);
+  }
+});
+
 test("site 4 counterexample: SQL dialect variant-copy scoring", () => {
   // crates/codestory-agent/src/packet_scoring.rs, deleted at e74db13a.
   const deleted = `

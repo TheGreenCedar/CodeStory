@@ -484,9 +484,6 @@ pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCit
     if packet_type_declaration_probe_subject_tokens(query).is_some() {
         return packet_citation_matches_type_declaration_probe(query, citation);
     }
-    if packet_citation_matches_sql_table_identity(query, citation) {
-        return true;
-    }
     if packet_citation_matches_required_coverage_role(query, citation) {
         return true;
     }
@@ -507,12 +504,10 @@ pub fn packet_citation_satisfies_required_probe(query: &str, citation: &AgentCit
     !packet_required_probe_needs_exact_match(query) || match_rank >= 4
 }
 
+/// A probe that spells out an owner and what it owns is asking for that exact
+/// identity, not for anything whose name ends the same way.
 pub fn packet_required_probe_needs_exact_match(query: &str) -> bool {
-    // Qualified path/symbol and SQL table probes require exact identity matches.
-    query.contains("::")
-        || query.contains('.')
-        || packet_create_table_probe_table(query).is_some()
-        || packet_public_catalog_probe_table(query).is_some()
+    query.contains("::") || query.contains('.')
 }
 
 pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto) -> Option<u8> {
@@ -523,22 +518,12 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
     if packet_type_declaration_probe_subject_tokens(query).is_some() {
         return packet_citation_matches_type_declaration_probe(query, citation).then_some(6);
     }
-    if packet_citation_matches_sql_table_identity(query, citation) {
-        return Some(6);
-    }
-    if packet_create_table_probe_table(query).is_some()
-        || packet_public_catalog_probe_table(query).is_some()
-    {
-        // SQL table probes never fall through to shared CREATE/TABLE token coverage.
-        return None;
-    }
     if packet_citation_matches_required_coverage_role(query, citation) {
         return Some(6);
     }
     if packet_citation_is_exact_primary_file_probe_match(query, citation) {
         return Some(6);
     }
-    let normalized_display = normalize_identifier(&citation.display_name);
     if let Some(matches_file_scoped_symbol) =
         packet_file_scoped_symbol_probe_matches(query, citation)
     {
@@ -549,14 +534,45 @@ pub fn packet_citation_probe_match_rank(query: &str, citation: &AgentCitationDto
         }
     } else if packet_file_stem_matches_query(query, citation.file_path.as_deref()) {
         Some(5)
-    } else if normalized_display == normalized_query
-        || normalized_display.ends_with(&normalized_query)
-    {
+    } else if identity_suffix_matches(&citation.display_name, query) {
         // Identity-only: exact / suffix identifier match only (CX-R3-01).
         Some(4)
     } else {
         None
     }
+}
+
+/// True when `probe` is `identity`, or names a whole trailing run of its
+/// segments.
+///
+/// Comparing normalized identifiers with `ends_with` ignores where one identity
+/// ends and the next begins, so `Alpha.run` matched `OtherAlpha.run`. Segments
+/// are the boundaries the source itself wrote, so a probe must land on one.
+fn identity_suffix_matches(identity: &str, probe: &str) -> bool {
+    let identity = identity.trim();
+    let probe = probe.trim();
+    if identity.is_empty() || probe.is_empty() {
+        return false;
+    }
+    if normalize_identifier(identity) == normalize_identifier(probe) {
+        return true;
+    }
+    let owner = identity_segments(identity);
+    let probe = identity_segments(probe);
+    if probe.is_empty() || owner.len() <= probe.len() {
+        return false;
+    }
+    owner[owner.len() - probe.len()..] == probe[..]
+}
+
+/// Split an identity on the separators source languages use between an owner and
+/// what it owns, normalizing each part so casing and punctuation do not matter.
+fn identity_segments(value: &str) -> Vec<String> {
+    value
+        .split([':', '.', '#', '/', '\\', ' '])
+        .map(|segment| normalize_identifier(segment.trim().trim_end_matches("()")))
+        .filter(|segment| !segment.is_empty())
+        .collect()
 }
 
 fn packet_type_declaration_probe_subject_tokens(query: &str) -> Option<Vec<String>> {
@@ -620,68 +636,6 @@ fn packet_citation_matches_required_coverage_role(
     normalize_identifier(coverage_role) == normalize_identifier(query)
 }
 
-fn packet_citation_matches_sql_table_identity(query: &str, citation: &AgentCitationDto) -> bool {
-    // Only explicit SQL table probe forms — never treat arbitrary tokens as tables.
-    let Some(query_table) =
-        packet_create_table_probe_table(query).or_else(|| packet_public_catalog_probe_table(query))
-    else {
-        return false;
-    };
-    let citation_table = packet_create_table_probe_table(&citation.display_name)
-        .or_else(|| packet_public_catalog_probe_table(&citation.display_name))
-        .or_else(|| packet_sql_table_identity(&citation.display_name));
-    citation_table.is_some_and(|table| table == query_table)
-}
-
-fn packet_public_catalog_probe_table(query: &str) -> Option<String> {
-    let trimmed = query.trim();
-    let remainder = trimmed
-        .strip_prefix("public.")
-        .or_else(|| trimmed.strip_prefix("PUBLIC."))?;
-    if remainder.is_empty() {
-        return None;
-    }
-    packet_sql_table_identity(remainder)
-}
-
-fn packet_create_table_probe_table(query: &str) -> Option<String> {
-    let trimmed = query.trim();
-    let remainder = trimmed
-        .strip_prefix("CREATE TABLE")
-        .or_else(|| {
-            let lower = trimmed.to_ascii_lowercase();
-            let index = lower.find("create table")?;
-            Some(&trimmed[index + "create table".len()..])
-        })?
-        .trim();
-    if remainder.is_empty() {
-        return None;
-    }
-    packet_sql_table_identity(remainder)
-}
-
-fn packet_sql_table_identity(display: &str) -> Option<String> {
-    let trimmed = display.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let without_create = trimmed
-        .strip_prefix("CREATE TABLE")
-        .or_else(|| {
-            let lower = trimmed.to_ascii_lowercase();
-            let index = lower.find("create table")?;
-            Some(&trimmed[index + "create table".len()..])
-        })
-        .unwrap_or(trimmed)
-        .trim();
-    let token = without_create
-        .rsplit(['.', ' ', '/', '\\'])
-        .next()?
-        .trim_matches(|ch: char| matches!(ch, '[' | ']' | '"' | '\'' | '`' | '(' | ')' | ';'));
-    let normalized = normalize_identifier(token);
-    (normalized.len() >= 4).then_some(normalized)
-}
-
 fn packet_file_scoped_symbol_probe_matches(
     query: &str,
     citation: &AgentCitationDto,
@@ -701,24 +655,8 @@ fn packet_file_scoped_symbol_probe_matches(
         return Some(false);
     }
 
-    let normalized_display = normalize_identifier(&citation.display_name);
-    if parts.symbols.len() >= 3 && parts.symbols[0] == "create" && parts.symbols[1] == "table" {
-        let Some(table_name) = parts.symbols.last() else {
-            return Some(false);
-        };
-        let expected = format!("createtable{table_name}");
-        return Some(normalized_display == expected || normalized_display.ends_with(&expected));
-    }
-    if parts.symbols.len() >= 2 && parts.symbols[0] == "foreign" && parts.symbols[1] == "key" {
-        let tokens = crate::text::symbol_query_tokens(&citation.display_name);
-        return Some(
-            tokens.iter().any(|token| token == "foreign")
-                && tokens.iter().any(|token| token == "key"),
-        );
-    }
     Some(parts.symbols.iter().any(|symbol| {
-        normalized_display == *symbol
-            || normalized_display.ends_with(symbol)
+        identity_suffix_matches(&citation.display_name, symbol)
             || packet_file_scoped_short_symbol_matches(&citation.display_name, symbol)
     }))
 }
@@ -928,6 +866,44 @@ mod tests {
         assert_eq!(
             queries,
             ["animate.css", "src/http/client.dart", "foo-bar.ts"]
+        );
+    }
+
+    #[test]
+    fn an_exact_probe_does_not_accept_a_suffix_collision() {
+        // `otheralpharun` ends with `alpharun`, but `OtherAlpha` is a different
+        // type and the probe named `Alpha`.
+        let other = test_packet_citation("OtherAlpha.run", "src/module_one.rs", 0.9);
+        assert_eq!(packet_citation_probe_match_rank("Alpha.run", &other), None);
+        assert!(!packet_citation_satisfies_required_probe(
+            "Alpha.run",
+            &other
+        ));
+
+        let exact = test_packet_citation("Alpha.run", "src/module_one.rs", 0.9);
+        assert_eq!(
+            packet_citation_probe_match_rank("Alpha.run", &exact),
+            Some(4)
+        );
+
+        // A real owner prefix still matches: the probe lands on a segment.
+        let owned = test_packet_citation("crate::module::Alpha.run", "src/module_one.rs", 0.9);
+        assert_eq!(
+            packet_citation_probe_match_rank("Alpha.run", &owned),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn a_partial_segment_probe_does_not_match() {
+        let citation = test_packet_citation("Alpha.render", "src/module_one.rs", 0.9);
+        assert_eq!(
+            packet_citation_probe_match_rank("Alpha.render", &citation),
+            Some(4)
+        );
+        assert_eq!(
+            packet_citation_probe_match_rank("pha.render", &citation),
+            None
         );
     }
 
@@ -1493,61 +1469,33 @@ mod tests {
             &router_group
         ));
 
-        let create_track = test_packet_citation(
-            "CREATE TABLE Track",
-            "SampleDatabase/DataSources/Sample_Sqlite.sql",
-            0.9,
-        );
-        let create_playlist_track = test_packet_citation(
-            "CREATE TABLE PlaylistTrack",
-            "SampleDatabase/DataSources/Sample_Sqlite.sql",
-            0.9,
-        );
-        let create_invoice = test_packet_citation(
-            "CREATE TABLE Invoice",
-            "SampleDatabase/DataSources/Sample_Sqlite.sql",
-            0.9,
-        );
+        // A multi-word display name is matched by the same segment rule as any
+        // other identity. The cross-form equivalences this block used to assert
+        // ("public.X" satisfying a "CREATE TABLE X" probe) were SQL steering and
+        // are gone with it.
+        let declare_alpha =
+            test_packet_citation("DECLARE ENTITY Alpha", "schema/definitions.txt", 0.9);
+        let declare_sub_alpha =
+            test_packet_citation("DECLARE ENTITY SubAlpha", "schema/definitions.txt", 0.9);
+        let declare_beta =
+            test_packet_citation("DECLARE ENTITY Beta", "schema/definitions.txt", 0.9);
         assert!(packet_citation_satisfies_required_probe(
-            "CREATE TABLE Track",
-            &create_track
+            "DECLARE ENTITY Alpha",
+            &declare_alpha
         ));
         assert!(!packet_citation_satisfies_required_probe(
-            "CREATE TABLE Track",
-            &create_invoice
+            "DECLARE ENTITY Alpha",
+            &declare_beta
         ));
         assert!(packet_citation_satisfies_required_probe(
-            "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
-            &create_track
+            "schema/definitions.txt DECLARE ENTITY Alpha",
+            &declare_alpha
         ));
+        // `subalpha` ends with `alpha`, and the trailing segment is the whole
+        // name: a suffix inside one segment is not a match.
         assert!(!packet_citation_satisfies_required_probe(
-            "SampleDatabase/DataSources/Sample_Sqlite.sql CREATE TABLE Track",
-            &create_playlist_track
-        ));
-
-        let catalog_track = test_packet_citation("public.Track", "db/schema.sql", 0.9);
-        let catalog_playlist = test_packet_citation("public.PlaylistTrack", "db/schema.sql", 0.9);
-        assert!(packet_citation_satisfies_required_probe(
-            "CREATE TABLE Track",
-            &catalog_track
-        ));
-        assert!(!packet_citation_satisfies_required_probe(
-            "CREATE TABLE Track",
-            &catalog_playlist
-        ));
-        assert!(packet_citation_satisfies_required_probe(
-            "public.Track",
-            &create_track
-        ));
-        assert!(!packet_citation_satisfies_required_probe(
-            "public.Track",
-            &create_playlist_track
-        ));
-        let rewritten_publisher =
-            test_packet_citation("CREATE TABLE Publisher", "schema/Catalog_Sqlite.sql", 0.9);
-        assert!(packet_citation_satisfies_required_probe(
-            "public.publisher",
-            &rewritten_publisher
+            "schema/definitions.txt DECLARE ENTITY Alpha",
+            &declare_sub_alpha
         ));
 
         let log_record = test_packet_citation("LogRecord", "src/Monolog/LogRecord.php", 0.9);

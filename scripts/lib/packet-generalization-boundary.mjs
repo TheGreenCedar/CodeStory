@@ -257,6 +257,22 @@ const DOMAIN_VOCABULARY_SHAPES = Object.freeze([
     ]),
   }),
   Object.freeze({
+    // One occurrence is enough. Packet planning never needs to recognize a
+    // query language by its syntax; code that does is reading a known corpus.
+    kind: "sql_syntax_phrase",
+    minimum: 1,
+    vocabulary: Object.freeze([
+      "createtable",
+      "altertable",
+      "droptable",
+      "insertinto",
+      "selectfrom",
+      "foreignkey",
+      "primarykey",
+      "notnull",
+    ]),
+  }),
+  Object.freeze({
     kind: "schema_noun_cluster",
     minimum: 3,
     // "relation" and "references" are ordinary graph words, so a cluster only
@@ -664,12 +680,19 @@ function functionStringLiterals(body) {
 function findDomainVocabularyClusters(source, relative) {
   const findings = [];
   for (const fn of splitRustFunctions(source)) {
+    const literals = functionStringLiterals(fn.body);
     const tokens = new Set(
-      functionStringLiterals(fn.body)
+      literals
         .flatMap((literal) => literal.split(/[^A-Za-z0-9]+/))
         .map((token) => token.toLowerCase())
         .filter(Boolean),
     );
+    // A multi-word literal is one phrase, so its compacted form counts too:
+    // "CREATE TABLE" is a single piece of SQL vocabulary, not two nouns.
+    for (const literal of literals) {
+      const compacted = normalizeIdentifier(literal);
+      if (compacted) tokens.add(compacted);
+    }
     for (const shape of DOMAIN_VOCABULARY_SHAPES) {
       const matched = shape.vocabulary.filter((word) => tokens.has(word));
       const core = shape.core == null

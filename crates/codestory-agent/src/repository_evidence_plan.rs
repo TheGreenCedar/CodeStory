@@ -348,10 +348,19 @@ fn seed_path_matches_identity(file_path: Option<&str>, identity: &str) -> bool {
         return false;
     }
     path == identity
-        || path.ends_with(identity)
-        || identity.ends_with(path)
+        || path_has_suffix(path, identity)
+        || path_has_suffix(identity, path)
         || path_file_name(path) == Some(identity)
         || path_file_name(identity) == Some(path)
+}
+
+/// A path suffix has to start at a directory boundary. Plain `ends_with` made
+/// `src/notfoo.rs` a match for `foo.rs`.
+fn path_has_suffix(path: &str, suffix: &str) -> bool {
+    let Some(prefix) = path.strip_suffix(suffix) else {
+        return false;
+    };
+    prefix.ends_with('/') || prefix.ends_with('\\')
 }
 
 fn path_file_name(path: &str) -> Option<&str> {
@@ -763,6 +772,44 @@ mod tests {
             g.kind,
             RepositoryEvidenceGapKind::MissingRelation | RepositoryEvidenceGapKind::Unknown
         )));
+    }
+
+    #[test]
+    fn a_path_suffix_must_start_at_a_directory_boundary() {
+        assert!(seed_path_matches_identity(Some("src/foo.rs"), "foo.rs"));
+        assert!(seed_path_matches_identity(
+            Some("a/b/src/foo.rs"),
+            "src/foo.rs"
+        ));
+        assert!(!seed_path_matches_identity(Some("src/notfoo.rs"), "foo.rs"));
+        assert!(!seed_path_matches_identity(Some("src/my_foo.rs"), "foo.rs"));
+        assert!(!seed_path_matches_identity(
+            Some("src/xsrc/foo.rs"),
+            "rc/foo.rs"
+        ));
+    }
+
+    #[test]
+    fn a_colliding_path_suffix_does_not_resolve_an_anchor() {
+        let mut seeds = [citation("wrong", "NotFoo"), citation("right", "Foo")];
+        seeds[0].file_path = Some("src/notfoo.rs".into());
+        seeds[1].file_path = Some("src/foo.rs".into());
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Inspect foo.rs",
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                seeds: &seeds,
+                relations: &[],
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        assert_eq!(
+            plan.material_node_ids
+                .iter()
+                .map(|n| n.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["right"],
+        );
     }
 
     #[test]
