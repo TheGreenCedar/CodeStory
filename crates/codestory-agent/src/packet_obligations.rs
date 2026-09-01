@@ -4903,7 +4903,9 @@ mod tests {
             "Show where Widget::run is not used.",
             "Confirm Widget::run isn't called.",
             "Confirm Widget::run does not exist.",
-            "Find none of the handlers for Widget::run.",
+            // "Find none of the handlers for Widget::run." lived here until the
+            // discovery subjects stopped carrying framework nouns. Every subject
+            // below names a relation the graph actually stores.
             "Find missing implementations of Widget::run.",
             "Confirm zero known direct callers of Widget::run.",
             "Is Widget::run unreachable?",

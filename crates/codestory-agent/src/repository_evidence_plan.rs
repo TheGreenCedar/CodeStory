@@ -219,55 +219,75 @@ pub fn build_repository_evidence_plan(
     plan
 }
 
-/// Prefer seeds whose path, display name, or node identity appears exactly in
-/// the prompt. When the prompt carries no matching identities, fall back to
-/// retrieval order so seed-only fixtures still resolve anchors.
+/// Anchors are the seeds whose path, display name, or node identity the prompt
+/// actually names, ordered by where the prompt names them.
+///
+/// A prompt that names no repository identity resolves no anchors. Retrieval
+/// order is not evidence that the caller asked about a symbol, so falling back
+/// to it would let a broad prompt protect whatever happened to rank first and
+/// demand a continuation for it.
+///
+/// Prompt order, not seed order, also fixes the direction of every pair the
+/// caller asked about: "trace A calling B" searches A to B whatever order
+/// retrieval returned them in.
 fn resolve_prompt_anchor_nodes(
     question: &str,
     seeds: &[AgentCitationDto],
     max_seed_nodes: usize,
 ) -> Vec<NodeId> {
     let identities = prompt_path_and_symbol_identities(question);
-    let mut out = Vec::new();
+    let lowered_question = question.to_lowercase();
+    let mut anchors: Vec<(usize, usize, NodeId)> = Vec::new();
     let mut seen = BTreeSet::new();
-    for seed in seeds {
-        if !(seed_mentioned_verbatim_in_question(seed, question)
-            || seed_matches_prompt_identity(seed, &identities))
-        {
+    for (seed_index, seed) in seeds.iter().enumerate() {
+        let Some(offset) =
+            seed_prompt_mention_offset(seed, question, &lowered_question, &identities)
+        else {
             continue;
-        }
+        };
         if seen.insert(seed.node_id.clone()) {
-            out.push(seed.node_id.clone());
-        }
-        if out.len() >= max_seed_nodes {
-            return out;
+            anchors.push((offset, seed_index, seed.node_id.clone()));
         }
     }
-    if !out.is_empty() {
-        return out;
-    }
-    for seed in seeds {
-        if seen.insert(seed.node_id.clone()) {
-            out.push(seed.node_id.clone());
-        }
-        if out.len() >= max_seed_nodes {
-            break;
-        }
-    }
-    out
+    anchors.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    anchors.truncate(max_seed_nodes);
+    anchors.into_iter().map(|(_, _, node)| node).collect()
 }
 
-fn seed_mentioned_verbatim_in_question(seed: &AgentCitationDto, question: &str) -> bool {
-    if !seed.display_name.is_empty() && question.contains(&seed.display_name) {
-        return true;
+/// Where the prompt first names this seed, or `None` when it never does.
+fn seed_prompt_mention_offset(
+    seed: &AgentCitationDto,
+    question: &str,
+    lowered_question: &str,
+    identities: &[String],
+) -> Option<usize> {
+    let mut offset: Option<usize> = None;
+    let mut record = |candidate: Option<usize>| {
+        if let Some(candidate) = candidate {
+            offset = Some(offset.map_or(candidate, |best: usize| best.min(candidate)));
+        }
+    };
+
+    if !seed.display_name.is_empty() {
+        record(question.find(&seed.display_name));
     }
-    if let Some(path) = seed.file_path.as_deref()
-        && !path.is_empty()
-        && question.contains(path)
-    {
-        return true;
+    if let Some(path) = seed.file_path.as_deref().filter(|path| !path.is_empty()) {
+        record(question.find(path));
     }
-    false
+    for identity in identities {
+        if !seed_matches_prompt_identity(seed, std::slice::from_ref(identity)) {
+            continue;
+        }
+        // An identity the prompt produced is normally locatable in it. When
+        // casing or trailing punctuation hides it, the seed still resolves; it
+        // just carries no position of its own.
+        record(Some(
+            lowered_question
+                .find(&identity.to_lowercase())
+                .unwrap_or(question.len()),
+        ));
+    }
+    offset
 }
 
 fn prompt_path_and_symbol_identities(question: &str) -> Vec<String> {
@@ -394,11 +414,18 @@ fn preferred_edge_kinds(task_class: PacketTaskClassDto) -> HashSet<EdgeKind> {
     kinds.iter().copied().collect()
 }
 
+/// Membership and inheritance relations are symmetric facts about a seed: which
+/// type owns it, what it overrides. They hold whichever way the incident edge is
+/// stored, so an undirected incidence pass may select them.
+///
+/// `CALL` is not such a fact. It is exactly the directional claim the path
+/// search adjudicates, so selecting it by incidence would protect the reverse
+/// edge that the directed search just rejected.
 fn is_implementation_kind(kind: EdgeKind, task_class: PacketTaskClassDto) -> bool {
     preferred_edge_kinds(task_class).contains(&kind)
         && matches!(
             kind,
-            EdgeKind::MEMBER | EdgeKind::OVERRIDE | EdgeKind::INHERITANCE | EdgeKind::CALL
+            EdgeKind::MEMBER | EdgeKind::OVERRIDE | EdgeKind::INHERITANCE
         )
 }
 
@@ -607,11 +634,57 @@ mod tests {
     }
 
     #[test]
-    fn domain_vocabulary_without_edges_creates_no_relation_objectives() {
+    fn broad_prompt_naming_no_identity_materializes_nothing() {
+        // The prompt names no repository identity, so the top retrieval hits are
+        // leads, not anchors. Materializing them would protect arbitrary results
+        // and demand a continuation to close a gap the caller never opened.
         let seeds = [citation("n1", "Client"), citation("n2", "Cache")];
         let plan = build_repository_evidence_plan(
             RepositoryEvidenceInput {
                 question: "Explain how the client cache formatter mapper request animation works",
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                seeds: &seeds,
+                relations: &[],
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        assert!(plan.objectives.is_empty(), "{:?}", plan.objectives);
+        assert!(plan.material_node_ids.is_empty());
+        assert!(plan.material_edge_ids.is_empty());
+        assert_eq!(
+            plan.uncovered
+                .iter()
+                .map(|gap| gap.kind)
+                .collect::<Vec<_>>(),
+            vec![RepositoryEvidenceGapKind::UnresolvedAnchors],
+        );
+    }
+
+    #[test]
+    fn broad_prompt_does_not_protect_the_first_retrieval_hit() {
+        // Same prompt, but retrieval also returned a relationship between the
+        // top hits. Neither the hits nor the edge become material.
+        let seeds = [citation("n1", "Client"), citation("n2", "Cache")];
+        let relations = [call_edge("e1", "n1", "n2")];
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Explain how requests are handled end to end",
+                task_class: PacketTaskClassDto::ArchitectureExplanation,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        assert!(plan.material_node_ids.is_empty());
+        assert!(plan.material_edge_ids.is_empty());
+    }
+
+    #[test]
+    fn named_anchors_without_edges_report_a_missing_relation() {
+        let seeds = [citation("n1", "Client"), citation("n2", "Cache")];
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Explain how Client uses Cache",
                 task_class: PacketTaskClassDto::ArchitectureExplanation,
                 seeds: &seeds,
                 relations: &[],
@@ -628,6 +701,57 @@ mod tests {
             g.kind,
             RepositoryEvidenceGapKind::MissingRelation | RepositoryEvidenceGapKind::Unknown
         )));
+    }
+
+    #[test]
+    fn pair_direction_follows_prompt_order_not_retrieval_order() {
+        // Retrieval returned Beta first; the prompt asks about Alpha calling
+        // Beta, and the stored edge runs Alpha to Beta. Searching in retrieval
+        // order would look for Beta to Alpha and report a missing relation.
+        let seeds = [citation("b", "Beta::finish"), citation("a", "Alpha::run")];
+        let relations = [call_edge("forward", "a", "b")];
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Beta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        let anchors: Vec<_> = plan
+            .objectives
+            .iter()
+            .filter(|o| o.kind == RepositoryEvidenceObjectiveKind::ResolvedAnchor)
+            .flat_map(|o| o.node_ids.iter().map(|n| n.0.as_str()))
+            .collect();
+        assert_eq!(anchors, vec!["a", "b"]);
+        assert!(plan.material_edge_ids.iter().any(|e| e.0 == "forward"));
+    }
+
+    #[test]
+    fn reversed_prompt_order_searches_the_other_direction() {
+        // Mirror of the previous case: the same seeds and the same stored edge,
+        // but the prompt asks the reverse question, which the graph cannot show.
+        let seeds = [citation("b", "Beta::finish"), citation("a", "Alpha::run")];
+        let relations = [call_edge("forward", "a", "b")];
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Beta::finish calling Alpha::run",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        let anchors: Vec<_> = plan
+            .objectives
+            .iter()
+            .filter(|o| o.kind == RepositoryEvidenceObjectiveKind::ResolvedAnchor)
+            .flat_map(|o| o.node_ids.iter().map(|n| n.0.as_str()))
+            .collect();
+        assert_eq!(anchors, vec!["b", "a"]);
+        assert!(!plan.material_edge_ids.iter().any(|e| e.0 == "forward"));
     }
 
     #[test]
@@ -720,6 +844,21 @@ mod tests {
             o.kind == RepositoryEvidenceObjectiveKind::RelationPath
                 && o.edge_ids.iter().any(|e| e.0 == "reverse_only")
         }));
+        // The incidence pass must not readmit the edge the directed search
+        // rejected: a rejected route cannot come back as material evidence.
+        assert!(
+            !plan.material_edge_ids.iter().any(|e| e.0 == "reverse_only"),
+            "{:?}",
+            plan.material_edge_ids
+        );
+        assert!(
+            !plan
+                .objectives
+                .iter()
+                .any(|o| o.edge_ids.iter().any(|e| e.0 == "reverse_only")),
+            "{:?}",
+            plan.objectives
+        );
         assert!(plan.uncovered.iter().any(|g| {
             g.kind == RepositoryEvidenceGapKind::MissingRelation
                 && g.node_ids.iter().any(|n| n.0 == "a")
