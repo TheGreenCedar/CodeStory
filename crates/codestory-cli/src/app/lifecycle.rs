@@ -150,11 +150,42 @@ fn render_cache_inventory_markdown(report: &codestory_runtime::CacheInventoryRep
     let _ = writeln!(markdown, "ownership_scope: `{}`", report.ownership_scope);
     let _ = writeln!(markdown, "apparent_bytes: {}", report.apparent_bytes);
     let _ = writeln!(markdown, "unique_bytes: {}", report.unique_bytes);
+    match report.allocated_bytes {
+        Some(allocated) => {
+            let _ = writeln!(markdown, "allocated_bytes: {allocated}");
+        }
+        None => {
+            let _ = writeln!(
+                markdown,
+                "allocated_bytes: unavailable (this platform does not report file allocation)"
+            );
+        }
+    }
     let _ = writeln!(
         markdown,
         "hardlink_deduplicated_bytes: {}",
         report.hardlink_deduplicated_bytes
     );
+    match report.clone_shared_bytes {
+        Some(shared) => {
+            let _ = writeln!(
+                markdown,
+                "clone_shared_bytes: {shared} (apparent minus allocated; cause not attributed)"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                markdown,
+                "clone_shared_bytes: unavailable (no allocation evidence)"
+            );
+        }
+    }
+    if report.partial_scan {
+        let _ = writeln!(
+            markdown,
+            "partial_scan: `true` (byte totals are lower bounds)"
+        );
+    }
     let _ = writeln!(markdown, "required_bytes: {}", report.required_bytes);
     let _ = writeln!(markdown, "reclaimable_bytes: {}", report.reclaimable_bytes);
     let _ = writeln!(markdown, "blocked_bytes: {}", report.blocked_bytes);

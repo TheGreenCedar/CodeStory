@@ -6,7 +6,7 @@
 
 use crate::cache_clean::{CacheCleanPlan, plan_cache_clean};
 use crate::config::user_cache_root;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use codestory_contracts::owned_artifacts::{
     ANNOTATIONS_SIDECAR_FILE, EMBEDDED_MODEL_CACHE_DIR, EMBEDDED_MODEL_DIGEST_DIR,
     EMBEDDED_MODEL_MATERIALIZE_LOCK_FILE,
@@ -32,6 +32,9 @@ pub enum CacheInventoryKind {
     Quarantine,
     Annotation,
     Temporary,
+    /// A directory or entry the scan could not read. Its contents are absent
+    /// from every byte total, so those totals are lower bounds.
+    Unreadable,
     Unknown,
 }
 
@@ -41,6 +44,11 @@ pub struct CacheInventoryEntry {
     pub relative_path: String,
     pub apparent_bytes: u64,
     pub unique_bytes: u64,
+    /// Bytes the filesystem reports as allocated for this file, where the
+    /// platform exposes that. `None` means allocation is unobservable here, not
+    /// that the file occupies nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocated_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -53,16 +61,17 @@ pub struct CacheHardlinkGroup {
     pub paths: Vec<String>,
 }
 
-/// One-shot report of copy-on-write clone *capability* under the cache root.
+/// One file whose allocated size is smaller than its apparent size.
 ///
-/// This is not a claim that extents are already shared across generations.
-/// Proven sharing is reported via [`CacheInventoryReport::hardlink_deduplicated_bytes`]
-/// / [`CacheInventoryReport::clone_shared_bytes`] from native file identity groups.
+/// The shortfall is measured, but its cause is not: copy-on-write extent
+/// sharing, sparse regions, and filesystem compression all produce it. Nothing
+/// here claims a specific cause, and nothing here is a capability probe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheCloneSharing {
     pub relative_path: String,
     pub apparent_bytes: u64,
-    pub provable: bool,
+    pub allocated_bytes: u64,
+    pub unallocated_bytes: u64,
     pub detail: String,
 }
 
@@ -81,8 +90,20 @@ pub struct CacheInventoryReport {
     pub ownership_scope: String,
     pub apparent_bytes: u64,
     pub unique_bytes: u64,
+    /// Summed per-file allocation over distinct native identities, where the
+    /// platform reports it. `None` means this platform exposes no allocation
+    /// evidence, so no allocation claim is made at all.
+    pub allocated_bytes: Option<u64>,
     pub hardlink_deduplicated_bytes: u64,
-    pub clone_shared_bytes: u64,
+    /// Apparent bytes with no distinct allocation behind them, measured as the
+    /// shortfall between apparent and allocated size. Copy-on-write sharing,
+    /// sparse regions, and compression all contribute; this does not attribute
+    /// the shortfall to any one of them, and it is never inferred from hardlink
+    /// counts or from a write probe.
+    pub clone_shared_bytes: Option<u64>,
+    /// Whether an unreadable entry kept the scan from seeing the whole tree.
+    /// When true every byte total below is a lower bound.
+    pub partial_scan: bool,
     pub required_bytes: u64,
     pub reclaimable_bytes: u64,
     pub blocked_bytes: u64,
@@ -94,6 +115,7 @@ pub struct CacheInventoryReport {
     pub quarantine: Vec<CacheInventoryEntry>,
     pub annotations: Vec<CacheInventoryEntry>,
     pub temporaries: Vec<CacheInventoryEntry>,
+    pub unreadable: Vec<CacheInventoryEntry>,
     pub unknown: Vec<CacheInventoryEntry>,
     pub hardlink_groups: Vec<CacheHardlinkGroup>,
     pub clone_sharing: Vec<CacheCloneSharing>,
@@ -113,19 +135,16 @@ fn build_cache_inventory(cache_root: &Path) -> Result<CacheInventoryReport> {
     let clean_plan = plan_cache_clean()?;
     let mut state = InventoryState::new(cache_root);
     if cache_root.is_dir() {
-        state.scan_tree(cache_root, cache_root)?;
-        state.probe_clone_capability_under_cache_root();
+        state.scan_tree(cache_root, cache_root);
     } else {
         state.errors.push(format!(
             "cache root does not exist: {}",
             cache_root.display()
         ));
     }
-    state.observe_sqlite_databases()?;
+    state.observe_sqlite_databases();
     state.finalize(clean_plan)
 }
-
-const CLONE_CAPABILITY_PROBE_DIR_PREFIX: &str = ".codestory-inventory-cow-probe-";
 
 struct InventoryState {
     cache_root: PathBuf,
@@ -135,11 +154,13 @@ struct InventoryState {
     hardlink_groups: BTreeMap<String, CacheHardlinkGroup>,
     clone_sharing: Vec<CacheCloneSharing>,
     sqlite_databases: Vec<SqliteDatabaseObservation>,
+    partial_scan: bool,
     errors: Vec<String>,
 }
 
 struct FileIdentityRecord {
     apparent_bytes: u64,
+    allocated_bytes: Option<u64>,
     link_count: u64,
 }
 
@@ -153,33 +174,79 @@ impl InventoryState {
             hardlink_groups: BTreeMap::new(),
             clone_sharing: Vec::new(),
             sqlite_databases: Vec::new(),
+            partial_scan: false,
             errors: Vec::new(),
         }
     }
 
-    fn scan_tree(&mut self, root: &Path, dir: &Path) -> Result<()> {
-        let read_dir = std::fs::read_dir(dir)
-            .with_context(|| format!("read cache directory {}", dir.display()))?;
+    /// Record one entry the scan could not read and continue. An unreadable
+    /// subtree is a scoped hole in the observation, never a proof that the
+    /// subtree is empty or reclaimable, so it also marks the scan partial.
+    fn push_unreadable(&mut self, relative: String, detail: String) {
+        self.partial_scan = true;
+        self.errors.push(format!("{relative}: {detail}"));
+        self.entries.push(CacheInventoryEntry {
+            kind: CacheInventoryKind::Unreadable,
+            relative_path: relative,
+            apparent_bytes: 0,
+            unique_bytes: 0,
+            allocated_bytes: None,
+            detail: Some(detail),
+        });
+    }
+
+    fn scan_tree(&mut self, root: &Path, dir: &Path) {
+        let dir_relative = display_relative(root, dir);
+        let read_dir = match std::fs::read_dir(dir) {
+            Ok(read_dir) => read_dir,
+            Err(error) => {
+                self.push_unreadable(dir_relative, format!("read cache directory: {error}"));
+                return;
+            }
+        };
         for entry in read_dir {
-            let entry = entry.with_context(|| format!("read entry under {}", dir.display()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    self.push_unreadable(
+                        dir_relative.clone(),
+                        format!("read entry under directory: {error}"),
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path)
-                .with_context(|| format!("inspect {}", path.display()))?;
+            let relative = display_relative(root, &path);
+            let metadata = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.push_unreadable(relative, format!("inspect entry: {error}"));
+                    continue;
+                }
+            };
             if metadata.file_type().is_symlink() {
-                self.push_unknown(&relative_path(root, &path)?, 0, "symlink entry");
+                self.push_unknown(&relative, 0, "symlink entry");
                 continue;
             }
             if metadata.is_dir() {
-                self.scan_tree(root, &path)?;
+                self.scan_tree(root, &path);
                 continue;
             }
             if !metadata.is_file() {
-                self.push_unknown(&relative_path(root, &path)?, 0, "unsupported entry type");
+                self.push_unknown(&relative, 0, "unsupported entry type");
                 continue;
             }
-            let relative = relative_path(root, &path)?;
             let apparent_bytes = metadata.len();
-            self.record_file(&relative, apparent_bytes, metadata)?;
+            let allocated_bytes = allocated_file_bytes(&metadata);
+            match native_file_identity(&metadata) {
+                Ok(identity) => {
+                    self.record_file(&relative, apparent_bytes, allocated_bytes, identity)
+                }
+                Err(error) => {
+                    self.push_unreadable(relative.clone(), format!("native identity: {error}"));
+                    continue;
+                }
+            }
             if path.extension().is_some_and(|ext| ext == "db")
                 || path.file_name().is_some_and(|name| {
                     name == "codestory.db" || name.to_string_lossy().ends_with(".sqlite3")
@@ -192,28 +259,41 @@ impl InventoryState {
                 kind,
                 relative_path: relative,
                 apparent_bytes,
-                unique_bytes: apparent_bytes,
+                unique_bytes: allocated_bytes.unwrap_or(apparent_bytes),
+                allocated_bytes,
                 detail: None,
             });
         }
-        Ok(())
     }
 
     fn record_file(
         &mut self,
         relative: &str,
         apparent_bytes: u64,
-        metadata: std::fs::Metadata,
-    ) -> Result<()> {
-        let identity = native_file_identity(&metadata)?;
+        allocated_bytes: Option<u64>,
+        identity: String,
+    ) {
         let record = self
             .file_identities
             .entry(identity.clone())
             .or_insert_with(|| FileIdentityRecord {
                 apparent_bytes,
+                allocated_bytes,
                 link_count: 0,
             });
         record.link_count = record.link_count.saturating_add(1);
+        if let Some(allocated) = allocated_bytes
+            && allocated < apparent_bytes
+            && record.link_count == 1
+        {
+            self.clone_sharing.push(CacheCloneSharing {
+                relative_path: relative.to_string(),
+                apparent_bytes,
+                allocated_bytes: allocated,
+                unallocated_bytes: apparent_bytes.saturating_sub(allocated),
+                detail: "apparent size exceeds allocated size; the filesystem is sharing, sparsifying, or compressing these bytes".into(),
+            });
+        }
         let group = self
             .hardlink_groups
             .entry(identity.clone())
@@ -225,60 +305,9 @@ impl InventoryState {
             });
         group.link_count = group.link_count.saturating_add(1);
         group.paths.push(relative.to_string());
-        Ok(())
     }
 
-    /// Probe CoW clone capability once under the cache root, then remove the
-    /// probe tree. Never writes outside the process cache root.
-    fn probe_clone_capability_under_cache_root(&mut self) {
-        let probe_dir = self.cache_root.join(format!(
-            "{CLONE_CAPABILITY_PROBE_DIR_PREFIX}{}",
-            std::process::id()
-        ));
-        let relative = relative_path(&self.cache_root, &probe_dir).unwrap_or_else(|_| {
-            CLONE_CAPABILITY_PROBE_DIR_PREFIX
-                .trim_end_matches('-')
-                .into()
-        });
-        let _ = std::fs::remove_dir_all(&probe_dir);
-        if let Err(error) = std::fs::create_dir_all(&probe_dir) {
-            self.clone_sharing.push(CacheCloneSharing {
-                relative_path: relative,
-                apparent_bytes: 0,
-                provable: false,
-                detail: format!("could not create cache-root CoW capability probe: {error}"),
-            });
-            return;
-        }
-        let source = probe_dir.join("source.bin");
-        let destination = probe_dir.join("clone.bin");
-        let capability = match std::fs::write(&source, b"codestory-inventory-cow-probe") {
-            Ok(()) => crate::copy_on_write::clone_file(&source, &destination).unwrap_or(false),
-            Err(error) => {
-                let _ = std::fs::remove_dir_all(&probe_dir);
-                self.clone_sharing.push(CacheCloneSharing {
-                    relative_path: relative,
-                    apparent_bytes: 0,
-                    provable: false,
-                    detail: format!("could not seed cache-root CoW capability probe: {error}"),
-                });
-                return;
-            }
-        };
-        let _ = std::fs::remove_dir_all(&probe_dir);
-        self.clone_sharing.push(CacheCloneSharing {
-            relative_path: relative,
-            apparent_bytes: 0,
-            provable: capability,
-            detail: if capability {
-                "copy-on-write clone capability available under cache root".into()
-            } else {
-                "copy-on-write clone capability unavailable under cache root".into()
-            },
-        });
-    }
-
-    fn observe_sqlite_databases(&mut self) -> Result<()> {
+    fn observe_sqlite_databases(&mut self) {
         for path in self.sqlite_paths.clone() {
             match observe_sqlite_database(&path) {
                 Ok(observation) => self.sqlite_databases.push(observation),
@@ -287,15 +316,25 @@ impl InventoryState {
                     .push(format!("observe sqlite {}: {error}", path.display())),
             }
         }
-        Ok(())
     }
 
     fn finalize(self, clean_plan: CacheCleanPlan) -> Result<CacheInventoryReport> {
-        let unique_bytes = self
+        let apparent_unique_bytes: u64 = self
             .file_identities
             .values()
             .map(|record| record.apparent_bytes)
             .sum();
+        // Allocation is all-or-nothing evidence: one file without it makes the
+        // total a claim the platform cannot support, so the whole figure drops
+        // to `None` rather than silently mixing apparent and allocated bytes.
+        let allocated_bytes = self
+            .file_identities
+            .values()
+            .map(|record| record.allocated_bytes)
+            .try_fold(0_u64, |total, allocated| {
+                allocated.map(|allocated| total.saturating_add(allocated))
+            });
+        let unique_bytes = allocated_bytes.unwrap_or(apparent_unique_bytes);
         let apparent_bytes = self.entries.iter().map(|entry| entry.apparent_bytes).sum();
         let hardlink_deduplicated_bytes = self
             .hardlink_groups
@@ -307,9 +346,10 @@ impl InventoryState {
                     .saturating_mul(group.link_count.saturating_sub(1))
             })
             .sum();
-        // Proven sharing only: hardlink / native-identity groups. A successful
-        // CoW capability probe is not evidence that extents are already shared.
-        let clone_shared_bytes = hardlink_deduplicated_bytes;
+        // Measured allocation shortfall over distinct files. Hardlink counts
+        // prove aliasing, not extent sharing, so they never feed this figure.
+        let clone_shared_bytes =
+            allocated_bytes.map(|allocated| apparent_unique_bytes.saturating_sub(allocated));
 
         let mut top_consumers = self
             .entries
@@ -336,6 +376,7 @@ impl InventoryState {
         let quarantine = filter_kind(&self.entries, CacheInventoryKind::Quarantine);
         let annotations = filter_kind(&self.entries, CacheInventoryKind::Annotation);
         let temporaries = filter_kind(&self.entries, CacheInventoryKind::Temporary);
+        let unreadable = filter_kind(&self.entries, CacheInventoryKind::Unreadable);
         let unknown = filter_kind(&self.entries, CacheInventoryKind::Unknown);
 
         let required_bytes = self
@@ -370,13 +411,17 @@ impl InventoryState {
 
         Ok(CacheInventoryReport {
             schema_version: CACHE_INVENTORY_SCHEMA_VERSION,
-            dry_run: true,
+            // Inventory only ever plans, so it reports the plan's own mode
+            // rather than asserting a mode of its own.
+            dry_run: clean_plan.dry_run,
             cache_root: self.cache_root.display().to_string(),
             ownership_scope: "process_cache_root".into(),
             apparent_bytes,
             unique_bytes,
+            allocated_bytes,
             hardlink_deduplicated_bytes,
             clone_shared_bytes,
+            partial_scan: self.partial_scan,
             required_bytes,
             reclaimable_bytes,
             blocked_bytes,
@@ -388,6 +433,7 @@ impl InventoryState {
             quarantine,
             annotations,
             temporaries,
+            unreadable,
             unknown,
             hardlink_groups: self.hardlink_groups.into_values().collect(),
             clone_sharing: self.clone_sharing,
@@ -404,6 +450,7 @@ impl InventoryState {
             relative_path: relative.to_string(),
             apparent_bytes,
             unique_bytes: apparent_bytes,
+            allocated_bytes: None,
             detail: Some(detail.into()),
         });
     }
@@ -420,16 +467,35 @@ fn filter_kind(
         .collect()
 }
 
-fn relative_path(root: &Path, path: &Path) -> Result<String> {
-    path.strip_prefix(root)
-        .with_context(|| {
-            format!(
-                "path {} is outside cache root {}",
-                path.display(),
-                root.display()
-            )
-        })
-        .map(|relative| relative.to_string_lossy().replace('\\', "/"))
+/// The cache-root-relative label for one path. A path outside the root can only
+/// come from the root itself, which labels as the empty string; everything else
+/// falls back to the absolute path rather than dropping the entry.
+fn display_relative(root: &Path, path: &Path) -> String {
+    match path.strip_prefix(root) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".into(),
+        Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+        Err(_) => path.to_string_lossy().replace('\\', "/"),
+    }
+}
+
+/// Bytes the filesystem has actually allocated for one file, where the platform
+/// reports it. Windows exposes no allocation size through `std`, so allocation
+/// evidence is simply absent there rather than approximated.
+fn allocated_file_bytes(metadata: &std::fs::Metadata) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(
+            u64::try_from(metadata.blocks())
+                .unwrap_or(0)
+                .saturating_mul(512),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        None
+    }
 }
 
 fn path_is_under_retained(entry_relative: &str, retained_relative: &str) -> bool {
@@ -537,20 +603,43 @@ mod tests {
         );
         assert!(report.dry_run);
         assert_eq!(report.ownership_scope, "process_cache_root");
-        assert_eq!(
-            report.clone_sharing.len(),
-            1,
-            "inventory should report CoW capability once: {:?}",
+        assert!(
+            !report.partial_scan,
+            "a fully readable cache root must not report a partial scan: {:?}",
+            report.errors
+        );
+        assert!(
+            report
+                .clone_sharing
+                .iter()
+                .all(|entry| entry.unallocated_bytes > 0
+                    && entry.allocated_bytes < entry.apparent_bytes),
+            "clone sharing rows must carry a measured allocation shortfall: {:?}",
             report.clone_sharing
         );
-        assert_eq!(
-            report.clone_sharing[0].apparent_bytes, 0,
-            "capability probes must not claim shared bytes"
-        );
-        assert_eq!(
-            report.clone_shared_bytes, report.hardlink_deduplicated_bytes,
-            "clone_shared_bytes must equal identity-proven hardlink sharing"
-        );
+        if cfg!(unix) {
+            let clone_shared = report
+                .clone_shared_bytes
+                .expect("unix reports allocation evidence");
+            assert_eq!(
+                clone_shared,
+                report
+                    .clone_sharing
+                    .iter()
+                    .map(|entry| entry.unallocated_bytes)
+                    .sum::<u64>(),
+                "shared bytes must be the measured shortfall, not a hardlink count"
+            );
+            assert!(
+                report.allocated_bytes.is_some(),
+                "unix inventory must report allocation"
+            );
+        } else {
+            assert_eq!(
+                report.clone_shared_bytes, None,
+                "a platform without allocation evidence must make no sharing claim"
+            );
+        }
         assert!(
             report
                 .entries
@@ -567,10 +656,8 @@ mod tests {
             "sqlite databases should be observed"
         );
         assert!(
-            !after
-                .keys()
-                .any(|path| path.contains(CLONE_CAPABILITY_PROBE_DIR_PREFIX)),
-            "capability probe directory must be removed: {:?}",
+            !after.keys().any(|path| path.contains("probe")),
+            "inventory must not create a probe under the cache root at all: {:?}",
             after.keys().collect::<Vec<_>>()
         );
     }
@@ -636,17 +723,68 @@ mod tests {
             "hardlink dedup should be reported: {:?}",
             report.hardlink_groups
         );
-        assert_eq!(
-            report.clone_shared_bytes, report.hardlink_deduplicated_bytes,
-            "shared bytes must come from identity groups, not CoW capability probes"
+        // Two names for eight bytes is aliasing, not extent sharing. The
+        // previous report equated the two and claimed shared bytes that the
+        // filesystem had never shared.
+        assert_ne!(
+            report.clone_shared_bytes,
+            Some(report.hardlink_deduplicated_bytes),
+            "hardlink aliasing must not be restated as clone sharing"
         );
         assert!(
             report
                 .clone_sharing
                 .iter()
-                .all(|entry| entry.apparent_bytes == 0),
-            "capability entries must not inflate shared bytes: {:?}",
+                .all(|entry| entry.allocated_bytes < entry.apparent_bytes),
+            "every sharing row must rest on measured allocation: {:?}",
             report.clone_sharing
+        );
+    }
+
+    /// A directory the scan cannot open is a hole in the observation. Aborting
+    /// the whole inventory hides everything else, and skipping it silently
+    /// would let an unreadable subtree read as empty.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_subtree_is_scoped_rather_than_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cache = tempdir().expect("cache root");
+        let workspace_id = "00112233445566aa";
+        let project_cache = cache.path().join(workspace_id);
+        std::fs::create_dir_all(&project_cache).expect("create project cache");
+        std::fs::write(project_cache.join("codestory.db"), b"readable-payload")
+            .expect("write readable database");
+        let locked = cache.path().join("locked");
+        std::fs::create_dir_all(&locked).expect("create locked directory");
+        std::fs::write(locked.join("hidden.bin"), b"hidden").expect("write hidden payload");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("remove directory read permission");
+
+        let report = with_test_cache_root(cache.path(), cache_inventory);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore directory permission");
+        let report = report.expect("an unreadable subtree must not fail the inventory");
+
+        assert!(
+            report.partial_scan,
+            "an unreadable subtree makes every byte total a lower bound"
+        );
+        assert!(
+            report
+                .unreadable
+                .iter()
+                .any(|entry| entry.relative_path == "locked"),
+            "the unreadable directory must be scoped as its own entry: {:?}",
+            report.unreadable
+        );
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == format!("{workspace_id}/codestory.db")),
+            "the readable remainder of the tree must still be inventoried: {:?}",
+            report.entries
         );
     }
 
