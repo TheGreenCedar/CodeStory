@@ -121,7 +121,7 @@ pub fn build_repository_evidence_plan(
     let adjacency = build_adjacency(input.relations, &preferred, limits.max_candidate_edges);
 
     let mut path_count = 0usize;
-    let mut truncated = false;
+    let mut truncated = adjacency.truncated;
     for (seed_index, start) in seed_nodes.iter().enumerate() {
         for end in seed_nodes.iter().skip(seed_index + 1) {
             if path_count >= limits.max_relation_paths {
@@ -131,11 +131,11 @@ pub fn build_repository_evidence_plan(
             match shortest_path(
                 start,
                 end,
-                &adjacency,
+                &adjacency.edges,
                 limits.max_depth,
                 limits.max_candidate_nodes,
             ) {
-                Some(path) => {
+                PathSearch::Found(path) => {
                     path_count += 1;
                     for node in &path.nodes {
                         push_unique_node(&mut plan.material_node_ids, node.clone());
@@ -149,7 +149,18 @@ pub fn build_repository_evidence_plan(
                         edge_ids: path.edges,
                     });
                 }
-                None => {
+                PathSearch::Exhausted if adjacency.truncated => {
+                    // The graph itself was cut, so an exhausted search over it
+                    // still proves nothing about the repository.
+                    plan.uncovered.push(RepositoryEvidenceGap {
+                        kind: RepositoryEvidenceGapKind::TruncatedSearch,
+                        detail: "relationship graph truncated before the anchors were connected"
+                            .into(),
+                        node_ids: vec![start.clone(), end.clone()],
+                        edge_ids: Vec::new(),
+                    });
+                }
+                PathSearch::Exhausted => {
                     // Missing path between two seeds is unknown, not absence.
                     plan.uncovered.push(RepositoryEvidenceGap {
                         kind: RepositoryEvidenceGapKind::MissingRelation,
@@ -158,18 +169,29 @@ pub fn build_repository_evidence_plan(
                         edge_ids: Vec::new(),
                     });
                 }
+                PathSearch::Truncated => {
+                    truncated = true;
+                    plan.uncovered.push(RepositoryEvidenceGap {
+                        kind: RepositoryEvidenceGapKind::TruncatedSearch,
+                        detail: "relationship search hit the depth or node budget".into(),
+                        node_ids: vec![start.clone(), end.clone()],
+                        edge_ids: Vec::new(),
+                    });
+                }
             }
         }
-        if truncated {
+        if truncated && path_count >= limits.max_relation_paths {
             break;
         }
     }
 
     // Implementation relations incident to seeds (membership / override / etc.).
-    for edge in input.relations.iter().take(limits.max_candidate_edges) {
-        if !is_implementation_kind(edge.kind, input.task_class) {
-            continue;
-        }
+    for edge in input
+        .relations
+        .iter()
+        .filter(|edge| is_implementation_kind(edge.kind, input.task_class))
+        .take(limits.max_candidate_edges)
+    {
         let touches_seed = seed_nodes
             .iter()
             .any(|n| n == &edge.source || n == &edge.target);
@@ -441,16 +463,33 @@ fn edge_kind_is_undirected(_kind: EdgeKind) -> bool {
     false
 }
 
+struct Adjacency {
+    edges: BTreeMap<NodeId, Vec<AdjEdge>>,
+    /// The edge budget dropped preferred edges, so any failed search over this
+    /// graph is truncated rather than exhaustive.
+    truncated: bool,
+}
+
+/// Spend the edge budget on edges this task class can actually traverse. Taking
+/// the first `max_edges` relations regardless of kind let unusable edges consume
+/// the budget and made a reachable path look absent.
 fn build_adjacency(
     relations: &[GraphEdgeDto],
     preferred: &HashSet<EdgeKind>,
     max_edges: usize,
-) -> BTreeMap<NodeId, Vec<AdjEdge>> {
+) -> Adjacency {
     let mut adj: BTreeMap<NodeId, Vec<AdjEdge>> = BTreeMap::new();
-    for edge in relations.iter().take(max_edges) {
-        if !preferred.contains(&edge.kind) {
-            continue;
+    let mut admitted = 0usize;
+    let mut truncated = false;
+    for edge in relations
+        .iter()
+        .filter(|edge| preferred.contains(&edge.kind))
+    {
+        if admitted >= max_edges {
+            truncated = true;
+            break;
         }
+        admitted += 1;
         adj.entry(edge.source.clone()).or_default().push(AdjEdge {
             to: edge.target.clone(),
             edge_id: edge.id.clone(),
@@ -462,7 +501,10 @@ fn build_adjacency(
             });
         }
     }
-    adj
+    Adjacency {
+        edges: adj,
+        truncated,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -471,15 +513,25 @@ struct PathResult {
     edges: Vec<EdgeId>,
 }
 
+/// Why a directed search ended. A search stopped by a planner limit has not
+/// looked everywhere, so it cannot report that no path exists.
+enum PathSearch {
+    Found(PathResult),
+    /// The whole reachable subgraph was searched and holds no path.
+    Exhausted,
+    /// A depth or node budget cut the search short.
+    Truncated,
+}
+
 fn shortest_path(
     start: &NodeId,
     end: &NodeId,
     adjacency: &BTreeMap<NodeId, Vec<AdjEdge>>,
     max_depth: usize,
     max_nodes: usize,
-) -> Option<PathResult> {
+) -> PathSearch {
     if start == end {
-        return Some(PathResult {
+        return PathSearch::Found(PathResult {
             nodes: vec![start.clone()],
             edges: Vec::new(),
         });
@@ -488,10 +540,16 @@ fn shortest_path(
     let mut visited = BTreeSet::new();
     // pred: node -> (previous node, edge used)
     let mut pred: BTreeMap<NodeId, (NodeId, EdgeId)> = BTreeMap::new();
+    let mut truncated = false;
     queue.push_back((start.clone(), 0usize));
     visited.insert(start.clone());
     while let Some((node, depth)) = queue.pop_front() {
         if depth >= max_depth {
+            // Frontier nodes still had unexplored edges when the depth budget
+            // ran out, so the search is incomplete rather than exhaustive.
+            if adjacency.get(&node).is_some_and(|edges| !edges.is_empty()) {
+                truncated = true;
+            }
             continue;
         }
         for edge in adjacency.get(&node).into_iter().flatten() {
@@ -500,15 +558,19 @@ fn shortest_path(
             }
             pred.insert(edge.to.clone(), (node.clone(), edge.edge_id.clone()));
             if &edge.to == end {
-                return Some(reconstruct_path(start, end, &pred));
+                return PathSearch::Found(reconstruct_path(start, end, &pred));
             }
             if visited.len() >= max_nodes {
-                return None;
+                return PathSearch::Truncated;
             }
             queue.push_back((edge.to.clone(), depth + 1));
         }
     }
-    None
+    if truncated {
+        PathSearch::Truncated
+    } else {
+        PathSearch::Exhausted
+    }
 }
 
 fn reconstruct_path(
@@ -864,6 +926,196 @@ mod tests {
                 && g.node_ids.iter().any(|n| n.0 == "a")
                 && g.node_ids.iter().any(|n| n.0 == "b")
         }));
+    }
+
+    #[test]
+    fn depth_exhaustion_reports_truncation_not_a_missing_relation() {
+        // A chain longer than max_depth. The path exists; the search cannot see
+        // it, and must not claim the repository lacks one.
+        let seeds = [citation("a", "Alpha::run"), citation("z", "Zeta::finish")];
+        let relations = [
+            call_edge("e1", "a", "m1"),
+            call_edge("e2", "m1", "m2"),
+            call_edge("e3", "m2", "m3"),
+            call_edge("e4", "m3", "m4"),
+            call_edge("e5", "m4", "z"),
+        ];
+        let limits = RepositoryEvidenceLimits {
+            max_depth: 2,
+            ..RepositoryEvidenceLimits::default()
+        };
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Zeta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            limits,
+        );
+        assert!(
+            plan.uncovered
+                .iter()
+                .any(|g| g.kind == RepositoryEvidenceGapKind::TruncatedSearch),
+            "{:?}",
+            plan.uncovered
+        );
+        assert!(
+            !plan
+                .uncovered
+                .iter()
+                .any(|g| g.kind == RepositoryEvidenceGapKind::MissingRelation),
+            "{:?}",
+            plan.uncovered
+        );
+    }
+
+    #[test]
+    fn node_budget_exhaustion_reports_truncation() {
+        let seeds = [citation("a", "Alpha::run"), citation("z", "Zeta::finish")];
+        let mut relations = vec![call_edge("e1", "a", "m1"), call_edge("e2", "m1", "z")];
+        for index in 0..8 {
+            relations.push(call_edge(
+                &format!("fan{index}"),
+                "a",
+                &format!("fanout{index}"),
+            ));
+        }
+        let limits = RepositoryEvidenceLimits {
+            max_candidate_nodes: 3,
+            ..RepositoryEvidenceLimits::default()
+        };
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Zeta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            limits,
+        );
+        assert!(
+            plan.uncovered
+                .iter()
+                .any(|g| g.kind == RepositoryEvidenceGapKind::TruncatedSearch),
+            "{:?}",
+            plan.uncovered
+        );
+        assert!(
+            !plan
+                .uncovered
+                .iter()
+                .any(|g| g.kind == RepositoryEvidenceGapKind::MissingRelation),
+            "{:?}",
+            plan.uncovered
+        );
+    }
+
+    #[test]
+    fn unusable_edges_do_not_spend_the_traversal_budget() {
+        // RouteTracing only traverses CALL. The IMPORT edges arrive first, and
+        // taking the first max_candidate_edges relations would spend the whole
+        // budget on edges this task class can never follow.
+        let seeds = [citation("a", "Alpha::run"), citation("b", "Beta::finish")];
+        let mut relations = Vec::new();
+        for index in 0..8 {
+            relations.push(GraphEdgeDto {
+                kind: EdgeKind::IMPORT,
+                ..call_edge(&format!("import{index}"), "a", &format!("module{index}"))
+            });
+        }
+        relations.push(call_edge("forward", "a", "b"));
+        let limits = RepositoryEvidenceLimits {
+            max_candidate_edges: 4,
+            ..RepositoryEvidenceLimits::default()
+        };
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Beta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            limits,
+        );
+        assert!(
+            plan.material_edge_ids.iter().any(|e| e.0 == "forward"),
+            "{:?}",
+            plan.material_edge_ids
+        );
+    }
+
+    #[test]
+    fn a_truncated_graph_never_reports_a_missing_relation() {
+        let seeds = [citation("a", "Alpha::run"), citation("b", "Beta::finish")];
+        let mut relations = Vec::new();
+        for index in 0..8 {
+            relations.push(call_edge(
+                &format!("noise{index}"),
+                &format!("other{index}"),
+                &format!("target{index}"),
+            ));
+        }
+        let limits = RepositoryEvidenceLimits {
+            max_candidate_edges: 4,
+            ..RepositoryEvidenceLimits::default()
+        };
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Beta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            limits,
+        );
+        assert!(
+            !plan
+                .uncovered
+                .iter()
+                .any(|g| g.kind == RepositoryEvidenceGapKind::MissingRelation),
+            "{:?}",
+            plan.uncovered
+        );
+        assert!(
+            plan.uncovered
+                .iter()
+                .any(|g| g.kind == RepositoryEvidenceGapKind::TruncatedSearch),
+            "{:?}",
+            plan.uncovered
+        );
+    }
+
+    #[test]
+    fn a_complete_graph_still_reports_a_genuine_missing_relation() {
+        // Nothing was cut, so an exhausted search is real evidence of absence
+        // within the retained graph and must stay MissingRelation.
+        let seeds = [citation("a", "Alpha::run"), citation("b", "Beta::finish")];
+        let relations = [call_edge("elsewhere", "other", "target")];
+        let plan = build_repository_evidence_plan(
+            RepositoryEvidenceInput {
+                question: "Trace Alpha::run calling Beta::finish",
+                task_class: PacketTaskClassDto::RouteTracing,
+                seeds: &seeds,
+                relations: &relations,
+            },
+            RepositoryEvidenceLimits::default(),
+        );
+        assert!(
+            plan.uncovered
+                .iter()
+                .any(|g| g.kind == RepositoryEvidenceGapKind::MissingRelation),
+            "{:?}",
+            plan.uncovered
+        );
+        assert!(
+            !plan
+                .uncovered
+                .iter()
+                .any(|g| g.kind == RepositoryEvidenceGapKind::TruncatedSearch),
+            "{:?}",
+            plan.uncovered
+        );
     }
 
     #[test]

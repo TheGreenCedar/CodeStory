@@ -699,7 +699,7 @@ pub fn merge_repository_evidence_gaps_into_disposition(
     gaps: &[codestory_agent::repository_evidence_plan::RepositoryEvidenceGap],
     already_drilled: bool,
 ) {
-    if already_drilled || gaps.is_empty() {
+    if gaps.is_empty() {
         return;
     }
     if matches!(
@@ -713,6 +713,18 @@ pub fn merge_repository_evidence_gaps_into_disposition(
         return;
     }
     options.truncate(PACKET_DRILL_MAX_OPTIONS);
+
+    if already_drilled {
+        // The drill round is spent, so no further options are offered. The gap
+        // is still open, and `terminal_after_drill` already treats a remaining
+        // option as an unmet material obligation: a packet whose repository
+        // evidence never closed cannot read as Supported. An existing
+        // not-established reason is more specific, so it stays.
+        if packet.disposition.kind == PacketDispositionKindDto::Supported {
+            packet.disposition = terminal_after_drill(&packet.support, options, false);
+        }
+        return;
+    }
 
     if let Some(drill) = packet.disposition.drill.as_mut() {
         let mut seen = drill
@@ -837,6 +849,85 @@ mod tests {
             eligible_for_sufficiency: Some(true),
             source_excerpt: None,
         }
+    }
+
+    fn unresolved_repository_gap()
+    -> codestory_agent::repository_evidence_plan::RepositoryEvidenceGap {
+        use codestory_agent::repository_evidence_plan::{
+            RepositoryEvidenceGap, RepositoryEvidenceGapKind,
+        };
+        RepositoryEvidenceGap {
+            kind: RepositoryEvidenceGapKind::MissingRelation,
+            detail: "no retained typed path between resolved anchors".to_string(),
+            node_ids: vec![NodeId("Alpha".to_string())],
+            edge_ids: Vec::new(),
+        }
+    }
+
+    /// An open repository gap on a first-round packet is closable, so it becomes
+    /// a drill option.
+    #[test]
+    fn a_repository_gap_before_the_drill_offers_a_continuation() {
+        let mut packet = test_packet("Trace Alpha::run calling Beta::finish", 8192);
+        packet.disposition = PacketDispositionDto::supported();
+
+        merge_repository_evidence_gaps_into_disposition(
+            &mut packet,
+            &[unresolved_repository_gap()],
+            false,
+        );
+
+        assert_eq!(packet.disposition.kind, PacketDispositionKindDto::DrillOnce);
+    }
+
+    /// The drill round is spent and the gap is still open. Dropping it here let
+    /// a packet whose repository evidence never resolved report Supported.
+    #[test]
+    fn a_repository_gap_after_the_drill_blocks_supported() {
+        let mut packet = test_packet("Trace Alpha::run calling Beta::finish", 8192);
+        packet.disposition = PacketDispositionDto::supported();
+
+        merge_repository_evidence_gaps_into_disposition(
+            &mut packet,
+            &[unresolved_repository_gap()],
+            true,
+        );
+
+        assert_eq!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::NotEstablished,
+            "{:?}",
+            packet.disposition
+        );
+        assert_ne!(
+            packet.disposition.kind,
+            PacketDispositionKindDto::DrillOnce,
+            "a spent drill must not offer another round"
+        );
+    }
+
+    /// Observational gaps never assert absence, so they never move a
+    /// disposition in either round.
+    #[test]
+    fn an_unknown_repository_gap_after_the_drill_leaves_supported_alone() {
+        use codestory_agent::repository_evidence_plan::{
+            RepositoryEvidenceGap, RepositoryEvidenceGapKind,
+        };
+        let mut packet = test_packet("Trace Alpha::run calling Beta::finish", 8192);
+        packet.disposition = PacketDispositionDto::supported();
+
+        merge_repository_evidence_gaps_into_disposition(
+            &mut packet,
+            &[RepositoryEvidenceGap {
+                kind: RepositoryEvidenceGapKind::Unknown,
+                detail: "anchors resolved but no repository relationship selected".to_string(),
+                node_ids: vec![NodeId("Alpha".to_string())],
+                edge_ids: Vec::new(),
+            }],
+            true,
+        );
+
+        assert_eq!(packet.disposition.kind, PacketDispositionKindDto::Supported);
     }
 
     fn retained_source_range(symbol_id: &str, path: &str) -> SupportUnitDto {
