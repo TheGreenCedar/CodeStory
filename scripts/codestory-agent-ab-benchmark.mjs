@@ -3033,6 +3033,9 @@ function installedAgentTiming(values) {
       throw new Error(`installed timing ${field} must be finite and nonnegative`);
     }
   }
+  // Reconcile in unrounded milliseconds, then round once. Rounding each phase
+  // and the wall independently lets three half-millisecond errors accumulate,
+  // and the downstream equality checks read that as a reconciliation failure.
   const reconciled = values.agent_runner_ms
     + values.time_to_first_packet_ms
     + values.continuation_ms;
@@ -3041,15 +3044,16 @@ function installedAgentTiming(values) {
       `installed timing does not reconcile: phases=${reconciled} wall=${values.whole_task_wall_ms}`,
     );
   }
+  const agentRunnerMs = Math.round(values.agent_runner_ms);
+  const timeToFirstPacketMs = Math.round(values.time_to_first_packet_ms);
+  const continuationMs = Math.round(values.continuation_ms);
   return {
     timing_cohort_id: values.timing_cohort_id,
-    agent_runner_ms: Math.round(values.agent_runner_ms),
-    time_to_first_packet_ms: Math.round(values.time_to_first_packet_ms),
-    continuation_ms: Math.round(values.continuation_ms),
-    time_to_final_packet_ms: Math.round(
-      values.time_to_first_packet_ms + values.continuation_ms,
-    ),
-    whole_task_wall_ms: Math.round(values.whole_task_wall_ms),
+    agent_runner_ms: agentRunnerMs,
+    time_to_first_packet_ms: timeToFirstPacketMs,
+    continuation_ms: continuationMs,
+    time_to_final_packet_ms: timeToFirstPacketMs + continuationMs,
+    whole_task_wall_ms: agentRunnerMs + timeToFirstPacketMs + continuationMs,
   };
 }
 
@@ -4766,6 +4770,8 @@ function preludePublicFields(prelude) {
     signal: prelude.signal,
     error: prelude.error,
     wall_ms: prelude.wall_ms,
+    time_to_first_packet_ms: prelude.time_to_first_packet_ms ?? 0,
+    continuation_ms: prelude.continuation_ms ?? 0,
     stdout_path: prelude.stdout_path,
     stderr_path: prelude.stderr_path,
     stdout_bytes: prelude.stdout_bytes,
@@ -5989,6 +5995,11 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     timeoutMs: opts.timeoutMs,
     timeoutMessage: `CodeStory packet prelude timed out after ${opts.timeoutMs}ms.`,
   });
+  // Stop the clock when the first packet returns. A continuation, if one runs
+  // at all, is timed on its own interval below; nothing else is attributed to
+  // either of them.
+  const timeToFirstPacketMs = performance.now() - started;
+  let continuationMs = 0;
   await writeFile(stdoutPath, result.stdout, "utf8");
   await writeFile(stderrPath, result.stderr, "utf8");
 
@@ -6020,6 +6031,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     if (drillArgs) {
       const drillStdoutPath = path.join(outDir, `${runId}.codestory-packet-drill.stdout.json`);
       const drillStderrPath = path.join(outDir, `${runId}.codestory-packet-drill.stderr.txt`);
+      const drillStarted = performance.now();
       const drillResult = await runProcess(codestoryCli, drillArgs, {
         cwd: repoConfig.path,
         env,
@@ -6027,6 +6039,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
         timeoutMs: opts.timeoutMs,
         timeoutMessage: `CodeStory packet drill continuation timed out after ${opts.timeoutMs}ms.`,
       });
+      continuationMs = performance.now() - drillStarted;
       await writeFile(drillStdoutPath, drillResult.stdout, "utf8");
       await writeFile(drillStderrPath, drillResult.stderr, "utf8");
       if (drillResult.status === "pass") {
@@ -6080,6 +6093,8 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     signal: result.signal,
     error: result.error ?? parseError ?? commandFailureReason ?? contractBlockers[0] ?? null,
     wall_ms: wallMs,
+    time_to_first_packet_ms: timeToFirstPacketMs,
+    continuation_ms: continuationMs,
     stdout_path: activeStdoutPath,
     stderr_path: activeStderrPath,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
@@ -6240,16 +6255,22 @@ async function runOne(opts, run, outDir) {
     task_id: run.task?.id ?? run.repo,
     repeat: run.repeat,
   });
-  const codestoryPreludeWallMs = codestoryPrelude?.public.wall_ms ?? 0;
-  const timeToFirstPacketMs = Number.isFinite(codestoryPrelude?.public.time_to_first_packet_ms)
-    ? codestoryPrelude.public.time_to_first_packet_ms
-    : 0;
-  const continuationMs = Number.isFinite(codestoryPrelude?.public.continuation_ms)
-    ? codestoryPrelude.public.continuation_ms
-    : Math.max(0, codestoryPreludeWallMs - timeToFirstPacketMs);
+  // Both packet phases are measured intervals or nothing. A run without a
+  // CodeStory prelude has no packet phases at all, and a continuation that did
+  // not run contributes zero rather than absorbing the rest of the prelude.
+  if (codestoryPrelude && !(
+    Number.isFinite(codestoryPrelude.public.time_to_first_packet_ms)
+    && Number.isFinite(codestoryPrelude.public.continuation_ms)
+  )) {
+    throw new Error("CodeStory packet prelude did not measure its first-packet and continuation intervals");
+  }
+  const timeToFirstPacketMs = codestoryPrelude?.public.time_to_first_packet_ms ?? 0;
+  const continuationMs = codestoryPrelude?.public.continuation_ms ?? 0;
   const installedTiming = installedAgentTiming({
     timing_cohort_id: timingCohortId,
-    agent_runner_ms: runnerWallMs + (baselinePrelude?.public.wall_ms ?? 0),
+    // Everything outside the two measured packet intervals: the agent runner,
+    // the baseline prelude, and the prelude's own parsing and file writes.
+    agent_runner_ms: Math.max(0, wallMs - timeToFirstPacketMs - continuationMs),
     time_to_first_packet_ms: timeToFirstPacketMs,
     continuation_ms: continuationMs,
     whole_task_wall_ms: wallMs,

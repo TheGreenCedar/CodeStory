@@ -38,6 +38,7 @@ import {
   isPathInside,
   installedAgentTiming,
   installedAgentTimingCohortId,
+  installedAgentTimingPhaseWarmMs,
   exactCandidateTimingFromInstalledPhases,
   timingEligibleExactCandidateRow,
   timingIneligibleComparatorRow,
@@ -9143,6 +9144,57 @@ test("installed timing separates runner, first packet, continuation, final packe
       whole_task_wall_ms: 59,
     }),
     /does not reconcile/,
+  );
+});
+
+test("installed timing reconciles at rounding boundaries instead of drifting by up to 1.5ms", () => {
+  // Every phase sits on a .5 boundary, so rounding each one independently and
+  // rounding the wall independently disagree by 1ms. Reconciling unrounded and
+  // rounding once keeps the emitted phases and wall exactly consistent.
+  const timing = installedAgentTiming({
+    timing_cohort_id: "d".repeat(64),
+    agent_runner_ms: 100.5,
+    time_to_first_packet_ms: 20.5,
+    continuation_ms: 4.5,
+    whole_task_wall_ms: 125.5,
+  });
+  assert.equal(installedAgentTimingPhaseWarmMs(timing), timing.whole_task_wall_ms);
+  assert.equal(
+    timing.time_to_final_packet_ms,
+    timing.time_to_first_packet_ms + timing.continuation_ms,
+  );
+  assert.doesNotThrow(() => exactCandidateTimingFromInstalledPhases(timing));
+});
+
+test("a packet prelude that ran no continuation reports zero, not the rest of its wall", () => {
+  const noContinuation = preludePublicFields({
+    command: "codestory-cli packet",
+    args: ["packet"],
+    status: "pass",
+    process_status: "pass",
+    exit_code: 0,
+    signal: null,
+    error: null,
+    wall_ms: 812.4,
+    time_to_first_packet_ms: 806.1,
+    continuation_ms: 0,
+    stdout_path: "/tmp/out.json",
+    stderr_path: "/tmp/err.txt",
+    stdout_bytes: 10,
+    stderr_bytes: 0,
+    packet_parse_error: null,
+    packet_citation_count: 1,
+    packet_avoid_opening_count: 0,
+    packet_latency: null,
+    packet_composition: null,
+    packet_manifest_quality: null,
+  });
+  assert.equal(noContinuation.continuation_ms, 0);
+  assert.equal(noContinuation.time_to_first_packet_ms, 806.1);
+  assert.notEqual(
+    noContinuation.continuation_ms,
+    noContinuation.wall_ms - noContinuation.time_to_first_packet_ms,
+    "a skipped continuation must not absorb the prelude's remaining wall time",
   );
 });
 
