@@ -1093,7 +1093,7 @@ fn packet_citation_file_path_key(citation: &AgentCitationDto) -> Option<String> 
 fn packet_focus_neighborhood_rank(
     citation: &AgentCitationDto,
     focus_roots: &[PacketCommandFocusRoot],
-) -> (u8, u8, u8, u8, u8, u8, i32) {
+) -> (u8, u8, u8, u8, u8, i32) {
     let path = citation
         .file_path
         .as_deref()
@@ -1125,7 +1125,6 @@ fn packet_focus_neighborhood_rank(
     (
         packet_citation_focus_root_score(citation, focus_roots),
         direct_root_file,
-        packet_source_navigation_file_score(&path),
         source_file,
         role_backed,
         implementation_file.saturating_add(definition_file),
@@ -1150,31 +1149,6 @@ fn packet_citation_direct_focus_root_file_score(
         .map(|root| root.weight)
         .max()
         .unwrap_or_default()
-}
-
-fn packet_source_navigation_file_score(path: &str) -> u8 {
-    let normalized = packet_display_path(path).replace('\\', "/");
-    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
-    let stem = file_name
-        .rsplit_once('.')
-        .map(|(stem, _)| stem)
-        .unwrap_or(file_name)
-        .to_ascii_lowercase();
-    match stem.as_str() {
-        "cli" | "cmd" | "command" | "commands" => 4,
-        "lib" | "mod" | "index" => 3,
-        "events" | "event" => 2,
-        "main" | "app" | "server" | "router" | "routes" => 2,
-        "handler" | "handlers" | "entrypoint" | "entrypoints" => 1,
-        _ if stem.ends_with("_events")
-            || stem.ends_with("_event")
-            || stem.ends_with("-events")
-            || stem.ends_with("-event") =>
-        {
-            2
-        }
-        _ => 0,
-    }
 }
 
 fn packet_prefer_required_probe_match(

@@ -12,7 +12,6 @@ use super::packet_proof_atoms::{
     match_flow_requirements,
 };
 use super::packet_required_probes::{
-    packet_named_schema_entity_queries, packet_named_schema_entity_symbol_queries,
     packet_prompt_exact_symbol_probe_queries, packet_prompt_explicit_source_path_queries,
     packet_sufficiency_required_probe_queries_from_terms,
 };
@@ -87,23 +86,6 @@ pub fn build_packet_obligation_plan(
             )
         })
         .collect::<Vec<_>>();
-    let named_schema_entities = if false {
-        packet_named_schema_entity_queries(question)
-    } else {
-        Vec::new()
-    };
-    if !named_schema_entities.is_empty()
-        && let Some(obligation) = claim_obligations
-            .iter_mut()
-            .find(|obligation| obligation.id == "sql_tables")
-    {
-        obligation.binding_terms = named_schema_entities.clone();
-        for query in packet_named_schema_entity_symbol_queries(question) {
-            if !obligation.open_next_candidates.contains(&query) {
-                obligation.open_next_candidates.push(query);
-            }
-        }
-    }
     claim_obligations.extend(default_profile_requested_claim_obligations(
         &binding_terms,
         task_class,
@@ -159,16 +141,6 @@ pub fn build_packet_obligation_plan(
                     true,
                 );
             }
-        }
-    }
-    for query in packet_named_schema_entity_symbol_queries(question) {
-        if required_queries.insert(query.clone()) {
-            push_query_obligation(
-                &mut query_obligations,
-                PacketQueryObligationKindDto::RequiredProbe,
-                &query,
-                true,
-            );
         }
     }
     for query in packet_prompt_explicit_source_path_queries(question) {

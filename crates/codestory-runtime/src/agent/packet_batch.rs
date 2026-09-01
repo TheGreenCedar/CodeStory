@@ -1445,48 +1445,6 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_sql_queries_reserve_the_named_schema_entities() {
-        let question = "Explain schema relationships between artists, albums, tracks, invoices, and invoice lines across the SQL scripts.";
-        let task_class = PacketTaskClassDto::DataFlow;
-        let original = PacketPlanQueryDto {
-            query: question.to_string(),
-            purpose: "original task phrasing".to_string(),
-        };
-        let plan = PacketPlanDto {
-            task_class,
-            inferred_task_class: false,
-            queries: vec![original.clone()],
-            probe_resolutions: Vec::new(),
-            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
-                question,
-                task_class,
-                &[original],
-            ),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16)
-            .into_iter()
-            .map(|query| query.query)
-            .collect::<Vec<_>>();
-
-        for expected in [
-            "public.artist",
-            "public.album",
-            "public.track",
-            "public.invoice",
-            "public.invoiceline",
-        ] {
-            assert!(
-                queries.iter().any(|query| query == expected),
-                "missing {expected} from {queries:?}"
-            );
-        }
-        assert!(!queries.iter().any(|query| query.starts_with("Chinook.")));
-        assert!(queries.len() <= 16);
-    }
-
-    #[test]
     fn packet_anchor_probe_queries_prioritize_symbol_probes_under_reduced_windows() {
         let plan = PacketPlanDto {
             task_class: PacketTaskClassDto::ArchitectureExplanation,

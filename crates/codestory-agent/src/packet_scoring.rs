@@ -37,21 +37,6 @@ pub fn packet_stage_citation_carry_limit(limits: &PacketBudgetLimitsDto) -> usiz
     limits.max_anchors.clamp(8, 16) as usize
 }
 
-/// Path-local heuristic: SQL dialect variant copies are weaker schema evidence.
-pub fn packet_sql_schema_file_is_variant_copy(path: &str) -> bool {
-    let lower = packet_display_path(path).to_ascii_lowercase();
-    if !lower.ends_with(".sql") {
-        return false;
-    }
-    let file_name = lower.rsplit('/').next().unwrap_or(lower.as_str());
-    file_name.contains("autoincrement")
-        || file_name.contains("serialpks")
-        || file_name.contains("serial_pks")
-        || file_name.contains("db2")
-        || file_name.contains("oracle")
-        || file_name.contains("sqlserver")
-}
-
 /// Candidate hits fetched per planned subquery or anchor-probe batch query.
 pub fn packet_subquery_hit_limit(limits: &PacketBudgetLimitsDto) -> usize {
     limits.max_anchors.clamp(8, 20) as usize

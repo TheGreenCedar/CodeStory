@@ -1324,9 +1324,11 @@ impl AppController {
             root,
             storage_path.to_path_buf(),
             &move |store: &mut Store| {
-                store.upsert_symbol_summaries_batch(&summaries).map_err(|e| {
-                    ApiError::internal(format!("Failed to store symbol summaries: {e}"))
-                })
+                store
+                    .upsert_symbol_summaries_batch(&summaries)
+                    .map_err(|e| {
+                        ApiError::internal(format!("Failed to store symbol summaries: {e}"))
+                    })
             },
         )
         .map(|_| ())
