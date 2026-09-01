@@ -312,6 +312,48 @@ pub fn core_database_exists(storage_path: &Path) -> Result<bool, StorageError> {
         .is_some())
 }
 
+/// Install a standalone rehydrate candidate as the target's first generation
+/// and swap `core/publication.json` to it.
+///
+/// The candidate must already sit in this layout's staging directory. The
+/// target must have no publication pointer yet: rehydrate is how an empty
+/// cache first names a generation, not how a live publication is replaced.
+/// The SQLite `index_publication` row may stay empty; the pointer is what
+/// later readers use to find the copied image.
+pub fn publish_rehydrated_generation(
+    candidate_database: &Path,
+    target_storage_path: &Path,
+) -> Result<CorePublicationPointerV1, StorageError> {
+    let layout = CorePublicationLayout::from_storage_path(target_storage_path)?;
+    if layout.read_pointer()?.is_some() {
+        return Err(core_publication_error(format!(
+            "Cannot publish a rehydrated generation over an existing pointer: {}",
+            layout.publication_path().display()
+        )));
+    }
+    require_regular_generation_file(candidate_database)?;
+    let logical_bytes = crate::storage_impl::database_logical_bytes_at_path(candidate_database)?;
+    let generation_id = format!("rehydrate-{}", uuid::Uuid::new_v4().simple());
+    let run_id = format!("rehydrate-run-{}", uuid::Uuid::new_v4().simple());
+    let published_at_epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            core_publication_error(format!("system clock before Unix epoch: {error}"))
+        })?
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    layout.install_staging_generation(candidate_database, &generation_id)?;
+    layout.publish_pointer(
+        CoreGenerationIdentityV1 {
+            generation_id,
+            run_id,
+            logical_bytes,
+            published_at_epoch_ms,
+        },
+        None,
+    )
+}
+
 /// Clone a sealed generation into a distinct mutable stage without copying
 /// unchanged extents. `Ok(false)` means the current platform/filesystem cannot
 /// satisfy the copy-on-write contract; callers must not silently turn an
@@ -781,7 +823,7 @@ fn sync_parent(path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-pub(crate) fn remove_staging_database(path: &Path) -> Result<(), StorageError> {
+pub fn remove_staging_database(path: &Path) -> Result<(), StorageError> {
     let directory = path.parent().ok_or_else(|| {
         core_publication_error(format!("Stage has no directory: {}", path.display()))
     })?;
