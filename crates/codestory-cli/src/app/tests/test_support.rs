@@ -76,7 +76,6 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
     AgentPacketDto {
         packet_id: "packet-task-brief".to_string(),
         question: "Add `$env:SECRET $(Get-ChildItem) 'literal' task brief".to_string(),
-        task_class: Some(PacketTaskClassDto::EditPlanning),
         plan: PacketPlanDto {
             task_class: PacketTaskClassDto::EditPlanning,
             inferred_task_class: false,
@@ -204,6 +203,7 @@ pub(super) fn sample_task_brief_packet() -> AgentPacketDto {
             search_steps: 1,
             trail_steps: 0,
         },
+        answer_sufficiency: Default::default(),
     }
 }
 

@@ -9,9 +9,6 @@ use crate::agent::packet_evidence::citation_sufficiency_eligible;
 use crate::agent::packet_freshness::PacketFreshnessInput;
 use crate::agent::packet_probe::exact_packet_probe_paths;
 use crate::agent::packet_scoring::packet_display_path;
-use codestory_agent::packet_obligations::{
-    PacketProofEvidenceExtras, reconcile_packet_proof_obligations_after_compile,
-};
 use codestory_contracts::api::{
     AgentAnswerDto, AgentPacketDto, AgentPacketRequestDto, BoundedDrillPlanDto, DrillOptionDto,
     EdgeKind, EmbeddingVectorPublicationIdentityDto, GraphArtifactDto, GraphResponse,
@@ -635,32 +632,6 @@ pub fn apply_compiled_evidence(
     packet.disposition = disposition;
 }
 
-/// [`apply_compiled_evidence`] followed by the R5 reconciliation: the compile
-/// pass rewrites `packet.support` and `packet.disposition` but never touches
-/// `plan.obligations`, so every formula-proven obligation is re-verified
-/// against the COMPILED support and the live `answer.graphs`. On any missing
-/// receipt the obligation is demoted fail-closed (reason recorded) and the
-/// disposition is recomputed on the post-demotion state, so
-/// `packet.disposition` and the obligations agree at return.
-pub fn apply_compiled_evidence_with_proof_reconciliation(
-    packet: &mut AgentPacketDto,
-    request: Option<&AgentPacketRequestDto>,
-    proof_evidence_extras: &PacketProofEvidenceExtras,
-) {
-    apply_compiled_evidence(packet, request);
-    let demoted = reconcile_packet_proof_obligations_after_compile(
-        &packet.question,
-        packet.plan.task_class,
-        &mut packet.plan.obligations,
-        &packet.answer,
-        &packet.support,
-        proof_evidence_extras,
-    );
-    if demoted {
-        apply_compiled_evidence(packet, request);
-    }
-}
-
 pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
     option_ids
         .iter()
@@ -793,15 +764,10 @@ fn drill_options_from_repository_evidence_gaps(
                 return options;
             }
         }
-        if gap.node_ids.is_empty() && !gap.detail.is_empty() {
-            let option = DrillOptionDto::deadline_lost_query(
-                format!("repository-evidence:{}", gap.detail),
-                gap.detail.clone(),
-            );
-            if seen.insert(option.id.clone()) {
-                options.push(option);
-            }
-        }
+        // Residual uncovered identities become typed obligations or a
+        // generation-bound continuation. Diagnostic gap text must never become
+        // a retrieval query.
+        let _ = &gap.detail;
         if options.len() >= PACKET_DRILL_MAX_OPTIONS {
             break;
         }
@@ -1079,7 +1045,6 @@ mod tests {
         let request = AgentPacketRequestDto {
             question: packet.question.clone(),
             budget: Default::default(),
-            task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
             latency_budget_ms: None,
@@ -1246,7 +1211,6 @@ mod tests {
         let request = AgentPacketRequestDto {
             question: packet.question.clone(),
             budget: Default::default(),
-            task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
             latency_budget_ms: None,
@@ -1576,7 +1540,6 @@ mod tests {
         let request = AgentPacketRequestDto {
             question: packet.question.clone(),
             budget: Default::default(),
-            task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
             latency_budget_ms: None,
@@ -1711,150 +1674,6 @@ mod tests {
             .map(|option| option.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(retained, option_ids);
-    }
-
-    // -----------------------------------------------------------------------
-    // Stage 2: R5 reconciliation after compile
-    // -----------------------------------------------------------------------
-
-    /// Finalizes the mapper fixture so `mapper_config` is formula-proven
-    /// through its atom receipts (a certain TYPE_USAGE edge, the builder's
-    /// MEMBER-onto-METHOD edge, and a reread configuration source range).
-    fn finalized_mapper_proof_packet() -> AgentPacketDto {
-        let mut packet = crate::agent::packet_budget::tests::mapper_proof_packet();
-        codestory_agent::packet_obligations::finalize_packet_obligation_plan(
-            &packet.question.clone(),
-            packet.plan.task_class,
-            &mut packet.plan.obligations,
-            &packet.answer,
-            &packet.budget,
-            &packet.support.clone(),
-            &PacketProofEvidenceExtras::default(),
-        );
-        assert_eq!(
-            mapper_config_obligation(&packet).proof_status,
-            PacketObligationProofStatusDto::Proven,
-            "fixture must start formula-proven"
-        );
-        packet
-    }
-
-    fn mapper_config_obligation(packet: &AgentPacketDto) -> &PacketClaimObligationDto {
-        packet
-            .plan
-            .obligations
-            .claim_obligations
-            .iter()
-            .find(|obligation| obligation.id == "mapper_config")
-            .expect("mapper_config obligation")
-    }
-
-    /// R5 control: when every receipt survives compile, nothing is demoted
-    /// and the compiled disposition stands.
-    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
-    #[test]
-    fn reconciliation_keeps_formula_proof_whose_receipts_survive_compile() {
-        let mut packet = finalized_mapper_proof_packet();
-
-        apply_compiled_evidence_with_proof_reconciliation(
-            &mut packet,
-            None,
-            &PacketProofEvidenceExtras::default(),
-        );
-
-        let obligation = mapper_config_obligation(&packet);
-        assert_eq!(
-            obligation.proof_status,
-            PacketObligationProofStatusDto::Proven,
-            "{obligation:?}"
-        );
-        assert!(
-            packet.support.iter().any(|unit| {
-                unit.kind == SupportUnitKindDto::SourceRange
-                    && unit.symbol_id.as_deref() == Some("MapperConfiguration")
-            }),
-            "the A2 receipt must survive compile for this control to be meaningful"
-        );
-    }
-
-    /// R5: a formula-proven obligation whose receipt is absent from the
-    /// compiled support is demoted fail-closed with the recorded reason, and
-    /// the disposition is recomputed on the post-demotion state — a fresh
-    /// compile of the returned packet yields the same disposition.
-    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
-    #[test]
-    fn reconciliation_demotes_formula_proof_and_recomputes_disposition() {
-        let mut packet = finalized_mapper_proof_packet();
-        // A budget-style loss between finalize and compile: the configuration
-        // citation is gone, so compile drops the A2 source-range receipt.
-        packet
-            .answer
-            .citations
-            .retain(|citation| citation.node_id.0 != "MapperConfiguration");
-
-        apply_compiled_evidence_with_proof_reconciliation(
-            &mut packet,
-            None,
-            &PacketProofEvidenceExtras::default(),
-        );
-
-        let obligation = mapper_config_obligation(&packet);
-        assert_ne!(
-            obligation.proof_status,
-            PacketObligationProofStatusDto::Proven,
-            "missing receipts must demote fail-closed: {obligation:?}"
-        );
-        assert_eq!(
-            obligation.reason.as_deref(),
-            Some("flow_proof_receipts_missing_after_compile")
-        );
-        assert!(
-            !packet.support.iter().any(|unit| {
-                unit.kind == SupportUnitKindDto::SourceRange
-                    && unit.symbol_id.as_deref() == Some("MapperConfiguration")
-            }),
-            "compile must actually have dropped the receipt for this test to bite"
-        );
-        // Disposition and obligations agree at return: recompiling the
-        // post-demotion state reproduces the returned disposition exactly.
-        let (_support, recompiled) = compile_packet_evidence_with_source_ranges(
-            &packet.packet_id,
-            &packet.question,
-            &packet.plan,
-            &packet.answer,
-            &packet.support,
-            None,
-        );
-        assert_eq!(
-            packet.disposition, recompiled,
-            "packet.disposition must be the disposition of the post-demotion state"
-        );
-    }
-
-    /// Pins the property R5's single-recompile argument rests on: compiling
-    /// support is idempotent on its own output. If a future support-side
-    /// change breaks `compile(answer, S1) == S1` for `S1 = compile(answer,
-    /// S0)`, the one-pass reconciliation in
-    /// `apply_compiled_evidence_with_proof_reconciliation` would no longer be
-    /// provably sufficient — this test makes that break loud.
-    #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
-    #[test]
-    fn compile_support_units_are_idempotent_on_their_own_output() {
-        let packet = finalized_mapper_proof_packet();
-
-        let first = compile_support_units_with_source_ranges(&packet.answer, &packet.support);
-        let second = compile_support_units_with_source_ranges(&packet.answer, &first);
-
-        assert!(
-            first
-                .iter()
-                .any(|unit| unit.kind == SupportUnitKindDto::SourceRange),
-            "the fixture must retain a SourceRange unit for the property to bite"
-        );
-        assert_eq!(
-            second, first,
-            "compiling support must be idempotent on its own output"
-        );
     }
 
     /// R2 visibility (landed together with the budget-cap protection

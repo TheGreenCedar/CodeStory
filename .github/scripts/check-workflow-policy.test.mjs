@@ -182,11 +182,11 @@ test("qualification product dependencies use only the reviewed feature topology"
   const source = benchmarkManifestSource();
   const fixtures = [
     [
-      "agent feature missing",
+      "agent feature added",
       replaceManifestFragment(
         source,
-        'codestory-agent = { workspace = true, features = ["proof-qualification-support"] }',
         "codestory-agent = { workspace = true }",
+        'codestory-agent = { workspace = true, features = ["proof-qualification-support"] }',
       ),
     ],
     [
@@ -217,8 +217,8 @@ test("qualification product dependencies use only the reviewed feature topology"
       "agent dependency attributes widened",
       replaceManifestFragment(
         source,
-        'codestory-agent = { workspace = true, features = ["proof-qualification-support"] }',
-        'codestory-agent = { workspace = true, default-features = false, features = ["proof-qualification-support"] }',
+        "codestory-agent = { workspace = true }",
+        "codestory-agent = { workspace = true, default-features = false }",
       ),
     ],
     [

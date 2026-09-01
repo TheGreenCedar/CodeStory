@@ -349,7 +349,7 @@ fn seed_plan_paraphrase_keeps_explicit_path_anchors() {
 #[test]
 fn frozen_planner_limits_match_phase4_receipt() {
     assert_eq!(DEFAULT_REPOSITORY_EVIDENCE_LIMITS.max_seed_nodes, 12);
-    assert_eq!(DEFAULT_REPOSITORY_EVIDENCE_LIMITS.max_candidate_nodes, 256);
+    assert_eq!(DEFAULT_REPOSITORY_EVIDENCE_LIMITS.max_candidate_nodes, 16);
     assert_eq!(DEFAULT_REPOSITORY_EVIDENCE_LIMITS.max_candidate_edges, 512);
     assert_eq!(DEFAULT_REPOSITORY_EVIDENCE_LIMITS.max_depth, 4);
     assert_eq!(DEFAULT_REPOSITORY_EVIDENCE_LIMITS.max_relation_paths, 32);

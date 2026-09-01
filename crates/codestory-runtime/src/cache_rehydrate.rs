@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use codestory_store::{
     CURRENT_SCHEMA_VERSION, CompactRehydratePeakSpace, CorePublicationLayout,
-    RehydratedCacheRebaseStats, SqliteVacuumIntoStats, Store, ensure_compact_rehydrate_peak_space,
-    measure_compact_rehydrate_peak_space, publish_rehydrated_generation, remove_staging_database,
-    vacuum_into_database,
+    CorePublishTransaction, RehydratedCacheRebaseStats, SqliteVacuumIntoStats, Store,
+    ensure_compact_rehydrate_peak_space, measure_compact_rehydrate_peak_space,
+    remove_staging_database, vacuum_into_database,
 };
 use codestory_workspace::{
     RefreshInputs, SourceIndexPolicy, WorkspaceInventory, WorkspaceInventoryOutcome,
@@ -483,7 +483,9 @@ fn publish_rehydrated_database(
             .open(&compacted)
             .and_then(|file| file.sync_all())
             .with_context(|| format!("sync rehydrate candidate {}", compacted.display()))?;
-        publish_rehydrated_generation(&compacted, logical_target)
+        CorePublishTransaction::begin_from_stage(&logical_target, compacted)
+            .context("begin rehydrate publish transaction")?
+            .commit_rehydrate(&logical_target)
             .context("publish rehydrated generation and swap the publication pointer")?;
         Ok(PublishedRehydrate {
             invalidated_retrieval_manifests,
@@ -1587,7 +1589,9 @@ mod tests {
             .create_staging_database_path()
             .expect("stage the seeded image");
         fs::copy(&logical_source, &staged).expect("copy seed into staging");
-        publish_rehydrated_generation(&staged, &logical_source)
+        CorePublishTransaction::begin_from_stage(&logical_source, staged)
+            .expect("begin seeded publish")
+            .commit_rehydrate(&logical_source)
             .expect("publish the seeded image as a generation");
         fs::write(&logical_source, b"stale-leftover").expect("leave a wrong leftover file");
 

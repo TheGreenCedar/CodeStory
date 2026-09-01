@@ -2553,8 +2553,6 @@ fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) 
         "Explain how AppController routes project opening through normalize_project",
         "--budget",
         "tiny",
-        "--task-class",
-        "architecture-explanation",
         "--format",
         "json",
     ];
@@ -2575,9 +2573,17 @@ fn assert_packet_builds_broad_task_contract(workspace: &Path, cache_dir: &Path) 
         packet["budget"]["requested"], "tiny",
         "packet should honor the requested budget: {packet:#}"
     );
+    assert!(
+        packet.pointer("/plan/task_class").is_none(),
+        "public packet JSON must not expose task_class: {packet:#}"
+    );
     assert_eq!(
-        packet["plan"]["task_class"], "architecture_explanation",
-        "packet should expose the planner task class: {packet:#}"
+        packet["answer_sufficiency"], "not_asserted",
+        "public packets must not assert semantic sufficiency: {packet:#}"
+    );
+    assert!(
+        packet.get("compilation_status").is_none(),
+        "Horizon A retrieval-first packets must omit compilation_status: {packet:#}"
     );
     assert!(
         array_is_non_empty(&packet, &["plan", "queries"]),

@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = ["proof-qualification-support"]
 benchmark-support = []
-proof-qualification-support = ["codestory-agent/proof-qualification-support"]
+proof-qualification-support = ["dep:serde_json_canonicalizer"]
 v3-evidence-separation-support = ["codestory-agent/v3-evidence-separation-support"]
 # The runtime test hooks now partly live in codestory-agent (fresh_index_observation
 # moved with packet_freshness), so turning this on has to turn the agent crate's
@@ -27,6 +27,7 @@ parking_lot = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_json_canonicalizer = { workspace = true, optional = true }
 sha2 = { workspace = true }
 tantivy = { workspace = true }
 tracing = { workspace = true }

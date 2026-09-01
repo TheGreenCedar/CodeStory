@@ -9,13 +9,14 @@ use crate::text::exact_symbol_query_terms;
 use codestory_contracts::api::{
     AgentCitationDto, EdgeId, EdgeKind, GraphEdgeDto, NodeId, PacketTaskClassDto,
 };
+use codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 /// Frozen planner constants after visible metamorphic suite green.
 /// Do not mutate without a new Phase-4 suite run and holdout invalidation.
 pub const DEFAULT_REPOSITORY_EVIDENCE_LIMITS: RepositoryEvidenceLimits = RepositoryEvidenceLimits {
     max_seed_nodes: 12,
-    max_candidate_nodes: 256,
+    max_candidate_nodes: INTERIM_MAX_ADMITTED_CANDIDATES,
     max_candidate_edges: 512,
     max_depth: 4,
     max_relation_paths: 32,
@@ -397,52 +398,19 @@ fn identity_segments(value: &str) -> Vec<&str> {
         .collect()
 }
 
-fn preferred_edge_kinds(task_class: PacketTaskClassDto) -> HashSet<EdgeKind> {
-    let kinds: &[EdgeKind] = match task_class {
-        PacketTaskClassDto::ArchitectureExplanation => &[
-            EdgeKind::CALL,
-            EdgeKind::MEMBER,
-            EdgeKind::INHERITANCE,
-            EdgeKind::OVERRIDE,
-            EdgeKind::IMPORT,
-            EdgeKind::INCLUDE,
-        ],
-        PacketTaskClassDto::BugLocalization => &[
-            EdgeKind::CALL,
-            EdgeKind::USAGE,
-            EdgeKind::TYPE_USAGE,
-            EdgeKind::MEMBER,
-            EdgeKind::OVERRIDE,
-        ],
-        PacketTaskClassDto::ChangeImpact => &[
-            EdgeKind::CALL,
-            EdgeKind::USAGE,
-            EdgeKind::TYPE_USAGE,
-            EdgeKind::IMPORT,
-            EdgeKind::INCLUDE,
-        ],
-        PacketTaskClassDto::RouteTracing => &[EdgeKind::CALL],
-        PacketTaskClassDto::SymbolOwnership => {
-            &[EdgeKind::MEMBER, EdgeKind::OVERRIDE, EdgeKind::INHERITANCE]
-        }
-        PacketTaskClassDto::DataFlow => &[
-            EdgeKind::CALL,
-            EdgeKind::USAGE,
-            EdgeKind::TYPE_USAGE,
-            EdgeKind::MEMBER,
-        ],
-        PacketTaskClassDto::EditPlanning => &[
-            EdgeKind::CALL,
-            EdgeKind::USAGE,
-            EdgeKind::TYPE_USAGE,
-            EdgeKind::MEMBER,
-            EdgeKind::OVERRIDE,
-            EdgeKind::INHERITANCE,
-            EdgeKind::IMPORT,
-            EdgeKind::INCLUDE,
-        ],
-    };
-    kinds.iter().copied().collect()
+fn preferred_edge_kinds(_task_class: PacketTaskClassDto) -> HashSet<EdgeKind> {
+    [
+        EdgeKind::CALL,
+        EdgeKind::MEMBER,
+        EdgeKind::INHERITANCE,
+        EdgeKind::OVERRIDE,
+        EdgeKind::IMPORT,
+        EdgeKind::INCLUDE,
+        EdgeKind::USAGE,
+        EdgeKind::TYPE_USAGE,
+    ]
+    .into_iter()
+    .collect()
 }
 
 /// Membership and inheritance relations are symmetric facts about a seed: which
@@ -479,21 +447,35 @@ struct Adjacency {
     truncated: bool,
 }
 
-/// Spend the edge budget on edges this task class can actually traverse. Taking
-/// the first `max_edges` relations regardless of kind let unusable edges consume
-/// the budget and made a reachable path look absent.
+/// Spend the edge budget on CALL first, then other structural kinds. Relation
+/// order is frozen and task-class-free; unusable prompt taxonomies must not
+/// decide which edges occupy the budget.
 fn build_adjacency(
     relations: &[GraphEdgeDto],
     preferred: &HashSet<EdgeKind>,
     max_edges: usize,
 ) -> Adjacency {
+    const KIND_ORDER: [EdgeKind; 8] = [
+        EdgeKind::CALL,
+        EdgeKind::MEMBER,
+        EdgeKind::INHERITANCE,
+        EdgeKind::OVERRIDE,
+        EdgeKind::USAGE,
+        EdgeKind::TYPE_USAGE,
+        EdgeKind::IMPORT,
+        EdgeKind::INCLUDE,
+    ];
+    let mut ordered = Vec::new();
+    for kind in KIND_ORDER {
+        if !preferred.contains(&kind) {
+            continue;
+        }
+        ordered.extend(relations.iter().filter(|edge| edge.kind == kind));
+    }
     let mut adj: BTreeMap<NodeId, Vec<AdjEdge>> = BTreeMap::new();
     let mut admitted = 0usize;
     let mut truncated = false;
-    for edge in relations
-        .iter()
-        .filter(|edge| preferred.contains(&edge.kind))
-    {
+    for edge in ordered {
         if admitted >= max_edges {
             truncated = true;
             break;
@@ -1060,9 +1042,8 @@ mod tests {
 
     #[test]
     fn unusable_edges_do_not_spend_the_traversal_budget() {
-        // RouteTracing only traverses CALL. The IMPORT edges arrive first, and
-        // taking the first max_candidate_edges relations would spend the whole
-        // budget on edges this task class can never follow.
+        // CALL occupies the frozen relation-order budget before IMPORT, so a
+        // reachable call path cannot be crowded out by earlier import edges.
         let seeds = [citation("a", "Alpha::run"), citation("b", "Beta::finish")];
         let mut relations = Vec::new();
         for index in 0..8 {

@@ -10,23 +10,20 @@ use crate::agent::packet_scoring::{
     normalize_identifier, packet_citation_key, packet_display_name_is_import_literal,
     packet_display_name_is_test_like, packet_display_path, packet_low_signal_display_name,
 };
-use crate::{query_mentions_non_primary_source, retrieval_file_role_from_path};
+use crate::retrieval_file_role_from_path;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, NodeId, NodeKind, PacketBudgetLimitsDto,
     RetrievalAnnotationDto, SearchHitOrigin,
 };
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+#[cfg(test)]
 pub(crate) const PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE: &str = "material owner/member probe";
+#[cfg(test)]
 pub(crate) const PACKET_MATERIAL_SCHEMA_ENTITY_ROLE: &str = "material schema entity";
 
-fn packet_citation_has_protected_probe_role(citation: &AgentCitationDto) -> bool {
-    matches!(
-        citation.coverage_role.as_deref(),
-        Some("explicit exact probe")
-            | Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE)
-            | Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE)
-    )
+fn packet_citation_has_protected_probe_role(_citation: &AgentCitationDto) -> bool {
+    false
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -86,7 +83,7 @@ fn cap_citations_with_priorities(
     let mut deferred = Vec::new();
 
     let mut candidates = std::mem::take(&mut answer.citations);
-    let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
+    let prefer_primary_sources = true;
     prioritize_protected_citations(&mut candidates, protected_citation_keys);
     order_citations_by_marginal_utility(
         &mut candidates,
@@ -779,8 +776,6 @@ fn packet_file_fits_limit(path: Option<&str>, files: &HashSet<String>, max_files
     path.is_none_or(|path| files.contains(path) || files.len() < max_files as usize)
 }
 
-const PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT: usize = 4;
-
 #[cfg(test)]
 pub(crate) fn cap_packet_citations(
     answer: &mut AgentAnswerDto,
@@ -797,11 +792,10 @@ pub(crate) fn cap_packet_citations_with_obligation_carriers(
     obligation_carrier_node_ids: &[NodeId],
 ) -> bool {
     let required_probe_keys = promote_required_probe_citations(answer, required_probe_queries);
-    let focus_neighborhood_keys =
-        promote_focus_neighborhood_citations(answer, &required_probe_keys);
     let obligation_carrier_keys =
         promote_obligation_carrier_citations(answer, obligation_carrier_node_ids);
     let mut protected_citation_keys = obligation_carrier_keys;
+    protected_citation_keys.extend(required_probe_keys.iter().cloned());
     protected_citation_keys.extend(
         answer
             .citations
@@ -810,7 +804,6 @@ pub(crate) fn cap_packet_citations_with_obligation_carriers(
             .map(packet_citation_key),
     );
     let mut obligation_value_keys = required_probe_keys;
-    obligation_value_keys.extend(focus_neighborhood_keys);
     obligation_value_keys.extend(protected_citation_keys.iter().cloned());
     cap_citations_with_priorities(
         answer,
@@ -872,7 +865,6 @@ pub(crate) fn promote_required_probe_citations(
         .iter()
         .filter(|query| seen_probe_queries.insert(query.as_str()))
         .collect::<Vec<_>>();
-    let focus_roots = packet_command_focus_roots(&answer.citations);
     let mut promoted_indices = Vec::new();
     let mut promoted_index_set = HashSet::new();
     for query in &required_probe_queries {
@@ -904,7 +896,6 @@ pub(crate) fn promote_required_probe_citations(
                         match_rank,
                         &answer.citations[best_index],
                         best_rank,
-                        &focus_roots,
                     )
                 })
                 .unwrap_or(true)
@@ -954,232 +945,25 @@ pub(crate) fn promote_required_probe_citations(
     protected_citation_keys
 }
 
-pub(crate) fn promote_focus_neighborhood_citations(
-    answer: &mut AgentAnswerDto,
-    protected_citation_keys: &HashSet<String>,
-) -> HashSet<String> {
-    if answer.citations.is_empty() {
-        return HashSet::new();
-    }
-    let focus_roots = packet_command_focus_roots(&answer.citations);
-    if focus_roots.is_empty() {
-        return HashSet::new();
-    }
-    let protected_file_paths = answer
-        .citations
-        .iter()
-        .filter(|citation| packet_citation_is_protected(citation, protected_citation_keys))
-        .filter_map(packet_citation_file_path_key)
-        .collect::<HashSet<_>>();
-
-    let mut ranked_candidates = answer
-        .citations
-        .iter()
-        .enumerate()
-        .filter(|(_, citation)| {
-            packet_focus_neighborhood_candidate(
-                citation,
-                &focus_roots,
-                protected_citation_keys,
-                &protected_file_paths,
-            )
-        })
-        .map(|(index, citation)| {
-            (
-                index,
-                packet_focus_neighborhood_rank(citation, &focus_roots),
-            )
-        })
-        .collect::<Vec<_>>();
-    ranked_candidates.sort_by(|(left_index, left_rank), (right_index, right_rank)| {
-        right_rank
-            .cmp(left_rank)
-            .then_with(|| left_index.cmp(right_index))
-    });
-
-    let mut promoted_indices = Vec::new();
-    let mut promoted_file_paths = HashSet::new();
-    for (index, _) in ranked_candidates {
-        let Some(path) = packet_citation_file_path_key(&answer.citations[index]) else {
-            continue;
-        };
-        if !promoted_file_paths.insert(path) {
-            continue;
-        }
-        promoted_indices.push(index);
-        if promoted_indices.len() >= PACKET_FOCUS_NEIGHBORHOOD_CARRY_LIMIT {
-            break;
-        }
-    }
-    if promoted_indices.is_empty() {
-        return HashSet::new();
-    }
-
-    let promoted_index_set = promoted_indices.iter().copied().collect::<HashSet<_>>();
-    let promoted_keys = promoted_indices
-        .iter()
-        .map(|index| packet_citation_key(&answer.citations[*index]))
-        .collect::<HashSet<_>>();
-    let mut all_protected_citation_keys = protected_citation_keys.clone();
-    all_protected_citation_keys.extend(promoted_keys.iter().cloned());
-    let mut reordered = Vec::with_capacity(answer.citations.len());
-    for citation in &answer.citations {
-        if packet_citation_is_protected(citation, protected_citation_keys) {
-            reordered.push(citation.clone());
-        }
-    }
-    for index in promoted_indices {
-        reordered.push(answer.citations[index].clone());
-    }
-    for (index, citation) in answer.citations.drain(..).enumerate() {
-        if !packet_citation_is_protected(&citation, protected_citation_keys)
-            && !promoted_index_set.contains(&index)
-        {
-            reordered.push(citation);
-        }
-    }
-    prioritize_protected_citations(&mut reordered, &all_protected_citation_keys);
-    answer.citations = reordered;
-    // Echoes focus-root symbol names: promotion telemetry, not an evidence gap.
-    answer
-        .retrieval_trace
-        .annotations
-        .push(RetrievalAnnotationDto::observation(format!(
-            "packet_focus_neighborhood_citations promoted={} roots={}",
-            promoted_keys.len(),
-            focus_roots
-                .iter()
-                .map(|root| root.root.as_str())
-                .collect::<Vec<_>>()
-                .join("|")
-                .replace('`', "'")
-        )));
-    promoted_keys
-}
-
-fn packet_focus_neighborhood_candidate(
-    citation: &AgentCitationDto,
-    focus_roots: &[PacketCommandFocusRoot],
-    protected_citation_keys: &HashSet<String>,
-    protected_file_paths: &HashSet<String>,
-) -> bool {
-    if packet_citation_is_protected(citation, protected_citation_keys)
-        || citation.origin != SearchHitOrigin::IndexedSymbol
-        || !citation.resolvable
-        || packet_display_name_is_import_literal(&citation.display_name.to_ascii_lowercase())
-        || packet_display_name_is_test_like(&citation.display_name)
-    {
-        return false;
-    }
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    if path.is_empty() || packet_citation_focus_root_score(citation, focus_roots) == 0 {
-        return false;
-    }
-    if protected_file_paths.contains(&path) {
-        return false;
-    }
-    !retrieval_file_role_from_path(&path.to_ascii_lowercase()).is_non_primary()
-}
-
-fn packet_citation_file_path_key(citation: &AgentCitationDto) -> Option<String> {
-    let path = citation.file_path.as_deref().map(packet_display_path)?;
-    if path.is_empty() { None } else { Some(path) }
-}
-
-fn packet_focus_neighborhood_rank(
-    citation: &AgentCitationDto,
-    focus_roots: &[PacketCommandFocusRoot],
-) -> (u8, u8, u8, u8, u8, i32) {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default();
-    let source_file: u8 = if retrieval_file_role_from_path(&path.to_ascii_lowercase())
-        == crate::RetrievalFileRole::Source
-    {
-        1
-    } else {
-        0
-    };
-    let direct_root_file = packet_citation_direct_focus_root_file_score(citation, focus_roots);
-    let role_backed: u8 = if packet_evidence_role(citation).is_some() {
-        1
-    } else {
-        0
-    };
-    let implementation_file: u8 = if packet_path_is_implementation(&path) {
-        1
-    } else {
-        0
-    };
-    let definition_file: u8 = if packet_primary_definition_file_citation(citation) {
-        1
-    } else {
-        0
-    };
-    (
-        packet_citation_focus_root_score(citation, focus_roots),
-        direct_root_file,
-        source_file,
-        role_backed,
-        implementation_file.saturating_add(definition_file),
-        (citation.score * 1000.0).round() as i32,
-    )
-}
-
-fn packet_citation_direct_focus_root_file_score(
-    citation: &AgentCitationDto,
-    focus_roots: &[PacketCommandFocusRoot],
-) -> u8 {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .replace('\\', "/");
-    let parent = path.rsplit_once('/').map(|(parent, _)| parent);
-    focus_roots
-        .iter()
-        .filter(|root| parent == Some(root.root.as_str()))
-        .map(|root| root.weight)
-        .max()
-        .unwrap_or_default()
-}
-
 fn packet_prefer_required_probe_match(
     query: &str,
     candidate: &AgentCitationDto,
     candidate_rank: u8,
     existing: &AgentCitationDto,
     existing_rank: u8,
-    focus_roots: &[PacketCommandFocusRoot],
 ) -> bool {
-    if !query_mentions_non_primary_source(query) {
-        let candidate_non_primary = packet_citation_is_non_primary(candidate);
-        let existing_non_primary = packet_citation_is_non_primary(existing);
-        if candidate_non_primary != existing_non_primary {
-            return !candidate_non_primary;
-        }
-        if let Some(prefer_candidate) =
-            packet_prefer_shared_source_set_citation(query, candidate, existing)
-        {
-            return prefer_candidate;
-        }
+    let candidate_non_primary = packet_citation_is_non_primary(candidate);
+    let existing_non_primary = packet_citation_is_non_primary(existing);
+    if candidate_non_primary != existing_non_primary {
+        return !candidate_non_primary;
+    }
+    if let Some(prefer_candidate) = packet_prefer_shared_source_set_citation(candidate, existing) {
+        return prefer_candidate;
     }
     if candidate_rank != existing_rank {
         return candidate_rank > existing_rank;
     }
     if !packet_required_probe_needs_exact_match(query) {
-        let candidate_focus = packet_citation_focus_root_score(candidate, focus_roots);
-        let existing_focus = packet_citation_focus_root_score(existing, focus_roots);
-        if candidate_focus != existing_focus {
-            return candidate_focus > existing_focus;
-        }
         let candidate_token_coverage = packet_citation_probe_token_coverage(query, candidate);
         let existing_token_coverage = packet_citation_probe_token_coverage(query, existing);
         if candidate_token_coverage != existing_token_coverage {
@@ -1199,26 +983,12 @@ fn packet_prefer_required_probe_match(
 }
 
 fn packet_prefer_shared_source_set_citation(
-    query: &str,
     candidate: &AgentCitationDto,
     existing: &AgentCitationDto,
 ) -> Option<bool> {
-    if packet_query_mentions_platform_source_set(query) {
-        return None;
-    }
     let candidate_score = packet_source_set_path_score(candidate);
     let existing_score = packet_source_set_path_score(existing);
     (candidate_score != existing_score).then_some(candidate_score > existing_score)
-}
-
-fn packet_query_mentions_platform_source_set(query: &str) -> bool {
-    let normalized = normalize_identifier(query);
-    [
-        "jvm", "nonjvm", "android", "ios", "native", "linux", "windows", "darwin", "apple", "wasm",
-        "nodejs", "browser",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term))
 }
 
 fn packet_source_set_path_score(citation: &AgentCitationDto) -> u8 {
@@ -1310,88 +1080,6 @@ fn packet_path_is_implementation(path: &str) -> bool {
                 | "tsx"
         )
     )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PacketCommandFocusRoot {
-    root: String,
-    weight: u8,
-}
-
-fn packet_command_focus_roots(citations: &[AgentCitationDto]) -> Vec<PacketCommandFocusRoot> {
-    let mut roots = Vec::<PacketCommandFocusRoot>::new();
-    for citation in citations {
-        let display = citation.display_name.as_str();
-        let normalized_display = normalize_identifier(display);
-        let path = citation
-            .file_path
-            .as_deref()
-            .map(packet_display_path)
-            .unwrap_or_default();
-        let Some(root) = packet_source_root_from_path(&path) else {
-            continue;
-        };
-        let normalized_path = path.replace('\\', "/");
-        let weight = if display.contains("::Cli")
-            || display.contains("::cli")
-            || normalized_path.ends_with("/src/cli.rs")
-            || (normalized_path.ends_with("/main.rs") && normalized_display == "main")
-        {
-            2
-        } else if display.contains("Subcommand::") {
-            1
-        } else {
-            continue;
-        };
-        packet_push_focus_root(&mut roots, root, weight);
-    }
-    roots.sort_by(|left, right| {
-        right
-            .weight
-            .cmp(&left.weight)
-            .then_with(|| left.root.cmp(&right.root))
-    });
-    roots
-}
-
-fn packet_push_focus_root(roots: &mut Vec<PacketCommandFocusRoot>, root: String, weight: u8) {
-    if let Some(existing) = roots.iter_mut().find(|existing| existing.root == root) {
-        existing.weight = existing.weight.max(weight);
-    } else {
-        roots.push(PacketCommandFocusRoot { root, weight });
-    }
-}
-
-fn packet_source_root_from_path(path: &str) -> Option<String> {
-    let normalized = packet_display_path(path);
-    let normalized = normalized.trim_matches('/').replace('\\', "/");
-    if normalized.is_empty() {
-        return None;
-    }
-    if let Some(index) = normalized.find("/src/") {
-        let root = &normalized[..index + "/src".len()];
-        return (!root.is_empty()).then(|| root.to_string());
-    }
-    let (parent, _) = normalized.rsplit_once('/')?;
-    (!parent.is_empty()).then(|| parent.to_string())
-}
-
-fn packet_citation_focus_root_score(
-    citation: &AgentCitationDto,
-    focus_roots: &[PacketCommandFocusRoot],
-) -> u8 {
-    let path = citation
-        .file_path
-        .as_deref()
-        .map(packet_display_path)
-        .unwrap_or_default()
-        .replace('\\', "/");
-    focus_roots
-        .iter()
-        .filter(|root| path == root.root || path.starts_with(&format!("{}/", root.root)))
-        .map(|root| root.weight)
-        .max()
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1590,22 +1278,20 @@ mod tests {
             4,
             &test,
             6,
-            &[],
         ));
-        assert!(!packet_prefer_required_probe_match(
+        assert!(packet_prefer_required_probe_match(
             "mapping tests",
             &primary,
             4,
             &test,
             6,
-            &[],
         ));
     }
 
     #[test]
-    fn explicit_exact_probe_anchor_survives_citation_capping() {
-        let ordinary = citation("ordinary", "src/ordinary.rs", 500.0);
-        let mut exact = citation("selected", "src/selected.rs", 1.0);
+    fn explicit_exact_probe_coverage_role_does_not_outrank_retrieval_score() {
+        let ordinary = citation("ordinary", "src/ordinary.rs", 1.0);
+        let mut exact = citation("selected", "src/selected.rs", 0.1);
         exact.coverage_role = Some("explicit exact probe".to_string());
         exact.eligible_for_sufficiency = Some(false);
         let mut answer = answer_fixture(vec![ordinary, exact]);
@@ -1619,11 +1305,11 @@ mod tests {
 
         assert!(cap_citations(&mut answer, &limits));
         assert_eq!(answer.citations.len(), 1);
-        assert_eq!(answer.citations[0].display_name, "selected");
+        assert_eq!(answer.citations[0].display_name, "ordinary");
     }
 
     #[test]
-    fn material_owner_member_anchor_survives_citation_capping() {
+    fn material_owner_member_role_does_not_outrank_retrieval_score() {
         let ordinary = citation("ordinary", "src/ordinary.rs", 500.0);
         let mut material = citation("Site.render", "src/site.rb", 1.0);
         material.coverage_role = Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE.to_string());
@@ -1638,11 +1324,11 @@ mod tests {
 
         assert!(cap_citations(&mut answer, &limits));
         assert_eq!(answer.citations.len(), 1);
-        assert_eq!(answer.citations[0].display_name, "Site.render");
+        assert_eq!(answer.citations[0].display_name, "ordinary");
     }
 
     #[test]
-    fn material_schema_entity_survives_citation_capping() {
+    fn material_schema_entity_role_does_not_outrank_retrieval_score() {
         let ordinary = citation("ordinary", "src/ordinary.rs", 500.0);
         let mut material = citation("public.Invoice", "db/schema.sql", 1.0);
         material.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
@@ -1658,7 +1344,7 @@ mod tests {
 
         assert!(cap_citations(&mut answer, &limits));
         assert_eq!(answer.citations.len(), 1);
-        assert_eq!(answer.citations[0].display_name, "public.Invoice");
+        assert_eq!(answer.citations[0].display_name, "ordinary");
     }
 
     #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
@@ -1716,14 +1402,14 @@ mod tests {
 
     #[test]
     fn same_role_exact_probe_anchors_survive_small_cap_and_role_replacement() {
-        let mut first_exact = citation("selected", "src/selected.rs", 1.0);
+        let mut first_exact = citation("selected", "src/selected.rs", 0.1);
         first_exact.coverage_role = Some("explicit exact probe".to_string());
         first_exact.eligible_for_sufficiency = Some(false);
-        let mut second_exact = citation("selected helper", "src/helper.rs", 0.5);
+        let mut second_exact = citation("selected helper", "src/helper.rs", 0.05);
         second_exact.coverage_role = Some("explicit exact probe".to_string());
         second_exact.eligible_for_sufficiency = Some(false);
-        let ordinary_test = citation("selected regression", "tests/selected_test.rs", 500.0);
-        let ordinary_dispatch = citation("dispatch command", "src/dispatch.rs", 400.0);
+        let ordinary_test = citation("selected regression", "src/selected_regression.rs", 1.0);
+        let ordinary_dispatch = citation("dispatch command", "src/dispatch.rs", 0.9);
         let mut answer = answer_fixture(vec![
             ordinary_test,
             first_exact,
@@ -1739,19 +1425,24 @@ mod tests {
         };
 
         assert!(cap_citations(&mut answer, &limits));
-        assert_eq!(
+        assert_eq!(answer.citations.len(), 2);
+        assert!(
+            answer
+                .citations
+                .iter()
+                .all(|citation| citation.coverage_role.as_deref() != Some("explicit exact probe")),
+            "magic coverage_role must not protect low-score citations: {:?}",
             answer
                 .citations
                 .iter()
                 .map(|citation| citation.display_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["selected", "selected helper"]
+                .collect::<Vec<_>>()
         );
         assert!(
             answer
                 .citations
                 .iter()
-                .all(|citation| citation.coverage_role.as_deref() == Some("explicit exact probe"))
+                .any(|citation| citation.display_name == "dispatch command")
         );
     }
 
@@ -1820,28 +1511,15 @@ mod tests {
     }
 
     #[test]
-    fn packet_promotion_pipeline_keeps_exact_probes_ahead_of_required_and_focus_anchors() {
-        let ordinary_required = citation("dispatch command", "crates/other/src/dispatch.rs", 500.0);
-        let focus_root = citation("demo::Cli", "crates/demo/src/cli.rs", 450.0);
-        let focus_neighbor = citation("runtime work", "crates/demo/src/runtime.rs", 400.0);
-        let mut first_exact = citation("selected", "crates/demo/src/selected.rs", 1.0);
-        first_exact.coverage_role = Some("explicit exact probe".to_string());
-        first_exact.eligible_for_sufficiency = Some(false);
-        let mut second_exact = citation("selected helper", "crates/demo/src/helper.rs", 0.5);
-        second_exact.coverage_role = Some("explicit exact probe".to_string());
-        second_exact.eligible_for_sufficiency = Some(false);
-        let mut answer = answer_fixture(vec![
-            ordinary_required,
-            focus_root,
-            focus_neighbor,
-            first_exact,
-            second_exact,
-        ]);
+    fn packet_promotion_pipeline_keeps_required_probes_ahead_of_retrieval_score() {
+        let ordinary_required = citation("dispatch command", "crates/other/src/dispatch.rs", 0.1);
+        let higher_score = citation("unrelated helper", "crates/other/src/helper.rs", 1.0);
+        let mut answer = answer_fixture(vec![higher_score, ordinary_required]);
         let limits = PacketBudgetLimitsDto {
-            max_anchors: 2,
-            max_files: 2,
-            max_snippets: 2,
-            max_trail_edges: 2,
+            max_anchors: 1,
+            max_files: 1,
+            max_snippets: 1,
+            max_trail_edges: 1,
             max_output_bytes: 1024,
         };
 
@@ -1856,28 +1534,32 @@ mod tests {
                 .iter()
                 .map(|citation| citation.display_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["selected", "selected helper"]
+            vec!["dispatch command"]
         );
-        // EV-6b (#1746): both promotion counters echo prompt-derived probe queries and focus-root
-        // symbol names, so their wording is attacker- and repository-controlled. They report how
-        // ranking ran and must carry the observation kind, never the gap kind.
-        for prefix in [
-            "packet_required_probe_citations promoted=1",
-            "packet_focus_neighborhood_citations promoted=",
-        ] {
-            let annotation = answer
+        let annotation = answer
+            .retrieval_trace
+            .annotations
+            .iter()
+            .find(|annotation| {
+                annotation
+                    .text
+                    .starts_with("packet_required_probe_citations promoted=1")
+            })
+            .expect("required-probe promotion must record an observation");
+        assert_eq!(
+            annotation.kind,
+            codestory_contracts::api::RetrievalAnnotationKindDto::Observation,
+            "citation promotion telemetry is not an evidence gap: {}",
+            annotation.text
+        );
+        assert!(
+            answer
                 .retrieval_trace
                 .annotations
                 .iter()
-                .find(|annotation| annotation.text.starts_with(prefix))
-                .unwrap_or_else(|| panic!("citation promotion must record `{prefix}`"));
-            assert_eq!(
-                annotation.kind,
-                codestory_contracts::api::RetrievalAnnotationKindDto::Observation,
-                "citation promotion telemetry is not an evidence gap: {}",
-                annotation.text
-            );
-        }
+                .all(|annotation| !annotation.text.contains("packet_focus_neighborhood")),
+            "CLI-shaped focus-neighborhood promotion must not run"
+        );
     }
 
     #[test]

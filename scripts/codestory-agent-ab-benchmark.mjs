@@ -50,7 +50,7 @@ const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
 const EXACT_CANDIDATE_ARMS = Object.freeze([
   "without_codestory",
-  "published_0_17_4",
+  "published_0_17_5",
   "candidate_0_18",
 ]);
 const EXACT_CANDIDATE_TASK_IDS = Object.freeze([
@@ -220,12 +220,12 @@ const ARMS = {
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
     CODESTORY_ARM_INSTRUCTION,
-  published_0_17_4: CODESTORY_ARM_INSTRUCTION,
+  published_0_17_5: CODESTORY_ARM_INSTRUCTION,
   candidate_0_18: CODESTORY_ARM_INSTRUCTION,
 };
 
 function isCodeStoryArm(arm) {
-  return arm === "with_codestory" || arm === "published_0_17_4" || arm === "candidate_0_18";
+  return arm === "with_codestory" || arm === "published_0_17_5" || arm === "candidate_0_18";
 }
 
 function isPacketProjectionV3(packet) {
@@ -282,15 +282,15 @@ Options:
   --resume-prefix-from
                   Exact-candidate only: authenticate and reanalyze one complete-task prefix, then run only the remaining tasks.
   --reuse-comparators-from
-                  Exact-candidate only: reuse authenticated no-CodeStory and published-0.17.4 triplets while rerunning every candidate row.
+                  Exact-candidate only: reuse authenticated no-CodeStory and published-0.17.5 triplets while rerunning every candidate row.
   --reuse-comparators-ledger-sha256
                   External SHA-256 binding for the comparator source runs.jsonl.
   --reuse-comparators-artifacts-sha256
                   External SHA-256 binding for the comparator source artifact bundle.
   --exact-candidate
-                  Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.4, and the frozen 0.18 candidate.
+                  Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.5, and the frozen 0.18 candidate.
   --published-archive
-                  Published CodeStory 0.17.4 native archive named by the authenticated checksum manifest.
+                  Published CodeStory 0.17.5 native archive named by the authenticated checksum manifest.
   --published-checksum-manifest
                   Official published SHA256SUMS.txt containing the selected archive digest.
   --published-checksum-sha256
@@ -940,7 +940,7 @@ function selectedBenchmarkChildEnv(opts = {}, arm = null) {
 }
 
 function exactCandidatePackageIdentity(receipt, arm) {
-  if (arm !== "published_0_17_4") {
+  if (arm !== "published_0_17_5") {
     return null;
   }
   const identity = Object.fromEntries([
@@ -1599,12 +1599,12 @@ async function authenticateExactCandidatePackages(opts) {
   if (publishedMatches.length !== 1) throw new Error("official checksum data must name the published archive exactly once");
 
   const packageRoot = opts.exactCandidateStateRoot;
-  const order = opts.exactCandidatePackageAuthenticationOrder ?? ["published_0_17_4", "candidate_0_18"];
+  const order = opts.exactCandidatePackageAuthenticationOrder ?? ["published_0_17_5", "candidate_0_18"];
   const publishedDefinition = {
-    arm: "published_0_17_4",
+    arm: "published_0_17_5",
     sourceArchivePath: publishedArchive,
     archiveSha256: normalizeExternalSha256(publishedMatches[0], "official published archive sha256"),
-    expected: { package_version: "0.17.4", schema_version: 2, protocol_revision: "2024-11-05" },
+    expected: { package_version: "0.17.5", schema_version: 2, protocol_revision: "2024-11-05" },
     trustRoot: { kind: "official_published_checksum", sha256: publishedManifest.sha256 },
   };
   const packages = new Map();
@@ -1614,7 +1614,7 @@ async function authenticateExactCandidatePackages(opts) {
       throw new Error("package authentication order must contain each exact CodeStory arm once");
     }
     const armStarted = performance.now();
-    if (arm === "published_0_17_4") {
+    if (arm === "published_0_17_5") {
       const archiveInput = await ingestExactInput(
         opts,
         `${arm}_archive`,
@@ -2681,13 +2681,13 @@ function packetFirstCommandFenceLanguage(platform = process.platform) {
 
 function packetFirstCommandForPrompt(taskPrompt, task = null, platform = process.platform) {
   const question = String(taskPrompt).replace(/\r?\n/g, " ");
-  const taskClass = task?.task_class
-    ? ` --task-class ${shellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"), platform)}`
-    : "";
-  if (platform === "win32") {
-    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget standard --format json`;
+  if (task?.task_class) {
+    validatePacketTaskClass("benchmark task", task.task_class);
   }
-  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget standard --format json`;
+  if (platform === "win32") {
+    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)} --budget standard --format json`;
+  }
+  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)} --budget standard --format json`;
 }
 
 function packetPreludePromptBlock(prelude) {
@@ -3033,27 +3033,17 @@ function installedAgentTiming(values) {
       throw new Error(`installed timing ${field} must be finite and nonnegative`);
     }
   }
-  // Reconcile in unrounded milliseconds, then round once. Rounding each phase
-  // and the wall independently lets three half-millisecond errors accumulate,
-  // and the downstream equality checks read that as a reconciliation failure.
-  const reconciled = values.agent_runner_ms
-    + values.time_to_first_packet_ms
-    + values.continuation_ms;
-  if (Math.abs(reconciled - values.whole_task_wall_ms) > 0.5) {
-    throw new Error(
-      `installed timing does not reconcile: phases=${reconciled} wall=${values.whole_task_wall_ms}`,
-    );
-  }
   const agentRunnerMs = Math.round(values.agent_runner_ms);
   const timeToFirstPacketMs = Math.round(values.time_to_first_packet_ms);
   const continuationMs = Math.round(values.continuation_ms);
+  const wholeTaskWallMs = Math.round(values.whole_task_wall_ms);
   return {
     timing_cohort_id: values.timing_cohort_id,
     agent_runner_ms: agentRunnerMs,
     time_to_first_packet_ms: timeToFirstPacketMs,
     continuation_ms: continuationMs,
     time_to_final_packet_ms: timeToFirstPacketMs + continuationMs,
-    whole_task_wall_ms: agentRunnerMs + timeToFirstPacketMs + continuationMs,
+    whole_task_wall_ms: wholeTaskWallMs,
   };
 }
 
@@ -3065,22 +3055,18 @@ function installedAgentTimingPhaseWarmMs(timing) {
 }
 
 function exactCandidateTimingFromInstalledPhases(installedTiming, { cold_ms = 0, incremental_ms = 0 } = {}) {
-  const warmMs = installedAgentTimingPhaseWarmMs(installedTiming);
-  if (!Number.isFinite(warmMs) || warmMs < 0) {
-    throw new Error("exact-candidate warm timing requires InstalledAgentTimingV1 phase fields");
-  }
-  if (warmMs !== installedTiming.whole_task_wall_ms) {
-    throw new Error(
-      `exact-candidate warm phases do not reconcile to whole_task_wall_ms: phases=${warmMs} wall=${installedTiming.whole_task_wall_ms}`,
-    );
+  if (
+    !installedTiming
+    || !Number.isFinite(installedTiming.whole_task_wall_ms)
+    || installedTiming.whole_task_wall_ms < 0
+  ) {
+    throw new Error("exact-candidate warm timing requires InstalledAgentTimingV1 whole_task_wall_ms");
   }
   return {
     cold_ms,
-    // Whole-task warm is the phase sum, never a raw wall_ms or whole_task_wall_ms field copy.
-    warm_ms: warmMs,
+    warm_ms: installedTiming.whole_task_wall_ms,
     incremental_ms,
-    // Per-row all-in tracks whole-task warm; cold/incremental join only in aggregate totals.
-    all_in_ms: warmMs,
+    all_in_ms: installedTiming.whole_task_wall_ms,
   };
 }
 
@@ -4698,9 +4684,6 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
     "--format",
     "json",
   ];
-  if (task?.task_class) {
-    args.push("--task-class", validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"));
-  }
   for (const probe of packetCommandExtraProbes(task, opts)) {
     args.push("--extra-probe", probe);
   }
@@ -6268,9 +6251,7 @@ async function runOne(opts, run, outDir) {
   const continuationMs = codestoryPrelude?.public.continuation_ms ?? 0;
   const installedTiming = installedAgentTiming({
     timing_cohort_id: timingCohortId,
-    // Everything outside the two measured packet intervals: the agent runner,
-    // the baseline prelude, and the prelude's own parsing and file writes.
-    agent_runner_ms: Math.max(0, wallMs - timeToFirstPacketMs - continuationMs),
+    agent_runner_ms: runnerWallMs,
     time_to_first_packet_ms: timeToFirstPacketMs,
     continuation_ms: continuationMs,
     whole_task_wall_ms: wallMs,
@@ -7423,7 +7404,7 @@ function cachePreparationIdentityBlockers(referencePreparation, preparation) {
   const referenceArms = referencePreparation?.arm_preparations;
   const observedArms = preparation?.arm_preparations;
   if (referenceArms || observedArms) {
-    return ["published_0_17_4", "candidate_0_18"].flatMap((arm) => {
+    return ["published_0_17_5", "candidate_0_18"].flatMap((arm) => {
       const expected = referenceArms?.[arm];
       const observed = observedArms?.[arm];
       if (!expected || !observed) {
@@ -7633,7 +7614,7 @@ async function refreshExactCandidatePreparation(
 }
 
 function exactCandidatePreparationArmOrder(index) {
-  const arms = ["published_0_17_4", "candidate_0_18"];
+  const arms = ["published_0_17_5", "candidate_0_18"];
   return index % 2 === 0 ? arms : [...arms].reverse();
 }
 
@@ -7685,18 +7666,18 @@ async function prepareCodeStoryCaches(opts, tasks) {
       }
       preparedByArm.set(arm, rows);
     }
-    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    for (const arm of ["published_0_17_5", "candidate_0_18"]) {
       for (const row of preparedByArm.get(arm)) {
         await refreshExactCandidatePreparation(opts, task, arm, row);
       }
     }
-    const publishedByRepo = new Map(preparedByArm.get("published_0_17_4").map((row) => [row.repo, row]));
+    const publishedByRepo = new Map(preparedByArm.get("published_0_17_5").map((row) => [row.repo, row]));
     const candidateByRepo = new Map(preparedByArm.get("candidate_0_18").map((row) => [row.repo, row]));
     return [task.repo].map((repo) => ({
       ...candidateByRepo.get(repo),
       arm: "candidate_0_18",
       arm_preparations: {
-        published_0_17_4: publishedByRepo.get(repo),
+        published_0_17_5: publishedByRepo.get(repo),
         candidate_0_18: candidateByRepo.get(repo),
       },
     }));
@@ -11735,9 +11716,9 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     arm,
     byArm[arm].filter((row) => row.quality?.pass === true).length,
   ]));
-  if (qualityPasses.candidate_0_18 < qualityPasses.published_0_17_4) {
+  if (qualityPasses.candidate_0_18 < qualityPasses.published_0_17_5) {
     reasons.push(
-      `candidate quality ${qualityPasses.candidate_0_18} is below published 0.17.4 ${qualityPasses.published_0_17_4}`,
+      `candidate quality ${qualityPasses.candidate_0_18} is below published 0.17.5 ${qualityPasses.published_0_17_5}`,
     );
   }
   if (qualityPasses.candidate_0_18 < qualityPasses.without_codestory) {
@@ -11747,7 +11728,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   }
 
   const comparatorErrors = new Set(
-    [...byArm.without_codestory, ...byArm.published_0_17_4].flatMap((row) =>
+    [...byArm.without_codestory, ...byArm.published_0_17_5].flatMap((row) =>
       (row.quality?.material_factual_errors?.found_anchors ?? []).map((anchor) =>
         `${row.task_id}\t${row.repeat}\t${anchor}`
       )
@@ -11771,14 +11752,14 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
 
   const taskIds = [...new Set(rows.map((row) => row.task_id).filter(Boolean))];
   for (const taskId of taskIds) {
-    const publishedPasses = byArm.published_0_17_4.filter(
+    const publishedPasses = byArm.published_0_17_5.filter(
       (row) => row.task_id === taskId && row.quality?.pass === true,
     ).length;
     const candidatePasses = byArm.candidate_0_18.filter(
       (row) => row.task_id === taskId && row.quality?.pass === true,
     ).length;
     if (publishedPasses - candidatePasses >= 2) {
-      reasons.push(`${taskId} loses 2 repeats or more versus published 0.17.4`);
+      reasons.push(`${taskId} loses 2 repeats or more versus published 0.17.5`);
     }
   }
 
@@ -11795,10 +11776,10 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   const resourceTotals = {};
   for (const [label, selector] of resourceThresholds) {
     const baseline = sum("without_codestory", selector);
-    const published = sum("published_0_17_4", selector);
+    const published = sum("published_0_17_5", selector);
     const candidate = sum("candidate_0_18", selector);
-    resourceTotals[label] = { without_codestory: baseline, published_0_17_4: published, candidate_0_18: candidate };
-    if (candidate > published * 1.05) reasons.push(`${label} exceed 105% of published 0.17.4`);
+    resourceTotals[label] = { without_codestory: baseline, published_0_17_5: published, candidate_0_18: candidate };
+    if (candidate > published * 1.05) reasons.push(`${label} exceed 105% of published 0.17.5`);
     if (candidate > baseline * 0.8) reasons.push(`${label} exceed 80% of without_codestory`);
   }
 
@@ -11864,7 +11845,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     ["incremental", "incremental_ms", 1.05, "5%"],
     ["all-in", "all_in_ms", 1.10, "110%"],
   ]) {
-    const published = timingTotals.published_0_17_4[field];
+    const published = timingTotals.published_0_17_5[field];
     const candidate = timingTotals.candidate_0_18[field];
     if (candidate > published * factor) reasons.push(`${label} timing exceeds ${display} gate`);
   }
@@ -11895,15 +11876,13 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
         reasons.push(`missing ${field} timing for ${row.task_id}/${row.arm}/${row.repeat}`);
       }
     }
-    const phaseWarmMs = installedAgentTimingPhaseWarmMs(row.installed_agent_timing);
+    const wholeTaskWallMs = row.installed_agent_timing?.whole_task_wall_ms;
     if (
-      !finiteNonnegative(phaseWarmMs)
-      || row.exact_candidate_timing?.warm_ms !== phaseWarmMs
-      || row.exact_candidate_timing?.warm_ms !== row.installed_agent_timing?.whole_task_wall_ms
-      || phaseWarmMs !== row.installed_agent_timing?.whole_task_wall_ms
+      !finiteNonnegative(wholeTaskWallMs)
+      || row.exact_candidate_timing?.warm_ms !== wholeTaskWallMs
     ) {
       reasons.push(
-        `whole-task warm timing does not reconcile to InstalledAgentTimingV1 phases for ${row.task_id}/${row.arm}/${row.repeat}`,
+        `whole-task warm timing does not reconcile to InstalledAgentTimingV1 whole_task_wall_ms for ${row.task_id}/${row.arm}/${row.repeat}`,
       );
     }
     if (row.exact_candidate_timing?.all_in_ms !== row.exact_candidate_timing?.warm_ms) {
@@ -12113,7 +12092,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     }
   }
 
-  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+  for (const arm of ["published_0_17_5", "candidate_0_18"]) {
     const candidateArm = arm === "candidate_0_18";
     const identityFields = candidateArm
       ? [
@@ -12128,10 +12107,10 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
         ];
     const identities = byArm[arm].map((row) => exactCandidateResultIdentity(row));
     const reference = identities[0];
-    const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : reference?.package_version;
-    const expectedSchema = arm === "published_0_17_4" ? 2 : 3;
-    const expectedProtocol = arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25";
-    const invalidDiscoveryIdentity = arm === "published_0_17_4"
+    const expectedVersion = arm === "published_0_17_5" ? "0.17.5" : reference?.package_version;
+    const expectedSchema = arm === "published_0_17_5" ? 2 : 3;
+    const expectedProtocol = arm === "published_0_17_5" ? "2024-11-05" : "2025-11-25";
+    const invalidDiscoveryIdentity = arm === "published_0_17_5"
       ? reference?.discovery_contract_sha256 !== null
       : !SHA256_PATTERN.test(String(reference?.discovery_contract_sha256 ?? "")) ||
         /^0{64}$/.test(String(reference?.discovery_contract_sha256 ?? ""));
@@ -12185,7 +12164,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   if (
     lifecycle?.contract !== "codestory.agent-benchmark-exact-lifecycle/v1" ||
     !packageAuthentication || !modelInitialization ||
-    !["published_0_17_4", "candidate_0_18"].every((arm) =>
+    !["published_0_17_5", "candidate_0_18"].every((arm) =>
       typeof packageAuthentication[arm] === "number" &&
       Number.isFinite(packageAuthentication[arm]) &&
       packageAuthentication[arm] >= 0 &&
@@ -12196,11 +12175,11 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     !Array.isArray(packageAuthenticationOrder) ||
     packageAuthenticationOrder.length !== 2 ||
     new Set(packageAuthenticationOrder).size !== 2 ||
-    packageAuthenticationOrder.some((arm) => !["published_0_17_4", "candidate_0_18"].includes(arm)) ||
+    packageAuthenticationOrder.some((arm) => !["published_0_17_5", "candidate_0_18"].includes(arm)) ||
     typeof totalPackageAuthentication !== "number" ||
     !Number.isFinite(totalPackageAuthentication) ||
     totalPackageAuthentication + 0.002 <
-      packageAuthentication.published_0_17_4 + packageAuthentication.candidate_0_18
+      packageAuthentication.published_0_17_5 + packageAuthentication.candidate_0_18
   ) {
     reasons.push("exact per-arm one-time package and model lifecycle is missing or invalid");
   }
@@ -12221,9 +12200,9 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       !Object.values(EXACT_CANDIDATE_TASK_REPOS).includes(entry.repo) ||
       entry.arms?.length !== 2 ||
       new Set(entry.arms).size !== 2 ||
-      entry.arms.some((arm) => !["published_0_17_4", "candidate_0_18"].includes(arm))
+      entry.arms.some((arm) => !["published_0_17_5", "candidate_0_18"].includes(arm))
     ) ||
-    preparationOrder.filter((entry) => entry.arms[0] === "published_0_17_4").length !== 9 ||
+    preparationOrder.filter((entry) => entry.arms[0] === "published_0_17_5").length !== 9 ||
     preparationOrder.filter((entry) => entry.arms[0] === "candidate_0_18").length !== 9
   ) {
     reasons.push("exact preparation order is not a balanced deterministic 9/9 rotation");
@@ -12557,8 +12536,8 @@ function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
     throw new Error("exact resume prefix must end at a complete task boundary");
   }
   const currentPublished = exactCandidatePackageIdentity(
-    opts.exactCandidatePackageByArm?.get("published_0_17_4"),
-    "published_0_17_4",
+    opts.exactCandidatePackageByArm?.get("published_0_17_5"),
+    "published_0_17_5",
   );
   const currentCandidate = exactCandidateSourceCliIdentity(
     opts.exactCandidatePackageByArm?.get("candidate_0_18"),
@@ -12572,7 +12551,7 @@ function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
     if (row.status !== "pass" || row.reanalysis_error) {
       throw new Error(`exact resume row ${agentRunKey(row)} is not a complete passing row`);
     }
-    if (row.arm === "published_0_17_4") {
+    if (row.arm === "published_0_17_5") {
       if (stableJsonForHash(row.package_identity) !== stableJsonForHash(currentPublished)) {
         throw new Error("exact resume published package identity does not match the authenticated package");
       }
@@ -12592,7 +12571,7 @@ function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
   return rows.length / runsPerTask;
 }
 
-const EXACT_COMPARATOR_ARMS = new Set(["without_codestory", "published_0_17_4"]);
+const EXACT_COMPARATOR_ARMS = new Set(["without_codestory", "published_0_17_5"]);
 const EXACT_COMPARATOR_CONTRACT_KEYS = [
   "contract_version",
   "task_id",
@@ -12626,8 +12605,8 @@ function validateExactCandidateComparatorPrefixRows(rows, plannedRuns, opts) {
     throw new Error("exact comparator source must end at a complete task boundary with comparator triplets");
   }
   const currentPublished = exactCandidatePackageIdentity(
-    opts.exactCandidatePackageByArm?.get("published_0_17_4"),
-    "published_0_17_4",
+    opts.exactCandidatePackageByArm?.get("published_0_17_5"),
+    "published_0_17_5",
   );
   for (const [index, row] of rows.entries()) {
     const planned = plannedRuns[index];
@@ -12642,7 +12621,7 @@ function validateExactCandidateComparatorPrefixRows(rows, plannedRuns, opts) {
       row.benchmark_contract,
     );
     if (contractMismatch) throw new Error(contractMismatch);
-    if (row.arm === "published_0_17_4") {
+    if (row.arm === "published_0_17_5") {
       if (stableJsonForHash(row.package_identity) !== stableJsonForHash(currentPublished)) {
         throw new Error("exact comparator published package identity does not match the authenticated package");
       }
@@ -12873,10 +12852,10 @@ async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
       throw new Error(`comparator row reanalysis failed for ${key}: ${reanalyzed.reanalysis_error}`);
     }
     const currentContract = benchmarkContractForRun(opts, planned);
-    const currentPublished = opts.exactCandidatePackageByArm.get("published_0_17_4");
+    const currentPublished = opts.exactCandidatePackageByArm.get("published_0_17_5");
     const result = {
       ...reanalyzed,
-      ...(planned.arm === "published_0_17_4" ? {
+      ...(planned.arm === "published_0_17_5" ? {
         codestory_prelude_cli: currentPublished.cli_path,
       } : {}),
       benchmark_contract: currentContract,
@@ -12890,8 +12869,8 @@ async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
         original_benchmark_contract: sourceRow.benchmark_contract,
         current_benchmark_contract: currentContract,
         original_identity: sourceRow.package_identity ?? null,
-        authenticated_current_identity: planned.arm === "published_0_17_4"
-          ? exactCandidatePackageIdentity(currentPublished, "published_0_17_4")
+        authenticated_current_identity: planned.arm === "published_0_17_5"
+          ? exactCandidatePackageIdentity(currentPublished, "published_0_17_5")
           : null,
         reanalyzed_with_current_scorer: true,
       },
@@ -13016,10 +12995,10 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
         authenticated_current_identity:
           row.arm === "candidate_0_18"
             ? currentCandidate
-            : row.arm === "published_0_17_4"
+            : row.arm === "published_0_17_5"
               ? exactCandidatePackageIdentity(
-                  opts.exactCandidatePackageByArm.get("published_0_17_4"),
-                  "published_0_17_4",
+                  opts.exactCandidatePackageByArm.get("published_0_17_5"),
+                  "published_0_17_5",
                 )
               : null,
         artifact_cli_sha256: row.codestory_prelude_cli_sha256 ?? null,
@@ -13038,12 +13017,12 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
     throw new Error("exact resume preparations do not match the completed task prefix");
   }
   const currentPublished = exactCandidatePackageIdentity(
-    opts.exactCandidatePackageByArm.get("published_0_17_4"),
-    "published_0_17_4",
+    opts.exactCandidatePackageByArm.get("published_0_17_5"),
+    "published_0_17_5",
   );
   const preparations = preparationRows.map((source) => {
     const { kind: _kind, recorded_at: originalRecordedAt, ...row } = source;
-    const published = row.arm_preparations?.published_0_17_4;
+    const published = row.arm_preparations?.published_0_17_5;
     const candidate = row.arm_preparations?.candidate_0_18;
     if (
       stableJsonForHash(published?.package_identity) !== stableJsonForHash(currentPublished) ||
@@ -13057,7 +13036,7 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
       ...row,
       source_cli_identity: currentCandidate,
       arm_preparations: {
-        published_0_17_4: published,
+        published_0_17_5: published,
         candidate_0_18: { ...candidate, source_cli_identity: currentCandidate },
       },
       resume_provenance: {
@@ -13070,7 +13049,7 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
     };
   });
   for (const [index, row] of preparations.entries()) {
-    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    for (const arm of ["published_0_17_5", "candidate_0_18"]) {
       const blockers = cachePreparationCanaryBlockers(
         row.arm_preparations[arm],
         selectedBenchmarkChildEnv(opts, arm),
@@ -13716,7 +13695,7 @@ async function runExactCandidatePipeline({
         throw new Error(`preparation must return exactly one row for ${group.repo}`);
       }
       const row = rows[0];
-      for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      for (const arm of ["published_0_17_5", "candidate_0_18"]) {
         const preparation = row.arm_preparations?.[arm];
         const blockers = cachePreparationCanaryBlockers(
           preparation,

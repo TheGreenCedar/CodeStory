@@ -11,7 +11,7 @@ use codestory_contracts::api::{
     BookmarkCategoryDto, BookmarkDto, GroundingBudgetDto, IndexDryRunDto, IndexFreshnessDto,
     IndexedFileRoleDto, IndexingPhaseTimings, LayoutDirection, NodeId, NodeKind,
     PacketBudgetModeDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketProbeDto,
-    PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto,
+    ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto,
     RepoTextScanStatsDto, RetrievalScoreBreakdownDto, RetrievalShadowDto, RetrievalStateDto,
     SearchHitOrigin, SearchMatchQualityDto, SearchPlanDto, SearchQueryAssessmentDto,
     SearchTargetDto, SnippetContextDto, SummaryGenerationDto, SymbolContextDto, TrailCallerScope,
@@ -144,6 +144,16 @@ pub(crate) struct VerifyIndexedDirectCallsCommand {
     /// A `call-path/v1` document, or `-` to read it from stdin.
     #[arg(long, value_name = "PATH")]
     pub(crate) spec: PathBuf,
+    /// Compact JSON is capped at 4 KiB. Full provenance stays behind the
+    /// capability URI when available.
+    #[arg(long, value_enum, default_value_t = VerifyOutputMode::Compact)]
+    pub(crate) output: VerifyOutputMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum VerifyOutputMode {
+    Compact,
+    Full,
 }
 
 #[derive(Args, Debug)]
@@ -292,17 +302,6 @@ pub(crate) enum CliPacketBudget {
     Compact,
     Standard,
     Deep,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub(crate) enum CliPacketTaskClass {
-    ArchitectureExplanation,
-    BugLocalization,
-    ChangeImpact,
-    RouteTracing,
-    SymbolOwnership,
-    DataFlow,
-    EditPlanning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -530,8 +529,6 @@ pub(crate) struct PacketCommand {
     pub(crate) question: String,
     #[arg(long, value_enum, default_value_t = CliPacketBudget::Standard)]
     pub(crate) budget: CliPacketBudget,
-    #[arg(long, value_enum)]
-    pub(crate) task_class: Option<CliPacketTaskClass>,
     #[arg(
         long = "probe",
         value_name = "TAGGED_JSON",
@@ -2583,20 +2580,6 @@ impl From<CliPacketBudget> for PacketBudgetModeDto {
             CliPacketBudget::Compact => Self::Compact,
             CliPacketBudget::Standard => Self::Standard,
             CliPacketBudget::Deep => Self::Deep,
-        }
-    }
-}
-
-impl From<CliPacketTaskClass> for PacketTaskClassDto {
-    fn from(value: CliPacketTaskClass) -> Self {
-        match value {
-            CliPacketTaskClass::ArchitectureExplanation => Self::ArchitectureExplanation,
-            CliPacketTaskClass::BugLocalization => Self::BugLocalization,
-            CliPacketTaskClass::ChangeImpact => Self::ChangeImpact,
-            CliPacketTaskClass::RouteTracing => Self::RouteTracing,
-            CliPacketTaskClass::SymbolOwnership => Self::SymbolOwnership,
-            CliPacketTaskClass::DataFlow => Self::DataFlow,
-            CliPacketTaskClass::EditPlanning => Self::EditPlanning,
         }
     }
 }

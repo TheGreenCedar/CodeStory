@@ -46,7 +46,54 @@ pub(crate) fn project_public_verification_result(internal: Value) -> Result<Valu
     );
     public.insert("runtime_execution_proven".to_owned(), Value::Bool(false));
     attach_proof_provenance_capability(&mut public);
-    Ok(Value::Object(public))
+    apply_public_compact_budget(Value::Object(public))
+}
+
+fn apply_public_compact_budget(root: Value) -> Result<Value, String> {
+    let serialized = serde_json::to_vec(&root)
+        .map_err(|error| format!("serialize public verification result: {error}"))?;
+    if serialized.len() <= proof::COMPACT_PROOF_MAX_BYTES {
+        return Ok(root);
+    }
+    let object = root
+        .as_object()
+        .ok_or_else(|| "proof projection root must be an object".to_owned())?;
+    let contract_digest = object.get("contract_digest").cloned().unwrap_or(json!(""));
+    let mut compact = json!({
+        "kind": "budget_exceeded",
+        "schema_version": object.get("schema_version").cloned().unwrap_or(json!(1)),
+        "domain": object.get("domain").cloned().unwrap_or(json!(PUBLIC_CALL_PATH_DOMAIN)),
+        "translation_status": object.get("translation_status").cloned().unwrap_or(json!(proof::CONTRACT_INTERPRETATION)),
+        "graph_disposition": "unknown",
+        "runtime_execution_proven": false,
+        "guard_version": object.get("guard_version").cloned().unwrap_or(json!("clause_guard_v1")),
+        "source_text_sha256": object.get("source_text_sha256").cloned().unwrap_or(json!("")),
+        "contract_digest": contract_digest.clone(),
+        "core_publication": object.get("core_publication").cloned().unwrap_or(json!({})),
+        "disposition": {
+            "kind": "unknown",
+            "contract_digest": contract_digest,
+            "gaps": [{"kind": "output_budget_exceeded"}]
+        },
+        "cap_bytes": proof::COMPACT_PROOF_MAX_BYTES,
+        "required_complete_size": serialized.len(),
+    });
+    if let Some(compact_object) = compact.as_object_mut() {
+        if let Some(provenance) = object.get("provenance").cloned() {
+            compact_object.insert("provenance".to_owned(), provenance);
+        }
+        attach_proof_provenance_capability(compact_object);
+    }
+    let compact_bytes = serde_json::to_vec(&compact)
+        .map_err(|error| format!("serialize public verification budget envelope: {error}"))?;
+    if compact_bytes.len() > proof::COMPACT_PROOF_MAX_BYTES {
+        return Err(format!(
+            "public verification result exceeds {} bytes even after budget projection ({} bytes)",
+            proof::COMPACT_PROOF_MAX_BYTES,
+            compact_bytes.len()
+        ));
+    }
+    Ok(compact)
 }
 
 fn rewrite_forbidden_public_absence(
@@ -122,7 +169,9 @@ fn attach_proof_provenance_capability(public: &mut serde_json::Map<String, Value
 /// Reads the single public request field and parses the grammar. The internal
 /// contract, its clause anchors, and its selectors are produced here; no caller
 /// can supply a classification or a pinned internal node identity.
-pub(crate) fn parse_request(arguments: Value) -> Result<proof::UnvalidatedCallPathContract, String> {
+pub(crate) fn parse_request(
+    arguments: Value,
+) -> Result<proof::UnvalidatedCallPathContract, String> {
     let object = arguments
         .as_object()
         .ok_or_else(|| format!("{PUBLIC_VERIFY_TOOL_NAME} arguments must be an object"))?;
@@ -143,6 +192,11 @@ pub(crate) fn parse_request(arguments: Value) -> Result<proof::UnvalidatedCallPa
         .ok_or_else(|| {
             format!("{PUBLIC_VERIFY_TOOL_NAME} requires `{CALL_PATH_ARGUMENT}` as a {CALL_PATH_GRAMMAR_HEADER} text document")
         })?;
+    if document.len() > PROVE_CALL_PATH_INPUT_MAX_BYTES {
+        return Err(format!(
+            "{PUBLIC_VERIFY_TOOL_NAME} `{CALL_PATH_ARGUMENT}` exceeds the {PROVE_CALL_PATH_INPUT_MAX_BYTES} byte input limit"
+        ));
+    }
     parse_call_path_document(document).map_err(|error| error.message)
 }
 
@@ -215,7 +269,7 @@ mod tests {
             "kind": "complete",
             "schema_version": 1,
             "domain": "indexed_source_call_path_v1",
-            "contract_interpretation": "parser_derived",
+            "contract_interpretation": "host_supplied",
             "guard_version": "clause_guard_v1",
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
@@ -240,7 +294,7 @@ mod tests {
             let public = project_public_verification_result(internal_fixture(internal_kind))
                 .expect("project public verification result");
             assert_eq!(public["domain"], "call-path/v1");
-            assert_eq!(public["translation_status"], "parser_derived");
+            assert_eq!(public["translation_status"], "host_supplied");
             assert_eq!(public["graph_disposition"], graph_disposition);
             assert_eq!(public["runtime_execution_proven"], false);
             assert!(public.get("contract_interpretation").is_none());
@@ -296,7 +350,8 @@ mod tests {
     #[test]
     fn the_request_accepts_only_the_call_path_document() {
         let document =
-            "call-path/v1\nstart: crate::Alpha\nstep 1: direct call -> crate::Beta\n".to_owned();
+            "call-path/v1\nfrom symbol \"crate::Alpha\"\ndirect-call symbol \"crate::Beta\"\n"
+                .to_owned();
         parse_request(json!({ "call_path": document.clone() })).expect("a grammar document parses");
 
         for hostile in [
@@ -313,9 +368,54 @@ mod tests {
     }
 
     #[test]
+    fn public_budget_overflow_emits_unknown_output_budget_exceeded() {
+        let mut internal = internal_fixture("contract_proven");
+        internal["clauses"] = json!([{
+            "start": 0,
+            "end": 1,
+            "clause_id": "c",
+            "quote": "x".repeat(5 * 1024),
+            "classification": "resolved_material",
+            "fields": [{"kind": "start"}],
+            "reason": null,
+            "non_material_kind": null
+        }]);
+        let public = project_public_verification_result(internal)
+            .expect("oversized public verification must emit a typed budget envelope");
+        assert_eq!(public["kind"], "budget_exceeded");
+        assert_eq!(public["graph_disposition"], "unknown");
+        assert_eq!(public["guard_version"], "clause_guard_v1");
+        assert_eq!(
+            public["provenance"],
+            json!({"availability": "unavailable"})
+        );
+        assert_eq!(public.pointer("/disposition/kind"), Some(&json!("unknown")));
+        assert_eq!(
+            public.pointer("/disposition/gaps/0/kind"),
+            Some(&json!("output_budget_exceeded"))
+        );
+        assert!(public.pointer("/disposition/reasons").is_none());
+        let bytes = serde_json::to_vec(&public).expect("serialize budget envelope");
+        assert!(bytes.len() <= proof::COMPACT_PROOF_MAX_BYTES);
+    }
+
+    #[test]
+    fn parse_request_rejects_multibyte_documents_over_eight_kib() {
+        let oversized = format!(
+            "call-path/v1\nfrom symbol \"{}\"\ndirect-call symbol \"crate::Beta\"\n",
+            "字".repeat(3 * 1024)
+        );
+        assert!(oversized.len() > PROVE_CALL_PATH_INPUT_MAX_BYTES);
+        assert!(oversized.chars().count() <= PROVE_CALL_PATH_INPUT_MAX_BYTES);
+        let error = parse_request(json!({ "call_path": oversized }))
+            .expect_err("UTF-8 byte length, not character count, is the input cap");
+        assert!(error.contains("byte"), "{error}");
+    }
+
+    #[test]
     fn a_pinned_internal_node_is_not_a_public_selector() {
         let error = parse_request(json!({
-            "call_path": "call-path/v1\nstart: {\"kind\":\"pinned_node\",\"node_id\":\"7\"}\nstep 1: direct call -> crate::Beta\n"
+            "call_path": "call-path/v1\nfrom symbol \"{\\\"kind\\\":\\\"pinned_node\\\",\\\"node_id\\\":\\\"7\\\"}\"\ndirect-call symbol \"crate::Beta\"\n"
         }))
         .expect_err("internal node identities never cross the public surface");
         assert!(error.contains("start"), "{error}");

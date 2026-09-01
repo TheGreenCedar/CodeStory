@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
-use crate::args::{OutputFormat, ProjectArgs, VerifyIndexedDirectCallsCommand};
+use crate::args::{OutputFormat, ProjectArgs, VerifyIndexedDirectCallsCommand, VerifyOutputMode};
 use crate::call_path_grammar::parse_call_path_document;
 use crate::output::emit;
 use crate::prove_call_path::{
@@ -13,9 +13,14 @@ use crate::prove_call_path::{
 use crate::runtime::{RuntimeContext, map_api_error};
 
 pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsCommand) -> Result<()> {
+    if cmd.output == VerifyOutputMode::Full {
+        anyhow::bail!(
+            "--output full is unavailable until proof provenance is published; use --output compact"
+        );
+    }
     let document = read_bounded_call_path(&cmd.spec)?;
-    let contract = parse_call_path_document(&document)
-        .map_err(|error| anyhow::Error::msg(error.message))?;
+    let contract =
+        parse_call_path_document(&document).map_err(|error| anyhow::Error::msg(error.message))?;
     let validation = validate_request(contract).map_err(anyhow::Error::msg)?;
     let project = ProjectArgs {
         project: cmd.project,

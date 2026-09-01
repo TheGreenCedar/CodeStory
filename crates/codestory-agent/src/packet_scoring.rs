@@ -34,12 +34,18 @@ pub fn sort_by_cached_rank_desc<T>(values: &mut Vec<T>, mut rank: impl FnMut(&T)
 
 /// Citations merged from each packet retrieval stage before the final budget cap.
 pub fn packet_stage_citation_carry_limit(limits: &PacketBudgetLimitsDto) -> usize {
-    limits.max_anchors.clamp(8, 16) as usize
+    (limits.max_anchors as usize).clamp(
+        1,
+        codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES,
+    )
 }
 
 /// Candidate hits fetched per planned subquery or anchor-probe batch query.
 pub fn packet_subquery_hit_limit(limits: &PacketBudgetLimitsDto) -> usize {
-    limits.max_anchors.clamp(8, 20) as usize
+    (limits.max_anchors as usize).clamp(
+        1,
+        codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES,
+    )
 }
 
 pub fn packet_citation_key(citation: &AgentCitationDto) -> String {
@@ -52,7 +58,7 @@ pub fn packet_citation_key(citation: &AgentCitationDto) -> String {
 }
 pub fn packet_citation_rank(
     citation: &AgentCitationDto,
-    terms: &[String],
+    _terms: &[String],
     prefer_primary_sources: bool,
 ) -> f32 {
     let display = citation.display_name.to_ascii_lowercase();
@@ -134,37 +140,14 @@ pub fn packet_citation_rank(
     {
         score -= 14.0;
     }
-    if path.contains("/server/") && !packet_terms_contain(terms, "server") {
-        score -= 12.0;
-    }
     #[cfg(any(test, feature = "test-support"))]
     {
         score = eval_citation_rank_adjustment(&normalized_display, &path, score);
     }
-    for term in terms {
-        if term.len() < 3 {
-            continue;
-        }
-        let normalized_term = normalize_identifier(term);
-        if !normalized_term.is_empty() && normalized_display.contains(&normalized_term) {
-            score += 1.25;
-            if normalized_display == normalized_term
-                || normalized_display.ends_with(&normalized_term)
-            {
-                score += 4.0;
-            }
-        }
-        if path.contains(term) {
-            score += 0.5;
-        }
-    }
-
-    if packet_low_signal_display_name(normalized_display.as_str())
-        && !packet_terms_contain(terms, normalized_display.as_str())
-    {
+    if packet_low_signal_display_name(normalized_display.as_str()) {
         score -= 8.0;
     }
-    score += packet_shared_source_set_rank_adjustment(&path, terms);
+    score += packet_shared_source_set_rank_adjustment(&path, &[]);
 
     {
         if normalized_display.chars().count() <= 1 {
@@ -440,7 +423,6 @@ const PACKET_QUERY_STOP_TERMS: &[&str] = &[
     "with",
     "flows",
     "level",
-    "requests",
     "support",
 ];
 
@@ -484,6 +466,11 @@ pub fn packet_file_stem_matches_query(query: &str, path: Option<&str>) -> bool {
     let Some(path) = path else {
         return false;
     };
+    // Basename-stem identity is deleted. Only an explicit path-shaped query may
+    // match a file name; a bare symbol must not match `router.rs`.
+    if !query.contains(['/', '\\']) {
+        return false;
+    }
     let query_path = query.replace('\\', "/");
     let query_file_name = query_path.rsplit('/').next().unwrap_or(query).trim();
     let query_stem = query_file_name

@@ -823,15 +823,6 @@ const AFFECTED_INPUT_CLASSIFICATIONS: &[&str] = &[
     "malformed",
     "unavailable_evidence",
 ];
-const PACKET_TASK_CLASSES: &[&str] = &[
-    "architecture_explanation",
-    "bug_localization",
-    "change_impact",
-    "route_tracing",
-    "symbol_ownership",
-    "data_flow",
-    "edit_planning",
-];
 
 static GENERIC_OBJECT_SCHEMA: SchemaObject =
     SchemaObject::passthrough_object("Generic JSON object.");
@@ -1776,9 +1767,6 @@ static AGENT_PACKET_SCHEMA: SchemaObject = SchemaObject::object(
     &[
         SchemaProperty::string("packet_id", "Stable packet id."),
         SchemaProperty::string("question", "Packet question."),
-        SchemaProperty::string("task_class", "Optional task class.")
-            .with_enum(PACKET_TASK_CLASSES)
-            .nullable(),
         SchemaProperty::object("plan", "Packet planner trace."),
         SchemaProperty::object("answer", "Underlying DB-first answer packet."),
         SchemaProperty::object("budget", "Budget limits, usage, and truncation metadata."),
@@ -2289,9 +2277,6 @@ static PACKET_INPUT_SCHEMA: SchemaObject = SchemaObject::object(
         SchemaProperty::string("budget", "Packet budget.")
             .with_enum(PACKET_BUDGETS)
             .with_default(ValueLiteral::String("standard")),
-        SchemaProperty::string("task_class", "Optional task class.")
-            .with_enum(PACKET_TASK_CLASSES)
-            .nullable(),
         SchemaProperty::tagged_union_array(
             "probes",
             "Optional tagged exact-path, symbol-id, file-symbol, free-query, or generation-bound continuation probes.",

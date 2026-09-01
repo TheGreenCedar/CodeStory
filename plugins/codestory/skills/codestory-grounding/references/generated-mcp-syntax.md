@@ -21,7 +21,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | Tool | Required besides `project` | Optional | Notes |
 | --- | --- | --- | --- |
 | `status` | | | Observational. Do not call first. |
-| `packet` | `question` | `budget`, `task_class`, `probes`, `extra_probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Broad evidence questions. No `include_evidence`. |
+| `packet` | `question` | `budget`, `probes`, `extra_probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Broad evidence questions. No `include_evidence`. No `task_class`. |
 | `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery, not packet recovery. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
 | `files` | | `language`, `path`, `role`, `limit` | Refreshes the local map before dispatch. No `refresh` field. |
@@ -49,23 +49,25 @@ per line:
 
 ```text
 call-path/v1
-start: crate::module::Alpha
-step 1: direct call -> crate::module::Beta
-step 2: direct call -> "src/gamma.rs"::Gamma
-prohibit traversal through: crate::detail::Helper
-exclude from projection: crate::test_support
+from symbol "crate::module::Alpha"
+direct-call symbol "crate::module::Beta"
+direct-call symbol "Gamma" in "src/gamma.rs"
+prohibit-through symbol "crate::detail::Helper"
+exclude-from-projection symbol "crate::test_support"
 ```
 
-The version line comes first. `start` and at least one `step` are required;
-steps are numbered consecutively from 1, up to 6. The `prohibit traversal
-through` and `exclude from projection` lines are optional and repeatable.
-Selectors are qualified names, or `"path/to/file"::Name` to scope one file.
-Signatures, wildcards, and internal node identities are not selectors.
+The version line comes first. Exactly one `from` and one to six `direct-call`
+lines are required. `prohibit-through` and `exclude-from-projection` are
+optional and capped at sixteen each. Selectors are
+`symbol "<qualified-name>" [in "<project-relative-path>"]` or
+`canonical "<id>"`. Signatures, wildcards, absolute paths, `..`, and internal
+node identities are not selectors.
 
 Blank lines and indentation are ignored. Any other line the grammar cannot read
 becomes an unresolved clause, and the whole verification then reports
 `graph_disposition: "unknown"` instead of proving a smaller contract than you
-wrote. The document is capped at 8192 bytes.
+wrote. The document is capped at 8192 bytes. Compact results are capped at
+4 KiB.
 
 ## Resources and prompts
 

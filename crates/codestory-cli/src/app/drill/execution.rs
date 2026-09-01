@@ -99,7 +99,6 @@ fn prepare_drill(cmd: &DrillCommand) -> Result<PreparedDrill> {
         packet_request: AgentPacketRequestDto {
             question,
             budget: PacketBudgetModeDto::Standard,
-            task_class: None,
             probes: Vec::new(),
             extra_probes: anchors.clone(),
             latency_budget_ms: None,

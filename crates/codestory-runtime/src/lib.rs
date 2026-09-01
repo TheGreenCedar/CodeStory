@@ -77,6 +77,13 @@ pub fn resolve_core_database_path(storage_path: &Path) -> Result<PathBuf, ApiErr
 
 mod affected;
 mod agent;
+#[allow(unused_imports)]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "proof-qualification-support"
+))]
+mod call_path_kernel;
 mod evidence_projection_v3;
 mod index_commit;
 mod index_coverage;

@@ -321,39 +321,16 @@ pub fn packet_sufficiency_required_probe_queries_with_extra(
 
 pub fn packet_sufficiency_required_probe_queries_from_terms(
     _terms: &[String],
-    task_class: PacketTaskClassDto,
+    _task_class: PacketTaskClassDto,
 ) -> Vec<String> {
-    if !matches!(
-        task_class,
-        PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::EditPlanning
-    ) {
-        return Vec::new();
-    }
     Vec::new()
 }
 
 pub fn packet_prompt_exact_symbol_probe_queries(
     question: &str,
     terms: &[String],
-    task_class: PacketTaskClassDto,
+    _task_class: PacketTaskClassDto,
 ) -> Vec<String> {
-    if !matches!(
-        task_class,
-        PacketTaskClassDto::ArchitectureExplanation
-            | PacketTaskClassDto::DataFlow
-            | PacketTaskClassDto::ChangeImpact
-            | PacketTaskClassDto::RouteTracing
-            | PacketTaskClassDto::EditPlanning
-            | PacketTaskClassDto::SymbolOwnership
-            | PacketTaskClassDto::BugLocalization
-    ) {
-        return Vec::new();
-    }
-
     let mut queries = Vec::new();
     for term in exact_symbol_query_terms(question) {
         if packet_prompt_exact_symbol_term_is_probe(&term) {
@@ -927,7 +904,7 @@ mod tests {
         );
         assert_eq!(
             packet_citation_probe_match_rank("event_processor_with_jsonl_output", &citation),
-            Some(5)
+            None
         );
     }
 
@@ -1124,8 +1101,12 @@ mod tests {
             test_packet_citation("transport registry", "src/runtime/adapters.js", 0.1);
         indexed_file.kind = NodeKind::FILE;
         assert_eq!(
-            packet_citation_probe_match_rank("adapters", &indexed_file),
+            packet_citation_probe_match_rank("src/runtime/adapters.js", &indexed_file),
             Some(6)
+        );
+        assert_eq!(
+            packet_citation_probe_match_rank("adapters", &indexed_file),
+            None
         );
 
         for (label, citation) in [

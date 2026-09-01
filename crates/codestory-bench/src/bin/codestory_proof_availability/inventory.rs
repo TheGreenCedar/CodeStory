@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail};
-use codestory_agent::proof_qualification_support::{RawAdmissionFailure, diagnose_raw_call_edge};
 use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, ResolutionCertainty};
+use codestory_runtime::proof_qualification_support::{RawAdmissionFailure, diagnose_raw_call_edge};
 use codestory_store::Store;
 
 use super::contracts::InventoryReportV1;
@@ -170,8 +170,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use anyhow::Result;
-    use codestory_agent::proof_qualification_support::RawAdmissionFailure;
     use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, Node, NodeId, ResolutionCertainty};
+    use codestory_runtime::proof_qualification_support::RawAdmissionFailure;
     use codestory_store::Store;
 
     use super::{CertaintyBucket, ResolutionBucket, analyze_store, checked_total};

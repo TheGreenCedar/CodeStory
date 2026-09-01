@@ -24,13 +24,13 @@ const ROUTING_CORPUS_DOCUMENT = JSON.parse(readFileSync(
   "utf8",
 ));
 const GENERATED_TOOL_SCHEMAS = new Map(GENERATED_MCP_CATALOG.tools.map((tool) => [tool.name, tool]));
-const PROVE_CALL_PATH_INPUT_SCHEMA = GENERATED_TOOL_SCHEMAS.get("prove_call_path")?.inputSchema;
+const VERIFY_INDEXED_DIRECT_CALLS_INPUT_SCHEMA = GENERATED_TOOL_SCHEMAS.get("verify_indexed_direct_calls")?.inputSchema;
 const ROUTING_ACTIONS = Object.freeze([
   "source_read",
   "search",
   "context",
   "packet",
-  "prove_call_path",
+  "verify_indexed_direct_calls",
   "tool_search",
 ]);
 export const MCP_PROTOCOL_REVISIONS = Object.freeze([
@@ -193,35 +193,35 @@ export const ROUTING_SCENARIOS = deepFreeze([
   }),
   scenario({
     id: "typed_proof_contract_proven",
-    first: "prove_call_path",
+    first: "verify_indexed_direct_calls",
     required: ["ContractProven", "indexed source"],
     disposition: "contract_proven",
     typedContract: "valid",
   }),
   scenario({
     id: "typed_proof_contract_refuted",
-    first: "prove_call_path",
+    first: "verify_indexed_direct_calls",
     required: ["ContractRefuted", "positive_contradiction"],
     disposition: "contract_refuted",
     typedContract: "valid",
   }),
   scenario({
     id: "typed_proof_unknown",
-    first: "prove_call_path",
+    first: "verify_indexed_direct_calls",
     required: ["Unknown", "selector_missing", "does not establish absence"],
     disposition: "unknown",
     typedContract: "valid",
   }),
   scenario({
     id: "typed_proof_unavailable",
-    first: "prove_call_path",
+    first: "verify_indexed_direct_calls",
     required: ["Unavailable", "proof_semantic_projection_unavailable"],
     disposition: "unavailable",
     typedContract: "valid",
   }),
   scenario({
     id: "malformed_proof_contract",
-    first: "prove_call_path",
+    first: "verify_indexed_direct_calls",
     required: ["invalid_proof_interpretation", "no proof disposition"],
     forbidden: NO_PROOF_CLAIMS,
     typedContract: "malformed",
@@ -235,16 +235,16 @@ export const ROUTING_SCENARIOS = deepFreeze([
   }),
   scenario({
     id: "proof_observational",
-    first: "prove_call_path",
+    first: "verify_indexed_direct_calls",
     required: ["Unknown", "edge_not_proof_authoritative", "did not activate semantic retrieval"],
     disposition: "unknown",
     typedContract: "valid",
   }),
   scenario({
     id: "hidden_proof_tool_discovery",
-    first: "prove_call_path",
+    first: "verify_indexed_direct_calls",
     optionalPrefixes: ["tool_search"],
-    required: ["only prove_call_path", "ContractProven"],
+    required: ["only verify_indexed_direct_calls", "ContractProven"],
     disposition: "contract_proven",
     typedContract: "valid",
   }),
@@ -480,9 +480,9 @@ function matchesJsonSchema(value, schema) {
 }
 
 export function validateProofCallInputAgainstCatalog(input) {
-  if (!plainObject(PROVE_CALL_PATH_INPUT_SCHEMA)
-      || !matchesJsonSchema(input, PROVE_CALL_PATH_INPUT_SCHEMA)) {
-    fail("prove_call_path input schema does not match the generated catalog");
+  if (!plainObject(VERIFY_INDEXED_DIRECT_CALLS_INPUT_SCHEMA)
+      || !matchesJsonSchema(input, VERIFY_INDEXED_DIRECT_CALLS_INPUT_SCHEMA)) {
+    fail("verify_indexed_direct_calls input schema does not match the generated catalog");
   }
   return true;
 }
@@ -1143,7 +1143,7 @@ function validateResultIdentity(action, expected, host) {
     return normalized;
   }
   if (normalized.transport_projection === "cursor_semantic_error_text_v1") {
-    if (action.tool !== "prove_call_path") {
+    if (action.tool !== "verify_indexed_direct_calls") {
       fail(`${action.tool} Cursor text-only semantic error projection is not authorized`);
     }
     return normalized;
@@ -1173,7 +1173,7 @@ function validateResultIdentity(action, expected, host) {
   if (projected && protocol.discovery_contract_sha256 !== negotiatedDiscovery) {
     fail(`${action.tool} result identity protocol.discovery_contract_sha256 does not match the negotiated revision`);
   }
-  if (!plainObject(runtime) && (projected || action.kind !== "prove_call_path")) {
+  if (!plainObject(runtime) && (projected || action.kind !== "verify_indexed_direct_calls")) {
     fail(`${action.tool} result identity requires runtime identity outside the native proof result contract`);
   }
   const mismatches = [
@@ -1202,11 +1202,11 @@ function actionName(action) {
 
 function validateExpectedMcpAvailability(scenarioContract, actions) {
   const expected = new Set(scenarioContract.required_action_sequence.filter((kind) => (
-    ["search", "context", "packet", "prove_call_path"].includes(kind)
+    ["search", "context", "packet", "verify_indexed_direct_calls"].includes(kind)
   )));
   for (const action of actions) {
     const expectedSemanticError = scenarioContract.typed_contract === "malformed"
-      && action.kind === "prove_call_path";
+      && action.kind === "verify_indexed_direct_calls";
     if (expected.has(action.kind) && action.error && !expectedSemanticError) {
       fail(`${scenarioContract.id} has an unexpected failed ${action.tool} action`);
     }
@@ -1463,7 +1463,26 @@ function proofContractFieldKey(field, stepCount, prohibitionCount, exclusionCoun
   fail(`${label} uses an unsupported proof contract field`);
 }
 
+function isHostSuppliedCallPathDocument(text) {
+  if (typeof text !== "string" || text.length < 1 || text.length > 8192) return false;
+  const lines = text.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line.length > 0);
+  if (lines[0] !== "call-path/v1") return false;
+  let fromCount = 0;
+  let directCount = 0;
+  for (const line of lines.slice(1)) {
+    if (line.startsWith("from ")) fromCount += 1;
+    else if (line.startsWith("direct-call ")) directCount += 1;
+    else if (line.startsWith("prohibit-through ") || line.startsWith("exclude-from-projection ")) continue;
+    else return false;
+  }
+  return fromCount === 1 && directCount >= 1 && directCount <= 6;
+}
+
 function validTypedContract(contract) {
+  if (plainObject(contract) && typeof contract.call_path === "string"
+      && Object.keys(contract).every((key) => key === "call_path")) {
+    return isHostSuppliedCallPathDocument(contract.call_path);
+  }
   try {
     contract = normalizeTypedContract(contract);
     if (contract.clauses.length === 0) {
@@ -1648,6 +1667,11 @@ function groupedContractClauses(contract) {
 }
 
 export function canonicalRequestContractDigest(contract) {
+  if (plainObject(contract) && typeof contract.call_path === "string"
+      && Object.keys(contract).every((key) => key === "call_path")) {
+    if (!isHostSuppliedCallPathDocument(contract.call_path)) fail("typed proof contract is not canonicalizable");
+    return sha256Bytes(Buffer.concat([PROOF_CONTRACT_DIGEST_DOMAIN, Buffer.from(contract.call_path)]));
+  }
   if (!validTypedContract(contract)) fail("typed proof contract is not canonicalizable");
   const normalized = normalizeTypedContract(contract);
   const sourceTextSha256 = sha256Bytes(Buffer.from(normalized.source_text));
@@ -2263,11 +2287,27 @@ function validateSelectorReceiptBinding(selector, expectedSymbol, label) {
   }
 }
 
+function hostSuppliedCallPathContract(contract) {
+  return plainObject(contract)
+    && typeof contract.call_path === "string"
+    && Object.keys(contract).every((key) => key === "call_path");
+}
+
 function validateCanonicalProofResult(result, contract) {
-  const normalized = normalizeTypedContract(contract);
   validateProofResult(result);
   const sequence = dispositionReceiptSequence(result, result.spec.steps.length);
   validateSemanticReceiptTable(result, sequence);
+  if (hostSuppliedCallPathContract(contract)) {
+    if (result.source_text_sha256 !== sha256Bytes(Buffer.from(contract.call_path))) {
+      proofSemanticFail("source_text_sha256 does not match the unchanged typed request");
+    }
+    const expectedDigest = canonicalRequestContractDigest(contract);
+    if (result.contract_digest !== expectedDigest || result.disposition.contract_digest !== expectedDigest) {
+      proofSemanticFail("contract digest is not derived from the unchanged typed request");
+    }
+    return;
+  }
+  const normalized = normalizeTypedContract(contract);
   if (result.source_text_sha256 !== sha256Bytes(Buffer.from(contract.source_text))) {
     proofSemanticFail("source_text_sha256 does not match the unchanged typed request");
   }
@@ -2300,7 +2340,7 @@ function validateCanonicalProofResult(result, contract) {
 }
 
 function validateProofCalls(scenarioContract, request, actions, results) {
-  const proofCalls = actions.filter((action) => action.kind === "prove_call_path");
+  const proofCalls = actions.filter((action) => action.kind === "verify_indexed_direct_calls");
   if (proofCalls.length > 1) fail(`${scenarioContract.id} proof may be called only once; selector relaxation and retries are forbidden`);
   if (proofCalls.length === 0) {
     if (["valid", "malformed"].includes(scenarioContract.typed_contract)) {
@@ -2337,7 +2377,7 @@ function validatePacketContinuation(scenarioContract, actions, results) {
   if (packets.length > 2) fail(`${scenarioContract.id} allows at most one packet continuation`);
   if (packets.length > 0) {
     const allowedInitialKeys = new Set([
-      "project", "question", "budget", "task_class", "latency_budget_ms",
+      "project", "question", "budget", "latency_budget_ms",
     ]);
     if (!plainObject(packets[0].args)
         || !nonemptyString(packets[0].args.project)
@@ -2361,7 +2401,7 @@ function validatePacketContinuation(scenarioContract, actions, results) {
     core_generation_id: first?.publication?.core?.generation_id,
     retrieval_generation: first?.publication?.retrieval?.retrieval_generation,
   };
-  for (const key of ["budget", "task_class", "latency_budget_ms"]) {
+  for (const key of ["budget", "latency_budget_ms"]) {
     if (Object.hasOwn(packets[0].args, key)) expected[key] = packets[0].args[key];
   }
   if (!equalJson(packets[1].args, expected)) fail(`${scenarioContract.id} packet continuation arguments do not match the pinned offer`);
@@ -2432,18 +2472,18 @@ function validateHiddenDiscovery(scenarioContract, actions, results) {
   if (searches.length === 0) return;
   if (searches.length !== 1) fail(`${scenarioContract.id} allows at most one hidden-tool discovery`);
   const search = searches[0];
-  if (search.args?.query !== "codestory mcp prove_call_path") {
-    fail(`${scenarioContract.id} hidden-tool discovery must name only prove_call_path`);
+  if (search.args?.query !== "codestory mcp verify_indexed_direct_calls") {
+    fail(`${scenarioContract.id} hidden-tool discovery must name only verify_indexed_direct_calls`);
   }
   const searchBody = results.get(search)?.body;
   const tools = plainObject(searchBody) && Array.isArray(searchBody.tools) ? searchBody.tools : [];
-  if (!equalJson(tools, ["mcp__codestory__prove_call_path"])) {
-    fail(`${scenarioContract.id} hidden-tool discovery returned tools outside prove_call_path`);
+  if (!equalJson(tools, ["mcp__codestory__verify_indexed_direct_calls"])) {
+    fail(`${scenarioContract.id} hidden-tool discovery returned tools outside verify_indexed_direct_calls`);
   }
 }
 
 function proofDisposition(actions, results) {
-  const proof = actions.find((action) => action.kind === "prove_call_path");
+  const proof = actions.find((action) => action.kind === "verify_indexed_direct_calls");
   if (!proof) return null;
   const kind = results.get(proof)?.body?.disposition?.kind;
   return typeof kind === "string" ? kind : null;
@@ -2506,7 +2546,7 @@ function expectedFinalClaim(scenarioContract, actions, results) {
   const contexts = actions.filter((action) => action.kind === "context");
   const packets = actions.filter((action) => action.kind === "packet");
   const searches = actions.filter((action) => action.kind === "search");
-  const proof = actions.find((action) => action.kind === "prove_call_path");
+  const proof = actions.find((action) => action.kind === "verify_indexed_direct_calls");
   const reads = actions.filter((action) => action.kind === "source_read" && action.completed && !action.error);
 
   if (contexts.length > 0) {
@@ -2569,7 +2609,7 @@ function expectedFinalClaim(scenarioContract, actions, results) {
 function validateFinalClaims(scenarioContract, final, actions, results) {
   const claim = parseFinalClaim(final, scenarioContract.id);
   const expected = expectedFinalClaim(scenarioContract, actions, results);
-  const proofAction = actions.find((action) => action.kind === "prove_call_path");
+  const proofAction = actions.find((action) => action.kind === "verify_indexed_direct_calls");
   const proofDisposition = proofAction ? results.get(proofAction)?.body?.disposition : null;
   const hasResultBoundGap = expected.gap_ids.length > 0
     || expected.reason_codes.length > 0
@@ -2607,7 +2647,7 @@ function validateFinalClaims(scenarioContract, final, actions, results) {
       fail(`${scenarioContract.id} final claim ${key} does not match result-bound evidence`);
     }
   }
-  const proof = actions.some((action) => action.kind === "prove_call_path");
+  const proof = actions.some((action) => action.kind === "verify_indexed_direct_calls");
   const reads = actions.some((action) => action.kind === "source_read" && action.completed && !action.error);
   if (proof) {
     if (!equalJson(claim.evidence_ids, expected.evidence_ids)) {
@@ -2966,8 +3006,8 @@ export function validateInstalledSession({
   for (const action of actions) {
     if (!action.completed) fail(`${scenarioId} has an incomplete ${action.tool} action`);
     const expectedSemanticError = scenarioContract.typed_contract === "malformed"
-      && action.kind === "prove_call_path";
-    if (["search", "context", "packet", "prove_call_path"].includes(action.kind)) {
+      && action.kind === "verify_indexed_direct_calls";
+    if (["search", "context", "packet", "verify_indexed_direct_calls"].includes(action.kind)) {
       validateToolInputSchema(action);
       results.set(action, expectedSemanticError
         ? normalizedResult(action, normalizedHost)
@@ -2981,7 +3021,7 @@ export function validateInstalledSession({
     if (results.get(action).isError && !expectedSemanticError && !allowedOptionalSourceFailure) {
       fail(`${scenarioId} has an unexpected failed ${action.tool} action`);
     }
-    if (!expectedSemanticError && ["search", "context", "packet", "prove_call_path"].includes(action.kind)) {
+    if (!expectedSemanticError && ["search", "context", "packet", "verify_indexed_direct_calls"].includes(action.kind)) {
       validateToolResultSchema(action, results.get(action));
     }
   }
@@ -3028,9 +3068,9 @@ function validateRoutingGuidance(text, label) {
     [/selected target.*`context`/isu, "selected-target context authority"],
     [/supplied symbol name.*search\.query.*unchanged/isu, "exact search query preservation"],
     [/broad.*`packet`.*continuation.*once/isu, "bounded packet routing"],
-    [/host-supplied.*`prove_call_path`/isu, "host-supplied proof routing"],
+    [/host-supplied.*`verify_indexed_direct_calls`/isu, "host-supplied proof routing"],
     [/semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu, "semantic proof error boundary"],
-    [/exact proof from English.*no complete typed\s+contract.*stop.*do not call a\s+repository tool/isu, "free-English proof refusal"],
+    [/exact proof from English.*no complete\s+`call-path\/v1` document.*stop.*do not\s+call a\s+repository tool/isu, "free-English proof refusal"],
     [/`unknown`.*not absence/isu, "unknown boundary"],
     [/runtime execution/iu, "runtime-execution boundary"],
     [/typed `Unavailable`.*terminal/isu, "typed-unavailable terminal boundary"],
@@ -3127,7 +3167,7 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
       || !/adds no parallel instructions/isu.test(openAiMetadataText)) {
     fail("OpenAI skill metadata is not the canonical skill pointer");
   }
-  if (/search.*context.*packet.*prove_call_path|unknown.*not absence|typed contract/isu.test(openAiMetadataText)) {
+  if (/search.*context.*packet.*verify_indexed_direct_calls|unknown.*not absence|typed contract/isu.test(openAiMetadataText)) {
     fail("OpenAI skill metadata duplicates canonical routing or proof guidance");
   }
 
@@ -3194,7 +3234,7 @@ export async function validateStaticHostParity(pluginRoot, expectedIdentity) {
           || !ruleText.includes("adds no parallel instructions")) {
         fail("cursor rule is not the canonical skill pointer");
       }
-      if (/Routing contract:|Discovery leads come from|prove_call_path|Inspect source after a packet/u.test(ruleText)) {
+      if (/Routing contract:|Discovery leads come from|verify_indexed_direct_calls|Inspect source after a packet/u.test(ruleText)) {
         fail("cursor rule duplicates the canonical grounding contract");
       }
     } else if (!/^---\nname: codestory-grounding\n/iu.test(ruleText)

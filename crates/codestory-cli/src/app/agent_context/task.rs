@@ -11,9 +11,9 @@ use crate::display;
 use crate::output::{RenderedPublicOutput, emit_public_operation};
 use crate::runtime::map_api_error;
 use anyhow::Result;
+use codestory_contracts::api::AgentPacketRequestDto;
 #[cfg(test)]
 use codestory_contracts::api::{AgentPacketDto, BoundedDrillPlanDto, PacketDispositionKindDto};
-use codestory_contracts::api::{AgentPacketRequestDto, PacketTaskClassDto};
 use codestory_contracts::packet_projection_v3::{
     ContinuationStateV3Dto, EvidenceAvailabilityV3Dto, PacketProjectionV3Dto,
 };
@@ -38,7 +38,6 @@ fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     let request = AgentPacketRequestDto {
         question: cmd.prompt.clone(),
         budget: cmd.budget.into(),
-        task_class: Some(PacketTaskClassDto::EditPlanning),
         probes: cmd.probes.clone(),
         extra_probes: cmd.extra_probes.clone(),
         latency_budget_ms: cmd.latency_budget_ms,

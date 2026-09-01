@@ -26,17 +26,14 @@ impl InstalledAgentTimingV1 {
         INSTALLED_AGENT_TIMING_CONTRACT
     }
 
-    /// `agent_runner_ms + time_to_first_packet_ms + continuation_ms` must
-    /// equal `whole_task_wall_ms` (integer milliseconds).
+    /// `time_to_final_packet_ms` is the sum of the two measured packet
+    /// intervals. `whole_task_wall_ms` is its own measured inclusive wall and
+    /// is not reconstructed from a remainder.
     pub fn phases_reconcile(&self) -> bool {
-        self.agent_runner_ms
-            .saturating_add(self.time_to_first_packet_ms)
-            .saturating_add(self.continuation_ms)
-            == self.whole_task_wall_ms
-            && self.time_to_final_packet_ms
-                == self
-                    .time_to_first_packet_ms
-                    .saturating_add(self.continuation_ms)
+        self.time_to_final_packet_ms
+            == self
+                .time_to_first_packet_ms
+                .saturating_add(self.continuation_ms)
     }
 }
 

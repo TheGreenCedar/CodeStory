@@ -279,6 +279,16 @@ fn validate_string_length(
             format!("expected at most {maximum} character(s)"),
         ));
     }
+    if pointer == "/call_path" || pointer.ends_with("/call_path") {
+        let max_bytes = crate::prove_call_path::PROVE_CALL_PATH_INPUT_MAX_BYTES as u64;
+        if text.len() as u64 > max_bytes {
+            out.push(ArgumentViolation::new(
+                "above_max_length",
+                pointer,
+                format!("expected at most {max_bytes} byte(s)"),
+            ));
+        }
+    }
 }
 
 fn validate_array(
@@ -1206,7 +1216,6 @@ mod tests {
                     "project": "/repo",
                     "question": "how does routing work",
                     "budget": "compact",
-                    "task_class": null,
                     "probes": [{"kind": "free_query", "query": "router"}],
                     "extra_probes": ["router"],
                     "latency_budget_ms": 5000,
@@ -1416,14 +1425,13 @@ mod tests {
     fn nullable_members_accept_null_and_non_nullable_members_do_not() {
         assert!(
             crate::stdio_catalog::tool_input_schema("packet")
-                .and_then(|schema| schema.pointer("/properties/task_class/enum"))
-                .and_then(Value::as_array)
-                .is_some_and(|values| values.contains(&Value::Null))
+                .and_then(|schema| schema.pointer("/properties/latency_budget_ms"))
+                .is_some()
         );
         assert_eq!(
             validate_tool_arguments(
                 "packet",
-                Some(&json!({"project": "/repo", "question": "why", "task_class": null}))
+                Some(&json!({"project": "/repo", "question": "why", "latency_budget_ms": null}))
             ),
             Ok(())
         );

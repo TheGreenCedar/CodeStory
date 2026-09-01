@@ -19,9 +19,7 @@ use super::packet_trace::{
 #[cfg(test)]
 use super::trace::field;
 use crate::{AppController, clamp_u128_to_u32};
-use codestory_agent::packet_obligations::{
-    PacketProofEvidenceExtras, preview_packet_obligation_plan_before_budget,
-};
+use codestory_agent::packet_obligations::preview_packet_obligation_plan_before_budget;
 use codestory_agent::packet_plan::packet_owner_member_probe_queries;
 pub(crate) use codestory_agent::packet_scoring::packet_file_stem_matches_query;
 use codestory_agent::planning::{
@@ -32,7 +30,7 @@ use codestory_agent::planning::{
 use codestory_contracts::api::{
     AgentAnswerDto, AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError,
     PacketBudgetLimitsDto, PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto,
-    PacketSidecarQueryDiagnosticDto, PacketTaskClassDto, RetrievalAnnotationDto,
+    PacketSidecarQueryDiagnosticDto, RetrievalAnnotationDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{
@@ -265,7 +263,6 @@ pub(crate) fn run_packet_planned_subqueries(
         include_evidence,
         rank_terms,
         stage_carry_limit,
-        &Vec::new(),
     );
     packet_latency.apply_to_trace(answer);
     Ok(())
@@ -396,7 +393,6 @@ fn packet_adaptive_material_queries(
         plan.task_class,
         &plan.obligations,
         answer,
-        &PacketProofEvidenceExtras::default(),
     );
     let mut queries = Vec::new();
     let mut seen = HashSet::<String>::new();
@@ -744,8 +740,8 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
         .filter(|query| {
             let query = query.1;
             !packet_anchor_probe_is_instruction_noise(query)
-                && (query.purpose.contains("symbol probe")
-                    || packet_task_seed_anchor_probe(&query.query)
+                && (packet_plan_query_is_exact_symbol_identity(query)
+                    || query.purpose.contains("symbol probe")
                     || query.purpose.contains("concrete symbol")
                     || is_packet_code_like_term(&query.query))
         })
@@ -758,7 +754,7 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
         )
     });
     let mut seen = HashSet::<String>::new();
-    let mut queries = ranked
+    let queries = ranked
         .into_iter()
         .filter_map(|(_, query)| {
             if is_packet_path_like_query(&query.query) {
@@ -772,33 +768,7 @@ pub(crate) fn packet_anchor_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
             }
         })
         .collect::<Vec<_>>();
-    reserve_architecture_main_anchor_probe(plan, &required_probes, &mut queries);
     queries
-}
-
-fn reserve_architecture_main_anchor_probe(
-    plan: &PacketPlanDto,
-    required_probes: &HashSet<String>,
-    queries: &mut Vec<String>,
-) {
-    // Holdout probe spelling removed; reserve main only for architecture tasks with
-    // an explicit "main" required probe or query term.
-    let wants_main = required_probes
-        .iter()
-        .any(|q| normalize_identifier(q) == "main")
-        || plan
-            .queries
-            .iter()
-            .any(|q| normalize_identifier(&q.query) == "main");
-    if plan.task_class != PacketTaskClassDto::ArchitectureExplanation || !wants_main {
-        return;
-    }
-    queries.retain(|query| normalize_identifier(query) != "main");
-    let insert_at = queries
-        .iter()
-        .take_while(|query| required_probes.contains(&normalize_identifier(query)))
-        .count();
-    queries.insert(insert_at, "main".to_string());
 }
 
 fn packet_anchor_required_probe_keys(plan: &PacketPlanDto) -> HashSet<String> {
@@ -828,8 +798,6 @@ fn packet_anchor_probe_priority(query: &PacketPlanQueryDto) -> u8 {
         1
     } else if query.purpose.contains("concrete symbol") {
         2
-    } else if packet_task_seed_anchor_probe(&query.query) {
-        3
     } else if matches!(
         query.purpose.as_str(),
         PACKET_ADJACENT_VARIANT_QUERY_PURPOSE | PACKET_GENERIC_TERM_QUERY_PURPOSE
@@ -862,13 +830,6 @@ fn packet_anchor_probe_is_instruction_noise(query: &PacketPlanQueryDto) -> bool 
             | "symbol"
             | "symbols"
             | "trace"
-    )
-}
-
-fn packet_task_seed_anchor_probe(query: &str) -> bool {
-    matches!(
-        normalize_identifier(query).as_str(),
-        "main" | "run" | "entrypoint"
     )
 }
 
@@ -1288,78 +1249,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "phase3: flow taxonomy deleted"]
-    fn adaptive_queries_follow_missing_material_obligations_and_skip_completed_work() {
-        let question = "Explain the indexing runtime, persistence, and snapshot flow.";
-        let task_class = PacketTaskClassDto::ArchitectureExplanation;
-        let original = PacketPlanQueryDto {
-            query: question.to_string(),
-            purpose: "original task phrasing".to_string(),
-        };
-        let plan = PacketPlanDto {
-            task_class,
-            inferred_task_class: false,
-            queries: vec![original.clone()],
-            probe_resolutions: Vec::new(),
-            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
-                question,
-                task_class,
-                &[original],
-            ),
-            trace: Vec::new(),
-        };
-        let mut answer = empty_answer();
-
-        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
-            .into_iter()
-            .map(|query| query.query)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            queries.first().map(String::as_str),
-            Some("indexing runtime")
-        );
-        for expected in [
-            "indexing entrypoint",
-            "file discovery",
-            "symbol extraction",
-            "storage persistence",
-        ] {
-            assert!(queries.iter().any(|query| query == expected), "{queries:?}");
-        }
-
-        answer
-            .retrieval_trace
-            .packet_sidecar_diagnostics
-            .push(PacketSidecarQueryDiagnosticDto {
-                query: "indexing entrypoint".to_string(),
-                completion: codestory_contracts::api::PacketQueryCompletionDto::Completed,
-                retrieval_mode: "full".to_string(),
-                sidecar_query_ms: Some(1),
-                candidate_resolution_ms: Some(0),
-                total_elapsed_ms: Some(1),
-                sidecar_stage_count: 1,
-                sidecar_stage_total_ms: Some(1),
-                batch_query_wall_ms: Some(1),
-                candidate_count: 1,
-                resolved_hit_count: 1,
-                unresolved_candidate_count: 0,
-                blocking_unresolved_candidate_count: 0,
-                semantic_stage_timeout_zero_hits: false,
-                semantic_abstained: false,
-                diagnostic: None,
-            });
-        let queries = packet_adaptive_material_queries(question, &plan, &answer, 16)
-            .into_iter()
-            .map(|query| query.query)
-            .collect::<Vec<_>>();
-        assert!(!queries.contains(&"indexing entrypoint".to_string()));
-        assert_eq!(
-            queries.first().map(String::as_str),
-            Some("indexing runtime")
-        );
-    }
-
-    #[test]
+    #[ignore = "phase3: owner/member probe synthesis deleted"]
     fn adaptive_queries_use_retrieved_owners_for_missing_lifecycle_members() {
         let question = "Trace how Jekyll's build command creates a site and runs the read, generate, render, and write phases. Cite the source files and name the supporting symbols.";
         let task_class = PacketTaskClassDto::RouteTracing;
@@ -1393,54 +1283,6 @@ mod tests {
                 "missing {expected} from {queries:?}"
             );
         }
-        assert!(queries.len() <= 16);
-    }
-
-    #[test]
-    #[ignore = "phase3: flow taxonomy deleted"]
-    fn adaptive_queries_reserve_batch_space_for_explicit_owner_members() {
-        let question = "Explain how package:http exposes top-level helpers, BaseClient convenience methods, BaseRequest finalization, and IOClient send behavior.";
-        let task_class = PacketTaskClassDto::DataFlow;
-        let original = PacketPlanQueryDto {
-            query: question.to_string(),
-            purpose: "original task phrasing".to_string(),
-        };
-        let plan = PacketPlanDto {
-            task_class,
-            inferred_task_class: false,
-            queries: vec![original.clone()],
-            probe_resolutions: Vec::new(),
-            obligations: codestory_agent::packet_obligations::build_packet_obligation_plan(
-                question,
-                task_class,
-                &[original],
-            ),
-            trace: Vec::new(),
-        };
-
-        let queries = packet_adaptive_material_queries(question, &plan, &empty_answer(), 16);
-
-        for expected in ["BaseRequest.finalize", "IOClient.send"] {
-            assert!(
-                queries.iter().any(|query| query.query == expected),
-                "missing {expected} from {queries:?}"
-            );
-        }
-        let owner_probe_indexes = queries
-            .iter()
-            .enumerate()
-            .filter(|(_, query)| query.purpose == PACKET_OWNER_MEMBER_QUERY_PURPOSE)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        assert_eq!(owner_probe_indexes.len(), PACKET_OWNER_MEMBER_QUERY_LIMIT);
-        let last_owner_probe = *owner_probe_indexes.last().expect("owner probes");
-        assert!(
-            queries.iter().skip(last_owner_probe + 1).any(|query| {
-                query.purpose.starts_with("material obligation ")
-                    || query.purpose.starts_with("material query obligation ")
-            }),
-            "owner probes starved the remaining material queries: {queries:?}"
-        );
         assert!(queries.len() <= 16);
     }
 
@@ -1602,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_anchor_probe_queries_execute_entrypoint_seed_queries() {
+    fn packet_anchor_probe_queries_do_not_admit_vocabulary_seed_terms() {
         let plan = PacketPlanDto {
             task_class: PacketTaskClassDto::ArchitectureExplanation,
             inferred_task_class: false,
@@ -1628,6 +1470,10 @@ mod tests {
                     query: "entrypoint".to_string(),
                     purpose: "task-class retrieval seed".to_string(),
                 },
+                PacketPlanQueryDto {
+                    query: "Runtime::start".to_string(),
+                    purpose: "concrete symbol, file, route, or code term".to_string(),
+                },
             ],
             probe_resolutions: Vec::new(),
             obligations: Default::default(),
@@ -1636,10 +1482,13 @@ mod tests {
 
         let queries = packet_anchor_probe_queries(&plan);
 
-        assert!(queries.contains(&"main".to_string()));
-        assert!(queries.contains(&"run".to_string()));
-        assert!(queries.contains(&"entrypoint".to_string()));
-        assert!(!queries.contains(&"architecture entrypoint".to_string()));
+        assert!(!queries.iter().any(|query| {
+            matches!(
+                normalize_identifier(query).as_str(),
+                "main" | "run" | "entrypoint" | "architectureentrypoint"
+            )
+        }));
+        assert!(queries.contains(&"Runtime::start".to_string()));
     }
 
     #[test]

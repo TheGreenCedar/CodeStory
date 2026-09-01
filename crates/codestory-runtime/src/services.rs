@@ -3115,7 +3115,7 @@ mod freshness_gate_tests {
     #[test]
     fn dark_indexed_call_path_builder_remains_core_only() {
         assert!(!operation_requires_retrieval(
-            codestory_agent::proof_qualification_test_support::PROOF_DOMAIN
+            crate::call_path_kernel::PROOF_DOMAIN
         ));
         for operation in ["packet", "search", "context", "drill"] {
             assert!(operation_requires_retrieval(operation));
@@ -3863,7 +3863,6 @@ pub(crate) mod activation_tests {
         codestory_contracts::api::AgentPacketRequestDto {
             question: "how does the ready lease source anchor work".to_string(),
             budget: codestory_contracts::api::PacketBudgetModeDto::default(),
-            task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
             latency_budget_ms: Some(30_000),

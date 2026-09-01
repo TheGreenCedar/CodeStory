@@ -1,8 +1,8 @@
 # Agent Subsystem
 
 `codestory-agent` owns packet planning. It decides what evidence a task needs:
-prompt terms, flow requirements, evidence roles and carriers, citation scoring,
-and the deduplicated query plan. It does not run that plan.
+prompt terms, claim-profile coverage labels, evidence roles and carriers, citation
+scoring, and the deduplicated query plan. It does not run that plan.
 
 The crate depends on `codestory-contracts` alone. It cannot activate a
 project, open or write storage, execute retrieval, retry a publication, or
@@ -11,7 +11,7 @@ pinned, through the `PinnedReader` trait implemented by runtime.
 
 ## Ownership
 
-- packet terms, claims, obligations, and flow requirements;
+- packet terms, claims, obligations, and coverage labels;
 - evidence roles, carriers, and citation scoring;
 - probe and required-probe planning;
 - the query plan handed to runtime for execution;
@@ -21,7 +21,7 @@ pinned, through the `PinnedReader` trait implemented by runtime.
 
 - `src/lib.rs`: crate contract and module map
 - `src/planning.rs` and `src/packet_plan.rs`: plan construction
-- `src/packet_terms.rs`, `src/packet_flow_requirements.rs`, `src/packet_obligations.rs`: what a task must prove
+- `src/packet_terms.rs`, `src/packet_flow_requirements.rs`, `src/packet_obligations.rs`: prompt terms, coverage labels, and exact-probe obligations
 - `src/packet_evidence_roles.rs` and `src/packet_evidence_carriers.rs`: how a citation can count
 - `src/packet_scoring.rs` and `src/citation.rs`: ranking inside the plan
 - `src/pinned_reader.rs`: the pin trait runtime implements

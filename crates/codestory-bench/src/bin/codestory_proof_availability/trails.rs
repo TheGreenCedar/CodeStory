@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
-use codestory_agent::proof_qualification_support::diagnose_raw_call_edge;
 use codestory_contracts::graph::{Edge, EdgeId, NodeId};
+use codestory_runtime::proof_qualification_support::diagnose_raw_call_edge;
 use codestory_store::Store;
 
 use super::contracts::{TrailLengthCountsV1, TrailReportV1};

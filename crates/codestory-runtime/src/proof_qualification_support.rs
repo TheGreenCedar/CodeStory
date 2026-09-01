@@ -8,6 +8,18 @@ use std::sync::atomic::AtomicBool;
 
 use codestory_contracts::api::ApiError;
 
+pub use crate::call_path_kernel::{
+    AdmittedRawCallEdge, BuiltCallPathFacts, COMPACT_PROOF_MAX_BYTES, CONTRACT_INTERPRETATION,
+    CallPathSpec, CallableContainmentEvidence, ClauseAnchor, ClauseClassification, FactBuildGap,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    NonMaterialKind, PinnedNodeIdentity, ProofContractField, ProofHashes, RawAdmissionFailure,
+    ReceiptRef, ResolvedNodeIdentity, TranslationGap, UnavailableReason, UnresolvedMaterialReason,
+    UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
+    UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
+    ValidatedContractRendering, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
+    check_built_call_path_integration, diagnose_raw_call_edge, project_internal_call_path_result,
+    project_translation_unknown_result, validate_compact_projection, validate_contract,
+};
 pub use crate::indexed_source_call_path_v1::{
     CandidateFailure, CandidateFailureHistogram, CandidateGate, ContainmentFailure,
     FinalizationFailure, FinalizationTrace, IntegratedProjectedCallPathResult,
@@ -16,27 +28,16 @@ pub use crate::indexed_source_call_path_v1::{
     ResolutionFactFailure, SelectorFailure, SelectorGateOutcome, SelectorQualificationTrace,
     SourceBindingFailure, StepQualificationOutcome, StepQualificationTrace,
 };
-pub use codestory_agent::proof_qualification_support::{
-    BuiltCallPathFacts, CONTRACT_INTERPRETATION, CallableContainmentEvidence, ClauseAnchor,
-    ClauseClassification,
-    FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
-    InternalProjection, NonMaterialKind, PinnedNodeIdentity, ProofContractField, ProofHashes,
-    ReceiptRef, ResolvedNodeIdentity, UnavailableReason, UnresolvedMaterialReason,
-    UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
-    UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
-    ValidatedContractRendering, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
-    check_built_call_path_integration, project_internal_call_path_result,
-    project_translation_unknown_result, validate_contract,
-};
+use serde::Serialize;
 
 /// Executes one proof through the runtime's existing core-only public
 /// operation. Callers cannot obtain the controller or add a second publication
 /// retry around this call.
 pub fn run_observed_call_path_public_operation(
     runtime: &crate::Runtime,
-    contract: &codestory_agent::proof_qualification_support::ValidatedCallPathContract,
-    hashes: &codestory_agent::proof_qualification_support::ProofHashes,
-    rendering: &codestory_agent::proof_qualification_support::ValidatedContractRendering,
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
     cancelled: Arc<AtomicBool>,
 ) -> Result<crate::PublicOperation<ObservedIntegratedProjectedCallPathResult>, ApiError> {
     runtime.controller.arm_proof_publication_validation();
@@ -67,10 +68,10 @@ pub fn run_observed_call_path_public_operation(
 /// publication without reading graph or retrieval state.
 pub fn run_translation_unknown_public_operation(
     runtime: &crate::Runtime,
-    spec: &codestory_agent::proof_qualification_support::CallPathSpec,
-    hashes: &codestory_agent::proof_qualification_support::ProofHashes,
-    rendering: &codestory_agent::proof_qualification_support::ValidatedContractRendering,
-    gaps: &[codestory_agent::proof_qualification_support::TranslationGap],
+    spec: &CallPathSpec,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    gaps: &[TranslationGap],
     cancelled: Arc<AtomicBool>,
 ) -> Result<crate::PublicOperation<InternalProjection>, ApiError> {
     runtime
@@ -104,13 +105,13 @@ pub fn run_translation_unknown_public_operation(
 
 /// Identifies the request domain observed by proof qualification.
 pub fn proof_domain() -> &'static str {
-    codestory_agent::proof_qualification_support::proof_domain()
+    crate::call_path_kernel::PROOF_DOMAIN
 }
 
-/// The sealed CLI seam validates every compact numeric reference before a
-/// revision-native transport serializes it.
-pub fn validate_compact_projection(root: &serde_json::Value) -> Result<(), String> {
-    codestory_agent::proof_qualification_support::validate_compact_projection(root)
+/// Serialize a qualification artifact with the repository-pinned RFC 8785
+/// implementation without exposing that dependency to the benchmark crate.
+pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    serde_json_canonicalizer::to_vec(value).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -124,9 +125,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use codestory_agent::proof_qualification_test_support::{
-        ClauseAnchor, ClauseClassification, ProofContractField, UnvalidatedCallPathContract,
-        UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector,
+    use super::{
+        ClauseAnchor, ClauseClassification, InternalProjection, ProofContractField, ProofHashes,
+        UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
+        UnvalidatedExactSymbolSelector, ValidatedCallPathContract, ValidatedContractRendering,
         ValidationOutcome, validate_contract,
     };
     use codestory_contracts::api::IndexMode;
@@ -160,9 +162,9 @@ mod tests {
         start: &str,
         target: &str,
     ) -> (
-        codestory_agent::proof_qualification_support::ValidatedCallPathContract,
-        codestory_agent::proof_qualification_support::ProofHashes,
-        codestory_agent::proof_qualification_support::ValidatedContractRendering,
+        ValidatedCallPathContract,
+        ProofHashes,
+        ValidatedContractRendering,
     ) {
         let source = "exact direct ordered call path";
         let outcome = validate_contract(UnvalidatedCallPathContract::new(
@@ -207,14 +209,8 @@ mod tests {
     ) -> &str {
         let result = operation.value.result.as_ref().expect("product result");
         let root = match &result.projection {
-            codestory_agent::proof_qualification_test_support::InternalProjection::Complete {
-                root,
-                ..
-            }
-            | codestory_agent::proof_qualification_test_support::InternalProjection::BudgetExceeded {
-                root,
-                ..
-            } => root,
+            InternalProjection::Complete { root, .. }
+            | InternalProjection::BudgetExceeded { root, .. } => root,
         };
         root["disposition"]["kind"]
             .as_str()

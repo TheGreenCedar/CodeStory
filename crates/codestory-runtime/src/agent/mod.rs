@@ -88,7 +88,7 @@ pub fn plan_packet(
     let extra_probes = packet_probe::unresolved_packet_probe_queries(&probes);
     Ok(packet_plan::build_packet_plan_with_extra(
         question,
-        request.task_class,
+        None,
         request.budget,
         &extra_probes,
     ))

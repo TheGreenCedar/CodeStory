@@ -240,6 +240,7 @@ fn storage_owned_discovery_directory_roots(storage_path: &Path) -> Vec<PathBuf> 
         legacy_search_directory_for_storage(storage_path),
         search_generation_directory_for_storage(storage_path),
         codestory_contracts::owned_artifacts::derived_reset_quarantine_root(storage_path),
+        codestory_contracts::owned_artifacts::core_publication_root(storage_path),
     ]
 }
 

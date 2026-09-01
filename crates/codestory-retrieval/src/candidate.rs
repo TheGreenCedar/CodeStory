@@ -102,6 +102,11 @@ pub struct CandidateHit {
     pub target: Option<SearchTargetDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_excerpt: Option<String>,
+    /// Conservative UTF-8 source-size upper bound, when known before exact
+    /// hydration. Admission charges this (or a conservative default) against
+    /// the packet-scoped source-byte budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bytes_upper_bound: Option<u32>,
     pub score: f32,
     #[serde(default, skip_serializing)]
     pub lane_scores: CandidateLaneScores,
@@ -172,6 +177,7 @@ impl CandidateHit {
             start_line: None,
             target: None,
             source_excerpt: None,
+            source_bytes_upper_bound: None,
             score,
             lane_scores: CandidateLaneScores {
                 lexical: Some(CandidateLaneEvidence {
@@ -205,6 +211,7 @@ impl CandidateHit {
             start_line: None,
             target: None,
             source_excerpt: None,
+            source_bytes_upper_bound: None,
             score,
             lane_scores: CandidateLaneScores::default(),
             source,
@@ -216,6 +223,23 @@ impl CandidateHit {
         };
         hit.record_lane(source.lane(), score, 0, source.default_provenance());
         hit
+    }
+
+    /// Conservative source cost charged before exact hydration.
+    ///
+    /// A measured upper bound wins. Otherwise a present excerpt is a lower
+    /// bound only, so admission still charges the unmeasured conservative
+    /// cap. Unknown candidates pay that same cap.
+    pub fn conservative_source_bytes(&self) -> usize {
+        use codestory_contracts::compilation::INTERIM_UNMEASURED_SOURCE_UPPER_BOUND;
+        self.source_bytes_upper_bound
+            .map(|bytes| bytes as usize)
+            .unwrap_or_else(|| {
+                self.source_excerpt
+                    .as_ref()
+                    .map(|excerpt| excerpt.len().max(INTERIM_UNMEASURED_SOURCE_UPPER_BOUND))
+                    .unwrap_or(INTERIM_UNMEASURED_SOURCE_UPPER_BOUND)
+            })
     }
 
     pub fn add_provenance(&mut self, label: impl Into<String>) {

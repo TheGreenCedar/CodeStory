@@ -121,7 +121,7 @@ const RUNTIME_REFRESH_CLAIM =
 
 const EXACT_CANDIDATE_ARMS = [
   "without_codestory",
-  "published_0_17_4",
+  "published_0_17_5",
   "candidate_0_18",
 ];
 const EXACT_TASKS = [
@@ -148,10 +148,10 @@ const EXACT_TASKS = [
 function exactLifecycle() {
   return {
     contract: "codestory.agent-benchmark-exact-lifecycle/v1",
-    package_authentication_order: ["published_0_17_4", "candidate_0_18"],
-    package_authentication_ms: { published_0_17_4: 10, candidate_0_18: 10 },
+    package_authentication_order: ["published_0_17_5", "candidate_0_18"],
+    package_authentication_ms: { published_0_17_5: 10, candidate_0_18: 10 },
     total_package_authentication_ms: 20,
-    model_initialization_ms: { published_0_17_4: 5, candidate_0_18: 5 },
+    model_initialization_ms: { published_0_17_5: 5, candidate_0_18: 5 },
     cost_rates: {
       currency: "USD",
       model: "gpt-5.6-sol",
@@ -162,8 +162,8 @@ function exactLifecycle() {
     preparation_order: EXACT_TASKS.map(([_, repo], index) => ({
       repo,
       arms: index % 2 === 0
-        ? ["published_0_17_4", "candidate_0_18"]
-        : ["candidate_0_18", "published_0_17_4"],
+        ? ["published_0_17_5", "candidate_0_18"]
+        : ["candidate_0_18", "published_0_17_5"],
     })),
   };
 }
@@ -283,8 +283,8 @@ function exactCandidateRows() {
     for (let repeat = 1; repeat <= 3; repeat += 1) {
       for (const arm of EXACT_CANDIDATE_ARMS) {
         const codestory = arm !== "without_codestory";
-        const packageVersion = "0.17.4";
-        const packageByte = arm === "published_0_17_4" ? "a" : "b";
+        const packageVersion = "0.17.5";
+        const packageByte = arm === "published_0_17_5" ? "a" : "b";
         rows.push({
           repo,
           task_id: taskId,
@@ -361,7 +361,7 @@ function exactCandidateRows() {
               ref: "9fdfd4650427eb050a11fd9ebd7a4e13dd4b57d7",
             },
           },
-          package_identity: arm === "published_0_17_4"
+          package_identity: arm === "published_0_17_5"
             ? {
                 contract: "codestory.agent-benchmark-package/v2",
                 arm,
@@ -394,12 +394,12 @@ function exactCandidateRows() {
             : null,
           codestory_prelude_cli: codestory ? "/authenticated/codestory-cli" : null,
           codestory_prelude_cli_sha256: codestory
-            ? (arm === "published_0_17_4" ? "c" : "d").repeat(64)
+            ? (arm === "published_0_17_5" ? "c" : "d").repeat(64)
             : null,
           codestory_binary_identity: codestory
             ? {
                 status: "prelude_only",
-                prelude_cli_sha256: (arm === "published_0_17_4" ? "c" : "d").repeat(64),
+                prelude_cli_sha256: (arm === "published_0_17_5" ? "c" : "d").repeat(64),
               }
             : null,
           codestory_cache_provenance: codestory
@@ -664,8 +664,8 @@ test("exact-candidate resume accepts only an authenticated whole-task contiguous
   };
   const published = {
     contract: "codestory.agent-benchmark-exact-package/v1",
-    arm: "published_0_17_4",
-    package_version: "0.17.4",
+    arm: "published_0_17_5",
+    package_version: "0.17.5",
     package_sha256: "7".repeat(64),
     cli_sha256: "8".repeat(64),
     source_commit: "9".repeat(40),
@@ -682,7 +682,7 @@ test("exact-candidate resume accepts only an authenticated whole-task contiguous
     repos: null,
     exactCandidatePackageByArm: new Map([
       ["candidate_0_18", candidate],
-      ["published_0_17_4", published],
+      ["published_0_17_5", published],
     ]),
   };
   const planned = benchmarkHarness.planAgentRuns(opts, tasks);
@@ -693,7 +693,7 @@ test("exact-candidate resume accepts only an authenticated whole-task contiguous
     repeat: run.repeat,
     status: "pass",
     task_manifest_snapshot: benchmarkHarness.taskSnapshotForResult(run.task),
-    package_identity: run.arm === "published_0_17_4"
+    package_identity: run.arm === "published_0_17_5"
       ? {
           contract: published.contract,
           arm: published.arm,
@@ -763,8 +763,8 @@ test("exact comparator reuse accepts only complete ordered comparator triplets a
   };
   const published = {
     contract: "codestory.agent-benchmark-package/v2",
-    arm: "published_0_17_4",
-    package_version: "0.17.4",
+    arm: "published_0_17_5",
+    package_version: "0.17.5",
     package_sha256: "7".repeat(64),
     cli_sha256: "8".repeat(64),
     source_commit: "9".repeat(40),
@@ -786,7 +786,7 @@ test("exact comparator reuse accepts only complete ordered comparator triplets a
     taskSuite: "language-expansion-holdout",
     exactCandidatePackageByArm: new Map([
       ["candidate_0_18", candidate],
-      ["published_0_17_4", published],
+      ["published_0_17_5", published],
     ]),
   };
   const planned = benchmarkHarness.planAgentRuns(opts, tasks);
@@ -812,7 +812,7 @@ test("exact comparator reuse accepts only complete ordered comparator triplets a
     status: "pass",
     task_manifest_snapshot: benchmarkHarness.taskSnapshotForResult(run.task),
     benchmark_contract: benchmarkHarness.benchmarkContractForRun(opts, run),
-    package_identity: run.arm === "published_0_17_4" ? publishedIdentity : null,
+    package_identity: run.arm === "published_0_17_5" ? publishedIdentity : null,
     source_cli_identity: run.arm === "candidate_0_18"
       ? { ...candidate, cli_sha256: "c".repeat(64), source_commit: "d".repeat(40) }
       : null,
@@ -828,7 +828,7 @@ test("exact comparator reuse accepts only complete ordered comparator triplets a
   assert.equal(accepted.comparatorRows.some((row) => row.arm === "candidate_0_18"), false);
   assert.throws(
     () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
-      rows.filter((row) => !(row.arm === "published_0_17_4" && row.repeat === 3)),
+      rows.filter((row) => !(row.arm === "published_0_17_5" && row.repeat === 3)),
       planned,
       opts,
     ),
@@ -844,7 +844,7 @@ test("exact comparator reuse accepts only complete ordered comparator triplets a
   );
   assert.throws(
     () => benchmarkHarness.validateExactCandidateComparatorPrefixRows(
-      rows.map((row) => row.arm === "published_0_17_4"
+      rows.map((row) => row.arm === "published_0_17_5"
         ? { ...row, package_identity: { ...row.package_identity, cli_sha256: "e".repeat(64) } }
         : row),
       planned,
@@ -1047,7 +1047,7 @@ test("exact candidate binds clean source, checked-in identities, immutable CLI b
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-three-arm-source-cli-"));
   try {
     const published = await makeExactArchive(root, "published", {
-      version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
+      version: "0.17.5", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
     });
     const candidate = await makeCandidateSourceCli(root, "candidate", {});
     const checksumPath = path.join(root, "SHA256SUMS.txt");
@@ -1074,9 +1074,9 @@ test("exact candidate binds clean source, checked-in identities, immutable CLI b
       });
     };
     const accepted = await run();
-    assert.equal(accepted.packages.get("published_0_17_4").package_sha256, published.sha256);
-    assert.equal(accepted.packages.get("published_0_17_4").protocol_revision, "2024-11-05");
-    assert.equal(accepted.packages.get("published_0_17_4").discovery_contract_sha256, null);
+    assert.equal(accepted.packages.get("published_0_17_5").package_sha256, published.sha256);
+    assert.equal(accepted.packages.get("published_0_17_5").protocol_revision, "2024-11-05");
+    assert.equal(accepted.packages.get("published_0_17_5").discovery_contract_sha256, null);
     const candidateIdentity = accepted.packages.get("candidate_0_18");
     assert.equal(candidateIdentity.contract, "codestory.agent-benchmark-source-cli/v1");
     assert.equal(candidateIdentity.source_commit, candidate.sourceCommit);
@@ -1104,18 +1104,18 @@ test("exact candidate binds clean source, checked-in identities, immutable CLI b
 test("exact input ingestion makes every caller path irrelevant before parsing extraction or execution", async () => {
   for (const kind of [
     "published_checksum_manifest",
-    "published_0_17_4_archive",
+    "published_0_17_5_archive",
     "candidate_cli",
   ]) {
     const root = await mkdtemp(path.join(os.tmpdir(), `codestory-exact-race-${kind}-`));
     try {
       const marker = path.join(root, "substituted-cli-executed");
       const published = await makeExactArchive(root, "published-original", {
-        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
+        version: "0.17.5", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
       });
       const candidate = await makeCandidateSourceCli(root, "candidate-original", {});
       const publishedSubstitute = await makeExactArchive(root, "published-substitute", {
-        version: "0.17.4", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
+        version: "0.17.5", schema: 2, source: "a".repeat(40), tree: "b".repeat(40), discovery: null,
         executionMarker: marker,
       });
       const candidateSubstitute = await makeCandidateSourceCli(root, "candidate-substitute", {
@@ -1145,17 +1145,17 @@ test("exact input ingestion makes every caller path irrelevant before parsing ex
           if (event.kind !== kind) return;
           if (kind === "published_checksum_manifest") {
             await writeFile(event.source_path, "substituted after ingest");
-          } else if (kind === "published_0_17_4_archive") {
+          } else if (kind === "published_0_17_5_archive") {
             await copyFile(publishedSubstitute.archivePath, event.source_path);
           } else {
             await copyFile(candidateSubstitute.cliPath, event.source_path);
           }
         },
       });
-      assert.equal(result.packages.get("published_0_17_4").package_sha256, published.sha256, kind);
+      assert.equal(result.packages.get("published_0_17_5").package_sha256, published.sha256, kind);
       assert.equal(result.packages.get("candidate_0_18").cli_sha256, candidate.cliSha256, kind);
       assert.equal(existsSync(marker), false, `${kind} executed the substituted CLI`);
-      assert.ok(isPathInside(path.join(state, "authenticated-inputs"), result.packages.get("published_0_17_4").package_path));
+      assert.ok(isPathInside(path.join(state, "authenticated-inputs"), result.packages.get("published_0_17_5").package_path));
       assert.ok(isPathInside(path.join(state, "authenticated-inputs"), result.packages.get("candidate_0_18").cli_path));
     } finally {
       await rm(root, { recursive: true, force: true });
@@ -1208,7 +1208,7 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
         row.usage.input_tokens = 61;
         row.usage.total_tokens = 81;
       }
-      for (const row of rows.filter((entry) => entry.arm === "published_0_17_4")) {
+      for (const row of rows.filter((entry) => entry.arm === "published_0_17_5")) {
         row.usage.input_tokens = 60;
         row.usage.total_tokens = 80;
       }
@@ -1246,13 +1246,13 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
       rows.find((row) => row.arm === "candidate_0_18").transcript_analysis.direct_source_reads[0].authorization = { status: "unauthorized", reason: null };
     }, /unauthorized direct source read/i],
     ["forged source authorization", (rows) => {
-      rows.find((row) => row.arm === "published_0_17_4").transcript_analysis.direct_source_reads[0].authorization = { status: "authorized", reason: "reviewer_said_ok" };
+      rows.find((row) => row.arm === "published_0_17_5").transcript_analysis.direct_source_reads[0].authorization = { status: "authorized", reason: "reviewer_said_ok" };
     }, /unauthorized direct source read/i],
     ["identity", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").source_cli_identity.cli_sha256 = "0".repeat(64);
     }, /candidate source\/CLI identity mismatch/i],
     ["fabricated legacy discovery identity", (rows) => {
-      rows.find((row) => row.arm === "published_0_17_4").package_identity.discovery_contract_sha256 = "9".repeat(64);
+      rows.find((row) => row.arm === "published_0_17_5").package_identity.discovery_contract_sha256 = "9".repeat(64);
     }, /published package identity mismatch/i],
     ["missing candidate discovery identity", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").source_cli_identity.discovery_contract_sha256 = null;
@@ -1290,13 +1290,13 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
       rows.find((row) => row.arm === "without_codestory").transcript_analysis.command_categories.codestory_cli = 1;
     }, /baseline has CodeStory visibility/i],
     ["published runtime proof", (rows) => {
-      rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_contract_runtime = null;
+      rows.find((row) => row.arm === "published_0_17_5").codestory_harness_prelude.packet_contract_runtime = null;
     }, /missing per-arm exact runtime proof/i],
     ["candidate cache proof", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance = null;
     }, /missing per-arm cache proof/i],
     ["published obligation proof", (rows) => {
-      rows.find((row) => row.arm === "published_0_17_4").codestory_harness_prelude.packet_sufficiency = null;
+      rows.find((row) => row.arm === "published_0_17_5").codestory_harness_prelude.packet_sufficiency = null;
     }, /missing per-arm obligation proof/i],
     ["candidate v3 evidence gap proof", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").codestory_harness_prelude.packet_evidence_gap_accounting = null;
@@ -1327,7 +1327,7 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
       rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.incremental_retrieval_work_evidence.retrieval_phase_timings = [];
     }, /candidate incremental retrieval phase timings/i],
     ["cache timing mismatch", (rows) => {
-      rows.find((row) => row.arm === "published_0_17_4").codestory_cache_provenance.cache_preparation.incremental_wall_ms = 19;
+      rows.find((row) => row.arm === "published_0_17_5").codestory_cache_provenance.cache_preparation.incremental_wall_ms = 19;
     }, /cache lifecycle timings do not reconcile/i],
     ["cross-arm coherence", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").codestory_cache_provenance.cache_preparation.coherence_semantic_generation = "stale";
@@ -1336,13 +1336,13 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
       rows.find((row) => row.arm === "candidate_0_18").codestory_prelude_cli_sha256 = "9".repeat(64);
     }, /executed CLI is not bound/i],
     ["zero trust root", (rows) => {
-      rows.find((row) => row.arm === "published_0_17_4").package_identity.trust_root_sha256 = "0".repeat(64);
+      rows.find((row) => row.arm === "published_0_17_5").package_identity.trust_root_sha256 = "0".repeat(64);
     }, /published package identity mismatch/i],
     ["malformed JSONL", (rows) => {
       rows.find((row) => row.arm === "candidate_0_18").malformed_stdout_lines = 1;
     }, /malformed or unreconciled JSONL parser telemetry/i],
     ["external web context", (rows) => {
-      rows.find((row) => row.arm === "published_0_17_4").transcript_analysis.external_context_tool_calls = 1;
+      rows.find((row) => row.arm === "published_0_17_5").transcript_analysis.external_context_tool_calls = 1;
     }, /external web\/search context is forbidden/i],
     ["zero baseline local commands", (rows) => {
       const row = rows.find((entry) => entry.arm === "without_codestory");
@@ -1375,7 +1375,7 @@ test("exact-candidate acceptance closes the complete causal threshold matrix", (
     }, /one-time package and model lifecycle/i],
     ["unbalanced lifecycle", (lifecycle) => {
       for (const entry of lifecycle.preparation_order) {
-        entry.arms = ["published_0_17_4", "candidate_0_18"];
+        entry.arms = ["published_0_17_5", "candidate_0_18"];
       }
       return lifecycle;
     }, /balanced deterministic 9\/9 rotation/i],
@@ -1416,15 +1416,15 @@ test("retrieval index work evidence preserves the measured trust-boundary fields
 
 test("exact lifecycle alternates preparation and restores the selected source bytes", async () => {
   assert.deepEqual(benchmarkHarness.exactCandidatePreparationArmOrder(0), [
-    "published_0_17_4", "candidate_0_18",
+    "published_0_17_5", "candidate_0_18",
   ]);
   assert.deepEqual(benchmarkHarness.exactCandidatePreparationArmOrder(1), [
-    "candidate_0_18", "published_0_17_4",
+    "candidate_0_18", "published_0_17_5",
   ]);
   const firstArms = Array.from({ length: 18 }, (_, index) =>
     benchmarkHarness.exactCandidatePreparationArmOrder(index)[0]
   );
-  assert.equal(firstArms.filter((arm) => arm === "published_0_17_4").length, 9);
+  assert.equal(firstArms.filter((arm) => arm === "published_0_17_5").length, 9);
   assert.equal(firstArms.filter((arm) => arm === "candidate_0_18").length, 9);
 
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-exact-mutation-"));
@@ -1511,11 +1511,11 @@ test("exact CodeStory arms use disjoint embedding-server qualification namespace
     exactCandidate: true,
     exactCandidateStateRoot: stateRoot,
   };
-  const published = benchmarkHarness.exactCandidateArmEnv(opts, "published_0_17_4");
+  const published = benchmarkHarness.exactCandidateArmEnv(opts, "published_0_17_5");
   const candidate = benchmarkHarness.exactCandidateArmEnv(opts, "candidate_0_18");
 
   for (const [arm, env] of [
-    ["published_0_17_4", published],
+    ["published_0_17_5", published],
     ["candidate_0_18", candidate],
   ]) {
     assert.equal(
@@ -1815,7 +1815,7 @@ test("exact Codex isolation keeps scalar namespace credentials out of cache root
       exactCandidateStateRoot: ${JSON.stringify(stateRoot)},
       exactCandidateBaselineStateRoot: ${JSON.stringify(baselineRoot)},
       exactCandidatePackageByArm: new Map([
-        ["published_0_17_4", { cli_path: process.execPath }],
+        ["published_0_17_5", { cli_path: process.execPath }],
         ["candidate_0_18", { cli_path: process.execPath }],
       ]),
       model: "gpt-5.6-sol",
@@ -1832,9 +1832,9 @@ test("exact Codex isolation keeps scalar namespace credentials out of cache root
     assert.equal(child.status, "pass", child.stderr);
     const receipt = JSON.parse(child.stdout);
     const rootEntries = await readdir(root);
-    assert.equal(rootEntries.includes("agent-benchmark-published_0_17_4"), false);
+    assert.equal(rootEntries.includes("agent-benchmark-published_0_17_5"), false);
     assert.equal(rootEntries.includes("agent-benchmark-candidate_0_18"), false);
-    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    for (const arm of ["published_0_17_5", "candidate_0_18"]) {
       assert.equal(
         Object.hasOwn(receipt.cache_roots[arm], "CODESTORY_EMBED_QUALIFICATION_NONCE"),
         false,
@@ -2118,7 +2118,7 @@ function packetV3Fixture() {
       codestory_publication: {
         contract_runtime: {
           cli_source: "direct_cli_launch",
-          cli_version: "0.17.4",
+          cli_version: "0.17.5",
           known_override_skew_channel: false,
         },
       },
@@ -2989,13 +2989,13 @@ function pipelinePreparation(repo, retrievalOverrides = {}) {
 }
 
 function exactPipelinePreparation(repo, overridesByArm = {}) {
-  const published = pipelinePreparation(repo, overridesByArm.published_0_17_4);
+  const published = pipelinePreparation(repo, overridesByArm.published_0_17_5);
   const candidate = pipelinePreparation(repo, overridesByArm.candidate_0_18);
   return {
     ...candidate,
     arm: "candidate_0_18",
     arm_preparations: {
-      published_0_17_4: published,
+      published_0_17_5: published,
       candidate_0_18: candidate,
     },
   };
@@ -3026,7 +3026,7 @@ test("canary preparation requires complete live accelerator and server identity"
     assert.match(blockers.join("\n"), expected);
   }
   const versionDrift = pipelinePreparation("canary", {
-    embedding_server_identity: { executable_version: "0.17.4" },
+    embedding_server_identity: { executable_version: "0.17.5" },
   });
   versionDrift.package_identity = { package_version: "0.18.0" };
   assert.match(
@@ -3721,7 +3721,7 @@ test("host class and shard attestation reject inconsistent preparation identity"
   assert.deepEqual(benchmarkHostClass([first, restarted]), hostClass);
   const exactFirst = exactPipelinePreparation("first");
   const exactRestarted = exactPipelinePreparation("second", {
-    published_0_17_4: {
+    published_0_17_5: {
       embedding_engine_instance_id: "published-engine-2",
       embedding_server_identity: { server_instance_id: "published-engine-2" },
     },
@@ -3731,7 +3731,7 @@ test("host class and shard attestation reject inconsistent preparation identity"
     },
   });
   assert.deepEqual(cachePreparationIdentityBlockers(exactFirst, exactRestarted), []);
-  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+  for (const arm of ["published_0_17_5", "candidate_0_18"]) {
     const changed = exactPipelinePreparation("second", {
       [arm]: { embedding_model_sha256: "c".repeat(64) },
     });
@@ -3787,7 +3787,7 @@ test("host class and shard attestation reject inconsistent preparation identity"
 });
 
 test("exact-candidate preparation fences stable identity drift in either CodeStory arm", async () => {
-  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+  for (const arm of ["published_0_17_5", "candidate_0_18"]) {
     const tasks = ["first", "second"].map((repo) => ({
       id: `${repo}-task`,
       repo,
@@ -5406,7 +5406,7 @@ test("packet-first command renders manifest text for host shells", () => {
     windowsCommand,
     /--question 'Inspect \$env:SECRET and \$\(Get-ChildItem\), then read John''s file\. Next line\.'/,
   );
-  assert.match(windowsCommand, /--task-class 'bug-localization'/);
+  assert.doesNotMatch(windowsCommand, /--task-class/);
 
   const unixCommand = packetFirstCommandForPrompt(
     "Inspect $env:SECRET and $(Get-ChildItem), then read John's file.\nNext line.",
@@ -5420,7 +5420,8 @@ test("packet-first command renders manifest text for host shells", () => {
       "--question 'Inspect $env:SECRET and $(Get-ChildItem), then read John'\\''s file. Next line.'",
     ),
   );
-  assert.match(unixCommand, /--task-class 'bug-localization'/);
+  assert.match(unixCommand, /--budget standard/);
+  assert.doesNotMatch(unixCommand, /--task-class/);
   assert.throws(
     () => packetFirstCommandForPrompt("Explain the task.", { task_class: "bug_localization; Remove-Item ." }, "linux"),
     /task_class/,
@@ -5921,7 +5922,7 @@ test("transcript analysis authorizes source reads only from user-named files or 
     commandEvent("gap-read", "item.completed", "Get-Content src/gap.ts", "source"),
   ];
   const gap = analyzeTranscript(gapEvents, project, {
-    arm: "published_0_17_4",
+    arm: "published_0_17_5",
     task: { prompt: "Explain the flow." },
   });
   assert.equal(gap.direct_source_reads[0].authorization.reason, "explicit_evidence_gap");
@@ -5932,7 +5933,7 @@ test("transcript analysis authorizes source reads only from user-named files or 
     commandEvent("gap-read-again", "item.started", "Get-Content src/gap.ts"),
     commandEvent("gap-read-again", "item.completed", "Get-Content src/gap.ts", "source again"),
   ], project, {
-    arm: "published_0_17_4",
+    arm: "published_0_17_5",
     task: { prompt: "Explain the flow." },
   });
   assert.equal(repeatedGapRead.direct_source_reads[0].authorization.status, "authorized");
@@ -9119,7 +9120,7 @@ test("installed timing cohorts match only inside one host, model, load-policy, t
   );
 });
 
-test("installed timing separates runner, first packet, continuation, final packet, and whole task", () => {
+test("installed timing records literal disjoint intervals without manufacturing a remainder", () => {
   const timing = installedAgentTiming({
     timing_cohort_id: "a".repeat(64),
     agent_runner_ms: 1_201.4,
@@ -9135,22 +9136,19 @@ test("installed timing separates runner, first packet, continuation, final packe
     time_to_final_packet_ms: 503,
     whole_task_wall_ms: 1_704,
   });
-  assert.throws(
-    () => installedAgentTiming({
-      timing_cohort_id: "a".repeat(64),
-      agent_runner_ms: 10,
-      time_to_first_packet_ms: 20,
-      continuation_ms: 30,
-      whole_task_wall_ms: 59,
-    }),
-    /does not reconcile/,
-  );
+  const overhead = installedAgentTiming({
+    timing_cohort_id: "a".repeat(64),
+    agent_runner_ms: 10,
+    time_to_first_packet_ms: 20,
+    continuation_ms: 30,
+    whole_task_wall_ms: 59,
+  });
+  assert.equal(overhead.agent_runner_ms, 10);
+  assert.equal(overhead.whole_task_wall_ms, 59);
+  assert.equal(overhead.time_to_final_packet_ms, 50);
 });
 
-test("installed timing reconciles at rounding boundaries instead of drifting by up to 1.5ms", () => {
-  // Every phase sits on a .5 boundary, so rounding each one independently and
-  // rounding the wall independently disagree by 1ms. Reconciling unrounded and
-  // rounding once keeps the emitted phases and wall exactly consistent.
+test("installed timing rounds each measured interval independently", () => {
   const timing = installedAgentTiming({
     timing_cohort_id: "d".repeat(64),
     agent_runner_ms: 100.5,
@@ -9158,7 +9156,10 @@ test("installed timing reconciles at rounding boundaries instead of drifting by 
     continuation_ms: 4.5,
     whole_task_wall_ms: 125.5,
   });
-  assert.equal(installedAgentTimingPhaseWarmMs(timing), timing.whole_task_wall_ms);
+  assert.equal(timing.agent_runner_ms, 101);
+  assert.equal(timing.time_to_first_packet_ms, 21);
+  assert.equal(timing.continuation_ms, 5);
+  assert.equal(timing.whole_task_wall_ms, 126);
   assert.equal(
     timing.time_to_final_packet_ms,
     timing.time_to_first_packet_ms + timing.continuation_ms,
@@ -9200,7 +9201,7 @@ test("a packet prelude that ran no continuation reports zero, not the rest of it
 
 test("reused comparator rows are always timing-ineligible", () => {
   const row = timingIneligibleComparatorRow({
-    arm: "published_0_17_4",
+    arm: "published_0_17_5",
     comparative_wall_time_eligible: true,
     installed_agent_timing: {
       timing_cohort_id: "b".repeat(64),
@@ -9218,7 +9219,7 @@ test("reused comparator rows are always timing-ineligible", () => {
   assert.equal(Object.keys(row.installed_agent_timing).length, 6);
 });
 
-test("exact-candidate warm timing comes from InstalledAgentTimingV1 phases, not wall_ms", () => {
+test("exact-candidate warm timing comes from whole_task_wall_ms, not a phase remainder", () => {
   const timing = installedAgentTiming({
     timing_cohort_id: "c".repeat(64),
     agent_runner_ms: 80,
@@ -9236,7 +9237,7 @@ test("exact-candidate warm timing comes from InstalledAgentTimingV1 phases, not 
     incremental_ms: 10,
     all_in_ms: 100,
   });
-  assert.equal(exact.warm_ms, timing.agent_runner_ms + timing.time_to_first_packet_ms + timing.continuation_ms);
+  assert.equal(exact.warm_ms, timing.whole_task_wall_ms);
   assert.notEqual(exact.warm_ms, timing.agent_runner_ms);
   assert.equal(
     Object.getOwnPropertyDescriptor(timing, "whole_task_wall_ms") != null,
@@ -9246,7 +9247,7 @@ test("exact-candidate warm timing comes from InstalledAgentTimingV1 phases, not 
 
 test("exact-candidate acceptance excludes reused timing-ineligible rows from warm gates", () => {
   const rows = exactCandidateRows();
-  for (const row of rows.filter((entry) => entry.arm === "published_0_17_4")) {
+  for (const row of rows.filter((entry) => entry.arm === "published_0_17_5")) {
     Object.assign(row, timingIneligibleComparatorRow({
       ...row,
       comparator_reuse_provenance: {
@@ -9262,7 +9263,7 @@ test("exact-candidate acceptance excludes reused timing-ineligible rows from war
     row.installed_agent_timing.time_to_final_packet_ms = 0;
     row.installed_agent_timing.whole_task_wall_ms = 1;
   }
-  assert.equal(timingEligibleExactCandidateRow(rows.find((row) => row.arm === "published_0_17_4")), false);
+  assert.equal(timingEligibleExactCandidateRow(rows.find((row) => row.arm === "published_0_17_5")), false);
   const accepted = benchmarkHarness.exactCandidateAcceptance(rows, exactLifecycle());
   assert.equal(accepted.pass, false);
   assert.match(
@@ -9282,6 +9283,6 @@ test("exact-candidate acceptance rejects warm that aliases raw wall_ms instead o
   assert.equal(accepted.pass, false);
   assert.match(
     accepted.reasons.join(" | "),
-    /whole-task warm timing does not reconcile to InstalledAgentTimingV1 phases/i,
+    /whole-task warm timing does not reconcile to InstalledAgentTimingV1 whole_task_wall_ms/i,
   );
 });

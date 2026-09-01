@@ -194,6 +194,28 @@ function proofContract({ prohibited = false } = {}) {
   };
 }
 
+function publicProofArgs(document) {
+  return { call_path: document };
+}
+
+const DEFAULT_CALL_PATH = [
+  "call-path/v1",
+  'from symbol "start" in "src/lib.rs"',
+  'direct-call symbol "finish" in "src/lib.rs"',
+  "",
+].join("\n");
+
+const REFUTED_CALL_PATH = [
+  "call-path/v1",
+  'from symbol "refuted_start" in "src/lib.rs"',
+  'direct-call symbol "detour" in "src/lib.rs"',
+  'direct-call symbol "finish" in "src/lib.rs"',
+  'prohibit-through symbol "detour" in "src/lib.rs"',
+  "",
+].join("\n");
+
+const MALFORMED_CALL_PATH = "A calls B";
+
 function projectedProofClauses(contract) {
   return contract.clauses.map((clause) => ({
     start: clause.start_byte,
@@ -343,7 +365,8 @@ function v3Packet({
 }
 
 function proofBody(disposition, contract, detail = {}) {
-  const contractDigest = canonicalRequestContractDigest(contract);
+  const publicContract = detail.public_contract ?? { call_path: DEFAULT_CALL_PATH };
+  const contractDigest = canonicalRequestContractDigest(publicContract);
   const common = { kind: disposition, contract_digest: contractDigest };
   let projectedDisposition;
   let stepStatus;
@@ -400,7 +423,7 @@ function proofBody(disposition, contract, detail = {}) {
     domain: "indexed_source_call_path_v1",
     contract_interpretation: "host_supplied",
     guard_version: "clause_guard_v1",
-    source_text_sha256: sha256(Buffer.from(contract.source_text)),
+    source_text_sha256: sha256(Buffer.from(publicContract.call_path)),
     contract_digest: contractDigest,
     core_publication: { project_id: "project-1", generation_id: "core-1", run_id: "run-1" },
     identities: hasReceipt ? {
@@ -467,6 +490,7 @@ function finalClaim(overrides = {}) {
 
 function baseRun(scenarioId) {
   const typed = proofContract();
+  const publicArgs = publicProofArgs(DEFAULT_CALL_PATH);
   const run = {
     scenario_id: scenarioId,
     request: {
@@ -612,14 +636,16 @@ function baseRun(scenarioId) {
       });
       break;
     case "typed_proof_contract_proven":
-      run.request.proof_contract = typed;
-      run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...typed }, proofBody("contract_proven", typed))];
+      run.request.proof_contract = publicArgs;
+      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("contract_proven", typed))];
       run.final = finalClaim({ authority: "typed_proof", evidence_ids: ["receipt-1"], proof_disposition: "contract_proven" });
       break;
     case "typed_proof_contract_refuted":
       const refutedContract = proofContract({ prohibited: true });
-      run.request.proof_contract = refutedContract;
-      run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...refutedContract }, proofBody("contract_refuted", refutedContract, {
+      const refutedArgs = publicProofArgs(REFUTED_CALL_PATH);
+      run.request.proof_contract = refutedArgs;
+      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...refutedArgs }, proofBody("contract_refuted", refutedContract, {
+        public_contract: refutedArgs,
         basis: { kind: "prohibited_scope_traversal" },
       }))];
       run.final = finalClaim({
@@ -631,15 +657,15 @@ function baseRun(scenarioId) {
       });
       break;
     case "typed_proof_unknown":
-      run.request.proof_contract = typed;
-      run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...typed }, proofBody("unknown", typed, {
+      run.request.proof_contract = publicArgs;
+      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("unknown", typed, {
         gaps: [{ code: "selector_missing" }],
       }))];
       run.final = finalClaim({ authority: "typed_proof", outcome: "unknown", reason_codes: ["selector_missing"], proof_disposition: "unknown" });
       break;
     case "typed_proof_unavailable":
-      run.request.proof_contract = typed;
-      run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...typed }, proofBody("unavailable", typed, {
+      run.request.proof_contract = publicArgs;
+      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("unavailable", typed, {
         reasons: ["proof_semantic_projection_unavailable"],
       }))];
       run.final = finalClaim({
@@ -651,8 +677,9 @@ function baseRun(scenarioId) {
       break;
     case "malformed_proof_contract": {
       const malformed = { ...typed, source_text: "A calls B", clauses: [] };
-      run.request.proof_contract = malformed;
-      run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...malformed }, {
+      const malformedArgs = publicProofArgs(MALFORMED_CALL_PATH);
+      run.request.proof_contract = malformedArgs;
+      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...malformedArgs }, {
         code: "invalid_proof_interpretation",
         message: "source text is unclassified",
       }, { isError: true })];
@@ -664,8 +691,8 @@ function baseRun(scenarioId) {
       run.final = finalClaim({ authority: "none", outcome: "refused", reason_codes: ["typed_contract_required"] });
       break;
     case "proof_observational":
-      run.request.proof_contract = typed;
-      run.steps = [mcp("prove_call_path", { project: "/workspace/repo", ...typed }, proofBody("unknown", typed, {
+      run.request.proof_contract = publicArgs;
+      run.steps = [mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("unknown", typed, {
         gaps: [{ code: "direct_call_missing" }],
       }))];
       run.final = finalClaim({
@@ -676,10 +703,10 @@ function baseRun(scenarioId) {
       });
       break;
     case "hidden_proof_tool_discovery":
-      run.request.proof_contract = typed;
+      run.request.proof_contract = publicArgs;
       run.steps = [
-        { kind: "tool_search", query: "codestory mcp prove_call_path", tools: ["mcp__codestory__prove_call_path"] },
-        mcp("prove_call_path", { project: "/workspace/repo", ...typed }, proofBody("contract_proven", typed)),
+        { kind: "tool_search", query: "codestory mcp verify_indexed_direct_calls", tools: ["mcp__codestory__verify_indexed_direct_calls"] },
+        mcp("verify_indexed_direct_calls", { project: "/workspace/repo", ...publicArgs }, proofBody("contract_proven", typed)),
       ];
       run.final = finalClaim({ authority: "typed_proof", evidence_ids: ["receipt-1"], proof_disposition: "contract_proven" });
       break;
@@ -1356,7 +1383,7 @@ test("checked-in request corpus covers the routing matrix exactly once", () => {
   );
   assert.equal(Object.isFrozen(ROUTING_REQUEST_CORPUS), true);
   for (const entry of ROUTING_REQUEST_CORPUS.scenarios) {
-    assert.doesNotMatch(entry.prompt, /\b(search|context|packet|prove_call_path)\b/iu, entry.id);
+    assert.doesNotMatch(entry.prompt, /\b(search|context|packet|verify_indexed_direct_calls)\b/iu, entry.id);
   }
   for (const [scenarioId, question] of Object.entries(ROUTING_PACKET_QUESTIONS)) {
     const entry = ROUTING_REQUEST_CORPUS.scenarios.find(({ id }) => id === scenarioId);
@@ -1459,9 +1486,9 @@ test("all proof scenarios preserve the public input DTO through both installed-h
   for (const scenarioId of PROOF_CALL_SCENARIOS) {
     const run = baseRun(scenarioId);
     const expected = run.request.proof_contract;
-    const proofStep = run.steps.find((step) => step.tool === "prove_call_path");
+    const proofStep = run.steps.find((step) => step.tool === "verify_indexed_direct_calls");
     assert.deepEqual(
-      { source_text: proofStep.args.source_text, clauses: proofStep.args.clauses, spec: proofStep.args.spec },
+      { call_path: proofStep.args.call_path },
       expected,
       scenarioId,
     );
@@ -1476,7 +1503,7 @@ test("hidden proof discovery is optional only when the verifier is directly visi
   for (const host of ["codex", "cursor"]) {
     const visible = baseRun("hidden_proof_tool_discovery");
     visible.steps.shift();
-    assert.deepEqual(validate(host, visible).actions, ["prove_call_path"]);
+    assert.deepEqual(validate(host, visible).actions, ["verify_indexed_direct_calls"]);
 
     const lateDiscovery = baseRun("hidden_proof_tool_discovery");
     lateDiscovery.steps.reverse();
@@ -1502,7 +1529,7 @@ test("the old normalized proof-response projection is rejected as public tool in
   input.spec.steps = input.spec.steps.map((step) => ({ relation: "direct_outgoing_call", ...step }));
   assert.throws(
     () => validateProofCallInputAgainstCatalog(input),
-    /prove_call_path input schema/u,
+    /verify_indexed_direct_calls input schema/u,
   );
 });
 
@@ -1783,6 +1810,7 @@ test("installed hosts collapse only bounded identical preparing retries", () => 
     kind: "preparing",
     state: "preparing",
     retry_after_ms: 250,
+    minimum_next: { kind: "retry_same_request", after_ms: 250 },
     operation: { operation_id: "activation-fixture", stage: "dense_preparation" },
   };
   for (const host of ["codex", "cursor"]) {
@@ -2099,10 +2127,15 @@ const MUTATIONS = [
     scenario: "typed_proof_contract_proven",
     mutate(run) {
       const retry = clone(run.steps[0]);
-      retry.args.spec.start = { kind: "qualified", qualified_name: "crate::start" };
+      retry.args.call_path = [
+        "call-path/v1",
+        'from symbol "start" in "src/lib.rs"',
+        'direct-call symbol "other" in "src/lib.rs"',
+        "",
+      ].join("\n");
       run.steps.push(retry);
     },
-    error: /required action sequence|follow-up prove_call_path is not permitted|proof request must preserve the host-supplied typed contract|proof may be called only once/u,
+    error: /required action sequence|follow-up verify_indexed_direct_calls is not permitted|proof request must preserve the host-supplied typed contract|proof may be called only once/u,
   },
   {
     name: "unknown becomes absence",
@@ -2499,14 +2532,12 @@ test("packet continuation and selected-context correlation are exact", () => {
 
   const classifiedPacket = baseRun("broad_packet");
   classifiedPacket.steps[0].args.task_class = "route_tracing";
-  assert.equal(validate("cursor", classifiedPacket).status, "pass");
+  assert.throws(() => validate("cursor", classifiedPacket), /generated catalog input schema|initial packet arguments/u);
 
   const classifiedContinuation = baseRun("packet_single_continuation");
   classifiedContinuation.steps[0].args.task_class = "route_tracing";
   classifiedContinuation.steps[1].args.task_class = "route_tracing";
-  assert.equal(validate("cursor", classifiedContinuation).status, "pass");
-  delete classifiedContinuation.steps[1].args.task_class;
-  assert.throws(() => validate("cursor", classifiedContinuation), /continuation arguments/u);
+  assert.throws(() => validate("cursor", classifiedContinuation), /generated catalog input schema|initial packet arguments/u);
 
   const authorizedGapRead = baseRun("packet_gap_to_focused_source");
   mutateBody(authorizedGapRead, 0, (body) => {
@@ -2739,9 +2770,9 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher a
   assert.match(skill, /selected target.*`context`/isu);
   assert.match(skill, /supplied symbol name.*search\.query.*unchanged/isu);
   assert.match(skill, /broad.*`packet`.*continuation.*once/isu);
-  assert.match(skill, /host-supplied.*`prove_call_path`/isu);
+  assert.match(skill, /host-supplied.*`verify_indexed_direct_calls`/isu);
   assert.match(skill, /semantic proof tool error.*invalid contract.*not\s+typed-proof evidence/isu);
-  assert.match(skill, /exact proof from English.*no complete typed\s+contract.*stop.*do not call a\s+repository tool/isu);
+  assert.match(skill, /exact proof from English.*no complete\s+`call-path\/v1` document.*stop.*do not\s+call a\s+repository tool/isu);
   assert.match(skill, /`unknown`.*not absence/isu);
   assert.match(skill, /runtime execution/iu);
   assert.match(skill, /typed `Unavailable`.*terminal/isu);
@@ -2754,14 +2785,14 @@ test("static Cursor Claude Code and Copilot surfaces bind one package launcher a
   assert.match(skill, /higher-level action.*mechanism.*same evidence rows/isu);
   assert.match(skill, /participates.*calls/isu);
   assert.match(cursorRule, /canonical codestory-grounding skill.*sole source of truth.*adds no parallel instructions/isu);
-  assert.doesNotMatch(cursorRule, /Routing contract:|Discovery leads come from|prove_call_path|Inspect source after a packet/u);
+  assert.doesNotMatch(cursorRule, /Routing contract:|Discovery leads come from|verify_indexed_direct_calls|Inspect source after a packet/u);
   assert.match(skill, /bounded command action.*cat.*sed.*exact authorized file.*before reporting.*unavailable/isu);
   assert.match(openAiMetadata, /read and follow the loaded codestory-grounding skill/isu);
   assert.match(openAiMetadata, /sole source of truth/isu);
   assert.match(openAiMetadata, /adds no parallel instructions/isu);
   assert.doesNotMatch(
     openAiMetadata,
-    /search.*context.*packet.*prove_call_path|unknown.*not absence|typed contract/isu,
+    /search.*context.*packet.*verify_indexed_direct_calls|unknown.*not absence|typed contract/isu,
   );
   assert.match(skill, /omit optional numeric bounds.*generated schema/isu);
   assert.match(searchReference, /limit.*1.*50/isu);
@@ -2851,7 +2882,7 @@ Call the CodeStory tool that matches the task. The codestory-grounding skill own
     cpSync(pluginRoot, root, { recursive: true, force: true });
     writeFileSync(
       openAiMetadataPath,
-      `${readFileSync(openAiMetadataPath, "utf8")}\nRouting contract: search, context, packet, then prove_call_path. Unknown is not absence; supply a typed contract.\n`,
+      `${readFileSync(openAiMetadataPath, "utf8")}\nRouting contract: search, context, packet, then verify_indexed_direct_calls. Unknown is not absence; supply a typed contract.\n`,
     );
     const duplicatedOpenAiGuidance = staticIdentityFor(root);
     await assert.rejects(

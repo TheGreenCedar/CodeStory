@@ -83,19 +83,19 @@ document yourself; CodeStory parses it and does not translate prose into one.
 
 ```text
 call-path/v1
-start: crate::module::Alpha
-step 1: direct call -> crate::module::Beta
-step 2: direct call -> "src/gamma.rs"::Gamma
-prohibit traversal through: crate::detail::Helper
-exclude from projection: crate::test_support
+from symbol "crate::module::Alpha"
+direct-call symbol "crate::module::Beta"
+direct-call symbol "Gamma" in "src/gamma.rs"
+prohibit-through symbol "crate::detail::Helper"
+exclude-from-projection symbol "crate::test_support"
 ```
 
-The version line comes first. `start` and at least one `step` are required, and
-steps are numbered consecutively from 1 up to 6. The `prohibit traversal
-through` and `exclude from projection` lines are optional and repeatable.
-Selectors are qualified names, or `"path/to/file"::Name` to scope the search to
-one file; signatures, wildcards, and internal identities are not selectors.
-Blank lines and indentation are ignored.
+The version line comes first. Exactly one `from` and one to six `direct-call`
+lines are required. `prohibit-through` and `exclude-from-projection` are
+optional and capped at sixteen each. Selectors are
+`symbol "<qualified-name>" [in "<project-relative-path>"]` or
+`canonical "<id>"`. Signatures, wildcards, absolute paths, `..`, and internal
+identities are not selectors. Blank lines and indentation are ignored.
 
 ```sh
 codestory-cli verify-indexed-direct-calls --project <repo> --spec <call-path.txt>

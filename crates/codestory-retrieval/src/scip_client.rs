@@ -423,6 +423,7 @@ fn symbol_to_hit(
         start_line: Some(symbol.start_line),
         target: None,
         source_excerpt: None,
+        source_bytes_upper_bound: None,
         score,
         lane_scores: Default::default(),
         source: CandidateSource::Scip,

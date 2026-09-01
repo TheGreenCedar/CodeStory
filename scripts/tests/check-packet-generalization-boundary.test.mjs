@@ -94,6 +94,45 @@ pub fn packet_drop_unrequested_sibling_noise(rows: &mut Vec<()>) {
   );
 });
 
+test("deleted formula substrate APIs fail closed", () => {
+  const contaminated = `
+pub fn packet_atom_hydration_spec() {}
+pub fn match_flow_proof() {}
+const LOG_HANDLER_FLOW_PROOF: () = ();
+fn reconcile_packet_proof_obligations_after_compile() {}
+`;
+  const findings = findBoundaryViolations(contaminated, {
+    filePath: path.join(repositoryRoot, "crates/codestory-agent/src/packet_obligations.rs"),
+    repoRoot: repositoryRoot,
+  });
+  const details = findings.filter((f) => f.kind === "deleted_taxonomy_api").map((f) => f.detail);
+  assert.ok(details.includes("packet_atom_hydration_spec"), findings);
+  assert.ok(details.includes("match_flow_proof"), findings);
+  assert.ok(details.includes("LOG_HANDLER_FLOW_PROOF"), findings);
+  assert.ok(details.includes("reconcile_packet_proof_obligations_after_compile"), findings);
+});
+
+test("vocabulary seed and CLI-shaped focus classifiers fail closed", () => {
+  const contaminated = `
+fn packet_task_seed_anchor_probe(term: &str) -> bool {
+    matches!(term, "main" | "run" | "entrypoint")
+}
+fn packet_command_focus_roots() -> Vec<&'static str> {
+    vec!["::Cli", "src/cli.rs", "main.rs", "Subcommand::"]
+}
+fn promote_focus_neighborhood_citations() {}
+citation.coverage_role = Some("explicit exact probe".to_string());
+`;
+  const findings = findBoundaryViolations(contaminated, {
+    filePath: path.join(repositoryRoot, "crates/codestory-runtime/src/agent/packet_batch.rs"),
+    repoRoot: repositoryRoot,
+  });
+  const kinds = new Set(findings.map((f) => f.kind));
+  assert.ok(kinds.has("vocabulary_steering_api"), findings);
+  assert.ok(kinds.has("cli_shaped_focus_classifier"), findings);
+  assert.ok(kinds.has("magic_coverage_role"), findings);
+});
+
 test("clean generic seed / projection surface passes", () => {
   const clean = `
 pub fn extract_packet_query_terms(question: &str) -> Vec<String> {

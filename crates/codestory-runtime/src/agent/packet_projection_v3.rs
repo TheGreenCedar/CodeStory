@@ -251,6 +251,7 @@ pub(crate) fn finalize_packet_projection_v3(
         gaps: packet_budget_exceeded_gaps_v3(),
         maximum_bytes: PACKET_PUBLIC_RESULT_MAX_BYTES_V3 as u64,
         required_complete_bytes: required_complete_bytes as u64,
+        answer_sufficiency: Default::default(),
     };
     let fallback_bytes =
         measure(&fallback).map_err(|_| ProjectionBuildErrorV3::MeasurementFailed)?;
@@ -297,6 +298,7 @@ fn packet_complete_candidate_v3(
         gaps: BoundedVecV3::new(gaps).map_err(ProjectionBuildErrorV3::BoundViolation)?,
         continuation,
         diagnostics,
+        answer_sufficiency: Default::default(),
     })
 }
 
@@ -350,6 +352,7 @@ fn compact_packet_candidate_v3(
         gaps: BoundedVecV3::new(gaps).map_err(ProjectionBuildErrorV3::BoundViolation)?,
         continuation,
         diagnostics,
+        answer_sufficiency: Default::default(),
     })
 }
 
@@ -757,7 +760,6 @@ mod tests {
         let request = AgentPacketRequestDto {
             question: question.to_owned(),
             budget,
-            task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
             latency_budget_ms: None,
@@ -1416,6 +1418,7 @@ mod tests {
                     gaps: packet_budget_exceeded_gaps_v3(),
                     maximum_bytes,
                     required_complete_bytes,
+                    answer_sufficiency: Default::default(),
                 })
                 .unwrap();
                 let gaps = serialized["gaps"].as_array().expect("typed budget gap");

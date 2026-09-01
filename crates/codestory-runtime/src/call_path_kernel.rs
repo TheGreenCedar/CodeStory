@@ -25,17 +25,22 @@ use codestory_contracts::proof_resolution::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+pub use codestory_contracts::call_path::{
+    CLAUSE_GUARD_VERSION, COMPACT_PROOF_MAX_BYTES, CONTRACT_INTERPRETATION, CallPathSpec,
+    ClauseAnchor, ClauseClassification, DirectCallStep, ExactScopeSelector, ExactSymbolSelector,
+    InternalProjection, InternalProjectionError, NonMaterialKind, PinnedNodeIdentity,
+    ProofContractField, ProofHashes, UnresolvedMaterialReason, UnvalidatedCallPathContract,
+    UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector,
+    UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
+};
+
 pub const PROOF_CONTRACT_SCHEMA_VERSION: u32 = 1;
 pub const PROOF_DOMAIN: &str = "indexed_source_call_path_v1";
-pub const CLAUSE_GUARD_VERSION: &str = "clause_guard_v1";
-/// The contract and its clause anchors come from parsing the published
-/// `call-path/v1` grammar, not from a translation the caller supplied.
-pub const CONTRACT_INTERPRETATION: &str = "parser_derived";
 const DIGEST_DOMAIN_SEPARATOR: &[u8] = b"codestory.proof-contract.digest.v1\0";
 const FACT_ID_DOMAIN_SEPARATOR: &[u8] = b"codestory-proof-resolution-fact-id-v1\0";
 const MIN_STEPS: usize = 1;
 const MAX_STEPS: usize = 6;
-const MAX_INDEXED_SCOPES: usize = u8::MAX as usize + 1;
+const MAX_INDEXED_SCOPES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmittedRawCallEdge {
@@ -200,245 +205,6 @@ pub fn diagnose_raw_call_edge(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnvalidatedCallPathContract {
-    source_text: String,
-    clauses: Vec<ClauseAnchor>,
-    spec: UnvalidatedCallPathSpec,
-}
-
-impl UnvalidatedCallPathContract {
-    pub fn new(
-        source_text: impl Into<String>,
-        clauses: Vec<ClauseAnchor>,
-        spec: UnvalidatedCallPathSpec,
-    ) -> Self {
-        Self {
-            source_text: source_text.into(),
-            clauses,
-            spec,
-        }
-    }
-
-    pub fn source_text(&self) -> &str {
-        &self.source_text
-    }
-
-    pub fn clauses(&self) -> &[ClauseAnchor] {
-        &self.clauses
-    }
-
-    pub fn spec(&self) -> &UnvalidatedCallPathSpec {
-        &self.spec
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClauseAnchor {
-    pub clause_id: String,
-    pub start: usize,
-    pub end: usize,
-    pub quote: String,
-    pub classification: ClauseClassification,
-}
-
-// The dark contract's wire-facing variant names are intentionally stable.
-#[allow(clippy::enum_variant_names)]
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ClauseClassification {
-    ResolvedMaterial { fields: Vec<ProofContractField> },
-    UnresolvedMaterial { reason: UnresolvedMaterialReason },
-    NonMaterial { kind: NonMaterialKind },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ProofContractField {
-    Start,
-    StepTarget { step: u8 },
-    Directness { step: u8 },
-    Ordering { step: u8 },
-    Relation { step: u8 },
-    TraversalProhibition { index: u8 },
-    ProjectionExclusion { index: u8 },
-}
-
-impl ProofContractField {
-    fn canonical_name(self) -> &'static str {
-        match self {
-            Self::Start => "start",
-            Self::StepTarget { .. } => "step_target",
-            Self::Directness { .. } => "directness",
-            Self::Ordering { .. } => "ordering",
-            Self::Relation { .. } => "relation",
-            Self::TraversalProhibition { .. } => "traversal_prohibition",
-            Self::ProjectionExclusion { .. } => "projection_exclusion",
-        }
-    }
-
-    fn canonical_json(self) -> Value {
-        match self {
-            Self::Start => json!({ "kind": self.canonical_name() }),
-            Self::StepTarget { step }
-            | Self::Directness { step }
-            | Self::Ordering { step }
-            | Self::Relation { step } => json!({
-                "kind": self.canonical_name(),
-                "step": step,
-            }),
-            Self::TraversalProhibition { index } | Self::ProjectionExclusion { index } => json!({
-                "kind": self.canonical_name(),
-                "index": index,
-            }),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum UnresolvedMaterialReason {
-    MissingSelectorResolution,
-    AmbiguousSelectorResolution,
-    UnsupportedInterpretation,
-}
-
-impl UnresolvedMaterialReason {
-    fn canonical_name(&self) -> &'static str {
-        match self {
-            Self::MissingSelectorResolution => "missing_selector_resolution",
-            Self::AmbiguousSelectorResolution => "ambiguous_selector_resolution",
-            Self::UnsupportedInterpretation => "unsupported_interpretation",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum NonMaterialKind {
-    Whitespace,
-    Punctuation,
-    Connector,
-    Commentary,
-}
-
-impl NonMaterialKind {
-    fn canonical_name(&self) -> &'static str {
-        match self {
-            Self::Whitespace => "whitespace",
-            Self::Punctuation => "punctuation",
-            Self::Connector => "connector",
-            Self::Commentary => "commentary",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnvalidatedCallPathSpec {
-    pub start: UnvalidatedExactSymbolSelector,
-    pub steps: Vec<UnvalidatedDirectCallStep>,
-    pub prohibit_traversal_through: Vec<UnvalidatedExactScopeSelector>,
-    pub exclude_from_projection: Vec<UnvalidatedExactScopeSelector>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnvalidatedDirectCallStep {
-    pub target: UnvalidatedExactSymbolSelector,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UnvalidatedExactSymbolSelector {
-    PinnedNode(PinnedNodeIdentity),
-    CanonicalId(String),
-    QualifiedName {
-        qualified_name: String,
-        project_file_components: Option<Vec<String>>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UnvalidatedExactScopeSelector {
-    PinnedNode(PinnedNodeIdentity),
-    CanonicalId(String),
-    QualifiedName {
-        qualified_name: String,
-        project_file_components: Option<Vec<String>>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PinnedNodeIdentity {
-    pub project_id: String,
-    pub core_generation_id: String,
-    pub core_run_id: String,
-    pub node_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ExactSymbolSelector {
-    PinnedNode(PinnedNodeIdentity),
-    CanonicalId(String),
-    QualifiedName {
-        qualified_name: String,
-        project_file_components: Option<Vec<String>>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ExactScopeSelector {
-    PinnedNode(PinnedNodeIdentity),
-    CanonicalId(String),
-    QualifiedName {
-        qualified_name: String,
-        project_file_components: Option<Vec<String>>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DirectCallStep {
-    target: ExactSymbolSelector,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CallPathSpec {
-    start: ExactSymbolSelector,
-    steps: Vec<DirectCallStep>,
-    prohibit_traversal_through: Vec<ExactScopeSelector>,
-    exclude_from_projection: Vec<ExactScopeSelector>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedCallPathContract {
-    spec: CallPathSpec,
-    bound_hashes: ProofHashes,
-}
-
-impl ValidatedCallPathContract {
-    pub fn spec(&self) -> &CallPathSpec {
-        &self.spec
-    }
-}
-
-impl CallPathSpec {
-    pub fn start(&self) -> &ExactSymbolSelector {
-        &self.start
-    }
-
-    pub fn steps(&self) -> &[DirectCallStep] {
-        &self.steps
-    }
-
-    pub fn traversal_prohibitions(&self) -> &[ExactScopeSelector] {
-        &self.prohibit_traversal_through
-    }
-
-    pub fn projection_exclusions(&self) -> &[ExactScopeSelector] {
-        &self.exclude_from_projection
-    }
-}
-
-impl DirectCallStep {
-    pub fn target(&self) -> &ExactSymbolSelector {
-        &self.target
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedContractRendering {
     normalized_clauses: Vec<NormalizedClause>,
 }
@@ -557,22 +323,6 @@ pub enum SelectorValidationError {
     SeparatorInsidePathComponent,
     NulInsidePathComponent,
     PlatformEscape,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProofHashes {
-    source_text_sha256: String,
-    contract_digest: String,
-}
-
-impl ProofHashes {
-    pub fn source_text_sha256(&self) -> &str {
-        &self.source_text_sha256
-    }
-
-    pub fn contract_digest(&self) -> &str {
-        &self.contract_digest
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2269,25 +2019,6 @@ fn authoritative_receipt_refs(disposition: &ProofDisposition) -> &[ReceiptRef] {
         } => connected_receipts,
         ProofDisposition::Unavailable { .. } => &[],
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InternalProjection {
-    Complete {
-        root: Value,
-        serialized_size: usize,
-    },
-    BudgetExceeded {
-        root: Value,
-        required_complete_size: usize,
-        serialized_size: usize,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InternalProjectionError {
-    Serialization(String),
-    InvalidCompactProjection(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4487,10 +4218,7 @@ pub fn project_internal_call_path_result(
     integration: &CheckedBuiltCallPathIntegration,
 ) -> Result<InternalProjection, InternalProjectionError> {
     let complete = complete_projection_json(integration)?;
-    Ok(InternalProjection::Complete {
-        serialized_size: serialized_json_size(&complete)?,
-        root: complete,
-    })
+    project_compact_or_budget(complete)
 }
 
 pub fn project_translation_unknown_result(
@@ -4528,8 +4256,19 @@ pub fn project_translation_unknown_result(
     });
     validate_compact_projection(&complete)
         .map_err(InternalProjectionError::InvalidCompactProjection)?;
+    project_compact_or_budget(complete)
+}
+
+fn project_compact_or_budget(
+    complete: Value,
+) -> Result<InternalProjection, InternalProjectionError> {
+    // Internal roots stay complete. The public 4 KiB compact cap is applied
+    // by the CLI/MCP projection, not by this kernel.
+    let serialized_size = serialized_json_size(&complete)?;
+    validate_compact_projection(&complete)
+        .map_err(InternalProjectionError::InvalidCompactProjection)?;
     Ok(InternalProjection::Complete {
-        serialized_size: serialized_json_size(&complete)?,
+        serialized_size,
         root: complete,
     })
 }
@@ -4980,6 +4719,10 @@ mod tests {
     use codestory_contracts::graph::{Edge, EdgeId, EdgeKind, NodeId};
     use codestory_contracts::proof_resolution::{FileId, ResolutionEvidence, ResolutionProvenance};
 
+    fn complete_root(integration: &CheckedBuiltCallPathIntegration) -> Value {
+        complete_projection_json(integration).expect("complete projection json")
+    }
+
     fn canonical_selector(name: &str) -> UnvalidatedExactSymbolSelector {
         UnvalidatedExactSymbolSelector::CanonicalId(name.to_owned())
     }
@@ -5347,11 +5090,7 @@ mod tests {
                 })],
             }
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integrated).unwrap()
-        else {
-            panic!("small checked integration fits")
-        };
+        let root = complete_root(&integrated);
         assert_eq!(
             root["steps"]
                 .as_array()
@@ -5502,11 +5241,7 @@ mod tests {
             &rendering,
             built_from_receipts(vec![r0, r1, later], Vec::new(), Vec::new()),
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integrated).unwrap()
-        else {
-            panic!("small checked integration fits")
-        };
+        let root = complete_root(&integrated);
         assert_eq!(
             root["steps"]
                 .as_array()
@@ -5554,11 +5289,7 @@ mod tests {
                 ..
             } if connected_receipts.iter().map(|receipt| receipt.receipt_id.as_str()).collect::<Vec<_>>() == ["receipt-0", "receipt-1"]
         ));
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integrated).unwrap()
-        else {
-            panic!("small checked integration fits")
-        };
+        let root = complete_root(&integrated);
         assert_eq!(
             root["steps"]
                 .as_array()
@@ -5695,7 +5426,7 @@ mod tests {
         assert_eq!(root["kind"], "complete");
         assert_eq!(root["schema_version"], 1);
         assert_eq!(root["domain"], "indexed_source_call_path_v1");
-        assert_eq!(root["contract_interpretation"], "parser_derived");
+        assert_eq!(root["contract_interpretation"], "host_supplied");
         assert_eq!(root["guard_version"], "clause_guard_v1");
         assert_eq!(root["identities"]["files"].as_array().unwrap().len(), 2);
         assert_eq!(root["identities"]["symbols"].as_array().unwrap().len(), 2);
@@ -5722,11 +5453,7 @@ mod tests {
             built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
         );
 
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).unwrap()
-        else {
-            panic!("compact projection should fit");
-        };
+        let root = complete_root(&integration);
         assert_eq!(root["identities"]["symbols"].as_array().unwrap().len(), 3);
         assert_eq!(root["identities"]["evidence"].as_array().unwrap().len(), 2);
         assert_eq!(root["receipts"][0]["source"], 0);
@@ -5786,11 +5513,7 @@ mod tests {
             &rendering,
             built_from_receipts(receipts, Vec::new(), Vec::new()),
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).expect("compact six-step projection")
-        else {
-            panic!("six-step projection remains complete")
-        };
+        let root = complete_root(&integration);
 
         let clauses = root["clauses"].as_array().expect("grouped clauses");
         assert_eq!(clauses.len(), 1);
@@ -5816,11 +5539,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).unwrap()
-        else {
-            panic!("fixture remains complete")
-        };
+        let root = complete_root(&integration);
         assert_eq!(root["clauses"].as_array().unwrap().len(), 2);
 
         let mut mutations = Vec::new();
@@ -5915,11 +5634,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).unwrap()
-        else {
-            panic!("selector fixture remains complete")
-        };
+        let root = complete_root(&integration);
         root
     }
 
@@ -5988,11 +5703,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        let InternalProjection::Complete { root: partial, .. } =
-            project_internal_call_path_result(&partial).unwrap()
-        else {
-            panic!("partial projection remains complete")
-        };
+        let partial = complete_root(&partial);
         assert_eq!(partial["spec"]["start"]["kind"], "canonical_id_ref");
         assert_eq!(
             partial["spec"]["steps"][0]["target"]["kind"],
@@ -6045,11 +5756,7 @@ mod tests {
             &rendering,
             built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).unwrap()
-        else {
-            panic!("shared provenance fixture remains complete")
-        };
+        let root = complete_root(&integration);
         assert_eq!(
             root["identities"]["provenance_profiles"]
                 .as_array()
@@ -6114,12 +5821,7 @@ mod tests {
             &rendering,
             built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
         );
-        let InternalProjection::Complete {
-            root: mut swapped, ..
-        } = project_internal_call_path_result(&two_profiles).unwrap()
-        else {
-            panic!("two-profile fixture remains complete")
-        };
+        let mut swapped = complete_root(&two_profiles);
         swapped["identities"]["evidence"][0]["provenance"]["profile"] = json!(1);
         swapped["identities"]["evidence"][1]["provenance"]["profile"] = json!(0);
         mutations.push(swapped);
@@ -6139,12 +5841,7 @@ mod tests {
         built: BuiltCallPathFacts,
     ) -> Value {
         let integration = checked_integration(contract, hashes, rendering, built);
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).unwrap()
-        else {
-            panic!("focused fixture remains complete")
-        };
-        root
+        complete_root(&integration)
     }
 
     #[test]
@@ -6357,11 +6054,7 @@ mod tests {
             &rendering,
             built_from_receipts(typed.clone(), Vec::new(), Vec::new()),
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).unwrap()
-        else {
-            panic!("two-profile fixture remains complete")
-        };
+        let root = complete_root(&integration);
         assert_eq!(
             validate_compact_projection_against_receipts(&root, &typed),
             Ok(())
@@ -6476,11 +6169,7 @@ mod tests {
             &rendering,
             built_from_receipts(vec![receipt], Vec::new(), Vec::new()),
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).unwrap()
-        else {
-            panic!("compact projection should fit");
-        };
+        let root = complete_root(&integration);
 
         let mut dangling = root.clone();
         dangling["receipts"][0]["evidence"] = json!(99);
@@ -6536,11 +6225,7 @@ mod tests {
                 Vec::new(),
             ),
         );
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).unwrap()
-        else {
-            panic!("small checked integration fits")
-        };
+        let root = complete_root(&integration);
 
         let mut mutations = Vec::new();
 
@@ -6657,11 +6342,7 @@ mod tests {
             built_from_receipts(vec![first, second], Vec::new(), Vec::new()),
         );
 
-        let InternalProjection::Complete { root, .. } =
-            project_internal_call_path_result(&integration).expect("cross-file projection")
-        else {
-            panic!("cross-file projection must remain complete")
-        };
+        let root = complete_root(&integration);
         assert_eq!(root["identities"]["files"].as_array().unwrap().len(), 3);
         assert_eq!(root["receipts"][0]["target"], root["receipts"][1]["source"]);
     }

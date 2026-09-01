@@ -183,7 +183,7 @@ impl CorePublicationLayout {
         Ok(path)
     }
 
-    pub fn publish_pointer(
+    pub(crate) fn publish_pointer(
         &self,
         active: CoreGenerationIdentityV1,
         rollback: Option<CoreGenerationIdentityV1>,
@@ -320,7 +320,7 @@ pub fn core_database_exists(storage_path: &Path) -> Result<bool, StorageError> {
 /// cache first names a generation, not how a live publication is replaced.
 /// The SQLite `index_publication` row may stay empty; the pointer is what
 /// later readers use to find the copied image.
-pub fn publish_rehydrated_generation(
+pub(crate) fn publish_rehydrated_generation(
     candidate_database: &Path,
     target_storage_path: &Path,
 ) -> Result<CorePublicationPointerV1, StorageError> {
@@ -401,7 +401,7 @@ pub(crate) fn clone_file_copy_on_write(
     Ok(false)
 }
 
-pub(crate) fn make_file_owner_writable(path: &Path) -> Result<(), StorageError> {
+pub fn make_file_owner_writable(path: &Path) -> Result<(), StorageError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| core_path_error("inspect stage permissions", path, error))?;
     if !metadata.file_type().is_file() {

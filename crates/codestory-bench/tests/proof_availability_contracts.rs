@@ -1314,14 +1314,15 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
         .split('/')
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
-    let pinned = |node_id: &str| codestory_agent::proof_qualification_support::PinnedNodeIdentity {
-        project_id: "project".into(),
-        core_generation_id: "generation".into(),
-        core_run_id: "run".into(),
-        node_id: node_id.into(),
-    };
+    let pinned =
+        |node_id: &str| codestory_runtime::proof_qualification_support::PinnedNodeIdentity {
+            project_id: "project".into(),
+            core_generation_id: "generation".into(),
+            core_run_id: "run".into(),
+            node_id: node_id.into(),
+        };
     let identity = |node_id: &str, declaration: &contracts::OracleDeclarationV1| {
-        codestory_agent::proof_qualification_support::ResolvedNodeIdentity {
+        codestory_runtime::proof_qualification_support::ResolvedNodeIdentity {
             pinned: pinned(node_id),
             canonical_id: format!("canonical-{node_id}"),
             qualified_name: declaration.symbol.clone(),
@@ -1330,8 +1331,8 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
         }
     };
     let wrong = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    let receipt = codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt {
-        receipt: codestory_agent::proof_qualification_support::ReceiptRef {
+    let receipt = codestory_runtime::proof_qualification_support::IndexedCallEdgeReceipt {
+        receipt: codestory_runtime::proof_qualification_support::ReceiptRef {
             receipt_id: "indexed-call-edge:fixture".into(),
             edge_id: "1".into(),
         },
@@ -1357,13 +1358,13 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
         exact_callsite_start_byte: 0,
         callsite_identity: "1:1:0:2|fixture".into(),
         column_or_ordinal: 0,
-        containment: codestory_agent::proof_qualification_support::CallableContainmentEvidence {
+        containment: codestory_runtime::proof_qualification_support::CallableContainmentEvidence {
             file_node_id: codestory_contracts::graph::NodeId(10),
             owner_node_id: codestory_contracts::graph::NodeId(1),
             start_line: 1,
             end_line: 1,
         },
-        line_window: codestory_agent::proof_qualification_support::IndexedLineWindow {
+        line_window: codestory_runtime::proof_qualification_support::IndexedLineWindow {
             kind: "indexed_line_v1",
             project_file_components,
             indexed_sha256: wrong.into(),
@@ -1385,8 +1386,10 @@ fn runtime_receipt_comparison_uses_the_oracle_file_hash_not_hash_self_agreement(
 
 #[test]
 fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
-    use codestory_agent::proof_qualification_support::{PinnedNodeIdentity, ResolvedNodeIdentity};
     use codestory_contracts::graph::NodeId;
+    use codestory_runtime::proof_qualification_support::{
+        PinnedNodeIdentity, ResolvedNodeIdentity,
+    };
 
     let raws = [
         "/Users/private/worktree/src/caller.rs::caller",
@@ -1459,11 +1462,11 @@ fn resolved_canonical_id_bindings_cover_host_paths_relative_ids_and_context() {
 
 #[test]
 fn canonical_selector_oracles_recompute_the_contextual_receipt_binding() {
-    use codestory_agent::proof_qualification_support::{
+    use codestory_contracts::graph::NodeId;
+    use codestory_runtime::proof_qualification_support::{
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity,
     };
-    use codestory_contracts::graph::NodeId;
 
     let path_file =
         CohortPathFileV1::from_json(cohort_path_file("codestory-rust")).expect("oracle path file");
@@ -1717,7 +1720,7 @@ fn task10a_refreeze_binds_methodology_thresholds_and_future_corpus() {
 
 #[test]
 fn canonical_artifact_seam_uses_rfc8785_number_and_utf16_semantics() {
-    let numeric = codestory_agent::proof_qualification_support::canonical_json_bytes(
+    let numeric = codestory_runtime::proof_qualification_support::canonical_json_bytes(
         &json!({"n": 9_007_199_254_740_993u64}),
     )
     .expect("canonical number");
@@ -1730,7 +1733,7 @@ fn canonical_artifact_seam_uses_rfc8785_number_and_utf16_semantics() {
     keys.insert("\u{e000}".into(), json!(2));
     keys.insert("\u{10000}".into(), json!(1));
     let utf16 =
-        codestory_agent::proof_qualification_support::canonical_json_bytes(&Value::Object(keys))
+        codestory_runtime::proof_qualification_support::canonical_json_bytes(&Value::Object(keys))
             .expect("canonical keys");
     assert_eq!(
         String::from_utf8(utf16).expect("UTF-8"),
@@ -2509,11 +2512,11 @@ fn invariant_table_exhausts_task4_task6_and_corpus_variants() {
 
 #[test]
 fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
-    use codestory_agent::proof_qualification_support::{
+    use codestory_contracts::graph::NodeId;
+    use codestory_runtime::proof_qualification_support::{
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity, UnavailableReason,
     };
-    use codestory_contracts::graph::NodeId;
     use codestory_runtime::proof_qualification_support::{
         CandidateFailure, CandidateGate, ContainmentFailure, FinalizationFailure,
         FinalizationTrace, ProofQualificationTrace, ResolutionFactFailure, SelectorFailure,
@@ -2614,17 +2617,17 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         let _: SelectorGateOutcomeV1 = SelectorGateOutcome::Unavailable(unavailable).into();
     }
     for reason in [
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CandidateAlternativesRetained,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingFileNode,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingLine,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteFileMismatch,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteLineMismatch,
-        codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteRawTargetMismatch,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::WrongKind,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::CandidateAlternativesRetained,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::MissingFileNode,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::MissingLine,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::CallsiteFileMismatch,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::CallsiteLineMismatch,
+        codestory_runtime::proof_qualification_support::RawAdmissionFailure::CallsiteRawTargetMismatch,
     ] {
         let _: CandidateFailureV1 = CandidateFailure::RawAdmission(reason).into();
     }
@@ -2741,17 +2744,17 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
     let positive_input = contracts::oracle_path_product_contract(oracle_path)
         .expect("positive product contract conversion");
     assert!(matches!(
-        codestory_agent::proof_qualification_support::validate_contract(positive_input).unwrap(),
-        codestory_agent::proof_qualification_support::ValidationOutcome::Validated { .. }
+        codestory_runtime::proof_qualification_support::validate_contract(positive_input).unwrap(),
+        codestory_runtime::proof_qualification_support::ValidationOutcome::Validated { .. }
     ));
     let mutation_id = &oracle_path.negative_mutations[0].mutation_id;
     let negative_input = contracts::negative_mutation_product_contract(oracle_path, mutation_id)
         .expect("negative product contract conversion");
     let frozen_hashes =
-        match codestory_agent::proof_qualification_support::validate_contract(negative_input)
+        match codestory_runtime::proof_qualification_support::validate_contract(negative_input)
             .unwrap()
         {
-            codestory_agent::proof_qualification_support::ValidationOutcome::Validated {
+            codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
                 hashes,
                 ..
             } => hashes,
@@ -2763,10 +2766,10 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
         contracts::negative_mutation_product_contract(oracle_path, &caller_altered_row.mutation_id)
             .expect("same ID resolves the frozen row, not the caller copy");
     let resolved_hashes =
-        match codestory_agent::proof_qualification_support::validate_contract(resolved_by_id)
+        match codestory_runtime::proof_qualification_support::validate_contract(resolved_by_id)
             .unwrap()
         {
-            codestory_agent::proof_qualification_support::ValidationOutcome::Validated {
+            codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
                 hashes,
                 ..
             } => hashes,
@@ -2873,11 +2876,11 @@ fn producer_facade_conversions_preserve_task4_and_task6_semantics() {
 
 #[test]
 fn admitted_callsite_identity_is_opaque_after_task6() {
-    use codestory_agent::proof_qualification_support::{
+    use codestory_contracts::graph::NodeId;
+    use codestory_runtime::proof_qualification_support::{
         CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow, PinnedNodeIdentity,
         ReceiptRef, ResolvedNodeIdentity,
     };
-    use codestory_contracts::graph::NodeId;
 
     const RAW_TARGET: i64 = -8_657_445_931_347_514_024;
     const RESOLVED_TARGET: i64 = -8_657_442_632_812_629_391;

@@ -67,6 +67,16 @@ export const DELETED_TAXONOMY_APIS = Object.freeze([
   "packet_drop_unrequested_export_macro_displays",
   "packet_drop_unrequested_system_format_failure_siblings",
   "packet_drop_unrequested_markdown_siblings",
+  "match_flow_proof",
+  "match_flow_requirements",
+  "LOG_HANDLER_FLOW_PROOF",
+  "MAPPER_PLAN_FLOW_PROOF",
+  "CSS_ANIMATION_FLOW_PROOF",
+  "packet_atom_hydration_spec",
+  "packet_flow_proof_formulas",
+  "hydrate_packet_atom_trails_post_pass",
+  "reconcile_packet_proof_obligations_after_compile",
+  "finalize_formula_claim_obligation",
 ]);
 
 /** Historical holdout anchors that must never steer production packet code. */
@@ -206,6 +216,24 @@ export const DELETED_TASK_CLASS_SEED_SPELLINGS = Object.freeze([
   "editcandidates",
   "testcoverage",
 ]);
+
+/** Prompt-vocabulary and CLI-shaped classifiers that steered retrieval or capping. */
+export const DELETED_VOCABULARY_STEERING_APIS = Object.freeze([
+  "packet_task_seed_anchor_probe",
+  "reserve_architecture_main_anchor_probe",
+  "promote_focus_neighborhood_citations",
+  "packet_command_focus_roots",
+]);
+
+/** CLI-shaped focus-root literals that must not appear together as a classifier. */
+export const DELETED_CLI_FOCUS_LITERALS = Object.freeze([
+  "::Cli",
+  "src/cli.rs",
+  "main.rs",
+  "Subcommand::",
+]);
+
+const MAGIC_EXPLICIT_EXACT_PROBE_ROLE = "explicit exact probe";
 
 /** Domain ownership predicate name patterns (CX-02). */
 export const DOMAIN_OWNERSHIP_PREDICATE_PATTERNS = Object.freeze([
@@ -854,6 +882,39 @@ export function findBoundaryViolations(source, { filePath = "<memory>", repoRoot
           detail: api,
         });
       }
+    }
+
+    for (const api of DELETED_VOCABULARY_STEERING_APIS) {
+      const re = new RegExp(`\\b${api}\\b`);
+      if (re.test(productionView)) {
+        findings.push({
+          kind: "vocabulary_steering_api",
+          file: relative,
+          detail: api,
+        });
+      }
+    }
+
+    const cliFocusHits = DELETED_CLI_FOCUS_LITERALS.filter((literal) => {
+      return productionView.includes(`"${literal}"`) || productionView.includes(`r"${literal}"`);
+    });
+    if (cliFocusHits.length >= 3) {
+      findings.push({
+        kind: "cli_shaped_focus_classifier",
+        file: relative,
+        detail: cliFocusHits.join(", "),
+      });
+    }
+
+    if (
+      productionView.includes(`"${MAGIC_EXPLICIT_EXACT_PROBE_ROLE}"`)
+      && /coverage_role/.test(productionView)
+    ) {
+      findings.push({
+        kind: "magic_coverage_role",
+        file: relative,
+        detail: MAGIC_EXPLICIT_EXACT_PROBE_ROLE,
+      });
     }
 
     for (const spelling of DELETED_TASK_CLASS_SEED_SPELLINGS) {

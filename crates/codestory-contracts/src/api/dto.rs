@@ -2810,9 +2810,10 @@ pub enum ClaimReadinessDto {
     ContradictedBySource,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PacketTaskClassDto {
+    #[default]
     ArchitectureExplanation,
     BugLocalization,
     ChangeImpact,
@@ -3092,7 +3093,9 @@ pub struct PacketProbeResolutionDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketPlanDto {
+    #[serde(default, skip_serializing)]
     pub task_class: PacketTaskClassDto,
+    #[serde(default, skip_serializing)]
     pub inferred_task_class: bool,
     #[serde(default)]
     pub queries: Vec<PacketPlanQueryDto>,
@@ -3110,8 +3113,6 @@ pub struct AgentPacketRequestDto {
     pub question: String,
     #[serde(default)]
     pub budget: PacketBudgetModeDto,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_class: Option<PacketTaskClassDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probes: Vec<PacketProbeDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3495,8 +3496,6 @@ pub struct PacketRetrievalTraceSummaryDto {
 pub struct AgentPacketDto {
     pub packet_id: String,
     pub question: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_class: Option<PacketTaskClassDto>,
     pub plan: PacketPlanDto,
     pub answer: AgentAnswerDto,
     #[serde(default)]
@@ -3505,6 +3504,9 @@ pub struct AgentPacketDto {
     pub budget: PacketBudgetDto,
     #[serde(alias = "benchmark_trace")]
     pub retrieval_trace_summary: PacketRetrievalTraceSummaryDto,
+    /// Production never asserts semantic sufficiency.
+    #[serde(default)]
+    pub answer_sufficiency: crate::compilation::AnswerSufficiencyV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -4258,7 +4260,6 @@ mod packet_tests {
         let request = AgentPacketRequestDto {
             question: "How does packet compile support?".to_string(),
             budget: PacketBudgetModeDto::Compact,
-            task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
             latency_budget_ms: None,
@@ -4271,10 +4272,27 @@ mod packet_tests {
         assert_eq!(value["parent_packet_id"], "packet-1");
         assert_eq!(value["option_ids"][0], "bounded_source_read:src%2Fmain.rs");
         assert_eq!(value["core_generation_id"], "core-1");
+        assert!(
+            value.get("task_class").is_none(),
+            "public packet requests must not carry task_class: {value}"
+        );
         let decoded: AgentPacketRequestDto =
             serde_json::from_value(value).expect("deserialize request");
         assert_eq!(decoded.parent_packet_id.as_deref(), Some("packet-1"));
         assert_eq!(decoded.option_ids.len(), 1);
+    }
+
+    #[test]
+    fn agent_packet_request_rejects_task_class() {
+        let err = serde_json::from_value::<AgentPacketRequestDto>(serde_json::json!({
+            "question": "why",
+            "task_class": "architecture_explanation"
+        }))
+        .expect_err("task_class must be unknown on the public packet request");
+        assert!(
+            err.to_string().contains("task_class"),
+            "deny_unknown_fields should name task_class: {err}"
+        );
     }
 
     #[test]

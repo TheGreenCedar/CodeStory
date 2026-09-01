@@ -74,6 +74,7 @@ fn sample_v3_packet_projection(
         gaps: BoundedVecV3::new(Vec::new()).expect("bounded gaps"),
         continuation: None,
         diagnostics: DiagnosticsCapabilityV3Dto::Unavailable,
+        answer_sufficiency: Default::default(),
     }
 }
 
@@ -229,7 +230,6 @@ fn drill_executes_one_packet_with_explicit_anchor_probes() {
     let request = AgentPacketRequestDto {
         question: packet.question.clone(),
         budget: PacketBudgetModeDto::Standard,
-        task_class: None,
         probes: Vec::new(),
         extra_probes: vec!["WorkspaceIndexer".to_string()],
         latency_budget_ms: None,

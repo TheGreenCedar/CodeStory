@@ -325,7 +325,6 @@ export function benchmarkDependencyIsolationViolations(source) {
     const reviewedProductDependencies = [
       ["codestory-agent", {
         workspace: true,
-        features: [proofQualificationSupport],
       }],
       ["codestory-cli", {
         workspace: true,
@@ -365,7 +364,6 @@ export function benchmarkDependencyIsolationViolations(source) {
       violations,
       dependencyMatches(dependencies, "codestory-agent", {
         workspace: true,
-        features: [proofQualificationSupport],
       })
         && dependencyMatches(dependencies, "codestory-cli", {
           workspace: true,
@@ -375,8 +373,8 @@ export function benchmarkDependencyIsolationViolations(source) {
           workspace: true,
           features: [benchmarkSupport, proofQualificationSupport],
         })
-        && qualificationFeatureOwners.length === 3
-        && ["codestory-agent", "codestory-cli", "codestory-runtime"]
+        && qualificationFeatureOwners.length === 2
+        && ["codestory-cli", "codestory-runtime"]
           .every((name) => qualificationFeatureOwners.some((record) =>
             record.name === name
           )),

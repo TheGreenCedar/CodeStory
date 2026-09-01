@@ -226,6 +226,7 @@ fn exact_path_probe_source_carrier_citation(
             }
             citation.file_path = Some(display_relative_path(&relative));
             citation.coverage_role = None;
+            citation.evidence_producer = Some("packet_exact_path_source".to_string());
             // Domain role_rank removed (CX-01). Prefer callable term hits only.
             let role = packet_evidence_role(&citation);
             if matches!(role, Some(PacketEvidenceRole::TestsAndRegressionCoverage)) {
@@ -257,7 +258,7 @@ fn exact_symbol_probe_citation(
     };
     let mut citation = to_citation_from_hit(&resolved.selected, None, None, include_evidence);
     citation.score = 100.0;
-    citation.coverage_role = Some("explicit exact probe".to_string());
+    citation.evidence_producer = Some("packet_exact_symbol_probe".to_string());
     citation.eligible_for_sufficiency = Some(false);
     Some(citation)
 }
@@ -291,7 +292,7 @@ fn exact_path_probe_citation(
         evidence_producer: Some("packet_exact_path_probe".to_string()),
         resolution_status: Some(PacketEvidenceResolutionDto::SourceRangeOnly),
         loss_reason: None,
-        coverage_role: Some("explicit exact probe".to_string()),
+        coverage_role: None,
         eligible_for_sufficiency: Some(false),
         source_excerpt: None,
     })

@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use codestory_contracts::{
     api::{
         AgentPacketRequestDto, ApiError, EmbeddingVectorPublicationIdentityDto,
-        PacketBudgetModeDto, PacketProbeDto, PacketTaskClassDto,
+        PacketBudgetModeDto, PacketProbeDto,
     },
     packet_projection_v3::{
         ContinuationStateV3Dto, CorePublicationIdentityV3Dto, DIAGNOSTIC_ROWS_MAX_V3,
@@ -45,7 +45,6 @@ pub(crate) struct PacketRequestFingerprintV3 {
     question: String,
     budget: PacketBudgetModeDto,
     profile: PacketProfileV3,
-    task_class: Option<PacketTaskClassDto>,
     typed_probes: Vec<PacketProbeDto>,
     extra_probes: Vec<String>,
     latency_budget_ms: Option<u32>,
@@ -64,7 +63,6 @@ impl PacketRequestFingerprintV3 {
             question: request.question.clone(),
             budget: request.budget,
             profile,
-            task_class: request.task_class,
             typed_probes: request.probes.clone(),
             extra_probes: request.extra_probes.clone(),
             latency_budget_ms: request.latency_budget_ms,
@@ -85,10 +83,6 @@ impl PacketRequestFingerprintV3 {
 
     pub(crate) fn profile(&self) -> PacketProfileV3 {
         self.profile
-    }
-
-    pub(crate) fn task_class(&self) -> Option<PacketTaskClassDto> {
-        self.task_class
     }
 
     pub(crate) fn typed_probes(&self) -> &[PacketProbeDto] {
@@ -838,7 +832,6 @@ mod tests {
 
     use codestory_contracts::api::{
         AgentPacketRequestDto, EmbeddingVectorPublicationIdentityDto, PacketProbeDto,
-        PacketTaskClassDto,
     };
     use codestory_contracts::packet_projection_v3::{
         BoundedVecV3, ContinuationStateV3Dto, DiagnosticCategoryV3Dto, DiagnosticCodeTextV3,
@@ -863,7 +856,6 @@ mod tests {
             question: "hello".to_owned(),
             budget: PacketBudgetModeDto::Standard,
             profile: PacketProfileV3::Auto,
-            task_class: None,
             typed_probes: Vec::new(),
             extra_probes: Vec::new(),
             latency_budget_ms: None,
@@ -1036,9 +1028,6 @@ mod tests {
         value.profile = PacketProfileV3::Callflow;
         mutations.push(value);
         let mut value = base.clone();
-        value.task_class = Some(PacketTaskClassDto::RouteTracing);
-        mutations.push(value);
-        let mut value = base.clone();
         value.typed_probes = vec![PacketProbeDto::ExactPath {
             path: "src/lib.rs".to_owned(),
         }];
@@ -1097,7 +1086,6 @@ mod tests {
         let current_request = AgentPacketRequestDto {
             question: "hello".to_owned(),
             budget: PacketBudgetModeDto::Standard,
-            task_class: None,
             probes: Vec::new(),
             extra_probes: Vec::new(),
             latency_budget_ms: None,

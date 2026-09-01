@@ -10,15 +10,15 @@
     ],
     "preferredMcpProtocolVersion": "2025-11-25",
     "discoveryContracts": {
-      "2024-11-05": "13358aa81fd145061b640919f1900d2fbc6b7afdc02fb5370728f2918bdbedf9",
-      "2025-03-26": "3e7625c71eea02f1bbb62482402c1d3d08e32b8825d0e8465d570a0350c0f437",
-      "2025-06-18": "2fc839314546e8fe83ea7554fa048443b4467b30eebe3b2e4c8793327ffecb61",
-      "2025-11-25": "e903cd071f7eb81510332874a63d167dc56a478553e33819ef071f6e76a94383"
+      "2024-11-05": "99ae2ef4ee139d1ea070d408596993a669300fa535e3232221a481c6d6ee1a44",
+      "2025-03-26": "df52d18ab523ead3365fa1f12e0920ed6cc66e1c2ed817cbec1ea8c0e70a7169",
+      "2025-06-18": "d6336477a226cd6c4b5083d86cbf7f4ae317f8ee7f9d8ccf5bdc804d29820e02",
+      "2025-11-25": "b3fafc4cc4f9fbcff175b79180a901ef48ef7b7e08e227a71060dc5b352c38b7"
     }
   },
   "revisionProfiles": {
     "2024-11-05": {
-      "discoveryContractSha256": "13358aa81fd145061b640919f1900d2fbc6b7afdc02fb5370728f2918bdbedf9",
+      "discoveryContractSha256": "99ae2ef4ee139d1ea070d408596993a669300fa535e3232221a481c6d6ee1a44",
       "tools": [
         {
           "description": "Inspect CodeStory readiness for the requested repository when diagnostics are needed. CodeStory effect: observational and does not activate managed state.",
@@ -541,23 +541,6 @@
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
                 "type": "string"
-              },
-              "task_class": {
-                "description": "Optional task class.",
-                "enum": [
-                  "architecture_explanation",
-                  "bug_localization",
-                  "change_impact",
-                  "route_tracing",
-                  "symbol_ownership",
-                  "data_flow",
-                  "edit_planning",
-                  null
-                ],
-                "type": [
-                  "string",
-                  "null"
-                ]
               }
             },
             "required": [
@@ -1724,7 +1707,7 @@
             "additionalProperties": false,
             "properties": {
               "call_path": {
-                "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nstart: crate::module::Alpha\nstep 1: direct call -> crate::module::Beta\nstep 2: direct call -> \"src/gamma.rs\"::Gamma\nprohibit traversal through: crate::detail::Helper\nexclude from projection: crate::test_support\nSelectors are qualified names or \"path/to/file\"::Name. Steps are numbered consecutively from 1. Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
+                "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nfrom symbol \"app::start\" in \"src/app.rs\"\ndirect-call symbol \"service::load\" in \"src/service.rs\"\ndirect-call canonical \"store::read\"\nprohibit-through symbol \"legacy::shim\"\nexclude-from-projection symbol \"tracing::span\"\nExactly one from, one to six ordered direct-call lines, then zero to sixteen prohibit-through and exclude-from-projection lines. Selectors are symbol \"<qualified-name>\" [in \"<project-relative-path>\"] or canonical \"<id>\". Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
                 "maxLength": 8192,
                 "minLength": 1,
                 "type": "string"
@@ -1808,7 +1791,7 @@
       ]
     },
     "2025-03-26": {
-      "discoveryContractSha256": "3e7625c71eea02f1bbb62482402c1d3d08e32b8825d0e8465d570a0350c0f437",
+      "discoveryContractSha256": "df52d18ab523ead3365fa1f12e0920ed6cc66e1c2ed817cbec1ea8c0e70a7169",
       "tools": [
         {
           "annotations": {
@@ -2343,23 +2326,6 @@
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
                 "type": "string"
-              },
-              "task_class": {
-                "description": "Optional task class.",
-                "enum": [
-                  "architecture_explanation",
-                  "bug_localization",
-                  "change_impact",
-                  "route_tracing",
-                  "symbol_ownership",
-                  "data_flow",
-                  "edit_planning",
-                  null
-                ],
-                "type": [
-                  "string",
-                  "null"
-                ]
               }
             },
             "required": [
@@ -3640,7 +3606,7 @@
             "additionalProperties": false,
             "properties": {
               "call_path": {
-                "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nstart: crate::module::Alpha\nstep 1: direct call -> crate::module::Beta\nstep 2: direct call -> \"src/gamma.rs\"::Gamma\nprohibit traversal through: crate::detail::Helper\nexclude from projection: crate::test_support\nSelectors are qualified names or \"path/to/file\"::Name. Steps are numbered consecutively from 1. Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
+                "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nfrom symbol \"app::start\" in \"src/app.rs\"\ndirect-call symbol \"service::load\" in \"src/service.rs\"\ndirect-call canonical \"store::read\"\nprohibit-through symbol \"legacy::shim\"\nexclude-from-projection symbol \"tracing::span\"\nExactly one from, one to six ordered direct-call lines, then zero to sixteen prohibit-through and exclude-from-projection lines. Selectors are symbol \"<qualified-name>\" [in \"<project-relative-path>\"] or canonical \"<id>\". Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
                 "maxLength": 8192,
                 "minLength": 1,
                 "type": "string"
@@ -3724,7 +3690,7 @@
       ]
     },
     "2025-06-18": {
-      "discoveryContractSha256": "2fc839314546e8fe83ea7554fa048443b4467b30eebe3b2e4c8793327ffecb61",
+      "discoveryContractSha256": "d6336477a226cd6c4b5083d86cbf7f4ae317f8ee7f9d8ccf5bdc804d29820e02",
       "tools": [
         {
           "_meta": {
@@ -4445,23 +4411,6 @@
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
                 "type": "string"
-              },
-              "task_class": {
-                "description": "Optional task class.",
-                "enum": [
-                  "architecture_explanation",
-                  "bug_localization",
-                  "change_impact",
-                  "route_tracing",
-                  "symbol_ownership",
-                  "data_flow",
-                  "edit_planning",
-                  null
-                ],
-                "type": [
-                  "string",
-                  "null"
-                ]
               }
             },
             "required": [
@@ -12283,7 +12232,7 @@
             "additionalProperties": false,
             "properties": {
               "call_path": {
-                "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nstart: crate::module::Alpha\nstep 1: direct call -> crate::module::Beta\nstep 2: direct call -> \"src/gamma.rs\"::Gamma\nprohibit traversal through: crate::detail::Helper\nexclude from projection: crate::test_support\nSelectors are qualified names or \"path/to/file\"::Name. Steps are numbered consecutively from 1. Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
+                "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nfrom symbol \"app::start\" in \"src/app.rs\"\ndirect-call symbol \"service::load\" in \"src/service.rs\"\ndirect-call canonical \"store::read\"\nprohibit-through symbol \"legacy::shim\"\nexclude-from-projection symbol \"tracing::span\"\nExactly one from, one to six ordered direct-call lines, then zero to sixteen prohibit-through and exclude-from-projection lines. Selectors are symbol \"<qualified-name>\" [in \"<project-relative-path>\"] or canonical \"<id>\". Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
                 "maxLength": 8192,
                 "minLength": 1,
                 "type": "string"
@@ -14000,7 +13949,7 @@
                           },
                           "translation_status": {
                             "enum": [
-                              "parser_derived"
+                              "host_supplied"
                             ],
                             "type": "string"
                           }
@@ -14164,7 +14113,7 @@
                           },
                           "translation_status": {
                             "enum": [
-                              "parser_derived"
+                              "host_supplied"
                             ],
                             "type": "string"
                           }
@@ -14330,7 +14279,7 @@
       ]
     },
     "2025-11-25": {
-      "discoveryContractSha256": "e903cd071f7eb81510332874a63d167dc56a478553e33819ef071f6e76a94383",
+      "discoveryContractSha256": "b3fafc4cc4f9fbcff175b79180a901ef48ef7b7e08e227a71060dc5b352c38b7",
       "tools": [
         {
           "_meta": {
@@ -15051,23 +15000,6 @@
               "retrieval_generation": {
                 "description": "Pinned retrieval generation for a continuation.",
                 "type": "string"
-              },
-              "task_class": {
-                "description": "Optional task class.",
-                "enum": [
-                  "architecture_explanation",
-                  "bug_localization",
-                  "change_impact",
-                  "route_tracing",
-                  "symbol_ownership",
-                  "data_flow",
-                  "edit_planning",
-                  null
-                ],
-                "type": [
-                  "string",
-                  "null"
-                ]
               }
             },
             "required": [
@@ -22889,7 +22821,7 @@
             "additionalProperties": false,
             "properties": {
               "call_path": {
-                "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nstart: crate::module::Alpha\nstep 1: direct call -> crate::module::Beta\nstep 2: direct call -> \"src/gamma.rs\"::Gamma\nprohibit traversal through: crate::detail::Helper\nexclude from projection: crate::test_support\nSelectors are qualified names or \"path/to/file\"::Name. Steps are numbered consecutively from 1. Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
+                "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nfrom symbol \"app::start\" in \"src/app.rs\"\ndirect-call symbol \"service::load\" in \"src/service.rs\"\ndirect-call canonical \"store::read\"\nprohibit-through symbol \"legacy::shim\"\nexclude-from-projection symbol \"tracing::span\"\nExactly one from, one to six ordered direct-call lines, then zero to sixteen prohibit-through and exclude-from-projection lines. Selectors are symbol \"<qualified-name>\" [in \"<project-relative-path>\"] or canonical \"<id>\". Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
                 "maxLength": 8192,
                 "minLength": 1,
                 "type": "string"
@@ -24606,7 +24538,7 @@
                           },
                           "translation_status": {
                             "enum": [
-                              "parser_derived"
+                              "host_supplied"
                             ],
                             "type": "string"
                           }
@@ -24770,7 +24702,7 @@
                           },
                           "translation_status": {
                             "enum": [
-                              "parser_derived"
+                              "host_supplied"
                             ],
                             "type": "string"
                           }
@@ -25656,23 +25588,6 @@
           "retrieval_generation": {
             "description": "Pinned retrieval generation for a continuation.",
             "type": "string"
-          },
-          "task_class": {
-            "description": "Optional task class.",
-            "enum": [
-              "architecture_explanation",
-              "bug_localization",
-              "change_impact",
-              "route_tracing",
-              "symbol_ownership",
-              "data_flow",
-              "edit_planning",
-              null
-            ],
-            "type": [
-              "string",
-              "null"
-            ]
           }
         },
         "required": [
@@ -33494,7 +33409,7 @@
         "additionalProperties": false,
         "properties": {
           "call_path": {
-            "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nstart: crate::module::Alpha\nstep 1: direct call -> crate::module::Beta\nstep 2: direct call -> \"src/gamma.rs\"::Gamma\nprohibit traversal through: crate::detail::Helper\nexclude from projection: crate::test_support\nSelectors are qualified names or \"path/to/file\"::Name. Steps are numbered consecutively from 1. Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
+            "description": "A call-path/v1 document. Line-oriented, one contract per document:\ncall-path/v1\nfrom symbol \"app::start\" in \"src/app.rs\"\ndirect-call symbol \"service::load\" in \"src/service.rs\"\ndirect-call canonical \"store::read\"\nprohibit-through symbol \"legacy::shim\"\nexclude-from-projection symbol \"tracing::span\"\nExactly one from, one to six ordered direct-call lines, then zero to sixteen prohibit-through and exclude-from-projection lines. Selectors are symbol \"<qualified-name>\" [in \"<project-relative-path>\"] or canonical \"<id>\". Any line the grammar cannot read is reported as an unresolved clause and yields graph_disposition \"unknown\" rather than being skipped.",
             "maxLength": 8192,
             "minLength": 1,
             "type": "string"
@@ -35211,7 +35126,7 @@
                       },
                       "translation_status": {
                         "enum": [
-                          "parser_derived"
+                          "host_supplied"
                         ],
                         "type": "string"
                       }
@@ -35375,7 +35290,7 @@
                       },
                       "translation_status": {
                         "enum": [
-                          "parser_derived"
+                          "host_supplied"
                         ],
                         "type": "string"
                       }

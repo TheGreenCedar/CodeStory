@@ -884,7 +884,6 @@ fn projection_envelope(
     let request = AgentPacketRequestDto {
         question: question.to_owned(),
         budget: Default::default(),
-        task_class: None,
         probes: Vec::new(),
         extra_probes: Vec::new(),
         latency_budget_ms: None,

@@ -6980,7 +6980,11 @@ impl Storage {
         // immutable generation.
         require_standalone_core_candidate(staged_path)?;
         remove_closed_core_sidecars(staged_path)?;
-        let final_database = layout.generation_database_path(&candidate.generation_id)?;
+        let publication = crate::CorePublishTransaction::begin_from_stage(
+            live_path,
+            staged_path.to_path_buf(),
+        )?;
+        let final_database = publication.generation_database_path(&candidate.generation_id)?;
         if final_database.is_file() {
             let installed = require_complete_promotion_database_identity(
                 &final_database,
@@ -6995,7 +6999,7 @@ impl Storage {
             cleanup_sqlite_sidecars(staged_path)?;
             crate::core_generation::remove_staging_database(staged_path)?;
         } else {
-            layout.install_staging_generation(staged_path, &candidate.generation_id)?;
+            publication.install_generation(&candidate.generation_id)?;
         }
         if let Some(validation) = dense_anchor_validation {
             let key = dense_anchor_receipt_key(&final_database, &candidate);
@@ -7055,7 +7059,7 @@ impl Storage {
                 },
             )?;
         }
-        layout.publish_pointer(candidate_identity, previous_identity.clone())?;
+        publication.commit_pointer(candidate_identity, previous_identity.clone())?;
         durations.pointer_publication = pointer_started.elapsed();
 
         let cleanup_started = Instant::now();

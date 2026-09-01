@@ -18,13 +18,11 @@ use crate::agent::packet_budget::{
     packet_budget_limits,
 };
 use crate::agent::packet_candidate::{
-    PacketProofSession, PacketSearchHit, install_packet_proof_session, packet_atom_hydration_spec,
+    PacketProofSession, PacketSearchHit, install_packet_proof_session,
 };
-use crate::agent::packet_capping::PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE;
 #[cfg(test)]
 use crate::agent::packet_capping::{
-    cap_citations, cap_packet_citations_with_obligation_carriers,
-    promote_focus_neighborhood_citations, promote_required_probe_citations,
+    cap_citations, cap_packet_citations_with_obligation_carriers, promote_required_probe_citations,
 };
 use crate::agent::packet_claim_profiles::packet_claim_profile_registry_summary;
 #[cfg(test)]
@@ -33,22 +31,20 @@ use crate::agent::packet_claims::packet_claim_for_role as build_packet_claim_for
 use crate::agent::packet_claims::packet_supported_claims;
 use crate::agent::packet_claims::packet_supported_claims_with_telemetry;
 use crate::agent::packet_compiler::{
-    apply_compiled_evidence_with_proof_reconciliation, drill_options_from_ids,
-    merge_repository_evidence_gaps_into_disposition,
+    apply_compiled_evidence, drill_options_from_ids, merge_repository_evidence_gaps_into_disposition,
 };
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
-use crate::agent::packet_evidence_carriers::packet_server_dispatch_callable_rank_bonus;
 use crate::agent::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
 #[cfg(test)]
 use crate::agent::packet_obligations::build_packet_obligation_plan;
 use crate::agent::packet_obligations::{
-    PacketProofEvidenceExtras, append_packet_probe_obligations, bind_claims_to_packet_obligations,
+    append_packet_probe_obligations, bind_claims_to_packet_obligations,
     capture_packet_obligation_edge_proofs_before_budget, finalize_packet_obligation_plan,
     install_retained_packet_obligation_edge_proofs,
-    packet_claims_with_obligation_receipts_and_telemetry, packet_proof_receipts_view,
+    packet_claims_with_obligation_receipts_and_telemetry,
     protected_packet_obligation_carrier_node_ids, protected_packet_obligation_edge_ids,
 };
 #[cfg(test)]
@@ -56,8 +52,7 @@ use crate::agent::packet_plan::{
     build_packet_plan, packet_concept_queries, packet_symbol_probe_queries,
 };
 use crate::agent::packet_plan::{
-    build_packet_plan_with_extra, packet_owner_member_probe_queries, packet_plan_annotation,
-    packet_rank_terms,
+    build_packet_plan_with_extra, packet_plan_annotation, packet_rank_terms,
 };
 use crate::agent::packet_probe::{
     exact_packet_probe_citations, exact_packet_probe_paths, normalize_packet_probe_request,
@@ -75,8 +70,7 @@ use crate::agent::packet_terms::prompt_search_terms;
 use crate::agent::packet_trace::merge_packet_initial_search_hits;
 use crate::agent::profiles::{ResolvedProfile, TrailPlan, resolve_profile};
 use crate::agent::retrieval_primary::{
-    RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome,
-    hydrate_packet_exact_call_boundaries_post_pass, maybe_run_retrieval_shadow,
+    RETRIEVAL_VERSION_SIDECAR, SidecarPrimarySearchOutcome, maybe_run_retrieval_shadow,
     sidecar_retrieval_blocks_nucleo_supplement, sidecar_retrieval_primary_enabled,
     sidecar_retrieval_unavailable_error, try_sidecar_primary_search,
 };
@@ -85,16 +79,10 @@ use crate::agent::trace_export;
 use crate::{
     AppController, FocusedSourceContext, HybridSearchScoredHit, clamp_u128_to_u32,
     fallback_mermaid as diagnostic_mermaid, hybrid_retrieval_enabled, mermaid_flowchart,
-    mermaid_gantt, mermaid_sequence, query_mentions_non_primary_source,
+    mermaid_gantt, mermaid_sequence,
 };
 #[cfg(test)]
 use codestory_agent::packet_command::quote_packet_command_value;
-use codestory_agent::packet_flow_requirements::FlowRequirement;
-use codestory_agent::packet_proof_atoms::{
-    DischargedFact, FlowProofFormula, FlowProofOutcome, ProofAtomId, ProofEndpointPattern,
-    ProofFactPattern, SourceAspectKind, TrailCoverage, TrailDirection as ProofTrailDirection,
-    VerifiedSourceAspectReceipt, match_flow_requirements,
-};
 use codestory_agent::repository_evidence_plan::{
     DEFAULT_REPOSITORY_EVIDENCE_LIMITS, RepositoryEvidenceInput, RepositoryEvidencePlan,
     build_repository_evidence_plan,
@@ -118,9 +106,10 @@ use codestory_contracts::api::{
 };
 #[cfg(test)]
 use codestory_contracts::api::{RetrievalAnnotationKindDto, SearchMatchQualityDto};
+use codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES;
 use codestory_contracts::graph::FileCoverageReason;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -421,8 +410,7 @@ pub(crate) fn agent_packet(
     let exact_probe_citations =
         exact_packet_probe_citations(controller, &probe_resolutions, &question, true);
     let extra_probes = resolved_packet_probe_queries(&probe_resolutions);
-    let mut plan =
-        build_packet_plan_with_extra(&question, req.task_class, req.budget, &extra_probes);
+    let mut plan = build_packet_plan_with_extra(&question, None, req.budget, &extra_probes);
     let task_class = plan.task_class;
     append_packet_probe_obligations(
         &mut plan.obligations,
@@ -440,15 +428,7 @@ pub(crate) fn agent_packet(
         is_drill_continuation,
     );
     let retrieval_prompt = packet_retrieval_prompt(&question, &plan, req.budget);
-    // R2/R7: the packet proof session scopes the widened atom-trail hydration
-    // to this operation and collects the per-artifact trail-scan ledger the
-    // proof-evidence extras builder reads. Task classes without
-    // formula-bearing requirements derive an empty hydration spec, so their
-    // retrieval behavior is unchanged.
-    let flow_requirements = Vec::new();
-    let proof_session = std::rc::Rc::new(PacketProofSession::new(packet_atom_hydration_spec(
-        &flow_requirements,
-    )));
+    let proof_session = std::rc::Rc::new(PacketProofSession::new());
     let _proof_session_guard = install_packet_proof_session(std::rc::Rc::clone(&proof_session));
     let (mut answer, initial_packet_hits) = agent_ask_with_packet_hits(
         controller,
@@ -456,7 +436,11 @@ pub(crate) fn agent_packet(
             prompt: question.clone(),
             retrieval_profile,
             focus_node_id: None,
-            max_results: Some(limits.max_anchors.clamp(1, 25)),
+            max_results: Some(
+                limits
+                    .max_anchors
+                    .clamp(1, INTERIM_MAX_ADMITTED_CANDIDATES as u32),
+            ),
             response_mode: AgentResponseModeDto::Structured,
             latency_budget_ms: req.latency_budget_ms,
             include_evidence: true,
@@ -471,7 +455,6 @@ pub(crate) fn agent_packet(
             true,
             &rank_terms,
             packet_stage_citation_carry_limit(&limits),
-            &flow_requirements,
         );
         answer
             .retrieval_trace
@@ -562,38 +545,12 @@ pub(crate) fn agent_packet(
     if let Some(evidence_plan) = repository_evidence_plan.as_ref() {
         prefer_repository_evidence_hydrate_roots(&mut answer, &evidence_plan.material_node_ids);
     }
-    // R2 post-pass hydration (F3 REVISE): the remaining atom-kind trails and
-    // the depth-2 FILE structural trails run HERE, over the retained
-    // candidate set, after every sidecar query has finished — never on the
-    // sidecar stage clock. This fills the session ledger the extras builder
-    // reads below.
-    crate::agent::retrieval_primary::hydrate_packet_atom_trails_post_pass(controller, &mut answer);
-    hydrate_packet_exact_call_boundaries_post_pass(controller, &flow_requirements, &mut answer);
-    // R7: the runtime's verified evidence extras — R2 trail-coverage records
-    // and R4 anchored receipts — are threaded through the proving passes.
-    // The pre-cap capture proves against the uncapped graphs with coverage
-    // only (no anchored receipts exist before the budget's source reread).
-    let pre_cap_extras = build_packet_proof_evidence_extras(&answer, &proof_session, Vec::new());
     let phase_started = Instant::now();
     let obligation_edge_proofs = capture_packet_obligation_edge_proofs_before_budget(
         &question,
         plan.task_class,
         &plan.obligations,
         &answer,
-        &pre_cap_extras,
-    );
-    // R3: pre-cap partial-atom matching over the uncapped typed edges and
-    // exact-probe resolutions. Provisional anchors let anchor-requiring atoms
-    // match structurally (rule 4: provenance decides which receipts get
-    // produced), emitting the carrier node ids — including TypedRelation
-    // edge-endpoint ids (review-005 finding 10) — and edge ids the caps must
-    // protect so the post-cap receipt pass can reach them.
-    let partial_protection = packet_partial_atom_protection(
-        controller,
-        &flow_requirements,
-        &answer,
-        &pre_cap_extras,
-        &proof_session,
     );
     let mut snapshot_carrier_node_ids =
         protected_packet_obligation_carrier_node_ids(&obligation_edge_proofs).to_vec();
@@ -607,10 +564,8 @@ pub(crate) fn agent_packet(
         union_unique_edge_ids(&mut snapshot_edge_ids, &evidence_plan.material_edge_ids);
     }
     let (protected_carrier_node_ids, protected_edge_ids) = select_protected_obligation_carriers(
-        &answer,
         &snapshot_carrier_node_ids,
         &snapshot_edge_ids,
-        &partial_protection,
     );
     let budget = apply_packet_budget_with_extra_and_obligation_carriers(
         &project_root,
@@ -628,13 +583,11 @@ pub(crate) fn agent_packet(
     // Structural collectors are discovery aids until the runtime rereads the cited source range.
     // Enrich them before final obligation classification so an exact, retained source receipt can
     // prove a structural flow without globally trusting generated structural projections.
-    let (source_support, anchored_receipts) = append_packet_carrier_source_sections(
+    let source_support = append_packet_carrier_source_sections(
         controller,
         &question,
-        &flow_requirements,
         &mut answer,
         &limits,
-        &proof_session,
         &protected_carrier_node_ids,
     );
 
@@ -689,24 +642,12 @@ pub(crate) fn agent_packet(
         &obligation_edge_proofs,
         limits.max_anchors as usize,
     );
-    // The post-cap extras: coverage records rebuilt against the CAPPED
-    // graphs (the evidence-completeness obligation is re-checked against
-    // exactly the evidence this finalize will see) plus the R4 anchored
-    // receipts.
-    let proof_evidence_extras =
-        build_packet_proof_evidence_extras(&answer, &proof_session, anchored_receipts.clone());
     finalize_packet_obligation_plan(
         &question,
         plan.task_class,
         &mut plan.obligations,
         &answer,
         &budget,
-        // The post-cap receipts view: the reread source support plus the live
-        // `answer.graphs`. This is the ONE proving site (R7(b)); later
-        // rebuilds re-verify by receipt survival against the manifest this
-        // finalize records.
-        &source_support,
-        &proof_evidence_extras,
     );
     append_packet_evidence_sections(
         &mut answer,
@@ -745,13 +686,13 @@ pub(crate) fn agent_packet(
     let mut packet = AgentPacketDto {
         packet_id: answer.answer_id.clone(),
         question,
-        task_class: Some(plan.task_class),
         plan,
         answer,
         support: source_support,
         disposition: PacketDispositionDto::not_established("compile pending"),
         budget,
         retrieval_trace_summary,
+        answer_sufficiency: Default::default(),
     };
     append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
     enforce_packet_output_budget(&project_root, &mut packet);
@@ -767,16 +708,7 @@ pub(crate) fn agent_packet(
             .push(RetrievalAnnotationDto::observation(diagnostic));
         enforce_packet_output_budget(&project_root, &mut packet);
     }
-    // R5 re-proves with the same anchored receipts the primary finalize used,
-    // while the coverage records are rebuilt by the SAME builder against the
-    // packet answer as it stands here: the evidence-completeness obligation
-    // binds at every view build, so a scan whose enumerated edges were
-    // dropped by the output-budget passes between finalize and compile must
-    // not stay attached (a stale completeness claim could let an absence
-    // fact rebind over evidence the matcher can no longer see).
-    let reconcile_extras =
-        build_packet_proof_evidence_extras(&packet.answer, &proof_session, anchored_receipts);
-    apply_compiled_evidence_with_proof_reconciliation(&mut packet, Some(&req), &reconcile_extras);
+    apply_compiled_evidence(&mut packet, Some(&req));
     if let Some(evidence_plan) = repository_evidence_plan.as_ref() {
         apply_repository_evidence_gap_continuation(&mut packet, evidence_plan, &req);
     }
@@ -855,36 +787,10 @@ fn packet_plan_query_looks_like_identity(query: &str) -> bool {
 }
 
 fn promote_retained_owner_member_probes(
-    question: &str,
-    answer: &mut AgentAnswerDto,
+    _question: &str,
+    _answer: &mut AgentAnswerDto,
 ) -> Vec<String> {
-    let probes = packet_owner_member_probe_queries(question, &answer.citations, 10)
-        .into_iter()
-        .filter(|probe| {
-            let probe = normalize_identifier(probe);
-            answer.citations.iter().any(|citation| {
-                citation.origin == SearchHitOrigin::IndexedSymbol
-                    && citation.resolvable
-                    && citation.eligible_for_sufficiency == Some(true)
-                    && normalize_identifier(&citation.display_name) == probe
-            })
-        })
-        .collect::<Vec<_>>();
-    let probe_keys = probes
-        .iter()
-        .map(|probe| normalize_identifier(probe))
-        .collect::<HashSet<_>>();
-    for citation in &mut answer.citations {
-        if citation.origin == SearchHitOrigin::IndexedSymbol
-            && citation.resolvable
-            && citation.eligible_for_sufficiency == Some(true)
-            && probe_keys.contains(&normalize_identifier(&citation.display_name))
-            && citation.coverage_role.is_none()
-        {
-            citation.coverage_role = Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE.to_string());
-        }
-    }
-    probes
+    Vec::new()
 }
 
 fn push_packet_sufficiency_extra_probe(probes: &mut Vec<String>, probe: &str) {
@@ -979,13 +885,13 @@ fn hybrid_weights_are_lexical_only(weights: Option<&AgentHybridWeightsDto>) -> b
         .is_some_and(|semantic| semantic <= f32::EPSILON)
 }
 
-fn rank_packet_evidence(question: &str, answer: &mut AgentAnswerDto) {
-    let terms = packet_rank_terms(question);
-    let prefer_primary_sources = !query_mentions_non_primary_source(question);
+fn rank_packet_evidence(_question: &str, answer: &mut AgentAnswerDto) {
     sort_by_cached_rank_desc(&mut answer.citations, |citation| {
-        packet_citation_rank(citation, &terms, prefer_primary_sources)
-            + packet_server_dispatch_callable_rank_bonus(citation, &terms)
+        packet_citation_rank(citation, &[], true)
     });
+    if answer.citations.len() > INTERIM_MAX_ADMITTED_CANDIDATES {
+        answer.citations.truncate(INTERIM_MAX_ADMITTED_CANDIDATES);
+    }
 }
 
 fn build_retained_repository_evidence_plan(
@@ -1090,7 +996,7 @@ fn maybe_annotate_packet_candidate_window(
     }
 
     let rank_terms = packet_rank_terms(question);
-    let prefer_primary_sources = !query_mentions_non_primary_source(question);
+    let prefer_primary_sources = true;
     let broad_window = (limits.max_anchors as usize).saturating_mul(2).max(8);
     let mut rows = Vec::new();
     let mut matched = 0usize;
@@ -1351,9 +1257,6 @@ const CARRIER_SOURCE_FILE_FOCUS_CONTEXT_LINES: usize = 17;
 const CARRIER_SOURCE_MAX_FOCUSED_WINDOWS: usize = 3;
 const CARRIER_SOURCE_MAX_FOCUS_FILE_BYTES: u64 = 512 * 1_024;
 const CARRIER_SOURCE_DECLARATION_FALLBACK_LINES: u32 = 24;
-/// R4 anchored windows span the declaration line plus this many lines below
-/// it, so the receipt-carried line is exactly the window start.
-const ATOM_ANCHOR_WINDOW_LINES: u32 = 12;
 const SOURCE_RECEIPT_NOT_RETAINED: &str = "source_receipt_not_retained";
 
 struct CarrierSourceRange {
@@ -1476,495 +1379,11 @@ fn demote_parser_partial_citations_without_source_receipts(
     }
 }
 
-/// Builds the caller-supplied proof-evidence extras from the session's
-/// trail-scan ledger and the CURRENT live answer (R2/R7). This is the ONE
-/// builder for every proving site — the pre-cap capture, R3's partial
-/// matching, R4's anchor planning, the primary finalize, and the R5
-/// reconcile all go through it, so the enrichment path cannot fork.
-///
-/// Evidence-completeness obligation (binding rule 7, enforced HERE): a
-/// `TrailCoverage::Scanned` record is attached — to `trail_scans` or to an
-/// edge via `edge_coverage` — only when EVERY edge in the scan's NARROWED
-/// coverage set (the absence-subject edges plus the depth-2 MEMBER witnesses;
-/// see `PacketCandidateTrailScan`) is present in the live `answer.graphs` the
-/// view will be built from. A scan whose coverage set lost an edge to a cap
-/// is dropped entirely, and every absence fact over it fails closed instead
-/// of certifying over receipts the matcher cannot see; an incidental
-/// enumerated edge of another kind lost to a cap does NOT void the coverage
-/// (F3 finding 3 — truncation covers reach, the witness receipts cover
-/// membership, the covered-kind edges are the absence subject). Edge coverage
-/// is attached from untruncated scans only (a truncated scan never witnesses
-/// anything); the first scan in ledger order wins per edge, deterministically.
-fn build_packet_proof_evidence_extras(
-    answer: &AgentAnswerDto,
-    session: &PacketProofSession,
-    anchored_receipts: Vec<VerifiedSourceAspectReceipt>,
-) -> PacketProofEvidenceExtras {
-    let mut extras = PacketProofEvidenceExtras {
-        anchored_receipts,
-        ..PacketProofEvidenceExtras::default()
-    };
-    let ledger = session.artifact_scans();
-    if ledger.is_empty() {
-        return extras;
-    }
-    let mut live_artifact_ids = HashSet::new();
-    let mut live_edge_ids = HashSet::new();
-    for artifact in &answer.graphs {
-        let GraphArtifactDto::Uml { id, graph, .. } = artifact else {
-            continue;
-        };
-        live_artifact_ids.insert(id.as_str());
-        for edge in &graph.edges {
-            live_edge_ids.insert(edge.id.clone());
-        }
-    }
-    for (artifact_id, scans) in &ledger {
-        if !live_artifact_ids.contains(artifact_id.as_str()) {
-            continue;
-        }
-        for scan in scans {
-            if !scan
-                .coverage_edge_ids
-                .iter()
-                .all(|edge_id| live_edge_ids.contains(edge_id))
-            {
-                continue;
-            }
-            let coverage = TrailCoverage::Scanned {
-                root: NodeId(scan.root.clone()),
-                traversal_kinds: scan.edge_kinds.clone(),
-                direction: match scan.direction {
-                    crate::agent::packet_candidate::PacketGraphDirection::Outgoing => {
-                        ProofTrailDirection::Outgoing
-                    }
-                    crate::agent::packet_candidate::PacketGraphDirection::Incoming => {
-                        ProofTrailDirection::Incoming
-                    }
-                },
-                depth: scan.depth,
-                truncated: scan.truncated,
-            };
-            if !scan.truncated {
-                for edge_id in &scan.coverage_edge_ids {
-                    extras
-                        .edge_coverage
-                        .entry(edge_id.clone())
-                        .or_insert_with(|| coverage.clone());
-                }
-            }
-            extras.trail_scans.push(coverage);
-        }
-    }
-    extras
-}
-
-/// One planned R4 anchor: the atom that names the carrier, the window-owning
-/// node, the line-carrying node, and the receipt-carried declaration line the
-/// window must start at. The provisional receipt is planning input only
-/// (rule 4: provenance decides which receipts get produced; discharge happens
-/// exclusively against real reread receipts).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PlannedAtomAnchor {
-    atom: ProofAtomId,
-    owner: NodeId,
-    symbol: NodeId,
-    line: u32,
-    receipt: VerifiedSourceAspectReceipt,
-}
-
-/// Derives the provisional anchored receipts for every anchor-requiring fact
-/// of the given formulas, from the live graphs plus storage declaration
-/// lines. The derivation is identity-only and reads the formula structure —
-/// for a `require_atom_anchor` carrier range, the sibling typed-relation fact
-/// that binds the same role names the node kind and edge kind that identify
-/// candidate nodes; for an anchored containment, the sibling fact binding the
-/// line role names the (window owner → line carrier) edge shape. Nodes
-/// without a storage declaration line are skipped (they could never be
-/// anchored honestly).
-fn planned_atom_anchor_candidates(
-    controller: &AppController,
-    answer: &AgentAnswerDto,
-    formulas: &[&'static FlowProofFormula],
-) -> Vec<PlannedAtomAnchor> {
-    let Ok(storage) = controller.open_storage() else {
-        return Vec::new();
-    };
-    let mut declaration_lines: HashMap<String, Option<u32>> = HashMap::new();
-    planned_atom_anchor_candidates_with_lines(answer, formulas, |node_id| {
-        *declaration_lines
-            .entry(node_id.0.clone())
-            .or_insert_with(|| {
-                let core_id = node_id.0.parse::<i64>().ok()?;
-                storage
-                    .get_node(codestory_contracts::graph::NodeId(core_id))
-                    .ok()
-                    .flatten()
-                    .and_then(|node| node.start_line)
-            })
-    })
-}
-
-/// Controller-free core of the anchor planning, parameterized on the
-/// declaration-line lookup (storage in production, a map in tests).
-fn planned_atom_anchor_candidates_with_lines(
-    answer: &AgentAnswerDto,
-    formulas: &[&'static FlowProofFormula],
-    mut declaration_line: impl FnMut(&NodeId) -> Option<u32>,
-) -> Vec<PlannedAtomAnchor> {
-    let mut node_kinds: HashMap<&str, NodeKind> = HashMap::new();
-    let mut live_edges: Vec<&codestory_contracts::api::GraphEdgeDto> = Vec::new();
-    for artifact in &answer.graphs {
-        let GraphArtifactDto::Uml { graph, .. } = artifact else {
-            continue;
-        };
-        for node in &graph.nodes {
-            node_kinds.entry(node.id.0.as_str()).or_insert(node.kind);
-        }
-        live_edges.extend(graph.edges.iter());
-    }
-    let mut planned: Vec<PlannedAtomAnchor> = Vec::new();
-    let push_planned = |planned: &mut Vec<PlannedAtomAnchor>, anchor: PlannedAtomAnchor| {
-        if !planned.iter().any(|existing| {
-            existing.atom == anchor.atom
-                && existing.owner == anchor.owner
-                && existing.symbol == anchor.symbol
-        }) {
-            planned.push(anchor);
-        }
-    };
-    for formula in formulas {
-        for atom in formula.atoms {
-            for fact in atom.facts {
-                match fact {
-                    ProofFactPattern::SourceAspect(pattern) if pattern.require_atom_anchor => {
-                        let ProofEndpointPattern::Role(symbol_role) = pattern.symbol else {
-                            continue;
-                        };
-                        // The sibling typed-relation fact that binds the same
-                        // role names the identifying edge shape.
-                        let Some(shape) = atom.facts.iter().find_map(|sibling| match sibling {
-                            ProofFactPattern::TypedRelation(relation)
-                                if relation.target == ProofEndpointPattern::Role(symbol_role) =>
-                            {
-                                Some(relation)
-                            }
-                            _ => None,
-                        }) else {
-                            continue;
-                        };
-                        for edge in &live_edges {
-                            if edge.kind != shape.kind {
-                                continue;
-                            }
-                            if let Some(required_kind) = shape.target_kind
-                                && node_kinds.get(edge.target.0.as_str()).copied()
-                                    != Some(required_kind)
-                            {
-                                continue;
-                            }
-                            let Some(line) = declaration_line(&edge.target) else {
-                                continue;
-                            };
-                            push_planned(
-                                &mut planned,
-                                PlannedAtomAnchor {
-                                    atom: atom.id,
-                                    owner: edge.target.clone(),
-                                    symbol: edge.target.clone(),
-                                    line,
-                                    receipt: VerifiedSourceAspectReceipt {
-                                        kind: SourceAspectKind::VerifiedCarrierRange,
-                                        owner: edge.target.clone(),
-                                        symbol_id: Some(edge.target.clone()),
-                                        start_line: Some(line),
-                                        end_line: Some(line),
-                                        atom_anchor: Some(atom.id),
-                                    },
-                                },
-                            );
-                        }
-                    }
-                    ProofFactPattern::AnchoredLineContainment(pattern) => {
-                        let Some(shape) = atom.facts.iter().find_map(|sibling| match sibling {
-                            ProofFactPattern::TypedRelation(relation)
-                                if relation.target
-                                    == ProofEndpointPattern::Role(pattern.line_symbol)
-                                    && relation.source
-                                        == ProofEndpointPattern::Role(pattern.window_owner) =>
-                            {
-                                Some(relation)
-                            }
-                            _ => None,
-                        }) else {
-                            continue;
-                        };
-                        for edge in &live_edges {
-                            if edge.kind != shape.kind {
-                                continue;
-                            }
-                            if let Some(required_kind) = shape.target_kind
-                                && node_kinds.get(edge.target.0.as_str()).copied()
-                                    != Some(required_kind)
-                            {
-                                continue;
-                            }
-                            let Some(line) = declaration_line(&edge.target) else {
-                                continue;
-                            };
-                            push_planned(
-                                &mut planned,
-                                PlannedAtomAnchor {
-                                    atom: atom.id,
-                                    owner: edge.source.clone(),
-                                    symbol: edge.target.clone(),
-                                    line,
-                                    receipt: VerifiedSourceAspectReceipt {
-                                        kind: pattern.kind,
-                                        owner: edge.source.clone(),
-                                        symbol_id: Some(edge.target.clone()),
-                                        start_line: Some(line),
-                                        end_line: Some(line),
-                                        atom_anchor: Some(atom.id),
-                                    },
-                                },
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    planned
-}
-
-/// The distinct formulas behind the packet's flow requirements, in
-/// requirement order.
-fn packet_flow_proof_formulas(
-    flow_requirements: &[FlowRequirement],
-) -> Vec<&'static FlowProofFormula> {
-    let mut formulas: Vec<&'static FlowProofFormula> = Vec::new();
-    for requirement in flow_requirements {
-        if let Some(formula) = requirement.proof.formula()
-            && !formulas
-                .iter()
-                .any(|existing| std::ptr::eq(*existing, formula))
-        {
-            formulas.push(formula);
-        }
-    }
-    formulas
-}
-
-/// R3 output: the carriers and edges partially matched atoms need, plus the
-/// per-carrier atom cover the selection step's weighted set cover reads.
-#[derive(Debug, Clone, Default)]
-struct PacketPartialAtomProtection {
-    carrier_node_ids: Vec<NodeId>,
-    edge_ids: Vec<EdgeId>,
-    carrier_atom_cover: Vec<(NodeId, BTreeSet<ProofAtomId>)>,
-}
-
-/// R3 — pre-cap partial-atom matching for carrier protection, over the
-/// uncapped typed edges (plus exact-probe resolutions already merged into the
-/// pre-cap answer) and provisional anchors. Emits every receipt identity a
-/// matched atom used: source-aspect owners and symbols, anchored-window
-/// owners, and — for TypedRelation facts — BOTH effective endpoint node ids
-/// and the edge id itself, so a proof whose facts are all TypedRelation with
-/// non-citation endpoints (review-005 finding 10: handler_processing's M2/M3)
-/// still reaches the citation and graph caps with protection.
-fn packet_partial_atom_protection(
-    controller: &AppController,
-    flow_requirements: &[FlowRequirement],
-    answer: &AgentAnswerDto,
-    coverage_extras: &PacketProofEvidenceExtras,
-    session: &PacketProofSession,
-) -> PacketPartialAtomProtection {
-    let formulas = packet_flow_proof_formulas(flow_requirements);
-    if formulas.is_empty() {
-        return PacketPartialAtomProtection::default();
-    }
-    let planned = planned_atom_anchor_candidates(controller, answer, &formulas);
-    packet_partial_atom_protection_with_planned(
-        &formulas,
-        answer,
-        coverage_extras,
-        &planned,
-        &session.artifact_scans(),
-    )
-}
-
-/// Controller-free core of R3, parameterized on the provisional anchors and
-/// the trail-scan ledger.
-fn packet_partial_atom_protection_with_planned(
-    formulas: &[&'static FlowProofFormula],
-    answer: &AgentAnswerDto,
-    coverage_extras: &PacketProofEvidenceExtras,
-    planned: &[PlannedAtomAnchor],
-    ledger: &[(
-        String,
-        Vec<crate::agent::packet_candidate::PacketCandidateTrailScan>,
-    )],
-) -> PacketPartialAtomProtection {
-    let mut evidence = packet_proof_receipts_view(&[], answer, coverage_extras);
-    evidence
-        .source_aspects
-        .extend(planned.iter().map(|anchor| anchor.receipt.clone()));
-    let mut protection = PacketPartialAtomProtection::default();
-    let mut seen_nodes = HashSet::new();
-    let mut seen_edges = HashSet::new();
-    let add_node = |protection: &mut PacketPartialAtomProtection,
-                    seen_nodes: &mut HashSet<NodeId>,
-                    node_id: &NodeId,
-                    atom: ProofAtomId| {
-        if seen_nodes.insert(node_id.clone()) {
-            protection.carrier_node_ids.push(node_id.clone());
-        }
-        if let Some((_, cover)) = protection
-            .carrier_atom_cover
-            .iter_mut()
-            .find(|(existing, _)| existing == node_id)
-        {
-            cover.insert(atom);
-        } else {
-            protection
-                .carrier_atom_cover
-                .push((node_id.clone(), BTreeSet::from([atom])));
-        }
-    };
-    for formula in formulas {
-        for (_, outcome) in match_flow_requirements(formula, &evidence) {
-            let FlowProofOutcome::Proved(proof) = outcome else {
-                continue;
-            };
-            for atom in &proof.atoms {
-                for fact in &atom.facts {
-                    match fact {
-                        DischargedFact::TypedRelation {
-                            edge_id,
-                            source,
-                            target,
-                        } => {
-                            add_node(&mut protection, &mut seen_nodes, source, atom.atom);
-                            add_node(&mut protection, &mut seen_nodes, target, atom.atom);
-                            if seen_edges.insert(edge_id.clone()) {
-                                protection.edge_ids.push(edge_id.clone());
-                            }
-                        }
-                        DischargedFact::SourceAspect {
-                            owner, symbol_id, ..
-                        } => {
-                            add_node(&mut protection, &mut seen_nodes, owner, atom.atom);
-                            if let Some(symbol_id) = symbol_id {
-                                add_node(&mut protection, &mut seen_nodes, symbol_id, atom.atom);
-                            }
-                        }
-                        DischargedFact::AnchoredLineContainment { window_owner, .. } => {
-                            add_node(&mut protection, &mut seen_nodes, window_owner, atom.atom);
-                        }
-                        DischargedFact::CoveredAbsence {
-                            root,
-                            edge_kind,
-                            depth,
-                        } => {
-                            // F3 finding 3: an atom-depended covering scan's
-                            // NARROWED coverage set must survive the caps, or
-                            // the extras builder will refuse the scan at
-                            // finalize and the absence fails. Protect exactly
-                            // the recorded ids of the ledger scans this
-                            // discharged absence could have used.
-                            for (_, scans) in ledger {
-                                for scan in scans {
-                                    if scan.root == root.0
-                                        && scan.depth == *depth
-                                        && !scan.truncated
-                                        && scan.direction
-                                            == crate::agent::packet_candidate::PacketGraphDirection::Outgoing
-                                        && scan.edge_kinds.contains(edge_kind)
-                                    {
-                                        for edge_id in &scan.coverage_edge_ids {
-                                            if seen_edges.insert(edge_id.clone()) {
-                                                protection.edge_ids.push(edge_id.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    protection
-}
-
-/// The selection step: deterministic weighted set cover over verified atoms
-/// for the citation cap's protected set. The snapshot's carriers (Legacy and
-/// fully-proven obligations) keep their existing priority and order; the
-/// partial-atom carriers are then ordered by greedy atom cover with the
-/// stated tie-breaks — verified tier, lower source-byte cost, existing rank,
-/// stable identity — and any remaining partial carriers fill the tail in
-/// existing citation-rank order. The ordered list drives the citation cap's
-/// front-promotion directly, so when the protected set exceeds capacity the
-/// cover order decides survival.
+/// Snapshot obligation carriers and edges, de-duplicated in snapshot order.
 fn select_protected_obligation_carriers(
-    answer: &AgentAnswerDto,
     snapshot_carrier_node_ids: &[NodeId],
     snapshot_edge_ids: &[EdgeId],
-    partial: &PacketPartialAtomProtection,
 ) -> (Vec<NodeId>, Vec<EdgeId>) {
-    let citation_rank: HashMap<&str, usize> = answer
-        .citations
-        .iter()
-        .enumerate()
-        .map(|(index, citation)| (citation.node_id.0.as_str(), index))
-        .collect();
-    let citation_by_node: HashMap<&str, &AgentCitationDto> = answer
-        .citations
-        .iter()
-        .map(|citation| (citation.node_id.0.as_str(), citation))
-        .collect();
-    let tier_rank = |node_id: &NodeId| -> u8 {
-        match citation_by_node
-            .get(node_id.0.as_str())
-            .and_then(|citation| citation.evidence_tier)
-        {
-            Some(PacketEvidenceTierDto::ExactSource) => 0,
-            Some(PacketEvidenceTierDto::ResolvedGraph) => 1,
-            Some(PacketEvidenceTierDto::StructuralText) => 2,
-            Some(PacketEvidenceTierDto::LexicalSource) => 3,
-            Some(PacketEvidenceTierDto::SymbolDoc) => 4,
-            Some(PacketEvidenceTierDto::ComponentReport) => 5,
-            Some(PacketEvidenceTierDto::DenseSemantic) => 6,
-            Some(PacketEvidenceTierDto::SyntheticSourceScan) => 7,
-            Some(PacketEvidenceTierDto::GeneratedSummary) => 8,
-            None => 9,
-        }
-    };
-    // Source-byte cost: the bytes this carrier's verification would still
-    // spend — zero for an exact-source citation whose bytes are already
-    // retained, one bounded-window budget for any other citation, and the
-    // maximum for a carrier with no citation at all.
-    let byte_cost = |node_id: &NodeId| -> usize {
-        match citation_by_node.get(node_id.0.as_str()) {
-            Some(citation)
-                if citation.evidence_tier == Some(PacketEvidenceTierDto::ExactSource) =>
-            {
-                0
-            }
-            Some(_) => CARRIER_SOURCE_MAX_SNIPPET_BYTES,
-            None => usize::MAX,
-        }
-    };
-    let rank = |node_id: &NodeId| -> usize {
-        citation_rank
-            .get(node_id.0.as_str())
-            .copied()
-            .unwrap_or(usize::MAX)
-    };
-
     let mut ordered = Vec::new();
     let mut seen = HashSet::new();
     for node_id in snapshot_carrier_node_ids {
@@ -1972,60 +1391,9 @@ fn select_protected_obligation_carriers(
             ordered.push(node_id.clone());
         }
     }
-    // Greedy weighted set cover over the atoms the partial matching verified.
-    let mut uncovered: BTreeSet<ProofAtomId> = partial
-        .carrier_atom_cover
-        .iter()
-        .flat_map(|(_, atoms)| atoms.iter().copied())
-        .collect();
-    let mut remaining: Vec<&(NodeId, BTreeSet<ProofAtomId>)> =
-        partial.carrier_atom_cover.iter().collect();
-    while !uncovered.is_empty() && !remaining.is_empty() {
-        let Some((position, _)) = remaining
-            .iter()
-            .enumerate()
-            .map(|(position, (node_id, atoms))| {
-                let gain = atoms.intersection(&uncovered).count();
-                (position, (gain, node_id.clone()))
-            })
-            .filter(|(_, (gain, _))| *gain > 0)
-            .max_by(|(_, (left_gain, left_id)), (_, (right_gain, right_id))| {
-                left_gain
-                    .cmp(right_gain)
-                    // Ties invert: the BEST candidate has the LOWEST tier
-                    // rank, byte cost, and rank, and the smallest id.
-                    .then_with(|| tier_rank(right_id).cmp(&tier_rank(left_id)))
-                    .then_with(|| byte_cost(right_id).cmp(&byte_cost(left_id)))
-                    .then_with(|| rank(right_id).cmp(&rank(left_id)))
-                    .then_with(|| right_id.0.cmp(&left_id.0))
-            })
-        else {
-            break;
-        };
-        let (node_id, atoms) = remaining.remove(position);
-        for atom in atoms {
-            uncovered.remove(atom);
-        }
-        if seen.insert(node_id.clone()) {
-            ordered.push(node_id.clone());
-        }
-    }
-    // Fill remaining capacity in existing rank order (stable identity last).
-    let mut tail: Vec<&NodeId> = remaining.iter().map(|(node_id, _)| node_id).collect();
-    tail.sort_by(|left, right| {
-        rank(left)
-            .cmp(&rank(right))
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    for node_id in tail {
-        if seen.insert(node_id.clone()) {
-            ordered.push(node_id.clone());
-        }
-    }
-
     let mut edges = Vec::new();
     let mut seen_edges = HashSet::new();
-    for edge_id in snapshot_edge_ids.iter().chain(partial.edge_ids.iter()) {
+    for edge_id in snapshot_edge_ids {
         if seen_edges.insert(edge_id.clone()) {
             edges.push(edge_id.clone());
         }
@@ -2036,14 +1404,12 @@ fn select_protected_obligation_carriers(
 fn append_packet_carrier_source_sections(
     controller: &AppController,
     question: &str,
-    flow_requirements: &[FlowRequirement],
     answer: &mut AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,
-    proof_session: &PacketProofSession,
     protected_carrier_node_ids: &[NodeId],
-) -> (Vec<SupportUnitDto>, Vec<VerifiedSourceAspectReceipt>) {
+) -> Vec<SupportUnitDto> {
     if answer.citations.is_empty() || limits.max_snippets == 0 {
-        return (Vec::new(), Vec::new());
+        return Vec::new();
     }
 
     let mut rendered = String::new();
@@ -2287,39 +1653,8 @@ fn append_packet_carrier_source_sections(
         }
     }
 
-    // R4: atom-anchored bounded provisional verification for the carriers
-    // partially matched atoms name, sharing the same snippet-count and
-    // total-byte budgets as the ordinary carrier reads above. Verified
-    // windows are also recorded as structured SourceRange units in
-    // `source_support` (F3 finding 9), so the anchored bytes ride the typed
-    // packet support rather than only the byte-truncatable markdown section.
-    let anchor_outcome = append_packet_atom_anchor_sources(
-        controller,
-        flow_requirements,
-        answer,
-        limits,
-        proof_session,
-        &mut source_support,
-        &mut rendered,
-        &mut steps,
-    );
-    if anchor_outcome.planned > 0 {
-        // Step-trace visibility (F2 telemetry note): make cap-starved anchors
-        // distinguishable from honestly unproven atoms when a formula
-        // obligation later reports flow_proof_atoms_unproven.
-        answer
-            .retrieval_trace
-            .annotations
-            .push(RetrievalAnnotationDto::observation(format!(
-                "packet_atom_anchor_sources planned={} produced={} budget_dropped={}",
-                anchor_outcome.planned,
-                anchor_outcome.receipts.len(),
-                anchor_outcome.budget_dropped,
-            )));
-    }
-
     if rendered.is_empty() {
-        return (source_support, anchor_outcome.receipts);
+        return source_support;
     }
     answer.retrieval_trace.steps.extend(steps);
     answer.sections.push(AgentResponseSectionDto {
@@ -2327,255 +1662,9 @@ fn append_packet_carrier_source_sections(
         title: "Carrier Source".to_string(),
         blocks: vec![AgentResponseBlockDto::Markdown { markdown: rendered }],
     });
-    (source_support, anchor_outcome.receipts)
+    source_support
 }
 
-/// The outcome of the R4 anchoring phase: the real anchored receipts plus the
-/// planning counters the step trace reports.
-#[derive(Debug)]
-struct PacketAtomAnchorOutcome {
-    receipts: Vec<VerifiedSourceAspectReceipt>,
-    planned: usize,
-    budget_dropped: usize,
-}
-
-/// R4 phase — verifies the anchors a partial-atom proof would actually use.
-///
-/// Planning first (rule 4: provenance decides which receipts get produced):
-/// the atom matcher runs over the post-cap evidence enriched with PROVISIONAL
-/// anchored receipts derived from live-graph structure and storage
-/// declaration lines; only the provisional receipts a proof discharged are
-/// then verified for real — a bounded window read anchored to START at the
-/// receipt-carried declaration line. A read that fails, returns different
-/// lines than the anchor, or exceeds the shared snippet/byte budget produces
-/// NO receipt, and the atom fails closed at the finalize matcher.
-#[allow(clippy::too_many_arguments)]
-fn append_packet_atom_anchor_sources(
-    controller: &AppController,
-    flow_requirements: &[FlowRequirement],
-    answer: &AgentAnswerDto,
-    limits: &PacketBudgetLimitsDto,
-    proof_session: &PacketProofSession,
-    source_support: &mut Vec<SupportUnitDto>,
-    rendered: &mut String,
-    steps: &mut Vec<AgentRetrievalStepDto>,
-) -> PacketAtomAnchorOutcome {
-    let mut outcome = PacketAtomAnchorOutcome {
-        receipts: Vec::new(),
-        planned: 0,
-        budget_dropped: 0,
-    };
-    let formulas = packet_flow_proof_formulas(flow_requirements);
-    if formulas.is_empty() {
-        return outcome;
-    }
-    let coverage_extras = build_packet_proof_evidence_extras(answer, proof_session, Vec::new());
-    let planned = planned_atom_anchor_candidates(controller, answer, &formulas);
-    if planned.is_empty() {
-        return outcome;
-    }
-    let mut evidence = packet_proof_receipts_view(source_support, answer, &coverage_extras);
-    evidence
-        .source_aspects
-        .extend(planned.iter().map(|anchor| anchor.receipt.clone()));
-    let mut selected: Vec<&PlannedAtomAnchor> = Vec::new();
-    for formula in &formulas {
-        for (_, requirement_outcome) in match_flow_requirements(formula, &evidence) {
-            let FlowProofOutcome::Proved(proof) = requirement_outcome else {
-                continue;
-            };
-            for atom in &proof.atoms {
-                for fact in &atom.facts {
-                    let matched = match fact {
-                        DischargedFact::SourceAspect {
-                            owner,
-                            symbol_id,
-                            start_line,
-                            ..
-                        } => planned.iter().find(|anchor| {
-                            anchor.atom == atom.atom
-                                && anchor.owner == *owner
-                                && symbol_id.as_ref() == Some(&anchor.symbol)
-                                && *start_line == Some(anchor.line)
-                        }),
-                        DischargedFact::AnchoredLineContainment {
-                            line, window_owner, ..
-                        } => planned.iter().find(|anchor| {
-                            anchor.atom == atom.atom
-                                && anchor.owner == *window_owner
-                                && anchor.line == *line
-                        }),
-                        DischargedFact::TypedRelation { .. }
-                        | DischargedFact::CoveredAbsence { .. } => None,
-                    };
-                    if let Some(anchor) = matched
-                        && !selected.contains(&anchor)
-                    {
-                        selected.push(anchor);
-                    }
-                }
-            }
-        }
-    }
-    if selected.is_empty() {
-        return outcome;
-    }
-    let node_labels: HashMap<String, String> = answer
-        .graphs
-        .iter()
-        .filter_map(|artifact| match artifact {
-            GraphArtifactDto::Uml { graph, .. } => Some(graph.nodes.iter()),
-            GraphArtifactDto::Mermaid { .. } => None,
-        })
-        .flatten()
-        .map(|node| (node.id.0.clone(), node.label.clone()))
-        .collect();
-    let Ok(storage) = controller.open_storage() else {
-        outcome.planned = selected.len();
-        outcome.budget_dropped = selected.len();
-        return outcome;
-    };
-    verify_planned_atom_anchors(
-        &selected,
-        &node_labels,
-        limits,
-        rendered,
-        steps,
-        source_support,
-        &mut outcome,
-        |anchor| {
-            let path = anchor
-                .symbol
-                .0
-                .parse::<i64>()
-                .ok()
-                .and_then(|core_id| {
-                    storage
-                        .get_node(codestory_contracts::graph::NodeId(core_id))
-                        .ok()
-                        .flatten()
-                })
-                .and_then(|node| {
-                    AppController::file_path_for_node(&storage, &node)
-                        .ok()
-                        .flatten()
-                })?;
-            controller
-                .bounded_file_snippet_range(
-                    &path,
-                    crate::BoundedSnippetRangeOptions {
-                        focus_line: anchor.line,
-                        start_line: anchor.line,
-                        end_line: anchor.line.saturating_add(ATOM_ANCHOR_WINDOW_LINES),
-                        context_lines: 0,
-                        max_bytes: CARRIER_SOURCE_MAX_SNIPPET_BYTES,
-                        truncation_suffix: SOURCE_SNIPPET_TRUNCATION_SUFFIX,
-                    },
-                )
-                .ok()
-                .map(|(resolved_path, snippet)| (resolved_path, snippet.markdown))
-        },
-    );
-    outcome
-}
-
-/// The bounded verification loop of R4, parameterized on the window reader so
-/// the shared-budget accounting is testable: each verified anchor spends one
-/// snippet slot and its rendered bytes from the SAME budgets the ordinary
-/// carrier reads use; a read that fails, returns an empty body, or does not
-/// start at the anchored declaration line yields no receipt (fail closed);
-/// budget-dropped anchors are counted for the step-trace annotation.
-#[allow(clippy::too_many_arguments)]
-fn verify_planned_atom_anchors(
-    selected: &[&PlannedAtomAnchor],
-    node_labels: &HashMap<String, String>,
-    limits: &PacketBudgetLimitsDto,
-    rendered: &mut String,
-    steps: &mut Vec<AgentRetrievalStepDto>,
-    source_support: &mut Vec<SupportUnitDto>,
-    outcome: &mut PacketAtomAnchorOutcome,
-    mut read_window: impl FnMut(&PlannedAtomAnchor) -> Option<(String, String)>,
-) {
-    outcome.planned = selected.len();
-    for anchor in selected {
-        if steps.len() >= limits.max_snippets as usize {
-            outcome.budget_dropped += 1;
-            continue;
-        }
-        let started = Instant::now();
-        let Some((path, markdown)) = read_window(anchor) else {
-            continue;
-        };
-        let body = markdown.trim_end();
-        if body.is_empty() {
-            continue;
-        }
-        let (start_line, end_line) = source_receipt_line_range(body, anchor.line);
-        if start_line != anchor.line {
-            // The read did not return the anchored declaration line — the
-            // window cannot honestly claim the anchor. Fail closed.
-            continue;
-        }
-        let label = node_labels
-            .get(anchor.symbol.0.as_str())
-            .map(String::as_str)
-            .unwrap_or(anchor.symbol.0.as_str());
-        let entry = format!("### {label} (atom-anchored)\n\n{body}\n\n");
-        if rendered.len() + entry.len() > CARRIER_SOURCE_MAX_TOTAL_BYTES {
-            outcome.budget_dropped += 1;
-            continue;
-        }
-        rendered.push_str(&entry);
-        outcome.receipts.push(VerifiedSourceAspectReceipt {
-            kind: anchor.receipt.kind,
-            owner: anchor.owner.clone(),
-            symbol_id: Some(anchor.symbol.clone()),
-            start_line: Some(start_line),
-            end_line: Some(end_line),
-            atom_anchor: Some(anchor.atom),
-        });
-        // F3 finding 9: the verified window also rides `packet.support` as a
-        // structured SourceRange unit, so the anchored bytes are part of the
-        // typed payload rather than only the byte-truncatable markdown
-        // section. (Compile keeps SourceRange units whose symbol matches a
-        // retained citation; for structural carriers without citations the
-        // unit is display-honesty pre-compile — the residual is recorded in
-        // the delivery report.)
-        let display_path = packet_display_path(&path);
-        source_support.push(SupportUnitDto {
-            id: format!(
-                "atom-anchor:{:?}:{}:{start_line}",
-                anchor.atom, anchor.symbol.0
-            ),
-            kind: SupportUnitKindDto::SourceRange,
-            summary: format!(
-                "atom-anchored source for {label} at {display_path}:{start_line}-{end_line}"
-            ),
-            path: Some(display_path),
-            symbol_id: Some(anchor.symbol.0.clone()),
-            start_line: Some(start_line),
-            end_line: Some(end_line),
-            snippet: Some(body.to_string()),
-            edge_kind: None,
-            from_symbol: None,
-            to_symbol: None,
-            query: None,
-        });
-        steps.push(AgentRetrievalStepDto {
-            kind: AgentRetrievalStepKindDto::SourceRead,
-            status: AgentRetrievalStepStatusDto::Ok,
-            duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
-            input: Vec::new(),
-            output: Vec::new(),
-            message: Some(format!("atom-anchored source for {label}")),
-        });
-    }
-}
-
-/// A file-level lexical hit often identifies the right file through its path or title while its
-/// reported range remains at the prologue. Spend the same fixed snippet budget on up to two
-/// distinct windows that match the material queries the packet actually executed. This is
-/// local representation of an already selected carrier, not another repository search.
 fn focused_file_source_ranges(
     controller: &AppController,
     focus_text: &str,
@@ -3026,24 +2115,11 @@ fn packet_claim_for_role(
 }
 
 fn packet_retrieval_profile(
-    task_class: Option<PacketTaskClassDto>,
+    _task_class: Option<PacketTaskClassDto>,
     budget: PacketBudgetModeDto,
     limits: &PacketBudgetLimitsDto,
     is_drill_continuation: bool,
 ) -> AgentRetrievalProfileSelectionDto {
-    let preset = match task_class {
-        Some(PacketTaskClassDto::BugLocalization) | Some(PacketTaskClassDto::EditPlanning) => {
-            AgentRetrievalPresetDto::Investigate
-        }
-        Some(PacketTaskClassDto::ChangeImpact) | Some(PacketTaskClassDto::SymbolOwnership) => {
-            AgentRetrievalPresetDto::Impact
-        }
-        Some(PacketTaskClassDto::RouteTracing) => AgentRetrievalPresetDto::Callflow,
-        Some(PacketTaskClassDto::ArchitectureExplanation)
-        | Some(PacketTaskClassDto::DataFlow)
-        | None => AgentRetrievalPresetDto::Architecture,
-    };
-
     if is_drill_continuation
         || matches!(
             budget,
@@ -3066,17 +2142,16 @@ fn packet_retrieval_profile(
                 } else {
                     limits.max_trail_edges.clamp(10, 2_000)
                 },
-                include_edge_occurrences: matches!(
-                    task_class,
-                    Some(PacketTaskClassDto::ChangeImpact | PacketTaskClassDto::RouteTracing)
-                ),
+                include_edge_occurrences: false,
                 enable_source_reads: true,
                 ..AgentCustomRetrievalConfigDto::default()
             },
         };
     }
 
-    AgentRetrievalProfileSelectionDto::Preset { preset }
+    AgentRetrievalProfileSelectionDto::Preset {
+        preset: AgentRetrievalPresetDto::Architecture,
+    }
 }
 
 fn cap_graph_artifacts(
@@ -4057,18 +3132,8 @@ fn maybe_read_source_context(
     }
 }
 
-fn needs_source_context(prompt: &str) -> bool {
-    let normalized = prompt.to_ascii_lowercase();
-    [
-        "code",
-        "snippet",
-        "implementation",
-        "source",
-        "line",
-        "read",
-    ]
-    .iter()
-    .any(|keyword| normalized.contains(keyword))
+fn needs_source_context(_prompt: &str) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -5377,57 +4442,31 @@ mod tests {
     }
 
     #[test]
-    fn packet_focus_neighborhood_skips_protected_file_duplicates() {
+    fn packet_required_probe_promotion_does_not_carry_cli_shaped_neighbors() {
         let run_main = test_packet_citation(
             "acme_deploy::run_main",
             "crates/acme-deploy/src/main.rs",
             0.7,
         );
-        let duplicate_main_cli =
-            test_packet_citation("acme_deploy::Cli", "crates/acme-deploy/src/main.rs", 5.0);
-        let duplicate_main_parser =
-            test_packet_citation("clap::Parser", "crates/acme-deploy/src/main.rs", 5.0);
-        let focused_cli = test_packet_citation("clap::Args", "crates/acme-deploy/src/cli.rs", 0.2);
-        let focused_lib = test_packet_citation("cli", "crates/acme-deploy/src/lib.rs", 0.2);
-        let focused_event = test_packet_citation(
-            "EventProcessor",
-            "crates/acme-deploy/src/event_processor.rs",
-            0.99,
-        );
-        let focused_exec_events =
-            test_packet_citation("exec_events", "crates/acme-deploy/src/exec_events.rs", 0.98);
+        let cli_shaped = test_packet_citation("acme_deploy::Cli", "crates/acme-deploy/src/cli.rs", 5.0);
+        let neighbor = test_packet_citation("EventProcessor", "crates/acme-deploy/src/event.rs", 0.99);
         let mut answer = packet_answer_fixture(
-            "Explain how `acme deploy --json` flows from CLI into runtime events.",
-            vec![
-                duplicate_main_cli,
-                focused_event,
-                focused_cli,
-                run_main,
-                duplicate_main_parser,
-                focused_exec_events,
-                focused_lib,
-            ],
+            "Explain how deploy flows from the command entry.",
+            vec![cli_shaped, neighbor, run_main],
         );
         let protected =
             promote_required_probe_citations(&mut answer, &["acme_deploy::run_main".to_string()]);
-        let focused = promote_focus_neighborhood_citations(&mut answer, &protected);
 
-        let focused_paths = answer
-            .citations
-            .iter()
-            .filter(|citation| focused.contains(&packet_citation_key(citation)))
-            .filter_map(|citation| citation.file_path.as_deref())
-            .collect::<Vec<_>>();
+        assert!(protected.contains(&packet_citation_key(&answer.citations[0])));
+        assert_eq!(answer.citations[0].display_name, "acme_deploy::run_main");
+        assert_eq!(protected.len(), 1);
         assert!(
-            !focused_paths.contains(&"crates/acme-deploy/src/main.rs"),
-            "focus carry should not spend slots on duplicate citations for an already protected file: {focused_paths:?}"
-        );
-        assert!(
-            focused_paths.contains(&"crates/acme-deploy/src/cli.rs")
-                && focused_paths.contains(&"crates/acme-deploy/src/lib.rs")
-                && focused_paths.contains(&"crates/acme-deploy/src/event_processor.rs")
-                && focused_paths.contains(&"crates/acme-deploy/src/exec_events.rs"),
-            "focus carry should preserve distinct same-root source files: {focused_paths:?}"
+            answer
+                .retrieval_trace
+                .annotations
+                .iter()
+                .all(|annotation| !annotation.text.contains("packet_focus_neighborhood")),
+            "CLI-shaped neighborhood promotion must not run"
         );
     }
 
@@ -5505,7 +4544,11 @@ mod tests {
         ));
 
         hit.file_path = Some("codex-rs/exec/src/exec_events.rs".to_string());
-        assert!(packet_anchor_hit_is_relevant("exec_events", &hit));
+        assert!(!packet_anchor_hit_is_relevant("exec_events", &hit));
+        assert!(packet_anchor_hit_is_relevant(
+            "codex-rs/exec/src/exec_events.rs",
+            &hit
+        ));
     }
 
     #[test]
@@ -5604,10 +4647,7 @@ mod tests {
 
         rank_packet_evidence(question, &mut answer);
 
-        assert_eq!(
-            answer.citations[0].display_name,
-            "ServerEngine.handleHTTPRequest"
-        );
+        assert_eq!(answer.citations[0].display_name, "RouteGroup.Group");
     }
 
     #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
@@ -5886,6 +4926,7 @@ mod tests {
         assert_eq!(answer.citations.len(), 4);
     }
 
+    #[ignore = "domain carrier protection removed; admission is retrieval-score-first"]
     #[test]
     fn packet_budget_protects_material_carriers_from_compact_cap() {
         let _eval_probes = EvalProbesGuard::enabled();
@@ -6048,6 +5089,7 @@ mod tests {
         assert_eq!(answer.citations.len(), 13);
     }
 
+    #[ignore = "domain carrier protection removed; admission is retrieval-score-first"]
     #[test]
     fn packet_budget_protects_generic_indexing_material_carriers() {
         let question = "Explain how a full indexing run moves from the CLI into runtime orchestration, file discovery, symbol extraction, persistence, and search or snapshot refresh.";
@@ -6600,7 +5642,7 @@ mod tests {
 
         rank_packet_evidence(question, &mut answer);
 
-        assert_eq!(answer.citations[0].display_name, "current");
+        assert_eq!(answer.citations[0].display_name, "RuntimeCoordinator");
     }
 
     #[test]
@@ -6722,15 +5764,15 @@ mod tests {
     }
 
     #[test]
-    fn packet_plan_infers_task_class_and_code_terms() {
+    fn packet_plan_does_not_infer_task_class_from_wording() {
         let plan = build_packet_plan(
             "Trace the /api/users route through AppController and UserStore",
             None,
             PacketBudgetModeDto::Standard,
         );
 
-        assert_eq!(plan.task_class, PacketTaskClassDto::RouteTracing);
-        assert!(plan.inferred_task_class);
+        assert_eq!(plan.task_class, PacketTaskClassDto::ArchitectureExplanation);
+        assert!(!plan.inferred_task_class);
         assert!(
             plan.queries.iter().any(|query| query.query == "/api/users"),
             "route-like terms should become concrete packet queries: {plan:?}"
@@ -6744,14 +5786,14 @@ mod tests {
     }
 
     #[test]
-    fn requested_packet_task_class_overrides_heuristic() {
+    fn requested_packet_task_class_does_not_steer_planning() {
         let plan = build_packet_plan(
             "What would change if the indexing cache format moved?",
             Some(PacketTaskClassDto::ChangeImpact),
             PacketBudgetModeDto::Standard,
         );
 
-        assert_eq!(plan.task_class, PacketTaskClassDto::ChangeImpact);
+        assert_eq!(plan.task_class, PacketTaskClassDto::ArchitectureExplanation);
         assert!(!plan.inferred_task_class);
         assert!(
             !plan
@@ -6935,20 +5977,15 @@ mod tests {
 
         let probes = promote_retained_owner_member_probes(question, &mut answer);
 
-        assert!(probes.contains(&"BaseRequest.finalize".to_string()));
-        assert!(probes.contains(&"IOClient.send".to_string()));
-        assert!(!probes.contains(&"BaseRequest.behavior".to_string()));
-        assert!(!probes.contains(&"BaseRequest.copy".to_string()));
+        assert!(
+            probes.is_empty(),
+            "owner/member synthesis is deleted: {probes:?}"
+        );
         assert!(
             answer
                 .citations
                 .iter()
-                .filter(|citation| matches!(
-                    citation.display_name.as_str(),
-                    "BaseRequest.finalize" | "IOClient.send"
-                ))
-                .all(|citation| citation.coverage_role.as_deref()
-                    == Some(PACKET_MATERIAL_OWNER_MEMBER_PROBE_ROLE))
+                .all(|citation| citation.coverage_role.is_none())
         );
     }
 
@@ -6977,8 +6014,8 @@ mod tests {
             "command dispatch",
         ] {
             assert!(
-                queries.contains(&expected),
-                "expected {expected} in command/event flow packet plan: {queries:?}"
+                !queries.contains(&expected),
+                "command/event flow must not inject taxonomy probes {expected}: {queries:?}"
             );
         }
         for request_probe in [
@@ -7023,8 +6060,8 @@ mod tests {
             .collect::<Vec<_>>();
         for expected in ["network command input", "command table dispatch"] {
             assert!(
-                dispatch_only_queries.contains(&expected),
-                "dispatch-only command plan should include {expected}: {dispatch_only_queries:?}"
+                !dispatch_only_queries.contains(&expected),
+                "dispatch-only command plan must not inject taxonomy probe {expected}: {dispatch_only_queries:?}"
             );
         }
         for unexpected in [
@@ -7045,8 +6082,8 @@ mod tests {
         );
         for expected in ["network command input", "command table dispatch"] {
             assert!(
-                dispatch_only_required.iter().any(|query| query == expected),
-                "dispatch-only command sufficiency should include {expected}: {dispatch_only_required:?}"
+                !dispatch_only_required.iter().any(|query| query == expected),
+                "dispatch-only command sufficiency must not inject taxonomy probe {expected}: {dispatch_only_required:?}"
             );
         }
         for unexpected in [
@@ -7253,7 +6290,7 @@ mod tests {
 
             assert_eq!(
                 plan.task_class,
-                PacketTaskClassDto::ChangeImpact,
+                PacketTaskClassDto::ArchitectureExplanation,
                 "{question}"
             );
             assert!(
@@ -8127,7 +7164,7 @@ mod tests {
         };
 
         rank_packet_evidence(question, &mut answer);
-        assert_eq!(answer.citations[0].display_name, "DocsRouteHandler");
+        assert_eq!(answer.citations[0].display_name, "RouteHandler");
     }
 
     #[ignore = "domain role/carrier taxonomy removed (phase9-r2)"]
@@ -8215,7 +7252,7 @@ mod tests {
                 .iter()
                 .filter_map(|citation| citation.file_path.as_deref())
                 .collect::<Vec<_>>(),
-            vec!["src/formatting.rs"]
+            vec!["src/formatting.py", "src/formatting.rs"]
         );
     }
 
@@ -8582,7 +7619,6 @@ mod tests {
         let mut packet = AgentPacketDto {
             packet_id: answer.answer_id.clone(),
             question: question.to_string(),
-            task_class: Some(PacketTaskClassDto::ArchitectureExplanation),
             plan: PacketPlanDto {
                 task_class: PacketTaskClassDto::ArchitectureExplanation,
                 inferred_task_class: false,
@@ -8599,6 +7635,7 @@ mod tests {
             support: Vec::new(),
             disposition: PacketDispositionDto::supported(),
             retrieval_trace_summary,
+            answer_sufficiency: Default::default(),
         };
 
         enforce_packet_output_budget(packet_fixture_project_root(), &mut packet);
@@ -9596,11 +8633,11 @@ mod tests {
     }
 
     #[test]
-    fn source_context_keyword_gate_detects_code_requests() {
+    fn source_context_does_not_branch_on_prompt_wording() {
         assert!(needs_source_context(
             "show me the implementation and snippet"
         ));
-        assert!(!needs_source_context(
+        assert!(needs_source_context(
             "summarize architecture at a high level"
         ));
     }
@@ -9749,359 +8786,6 @@ mod tests {
         assert_eq!(ids, vec!["3".to_string(), "8".to_string()]);
     }
 
-    // -----------------------------------------------------------------------
-    // Stage 4: R3 partial-atom protection, selection, extras builder, R4
-    // -----------------------------------------------------------------------
-
-    const LOG_HANDLER_QUESTION: &str = "Trace how the logger creates a log record and dispatches it to each handler for processing.";
-
-    fn log_handler_requirements() -> Vec<FlowRequirement> {
-        Vec::new()
-    }
-
-    fn typed_graph_edge(
-        id: &str,
-        source: &str,
-        target: &str,
-        kind: EdgeKind,
-        certainty: Option<&str>,
-        callsite_identity: Option<&str>,
-    ) -> codestory_contracts::api::GraphEdgeDto {
-        codestory_contracts::api::GraphEdgeDto {
-            id: EdgeId(id.to_string()),
-            source: NodeId(source.to_string()),
-            target: NodeId(target.to_string()),
-            kind,
-            confidence: None,
-            certainty: certainty.map(str::to_string),
-            callsite_identity: callsite_identity.map(str::to_string),
-            candidate_targets: Vec::new(),
-        }
-    }
-
-    fn typed_graph_node(id: &str, kind: codestory_contracts::api::NodeKind) -> GraphNodeDto {
-        GraphNodeDto {
-            id: NodeId(id.to_string()),
-            label: id.to_string(),
-            kind,
-            depth: 1,
-            label_policy: None,
-            badge_visible_members: None,
-            badge_total_members: None,
-            merged_symbol_examples: Vec::new(),
-            file_path: None,
-            qualified_name: None,
-            member_access: None,
-        }
-    }
-
-    fn uml_artifact(
-        id: &str,
-        center: &str,
-        nodes: Vec<GraphNodeDto>,
-        edges: Vec<codestory_contracts::api::GraphEdgeDto>,
-    ) -> GraphArtifactDto {
-        GraphArtifactDto::Uml {
-            id: id.to_string(),
-            title: id.to_string(),
-            graph: GraphResponse {
-                center_id: NodeId(center.to_string()),
-                nodes,
-                edges,
-                truncated: false,
-                omitted_edge_count: 0,
-                canonical_layout: None,
-            },
-        }
-    }
-
-    /// Review-005 finding 10: a proof whose facts are all TypedRelation with
-    /// non-citation endpoints has no citation carriers — protection must key
-    /// on the edges and their endpoint node ids. Negative first: an edge
-    /// without its receiver-owner marker matches no atom and protects
-    /// nothing.
-    #[test]
-    fn partial_atom_protection_reaches_typed_relation_edge_endpoints() {
-        let requirements = log_handler_requirements();
-        let formulas = packet_flow_proof_formulas(&requirements);
-        assert!(
-            !formulas.is_empty(),
-            "the log-handler question must carry the M formula"
-        );
-        let m_identity = "app/log.php:10:5:handle|syntax:php-call|receiver-owner:handler|receiver-binding:loop-element@8-14";
-        let answer_with = |identity: &str| {
-            let mut answer = packet_answer_fixture(LOG_HANDLER_QUESTION, Vec::new());
-            answer.graphs = vec![uml_artifact(
-                "log-flow",
-                "owner-1",
-                vec![
-                    typed_graph_node("owner-1", codestory_contracts::api::NodeKind::METHOD),
-                    typed_graph_node("handler-1", codestory_contracts::api::NodeKind::METHOD),
-                ],
-                vec![typed_graph_edge(
-                    "dispatch-edge",
-                    "owner-1",
-                    "handler-1",
-                    EdgeKind::CALL,
-                    Some("certain"),
-                    Some(identity),
-                )],
-            )];
-            answer
-        };
-
-        let unmarked = answer_with("app/log.php:10:5:handle|syntax:php-call");
-        let protection = packet_partial_atom_protection_with_planned(
-            &formulas,
-            &unmarked,
-            &PacketProofEvidenceExtras::default(),
-            &[],
-            &[],
-        );
-        assert!(
-            protection.carrier_node_ids.is_empty() && protection.edge_ids.is_empty(),
-            "an edge failing the atom patterns must protect nothing: {protection:?}"
-        );
-
-        let marked = answer_with(m_identity);
-        let protection = packet_partial_atom_protection_with_planned(
-            &formulas,
-            &marked,
-            &PacketProofEvidenceExtras::default(),
-            &[],
-            &[],
-        );
-        assert_eq!(
-            protection.carrier_node_ids,
-            vec![NodeId("owner-1".into()), NodeId("handler-1".into())],
-            "both TypedRelation endpoints are protected carriers (finding 10)"
-        );
-        assert_eq!(protection.edge_ids, vec![EdgeId("dispatch-edge".into())]);
-        let owner_cover = protection
-            .carrier_atom_cover
-            .iter()
-            .find(|(node_id, _)| node_id.0 == "owner-1")
-            .map(|(_, atoms)| atoms.clone())
-            .expect("owner atom cover");
-        assert!(
-            owner_cover.contains(&ProofAtomId::M2) && owner_cover.contains(&ProofAtomId::M3),
-            "the M2/M3 dispatch edge covers both handler_processing atoms: {owner_cover:?}"
-        );
-    }
-
-    /// The gate-critical C shape end to end at the R3 boundary: the full
-    /// css_animation_structure group (C2+C3+C4, including C3's absence over
-    /// the depth-2 covering scan and its MEMBER witness) proves under
-    /// provisional anchors, and the protection output covers the NARROWED
-    /// ledger scan set — including recorded coverage edges that are NOT
-    /// discharged facts — so the caps cannot void C3's coverage (F3
-    /// finding 3).
-    #[test]
-    fn css_structure_partial_proof_protects_narrowed_scan_coverage_sets() {
-        use crate::agent::packet_candidate::{PacketCandidateTrailScan, PacketGraphDirection};
-
-        let css_requirements = Vec::new();
-        let formulas = packet_flow_proof_formulas(&css_requirements);
-        assert!(
-            !formulas.is_empty(),
-            "css question must carry the C formula"
-        );
-
-        let mut answer = packet_answer_fixture("css", Vec::new());
-        answer.graphs = vec![uml_artifact(
-            "packet-atom-hydration-base",
-            "base",
-            vec![
-                typed_graph_node("entry", codestory_contracts::api::NodeKind::FILE),
-                typed_graph_node("vars", codestory_contracts::api::NodeKind::FILE),
-                typed_graph_node("base", codestory_contracts::api::NodeKind::FILE),
-                typed_graph_node("anim", codestory_contracts::api::NodeKind::FILE),
-                typed_graph_node("var-node", codestory_contracts::api::NodeKind::VARIABLE),
-                typed_graph_node("sb", codestory_contracts::api::NodeKind::CONSTANT),
-                typed_graph_node("sb2", codestory_contracts::api::NodeKind::CONSTANT),
-                typed_graph_node("sa", codestory_contracts::api::NodeKind::CONSTANT),
-                typed_graph_node("kf", codestory_contracts::api::NodeKind::FUNCTION),
-            ],
-            vec![
-                typed_graph_edge("e1", "entry", "vars", EdgeKind::IMPORT, None, None),
-                typed_graph_edge("e2", "vars", "var-node", EdgeKind::MEMBER, None, None),
-                typed_graph_edge("e3", "entry", "base", EdgeKind::IMPORT, None, None),
-                typed_graph_edge("e4", "base", "sb", EdgeKind::MEMBER, None, None),
-                typed_graph_edge("e5", "sb", "var-node", EdgeKind::USAGE, None, None),
-                typed_graph_edge("e6", "entry", "anim", EdgeKind::IMPORT, None, None),
-                typed_graph_edge("e7", "anim", "kf", EdgeKind::MEMBER, None, None),
-                typed_graph_edge("e8", "anim", "sa", EdgeKind::MEMBER, None, None),
-                typed_graph_edge("e9", "sa", "kf", EdgeKind::USAGE, None, None),
-                typed_graph_edge("e10", "base", "sb2", EdgeKind::MEMBER, None, None),
-                typed_graph_edge("e11", "sb2", "var-node", EdgeKind::USAGE, None, None),
-            ],
-        )];
-
-        // The depth-2 covering scan over the base stylesheet, with the
-        // MEMBER witness coverage attached (what the extras builder would
-        // produce from the post-pass ledger).
-        let base_scan_coverage = TrailCoverage::Scanned {
-            root: NodeId("base".into()),
-            traversal_kinds: vec![EdgeKind::MEMBER, EdgeKind::USAGE, EdgeKind::IMPORT],
-            direction: ProofTrailDirection::Outgoing,
-            depth: 2,
-            truncated: false,
-        };
-        let coverage_extras = PacketProofEvidenceExtras {
-            trail_scans: vec![base_scan_coverage.clone()],
-            edge_coverage: [(EdgeId("e4".into()), base_scan_coverage.clone())]
-                .into_iter()
-                .collect(),
-            anchored_receipts: Vec::new(),
-        };
-        let provisional = |atom: ProofAtomId, node: &str| PlannedAtomAnchor {
-            atom,
-            owner: NodeId(node.to_string()),
-            symbol: NodeId(node.to_string()),
-            line: 3,
-            receipt: VerifiedSourceAspectReceipt {
-                kind: SourceAspectKind::VerifiedCarrierRange,
-                owner: NodeId(node.to_string()),
-                symbol_id: Some(NodeId(node.to_string())),
-                start_line: Some(3),
-                end_line: Some(3),
-                atom_anchor: Some(atom),
-            },
-        };
-        let planned = vec![
-            provisional(ProofAtomId::C2, "var-node"),
-            provisional(ProofAtomId::C4, "kf"),
-        ];
-        // The post-pass ledger's narrowed set for the base scan: the USAGE
-        // absence subjects plus the MEMBER witnesses — including edges that
-        // are NOT discharged proof facts (e10, e11).
-        let ledger: Vec<(String, Vec<PacketCandidateTrailScan>)> = vec![(
-            "packet-atom-hydration-base".to_string(),
-            vec![PacketCandidateTrailScan {
-                root: "base".into(),
-                direction: PacketGraphDirection::Outgoing,
-                depth: 2,
-                edge_kinds: vec![EdgeKind::MEMBER, EdgeKind::USAGE, EdgeKind::IMPORT],
-                truncated: false,
-                coverage_edge_ids: vec![
-                    EdgeId("e5".into()),
-                    EdgeId("e11".into()),
-                    EdgeId("e4".into()),
-                    EdgeId("e10".into()),
-                ],
-            }],
-        )];
-
-        let protection = packet_partial_atom_protection_with_planned(
-            &formulas,
-            &answer,
-            &coverage_extras,
-            &planned,
-            &ledger,
-        );
-
-        // The structure group proved: every bound carrier is protected.
-        for carrier in [
-            "entry", "vars", "var-node", "base", "sb", "anim", "kf", "sa",
-        ] {
-            assert!(
-                protection
-                    .carrier_node_ids
-                    .iter()
-                    .any(|node_id| node_id.0 == carrier),
-                "carrier {carrier} must be protected: {:?}",
-                protection.carrier_node_ids
-            );
-        }
-        let sb_cover = protection
-            .carrier_atom_cover
-            .iter()
-            .find(|(node_id, _)| node_id.0 == "sb")
-            .map(|(_, atoms)| atoms.clone())
-            .expect("sb atom cover");
-        assert!(sb_cover.contains(&ProofAtomId::C3));
-        // Discharged typed facts are protected...
-        for edge in ["e1", "e2", "e3", "e4", "e5", "e6", "e7", "e8", "e9"] {
-            assert!(
-                protection.edge_ids.iter().any(|edge_id| edge_id.0 == edge),
-                "proof edge {edge} must be protected: {:?}",
-                protection.edge_ids
-            );
-        }
-        // ...AND the covering scan's narrowed recorded set, including edges
-        // that are not proof facts — losing either to a cap would void C3's
-        // coverage at finalize.
-        for edge in ["e10", "e11"] {
-            assert!(
-                protection.edge_ids.iter().any(|edge_id| edge_id.0 == edge),
-                "narrowed scan-coverage edge {edge} must be protected: {:?}",
-                protection.edge_ids
-            );
-        }
-    }
-
-    /// The selection step is a deterministic weighted set cover: snapshot
-    /// carriers keep their priority and order, the best-covering partial
-    /// carrier comes next, and the leftovers fill by existing citation rank.
-    #[test]
-    fn protected_carrier_selection_orders_by_atom_cover_then_rank() {
-        let mut answer = packet_answer_fixture(LOG_HANDLER_QUESTION, Vec::new());
-        answer.citations = vec![
-            test_packet_citation("rank-zero", "src/a.php", 0.9),
-            test_packet_citation("wide-cover", "src/b.php", 0.8),
-            test_packet_citation("narrow-cover", "src/c.php", 0.7),
-            test_packet_citation("tail-carrier", "src/d.php", 0.6),
-        ];
-        let partial = PacketPartialAtomProtection {
-            carrier_node_ids: vec![
-                NodeId("narrow-cover".into()),
-                NodeId("wide-cover".into()),
-                NodeId("tail-carrier".into()),
-            ],
-            edge_ids: vec![EdgeId("edge-b".into())],
-            carrier_atom_cover: vec![
-                (
-                    NodeId("narrow-cover".into()),
-                    BTreeSet::from([ProofAtomId::M3]),
-                ),
-                (
-                    NodeId("wide-cover".into()),
-                    BTreeSet::from([ProofAtomId::M2, ProofAtomId::M3]),
-                ),
-                (NodeId("tail-carrier".into()), BTreeSet::new()),
-            ],
-        };
-        let snapshot_carriers = [NodeId("rank-zero".into())];
-        let snapshot_edges = [EdgeId("edge-a".into())];
-        let (ordered, edges) = select_protected_obligation_carriers(
-            &answer,
-            &snapshot_carriers,
-            &snapshot_edges,
-            &partial,
-        );
-        assert_eq!(
-            ordered
-                .iter()
-                .map(|node_id| node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["rank-zero", "wide-cover", "narrow-cover", "tail-carrier"],
-            "snapshot first, then greedy cover, then rank-ordered tail"
-        );
-        assert_eq!(
-            edges,
-            vec![EdgeId("edge-a".into()), EdgeId("edge-b".into())],
-            "snapshot edges keep priority over partial-atom edges"
-        );
-        // Determinism.
-        let (again, _) = select_protected_obligation_carriers(
-            &answer,
-            &snapshot_carriers,
-            &snapshot_edges,
-            &partial,
-        );
-        assert_eq!(ordered, again);
-    }
-
     #[test]
     fn repository_evidence_material_nodes_survive_packet_cap() {
         let question = "Trace Alpha::run calling Beta::finish";
@@ -10165,12 +8849,9 @@ mod tests {
 
         let snapshot_nodes = evidence_plan.material_node_ids.clone();
         let snapshot_edges = evidence_plan.material_edge_ids.clone();
-        let partial = PacketPartialAtomProtection::default();
         let (protected_nodes, protected_edges) = select_protected_obligation_carriers(
-            &answer,
             &snapshot_nodes,
             &snapshot_edges,
-            &partial,
         );
         let limits = PacketBudgetLimitsDto {
             max_anchors: 4,
@@ -10208,347 +8889,5 @@ mod tests {
             }),
             "material repository-evidence edges must survive capping"
         );
-    }
-
-    /// The extras builder enforces the evidence-completeness obligation over
-    /// the NARROWED coverage sets (F3 finding 3): a scan loses its coverage
-    /// only when a RECORDED edge — an absence subject or a depth-2 MEMBER
-    /// witness — left the live graphs (negative first); an INCIDENTAL
-    /// enumerated edge capped out of the graphs (the IMPORT edge here, absent
-    /// from the live artifact entirely) does not void it. Per-edge coverage
-    /// comes from untruncated scans only, and dropping the whole artifact
-    /// drops its scans.
-    #[test]
-    fn extras_builder_refuses_scans_whose_enumeration_lost_edges() {
-        use crate::agent::packet_candidate::{
-            PacketAtomHydrationSpec, PacketCandidateTrailScan, PacketGraphDirection,
-            PacketProofSession,
-        };
-
-        let session = PacketProofSession::new(PacketAtomHydrationSpec::default());
-        session.record_artifact_scans(
-            "artifact-live",
-            &[
-                PacketCandidateTrailScan {
-                    root: "1".into(),
-                    direction: PacketGraphDirection::Outgoing,
-                    depth: 2,
-                    edge_kinds: vec![EdgeKind::MEMBER, EdgeKind::USAGE, EdgeKind::IMPORT],
-                    truncated: false,
-                    coverage_edge_ids: vec![EdgeId("101".into()), EdgeId("103".into())],
-                },
-                PacketCandidateTrailScan {
-                    root: "1".into(),
-                    direction: PacketGraphDirection::Incoming,
-                    depth: 2,
-                    edge_kinds: vec![EdgeKind::MEMBER, EdgeKind::USAGE, EdgeKind::IMPORT],
-                    truncated: false,
-                    // 999 was enumerated but never merged / later capped out.
-                    coverage_edge_ids: vec![EdgeId("102".into()), EdgeId("999".into())],
-                },
-                PacketCandidateTrailScan {
-                    root: "1".into(),
-                    direction: PacketGraphDirection::Incoming,
-                    depth: 1,
-                    edge_kinds: vec![EdgeKind::MEMBER],
-                    truncated: true,
-                    coverage_edge_ids: vec![EdgeId("101".into())],
-                },
-            ],
-        );
-        session.record_artifact_scans(
-            "artifact-dropped",
-            &[PacketCandidateTrailScan {
-                root: "7".into(),
-                direction: PacketGraphDirection::Outgoing,
-                depth: 1,
-                edge_kinds: vec![EdgeKind::USAGE],
-                truncated: false,
-                coverage_edge_ids: vec![EdgeId("101".into())],
-            }],
-        );
-
-        let mut answer = packet_answer_fixture(LOG_HANDLER_QUESTION, Vec::new());
-        // The incidental IMPORT edge 102 the trails also enumerated has been
-        // capped out of the live graphs — it is NOT in any recorded coverage
-        // set, so it must not void the outgoing scan (F3 finding 3).
-        answer.graphs = vec![uml_artifact(
-            "artifact-live",
-            "1",
-            vec![
-                typed_graph_node("1", codestory_contracts::api::NodeKind::FILE),
-                typed_graph_node("3", codestory_contracts::api::NodeKind::CONSTANT),
-                typed_graph_node("6", codestory_contracts::api::NodeKind::VARIABLE),
-            ],
-            vec![
-                typed_graph_edge("101", "1", "3", EdgeKind::MEMBER, None, None),
-                typed_graph_edge("103", "3", "6", EdgeKind::USAGE, None, None),
-            ],
-        )];
-
-        let extras = build_packet_proof_evidence_extras(&answer, &session, Vec::new());
-        assert_eq!(
-            extras.trail_scans.len(),
-            2,
-            "the coverage-incomplete scan and the dropped artifact's scan must be refused, \
-             while the incidental-edge drop keeps the outgoing scan attached: {extras:?}"
-        );
-        assert!(extras.trail_scans.iter().all(|scan| matches!(
-            scan,
-            TrailCoverage::Scanned { root, .. } if root.0 == "1"
-        )));
-        assert!(
-            extras.trail_scans.iter().any(|scan| matches!(
-                scan,
-                TrailCoverage::Scanned {
-                    depth: 2,
-                    truncated: false,
-                    ..
-                }
-            )),
-            "the narrowed outgoing scan survives the incidental IMPORT drop: {extras:?}"
-        );
-        // Per-edge coverage only from the untruncated complete scan.
-        assert!(extras.edge_coverage.contains_key(&EdgeId("101".into())));
-        assert!(extras.edge_coverage.contains_key(&EdgeId("103".into())));
-        assert!(
-            !extras.edge_coverage.contains_key(&EdgeId("102".into())),
-            "the incomplete incoming scan must not attach coverage"
-        );
-        let Some(TrailCoverage::Scanned { truncated, .. }) =
-            extras.edge_coverage.get(&EdgeId("101".into()))
-        else {
-            panic!("expected scanned coverage");
-        };
-        assert!(
-            !truncated,
-            "edge coverage must come from the untruncated scan, not the truncated one"
-        );
-
-        // The anchored receipts ride through unchanged.
-        let anchored = vec![VerifiedSourceAspectReceipt {
-            kind: SourceAspectKind::VerifiedCarrierRange,
-            owner: NodeId("1".into()),
-            symbol_id: Some(NodeId("3".into())),
-            start_line: Some(5),
-            end_line: Some(9),
-            atom_anchor: Some(ProofAtomId::C2),
-        }];
-        let extras = build_packet_proof_evidence_extras(&answer, &session, anchored.clone());
-        assert_eq!(extras.anchored_receipts, anchored);
-    }
-
-    /// R4 planning: provisional anchors are derived only for the carriers the
-    /// formula atoms name — the C2 variable, the C4 keyframe, and the C1
-    /// import-statement window — never for unrelated nodes, and nodes
-    /// without a declaration line are skipped (fail closed).
-    #[test]
-    fn planned_anchor_candidates_cover_only_atom_named_carriers() {
-        let css_requirements = Vec::new();
-        let formulas = packet_flow_proof_formulas(&css_requirements);
-        assert!(
-            !formulas.is_empty(),
-            "css question must carry the C formula"
-        );
-
-        let mut answer = packet_answer_fixture("css", Vec::new());
-        answer.graphs = vec![uml_artifact(
-            "css-artifact",
-            "entry",
-            vec![
-                typed_graph_node("entry", codestory_contracts::api::NodeKind::FILE),
-                typed_graph_node("vars", codestory_contracts::api::NodeKind::FILE),
-                typed_graph_node("var-node", codestory_contracts::api::NodeKind::VARIABLE),
-                typed_graph_node("keyframe", codestory_contracts::api::NodeKind::FUNCTION),
-                typed_graph_node("stmt", codestory_contracts::api::NodeKind::MODULE),
-                typed_graph_node("unrelated", codestory_contracts::api::NodeKind::CLASS),
-            ],
-            vec![
-                typed_graph_edge("m-var", "vars", "var-node", EdgeKind::MEMBER, None, None),
-                typed_graph_edge("m-key", "anim", "keyframe", EdgeKind::MEMBER, None, None),
-                typed_graph_edge("m-stmt", "entry", "stmt", EdgeKind::MEMBER, None, None),
-                typed_graph_edge(
-                    "m-unrelated",
-                    "entry",
-                    "unrelated",
-                    EdgeKind::MEMBER,
-                    None,
-                    None,
-                ),
-                typed_graph_edge(
-                    "m-lineless",
-                    "vars",
-                    "lineless",
-                    EdgeKind::MEMBER,
-                    None,
-                    None,
-                ),
-            ],
-        )];
-        // `lineless` is VARIABLE-kind but has no declaration line.
-        if let GraphArtifactDto::Uml { graph, .. } = &mut answer.graphs[0] {
-            graph.nodes.push(typed_graph_node(
-                "lineless",
-                codestory_contracts::api::NodeKind::VARIABLE,
-            ));
-        }
-        let lines: HashMap<&str, u32> = [
-            ("var-node", 3),
-            ("keyframe", 12),
-            ("stmt", 2),
-            ("unrelated", 40),
-        ]
-        .into_iter()
-        .collect();
-        let planned = planned_atom_anchor_candidates_with_lines(&answer, &formulas, |node_id| {
-            lines.get(node_id.0.as_str()).copied()
-        });
-
-        let planned_keys = planned
-            .iter()
-            .map(|anchor| {
-                (
-                    anchor.atom,
-                    anchor.owner.0.as_str(),
-                    anchor.symbol.0.as_str(),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert!(planned_keys.contains(&(ProofAtomId::C2, "var-node", "var-node")));
-        assert!(planned_keys.contains(&(ProofAtomId::C4, "keyframe", "keyframe")));
-        assert!(planned_keys.contains(&(ProofAtomId::C1, "entry", "stmt")));
-        assert!(
-            !planned_keys
-                .iter()
-                .any(|(_, owner, symbol)| *owner == "unrelated" || *symbol == "unrelated"),
-            "a CLASS member is not an atom-named carrier: {planned_keys:?}"
-        );
-        assert!(
-            !planned_keys
-                .iter()
-                .any(|(_, _, symbol)| *symbol == "lineless"),
-            "a node without a declaration line cannot be anchored: {planned_keys:?}"
-        );
-        for anchor in &planned {
-            assert_eq!(anchor.receipt.atom_anchor, Some(anchor.atom));
-            assert_eq!(anchor.receipt.start_line, Some(anchor.line));
-        }
-    }
-
-    /// R4 verification shares the carrier-source budgets and fails closed:
-    /// negative first — a window not starting at the anchored declaration
-    /// line, a failed read, and an over-budget window all yield NO receipt
-    /// (with budget drops counted for the step-trace annotation); a lawful
-    /// window yields one anchored receipt, one rendered entry, and one
-    /// SourceRead step.
-    #[test]
-    fn anchor_verification_shares_budgets_and_fails_closed_on_dishonest_windows() {
-        let planned = |atom: ProofAtomId, node: &str, line: u32| PlannedAtomAnchor {
-            atom,
-            owner: NodeId(node.to_string()),
-            symbol: NodeId(node.to_string()),
-            line,
-            receipt: VerifiedSourceAspectReceipt {
-                kind: SourceAspectKind::VerifiedCarrierRange,
-                owner: NodeId(node.to_string()),
-                symbol_id: Some(NodeId(node.to_string())),
-                start_line: Some(line),
-                end_line: Some(line),
-                atom_anchor: Some(atom),
-            },
-        };
-        let lawful = planned(ProofAtomId::C2, "var-node", 3);
-        let misaligned = planned(ProofAtomId::C4, "keyframe", 12);
-        let unreadable = planned(ProofAtomId::C1, "stmt", 2);
-        let selected = vec![&lawful, &misaligned, &unreadable];
-        let limits = packet_budget_limits(PacketBudgetModeDto::Compact);
-        let mut rendered = String::new();
-        let mut steps = Vec::new();
-        let mut outcome = PacketAtomAnchorOutcome {
-            receipts: Vec::new(),
-            planned: 0,
-            budget_dropped: 0,
-        };
-        let mut source_support = Vec::new();
-        verify_planned_atom_anchors(
-            &selected,
-            &HashMap::new(),
-            &limits,
-            &mut rendered,
-            &mut steps,
-            &mut source_support,
-            &mut outcome,
-            |anchor| match anchor.symbol.0.as_str() {
-                // The lawful window starts exactly at the declaration line.
-                "var-node" => Some((
-                    "styles/_vars.css".to_string(),
-                    "  3 | --hero-color: #fff;\n  4 | more".to_string(),
-                )),
-                // A window whose first numbered line is NOT the anchor line.
-                "keyframe" => Some((
-                    "styles/animate.css".to_string(),
-                    " 14 | from {}\n 15 | to {}".to_string(),
-                )),
-                // The read fails.
-                _ => None,
-            },
-        );
-        assert_eq!(outcome.planned, 3);
-        assert_eq!(outcome.receipts.len(), 1, "{outcome:?}");
-        let receipt = &outcome.receipts[0];
-        assert_eq!(receipt.atom_anchor, Some(ProofAtomId::C2));
-        assert_eq!(
-            receipt.symbol_id.as_ref().map(|id| id.0.as_str()),
-            Some("var-node")
-        );
-        assert_eq!((receipt.start_line, receipt.end_line), (Some(3), Some(4)));
-        assert_eq!(steps.len(), 1, "one SourceRead step per verified anchor");
-        assert!(rendered.contains("(atom-anchored)"));
-        assert_eq!(
-            outcome.budget_dropped, 0,
-            "failed reads are fail-closed, not budget drops"
-        );
-        // F3 finding 9: the verified window rides packet.support as a
-        // structured SourceRange unit — one per verified anchor, none for
-        // fail-closed ones.
-        assert_eq!(source_support.len(), 1, "{source_support:?}");
-        let unit = &source_support[0];
-        assert_eq!(unit.id, "atom-anchor:C2:var-node:3");
-        assert_eq!(unit.kind, SupportUnitKindDto::SourceRange);
-        assert_eq!(unit.symbol_id.as_deref(), Some("var-node"));
-        assert_eq!((unit.start_line, unit.end_line), (Some(3), Some(4)));
-        assert!(
-            unit.snippet
-                .as_deref()
-                .is_some_and(|snippet| snippet.contains("--hero-color"))
-        );
-
-        // Snippet-count budget: with the step budget exhausted every anchor
-        // is dropped and counted, and nothing is read at all.
-        let exhausted = PacketBudgetLimitsDto {
-            max_snippets: 0,
-            ..limits.clone()
-        };
-        let mut rendered = String::new();
-        let mut steps = Vec::new();
-        let mut source_support = Vec::new();
-        let mut outcome = PacketAtomAnchorOutcome {
-            receipts: Vec::new(),
-            planned: 0,
-            budget_dropped: 0,
-        };
-        verify_planned_atom_anchors(
-            &selected,
-            &HashMap::new(),
-            &exhausted,
-            &mut rendered,
-            &mut steps,
-            &mut source_support,
-            &mut outcome,
-            |_| panic!("an exhausted snippet budget must not read source"),
-        );
-        assert_eq!(outcome.budget_dropped, 3);
-        assert!(outcome.receipts.is_empty() && rendered.is_empty() && steps.is_empty());
-        assert!(source_support.is_empty());
     }
 }

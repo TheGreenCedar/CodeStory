@@ -593,7 +593,7 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
 /// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
 /// that, so adding a module to the crate without extending this list fails
 /// loudly instead of silently escaping every contract built on it.
-const AGENT_PLANNING_MODULES: [&str; 29] = [
+const AGENT_PLANNING_MODULES: [&str; 28] = [
     "citation.rs",
     "packet_citations.rs",
     "packet_claim_profile_registry.rs",
@@ -613,7 +613,6 @@ const AGENT_PLANNING_MODULES: [&str; 29] = [
     "packet_plan.rs",
     "packet_probes.rs",
     "packet_profile_telemetry.rs",
-    "packet_proof_atoms.rs",
     "packet_required_probes.rs",
     "packet_scoring.rs",
     "packet_terms.rs",
@@ -635,10 +634,7 @@ const AGENT_PLANNING_MODULES: [&str; 29] = [
 ///   `agent_eval_hooks_stay_on_for_runtime_tests_and_off_for_product_builds`
 ///   pins how it compiles. Listing it as a planning module would hand the
 ///   import-DAG guard a file no product build links.
-/// - `indexed_source_call_path_v1.rs` is the private v3 proof kernel. Public
-///   callers reach it only through the sealed exact-verifier facades.
-const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 3] =
-    ["lib.rs", "eval_probes.rs", "indexed_source_call_path_v1.rs"];
+const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 2] = ["lib.rs", "eval_probes.rs"];
 
 #[test]
 fn packet_execution_plan_v3_is_the_public_evidence_planning_boundary() {
@@ -934,24 +930,31 @@ fn public_exact_verifier_uses_the_revision_native_transport_once() {
 #[test]
 fn public_exact_verifier_compiles_through_the_sealed_proof_facades() {
     const SUPPORT_FEATURE: &str = "proof-qualification-support";
-    for manifest_path in [
-        "crates/codestory-agent/Cargo.toml",
-        "crates/codestory-runtime/Cargo.toml",
-    ] {
-        let crate_manifest = manifest(manifest_path);
-        let features = crate_manifest
-            .get("features")
-            .and_then(Value::as_table)
-            .expect("exact verifier features");
-        assert!(
-            features
-                .get("default")
-                .is_some_and(|default| default.to_string().contains(SUPPORT_FEATURE)),
-            "{manifest_path} must compile the sealed proof facade for the public verifier"
-        );
-    }
+    let agent_manifest = manifest("crates/codestory-agent/Cargo.toml");
+    let agent_features = agent_manifest
+        .get("features")
+        .and_then(Value::as_table)
+        .expect("agent features");
+    assert!(
+        !agent_features
+            .get("default")
+            .is_some_and(|default| default.to_string().contains(SUPPORT_FEATURE)),
+        "the proof kernel must not compile in the default agent crate"
+    );
+    let runtime_manifest = manifest("crates/codestory-runtime/Cargo.toml");
+    let runtime_features = runtime_manifest
+        .get("features")
+        .and_then(Value::as_table)
+        .expect("runtime features");
+    assert!(
+        runtime_features
+            .get("default")
+            .is_some_and(|default| default.to_string().contains(SUPPORT_FEATURE)),
+        "crates/codestory-runtime/Cargo.toml must compile the sealed proof facade for the public verifier"
+    );
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(runtime_lib.contains("pub mod proof_qualification_support;"));
+    assert!(runtime_lib.contains("mod call_path_kernel;"));
     let cli = read_source_tree("crates/codestory-cli/src");
     assert!(cli.contains("run_observed_call_path_public_operation"));
     assert!(cli.contains("run_translation_unknown_public_operation"));
@@ -1011,12 +1014,13 @@ process.stdout.write(JSON.stringify(
 
 #[test]
 fn proof_qualification_facades_seal_the_kernel_and_preserve_transport_errors() {
-    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(
-        agent_lib.contains("mod indexed_source_call_path_v1;")
-            && !agent_lib.contains("pub mod indexed_source_call_path_v1;"),
-        "proof qualification must not make the dark agent kernel directly reachable"
+        runtime_lib.contains("mod call_path_kernel;")
+            && !runtime_lib.contains("pub mod call_path_kernel;"),
+        "proof qualification must not make the dark runtime kernel directly reachable"
     );
+    let facade = read("crates/codestory-runtime/src/proof_qualification_support.rs");
     for required in [
         "AdmittedRawCallEdge",
         "BuiltCallPathFacts",
@@ -1025,8 +1029,8 @@ fn proof_qualification_facades_seal_the_kernel_and_preserve_transport_errors() {
         "project_internal_call_path_result",
     ] {
         assert!(
-            agent_lib.contains(required),
-            "the sealed agent facade must name the runtime-required {required} API explicitly"
+            facade.contains(required),
+            "the sealed runtime facade must name the required {required} API explicitly"
         );
     }
 
@@ -1057,38 +1061,35 @@ fn runtime_test_support_never_reaches_the_private_agent_kernel() {
     for surface in [
         "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
         "crates/codestory-runtime/src/services.rs",
+        "crates/codestory-runtime/src/proof_qualification_support.rs",
     ] {
         let source = read(surface);
         assert!(
-            !source.contains("codestory_agent::indexed_source_call_path_v1"),
-            "{surface} reaches the private agent kernel instead of its explicit test-support facade"
+            !source.contains("codestory_agent::indexed_source_call_path_v1")
+                && !source.contains("codestory_agent::proof_qualification"),
+            "{surface} reaches the removed agent proof kernel"
         );
     }
     let agent_lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
-        agent_lib.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod proof_qualification_test_support"
-        ),
-        "runtime tests need an explicit test-support-only facade rather than kernel access"
+        !agent_lib.contains("mod indexed_source_call_path_v1;")
+            && !agent_lib.contains("proof_qualification_support"),
+        "the default agent crate must not host the proof kernel"
     );
 }
 
 #[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
-    let lib = read("crates/codestory-agent/src/lib.rs");
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(
-        lib.contains(
-            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\n#[doc(hidden)]\nmod indexed_source_call_path_v1;"
+        runtime_lib.contains(
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod call_path_kernel;"
         ),
         "the dark call-path kernel must remain private behind test or sealed qualification support"
     );
     assert!(
-        !lib.contains("pub mod indexed_source_call_path_v1;"),
+        !runtime_lib.contains("pub mod call_path_kernel;"),
         "the dark call-path kernel must never become a qualification-visible module"
-    );
-    assert!(
-        AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"indexed_source_call_path_v1.rs"),
-        "the dark proof kernel must not be counted as a production packet-planning module"
     );
 
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
@@ -1120,14 +1121,47 @@ fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
 }
 
 #[test]
-fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
-    let module = production_source(&read(
-        "crates/codestory-agent/src/indexed_source_call_path_v1.rs",
-    ));
-    let mut outside_allowed_regions = module.clone();
+fn call_path_shared_types_live_in_contracts() {
+    let contracts = read("crates/codestory-contracts/src/call_path.rs");
     for item in [
         "pub struct UnvalidatedCallPathContract",
-        "impl UnvalidatedCallPathContract",
+        "pub struct ClauseAnchor",
+        "pub enum ClauseClassification",
+        "pub enum ProofContractField",
+        "pub struct UnvalidatedCallPathSpec",
+        "pub struct ValidatedCallPathContract",
+        "pub struct ProofHashes",
+        "pub enum InternalProjection",
+    ] {
+        assert!(
+            contracts.contains(item),
+            "call-path shared type {item} must live in codestory-contracts"
+        );
+    }
+
+    let kernel = read("crates/codestory-runtime/src/call_path_kernel.rs");
+    assert!(
+        kernel.contains("pub use codestory_contracts::call_path::{"),
+        "the kernel must re-export shared call-path types from contracts"
+    );
+    for item in [
+        "pub struct UnvalidatedCallPathContract",
+        "pub struct ValidatedCallPathContract",
+        "pub struct ProofHashes",
+        "pub enum InternalProjection",
+    ] {
+        assert!(
+            !kernel.contains(item),
+            "shared call-path type {item} must not be redefined in runtime"
+        );
+    }
+}
+
+#[test]
+fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
+    let module = production_source(&read("crates/codestory-runtime/src/call_path_kernel.rs"));
+    let mut outside_allowed_regions = module.clone();
+    for item in [
         "fn validate_contract_with_domain",
         "fn validate_and_normalize_clauses",
         "fn classify_translation_gaps",
@@ -1144,7 +1178,7 @@ fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
 #[test]
 fn exact_resolution_facts_are_a_one_way_proof_overlay() {
     for proof_module in [
-        "crates/codestory-agent/src/indexed_source_call_path_v1.rs",
+        "crates/codestory-runtime/src/call_path_kernel.rs",
         "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
     ] {
         let source = read(proof_module);
@@ -1165,10 +1199,7 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
         ),
         (
             "packet planner",
-            read_source_tree("crates/codestory-agent/src").replace(
-                &read("crates/codestory-agent/src/indexed_source_call_path_v1.rs"),
-                "",
-            ),
+            read_source_tree("crates/codestory-agent/src"),
         ),
         (
             "search",
@@ -1191,6 +1222,7 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
                     "index_full.rs",
                     "index_incremental.rs",
                     "indexed_source_call_path_v1.rs",
+                    "call_path_kernel.rs",
                     "proof_qualification_support.rs",
                     "semantic_republish.rs",
                     "tests.rs",
@@ -1560,18 +1592,6 @@ fn agent_planning_import_graph_stays_acyclic() {
             .is_some_and(|imports| imports.contains("packet_required_probes")),
         "planning import scan lost the known packet_obligations -> packet_required_probes edge; \
          the DAG guard is no longer reading real imports"
-    );
-
-    // packet_proof_atoms is the stage-1 typed-proof leaf: its matcher consumes
-    // codestory_contracts types only, so its release-code planning-import set
-    // must stay empty. A sibling import added there must fail here by name,
-    // not only as an eventual cycle somewhere else in the DAG.
-    assert_eq!(
-        graph.get("packet_proof_atoms").map(BTreeSet::len),
-        Some(0),
-        "packet_proof_atoms must stay a leaf planning module: it may import contracts types \
-         only, never a crate::/super:: planning sibling; found imports: {:?}",
-        graph.get("packet_proof_atoms")
     );
 
     if let Some(cycle) = find_planning_import_cycle(&graph) {

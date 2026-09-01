@@ -93,6 +93,14 @@ pub fn embedded_model_directory(cache_root: &Path, digest: &str) -> PathBuf {
 /// rather than deletes, so the name is an owned identity like any other.
 pub const DERIVED_RESET_QUARANTINE_DIR: &str = "derived-reset-quarantine";
 
+/// Publication pointer, generations, and staging tree beside one storage file.
+pub const CORE_PUBLICATION_DIRECTORY: &str = "core";
+
+/// Root holding the publication pointer and immutable generations.
+pub fn core_publication_root(storage_path: &Path) -> PathBuf {
+    cache_root_for(storage_path).join(CORE_PUBLICATION_DIRECTORY)
+}
+
 fn cache_root_for(storage_path: &Path) -> &Path {
     storage_path
         .parent()

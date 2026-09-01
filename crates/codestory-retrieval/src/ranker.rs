@@ -649,6 +649,10 @@ mod tests {
         let features = classify_query("UserService class method");
         let mut structural = CandidateHit::lexical_stub("schema/users.sql", 0.99);
         let mut graph = CandidateHit::lexical_stub("src/user_service.rs", 0.8);
+        // Overlap is identity on the indexed symbol, not a prompt role taxonomy
+        // matching path stems such as `users`.
+        graph.symbol_name = Some("UserService".to_string());
+        graph.node_id = Some("42".to_string());
         structural.source = CandidateSource::Lexical;
         graph.source = CandidateSource::Lexical;
         let ranked = rank_candidates(&features, vec![structural, graph]);

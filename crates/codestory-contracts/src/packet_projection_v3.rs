@@ -352,6 +352,8 @@ pub enum PacketProjectionV3Dto {
         gaps: BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3>,
         continuation: Option<ContinuationStateV3Dto>,
         diagnostics: DiagnosticsCapabilityV3Dto,
+        #[serde(default)]
+        answer_sufficiency: crate::compilation::AnswerSufficiencyV1,
     },
     BudgetExceeded {
         schema_version: u16,
@@ -363,6 +365,8 @@ pub enum PacketProjectionV3Dto {
         gaps: BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3>,
         maximum_bytes: u64,
         required_complete_bytes: u64,
+        #[serde(default)]
+        answer_sufficiency: crate::compilation::AnswerSufficiencyV1,
     },
 }
 
@@ -654,6 +658,7 @@ mod tests {
             gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         };
         let context = ContextProjectionV3Dto {
             kind: ContextProjectionKindV3Dto::Complete,
@@ -708,6 +713,7 @@ mod tests {
             gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         };
         let budget_exceeded = PacketProjectionV3Dto::BudgetExceeded {
             schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
@@ -719,6 +725,7 @@ mod tests {
             gaps: list(vec![gap(GapKindV3Dto::OutputBudgetExceeded)]),
             maximum_bytes: 16_384,
             required_complete_bytes: 16_385,
+            answer_sufficiency: Default::default(),
         };
         let context = ContextProjectionV3Dto {
             kind: ContextProjectionKindV3Dto::Complete,
@@ -825,6 +832,7 @@ mod tests {
             gaps: list(Vec::new()),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         })
         .expect("serialize packet root");
         assert_eq!(packet_json["kind"], "complete");

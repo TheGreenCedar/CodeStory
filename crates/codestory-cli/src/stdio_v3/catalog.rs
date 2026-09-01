@@ -5,20 +5,22 @@ use super::{V3SurfaceSet, profile::McpRevisionV3};
 const VENDOR_SAFETY_KEY: &str = "com.thegreencedar.codestory/safety";
 const PROJECTION_ROWS_MAX_V3: usize = 256;
 const PROJECTION_REFERENCES_MAX_V3: usize = 256;
-/// The transport reads the document as UTF-8 bytes under an 8 KiB cap; the
-/// schema states the same bound in characters, which is never looser.
+/// The transport and MCP validator both enforce an 8 KiB UTF-8 byte cap.
+/// `maxLength` remains a character bound; `call_path` also rejects documents
+/// whose UTF-8 byte length exceeds that same 8 KiB limit.
 const PROOF_CALL_PATH_INPUT_MAX_CHARS_V3: usize =
     crate::prove_call_path::PROVE_CALL_PATH_INPUT_MAX_BYTES;
 const PROOF_CALL_PATH_GRAMMAR_DESCRIPTION_V3: &str = concat!(
     "A call-path/v1 document. Line-oriented, one contract per document:\n",
     "call-path/v1\n",
-    "start: crate::module::Alpha\n",
-    "step 1: direct call -> crate::module::Beta\n",
-    "step 2: direct call -> \"src/gamma.rs\"::Gamma\n",
-    "prohibit traversal through: crate::detail::Helper\n",
-    "exclude from projection: crate::test_support\n",
-    "Selectors are qualified names or \"path/to/file\"::Name. ",
-    "Steps are numbered consecutively from 1. ",
+    "from symbol \"app::start\" in \"src/app.rs\"\n",
+    "direct-call symbol \"service::load\" in \"src/service.rs\"\n",
+    "direct-call canonical \"store::read\"\n",
+    "prohibit-through symbol \"legacy::shim\"\n",
+    "exclude-from-projection symbol \"tracing::span\"\n",
+    "Exactly one from, one to six ordered direct-call lines, then zero to sixteen ",
+    "prohibit-through and exclude-from-projection lines. Selectors are ",
+    "symbol \"<qualified-name>\" [in \"<project-relative-path>\"] or canonical \"<id>\". ",
     "Any line the grammar cannot read is reported as an unresolved clause and ",
     "yields graph_disposition \"unknown\" rather than being skipped."
 );
@@ -53,7 +55,7 @@ fn proof_common_fields_v3(kind: &str) -> Vec<(&str, Value)> {
         ("kind", enum_schema_v3(&[kind])),
         ("schema_version", json!({"type":"integer","enum":[1]})),
         ("domain", enum_schema_v3(&["call-path/v1"])),
-        ("translation_status", enum_schema_v3(&["parser_derived"])),
+        ("translation_status", enum_schema_v3(&["host_supplied"])),
         (
             "graph_disposition",
             enum_schema_v3(&["proven", "refuted", "unknown"]),
@@ -1217,7 +1219,7 @@ mod tests {
             "kind": "complete",
             "schema_version": 1,
             "domain": "call-path/v1",
-            "translation_status": "parser_derived",
+            "translation_status": "host_supplied",
             "graph_disposition": "unknown",
             "runtime_execution_proven": false,
             "guard_version": "clause_guard_v1",
@@ -1240,7 +1242,7 @@ mod tests {
             "kind": "budget_exceeded",
             "schema_version": 1,
             "domain": "call-path/v1",
-            "translation_status": "parser_derived",
+            "translation_status": "host_supplied",
             "graph_disposition": "unknown",
             "runtime_execution_proven": false,
             "guard_version": "clause_guard_v1",

@@ -14,9 +14,9 @@ use codestory_contracts::api::{
     IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
     IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
     NodeDetailsRequest, NodeId, NodeKind, PACKET_PROBE_CONTRACT_VERSION, PacketBudgetModeDto,
-    PacketProbeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
-    ReadinessVerdictDto, SearchRepoTextMode, SearchRequest, StorageStatsDto, TrailCallerScope,
-    TrailDirection, TrailMode,
+    PacketProbeDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto,
+    SearchRepoTextMode, SearchRequest, StorageStatsDto, TrailCallerScope, TrailDirection,
+    TrailMode,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -2188,8 +2188,6 @@ fn project_stdio_tool_execution_v3(
                     .to_owned(),
                 budget: stdio_packet_budget(request)
                     .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
-                task_class: stdio_packet_task_class(request)
-                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
                 probes: stdio_packet_probes(request)
                     .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
                 extra_probes: stdio_packet_extra_probes(request)
@@ -3100,11 +3098,6 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
         &mut text,
         "question",
         packet.get("question").and_then(|value| value.as_str()),
-    );
-    append_packet_text_field(
-        &mut text,
-        "task_class",
-        packet.get("task_class").and_then(|value| value.as_str()),
     );
     text.push_str(REPO_CONTENT_BOUNDARY_LINE);
     text.push('\n');
@@ -4305,10 +4298,6 @@ fn handle_stdio_packet(
         Ok(budget) => budget,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    let task_class = match stdio_packet_task_class(request) {
-        Ok(task_class) => task_class,
-        Err(error) => return serde_json::json!({"error": error.to_string()}),
-    };
     let latency_budget_ms = match stdio_packet_latency_budget(request) {
         Ok(latency_budget_ms) => latency_budget_ms,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
@@ -4351,7 +4340,6 @@ fn handle_stdio_packet(
             publication,
             question,
             budget,
-            task_class,
             probes: &probes,
             extra_probes: &extra_probes,
             latency_budget_ms,
@@ -4373,7 +4361,6 @@ fn handle_stdio_packet(
         .packet(AgentPacketRequestDto {
             question: question.to_string(),
             budget,
-            task_class,
             probes,
             extra_probes,
             latency_budget_ms,
@@ -4478,7 +4465,6 @@ struct StdioPacketCacheKey {
     publication: StdioProductPublicationKey,
     question: String,
     budget: &'static str,
-    task_class: Option<&'static str>,
     probes: Vec<PacketProbeDto>,
     extra_probes: Vec<String>,
     latency_budget_ms: Option<u32>,
@@ -4553,7 +4539,6 @@ struct StdioPacketCacheKeyInput<'a> {
     publication: StdioProductPublicationKey,
     question: &'a str,
     budget: PacketBudgetModeDto,
-    task_class: Option<PacketTaskClassDto>,
     probes: &'a [PacketProbeDto],
     extra_probes: &'a [String],
     latency_budget_ms: Option<u32>,
@@ -4568,7 +4553,6 @@ fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCac
         publication: input.publication,
         question: input.question.to_string(),
         budget: stdio_packet_budget_label(input.budget),
-        task_class: input.task_class.map(stdio_packet_task_class_label),
         probes: input.probes.to_vec(),
         extra_probes: input.extra_probes.to_vec(),
         latency_budget_ms: input.latency_budget_ms,
@@ -4585,18 +4569,6 @@ fn stdio_packet_budget_label(budget: PacketBudgetModeDto) -> &'static str {
         PacketBudgetModeDto::Compact => "compact",
         PacketBudgetModeDto::Standard => "standard",
         PacketBudgetModeDto::Deep => "deep",
-    }
-}
-
-fn stdio_packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str {
-    match task_class {
-        PacketTaskClassDto::ArchitectureExplanation => "architecture_explanation",
-        PacketTaskClassDto::BugLocalization => "bug_localization",
-        PacketTaskClassDto::ChangeImpact => "change_impact",
-        PacketTaskClassDto::RouteTracing => "route_tracing",
-        PacketTaskClassDto::SymbolOwnership => "symbol_ownership",
-        PacketTaskClassDto::DataFlow => "data_flow",
-        PacketTaskClassDto::EditPlanning => "edit_planning",
     }
 }
 
@@ -4679,30 +4651,6 @@ fn stdio_packet_budget(request: &serde_json::Value) -> Result<PacketBudgetModeDt
             bail!("packet.budget must be one of tiny, compact, standard, or deep; got {value}")
         }
     }
-}
-
-fn stdio_packet_task_class(request: &serde_json::Value) -> Result<Option<PacketTaskClassDto>> {
-    let Some(task_class) = request
-        .pointer("/params/arguments/task_class")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-    let task_class = match task_class {
-        "architecture_explanation" => PacketTaskClassDto::ArchitectureExplanation,
-        "bug_localization" => PacketTaskClassDto::BugLocalization,
-        "change_impact" => PacketTaskClassDto::ChangeImpact,
-        "route_tracing" => PacketTaskClassDto::RouteTracing,
-        "symbol_ownership" => PacketTaskClassDto::SymbolOwnership,
-        "data_flow" => PacketTaskClassDto::DataFlow,
-        "edit_planning" => PacketTaskClassDto::EditPlanning,
-        value => bail!(
-            "packet.task_class must be one of architecture_explanation, bug_localization, change_impact, route_tracing, symbol_ownership, data_flow, or edit_planning; got {value}"
-        ),
-    };
-    Ok(Some(task_class))
 }
 
 fn stdio_packet_latency_budget(request: &serde_json::Value) -> Result<Option<u32>> {
@@ -8642,7 +8590,6 @@ mod tests {
             publication: product_publication(1),
             question,
             budget: PacketBudgetModeDto::Compact,
-            task_class: Some(PacketTaskClassDto::ArchitectureExplanation),
             probes: &[],
             extra_probes: &[],
             latency_budget_ms: Some(15_000),
@@ -9760,7 +9707,6 @@ version = "0.11.20"
         let text = stdio_packet_text(&json!({
             "packet_id": "packet-1",
             "question": "summarize repo docs",
-            "task_class": "architecture_explanation",
             "support": [{"id": "symbol:docs", "kind": "symbol_location", "summary": "Docs at README.md:1"}],
             "disposition": {
                 "kind": "supported",
@@ -10656,13 +10602,6 @@ version = "0.11.20"
             base,
             stdio_packet_cache_key(StdioPacketCacheKeyInput {
                 budget: PacketBudgetModeDto::Tiny,
-                ..base_packet_cache_key_input("Explain packet caching.")
-            })
-        );
-        assert_ne!(
-            base,
-            stdio_packet_cache_key(StdioPacketCacheKeyInput {
-                task_class: Some(PacketTaskClassDto::EditPlanning),
                 ..base_packet_cache_key_input("Explain packet caching.")
             })
         );
@@ -12369,8 +12308,8 @@ version = "0.11.20"
 
         let call_path = concat!(
             "call-path/v1\n",
-            "start: caller\n",
-            "step 1: direct call -> callee\n",
+            "from symbol \"caller\"\n",
+            "direct-call symbol \"callee\"\n",
         );
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut converged = None;
@@ -12418,7 +12357,9 @@ version = "0.11.20"
             (0, 0),
             "core-only verification must not start the embedding backend or finalize retrieval"
         );
-        let snapshot = activation.snapshot().expect("core-only activation snapshot");
+        let snapshot = activation
+            .snapshot()
+            .expect("core-only activation snapshot");
         assert_eq!(
             snapshot.capabilities.local_navigation,
             codestory_runtime::ActivationCapabilityState::Ready,

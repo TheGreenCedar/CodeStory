@@ -198,7 +198,6 @@ pub(in crate::app) fn packet_request_from_command(cmd: &PacketCommand) -> AgentP
     AgentPacketRequestDto {
         question: cmd.question.clone(),
         budget: cmd.budget.into(),
-        task_class: cmd.task_class.map(Into::into),
         probes: cmd.probes.clone(),
         extra_probes: cmd.extra_probes.clone(),
         latency_budget_ms: cmd.latency_budget_ms,
@@ -283,11 +282,6 @@ pub(in crate::app) fn render_packet_markdown(
         markdown,
         "budget: `{}`",
         packet_budget_mode_label(packet.budget.requested)
-    );
-    let _ = writeln!(
-        markdown,
-        "task_class: `{}`",
-        packet_task_class_label(packet.plan.task_class)
     );
     if packet.budget.truncated {
         let _ = writeln!(

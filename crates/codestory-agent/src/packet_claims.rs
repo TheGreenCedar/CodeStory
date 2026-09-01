@@ -6,12 +6,10 @@ use crate::packet_evidence::{
 use crate::packet_evidence_roles::{
     PacketEvidenceRole, packet_claim_key_for_citation, packet_evidence_role,
 };
-use crate::packet_plan::packet_rank_terms;
 use crate::packet_profile_telemetry::{PacketClaimSource, PacketClaimTelemetry};
 use crate::packet_scoring::{
     normalize_identifier, packet_claim_carry_rank, packet_display_path, sort_by_cached_rank_desc,
 };
-use crate::text::query_mentions_non_primary_source;
 use codestory_contracts::api::{
     AgentAnswerDto, AgentCitationDto, PacketClaimDto, PacketEvidenceResolutionDto,
     PacketEvidenceTierDto, PacketProofStatusDto,
@@ -53,16 +51,17 @@ pub fn packet_supported_claims_with_telemetry(
     let mut claims = Vec::new();
     let mut seen_claims = HashSet::new();
     let mut telemetry = PacketClaimTelemetry::default();
-    let rank_terms = packet_rank_terms(&answer.prompt);
-    let prefer_primary_sources = !query_mentions_non_primary_source(&answer.prompt);
+    // Disposition and claim ranking never inspect prompt tokens. Retrieval
+    // scores and citation identity already sit on the citation.
+    let rank_terms: &[String] = &[];
     let citations = answer.citations.clone();
 
     let before_role_claims = claims.len();
     append_ranked_citation_claims(
         &answer.prompt,
         &citations,
-        &rank_terms,
-        prefer_primary_sources,
+        rank_terms,
+        true,
         &mut claims,
         &mut seen_claims,
     );

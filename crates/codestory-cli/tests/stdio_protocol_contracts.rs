@@ -294,7 +294,7 @@ fn public_exact_proof_call_is_revision_native_and_keeps_uncertainty_successful()
             "{text_root}"
         );
         assert_eq!(text_root["domain"], "call-path/v1");
-        assert_eq!(text_root["translation_status"], "parser_derived");
+        assert_eq!(text_root["translation_status"], "host_supplied");
         assert_eq!(text_root["graph_disposition"], "proven");
         assert_eq!(text_root["runtime_execution_proven"], false);
         assert!(text_root.get("contract_interpretation").is_none());
@@ -380,7 +380,11 @@ fn public_exact_proof_call_is_revision_native_and_keeps_uncertainty_successful()
                 }
             }),
         );
-        assert_eq!(invalid.pointer("/error/code"), Some(&json!(-32602)), "{invalid}");
+        assert_eq!(
+            invalid.pointer("/error/code"),
+            Some(&json!(-32602)),
+            "{invalid}"
+        );
     }
     assert!(
         !fixture.cache_dir.path().join("search-generations").exists(),
@@ -670,7 +674,7 @@ fn verify_indexed_direct_calls_cli_keeps_file_stdin_parity_and_caps_before_parsi
         Some(&json!("unknown"))
     );
     assert_eq!(file_root["domain"], "call-path/v1");
-    assert_eq!(file_root["translation_status"], "parser_derived");
+    assert_eq!(file_root["translation_status"], "host_supplied");
     assert_eq!(file_root["graph_disposition"], "unknown");
     assert_eq!(file_root["runtime_execution_proven"], false);
 
@@ -1429,7 +1433,7 @@ fn exact_proof_arguments(fixture: &StdioFixture) -> Value {
 /// clause classification or an internal node identity; the parser derives both.
 fn exact_proof_document(fixture: &StdioFixture) -> String {
     format!(
-        "call-path/v1\nstart: {}\nstep 1: direct call -> {}\n",
+        "call-path/v1\nfrom symbol \"{}\"\ndirect-call symbol \"{}\"\n",
         proof_qualified_name(fixture, "exact_caller"),
         proof_qualified_name(fixture, "exact_callee"),
     )
@@ -1438,7 +1442,7 @@ fn exact_proof_document(fixture: &StdioFixture) -> String {
 /// A syntactically complete contract naming symbols the publication does not
 /// contain, so validation succeeds and the graph answer is `unknown`.
 fn unknown_proof_document() -> &'static str {
-    "call-path/v1\nstart: crate::missing::start\nstep 1: direct call -> crate::missing::target\n"
+    "call-path/v1\nfrom symbol \"crate::missing::start\"\ndirect-call symbol \"crate::missing::target\"\n"
 }
 
 /// True when activation terminated instead of staying retryable.
@@ -3001,18 +3005,9 @@ fn tool_catalog_input_schemas_capture_stable_arguments() {
         Some(&json!("standard")),
         "packet.budget should document the stdio default: {packet}"
     );
-    assert_schema_enum_values(
-        packet,
-        "/properties/task_class/enum",
-        &[
-            "architecture_explanation",
-            "bug_localization",
-            "change_impact",
-            "route_tracing",
-            "symbol_ownership",
-            "data_flow",
-            "edit_planning",
-        ],
+    assert!(
+        packet.pointer("/properties/task_class").is_none(),
+        "packet.task_class must be absent from the public MCP contract: {packet}"
     );
     assert!(
         packet.pointer("/properties/include_evidence").is_none(),

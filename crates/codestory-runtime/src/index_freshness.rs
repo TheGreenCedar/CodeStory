@@ -1044,13 +1044,17 @@ pub(super) fn open_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
 }
 
 pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
-    if !path.is_file() {
-        return Err(ApiError::new(
-            "project_unavailable",
-            "no complete project storage is available",
-        ));
-    }
-    let schema = Storage::database_schema_version(path).map_err(|error| {
+    let resolved = match codestory_store::resolve_core_database_path(path) {
+        Ok(resolved) => resolved,
+        Err(_) if path.is_file() => path.to_path_buf(),
+        Err(_) => {
+            return Err(ApiError::new(
+                "project_unavailable",
+                "no complete project storage is available",
+            ));
+        }
+    };
+    let schema = Storage::database_schema_version(&resolved).map_err(|error| {
         ApiError::internal(format!("Failed to inspect storage schema: {error}"))
     })?;
     if schema != CURRENT_SCHEMA_VERSION {
@@ -1062,6 +1066,7 @@ pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, Api
         ));
     }
     Storage::open_read_only(path)
+        .or_else(|_| Storage::open_read_only(&resolved))
         .map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
 }
 

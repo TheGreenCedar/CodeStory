@@ -39,7 +39,6 @@ pub fn real_projection_fixtures(
     let request = AgentPacketRequestDto {
         question: "sealed evidence-only conformance".to_owned(),
         budget: PacketBudgetModeDto::Standard,
-        task_class: None,
         probes: Vec::new(),
         extra_probes: Vec::new(),
         latency_budget_ms: None,

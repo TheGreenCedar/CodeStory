@@ -1907,11 +1907,7 @@ fn projection_cleanup_drops_inherited_facts_that_reference_removed_graph_rows() 
     // refresh can rebind it. Every projection cleanup below is a graph change,
     // and `proof_resolution_fact` holds foreign keys into the edge, node, and
     // file rows they remove, so the dependent facts must go with them.
-    for cleanup in [
-        "file_projection",
-        "caller_projection",
-        "unowned_projection",
-    ] {
+    for cleanup in ["file_projection", "caller_projection", "unowned_projection"] {
         let mut store = Store::new_in_memory().unwrap();
         seed_exact_graph(&mut store);
         store
