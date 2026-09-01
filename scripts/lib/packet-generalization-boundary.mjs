@@ -223,6 +223,147 @@ export function normalizeIdentifier(value) {
 const PRODUCTION_SCAN_GLOBS = Object.freeze([
   "crates/codestory-agent/src",
   "crates/codestory-runtime/src/agent",
+  "crates/codestory-runtime/src/packet.rs",
+  "crates/codestory-runtime/src/search.rs",
+  "crates/codestory-runtime/src/drill.rs",
+  "crates/codestory-runtime/src/context.rs",
+  "crates/codestory-runtime/src/ground.rs",
+  "crates/codestory-retrieval/src",
+  "crates/codestory-cli/src/packet.rs",
+  "crates/codestory-cli/src/search.rs",
+]);
+
+/**
+ * Vocabulary clusters that only appear in code steering answers toward a known
+ * corpus. Each set carries the smallest cluster size that cannot occur by
+ * accident in generic planning code.
+ */
+const DOMAIN_VOCABULARY_SHAPES = Object.freeze([
+  Object.freeze({
+    kind: "sql_dialect_cluster",
+    minimum: 2,
+    vocabulary: Object.freeze([
+      "sqlite",
+      "mysql",
+      "postgres",
+      "postgresql",
+      "sqlserver",
+      "mssql",
+      "oracle",
+      "db2",
+      "mariadb",
+      "autoincrement",
+      "serialpks",
+    ]),
+  }),
+  Object.freeze({
+    kind: "schema_noun_cluster",
+    minimum: 3,
+    // "relation" and "references" are ordinary graph words, so a cluster only
+    // counts when enough of it is relational-schema vocabulary that nothing else
+    // uses. Three generic graph nouns together stay legal.
+    minimumCore: 2,
+    core: Object.freeze([
+      "table",
+      "tables",
+      "column",
+      "columns",
+      "schema",
+      "foreign",
+      "constraint",
+      "constraints",
+    ]),
+    vocabulary: Object.freeze([
+      "table",
+      "tables",
+      "column",
+      "columns",
+      "schema",
+      "relation",
+      "relations",
+      "relationship",
+      "relationships",
+      "foreign",
+      "constraint",
+      "constraints",
+      "references",
+    ]),
+  }),
+  Object.freeze({
+    kind: "filename_stem_cluster",
+    minimum: 4,
+    vocabulary: Object.freeze([
+      "cli",
+      "cmd",
+      "command",
+      "commands",
+      "lib",
+      "mod",
+      "index",
+      "main",
+      "app",
+      "server",
+      "router",
+      "routes",
+      "route",
+      "handler",
+      "handlers",
+      "entrypoint",
+      "entrypoints",
+      "controller",
+      "middleware",
+      "events",
+      "event",
+    ]),
+  }),
+  Object.freeze({
+    kind: "corpus_entity_noun_cluster",
+    minimum: 3,
+    vocabulary: Object.freeze([
+      "artist",
+      "artists",
+      "album",
+      "albums",
+      "track",
+      "tracks",
+      "invoice",
+      "invoices",
+      "invoiceline",
+      "playlist",
+      "playlists",
+      "customer",
+      "customers",
+      "employee",
+      "employees",
+      "genre",
+      "genres",
+      "publisher",
+      "publishers",
+      "supplier",
+      "shipper",
+      "orderitem",
+    ]),
+  }),
+]);
+
+/** Identifiers that carry the caller's prompt text into a function body. */
+const PROMPT_TEXT_BINDINGS = Object.freeze([
+  "question",
+  "prompt",
+  "query_text",
+  "task_phrasing",
+]);
+
+/** String-content tests that turn prompt text into a branch. */
+const PROMPT_TEXT_PREDICATES = Object.freeze([
+  "contains",
+  "starts_with",
+  "ends_with",
+  "find",
+  "rfind",
+  "split_once",
+  "rsplit_once",
+  "matches",
 ]);
 
 const PERMITTED_VOCABULARY_PATH_FRAGMENTS = Object.freeze([
@@ -311,120 +452,134 @@ function listRustFiles(dir) {
   return out;
 }
 
-/** Strip `#[cfg(test)]` item bodies for a conservative production view. */
-export function maskCfgTestItems(source) {
-  let out = "";
+/**
+ * Replace the contents of every comment, string, and char literal with spaces,
+ * preserving byte offsets and newlines. Structural scans run against this view so
+ * a marker written inside a comment or a literal cannot steer them.
+ */
+export function blankNonCode(source) {
+  const out = source.split("");
+  const blank = (from, to) => {
+    for (let i = from; i < to && i < out.length; i += 1) {
+      if (out[i] !== "\n") out[i] = " ";
+    }
+  };
   let i = 0;
-  const re = /#\[cfg\(test\)\]/g;
+  while (i < source.length) {
+    const ch = source[i];
+    if (ch === "/" && source[i + 1] === "/") {
+      const nl = source.indexOf("\n", i);
+      const end = nl < 0 ? source.length : nl;
+      blank(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === "/" && source[i + 1] === "*") {
+      let depth = 1;
+      let j = i + 2;
+      while (j < source.length && depth > 0) {
+        if (source[j] === "/" && source[j + 1] === "*") {
+          depth += 1;
+          j += 2;
+          continue;
+        }
+        if (source[j] === "*" && source[j + 1] === "/") {
+          depth -= 1;
+          j += 2;
+          continue;
+        }
+        j += 1;
+      }
+      blank(i, j);
+      i = j;
+      continue;
+    }
+    // Raw strings: r"..", r#".."#, br#".."#, cr#".."#.
+    const rawPrefix = /^(?:b|c)?r(#*)"/.exec(source.slice(i, i + 8));
+    if (rawPrefix != null && (i === 0 || !/[A-Za-z0-9_]/.test(source[i - 1]))) {
+      const hashes = rawPrefix[1];
+      const openAt = i + rawPrefix[0].length;
+      const closer = `"${hashes}`;
+      const end = source.indexOf(closer, openAt);
+      const stop = end < 0 ? source.length : end;
+      blank(openAt, stop);
+      i = end < 0 ? source.length : end + closer.length;
+      continue;
+    }
+    if (ch === '"' || ((ch === "b" || ch === "c") && source[i + 1] === '"')) {
+      const openAt = ch === '"' ? i + 1 : i + 2;
+      let j = openAt;
+      while (j < source.length) {
+        if (source[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (source[j] === '"') break;
+        j += 1;
+      }
+      blank(openAt, j);
+      i = j + 1;
+      continue;
+    }
+    if (ch === "'") {
+      // A lifetime (`'a`) is not a literal; a char literal always closes with `'`.
+      const escaped = source[i + 1] === "\\";
+      const closeAt = escaped ? source.indexOf("'", i + 2) : i + 2;
+      if (!escaped && source[closeAt] === "'") {
+        blank(i + 1, closeAt);
+        i = closeAt + 1;
+        continue;
+      }
+      if (escaped && closeAt > 0 && closeAt - i <= 8) {
+        blank(i + 1, closeAt);
+        i = closeAt + 1;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return out.join("");
+}
+
+/** Byte ranges of every `#[cfg(test)]` item, located on the blanked view. */
+function cfgTestItemRanges(source) {
+  const blanked = blankNonCode(source);
+  const ranges = [];
+  const marker = /#\[cfg\(test\)\]/g;
   let match;
-  while ((match = re.exec(source)) != null) {
-    out += source.slice(i, match.index);
+  while ((match = marker.exec(blanked)) != null) {
     let j = match.index + match[0].length;
-    while (j < source.length && /[\s/]/.test(source[j])) {
-      // skip whitespace and line/block comments before the item
-      if (source.startsWith("//", j)) {
-        const nl = source.indexOf("\n", j);
-        j = nl < 0 ? source.length : nl + 1;
-        continue;
-      }
-      if (source.startsWith("/*", j)) {
-        const end = source.indexOf("*/", j + 2);
-        j = end < 0 ? source.length : end + 2;
-        continue;
-      }
-      if (source.startsWith("#[", j)) {
-        // additional attributes
-        const close = source.indexOf("]", j);
-        j = close < 0 ? source.length : close + 1;
-        continue;
-      }
-      if (/\s/.test(source[j])) {
+    while (j < blanked.length) {
+      if (/\s/.test(blanked[j])) {
         j += 1;
         continue;
       }
+      if (blanked.startsWith("#[", j)) {
+        const close = blanked.indexOf("]", j);
+        j = close < 0 ? blanked.length : close + 1;
+        continue;
+      }
       break;
     }
-    // find item end: brace-matched block or semicolon
-    while (j < source.length && source[j] !== "{" && source[j] !== ";") {
+    while (j < blanked.length && blanked[j] !== "{" && blanked[j] !== ";") {
       j += 1;
     }
-    if (j >= source.length) {
-      i = source.length;
+    if (j >= blanked.length) {
+      ranges.push([match.index, source.length]);
       break;
     }
-    if (source[j] === ";") {
-      i = j + 1;
-      re.lastIndex = i;
+    if (blanked[j] === ";") {
+      ranges.push([match.index, j + 1]);
+      marker.lastIndex = j + 1;
       continue;
     }
     let depth = 0;
     let k = j;
-    while (k < source.length) {
-      const ch = source[k];
-      // Skip line comments.
-      if (ch === "/" && source[k + 1] === "/") {
-        const nl = source.indexOf("\n", k + 2);
-        k = nl < 0 ? source.length : nl + 1;
-        continue;
-      }
-      // Skip block comments.
-      if (ch === "/" && source[k + 1] === "*") {
-        const end = source.indexOf("*/", k + 2);
-        k = end < 0 ? source.length : end + 2;
-        continue;
-      }
-      // Skip raw strings: r##"..."## or br"..." / cr#"..."#.
-      if (
-        ch === "r"
-        || ((ch === "b" || ch === "c") && source[k + 1] === "r")
-      ) {
-        let rawAt = ch === "r" ? k : k + 1;
-        if (source[rawAt] === "r") {
-          let hashes = 0;
-          let p = rawAt + 1;
-          while (source[p] === "#") {
-            hashes += 1;
-            p += 1;
-          }
-          if (source[p] === '"') {
-            const closer = `"${"#".repeat(hashes)}`;
-            const end = source.indexOf(closer, p + 1);
-            k = end < 0 ? source.length : end + closer.length;
-            continue;
-          }
-        }
-      }
-      // Skip ordinary / byte / c strings.
-      if (ch === '"' || ((ch === "b" || ch === "c") && source[k + 1] === '"')) {
-        k = ch === '"' ? k + 1 : k + 2;
-        while (k < source.length) {
-          if (source[k] === "\\") {
-            k += 2;
-            continue;
-          }
-          if (source[k] === '"') {
-            k += 1;
-            break;
-          }
-          k += 1;
-        }
-        continue;
-      }
-      // Skip char literals, including '"' / '}' / '\'' which otherwise break brace depth.
-      if (ch === "'") {
-        k += 1;
-        if (source[k] === "\\") {
-          k += 2;
-        } else {
-          k += 1;
-        }
-        if (source[k] === "'") {
-          k += 1;
-        }
-        continue;
-      }
-      if (ch === "{") depth += 1;
-      else if (ch === "}") {
+    while (k < blanked.length) {
+      if (blanked[k] === "{") depth += 1;
+      else if (blanked[k] === "}") {
         depth -= 1;
         if (depth === 0) {
           k += 1;
@@ -433,12 +588,146 @@ export function maskCfgTestItems(source) {
       }
       k += 1;
     }
-    i = k;
-    re.lastIndex = i;
+    ranges.push([match.index, k]);
+    marker.lastIndex = k;
   }
-  out += source.slice(i);
-  // Also drop a trailing `mod tests { ... }` if present without cfg (rare).
-  return out.replace(/\nmod tests\s*\{[\s\S]*\}\s*$/m, "\n");
+  return ranges;
+}
+
+/** Strip `#[cfg(test)]` item bodies for a conservative production view. */
+export function maskCfgTestItems(source) {
+  const ranges = cfgTestItemRanges(source);
+  if (ranges.length === 0) {
+    return source;
+  }
+  let out = "";
+  let cursor = 0;
+  for (const [start, end] of ranges) {
+    if (start < cursor) continue;
+    out += source.slice(cursor, start);
+    cursor = end;
+  }
+  out += source.slice(cursor);
+  return out;
+}
+
+/**
+ * Split a production view into functions. Brace matching runs on the blanked
+ * view; the returned body is the real source so literal contents stay visible.
+ */
+export function splitRustFunctions(source) {
+  const blanked = blankNonCode(source);
+  const functions = [];
+  const signature = /\bfn\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+  let match;
+  while ((match = signature.exec(blanked)) != null) {
+    let j = signature.lastIndex;
+    let depth = 0;
+    let bodyStart = -1;
+    while (j < blanked.length) {
+      const ch = blanked[j];
+      if (ch === ";" && depth === 0 && bodyStart < 0) break;
+      if (ch === "{") {
+        if (bodyStart < 0) bodyStart = j;
+        depth += 1;
+      } else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          j += 1;
+          break;
+        }
+      }
+      j += 1;
+    }
+    if (bodyStart < 0) continue;
+    functions.push({ name: match[1], start: match.index, end: j, body: source.slice(bodyStart, j) });
+    signature.lastIndex = j;
+  }
+  return functions;
+}
+
+/** String literals appearing directly in a function body. */
+function functionStringLiterals(body) {
+  const literals = [];
+  const re = /"((?:[^"\\]|\\.){1,160})"/g;
+  let match;
+  while ((match = re.exec(body)) != null) {
+    literals.push(match[1]);
+  }
+  return literals;
+}
+
+/**
+ * Domain vocabulary clusters: a single function enumerating several members of a
+ * corpus-specific vocabulary is steering answers, whatever the members are named.
+ */
+function findDomainVocabularyClusters(source, relative) {
+  const findings = [];
+  for (const fn of splitRustFunctions(source)) {
+    const tokens = new Set(
+      functionStringLiterals(fn.body)
+        .flatMap((literal) => literal.split(/[^A-Za-z0-9]+/))
+        .map((token) => token.toLowerCase())
+        .filter(Boolean),
+    );
+    for (const shape of DOMAIN_VOCABULARY_SHAPES) {
+      const matched = shape.vocabulary.filter((word) => tokens.has(word));
+      const core = shape.core == null
+        ? matched
+        : shape.core.filter((word) => tokens.has(word));
+      if (matched.length >= shape.minimum && core.length >= (shape.minimumCore ?? 0)) {
+        findings.push({
+          kind: shape.kind,
+          file: relative,
+          detail: `${fn.name} enumerates ${matched.join(", ")}`,
+        });
+      }
+    }
+  }
+  return findings;
+}
+
+/**
+ * Production planning may read the prompt, but it must not branch on which words
+ * the prompt happens to use. Any literal-valued string test against prompt text
+ * is a hardcoded answer shape.
+ */
+function findPromptTextBranches(source, relative) {
+  const findings = [];
+  const predicates = PROMPT_TEXT_PREDICATES.join("|");
+  for (const fn of splitRustFunctions(source)) {
+    const carriers = new Set(PROMPT_TEXT_BINDINGS);
+    const binding = new RegExp(
+      `\\blet\\s+(?:mut\\s+)?([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*[^;]*\\b(?:${[...carriers].join("|")})\\b`,
+      "g",
+    );
+    // Two passes so a binding chain (question -> lowered -> trimmed) is followed.
+    for (let pass = 0; pass < 2; pass += 1) {
+      binding.lastIndex = 0;
+      let bound;
+      while ((bound = binding.exec(fn.body)) != null) {
+        carriers.add(bound[1]);
+      }
+    }
+    // Only word arguments count. Testing the prompt for punctuation, a path
+    // separator, or a file extension reads its structure, not its vocabulary.
+    const test = new RegExp(
+      `\\b(${[...carriers].join("|")})\\s*\\.\\s*(?:${predicates})\\s*\\(\\s*"([^"]*)"`,
+      "g",
+    );
+    let branch;
+    while ((branch = test.exec(fn.body)) != null) {
+      const argument = branch[2];
+      if (!/^[A-Za-z][A-Za-z ]{2,}$/.test(argument)) continue;
+      findings.push({
+        kind: "prompt_text_branch",
+        file: relative,
+        detail: `${fn.name} branches on prompt wording "${argument}"`,
+      });
+      break;
+    }
+  }
+  return findings;
 }
 
 export function findBoundaryViolations(source, { filePath = "<memory>", repoRoot = defaultRepoRoot() } = {}) {
@@ -612,17 +901,27 @@ export function findBoundaryViolations(source, { filePath = "<memory>", repoRoot
         });
       }
     }
+
+    findings.push(...findDomainVocabularyClusters(productionView, relative));
+    findings.push(...findPromptTextBranches(productionView, relative));
   }
 
   return findings;
 }
 
 export function collectProductionPacketFiles(repoRoot = defaultRepoRoot()) {
-  const files = [];
+  const files = new Set();
   for (const rel of PRODUCTION_SCAN_GLOBS) {
-    files.push(...listRustFiles(path.join(repoRoot, rel)));
+    const target = path.join(repoRoot, rel);
+    if (existsSync(target) && statSync(target).isFile()) {
+      if (target.endsWith(".rs")) files.add(target);
+      continue;
+    }
+    for (const file of listRustFiles(target)) {
+      files.add(file);
+    }
   }
-  return files.sort();
+  return [...files].sort();
 }
 
 export function scanRepository(repoRoot = defaultRepoRoot()) {
@@ -649,11 +948,23 @@ export function runPacketGeneralizationBoundaryCheck(repoRoot = defaultRepoRoot(
       findings: [],
     };
   }
+  const scanned = collectProductionPacketFiles(repoRoot);
+  if (scanned.length === 0) {
+    // Scanning nothing is the loudest possible bypass, not a clean result.
+    return {
+      exitCode: 2,
+      stdout: "",
+      stderr:
+        "packet-generalization-boundary: scanned 0 production packet files; "
+        + `expected sources under ${PRODUCTION_SCAN_GLOBS.join(", ")}\n`,
+      findings: [],
+    };
+  }
   const findings = scanRepository(repoRoot);
   if (findings.length === 0) {
     return {
       exitCode: 0,
-      stdout: `packet-generalization-boundary: ok (${collectProductionPacketFiles(repoRoot).length} production packet file(s))\n`,
+      stdout: `packet-generalization-boundary: ok (${scanned.length} production packet file(s))\n`,
       stderr: "",
       findings,
     };

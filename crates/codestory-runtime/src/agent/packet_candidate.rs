@@ -1733,10 +1733,10 @@ fn hash_graph_id_component(digest: &mut Sha256, value: &str) {
 mod tests {
     use super::*;
     use crate::agent::packet_budget::cap_packet_graph_edges_for_test;
-    use codestory_agent::packet_terms::packet_probe_terms;
+
     use codestory_contracts::api::{
         AgentRetrievalTraceDto, GraphEdgeDto, GraphNodeDto, NodeId, NodeKind,
-        PacketEvidenceResolutionDto, PacketEvidenceTierDto, PacketTaskClassDto, SearchHitOrigin,
+        PacketEvidenceResolutionDto, PacketEvidenceTierDto, SearchHitOrigin,
     };
 
     fn answer() -> AgentAnswerDto {
@@ -1841,9 +1841,6 @@ mod tests {
     }
 
     fn server_requirement(id: &str) -> FlowRequirement {
-        let terms = packet_probe_terms(
-            "Trace how a server application registers middleware, handles a request, and sends the response.",
-        );
         Vec::<FlowRequirement>::new()
             .into_iter()
             .find(|requirement| requirement.id == id)
@@ -2038,8 +2035,6 @@ mod tests {
     }
 
     fn mapper_requirement(id: &str) -> FlowRequirement {
-        let terms =
-            packet_probe_terms("How does the mapper build its configuration and execution plan?");
         Vec::<FlowRequirement>::new()
             .into_iter()
             .find(|requirement| requirement.id == id)
@@ -3495,9 +3490,6 @@ mod tests {
                 canonical_layout: None,
             }),
         };
-        let terms = packet_probe_terms(
-            "Trace how a server application registers middleware, handles a request, and sends the response.",
-        );
         let requirements: Vec<FlowRequirement> = Vec::new();
         let terminal = requirements
             .iter()

@@ -257,6 +257,301 @@ pub fn also_live() {}
   );
 });
 
+// ---------------------------------------------------------------------------
+// Counterexamples: the five steering sites deleted in this PR, reproduced from
+// their pre-deletion source. Each must be caught if it is ever written again,
+// under any name, because the checker matches shape and not identifier.
+// ---------------------------------------------------------------------------
+
+function agentFile(name) {
+  return path.join(repositoryRoot, "crates/codestory-agent/src", name);
+}
+
+function runtimeAgentFile(name) {
+  return path.join(repositoryRoot, "crates/codestory-runtime/src/agent", name);
+}
+
+function kindsFor(source, filePath) {
+  return new Set(
+    findBoundaryViolations(source, { filePath, repoRoot: repositoryRoot }).map((f) => f.kind),
+  );
+}
+
+test("site 1 counterexample: probe-term retention branching on prompt wording", () => {
+  // crates/codestory-agent/src/packet_terms.rs, deleted at e74db13a.
+  const deleted = `
+fn packet_retains_non_primary_probe_term(question: &str, term: &str) -> bool {
+    if matches!(term, "source" | "sources") {
+        let lowered = question.to_ascii_lowercase();
+        return lowered.contains("buffer")
+            || lowered.contains("sink")
+            || lowered.contains("read")
+            || lowered.contains("write");
+    }
+
+    if matches!(term, "bench" | "benchmark" | "benchmarks") {
+        let lowered = question.to_ascii_lowercase();
+        return lowered.contains("architecture")
+            && (lowered.contains("boundary")
+                || lowered.contains("boundaries")
+                || lowered.contains("across"));
+    }
+
+    false
+}
+`;
+  const findings = findBoundaryViolations(deleted, {
+    filePath: agentFile("packet_terms.rs"),
+    repoRoot: repositoryRoot,
+  });
+  assert.ok(
+    findings.some((f) => f.kind === "prompt_text_branch"),
+    `prompt-wording retention must be caught: ${JSON.stringify(findings)}`,
+  );
+});
+
+test("site 1 counterexample: the same retention renamed and inlined is still caught", () => {
+  // Hostile variant: no `question` parameter name, no `contains`, chained binding.
+  const renamed = `
+fn packet_term_survives(user_prompt: &str, term: &str) -> bool {
+    let prompt = user_prompt.to_ascii_lowercase();
+    let phrasing = prompt.trim();
+    matches!(term, "source") && phrasing.starts_with("buffered reader")
+}
+`;
+  const kinds = kindsFor(renamed, agentFile("packet_terms.rs"));
+  assert.ok(kinds.has("prompt_text_branch"), [...kinds].join(","));
+});
+
+test("site 2 counterexample: named schema entity extraction from the prompt", () => {
+  // crates/codestory-agent/src/packet_required_probes.rs, deleted at e74db13a.
+  const deleted = `
+pub fn packet_named_schema_entity_queries(question: &str) -> Vec<String> {
+    let lower = question.to_ascii_lowercase();
+    let Some(start) = [" between ", " among "]
+        .into_iter()
+        .filter_map(|marker| lower.find(marker).map(|index| index + marker.len()))
+        .min()
+    else {
+        return Vec::new();
+    };
+    let tail = &lower[start..];
+    let segment = tail.replace(" and ", ",");
+    let mut queries = Vec::new();
+    for phrase in segment.split(',') {
+        let words = phrase.split_whitespace().collect::<Vec<_>>();
+        if words.iter().any(|word| {
+            matches!(
+                *word,
+                "database"
+                    | "relation"
+                    | "relations"
+                    | "relationship"
+                    | "relationships"
+                    | "schema"
+                    | "sql"
+                    | "table"
+                    | "tables"
+            )
+        }) {
+            continue;
+        }
+        queries.push(words.join(" "));
+    }
+    queries
+}
+`;
+  const kinds = kindsFor(deleted, agentFile("packet_required_probes.rs"));
+  assert.ok(kinds.has("schema_noun_cluster"), [...kinds].join(","));
+});
+
+test("site 3 counterexample: SQL dialect ranking and promotion in the orchestrator", () => {
+  // crates/codestory-runtime/src/agent/orchestrator.rs, deleted at e74db13a.
+  const deleted = `
+fn sql_schema_dialect_rank(path: &str) -> f32 {
+    let lower = packet_display_path(path).to_ascii_lowercase();
+    if lower.contains("sqlite") {
+        4.0
+    } else if lower.contains("mysql") || lower.contains("postgres") || lower.contains("postgresql")
+    {
+        3.0
+    } else if lower.contains("sqlserver") {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+fn promote_sql_schema_dialect_files(answer: &mut AgentAnswerDto) {
+    for marker in ["sqlite", "mysql", "postgres"] {
+        let _ = marker;
+    }
+}
+`;
+  const findings = findBoundaryViolations(deleted, {
+    filePath: runtimeAgentFile("orchestrator.rs"),
+    repoRoot: repositoryRoot,
+  });
+  assert.ok(
+    findings.filter((f) => f.kind === "sql_dialect_cluster").length >= 2,
+    `both dialect functions must be caught: ${JSON.stringify(findings)}`,
+  );
+});
+
+test("site 3 counterexample: the foreign-key promotion arm alone is caught", () => {
+  // The narrowest slice of the deleted block: no dialect names at all, only
+  // relational-constraint vocabulary. This is the reintroduction the flat
+  // four-word threshold used to miss.
+  const deleted = `
+fn promote_sql_schema_relationship_constraints(answer: &mut AgentAnswerDto) {
+    for citation in &mut answer.citations {
+        let display = citation.display_name.to_ascii_lowercase();
+        if !(display.contains("foreign")
+            || display.contains("constraint")
+            || display.contains("references")
+            || display.contains("fk_"))
+        {
+            continue;
+        }
+        citation.coverage_role = Some(PACKET_MATERIAL_SCHEMA_ENTITY_ROLE.to_string());
+    }
+}
+`;
+  const kinds = kindsFor(deleted, runtimeAgentFile("orchestrator.rs"));
+  assert.ok(kinds.has("schema_noun_cluster"), [...kinds].join(","));
+});
+
+test("generic graph vocabulary is not a schema cluster", () => {
+  // Guard on the previous test's threshold: relation/references/relationship are
+  // ordinary edge words and must stay legal in retrieval code.
+  const legitimate = `
+fn edge_kind_label(kind: EdgeKind) -> &'static str {
+    match kind {
+        EdgeKind::REFERENCES => "references",
+        EdgeKind::RELATION => "relation",
+        _ => "relationship",
+    }
+}
+`;
+  const kinds = kindsFor(legitimate, path.join(repositoryRoot, "crates/codestory-retrieval/src/ranker.rs"));
+  assert.ok(!kinds.has("schema_noun_cluster"), [...kinds].join(","));
+});
+
+test("site 4 counterexample: SQL dialect variant-copy scoring", () => {
+  // crates/codestory-agent/src/packet_scoring.rs, deleted at e74db13a.
+  const deleted = `
+pub fn packet_sql_schema_file_is_variant_copy(path: &str) -> bool {
+    let lower = packet_display_path(path).to_ascii_lowercase();
+    if !lower.ends_with(".sql") {
+        return false;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or(lower.as_str());
+    file_name.contains("autoincrement")
+        || file_name.contains("serialpks")
+        || file_name.contains("serial_pks")
+        || file_name.contains("db2")
+        || file_name.contains("oracle")
+        || file_name.contains("sqlserver")
+}
+`;
+  const kinds = kindsFor(deleted, agentFile("packet_scoring.rs"));
+  assert.ok(kinds.has("sql_dialect_cluster"), [...kinds].join(","));
+});
+
+test("site 5 counterexample: filename-stem navigation scoring", () => {
+  // crates/codestory-runtime/src/agent/packet_capping.rs, deleted at e74db13a.
+  const deleted = `
+fn packet_source_navigation_file_score(path: &str) -> u8 {
+    let normalized = packet_display_path(path).replace('\\\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(normalized.as_str());
+    let stem = file_name
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(file_name)
+        .to_ascii_lowercase();
+    match stem.as_str() {
+        "cli" | "cmd" | "command" | "commands" => 4,
+        "lib" | "mod" | "index" => 3,
+        "events" | "event" => 2,
+        "main" | "app" | "server" | "router" | "routes" => 2,
+        "handler" | "handlers" | "entrypoint" | "entrypoints" => 1,
+        _ => 0,
+    }
+}
+`;
+  const kinds = kindsFor(deleted, runtimeAgentFile("packet_capping.rs"));
+  assert.ok(kinds.has("filename_stem_cluster"), [...kinds].join(","));
+});
+
+test("bypass 1: a commented or quoted cfg(test) marker cannot hide production code", () => {
+  // The masker used to run on raw text, so a marker inside a comment opened a
+  // mask range that swallowed every following production item.
+  const hidden = `
+// #[cfg(test)]
+// mod tests {
+pub fn rank_by_dialect(path: &str) -> u8 {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("sqlite") || lower.contains("postgres") { 4 } else { 0 }
+}
+`;
+  const kinds = kindsFor(hidden, runtimeAgentFile("orchestrator.rs"));
+  assert.ok(kinds.has("sql_dialect_cluster"), `comment marker must not mask: ${[...kinds]}`);
+
+  const quoted = `
+const MARKER: &str = "#[cfg(test)] mod tests {";
+pub fn rank_by_dialect(path: &str) -> u8 {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("sqlite") || lower.contains("mysql") { 4 } else { 0 }
+}
+`;
+  const quotedKinds = kindsFor(quoted, runtimeAgentFile("orchestrator.rs"));
+  assert.ok(quotedKinds.has("sql_dialect_cluster"), `string marker must not mask: ${[...quotedKinds]}`);
+});
+
+test("bypass 1: a real cfg(test) module is still masked", () => {
+  const masked = `
+pub fn live(path: &str) -> u8 { path.len() as u8 }
+
+#[cfg(test)]
+mod tests {
+    fn rank_by_dialect(path: &str) -> u8 {
+        let lower = path.to_ascii_lowercase();
+        if lower.contains("sqlite") || lower.contains("postgres") { 4 } else { 0 }
+    }
+}
+`;
+  const kinds = kindsFor(masked, runtimeAgentFile("orchestrator.rs"));
+  assert.equal(kinds.size, 0, [...kinds].join(","));
+});
+
+test("bypass 2: scanning zero production files fails instead of reporting ok", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "packet-boundary-empty-"));
+  try {
+    writeTree(root, { "README.md": "no rust here\n" });
+    const result = runPacketGeneralizationBoundaryCheck(root);
+    assert.notEqual(result.exitCode, 0, result.stdout);
+    assert.match(result.stderr, /scanned 0 production packet files/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("widened globs reach production packet paths outside codestory-agent", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "packet-boundary-globs-"));
+  try {
+    writeTree(root, {
+      "crates/codestory-agent/src/packet_plan.rs": "pub fn plan() {}\n",
+      "crates/codestory-retrieval/src/query_features.rs":
+        `pub fn stem_rank(s: &str) -> u8 { match s { "cli" | "router" | "handler" | "main" => 1, _ => 0 } }\n`,
+    });
+    const result = runPacketGeneralizationBoundaryCheck(root);
+    assert.equal(result.exitCode, 1, result.stdout);
+    assert.match(result.stderr, /filename_stem_cluster/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("current production head must pass the strengthened boundary checker", () => {
   const result = runPacketGeneralizationBoundaryCheck(repositoryRoot);
   assert.equal(

@@ -106,15 +106,15 @@ use codestory_contracts::api::{
     AgentResponseModeDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
     AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepDto,
     AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, EdgeId, EdgeKind,
-    GraphArtifactDto, GraphNodeDto, GraphRequest, GraphResponse, GroundingBudgetDto,
-    IndexFreshnessDto, IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId,
-    NodeKind, NodeOccurrencesRequest, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
-    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto, PacketEvidenceResolutionDto,
-    PacketEvidenceTierDto, PacketObligationPlanDto, PacketPlanDto, PacketPlanQueryDto,
-    PacketProbeDto, PacketTaskClassDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SnippetScopeDto,
-    SourceCoverageObservationDto, SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto,
-    TrailConfigDto, TrailFilterOptionsDto,
+    GraphArtifactDto, GraphNodeDto, GraphRequest, GraphResponse, IndexFreshnessDto,
+    IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind,
+    NodeOccurrencesRequest, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS, PacketBudgetLimitsDto,
+    PacketBudgetModeDto, PacketDispositionDto, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
+    PacketObligationPlanDto, PacketPlanDto, PacketPlanQueryDto, PacketProbeDto, PacketTaskClassDto,
+    RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
+    SearchRepoTextMode, SearchRequest, SnippetScopeDto, SourceCoverageObservationDto,
+    SourceCoverageStatusDto, SupportUnitDto, SupportUnitKindDto, TrailConfigDto,
+    TrailFilterOptionsDto,
 };
 #[cfg(test)]
 use codestory_contracts::api::{RetrievalAnnotationKindDto, SearchMatchQualityDto};
@@ -205,7 +205,6 @@ struct RetrievalBundle {
     focused_node: Option<NodeDetailsDto>,
     primary_graph: Option<GraphResponse>,
     diagnostic_supplement_used: bool,
-    repo_explanation_supplement_used: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3295,7 +3294,7 @@ fn execute_retrieval(
             trace.annotate_gap(
                 "Investigation skipped repo-text diagnostics because packet evidence must come from sidecar-backed resolvable hits or direct source reads.",
             );
-        } else if weak_initial_hits(prompt, &hits) && !is_repo_explanation_prompt(prompt) {
+        } else if weak_initial_hits(prompt, &hits) {
             if !hits.is_empty() {
                 hits.clear();
                 scored_hits.clear();
@@ -3306,13 +3305,6 @@ fn execute_retrieval(
             trace.annotate_gap(
                 "Repo-text diagnostics are disabled for packet evidence; weak unanchored hits were not promoted.",
             );
-        } else if weak_initial_hits(prompt, &hits) {
-            trace.observe(
-                "Investigation deferred a broad repo explanation prompt to sidecar evidence only.",
-            );
-        }
-
-        if weak_initial_hits(prompt, &hits) && !is_repo_explanation_prompt(prompt) {
             trace.annotate_gap("Investigation low confidence gap after sidecar query expansion.");
         }
     } else if should_investigate(resolved_profile)
@@ -3321,38 +3313,6 @@ fn execute_retrieval(
     {
         trace.observe(
             "Investigation kept an explicit or prompt-anchored focus instead of broad diagnostics.",
-        );
-    }
-
-    if should_investigate(resolved_profile)
-        && weak_initial_hits(prompt, &hits)
-        && is_repo_explanation_prompt(prompt)
-        && !block_nucleo_supplement
-    {
-        let overview_hits = repo_explanation_grounding_hits(
-            controller,
-            req,
-            max_results,
-            ask_started_at,
-            resolved_profile,
-            trace,
-        )?;
-        if !overview_hits.is_empty() {
-            hits = overview_hits;
-            scored_hits.clear();
-            bundle.diagnostic_supplement_used = true;
-            bundle.repo_explanation_supplement_used = true;
-            trace.observe(
-                "Investigation used grounding snapshot diagnostic supplement for a broad repo explanation prompt.",
-            );
-        }
-    } else if should_investigate(resolved_profile)
-        && weak_initial_hits(prompt, &hits)
-        && is_repo_explanation_prompt(prompt)
-        && block_nucleo_supplement
-    {
-        trace.annotate_gap(
-            "Grounding snapshot supplement skipped because sidecar-primary retrieval is mandatory.",
         );
     }
 
@@ -3819,67 +3779,6 @@ fn has_literal_diagnostic_signal(prompt: &str) -> bool {
                             .filter(|ch| ch.is_ascii_alphabetic())
                             .all(|ch| ch.is_ascii_uppercase()))
             })
-}
-
-fn is_repo_explanation_prompt(prompt: &str) -> bool {
-    let lower = prompt.to_ascii_lowercase();
-    let subject = lower.contains("repo") || lower.contains("project") || lower.contains("codebase");
-    let intent = lower.contains("fit together")
-        || lower.contains("how does")
-        || lower.contains("explain")
-        || lower.contains("overview")
-        || lower.contains("architecture");
-    subject && intent
-}
-
-fn repo_explanation_grounding_hits(
-    controller: &AppController,
-    req: &AgentAskRequest,
-    max_results: usize,
-    ask_started_at: Instant,
-    resolved_profile: &ResolvedProfile,
-    trace: &mut TraceRecorder,
-) -> Result<Vec<SearchHit>, ApiError> {
-    let step = trace.start_step(
-        AgentRetrievalStepKindDto::QueryExpansion,
-        vec![
-            field("strategy", "grounding_snapshot"),
-            field("max_results", max_results.to_string()),
-        ],
-    );
-    let deadline_ms = phase_deadline_ms(req, 55, 100);
-    if should_truncate_phase(resolved_profile, ask_started_at, deadline_ms) {
-        trace.finish_truncated(
-            step,
-            "Skipped grounding snapshot supplement because latency budget was exceeded.",
-            vec![field("phase_deadline_ms", deadline_ms.to_string())],
-        );
-        return Ok(Vec::new());
-    }
-
-    let snapshot = match controller.grounding_snapshot(GroundingBudgetDto::Strict) {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            trace.finish_err(step, error.message.clone());
-            return Err(error);
-        }
-    };
-
-    let hits = crate::grounding::grounding_explanation_search_hits(&snapshot, max_results);
-
-    trace.finish_ok(
-        step,
-        vec![
-            field("grounding_symbols", hits.len().to_string()),
-            field("coverage_files", snapshot.coverage.total_files.to_string()),
-            field(
-                "coverage_symbols",
-                snapshot.coverage.total_symbols.to_string(),
-            ),
-        ],
-    );
-
-    Ok(hits)
 }
 
 #[cfg(test)]
@@ -4414,11 +4313,6 @@ fn retrieval_markdown(
     provenance.push_str("- Initial indexed-symbol search with current hybrid ranking.\n");
     if bundle.diagnostic_supplement_used {
         provenance.push_str("- Deterministic query expansion because initial hits were weak.\n");
-    }
-    if bundle.repo_explanation_supplement_used {
-        provenance.push_str(
-            "- Grounding snapshot diagnostic supplement for broad repo overview evidence.\n",
-        );
     }
     if !bundle.diagnostic_supplement_used && should_investigate(profile) {
         provenance.push_str("- Initial sidecar hits cleared the investigation confidence gate.\n");
@@ -6825,19 +6719,6 @@ mod tests {
             investigation_focus_node(&ordinary_request, &ordinary_request.prompt, &hits),
             Some(explicit)
         );
-    }
-
-    #[test]
-    fn repo_explanation_prompt_detection_is_broad_but_not_symbolic() {
-        assert!(is_repo_explanation_prompt(
-            "How does this repo fit together?"
-        ));
-        assert!(is_repo_explanation_prompt(
-            "Explain the project architecture"
-        ));
-        assert!(!is_repo_explanation_prompt(
-            "Where is build_llm_symbol_doc_text used?"
-        ));
     }
 
     #[test]

@@ -1456,18 +1456,7 @@ mod golden_tests {
             .collect::<Vec<_>>();
         let baseline = carry_selection(&hits, 3, &[]);
 
-        for (label, probe, class) in [
-            (
-                "all-Legacy",
-                "Trace how a server application registers middleware, handles a request, and sends the response.",
-                PacketTaskClassDto::RouteTracing,
-            ),
-            (
-                "M shard",
-                "Trace how the logger creates a log record and dispatches it to each handler for processing.",
-                PacketTaskClassDto::ArchitectureExplanation,
-            ),
-        ] {
+        for label in ["route tracing", "architecture explanation"] {
             let requirements = Vec::new();
             let session =
                 std::rc::Rc::new(crate::agent::packet_candidate::PacketProofSession::new(

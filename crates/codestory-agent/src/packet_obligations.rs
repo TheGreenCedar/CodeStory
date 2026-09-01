@@ -1742,7 +1742,7 @@ fn finalize_claim_obligation(
                 requirement,
                 citation,
                 answer,
-            ) || citation_plausibly_reports_obligation(citation, obligation.kind)
+            )
         })
         .collect::<Vec<_>>();
     rank_obligation_citations_by_context(obligation, &mut reported_citations);
@@ -1910,10 +1910,7 @@ fn finalize_formula_claim_obligation(
     let mut reported_citations = answer
         .citations
         .iter()
-        .filter(|citation| {
-            requirement.evidence.citation_proves(citation)
-                || citation_plausibly_reports_obligation(citation, obligation.kind)
-        })
+        .filter(|citation| requirement.evidence.citation_proves(citation))
         .collect::<Vec<_>>();
     rank_obligation_citations_by_context(obligation, &mut reported_citations);
     record_obligation_carriers(
@@ -2182,8 +2179,7 @@ fn finalize_default_profile_obligation(
                 binding_terms,
                 exact_binding_terms,
                 requested_paths,
-            ) && (has_requested_identity
-                || citation_plausibly_reports_obligation(citation, obligation.kind))
+            ) && has_requested_identity
         })
         .collect::<Vec<_>>();
     record_obligation_carriers(
@@ -2403,47 +2399,6 @@ fn record_obligation_carriers<'a>(
     // retained proof depend on a hash rather than evidence quality.
     obligation.carrier_node_ids = carrier_node_ids;
     obligation.carrier_paths = carrier_paths;
-}
-
-fn citation_plausibly_reports_obligation(
-    citation: &AgentCitationDto,
-    kind: PacketClaimObligationKindDto,
-) -> bool {
-    let display = citation.display_name.to_ascii_lowercase();
-    let path = citation
-        .file_path
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let contains_any = |needles: &[&str]| {
-        needles
-            .iter()
-            .any(|needle| display.contains(needle) || path.contains(needle))
-    };
-    match kind {
-        PacketClaimObligationKindDto::Entrypoint => {
-            display == "main"
-                || display.starts_with("cli")
-                || contains_any(&["entrypoint", "/main."])
-        }
-        PacketClaimObligationKindDto::Dispatch => contains_any(&["dispatch", "handler", "router"]),
-        PacketClaimObligationKindDto::Orchestration => {
-            contains_any(&["runtime", "service", "orchestrat"])
-        }
-        PacketClaimObligationKindDto::StateWrite => {
-            contains_any(&["store", "storage", "persist", "database", "snapshot"])
-        }
-        PacketClaimObligationKindDto::ExternalIo => contains_any(&[
-            "network",
-            "client",
-            "transport",
-            "socket",
-            "send",
-            "write",
-            "terminal",
-        ]),
-        PacketClaimObligationKindDto::ExactProbe => false,
-    }
 }
 
 fn citation_edge_proof(
@@ -3322,12 +3277,10 @@ fn packet_discovery_subject(token: &str) -> Option<&'static str> {
     match token {
         "call" | "called" | "caller" | "callers" | "calling" | "calls" => Some("call"),
         "exist" | "existed" | "exists" | "existing" => Some("existence"),
-        "handler" | "handlers" | "handling" => Some("handler"),
         "implementation" | "implementations" | "implemented" | "implementing" => {
             Some("implementation")
         }
         "reference" | "referenced" | "references" | "referencing" => Some("reference"),
-        "route" | "routed" | "routes" | "routing" => Some("route"),
         "usage" | "usages" | "use" | "used" | "uses" | "using" => Some("usage"),
         _ => None,
     }
@@ -3610,7 +3563,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn explicitly_named_source_files_are_material_query_obligations() {
         let plan = build_packet_obligation_plan(
             "Explain how `source/animate.css` imports _vars.css and connects classes to keyframes.",
@@ -3630,7 +3582,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn leading_task_verbs_do_not_become_material_requested_claims() {
         let identity = "RuntimeReferenceService::resolve";
@@ -3657,7 +3608,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn filtered_generic_request_gets_one_material_fallback_guard() {
         let plan = build_packet_obligation_plan(
@@ -3704,8 +3654,6 @@ mod tests {
         }));
     }
 
-    #[test]
-    #[test]
     #[test]
     fn requested_claim_cap_records_the_ninth_symbol_as_a_material_overflow() {
         let eight = "Find SymbolOne SymbolTwo SymbolThree SymbolFour SymbolFive SymbolSix SymbolSeven SymbolEight.";
@@ -3757,7 +3705,6 @@ mod tests {
         assert!(!material_packet_obligations_are_proven(&nine_plan));
     }
 
-    #[test]
     #[test]
     fn exact_typed_probe_ledger_preserves_each_input_and_typed_failure() {
         let resolutions = vec![
@@ -4284,7 +4231,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn exact_symbol_syntax_precedes_ambiguous_names_at_the_obligation_cap() {
         let question = "Explain AlphaName BravoName CharlieName DeltaName EchoName FoxtrotName GolfName HotelName RuntimeService::run.";
         let task_class = PacketTaskClassDto::ArchitectureExplanation;
@@ -4504,9 +4450,6 @@ mod tests {
         assert!(material_packet_obligations_are_proven(&plan));
     }
 
-    #[test]
-    #[test]
-    #[test]
     #[test]
     fn eligible_claim_without_an_exact_row_id_is_demoted_even_for_an_empty_plan() {
         let mut claims = vec![PacketClaimDto {
@@ -4814,7 +4757,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn exact_symbol_lookup_does_not_invent_a_behavioral_edge_requirement() {
         let question = "Find RuntimeService::run.";
         let mut answer = answer(vec![citation(
@@ -4938,38 +4880,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
-    #[test]
     #[test]
     fn tokenized_absence_profile_requires_complete_discovery() {
         let plan = build_packet_obligation_plan(

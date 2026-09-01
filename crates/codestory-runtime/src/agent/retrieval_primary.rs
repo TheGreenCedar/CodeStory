@@ -3320,8 +3320,7 @@ mod tests {
     use crate::agent::packet_evidence::PacketEvidenceTier;
     use crate::test_support::{git, git_available};
     use codestory_contracts::api::{
-        AgentCitationDto, NodeId, NodeKind as ApiNodeKind, PacketTaskClassDto, SearchHitOrigin,
-        SearchTargetDto,
+        AgentCitationDto, NodeId, NodeKind as ApiNodeKind, SearchHitOrigin, SearchTargetDto,
     };
     use codestory_retrieval::{
         CandidateHit, QueryTrace, RetrievalCacheKey, RetrievalStageKind, StageTrace,
