@@ -17,7 +17,8 @@ pub use crate::indexed_source_call_path_v1::{
     SourceBindingFailure, StepQualificationOutcome, StepQualificationTrace,
 };
 pub use codestory_agent::proof_qualification_support::{
-    BuiltCallPathFacts, CallableContainmentEvidence, ClauseAnchor, ClauseClassification,
+    BuiltCallPathFacts, CONTRACT_INTERPRETATION, CallableContainmentEvidence, ClauseAnchor,
+    ClauseClassification,
     FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
     InternalProjection, NonMaterialKind, PinnedNodeIdentity, ProofContractField, ProofHashes,
     ReceiptRef, ResolvedNodeIdentity, UnavailableReason, UnresolvedMaterialReason,

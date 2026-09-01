@@ -40,7 +40,32 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
 | `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | After packet/search/graph selects targets. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
-| `verify_indexed_direct_calls` | `source_text`, `clauses`, `spec` | | Observational exact verification of a host-supplied typed contract. Never construct one from free English or invoke this tool automatically. |
+| `verify_indexed_direct_calls` | `call_path` | | Observational exact verification of a `call-path/v1` document (see below). Never translate free English into one, and never invoke this tool automatically. |
+
+### `call-path/v1`
+
+`call_path` is a text document, not JSON. One contract per document, one clause
+per line:
+
+```text
+call-path/v1
+start: crate::module::Alpha
+step 1: direct call -> crate::module::Beta
+step 2: direct call -> "src/gamma.rs"::Gamma
+prohibit traversal through: crate::detail::Helper
+exclude from projection: crate::test_support
+```
+
+The version line comes first. `start` and at least one `step` are required;
+steps are numbered consecutively from 1, up to 6. The `prohibit traversal
+through` and `exclude from projection` lines are optional and repeatable.
+Selectors are qualified names, or `"path/to/file"::Name` to scope one file.
+Signatures, wildcards, and internal node identities are not selectors.
+
+Blank lines and indentation are ignored. Any other line the grammar cannot read
+becomes an unresolved clause, and the whole verification then reports
+`graph_disposition: "unknown"` instead of proving a smaller contract than you
+wrote. The document is capped at 8192 bytes.
 
 ## Resources and prompts
 

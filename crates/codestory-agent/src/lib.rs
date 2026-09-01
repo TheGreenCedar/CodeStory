@@ -29,10 +29,11 @@ pub mod proof_qualification_support {
     use serde::Serialize;
 
     pub use super::indexed_source_call_path_v1::{
-        AdmittedRawCallEdge, BuiltCallPathFacts, CallPathSpec, CallableContainmentEvidence,
-        CheckedBuiltCallPathIntegration, ClauseAnchor, ClauseClassification, ExactScopeSelector,
-        ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
-        InternalCorePublicationIdentity, InternalProjection, NonMaterialKind, PROOF_DOMAIN,
+        AdmittedRawCallEdge, BuiltCallPathFacts, CONTRACT_INTERPRETATION, CallPathSpec,
+        CallableContainmentEvidence, CheckedBuiltCallPathIntegration, ClauseAnchor,
+        ClauseClassification, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
+        IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
+        InternalProjection, NonMaterialKind, PROOF_DOMAIN,
         PinnedNodeIdentity, ProofContractField, ProofHashes, RawAdmissionFailure,
         RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, TranslationGap, UnavailableReason,
         UnresolvedMaterialReason, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,

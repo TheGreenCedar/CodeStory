@@ -28,6 +28,9 @@ use sha2::{Digest, Sha256};
 pub const PROOF_CONTRACT_SCHEMA_VERSION: u32 = 1;
 pub const PROOF_DOMAIN: &str = "indexed_source_call_path_v1";
 pub const CLAUSE_GUARD_VERSION: &str = "clause_guard_v1";
+/// The contract and its clause anchors come from parsing the published
+/// `call-path/v1` grammar, not from a translation the caller supplied.
+pub const CONTRACT_INTERPRETATION: &str = "parser_derived";
 const DIGEST_DOMAIN_SEPARATOR: &[u8] = b"codestory.proof-contract.digest.v1\0";
 const FACT_ID_DOMAIN_SEPARATOR: &[u8] = b"codestory-proof-resolution-fact-id-v1\0";
 const MIN_STEPS: usize = 1;
@@ -214,6 +217,18 @@ impl UnvalidatedCallPathContract {
             clauses,
             spec,
         }
+    }
+
+    pub fn source_text(&self) -> &str {
+        &self.source_text
+    }
+
+    pub fn clauses(&self) -> &[ClauseAnchor] {
+        &self.clauses
+    }
+
+    pub fn spec(&self) -> &UnvalidatedCallPathSpec {
+        &self.spec
     }
 }
 
@@ -3836,7 +3851,7 @@ fn validate_common_projection_fields(root: &serde_json::Map<String, Value>) -> R
             root,
             "contract_interpretation",
             "compact_interpretation_invalid",
-        )? != "host_supplied"
+        )? != CONTRACT_INTERPRETATION
         || compact_string(root, "guard_version", "compact_guard_version_invalid")?
             != CLAUSE_GUARD_VERSION
     {
@@ -4490,7 +4505,7 @@ pub fn project_translation_unknown_result(
         "kind": "complete",
         "schema_version": PROOF_CONTRACT_SCHEMA_VERSION,
         "domain": PROOF_DOMAIN,
-        "contract_interpretation": "host_supplied",
+        "contract_interpretation": CONTRACT_INTERPRETATION,
         "guard_version": CLAUSE_GUARD_VERSION,
         "source_text_sha256": hashes.source_text_sha256,
         "contract_digest": hashes.contract_digest,
@@ -4692,7 +4707,7 @@ fn complete_projection_json(
         "kind": "complete",
         "schema_version": PROOF_CONTRACT_SCHEMA_VERSION,
         "domain": PROOF_DOMAIN,
-        "contract_interpretation": "host_supplied",
+        "contract_interpretation": CONTRACT_INTERPRETATION,
         "guard_version": CLAUSE_GUARD_VERSION,
         "source_text_sha256": integration.hashes.source_text_sha256,
         "contract_digest": integration.hashes.contract_digest,
@@ -5680,7 +5695,7 @@ mod tests {
         assert_eq!(root["kind"], "complete");
         assert_eq!(root["schema_version"], 1);
         assert_eq!(root["domain"], "indexed_source_call_path_v1");
-        assert_eq!(root["contract_interpretation"], "host_supplied");
+        assert_eq!(root["contract_interpretation"], "parser_derived");
         assert_eq!(root["guard_version"], "clause_guard_v1");
         assert_eq!(root["identities"]["files"].as_array().unwrap().len(), 2);
         assert_eq!(root["identities"]["symbols"].as_array().unwrap().len(), 2);

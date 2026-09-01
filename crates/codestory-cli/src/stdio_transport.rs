@@ -1836,14 +1836,21 @@ fn handle_stdio_request(
                             "diagnostics_uri": diagnostics_uri,
                         });
                         if preparing {
+                            let retry_after_ms = operation
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.retry_after_ms)
+                                .unwrap_or(250)
+                                .max(1);
                             let preparing = serde_json::json!({
                                 "kind": "preparing",
                                 "state": "preparing",
-                                "retry_after_ms": operation
-                                    .as_ref()
-                                    .and_then(|snapshot| snapshot.retry_after_ms)
-                                    .unwrap_or(250)
-                                    .max(1),
+                                "retry_after_ms": retry_after_ms,
+                                // The caller need not re-plan: the same request,
+                                // unchanged, is the whole next action.
+                                "minimum_next": {
+                                    "kind": "retry_same_request",
+                                    "after_ms": retry_after_ms,
+                                },
                                 "operation": operation
                                     .as_ref()
                                     .and_then(|snapshot| serde_json::to_value(snapshot).ok())
@@ -3483,7 +3490,7 @@ enum PreparedStdioToolCall {
     Raw,
     Affected(AffectedAnalysisRequest),
     Snippet(StdioSnippetRequest),
-    ProveCallPath(crate::prove_call_path::ProveCallPathRequestDto),
+    ProveCallPath(codestory_runtime::proof_qualification_support::UnvalidatedCallPathContract),
 }
 
 #[derive(Debug, Clone)]
@@ -12316,6 +12323,117 @@ version = "0.11.20"
                 constructions + 1
             );
         });
+    }
+
+    /// A cold verification prepares the core it reads and stops there. Before
+    /// the core-only goal existed it fell through to full activation, so an
+    /// observational proof paid for search preparation, embedding startup,
+    /// retrieval finalization, and strict validation it can never consult.
+    #[test]
+    fn cold_exact_verification_prepares_the_core_without_activating_retrieval() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("core_only.rs"),
+            "fn callee() {}\nfn caller() { callee(); }\n",
+        )
+        .expect("write core-only verification fixture");
+
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio-cache")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar-cache"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        session
+            .select_project(project.path().to_str())
+            .expect("select cold verification project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("active cold project")
+            .runtime
+            .activation
+            .clone();
+        assert_eq!(
+            activation.preparation_counts_for_test(),
+            (0, 0),
+            "the fixture must start cold"
+        );
+
+        let call_path = concat!(
+            "call-path/v1\n",
+            "start: caller\n",
+            "step 1: direct call -> callee\n",
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut converged = None;
+        for attempt in 0..40 {
+            let response = handle_stdio_message(
+                &mut session,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("core-only-{attempt}"),
+                    "method": "tools/call",
+                    "params": {
+                        "name": "verify_indexed_direct_calls",
+                        "arguments": {
+                            "project": project.path().to_string_lossy(),
+                            "call_path": call_path,
+                        }
+                    }
+                })
+                .to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .expect("verification response");
+            let content = response["result"]["structuredContent"].clone();
+            if content.get("code") == Some(&json!("codestory_preparing")) {
+                assert!(
+                    Instant::now() < deadline,
+                    "cold verification did not converge: {content}"
+                );
+                std::thread::sleep(Duration::from_millis(
+                    content["retry_after_ms"].as_u64().unwrap_or(50).min(500),
+                ));
+                continue;
+            }
+            converged = Some(content);
+            break;
+        }
+        let converged = converged.expect("cold verification converged within the retry budget");
+        assert_eq!(
+            converged["domain"], "call-path/v1",
+            "cold verification must return a verification result: {converged}"
+        );
+
+        assert_eq!(
+            activation.preparation_counts_for_test(),
+            (0, 0),
+            "core-only verification must not start the embedding backend or finalize retrieval"
+        );
+        let snapshot = activation.snapshot().expect("core-only activation snapshot");
+        assert_eq!(
+            snapshot.capabilities.local_navigation,
+            codestory_runtime::ActivationCapabilityState::Ready,
+            "the core the verifier reads must be ready"
+        );
+        assert_ne!(
+            snapshot.capabilities.broad_search,
+            codestory_runtime::ActivationCapabilityState::Ready,
+            "a core-only run must never report broad retrieval readiness"
+        );
+        assert_ne!(
+            snapshot.state,
+            codestory_runtime::ActivationState::Ready,
+            "a core-only run must not terminate in the full-readiness state"
+        );
     }
 
     #[test]

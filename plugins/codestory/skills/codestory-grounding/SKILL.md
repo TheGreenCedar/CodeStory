@@ -76,7 +76,7 @@ plugin package to locate a documented field or excerpt.
 | Discover or disambiguate a symbol | Discovery leads come from `search`; they identify candidates and never prove a claim. After a successful search, stop for that turn unless the current request already supplied an exact selection criterion such as one project-relative path and asked for focused evidence after disambiguation. In that case only, choose the unique typed evidence row with a non-null `symbol_id` that matches the exact path, then call `context` with that `symbol_id` as `id`. Do not inspect source merely to upgrade a discovery result. Missing excerpts, unavailable diagnostics, and multiple leads do not authorize source inspection. |
 | Get evidence for one selected target | Use `context` with that exact selected target. A user-supplied name is `query`; `id` is only an opaque `symbol_id` copied unchanged from a CodeStory result. Never guess an ID, broaden the target, or treat evidence availability as proof. |
 | Follow a call path for navigation | `callers`, `callees`, `trace`, or `trail` can navigate the ordinary graph. Use `neighbors`, `shortest_path`, or `query_subgraph` only for a named node; none of these tools returns an exact proof disposition. |
-| Verify an already translated exact call-path contract | For a host-supplied or user-supplied complete typed contract, call `verify_indexed_direct_calls` with the unchanged `source_text`, clauses, and exact spec. Do not infer or assemble a typed contract from English. |
+| Verify an exact call path the user already wrote | When the request supplies a complete `call-path/v1` document, call `verify_indexed_direct_calls` with that text unchanged in `call_path`. Do not compose one from English, and do not repair a partial one. |
 | Review change impact | `affected` with explicit Git-changed `paths` (or `changed_paths` / `change_records`). Never omit the path source. |
 | One ordinary graph node | `get_node`, `definition`, `references`, or `symbols` provide navigation details, not a proof disposition. Use `context` when the task needs the schema-v3 evidence projection for that selected target. |
 | Broad structural question | Use `packet`; answer only from its evidence rows, name its gaps, and follow a returned bounded continuation at most once. Use `search` or `context` only for a user-named exact target, not as packet recovery. |
@@ -126,9 +126,9 @@ plugin package to locate a documented field or excerpt.
 - Pass an explicitly supplied symbol name to `search.query` unchanged. Do not
   add descriptive words such as "declarations named" or rewrite the selector.
 - `verify_indexed_direct_calls` is the only surface that returns `contract_proven` or
-  `contract_refuted`. It verifies a host-supplied interpretation; it does not
-  translate prose. Never call it automatically from a packet, search result,
-  context result, or guessed natural-language contract. Cite only the
+  `contract_refuted`. It verifies the `call-path/v1` document it is given; it
+  does not translate prose. Never call it automatically from a packet, search
+  result, context result, or guessed natural-language contract. Cite only the
   `receipt_id` values selected by its disposition; a proof `fact_id` or
   `edge_id` is not an authoritative receipt identity. When summarizing a
   refutation basis in a scalar field, copy its `refutation.kind`; do not replace
@@ -139,10 +139,10 @@ plugin package to locate a documented field or excerpt.
   typed-proof evidence. Preserve no proof authority or disposition, copy a
   reason code only when the payload supplies one explicitly, and never derive a
   code from human-readable validation text.
-- When the user asks for exact proof from English but supplies no complete typed
-  contract, stop and report that the typed contract is required. Do not call a
-  repository tool or substitute packet, search, context, or source evidence for
-  the requested proof.
+- When the user asks for exact proof from English but supplies no complete
+  `call-path/v1` document, stop and report that the document is required. Do not
+  call a repository tool or substitute packet, search, context, or source
+  evidence for the requested proof.
 - Preserve `contract_proven`, `contract_refuted`, `unknown`, and `unavailable`
   exactly. `unknown` is not absence, and `unavailable` is not negative proof.
   Exact structural proof does not establish runtime execution, reachability,

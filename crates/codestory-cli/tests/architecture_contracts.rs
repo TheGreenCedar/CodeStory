@@ -3646,7 +3646,6 @@ const PRODUCTION_GAP_ANNOTATION_PRODUCERS: &[(&str, &[&str])] = &[
             "\"Investigation discarded low-confidence unanchored hits for a natural-language query.\"",
             "\"Repo-text diagnostics are disabled for packet evidence; weak unanchored hits were not promoted.\"",
             "\"Investigation low confidence gap after sidecar query expansion.\"",
-            "\"Grounding snapshot supplement skipped because sidecar-primary retrieval is mandatory.\"",
             "\"Trail filter options unavailable; continuing with unsanitized filters.\"",
             "\"Neighborhood retrieval failed; continuing with trail retrieval.\"",
             "trail_truncated_annotation(idx + 1, plan.max_nodes)",

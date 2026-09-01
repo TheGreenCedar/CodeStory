@@ -826,6 +826,7 @@ mod tests {
             "kind": "preparing",
             "state": "preparing",
             "retry_after_ms": 250,
+            "minimum_next": {"kind":"retry_same_request","after_ms":250},
             "operation": {"stage":"publication"}
         });
         let schema = json!({
@@ -834,9 +835,10 @@ mod tests {
                 "kind":{"type":"string","enum":["preparing"]},
                 "state":{"type":"string","enum":["preparing"]},
                 "retry_after_ms":{"type":"integer","minimum":1},
+                "minimum_next":{"type":"object"},
                 "operation":{"type":"object"}
             },
-            "required":["kind","state","retry_after_ms","operation"],
+            "required":["kind","state","retry_after_ms","minimum_next","operation"],
             "additionalProperties":false
         });
         for revision in McpRevisionV3::all() {
@@ -860,6 +862,7 @@ mod tests {
             "kind": "preparing",
             "state": "preparing",
             "retry_after_ms": 250,
+            "minimum_next": {"kind":"retry_same_request","after_ms":250},
             "operation": {"stage":"publication"}
         });
         let activation_tools = crate::stdio_catalog::v3_tool_source_json()

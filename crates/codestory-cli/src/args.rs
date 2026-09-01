@@ -69,7 +69,9 @@ pub(crate) enum Command {
     Context(ContextCommand),
     #[command(about = "Answer a broad repository question with evidence.")]
     Packet(PacketCommand),
-    #[command(about = "Verify one host-supplied exact indexed source call path.")]
+    #[command(
+        about = "Verify one exact indexed source call path written in the call-path/v1 grammar."
+    )]
     VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand),
     #[command(about = "Build owner-directed task workflow packets.")]
     Task(TaskCommand),
@@ -134,12 +136,12 @@ pub(crate) enum Command {
 #[derive(Args, Debug)]
 #[command(
     name = "verify-indexed-direct-calls",
-    visible_alias = "prove-call-path",
-    about = "Verify one host-supplied exact indexed source call path."
+    about = "Verify one exact indexed source call path written in the call-path/v1 grammar."
 )]
 pub(crate) struct VerifyIndexedDirectCallsCommand {
     #[arg(long, value_name = "ROOT")]
     pub(crate) project: PathBuf,
+    /// A `call-path/v1` document, or `-` to read it from stdin.
     #[arg(long, value_name = "PATH")]
     pub(crate) spec: PathBuf,
 }

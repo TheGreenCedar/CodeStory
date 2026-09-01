@@ -5,6 +5,23 @@ use super::{V3SurfaceSet, profile::McpRevisionV3};
 const VENDOR_SAFETY_KEY: &str = "com.thegreencedar.codestory/safety";
 const PROJECTION_ROWS_MAX_V3: usize = 256;
 const PROJECTION_REFERENCES_MAX_V3: usize = 256;
+/// The transport reads the document as UTF-8 bytes under an 8 KiB cap; the
+/// schema states the same bound in characters, which is never looser.
+const PROOF_CALL_PATH_INPUT_MAX_CHARS_V3: usize =
+    crate::prove_call_path::PROVE_CALL_PATH_INPUT_MAX_BYTES;
+const PROOF_CALL_PATH_GRAMMAR_DESCRIPTION_V3: &str = concat!(
+    "A call-path/v1 document. Line-oriented, one contract per document:\n",
+    "call-path/v1\n",
+    "start: crate::module::Alpha\n",
+    "step 1: direct call -> crate::module::Beta\n",
+    "step 2: direct call -> \"src/gamma.rs\"::Gamma\n",
+    "prohibit traversal through: crate::detail::Helper\n",
+    "exclude from projection: crate::test_support\n",
+    "Selectors are qualified names or \"path/to/file\"::Name. ",
+    "Steps are numbered consecutively from 1. ",
+    "Any line the grammar cannot read is reported as an unresolved clause and ",
+    "yields graph_disposition \"unknown\" rather than being skipped."
+);
 
 pub(crate) fn tools_for_revision_v3(revision: McpRevisionV3) -> Vec<Value> {
     tools_for_surface_v3(revision, V3SurfaceSet::WithProof)
@@ -36,7 +53,7 @@ fn proof_common_fields_v3(kind: &str) -> Vec<(&str, Value)> {
         ("kind", enum_schema_v3(&[kind])),
         ("schema_version", json!({"type":"integer","enum":[1]})),
         ("domain", enum_schema_v3(&["call-path/v1"])),
-        ("translation_status", enum_schema_v3(&["host_supplied"])),
+        ("translation_status", enum_schema_v3(&["parser_derived"])),
         (
             "graph_disposition",
             enum_schema_v3(&["proven", "refuted", "unknown"]),
@@ -60,8 +77,11 @@ fn proof_common_fields_v3(kind: &str) -> Vec<(&str, Value)> {
     ]
 }
 
+/// No proof-provenance registry or resource route exists, so the schema admits
+/// only the unavailable report. It gains an `available` branch when something
+/// can actually serve the artifact.
 fn proof_provenance_capability_schema_v3() -> Value {
-    diagnostics_capability_schema_v3()
+    closed_object_schema_v3(vec![("availability", enum_schema_v3(&["unavailable"]))])
 }
 
 fn proof_complete_schema_v3() -> Value {
@@ -911,6 +931,15 @@ fn unsigned_integer_schema_v3() -> Value {
     json!({"type":"integer","minimum":0})
 }
 
+/// A preparing result states the smallest sufficient next action, so a caller
+/// never has to infer whether the request needs rewriting.
+fn preparing_minimum_next_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("kind", enum_schema_v3(&["retry_same_request"])),
+        ("after_ms", json!({"type":"integer","minimum":1})),
+    ])
+}
+
 fn successful_with_preparing_schema_v3(success: Value) -> Value {
     json!({
         "type": "object",
@@ -927,9 +956,10 @@ fn successful_with_preparing_schema_v3(success: Value) -> Value {
                     "kind": {"type":"string","enum":["preparing"]},
                     "state": {"type":"string","enum":["preparing"]},
                     "retry_after_ms": {"type":"integer","minimum":1},
+                    "minimum_next": preparing_minimum_next_schema_v3(),
                     "operation": {"type":"object"}
                 },
-                "required": ["kind", "state", "retry_after_ms", "operation"],
+                "required": ["kind", "state", "retry_after_ms", "minimum_next", "operation"],
                 "additionalProperties": false
             }
         ]
@@ -939,7 +969,7 @@ fn successful_with_preparing_schema_v3(success: Value) -> Value {
 pub(crate) fn proof_tool_source_v3() -> Value {
     json!({
         "name": "verify_indexed_direct_calls",
-        "description": "Verify one host-translated exact indexed source call-path contract against a pinned publication.",
+        "description": "Verify one exact indexed source call path, written in the call-path/v1 grammar, against a pinned publication.",
         "inputSchema": proof_input_schema_v3(),
         "outputSchema": proof_output_schema_v3(),
         "safety": {
@@ -953,141 +983,16 @@ pub(crate) fn proof_tool_source_v3() -> Value {
 fn proof_input_schema_v3() -> Value {
     closed_object_schema_v3(vec![
         ("project", json!({"type":"string","minLength":1})),
-        ("source_text", json!({"type":"string","minLength":1})),
         (
-            "clauses",
-            json!({"type":"array","items":proof_clause_anchor_input_schema_v3()}),
-        ),
-        ("spec", proof_spec_input_schema_v3()),
-    ])
-}
-
-fn proof_clause_anchor_input_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("clause_id", json!({"type":"string","minLength":1})),
-        ("start_byte", unsigned_integer_schema_v3()),
-        ("end_byte_exclusive", unsigned_integer_schema_v3()),
-        ("quote", string_schema_v3()),
-        (
-            "classification",
-            proof_clause_classification_input_schema_v3(),
-        ),
-    ])
-}
-
-fn proof_clause_classification_input_schema_v3() -> Value {
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["resolved_material"])),
-                ("fields", json!({
-                    "type":"array",
-                    "items":proof_contract_field_input_schema_v3(),
-                    "minItems":1,
-                })),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["unresolved_material"])),
-                ("reason", enum_schema_v3(&[
-                    "missing_selector_resolution",
-                    "ambiguous_selector_resolution",
-                    "unsupported_interpretation",
-                ])),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["non_material"])),
-                ("reason", enum_schema_v3(&[
-                    "whitespace",
-                    "punctuation",
-                    "connector",
-                    "commentary",
-                ])),
-            ]),
-        ],
-    })
-}
-
-fn proof_contract_field_input_schema_v3() -> Value {
-    let step = |kind| {
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&[kind])),
-            ("step", json!({"type":"integer","minimum":0,"maximum":5})),
-        ])
-    };
-    let scope = |kind| {
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&[kind])),
-            ("index", json!({"type":"integer","minimum":0,"maximum":255})),
-        ])
-    };
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![("kind", enum_schema_v3(&["start"]))]),
-            step("step_target"),
-            step("directness"),
-            step("ordering"),
-            step("relation"),
-            scope("traversal_prohibition"),
-            scope("projection_exclusion"),
-        ],
-    })
-}
-
-fn proof_spec_input_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("start", proof_selector_input_schema_v3()),
-        (
-            "steps",
+            "call_path",
             json!({
-                "type":"array",
-                "items":closed_object_schema_v3(vec![("target", proof_selector_input_schema_v3())]),
-                "minItems":1,
-                "maxItems":6,
+                "type":"string",
+                "minLength":1,
+                "maxLength":PROOF_CALL_PATH_INPUT_MAX_CHARS_V3,
+                "description":PROOF_CALL_PATH_GRAMMAR_DESCRIPTION_V3,
             }),
         ),
-        (
-            "prohibit_traversal_through",
-            json!({"type":"array","items":proof_selector_input_schema_v3(),"maxItems":256}),
-        ),
-        (
-            "exclude_from_projection",
-            json!({"type":"array","items":proof_selector_input_schema_v3(),"maxItems":256}),
-        ),
     ])
-}
-
-fn proof_selector_input_schema_v3() -> Value {
-    let file_components = json!({
-        "type":["array","null"],
-        "items":{"type":"string","minLength":1},
-    });
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["pinned_node"])),
-                ("project_id", string_schema_v3()),
-                ("core_generation_id", string_schema_v3()),
-                ("core_run_id", string_schema_v3()),
-                ("node_id", string_schema_v3()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["canonical_id"])),
-                ("canonical_id", string_schema_v3()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["qualified_name"])),
-                ("qualified_name", string_schema_v3()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["qualified_name"])),
-                ("qualified_name", string_schema_v3()),
-                ("project_file_components", file_components),
-            ]),
-        ],
-    })
 }
 
 fn title_v3(name: &str) -> String {
@@ -1283,6 +1188,7 @@ mod tests {
                 "kind":"preparing",
                 "state":"preparing",
                 "retry_after_ms":250,
+                "minimum_next":{"kind":"retry_same_request","after_ms":250},
                 "operation":{"stage":"publication"}
             });
             for name in ["packet", "context", "search", "verify_indexed_direct_calls"] {
@@ -1311,23 +1217,14 @@ mod tests {
             "kind": "complete",
             "schema_version": 1,
             "domain": "call-path/v1",
-            "translation_status": "host_supplied",
+            "translation_status": "parser_derived",
             "graph_disposition": "unknown",
             "runtime_execution_proven": false,
             "guard_version": "clause_guard_v1",
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
-            "provenance": {
-                "availability":"available",
-                "reference":{
-                    "artifact_id":"proof-provenance:b".to_string() + &"b".repeat(63),
-                    "sha256":"b".repeat(64),
-                    "byte_length":0,
-                    "uri":"codestory://proof-provenance/".to_string() + &"b".repeat(64),
-                    "wall_expiry_epoch_ms":0
-                }
-            },
+            "provenance": {"availability":"unavailable"},
             "identities": {"files":[],"symbols":[],"provenance_profiles":[],"evidence":[]},
             "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[{"relation":"direct_outgoing_call","target":{"kind":"canonical_id","canonical_id":"B"}}],"prohibit_traversal_through":[],"exclude_from_projection":[]},
             "clauses": [{
@@ -1343,23 +1240,14 @@ mod tests {
             "kind": "budget_exceeded",
             "schema_version": 1,
             "domain": "call-path/v1",
-            "translation_status": "host_supplied",
+            "translation_status": "parser_derived",
             "graph_disposition": "unknown",
             "runtime_execution_proven": false,
             "guard_version": "clause_guard_v1",
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
-            "provenance": {
-                "availability":"available",
-                "reference":{
-                    "artifact_id":"proof-provenance:b".to_string() + &"b".repeat(63),
-                    "sha256":"b".repeat(64),
-                    "byte_length":0,
-                    "uri":"codestory://proof-provenance/".to_string() + &"b".repeat(64),
-                    "wall_expiry_epoch_ms":0
-                }
-            },
+            "provenance": {"availability":"unavailable"},
             "disposition": {"kind":"unknown","contract_digest":"b".repeat(64),"gaps":[{"kind":"output_budget_exceeded"}]},
             "cap_bytes": 8192,
             "required_complete_size": 8193

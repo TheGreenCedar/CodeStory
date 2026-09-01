@@ -425,8 +425,8 @@ use semantic_doc_text::{
 pub use services::set_before_retrieval_pin_test_hook;
 pub use services::{
     ACTIVATION_QUIESCENCE_FAIL_STOP, ActivationCapabilities, ActivationCapabilityState,
-    ActivationFailStopHook, ActivationOperation, ActivationQuiescence, ActivationRun,
-    ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
+    ActivationFailStopHook, ActivationGoal, ActivationOperation, ActivationQuiescence,
+    ActivationRun, ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
     ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
     IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
     TrailService, embedding_api_error, set_activation_fail_stop_hook,

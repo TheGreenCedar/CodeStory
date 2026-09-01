@@ -69,7 +69,6 @@ pub(in crate::app) fn json_output_requested(args: &[OsString]) -> bool {
     args.windows(2)
         .any(|pair| pair[0] == OsStr::new("--format") && pair[1] == OsStr::new("json"))
         || args.iter().any(|arg| arg == OsStr::new("--format=json"))
-        || args.iter().any(|arg| arg == OsStr::new("prove-call-path"))
         || args
             .iter()
             .any(|arg| arg == OsStr::new("verify-indexed-direct-calls"))

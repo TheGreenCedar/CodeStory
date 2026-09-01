@@ -249,12 +249,41 @@ pub struct ActivationRun {
     pub joined: bool,
 }
 
+/// How far an activation run is asked to go.
+///
+/// `CoreOnly` stops once the complete core publication exists, which is all a
+/// complete-core observer such as exact verification or `affected` can read. It
+/// never starts search preparation, the embedding backend, retrieval
+/// finalization, or strict retrieval validation, and it never mints a ready
+/// lease, so it cannot make a broad tool look ready.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivationGoal {
+    CoreOnly,
+    #[default]
+    Full,
+}
+
+impl ActivationGoal {
+    /// Whether a run pursuing `self` delivers everything a `requested` run would.
+    fn satisfies(self, requested: Self) -> bool {
+        self == requested || (self == Self::Full && requested == Self::CoreOnly)
+    }
+
+    fn admits(self, snapshot: &ActivationSnapshot) -> bool {
+        match self {
+            Self::CoreOnly => snapshot.allows_operation("affected"),
+            Self::Full => snapshot_allows(snapshot),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ActivationCoordinatorState {
     target: Option<ActivationTarget>,
     current: Option<ActivationSnapshot>,
     ready_lease: Option<ReadyLease>,
     running: bool,
+    goal: ActivationGoal,
     current_cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -705,11 +734,35 @@ impl ActivationService {
         )
     }
 
+    /// Prepare only the complete core publication, for callers that read the
+    /// core and nothing else.
+    pub fn activate_core_only(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<ActivationRun, ApiError> {
+        self.activate_with_goal(
+            project_root,
+            storage_path,
+            cancelled,
+            DEFAULT_ACTIVATION_FOREGROUND_BUDGET,
+            ActivationGoal::CoreOnly,
+        )
+    }
+
     /// Configure the controller around an existing complete core publication
     /// without repairing source freshness. Warm complete cores stay bind-only
-    /// observational. Cold or fenced state starts normal activation so callers
-    /// can return `preparing` plus `retry_after_ms`; corrupt observational
-    /// reads fail directly and are never reclassified as a cold cache.
+    /// observational. Cold or fenced state starts a core-only activation so
+    /// callers can return `preparing` plus `retry_after_ms`; corrupt
+    /// observational reads fail directly and are never reclassified as a cold
+    /// cache.
+    ///
+    /// The preparation is core-only on purpose. A complete-core observer reads
+    /// the core publication and never the sidecars, so starting search
+    /// preparation, the embedding backend, or retrieval finalization on its
+    /// behalf would spend a broad-retrieval activation to answer a question
+    /// that cannot consult retrieval at all.
     pub fn ensure_complete_core_for_observation(
         &self,
         project_root: &Path,
@@ -728,7 +781,7 @@ impl ActivationService {
             CompleteCoreAdmission::Cold | CompleteCoreAdmission::Fenced => {}
         }
 
-        match self.activate_project(project_root, storage_path, cancelled) {
+        match self.activate_core_only(project_root, storage_path, cancelled) {
             Ok(_) => Ok(()),
             Err(error)
                 if error.code != "cancelled"
@@ -872,6 +925,23 @@ impl ActivationService {
         request_cancelled: Arc<AtomicBool>,
         foreground_budget: Duration,
     ) -> Result<ActivationRun, ApiError> {
+        self.activate_with_goal(
+            project_root,
+            storage_path,
+            request_cancelled,
+            foreground_budget,
+            ActivationGoal::Full,
+        )
+    }
+
+    fn activate_with_goal(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        request_cancelled: Arc<AtomicBool>,
+        foreground_budget: Duration,
+        goal: ActivationGoal,
+    ) -> Result<ActivationRun, ApiError> {
         if request_cancelled.load(Ordering::Acquire) {
             return Err(ApiError::new(
                 "cancelled",
@@ -897,6 +967,9 @@ impl ActivationService {
                             "a different logical project is already activating in this runtime context",
                         ));
                     }
+                    if !state.goal.satisfies(goal) {
+                        return Err(narrower_activation_in_flight());
+                    }
                     let operation_id = state
                         .current
                         .as_ref()
@@ -910,6 +983,7 @@ impl ActivationService {
                         true,
                         request_cancelled.as_ref(),
                         foreground_budget,
+                        goal,
                     );
                 }
                 if !state
@@ -953,6 +1027,9 @@ impl ActivationService {
                             "a different logical project started activation while the ready lease was being observed",
                         ));
                     }
+                    if !state.goal.satisfies(goal) {
+                        return Err(narrower_activation_in_flight());
+                    }
                     let operation_id = state
                         .current
                         .as_ref()
@@ -966,6 +1043,7 @@ impl ActivationService {
                         true,
                         request_cancelled.as_ref(),
                         foreground_budget,
+                        goal,
                     );
                 }
                 let candidate_is_current = state
@@ -997,6 +1075,7 @@ impl ActivationService {
                     &mut state,
                     &target,
                     probe.retained_core_publication,
+                    goal,
                 );
             }
 
@@ -1018,6 +1097,9 @@ impl ActivationService {
                         "a different logical project is already activating in this runtime context",
                     ));
                 }
+                if !state.goal.satisfies(goal) {
+                    return Err(narrower_activation_in_flight());
+                }
                 let operation_id = state
                     .current
                     .as_ref()
@@ -1031,6 +1113,7 @@ impl ActivationService {
                     true,
                     request_cancelled.as_ref(),
                     foreground_budget,
+                    goal,
                 );
             }
             if state
@@ -1042,7 +1125,12 @@ impl ActivationService {
                 drop(state);
                 continue;
             }
-            break self.begin_activation_locked(&mut state, &target, retained_core_publication);
+            break self.begin_activation_locked(
+                &mut state,
+                &target,
+                retained_core_publication,
+                goal,
+            );
         };
 
         let operation = ActivationOperation {
@@ -1086,6 +1174,7 @@ impl ActivationService {
                         &worker_operation,
                         worker_project_root,
                         worker_storage_path,
+                        goal,
                     )
                 });
             })
@@ -1104,6 +1193,7 @@ impl ActivationService {
             false,
             request_cancelled.as_ref(),
             foreground_budget,
+            goal,
         )
     }
 
@@ -1168,7 +1258,9 @@ impl ActivationService {
         state: &mut ActivationCoordinatorState,
         target: &ActivationTarget,
         retained_core_publication: Option<IndexPublicationDto>,
+        goal: ActivationGoal,
     ) -> (String, Arc<AtomicBool>) {
+        state.goal = goal;
         if !state
             .target
             .as_ref()
@@ -1283,6 +1375,7 @@ impl ActivationService {
         joined: bool,
         request_cancelled: &AtomicBool,
         foreground_budget: Duration,
+        goal: ActivationGoal,
     ) -> Result<ActivationRun, ApiError> {
         let deadline = Instant::now()
             .checked_add(foreground_budget)
@@ -1320,7 +1413,7 @@ impl ActivationService {
                     )
                 })?;
             if !state.running {
-                return if snapshot_allows(&snapshot) {
+                return if goal.admits(&snapshot) {
                     Ok(ActivationRun { snapshot, joined })
                 } else {
                     Err(snapshot_error(&snapshot))
@@ -1431,6 +1524,7 @@ impl ActivationService {
         operation: &ActivationOperation,
         project_root: PathBuf,
         storage_path: PathBuf,
+        goal: ActivationGoal,
     ) -> Result<(), ApiError> {
         let activation_started = Instant::now();
         // One activation owns the observations used to build and admit its
@@ -1525,6 +1619,20 @@ impl ActivationService {
             .or_else(|| summary.publication.clone())
             .expect("fresh complete core has a publication identity");
         operation.set_local_publication(local_publication.clone());
+
+        if goal == ActivationGoal::CoreOnly {
+            operation.set_capability(false, ActivationCapabilityState::Ready);
+            let total_ms =
+                u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::debug!(
+                target: "codestory::activation",
+                preflight_ms,
+                core_refresh_ms,
+                total_ms,
+                "core-only activation completed"
+            );
+            return Ok(());
+        }
 
         operation.ensure_not_cancelled("search preparation")?;
         operation.set_stage(ActivationStage::SearchPreparation);
@@ -1755,6 +1863,15 @@ fn index_freshness_block_message(operation: &str, freshness: &IndexFreshnessDto)
 
 fn snapshot_allows(snapshot: &ActivationSnapshot) -> bool {
     snapshot.allows_operation("packet")
+}
+
+/// A full request cannot borrow a core-only run's completion, because that run
+/// stops before retrieval. Retrying starts the full activation instead.
+fn narrower_activation_in_flight() -> ApiError {
+    ApiError::new(
+        "activation_retryable",
+        "a core-only activation is already running for this project; retry to start full activation",
+    )
 }
 
 fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
@@ -2406,6 +2523,7 @@ impl ActivationOperation {
             state.ready_lease = None;
         }
         let ready_lease_present = state.ready_lease.is_some();
+        let core_only = state.goal == ActivationGoal::CoreOnly;
         let Some(snapshot) = state
             .current
             .as_mut()
@@ -2462,6 +2580,21 @@ impl ActivationOperation {
                     )
                 });
             snapshot.failure = Some(error.message.clone());
+        } else if core_only {
+            // A core-only run proved the core and nothing else. Reporting
+            // `Ready` here would let a broad tool read full retrieval readiness
+            // out of a run that never prepared retrieval, so the terminal state
+            // stays `Updating`: local navigation is ready, and a broad caller is
+            // told to retry, which is what starts the full activation.
+            snapshot.state = ActivationState::Updating;
+            snapshot.stage = ActivationStage::CoreFreshness;
+            snapshot.progress = activation_stage_progress(ActivationStage::CoreFreshness);
+            snapshot.retry_after_ms = None;
+            snapshot.embedding_capacity = None;
+            snapshot.embedding_retry = None;
+            snapshot.failure_code = None;
+            snapshot.failure_details = None;
+            snapshot.failure = None;
         } else {
             debug_assert!(
                 ready_lease_present,
@@ -4014,7 +4147,12 @@ pub(crate) mod activation_tests {
         };
 
         let error = service
-            .activate_once(&operation, project_root, fixture.storage_path.clone())
+            .activate_once(
+                &operation,
+                project_root,
+                fixture.storage_path.clone(),
+                ActivationGoal::Full,
+            )
             .expect_err("a source tree that moved under the scan must not be leased as ready");
 
         assert_eq!(
@@ -4599,6 +4737,7 @@ pub(crate) mod activation_tests {
                 true,
                 &AtomicBool::new(true),
                 Duration::ZERO,
+                ActivationGoal::Full,
             )
             .expect_err("the cancelled waiter must return without joining");
         assert_eq!(cancelled.code, "cancelled");
@@ -4664,6 +4803,7 @@ pub(crate) mod activation_tests {
                 false,
                 &AtomicBool::new(false),
                 Duration::from_secs(1),
+                ActivationGoal::Full,
             )
             .expect_err("worker panic must become a terminal activation error");
         assert_eq!(terminal_error.code, "project_unavailable");

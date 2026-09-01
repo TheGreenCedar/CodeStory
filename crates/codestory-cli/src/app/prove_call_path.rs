@@ -1,21 +1,22 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::args::{OutputFormat, ProjectArgs, VerifyIndexedDirectCallsCommand};
+use crate::call_path_grammar::parse_call_path_document;
 use crate::output::emit;
 use crate::prove_call_path::{
-    internal_projection_root, parse_request, project_public_verification_result, projection_root,
-    read_bounded_spec, validate_request,
+    internal_projection_root, project_public_verification_result, projection_root,
+    read_bounded_call_path, validate_request,
 };
 use crate::runtime::{RuntimeContext, map_api_error};
 
 pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsCommand) -> Result<()> {
-    let bytes = read_bounded_spec(&cmd.spec)?;
-    let value = serde_json::from_slice(&bytes).context("parse proof spec JSON")?;
-    let request = parse_request(value).map_err(anyhow::Error::msg)?;
-    let validation = validate_request(request).map_err(anyhow::Error::msg)?;
+    let document = read_bounded_call_path(&cmd.spec)?;
+    let contract = parse_call_path_document(&document)
+        .map_err(|error| anyhow::Error::msg(error.message))?;
+    let validation = validate_request(contract).map_err(anyhow::Error::msg)?;
     let project = ProjectArgs {
         project: cmd.project,
         cache_dir: None,
