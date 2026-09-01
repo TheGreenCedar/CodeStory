@@ -4408,13 +4408,15 @@ fn semantic_projection_republish_rebinds_valid_proof_and_preserves_absence() {
     assert_eq!(after_proof.funnel, before_proof.funnel);
     assert_eq!(storage.get_proof_resolution_facts().unwrap(), before_facts);
 
-    storage
-        .get_connection()
-        .execute_batch(
-            "DELETE FROM proof_resolution_publication; DELETE FROM proof_resolution_fact;",
-        )
-        .unwrap();
     drop(storage);
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM proof_resolution_publication; DELETE FROM proof_resolution_fact;",
+            )
+            .unwrap();
+    });
     controller
         .republish_semantic_projections_blocking()
         .expect("semantic republish preserves migrated absence");
@@ -4445,15 +4447,15 @@ fn semantic_projection_republish_rejects_corrupt_proof_and_preserves_old_core() 
     let before = Storage::database_complete_index_publication(&storage_path)
         .unwrap()
         .unwrap();
-    let storage = Storage::open(&storage_path).unwrap();
-    storage
-        .get_connection()
-        .execute(
-            "UPDATE proof_resolution_publication SET funnel_json = '[]' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-    drop(storage);
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_publication SET funnel_json = '[]' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+    });
     let error = controller
         .republish_semantic_projections_blocking()
         .expect_err("corrupt old proof must reject semantic rebind");
@@ -4619,11 +4621,6 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("publish complete core");
     let identity = project_identity_v3(workspace.path());
-    let mut before_storage = Storage::open(&storage_path).expect("open complete core");
-    let before = before_storage
-        .get_complete_index_publication()
-        .expect("read complete core")
-        .expect("complete publication");
     let exclusions = (0_u64..112)
         .map(|index| OversizedSourceExclusionCandidate {
             normalized_path: format!("legacy/excluded-{index}.rs"),
@@ -4635,70 +4632,84 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
             structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         })
         .collect::<Vec<_>>();
-    before_storage
-        .publish_source_policy_exclusion_generation(
-            &before,
-            &identity.project_id,
-            &identity.workspace_id,
-            legacy_source_policy_identity(),
-            &exclusions,
-        )
-        .expect("replace retained source-policy publication");
-    let legacy_source_policy_digest = legacy_source_policy_exclusion_digest_for_test(
-        &before_storage
-            .get_source_policy_exclusions()
-            .expect("read retained source-policy exclusions"),
-    );
-    let dense_before = before_storage
-        .validate_dense_anchor_publication(&before)
-        .expect("retained dense publication");
-    assert!(dense_before.anchor_count > 0);
-    let symbol_doc_count = before_storage
-        .get_symbol_search_docs_batch_after(None, 10_000)
-        .expect("retained symbol documents")
-        .len();
-    assert!(symbol_doc_count > 0);
-    before_storage
-        .upsert_retrieval_index_manifest(&test_retrieval_manifest(
-            &identity.project_id,
-            symbol_doc_count as i64,
-            dense_before.anchor_count as i64,
-        ))
-        .expect("publish retained retrieval manifest");
-    let before_retrieval = before_storage
-        .get_retrieval_index_publication(&identity.project_id)
-        .expect("read retrieval publication")
-        .expect("retained retrieval publication");
-    drop(before_storage);
+    let (before, dense_anchor_count, symbol_doc_count) =
+        mutate_published_core(&storage_path, |storage| {
+            let before = storage
+                .get_complete_index_publication()
+                .expect("read complete core")
+                .expect("complete publication");
+            storage
+                .publish_source_policy_exclusion_generation(
+                    &before,
+                    &identity.project_id,
+                    &identity.workspace_id,
+                    legacy_source_policy_identity(),
+                    &exclusions,
+                )
+                .expect("replace retained source-policy publication");
+            let legacy_source_policy_digest = legacy_source_policy_exclusion_digest_for_test(
+                &storage
+                    .get_source_policy_exclusions()
+                    .expect("read retained source-policy exclusions"),
+            );
+            let dense_before = storage
+                .validate_dense_anchor_publication(&before)
+                .expect("retained dense publication");
+            assert!(dense_before.anchor_count > 0);
+            let symbol_doc_count = storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("retained symbol documents")
+                .len();
+            assert!(symbol_doc_count > 0);
 
-    let legacy = rusqlite::Connection::open(&storage_path).expect("open retained v1 core");
-    legacy
-        .execute(
-            "UPDATE source_policy_exclusion_publication
-             SET schema_version = 1, exclusion_digest = ?1",
-            rusqlite::params![legacy_source_policy_digest],
-        )
-        .expect("restore authentic retained v1 publication identity");
-    legacy
-        .execute_batch(
-            "DELETE FROM structural_text_unit_publication;
-             ALTER TABLE index_publication RENAME TO index_publication_v30;
-             CREATE TABLE index_publication (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                generation INTEGER NOT NULL CHECK (generation > 0),
-                generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
-                run_id TEXT NOT NULL CHECK (length(run_id) > 0),
-                mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
-                published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
-             );
-             INSERT INTO index_publication
-             SELECT * FROM index_publication_v30;
-             DROP TABLE index_publication_v30;
-             PRAGMA user_version = 29;
-             PRAGMA wal_checkpoint(TRUNCATE);",
-        )
-        .expect("downgrade retained core to schema 29");
-    drop(legacy);
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE source_policy_exclusion_publication
+                     SET schema_version = 1, exclusion_digest = ?1",
+                    rusqlite::params![legacy_source_policy_digest],
+                )
+                .expect("restore authentic retained v1 publication identity");
+            (before, dense_before.anchor_count, symbol_doc_count)
+        });
+    // The retrieval publication lives beside the core, not inside the
+    // generation, so it is written through the live storage path — and while
+    // the core still reads at the current schema.
+    let before_retrieval = {
+        let mut storage = Storage::open(&storage_path).expect("open retained retrieval state");
+        storage
+            .upsert_retrieval_index_manifest(&test_retrieval_manifest(
+                &identity.project_id,
+                symbol_doc_count as i64,
+                dense_anchor_count as i64,
+            ))
+            .expect("publish retained retrieval manifest");
+        storage
+            .get_retrieval_index_publication(&identity.project_id)
+            .expect("read retrieval publication")
+            .expect("retained retrieval publication")
+    };
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM structural_text_unit_publication;
+                 ALTER TABLE index_publication RENAME TO index_publication_v30;
+                 CREATE TABLE index_publication (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation INTEGER NOT NULL CHECK (generation > 0),
+                    generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+                    run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+                    mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+                    published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+                 );
+                 INSERT INTO index_publication
+                 SELECT * FROM index_publication_v30;
+                 DROP TABLE index_publication_v30;
+                 PRAGMA user_version = 29;",
+            )
+            .expect("downgrade retained core to schema 29");
+    });
     for entry in fs::read_dir(workspace.path()).expect("list fixture root") {
         let path = entry.expect("fixture entry").path();
         if path.file_name().is_some_and(|name| name == ".cache") {
@@ -4805,23 +4816,24 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     );
     assert_no_staged_publication_artifacts(&storage_path);
 
-    let tampered = rusqlite::Connection::open(&storage_path).expect("open rebound core");
-    let go_edge_id = tampered
-        .query_row(
-            "SELECT edge_id FROM proof_resolution_fact
-             WHERE status = 'exact' AND language_adapter = 'go'
-             ORDER BY edge_id LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .expect("stored fixture has one exact Go edge");
-    tampered
-        .execute(
-            "UPDATE edge SET line = line + 1 WHERE id = ?1",
-            [go_edge_id],
-        )
-        .expect("tamper stored Go correlation");
-    drop(tampered);
+    mutate_published_core(&storage_path, |storage| {
+        let tampered = storage.get_connection();
+        let go_edge_id = tampered
+            .query_row(
+                "SELECT edge_id FROM proof_resolution_fact
+                 WHERE status = 'exact' AND language_adapter = 'go'
+                 ORDER BY edge_id LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("stored fixture has one exact Go edge");
+        tampered
+            .execute(
+                "UPDATE edge SET line = line + 1 WHERE id = ?1",
+                [go_edge_id],
+            )
+            .expect("tamper stored Go correlation");
+    });
     let error = controller
         .republish_semantic_projections_at_blocking(
             workspace.path().to_path_buf(),
@@ -4852,8 +4864,7 @@ fn semantic_projection_republish_fails_closed_when_stored_document_is_missing() 
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("publish complete core");
-    let before = {
-        let mut storage = Storage::open(&storage_path).expect("open complete core");
+    let before = mutate_published_core(&storage_path, |storage| {
         let publication = storage
             .get_complete_index_publication()
             .expect("read complete core")
@@ -4865,7 +4876,7 @@ fn semantic_projection_republish_fails_closed_when_stored_document_is_missing() 
                 > 0
         );
         publication
-    };
+    });
 
     let error = controller
         .republish_semantic_projections_blocking()
@@ -5022,8 +5033,7 @@ fn semantic_projection_republish_rejects_manifestless_nonempty_structural_state(
         .expect("publish complete core");
     let before = Storage::database_complete_index_publication(&storage_path)
         .expect("read complete publication");
-    {
-        let storage = Storage::open(&storage_path).expect("open structural fixture");
+    mutate_published_core(&storage_path, |storage| {
         storage
             .get_connection()
             .execute_batch(
@@ -5039,7 +5049,7 @@ fn semantic_projection_republish_rejects_manifestless_nonempty_structural_state(
                     X'01', 1);",
             )
             .expect("seed nonempty unmanifested structural state");
-    }
+    });
 
     let error = controller
         .republish_semantic_projections_blocking()
@@ -5072,11 +5082,12 @@ fn semantic_projection_republish_rejects_manifestless_current_schema() {
         .expect("publish complete core");
     let before = Storage::database_complete_index_publication(&storage_path)
         .expect("read complete publication");
-    Storage::open(&storage_path)
-        .expect("open current core")
-        .get_connection()
-        .execute("DELETE FROM structural_text_unit_publication", [])
-        .expect("remove current structural manifest");
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute("DELETE FROM structural_text_unit_publication", [])
+            .expect("remove current structural manifest");
+    });
 
     let error = controller
         .republish_semantic_projections_blocking()
@@ -5239,6 +5250,82 @@ fn semantic_projection_republish_runtime_cache_fault_completes_committed_generat
     }
 }
 
+/// `index --summarize` writes `symbol_summary`, which lives in the core
+/// database. Once a publication pointer exists the live handle is read-only, so
+/// the summaries have to reach disk through a staged republish instead.
+#[test]
+fn symbol_summaries_persist_into_a_published_immutable_core() {
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let runtime = test_sidecar_runtime_from_env();
+    let controller = AppController::new_with_config(runtime.clone());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline core");
+    let baseline = Storage::database_complete_index_publication(&storage_path)
+        .expect("read baseline publication")
+        .expect("baseline publication");
+
+    let summarized_node = Storage::open(&storage_path)
+        .expect("open published core")
+        .get_nodes()
+        .expect("read published nodes")
+        .first()
+        .expect("indexed fixture must produce a node")
+        .id;
+    let record = codestory_store::SymbolSummaryRecord {
+        node_id: summarized_node,
+        content_hash: "published-core-summary-hash".to_string(),
+        summary: "summary written after publication".to_string(),
+        model: "test-model".to_string(),
+        updated_at_epoch_ms: 7,
+    };
+
+    // The direct write the old path attempted is refused by the published core.
+    let direct = Storage::open(&storage_path)
+        .expect("open published core")
+        .upsert_symbol_summaries_batch(std::slice::from_ref(&record));
+    assert!(
+        direct.is_err(),
+        "a published core must refuse a direct symbol-summary write"
+    );
+
+    let staged_record = record.clone();
+    let outcome = controller
+        .republish_core_with_staged_mutation_blocking(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+            &move |store: &mut Storage| {
+                store
+                    .upsert_symbol_summaries_batch(std::slice::from_ref(&staged_record))
+                    .map_err(|error| {
+                        codestory_contracts::api::ApiError::internal(error.to_string())
+                    })
+            },
+        )
+        .expect("republish the core with the generated summaries");
+
+    assert_eq!(outcome.publication.generation, baseline.generation + 1);
+    let stored: String = Storage::open(&storage_path)
+        .expect("open republished core")
+        .get_connection()
+        .query_row(
+            "SELECT summary FROM symbol_summary WHERE node_id = ?1",
+            [summarized_node.0],
+            |row| row.get(0),
+        )
+        .expect("read the republished summary");
+    assert_eq!(stored, "summary written after publication");
+    assert_no_staged_publication_artifacts(&storage_path);
+}
+
 #[test]
 fn semantic_projection_republish_detects_generation_drift_and_keeps_competing_publication() {
     let _env = hybrid_test_env();
@@ -5286,6 +5373,7 @@ fn semantic_projection_republish_detects_generation_drift_and_keeps_competing_pu
         None,
         &runtime,
         controller.source_index_policy.as_ref(),
+        None,
     ) {
         Err(error) => error,
         Ok(_) => panic!("outer writer must detect competing generation"),
@@ -9875,6 +9963,59 @@ pub(crate) fn assert_no_staged_publication_artifacts(storage_path: &Path) {
         .filter(|name| name.contains(".staged."))
         .collect::<Vec<_>>();
     assert!(staged.is_empty(), "staged publication debris: {staged:?}");
+}
+
+/// Apply a hostile fixture write to the published core.
+///
+/// A published generation is immutable: `Storage::open` on the live path is
+/// read-only, and `Store::open_build` would re-init schema on the sealed image.
+/// Fixtures that must corrupt or backdate a published core therefore open the
+/// generation database directly, then checkpoint and reseal it so later
+/// observational opens see the mutated image.
+pub(crate) fn mutate_published_core<R>(
+    storage_path: &Path,
+    mutate: impl FnOnce(&mut Storage) -> R,
+) -> R {
+    let generation_db = codestory_store::resolve_core_database_path(storage_path)
+        .expect("resolve active immutable generation");
+    set_generation_owner_writable(&generation_db, true);
+    let result = {
+        let mut storage =
+            Storage::open(&generation_db).expect("open active generation for hostile fixture");
+        let result = mutate(&mut storage);
+        storage
+            .get_connection()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint hostile generation writes");
+        result
+    };
+    for suffix in ["-wal", "-journal", "-shm"] {
+        let mut sidecar = generation_db.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(sidecar));
+    }
+    set_generation_owner_writable(&generation_db, false);
+    result
+}
+
+fn set_generation_owner_writable(generation_db: &Path, writable: bool) {
+    let metadata = fs::metadata(generation_db).expect("generation metadata");
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = permissions.mode();
+        permissions.set_mode(if writable {
+            mode | 0o200
+        } else {
+            mode & !0o222
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(!writable);
+    }
+    fs::set_permissions(generation_db, permissions).expect("set generation writability");
 }
 
 fn storage_has_symbol(storage: &Storage, name: &str) -> bool {

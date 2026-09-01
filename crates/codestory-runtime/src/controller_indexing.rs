@@ -28,7 +28,7 @@ use crate::semantic_projection::{
     CacheRefreshStats, SEMANTIC_POLICY_VERSION, SemanticProjectionRepublishOutcome,
     apply_cache_refresh_stats, summarize_symbol_doc,
 };
-use crate::semantic_republish::semantic_projection_republish_for_runtime;
+use crate::semantic_republish::{StagedCoreMutation, semantic_projection_republish_for_runtime};
 use crate::support::{clamp_i64_to_u32, clamp_u128_to_u32};
 #[cfg(test)]
 use crate::validate_source_policy_exclusions;
@@ -1048,11 +1048,37 @@ impl AppController {
         self.republish_semantic_projections_at_blocking_inner(root, storage_path, None)
     }
 
+    /// Republish the core to carry a staged write that the immutable live
+    /// generation cannot accept.
+    pub(crate) fn republish_core_with_staged_mutation_blocking(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        staged_mutation: StagedCoreMutation<'_>,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_at_blocking_with(
+            root,
+            storage_path,
+            None,
+            Some(staged_mutation),
+        )
+    }
+
     fn republish_semantic_projections_at_blocking_inner(
         &self,
         root: PathBuf,
         storage_path: PathBuf,
         cancel_token: Option<&CancellationToken>,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_at_blocking_with(root, storage_path, cancel_token, None)
+    }
+
+    fn republish_semantic_projections_at_blocking_with(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        cancel_token: Option<&CancellationToken>,
+        staged_mutation: Option<StagedCoreMutation<'_>>,
     ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
         if !root.is_dir() {
             return Err(ApiError::not_found(format!(
@@ -1095,6 +1121,7 @@ impl AppController {
             cancel_token,
             &self.runtime_config,
             &self.source_index_policy,
+            staged_mutation,
         );
         match result {
             Ok((
@@ -1214,51 +1241,48 @@ impl AppController {
             })?;
         let model = self.runtime_config.summary.model.clone();
         let storage_path = self.require_storage_path()?;
-        let mut storage = Store::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-        let docs = storage
-            .get_all_llm_symbol_docs()
-            .map_err(|e| ApiError::internal(format!("Failed to load symbol docs: {e}")))?;
-        let current_summaries = storage
-            .get_all_current_symbol_summaries()
-            .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
 
+        // Generate first, write once. A published core is immutable, so the
+        // summaries can only land through a staged republish, and that stage
+        // must not be held open across the model calls.
         let mut generated = 0u32;
         let mut reused = 0u32;
         let mut skipped = 0u32;
         let mut pending = Vec::new();
-        for doc in docs {
-            if current_summaries.contains_key(&doc.node_id) {
-                reused = reused.saturating_add(1);
-                continue;
-            }
-            if doc.doc_text.trim().is_empty() {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-            let summary =
-                summarize_symbol_doc(&endpoint, &model, &doc, &self.runtime_config.summary)?;
-            pending.push(SymbolSummaryRecord {
-                node_id: doc.node_id,
-                content_hash: doc.doc_hash,
-                summary,
-                model: model.clone(),
-                updated_at_epoch_ms: current_epoch_ms(),
-            });
-            generated = generated.saturating_add(1);
-
-            if pending.len() >= 32 {
-                storage
-                    .upsert_symbol_summaries_batch(&pending)
-                    .map_err(|e| {
-                        ApiError::internal(format!("Failed to store symbol summaries: {e}"))
-                    })?;
-                pending.clear();
+        {
+            let storage = Store::open(&storage_path)
+                .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+            let docs = storage
+                .get_all_llm_symbol_docs()
+                .map_err(|e| ApiError::internal(format!("Failed to load symbol docs: {e}")))?;
+            let current_summaries = storage
+                .get_all_current_symbol_summaries()
+                .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
+            for doc in docs {
+                if current_summaries.contains_key(&doc.node_id) {
+                    reused = reused.saturating_add(1);
+                    continue;
+                }
+                if doc.doc_text.trim().is_empty() {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                let summary =
+                    summarize_symbol_doc(&endpoint, &model, &doc, &self.runtime_config.summary)?;
+                pending.push(SymbolSummaryRecord {
+                    node_id: doc.node_id,
+                    content_hash: doc.doc_hash,
+                    summary,
+                    model: model.clone(),
+                    updated_at_epoch_ms: current_epoch_ms(),
+                });
+                generated = generated.saturating_add(1);
             }
         }
-        storage
-            .upsert_symbol_summaries_batch(&pending)
-            .map_err(|e| ApiError::internal(format!("Failed to store symbol summaries: {e}")))?;
+
+        if !pending.is_empty() {
+            self.persist_symbol_summaries(&storage_path, pending)?;
+        }
 
         Ok(SummaryGenerationDto {
             generated,
@@ -1266,6 +1290,46 @@ impl AppController {
             skipped,
             endpoint,
         })
+    }
+
+    /// Durably store freshly generated symbol summaries.
+    ///
+    /// `symbol_summary` is a core table, so once a core publication pointer
+    /// exists the live database is read-only and the rows can only be installed
+    /// by republishing a new generation. An unpublished cache still takes the
+    /// direct write.
+    fn persist_symbol_summaries(
+        &self,
+        storage_path: &Path,
+        summaries: Vec<SymbolSummaryRecord>,
+    ) -> Result<(), ApiError> {
+        let published = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
+            .and_then(|layout| layout.read_pointer())
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to resolve the core publication pointer: {error}"
+                ))
+            })?
+            .is_some();
+        if !published {
+            let mut storage = Store::open(storage_path)
+                .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+            return storage
+                .upsert_symbol_summaries_batch(&summaries)
+                .map_err(|e| ApiError::internal(format!("Failed to store symbol summaries: {e}")));
+        }
+
+        let root = self.require_project_root()?;
+        self.republish_core_with_staged_mutation_blocking(
+            root,
+            storage_path.to_path_buf(),
+            &move |store: &mut Store| {
+                store.upsert_symbol_summaries_batch(&summaries).map_err(|e| {
+                    ApiError::internal(format!("Failed to store symbol summaries: {e}"))
+                })
+            },
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn finalize_indexing_without_runtime_refresh_with<F>(

@@ -1392,6 +1392,7 @@ fn semantic_projection_republish_fail_and_cancel_matrix_preserves_complete_core_
                 Some(&cancel),
                 &runtime,
                 controller.source_index_policy.as_ref(),
+                None,
             ) {
                 Err(error) => error,
                 Ok(_) => panic!("faulted projection republish must not publish"),
