@@ -171,17 +171,23 @@ pub fn fused_candidate_identity_matches(left: &CandidateHit, right: &CandidateHi
 }
 
 impl CandidateHit {
+    /// Stable descriptor identity available without opening core state.
+    pub fn packet_stable_identity(&self) -> Option<String> {
+        match self.node_id.as_deref() {
+            Some(identity) => {
+                let identity = identity.trim();
+                let identity = identity.parse::<i64>().ok()?;
+                Some(format!("node:{identity}"))
+            }
+            None => packet_path_identity(&self.file_path).map(|path| format!("path:{path}")),
+        }
+    }
+
     /// Convert sidecar output into the descriptor-only packet admission
     /// boundary. Missing identity or source bounds makes a candidate
     /// ineligible; callers must not hydrate core state to fill either field.
     pub fn packet_descriptor(&self) -> Option<PacketCandidateDescriptorV1> {
-        let stable_identity = self
-            .node_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|identity| !identity.is_empty())
-            .map(|identity| format!("node:{identity}"))
-            .or_else(|| packet_path_identity(&self.file_path).map(|path| format!("path:{path}")))?;
+        let stable_identity = self.packet_stable_identity()?;
         let source_bytes_upper_bound = self.source_bytes_upper_bound?;
         if self.file_path.trim().is_empty()
             || source_bytes_upper_bound == 0
@@ -525,5 +531,44 @@ mod tests {
                 "unsafe path admitted: {path}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_sidecar_node_identity_makes_the_descriptor_ineligible() {
+        let mut candidate = CandidateHit::lexical_stub("src/lib.rs", 0.8);
+        candidate.node_id = Some("not-an-id".into());
+        candidate.source_bytes_upper_bound = Some(512);
+
+        assert!(candidate.packet_descriptor().is_none());
+    }
+
+    #[test]
+    fn signed_sidecar_node_identity_uses_the_real_node_id_grammar() {
+        let mut candidate = CandidateHit::lexical_stub("src/lib.rs", 0.8);
+        candidate.node_id = Some("-42".into());
+        candidate.source_bytes_upper_bound = Some(512);
+
+        assert_eq!(
+            candidate
+                .packet_descriptor()
+                .expect("signed node id is valid")
+                .stable_identity,
+            "node:-42"
+        );
+    }
+
+    #[test]
+    fn sidecar_node_identity_is_canonicalized_before_admission() {
+        let mut candidate = CandidateHit::lexical_stub("src/lib.rs", 0.8);
+        candidate.node_id = Some(" +0042 ".into());
+        candidate.source_bytes_upper_bound = Some(512);
+
+        assert_eq!(
+            candidate
+                .packet_descriptor()
+                .expect("numeric node id is valid")
+                .stable_identity,
+            "node:42"
+        );
     }
 }

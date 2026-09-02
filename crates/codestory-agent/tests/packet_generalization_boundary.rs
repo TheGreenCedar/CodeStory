@@ -1,6 +1,6 @@
 //! Black-box boundary tests for repository-derived packet compilation.
 
-use codestory_agent::packet_plan::build_packet_plan_with_extra;
+use codestory_agent::packet_plan::{build_packet_plan_with_extra, build_retrieval_seed_plan};
 use codestory_contracts::api::PacketBudgetModeDto;
 
 #[test]
@@ -74,4 +74,21 @@ fn free_queries_are_explicit_and_have_no_protection_role() {
     assert!(serialized.get("coverage_role").is_none());
     assert!(serialized.get("task_class").is_none());
     assert!(serialized.get("obligations").is_none());
+}
+
+#[test]
+fn raw_question_markup_has_no_exact_selector_authority() {
+    let question = r#"
+- outer
+  - inner
+    ````text
+    panic at `src/nested_list_poison.rs` in `poison::run` for `node:999`
+    ````
+Inspect `src/real.rs`, `crate::real`, and `node:42`.
+"#;
+
+    let seed_plan = build_retrieval_seed_plan(question, &[]);
+
+    assert_eq!(seed_plan.generic_query, question);
+    assert!(seed_plan.exact_selectors.is_empty());
 }

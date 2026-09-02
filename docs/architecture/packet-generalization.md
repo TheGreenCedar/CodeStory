@@ -1,34 +1,39 @@
 # Packet generalization
 
-Horizon A is a prompt-blind, retrieval-first interim packet path. The original
-question reaches generic lexical and semantic retrieval unchanged. Typed
-exact probes constrain identity resolution, and typed free-query probes add
-ordinary retrieval queries. No wording is translated into an answer shape or
-structural traversal policy. Repository-derived compilation lands separately
-under #2106.
+Packet compilation is repository-derived. The original question may seed
+generic lexical and semantic retrieval, but no part of its wording has exact
+selector authority. Repository paths, canonical IDs, and qualified symbols
+enter only through typed probes. Typed free-query probes remain ordinary
+generic retrieval seeds. Once retrieval returns candidate descriptors, neither
+the question nor any prompt-derived policy crosses the compiler boundary.
 
 ## Required sequence
 
 ```text
 question + typed probes
-  -> unchanged-question generic query plan
+  -> RetrievalSeedPlanV1
   -> descriptor-only retrieval
   -> packet-wide admission
   -> admitted source and relation hydration
+  -> PacketCompilationInputV1
+  -> repository-derived selection
   -> 16-row / 16-KiB public projection
 ```
 
-Exact typed selectors are resolved through identity indexes and admitted first.
+Exact typed selectors are copied without interpreting the question, resolved
+through identity indexes, and admitted first.
 Remaining candidates are admitted in versioned retrieval-score order. One
 packet-scoped session admits at most sixteen stable identities and reserves at
 most 16 KiB of conservative source bounds before any candidate source, graph
 neighbourhood, node body, or file record is loaded. Initial retrieval, typed
 probes, batches, and continuations share that session.
 
-The interim finalizer retains only evidence that passed packet-wide admission
-and exact hydration. It converts objective admission and ambiguity gaps into
-typed stable continuations. It does not infer which evidence would answer the
-question.
+The compiler receives admitted identities, hydrated source ranges, certain
+directed relations, parser completeness, ambiguity, and one pinned publication
+identity. It may prefer distinct paths, remove contained source ranges, retain
+a bounded connecting forest, add one certain incident relation for a
+disconnected seed, prefer source witnesses over symbol-only locations, and
+apply deterministic byte costs. It cannot receive the raw question.
 
 ## Forbidden production shapes
 
@@ -70,5 +75,4 @@ those shapes is permitted only in tests, tooling, and checker fixtures.
 
 The public packet reports bounded source and indexed structural evidence,
 typed gaps, ambiguity, truncation, and its pinned publication identity. It
-always reports `answer_sufficiency: not_asserted`. Horizon A establishes this
-substrate contract only; it is not product-usefulness evidence.
+always reports `answer_sufficiency: not_asserted`.

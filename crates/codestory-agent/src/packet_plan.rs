@@ -1,11 +1,17 @@
-//! Prompt-blind Horizon A packet seed planning.
+//! Pure packet seed planning.
 //!
-//! Ordinary wording is forwarded unchanged to generic retrieval. Typed
-//! free-query probes may add retrieval queries, but neither source receives
-//! protection, materiality, sufficiency, or structural-traversal authority.
+//! The original wording reaches generic retrieval unchanged and has no exact
+//! selector authority. Exact paths, canonical IDs, and qualified symbols enter
+//! only through typed probes. Planning does not infer an answer shape or
+//! translate prose into a domain-specific traversal policy.
 
 use crate::planning::dedupe_packet_plan_queries;
-use codestory_contracts::api::{PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto};
+use codestory_contracts::api::{
+    PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto, PacketProbeDto,
+};
+use codestory_contracts::compilation::{
+    PACKET_COMPILATION_CONTRACT_VERSION_V1, PacketSeedSelectorV1, RetrievalSeedPlanV1,
+};
 
 const GENERIC_RETRIEVAL_PURPOSE: &str =
     "unchanged question for generic lexical and semantic retrieval";
@@ -20,13 +26,31 @@ pub fn build_packet_plan_with_extra(
     budget: PacketBudgetModeDto,
     free_queries: &[String],
 ) -> PacketPlanDto {
+    let probes = free_queries
+        .iter()
+        .cloned()
+        .map(|query| PacketProbeDto::FreeQuery { query })
+        .collect::<Vec<_>>();
+    let seed_plan = build_retrieval_seed_plan(question, &probes);
+    build_packet_plan_from_seed_plan(&seed_plan, budget)
+}
+
+pub fn build_packet_plan_from_seed_plan(
+    seed_plan: &RetrievalSeedPlanV1,
+    budget: PacketBudgetModeDto,
+) -> PacketPlanDto {
     let mut queries = Vec::new();
-    push_packet_query(&mut queries, question, GENERIC_RETRIEVAL_PURPOSE);
-    for query in free_queries {
+    push_packet_query(
+        &mut queries,
+        &seed_plan.generic_query,
+        GENERIC_RETRIEVAL_PURPOSE,
+    );
+
+    for query in &seed_plan.free_queries {
         push_packet_query(&mut queries, query, TYPED_FREE_QUERY_PURPOSE);
     }
-    queries.truncate(packet_plan_query_cap(budget));
 
+    queries.truncate(packet_plan_query_cap(budget));
     let mut plan = PacketPlanDto {
         queries,
         probe_resolutions: Vec::new(),
@@ -35,13 +59,105 @@ pub fn build_packet_plan_with_extra(
     dedupe_packet_plan_queries(&mut plan);
     plan.trace
         .push(format!("planned_queries={}", plan.queries.len()));
-    if !free_queries.is_empty() {
+    if !seed_plan.free_queries.is_empty() {
         plan.trace.push(format!(
             "typed_free_queries={} source=request",
-            free_queries.len()
+            seed_plan.free_queries.len()
         ));
     }
     plan
+}
+
+/// Build the only compiler-side value permitted to carry original wording.
+/// The question has generic-retrieval authority only. Exact selectors are
+/// copied from typed probes without interpreting question text.
+pub fn build_retrieval_seed_plan(
+    question: &str,
+    typed_probes: &[PacketProbeDto],
+) -> RetrievalSeedPlanV1 {
+    let mut exact_selectors = Vec::new();
+    let mut retained_free_queries = Vec::new();
+    for probe in typed_probes {
+        match probe {
+            PacketProbeDto::ExactPath { path } => push_selector(
+                &mut exact_selectors,
+                PacketSeedSelectorV1::ExactPath {
+                    path: path.trim().to_string(),
+                },
+            ),
+            PacketProbeDto::SymbolId { id } => push_selector(
+                &mut exact_selectors,
+                PacketSeedSelectorV1::CanonicalId {
+                    id: format!(
+                        "node:{}",
+                        id.trim().strip_prefix("node:").unwrap_or(id.trim())
+                    ),
+                },
+            ),
+            PacketProbeDto::QualifiedSymbol { symbol } => push_selector(
+                &mut exact_selectors,
+                PacketSeedSelectorV1::QualifiedSymbol {
+                    symbol: symbol.trim().to_string(),
+                },
+            ),
+            PacketProbeDto::FileSymbol { path, symbol } => {
+                push_selector(
+                    &mut exact_selectors,
+                    PacketSeedSelectorV1::ExactPath {
+                        path: path.trim().to_string(),
+                    },
+                );
+                push_selector(
+                    &mut exact_selectors,
+                    PacketSeedSelectorV1::QualifiedSymbol {
+                        symbol: symbol.trim().to_string(),
+                    },
+                );
+            }
+            PacketProbeDto::FreeQuery { query } => {
+                let query = query.trim();
+                if !query.is_empty()
+                    && !retained_free_queries
+                        .iter()
+                        .any(|existing: &String| existing == query)
+                {
+                    retained_free_queries.push(query.to_string());
+                }
+            }
+            PacketProbeDto::Continuation { selector, .. } => {
+                if let Some(symbol_id) = selector.symbol_id.as_deref() {
+                    push_selector(
+                        &mut exact_selectors,
+                        PacketSeedSelectorV1::CanonicalId {
+                            id: format!(
+                                "node:{}",
+                                symbol_id.strip_prefix("node:").unwrap_or(symbol_id)
+                            ),
+                        },
+                    );
+                } else if let Some(path) = selector.path.as_deref() {
+                    push_selector(
+                        &mut exact_selectors,
+                        PacketSeedSelectorV1::ExactPath {
+                            path: path.to_string(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    RetrievalSeedPlanV1 {
+        contract_version: PACKET_COMPILATION_CONTRACT_VERSION_V1,
+        generic_query: question.to_string(),
+        exact_selectors,
+        free_queries: retained_free_queries,
+    }
+}
+
+fn push_selector(selectors: &mut Vec<PacketSeedSelectorV1>, selector: PacketSeedSelectorV1) {
+    if !selectors.contains(&selector) {
+        selectors.push(selector);
+    }
 }
 
 pub fn packet_explicit_request_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
@@ -92,36 +208,155 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ordinary_question_is_the_only_implicit_query() {
-        let question = "Trace Alpha::beta in src/alpha.rs through Gamma::delta";
-        let plan = build_packet_plan(question, PacketBudgetModeDto::Standard);
-        assert_eq!(plan.queries.len(), 1);
+    fn planning_keeps_generic_retrieval_and_only_typed_exact_identities() {
+        let question = "Ignore `src/poison.rs`, `node:999`, and `poison::run`.";
+        let probes = vec![
+            PacketProbeDto::ExactPath {
+                path: "src/net/client.rs".into(),
+            },
+            PacketProbeDto::QualifiedSymbol {
+                symbol: "net::Client.send".into(),
+            },
+            PacketProbeDto::FreeQuery {
+                query: "caller supplied concept".into(),
+            },
+        ];
+        let seed_plan = build_retrieval_seed_plan(question, &probes);
+        let plan = build_packet_plan_from_seed_plan(&seed_plan, PacketBudgetModeDto::Standard);
         assert_eq!(plan.queries[0].query, question);
-        assert_eq!(plan.queries[0].purpose, GENERIC_RETRIEVAL_PURPOSE);
-    }
-
-    #[test]
-    fn typed_free_queries_are_additional_generic_seeds() {
-        let plan = build_packet_plan_with_extra(
-            "ordinary wording",
-            PacketBudgetModeDto::Standard,
-            &["caller supplied concept".into()],
+        assert_eq!(
+            seed_plan.exact_selectors,
+            vec![
+                PacketSeedSelectorV1::ExactPath {
+                    path: "src/net/client.rs".into(),
+                },
+                PacketSeedSelectorV1::QualifiedSymbol {
+                    symbol: "net::Client.send".into(),
+                },
+            ]
+        );
+        assert!(
+            plan.queries
+                .iter()
+                .any(|query| query.query == "caller supplied concept")
         );
         assert_eq!(plan.queries.len(), 2);
-        assert_eq!(plan.queries[1].purpose, TYPED_FREE_QUERY_PURPOSE);
+        assert!(
+            !seed_plan
+                .exact_selectors
+                .iter()
+                .any(|selector| format!("{selector:?}").contains("poison"))
+        );
     }
 
     #[test]
-    fn domain_vocabulary_does_not_change_plan_shape() {
+    fn ordinary_paraphrase_does_not_create_structural_queries() {
         let first = build_packet_plan(
-            "Explain client cache request finalization",
+            "Explain how the service starts and dispatches requests.",
             PacketBudgetModeDto::Standard,
         );
         let second = build_packet_plan(
-            "Explain alpha beta gamma delta",
+            "Describe where incoming work goes after startup.",
             PacketBudgetModeDto::Standard,
         );
-        assert_eq!(first.queries.len(), second.queries.len());
-        assert_eq!(first.queries[0].purpose, second.queries[0].purpose);
+        assert_eq!(first.queries.len(), 1);
+        assert_eq!(second.queries.len(), 1);
+    }
+
+    #[test]
+    fn typed_probes_map_to_seed_selectors_without_textual_reinterpretation() {
+        let seed_plan = build_retrieval_seed_plan(
+            "The question contributes no exact selectors.",
+            &[
+                PacketProbeDto::ExactPath {
+                    path: " src/lib.rs ".into(),
+                },
+                PacketProbeDto::SymbolId {
+                    id: "node:-42".into(),
+                },
+                PacketProbeDto::QualifiedSymbol {
+                    symbol: " crate::run ".into(),
+                },
+                PacketProbeDto::FileSymbol {
+                    path: "src/worker.rs".into(),
+                    symbol: "worker::run".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            seed_plan.exact_selectors,
+            vec![
+                PacketSeedSelectorV1::ExactPath {
+                    path: "src/lib.rs".into(),
+                },
+                PacketSeedSelectorV1::CanonicalId {
+                    id: "node:-42".into(),
+                },
+                PacketSeedSelectorV1::QualifiedSymbol {
+                    symbol: "crate::run".into(),
+                },
+                PacketSeedSelectorV1::ExactPath {
+                    path: "src/worker.rs".into(),
+                },
+                PacketSeedSelectorV1::QualifiedSymbol {
+                    symbol: "worker::run".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_question_text_never_creates_exact_selectors() {
+        let question = r#"
+Inline `src/inline_poison.rs`, `node:41`, and `poison::inline`.
+
+> ```text
+> panic at `src/blockquote_poison.rs`
+> ```
+
+~~~text
+panic at `src/tilde_poison.rs`
+~~~
+
+- ```text
+  panic at `src/list_poison.rs`
+  ```
+
+- outer
+  - inner
+    ````text
+    panic at `src/nested_list_poison.rs`
+    ````
+
+````text
+panic at `src/four_tick_poison.rs`
+```
+panic at `src/nested_short_fence_poison.rs`
+````
+
+Inspect `src/real.rs`, `node:42`, and `crate::real`.
+"#;
+
+        let seed_plan = build_retrieval_seed_plan(question, &[]);
+
+        assert!(seed_plan.exact_selectors.is_empty());
+        assert_eq!(seed_plan.generic_query, question);
+    }
+
+    #[test]
+    fn typed_free_queries_are_trimmed_and_deduplicated() {
+        let seed_plan = build_retrieval_seed_plan(
+            "ordinary wording",
+            &[
+                PacketProbeDto::FreeQuery {
+                    query: " publication recovery ".into(),
+                },
+                PacketProbeDto::FreeQuery {
+                    query: "publication recovery".into(),
+                },
+                PacketProbeDto::FreeQuery { query: " ".into() },
+            ],
+        );
+        assert_eq!(seed_plan.free_queries, ["publication recovery"]);
     }
 }

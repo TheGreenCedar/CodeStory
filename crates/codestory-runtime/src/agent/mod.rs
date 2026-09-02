@@ -79,10 +79,9 @@ pub fn plan_packet(
     codestory_contracts::api::validate_packet_probe_request(&request.probes)
         .map_err(codestory_contracts::api::ApiError::invalid_argument)?;
     let probes = packet_probe::normalize_packet_probe_request(&request.probes);
-    let free_queries = packet_probe::unresolved_packet_probe_queries(&probes);
-    Ok(packet_plan::build_packet_plan_with_extra(
-        question,
+    let seed_plan = packet_plan::build_retrieval_seed_plan(question, &probes);
+    Ok(packet_plan::build_packet_plan_from_seed_plan(
+        &seed_plan,
         request.budget,
-        &free_queries,
     ))
 }

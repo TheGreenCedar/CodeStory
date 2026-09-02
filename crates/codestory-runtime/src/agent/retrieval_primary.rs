@@ -376,9 +376,12 @@ pub(crate) fn with_stable_retrieval_publication<T: RetrievalPublicationResponse>
 pub(crate) fn with_stable_packet_retrieval_publication<T: RetrievalPublicationResponse>(
     controller: &AppController,
     operation: &str,
+    expected_core_generation_id: &str,
+    expected_core_run_id: &str,
     mut build: impl FnMut() -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
     if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        ensure_pinned_core_publication(&pinned, expected_core_generation_id, expected_core_run_id)?;
         let mut response = build()?;
         response.attach_retrieval_publication(publication_dto(&pinned));
         return Ok(response);
@@ -390,7 +393,17 @@ pub(crate) fn with_stable_packet_retrieval_publication<T: RetrievalPublicationRe
         controller,
         operation,
         PinnedRetrievalScope::PacketDescriptor,
-        build,
+        || {
+            let pinned = active_pinned_retrieval_read(controller).ok_or_else(|| {
+                ApiError::internal("packet descriptor retrieval ran without its publication pin")
+            })?;
+            ensure_pinned_core_publication(
+                &pinned,
+                expected_core_generation_id,
+                expected_core_run_id,
+            )?;
+            build()
+        },
         |_| Ok(()),
     )
 }
@@ -997,15 +1010,13 @@ fn admit_packet_candidate_descriptors<'a>(
         if let Some(descriptor) = candidate.packet_descriptor() {
             descriptors.push(descriptor);
         } else {
-            let kind = if candidate.node_id.as_deref().is_none_or(str::is_empty) {
-                PacketAdmissionGapKindV1::StableIdentityMissing
-            } else {
+            let stable_identity = candidate.packet_stable_identity();
+            let kind = if stable_identity.is_some() {
                 PacketAdmissionGapKindV1::SourceBoundMissing
+            } else {
+                PacketAdmissionGapKindV1::StableIdentityMissing
             };
-            session.record_ineligible_candidate(
-                kind,
-                candidate.node_id.as_deref().map(|id| format!("node:{id}")),
-            );
+            session.record_ineligible_candidate(kind, None);
         }
     }
     descriptors.sort_by(|left, right| {
@@ -2667,15 +2678,13 @@ fn resolve_sidecar_candidates_in_storage(
             match candidate.packet_descriptor() {
                 Some(descriptor) => Some(descriptor),
                 None => {
-                    let kind = if candidate.node_id.as_deref().is_none_or(str::is_empty) {
-                        PacketAdmissionGapKindV1::StableIdentityMissing
-                    } else {
+                    let stable_identity = candidate.packet_stable_identity();
+                    let kind = if stable_identity.is_some() {
                         PacketAdmissionGapKindV1::SourceBoundMissing
+                    } else {
+                        PacketAdmissionGapKindV1::StableIdentityMissing
                     };
-                    identity_scope.record_ineligible_candidate(
-                        kind,
-                        candidate.node_id.as_deref().map(|id| format!("node:{id}")),
-                    );
+                    identity_scope.record_ineligible_candidate(kind, None);
                     unresolved_candidates.push((
                         candidate,
                         if matches!(kind, PacketAdmissionGapKindV1::StableIdentityMissing) {
@@ -3294,6 +3303,34 @@ mod tests {
             .expect("nested operation");
 
         assert_eq!(response.publication, Some(expected));
+    }
+
+    #[test]
+    fn packet_descriptor_pin_refuses_a_different_core_before_building() {
+        let fixture = pinned_operation_fixture();
+        let mut build_calls = 0;
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin packet descriptor pin"),
+        );
+
+        let error =
+            with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+                with_stable_packet_retrieval_publication(
+                    &fixture.controller,
+                    "packet response",
+                    "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                    "foreign-run",
+                    || {
+                        build_calls += 1;
+                        Ok(TestPublicationResponse::default())
+                    },
+                )
+            })
+            .expect_err("a descriptor publication from another core must be rejected");
+
+        assert_eq!(error.code, "publication_changed");
+        assert_eq!(build_calls, 0);
     }
 
     /// Every helper that can reuse an operation's pin must actually reuse it.
@@ -3961,6 +3998,40 @@ mod tests {
             session.admit_descriptor(&low.packet_descriptor().expect("complete low descriptor")),
             PacketAdmissionDecision::CountBudgetExceeded,
             "the sealed session must not admit a late lower-scoring query candidate"
+        );
+    }
+
+    #[test]
+    fn ineligible_sidecar_descriptor_never_exports_an_unauthenticated_identity() {
+        use crate::agent::packet_candidate::PacketProofSession;
+
+        let session = PacketProofSession::new();
+        let mut malformed = CandidateHit::with_source(
+            "src/malformed.rs",
+            Some("Malformed".to_string()),
+            0.9,
+            CandidateSource::Lexical,
+        );
+        malformed.node_id = Some("not-an-id".to_string());
+        malformed.source_bytes_upper_bound = Some(64);
+        let mut missing_bound = CandidateHit::with_source(
+            "src/missing.rs",
+            Some("Missing".to_string()),
+            0.8,
+            CandidateSource::Lexical,
+        );
+        missing_bound.node_id = Some("42".to_string());
+
+        admit_packet_candidate_descriptors(&session, [&malformed, &missing_bound]);
+
+        assert!(session.receipts().is_empty());
+        assert_eq!(session.gaps().len(), 2);
+        assert!(
+            session
+                .gaps()
+                .iter()
+                .all(|gap| gap.stable_identity.is_none()),
+            "unverified sidecar identities leaked into public continuation input"
         );
     }
 

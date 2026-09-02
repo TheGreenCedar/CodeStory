@@ -3,7 +3,6 @@ use crate::agent::citation::to_citation_from_hit;
 use crate::agent::packet_candidate::{PacketAdmissionDecision, active_packet_proof_session};
 use crate::agent::retrieval_primary::active_pinned_retrieval_publication;
 use crate::target_resolution::{TargetResolution, TargetSelection};
-pub(crate) use codestory_agent::packet_probes::exact_packet_probe_paths;
 use codestory_agent::{PinnedReader, admit_continuation_probe};
 use codestory_contracts::api::{
     AgentCitationDto, NodeId, NodeKind, PacketEvidenceResolutionDto, PacketEvidenceTierDto,
@@ -19,17 +18,6 @@ use std::path::Path;
 
 pub(crate) fn normalize_packet_probe_request(probes: &[PacketProbeDto]) -> Vec<PacketProbeDto> {
     probes.to_vec()
-}
-
-pub(crate) fn unresolved_packet_probe_queries(probes: &[PacketProbeDto]) -> Vec<String> {
-    probes
-        .iter()
-        .filter_map(|probe| match probe {
-            PacketProbeDto::FreeQuery { query } => Some(query.trim().to_string()),
-            _ => None,
-        })
-        .filter(|query| !query.trim().is_empty())
-        .collect()
 }
 
 pub(crate) fn resolve_packet_probes(
@@ -762,25 +750,6 @@ mod tests {
             source_bytes_upper_bound: Some(1),
             exact_selector_ordinal: None,
         }
-    }
-
-    #[test]
-    fn only_typed_free_queries_enter_generic_subquery_seeds() {
-        let probes = vec![
-            PacketProbeDto::ExactPath {
-                path: "src/lib.rs".into(),
-            },
-            PacketProbeDto::QualifiedSymbol {
-                symbol: "runtime::Publisher.commit".into(),
-            },
-            PacketProbeDto::FreeQuery {
-                query: "publication recovery".into(),
-            },
-        ];
-        assert_eq!(
-            unresolved_packet_probe_queries(&probes),
-            ["publication recovery"]
-        );
     }
 
     #[test]

@@ -1,9 +1,10 @@
-//! Prompt-blind packet seed planning and evidence-policy helpers.
+//! Pure packet seed planning and repository-derived evidence compilation.
 //!
-//! Horizon A forwards the unchanged question to generic retrieval and records
-//! caller-supplied free-query seeds. It does not infer answer shapes, material
-//! roles, lifecycle stages, or structural traversal from prompt wording. The
-//! repository-derived evidence compiler belongs to Horizon B (`#2106`).
+//! The original question may seed generic retrieval. Exact selectors come only
+//! from typed probes.
+//! Once retrieval has produced typed candidates, compilation sees only stable
+//! identities, source ranges, directed relations, ambiguity, and publication
+//! identity. It owns none of the machinery that answers those questions.
 //!
 //! Specifically, nothing here may activate a publication, open or write
 //! storage, execute retrieval, retry a publication, or move readiness. The only
@@ -16,6 +17,7 @@
 pub mod citation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod eval_probes;
+pub mod evidence_compiler;
 pub mod packet_citations;
 pub mod packet_command;
 pub mod packet_coverage;

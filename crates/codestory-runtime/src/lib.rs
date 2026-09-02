@@ -117,6 +117,7 @@ mod search_terms;
 mod semantic_projection;
 mod semantic_republish;
 mod snippets;
+#[cfg(test)]
 mod source_coverage;
 #[cfg(feature = "v3-evidence-separation-support")]
 #[doc(hidden)]
@@ -576,7 +577,10 @@ impl Runtime {
     }
 
     pub fn agent_service(&self) -> AgentService {
-        AgentService::new(self.controller.clone())
+        AgentService::new_with_public_operation(
+            self.controller.clone(),
+            self.public_operation.clone(),
+        )
     }
 
     pub fn bookmark_service(&self) -> BookmarkService {

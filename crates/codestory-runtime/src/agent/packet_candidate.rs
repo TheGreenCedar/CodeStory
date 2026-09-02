@@ -111,6 +111,11 @@ impl PacketProofSession {
         &self,
         descriptor: &PacketCandidateDescriptorV1,
     ) -> PacketAdmissionDecision {
+        let origin = if descriptor.exact_selector_ordinal.is_some() {
+            PacketAdmissionOriginV1::ExactTypedSelector
+        } else {
+            PacketAdmissionOriginV1::Retrieval
+        };
         if self
             .admitted_identities
             .borrow()
@@ -121,7 +126,7 @@ impl PacketProofSession {
         if *self.retrieval_admission_sealed.borrow() {
             self.record_gap(
                 PacketAdmissionGapKindV1::CandidateCountExceeded,
-                Some(descriptor.stable_identity.clone()),
+                unadmitted_gap_identity(origin, &descriptor.stable_identity),
                 descriptor.exact_selector_ordinal,
             );
             return PacketAdmissionDecision::CountBudgetExceeded;
@@ -129,7 +134,7 @@ impl PacketProofSession {
         let Some(source_bytes) = descriptor.source_bytes_upper_bound else {
             self.record_gap(
                 PacketAdmissionGapKindV1::SourceBoundMissing,
-                Some(descriptor.stable_identity.clone()),
+                unadmitted_gap_identity(origin, &descriptor.stable_identity),
                 descriptor.exact_selector_ordinal,
             );
             return PacketAdmissionDecision::SourceBudgetExceeded;
@@ -137,11 +142,7 @@ impl PacketProofSession {
         self.admit_with_receipt(
             &descriptor.stable_identity,
             source_bytes as usize,
-            if descriptor.exact_selector_ordinal.is_some() {
-                PacketAdmissionOriginV1::ExactTypedSelector
-            } else {
-                PacketAdmissionOriginV1::Retrieval
-            },
+            origin,
             &descriptor.retrieval_score.version,
             descriptor.exact_selector_ordinal,
         )
@@ -169,7 +170,7 @@ impl PacketProofSession {
         if self.remaining_hydration_slots() == 0 {
             self.record_gap(
                 PacketAdmissionGapKindV1::CandidateCountExceeded,
-                Some(stable_identity.to_string()),
+                unadmitted_gap_identity(origin, stable_identity),
                 exact_selector_ordinal,
             );
             return PacketAdmissionDecision::CountBudgetExceeded;
@@ -177,7 +178,7 @@ impl PacketProofSession {
         if source_bytes > self.remaining_source_bytes() {
             self.record_gap(
                 PacketAdmissionGapKindV1::SourceBudgetExceeded,
-                Some(stable_identity.to_string()),
+                unadmitted_gap_identity(origin, stable_identity),
                 exact_selector_ordinal,
             );
             return PacketAdmissionDecision::SourceBudgetExceeded;
@@ -279,6 +280,13 @@ impl PacketProofSession {
             }
         }
     }
+}
+
+fn unadmitted_gap_identity(
+    origin: PacketAdmissionOriginV1,
+    stable_identity: &str,
+) -> Option<String> {
+    (origin == PacketAdmissionOriginV1::ExactTypedSelector).then(|| stable_identity.to_string())
 }
 
 thread_local! {
@@ -648,6 +656,36 @@ mod tests {
             PacketAdmissionDecision::CountBudgetExceeded
         );
         assert!(session.receipts().is_empty());
+    }
+
+    #[test]
+    fn retrieval_overflow_never_exposes_an_unauthenticated_identity() {
+        let session = PacketProofSession::new();
+        for index in 0..INTERIM_MAX_ADMITTED_CANDIDATES {
+            assert_eq!(
+                session.admit(&format!("node:{index}"), 1),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let stale = PacketCandidateDescriptorV1 {
+            stable_identity: "node:999999".into(),
+            path: "src/stale.rs".into(),
+            symbol: Some("stale".into()),
+            retrieval_lane: PacketRetrievalLaneV1::Lexical,
+            retrieval_score: VersionedRetrievalScoreV1 {
+                version: PACKET_RETRIEVAL_SCORE_VERSION_V1.to_string(),
+                value: 0.1,
+            },
+            source_bytes_upper_bound: Some(1),
+            exact_selector_ordinal: None,
+        };
+
+        assert_eq!(
+            session.admit_descriptor(&stale),
+            PacketAdmissionDecision::CountBudgetExceeded
+        );
+        assert_eq!(session.gaps().len(), 1);
+        assert_eq!(session.gaps()[0].stable_identity, None);
     }
 
     fn answer() -> AgentAnswerDto {

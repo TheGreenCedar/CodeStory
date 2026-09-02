@@ -82,9 +82,9 @@ a live publication fence and is not persisted as vector compatibility.
 
 - add artifact formats and identity fields here before teaching runtime about
   them;
-- keep generic retrieval and descriptor metadata here, prompt-blind seed
-  planning in `codestory-agent`, and admission, hydration, interim assembly,
-  pin, and bounded product retry in `codestory-runtime`;
+- keep generic retrieval and descriptor metadata here, pure repository-derived
+  compilation in `codestory-agent`, and admission, hydration, assembly, pin,
+  and bounded product retry in `codestory-runtime`;
 - keep model execution mechanics and capability reporting in
   `codestory-llama-sys`, while keeping product model/vector/backend policy here;
 - preserve stable `sidecar_*` DTO fields only as compatibility vocabulary, not

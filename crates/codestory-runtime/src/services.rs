@@ -2957,11 +2957,26 @@ impl TrailService {
 #[derive(Clone)]
 pub struct AgentService {
     controller: AppController,
+    public_operation: PublicOperationService,
 }
 
 impl AgentService {
     pub(crate) fn new(controller: AppController) -> Self {
-        Self { controller }
+        let public_operation = PublicOperationService::new(controller.clone());
+        Self {
+            controller,
+            public_operation,
+        }
+    }
+
+    pub(crate) fn new_with_public_operation(
+        controller: AppController,
+        public_operation: PublicOperationService,
+    ) -> Self {
+        Self {
+            controller,
+            public_operation,
+        }
     }
 
     pub fn ask(&self, req: AgentAskRequest) -> Result<AgentAnswerDto, ApiError> {
@@ -2969,7 +2984,13 @@ impl AgentService {
     }
 
     pub fn packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
-        self.controller.agent_packet(req)
+        let cancelled = active_public_operation_cancellation()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        self.public_operation
+            .run_with_cancel("packet", cancelled, || {
+                self.controller.agent_packet(req.clone())
+            })
+            .map(|operation| operation.value)
     }
 }
 
@@ -3870,6 +3891,30 @@ pub(crate) mod activation_tests {
             core_generation_id: None,
             retrieval_generation: None,
         }
+    }
+
+    #[test]
+    fn exported_agent_packet_pins_core_before_retrieval() {
+        let fixture = ready_activation_fixture();
+        let agent = fixture.runtime.agent_service();
+        let controller = fixture.runtime.controller.clone();
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_in_hook = Arc::clone(&observed);
+        set_before_retrieval_pin_test_hook(move || {
+            assert!(
+                controller.active_core_publication().is_some(),
+                "retrieval began outside the exported service's core snapshot"
+            );
+            observed_in_hook.store(true, Ordering::Release);
+        });
+
+        agent
+            .packet(warm_packet_request())
+            .expect("exported agent packet");
+        assert!(
+            observed.load(Ordering::Acquire),
+            "exported agent service bypassed the public-operation boundary"
+        );
     }
 
     /// The first packet on a ready lease performs exactly one fingerprint pass.

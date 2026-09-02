@@ -140,12 +140,12 @@ flowchart LR
   the same engine.
 - `codestory-retrieval` owns immutable lexical/vector/SCIP generations,
   manifests, engine integration, health, retention, and fail-closed queries.
-- [`codestory-agent`](subsystems/agent.md) owns prompt-blind generic retrieval
-  planning and pure evidence-policy helpers. It forwards the unchanged question
-  and caller-supplied free-query seeds without inferring answer shapes or
-  traversal policy. It owns no activation, storage, retrieval execution,
-  admission, hydration, publication retry, or mutable readiness authority.
-  Repository-derived compilation lands separately under #2106.
+- [`codestory-agent`](subsystems/agent.md) owns syntactic retrieval-seed planning
+  and pure repository-derived compilation over admitted typed evidence. Only
+  the seed plan may retain the unchanged question; compilation receives no
+  prompt text, task class, obligation, role, carrier, or sufficiency policy. It
+  owns no activation, storage, retrieval execution, admission, hydration,
+  publication retry, or mutable readiness authority.
 - `codestory-runtime` is the only product orchestration layer.
 - `codestory-cli` parses and renders CLI, HTTP, and stdio adapters.
 - `codestory-bench` measures product paths without defining product behavior.

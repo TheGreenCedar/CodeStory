@@ -1529,7 +1529,7 @@ mod tests {
                 .is_some_and(|reason| reason.contains("insufficient space for compact rehydrate")),
             "unexpected reason: {output:?}"
         );
-        assert_eq!(output.copied, false);
+        assert!(!output.copied);
         assert!(
             output
                 .peak_space_required_bytes
