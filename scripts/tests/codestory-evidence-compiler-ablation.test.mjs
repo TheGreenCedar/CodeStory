@@ -906,6 +906,14 @@ test("blinded adjudication withholds arm identity and rejoins exact rows", async
       row.repo_provenance = { git_head: "a".repeat(40) };
       row.task_manifest_snapshot = { prompt: `Question for ${row.task_id}` };
     }
+    const failedPacket = rows.find((row) =>
+      row.task_id === BUILDER_ABLATION_TASK_IDS[0] &&
+      row.arm === "packet_semantic_off" &&
+      row.repeat === 1
+    );
+    failedPacket.status = "fail";
+    failedPacket.error = "retrieval_unavailable: stage_deadline";
+    await writeFile(failedPacket.stdout_path, "");
     await writeFile(
       path.join(runDir, "runs.jsonl"),
       `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
@@ -916,8 +924,17 @@ test("blinded adjudication withholds arm identity and rejoins exact rows", async
     assert.equal(cases.cases.length, 96);
     assert.equal(serializedCases.includes("packet_semantic_off"), false);
     assert.equal(serializedCases.includes("exact_plus_relations"), false);
+    const failedCase = cases.cases.find((entry) => entry.answer_status === "not_produced");
+    assert.ok(failedCase);
+    assert.equal(failedCase.answer, "");
+    assert.equal(
+      failedCase.answer_sha256,
+      createHash("sha256").update("").digest("hex"),
+    );
+    assert.equal(cases.cases.filter((entry) => entry.answer_status === "not_produced").length, 1);
+    assert.equal(cases.cases.filter((entry) => entry.answer_status === "produced").length, 95);
     const judgmentsPath = path.join(blindDir, "judgments.json");
-    await writeFile(judgmentsPath, `${JSON.stringify({
+    const judgments = {
       contract: JUDGMENTS_CONTRACT,
       source_cases_sha256: prepared.casesSha256,
       independent_reviewer: "independent-test-reviewer",
@@ -929,8 +946,25 @@ test("blinded adjudication withholds arm identity and rejoins exact rows", async
         unsupported_relation_finding_ids: [],
         notes: "fixture",
       })),
-    })}\n`);
+    };
+    const fabricatedClaim = judgments.rows.find((entry) => entry.case_id === failedCase.case_id);
+    fabricatedClaim.critical_factual_errors = 1;
+    fabricatedClaim.critical_factual_finding_ids = ["fabricated-no-answer-claim"];
+    await writeFile(judgmentsPath, `${JSON.stringify(judgments)}\n`);
     const outputPath = path.join(blindDir, "adjudication.json");
+    await assert.rejects(
+      () => finalizeAdjudication({
+        runDir,
+        casesPath: prepared.casesPath,
+        mapPath: prepared.mapPath,
+        judgmentsPath,
+        outputPath,
+      }),
+      /not_produced answer cannot contain adjudicated claims/,
+    );
+    fabricatedClaim.critical_factual_errors = 0;
+    fabricatedClaim.critical_factual_finding_ids = [];
+    await writeFile(judgmentsPath, `${JSON.stringify(judgments)}\n`);
     const adjudication = await finalizeAdjudication({
       runDir,
       casesPath: prepared.casesPath,
@@ -946,6 +980,31 @@ test("blinded adjudication withholds arm identity and rejoins exact rows", async
       "packet_semantic_off",
       "packet_semantic_on",
     ]));
+
+    for (const [status, label] of [
+      ["pass", "passing"],
+      [undefined, "missing-status"],
+      [null, "null-status"],
+      ["cancelled", "cancelled"],
+      ["unknown", "unknown"],
+    ]) {
+      if (status === undefined) {
+        delete failedPacket.status;
+      } else {
+        failedPacket.status = status;
+      }
+      await writeFile(
+        path.join(runDir, "runs.jsonl"),
+        `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`,
+      );
+      await assert.rejects(
+        () => prepareBlindedCases({
+          runDir,
+          outputDir: path.join(root, `${label}-row-without-answer`),
+        }),
+        /runner transcript contains no final agent answer/,
+      );
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }

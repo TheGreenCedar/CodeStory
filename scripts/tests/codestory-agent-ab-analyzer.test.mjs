@@ -2737,6 +2737,26 @@ test("saved packet reanalysis rebuilds revision-native accounting and derived ac
     assert.equal(v3WithoutTask.packet_evidence_gap_accounting.gap_count, 1);
     assert.equal(v3WithoutTask.packet_manifest_quality, null);
 
+    const failurePath = path.join(root, "packet-failure.json");
+    await writeFile(failurePath, JSON.stringify({
+      schema_version: 1,
+      error: {
+        code: "retrieval_unavailable",
+        message: "retrieval rejected query: stage_deadline",
+      },
+    }));
+    assert.equal(
+      await reanalysisPacketProjection({
+        status: "fail",
+        codestory_harness_prelude: {
+          stdout_path: failurePath,
+          packet_schema_version: null,
+        },
+      }, root, task),
+      null,
+      "a typed command failure is not a packet and cannot mint packet accounting",
+    );
+
     const refreshed = reanalysisExactCandidateAcceptance({
       exact_candidate_acceptance: { stale: true },
       exact_candidate_lifecycle: exactLifecycle(),
@@ -2788,6 +2808,19 @@ test("packet obligation accounting rejects unreconciled summaries", () => {
     ], "benchmark summary"),
     null,
   );
+  for (const arm of ["exact_identity_source", "exact_plus_relations"]) {
+    assert.equal(
+      summarizePacketObligationAccounting([{
+        repo: "fixture",
+        task_id: "builder-control",
+        arm,
+        repeat: 1,
+        status: "pass",
+      }], "benchmark summary"),
+      null,
+      `${arm} is a CodeStory control arm, not a packet arm`,
+    );
+  }
   for (const missing of [
     { repo: "fixture", task_id: "measured", arm: "with_codestory", repeat: 1, status: "pass" },
     { repo: "fixture", task_id: "runtime", mode: "cold_cli_packet", repeat: 1, status: "pass" },

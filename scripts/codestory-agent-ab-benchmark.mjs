@@ -5849,7 +5849,7 @@ function resultPacketObligationAccounting(result) {
 }
 
 function resultRequiresPacketObligationAccounting(result) {
-  if (!isCodeStoryArm(result?.arm) && result?.mode == null) {
+  if (!isPacketArm(result?.arm) && result?.mode == null) {
     return false;
   }
   const prelude = result?.codestory_harness_prelude;
@@ -8794,6 +8794,9 @@ async function reanalysisPacketProjection(result, runDir, task) {
     return null;
   }
   const packet = JSON.parse(await readFile(resolved, "utf8"));
+  if (packetCommandFailureEnvelope(packet)) {
+    return null;
+  }
   const manifestQuality = task ? packetManifestQualitySummary(packet, task) : null;
   const evidenceGapAccounting = packetV3EvidenceGapAccounting(packet);
   const sufficiency = packetSufficiencyTelemetry(packet, manifestQuality);
