@@ -115,17 +115,31 @@ fn push_selector(selectors: &mut Vec<PacketSeedSelectorV1>, selector: PacketSeed
 }
 
 fn inline_code_spans(question: &str) -> Vec<&str> {
+    #[derive(Clone, Copy)]
+    struct Fence {
+        marker: u8,
+        length: usize,
+    }
+
     let mut spans = Vec::new();
-    let mut fenced = false;
+    let mut fence: Option<Fence> = None;
     for line in question.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            fenced = !fenced;
+        let content = markdown_container_content(line);
+        if let Some(active) = fence {
+            if markdown_fence_run(content).is_some_and(|(marker, length, suffix)| {
+                marker == active.marker && length >= active.length && suffix.trim().is_empty()
+            }) {
+                fence = None;
+            }
             continue;
         }
-        if fenced {
+        if let Some((marker, length, suffix)) = markdown_fence_run(content)
+            && (marker != b'`' || !suffix.contains('`'))
+        {
+            fence = Some(Fence { marker, length });
             continue;
         }
+
         let bytes = line.as_bytes();
         let mut index = 0;
         let mut opening = None;
@@ -150,6 +164,61 @@ fn inline_code_spans(question: &str) -> Vec<&str> {
         }
     }
     spans
+}
+
+fn markdown_container_content(mut line: &str) -> &str {
+    loop {
+        let mut indent = 0;
+        while indent < 3 && line.as_bytes().get(indent) == Some(&b' ') {
+            indent += 1;
+        }
+        let after_indent = &line[indent..];
+        if let Some(after_quote) = after_indent.strip_prefix('>') {
+            line = strip_markdown_container_padding(after_quote);
+            continue;
+        }
+        if let Some(after_list) = markdown_list_item_content(after_indent) {
+            line = strip_markdown_container_padding(after_list);
+            continue;
+        }
+        return after_indent;
+    }
+}
+
+fn strip_markdown_container_padding(line: &str) -> &str {
+    line.trim_start_matches([' ', '\t'])
+}
+
+fn markdown_list_item_content(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    if matches!(bytes.first(), Some(b'-' | b'+' | b'*'))
+        && matches!(bytes.get(1), Some(b' ' | b'\t'))
+    {
+        return Some(&line[2..]);
+    }
+
+    let digits = bytes
+        .iter()
+        .take(9)
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits == 0
+        || !matches!(bytes.get(digits), Some(b'.' | b')'))
+        || !matches!(bytes.get(digits + 1), Some(b' ' | b'\t'))
+    {
+        return None;
+    }
+    Some(&line[digits + 2..])
+}
+
+fn markdown_fence_run(line: &str) -> Option<(u8, usize, &str)> {
+    let bytes = line.as_bytes();
+    let marker = *bytes.first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
+    }
+    let length = bytes.iter().take_while(|byte| **byte == marker).count();
+    (length >= 3).then(|| (marker, length, &line[length..]))
 }
 
 fn explicit_canonical_ids(explicit_fragments: &[&str]) -> Vec<String> {
@@ -431,6 +500,40 @@ mod tests {
                     symbol: "crate::real".into(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn every_markdown_fence_shape_keeps_diagnostics_out_of_exact_selectors() {
+        let question = r#"
+> ```text
+> panic at `src/blockquote_poison.rs`
+> ```
+
+~~~text
+panic at `src/tilde_poison.rs`
+~~~
+
+- ```text
+  panic at `src/list_poison.rs`
+  ```
+
+````text
+panic at `src/four_tick_poison.rs`
+```
+panic at `src/nested_short_fence_poison.rs`
+````
+
+Inspect `src/real.rs`.
+"#;
+
+        let seed_plan = build_retrieval_seed_plan(question, &[]);
+
+        assert_eq!(
+            seed_plan.exact_selectors,
+            vec![PacketSeedSelectorV1::ExactPath {
+                path: "src/real.rs".into(),
+            }]
         );
     }
 }

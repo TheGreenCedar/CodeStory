@@ -376,9 +376,12 @@ pub(crate) fn with_stable_retrieval_publication<T: RetrievalPublicationResponse>
 pub(crate) fn with_stable_packet_retrieval_publication<T: RetrievalPublicationResponse>(
     controller: &AppController,
     operation: &str,
+    expected_core_generation_id: &str,
+    expected_core_run_id: &str,
     mut build: impl FnMut() -> Result<T, ApiError>,
 ) -> Result<T, ApiError> {
     if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        ensure_pinned_core_publication(&pinned, expected_core_generation_id, expected_core_run_id)?;
         let mut response = build()?;
         response.attach_retrieval_publication(publication_dto(&pinned));
         return Ok(response);
@@ -390,7 +393,17 @@ pub(crate) fn with_stable_packet_retrieval_publication<T: RetrievalPublicationRe
         controller,
         operation,
         PinnedRetrievalScope::PacketDescriptor,
-        build,
+        || {
+            let pinned = active_pinned_retrieval_read(controller).ok_or_else(|| {
+                ApiError::internal("packet descriptor retrieval ran without its publication pin")
+            })?;
+            ensure_pinned_core_publication(
+                &pinned,
+                expected_core_generation_id,
+                expected_core_run_id,
+            )?;
+            build()
+        },
         |_| Ok(()),
     )
 }
@@ -3290,6 +3303,34 @@ mod tests {
             .expect("nested operation");
 
         assert_eq!(response.publication, Some(expected));
+    }
+
+    #[test]
+    fn packet_descriptor_pin_refuses_a_different_core_before_building() {
+        let fixture = pinned_operation_fixture();
+        let mut build_calls = 0;
+        let pinned = Rc::new(
+            PinnedRetrievalRead::begin_packet_descriptor(&fixture.controller)
+                .expect("begin packet descriptor pin"),
+        );
+
+        let error =
+            with_active_pinned_retrieval_read(&fixture.controller, Rc::clone(&pinned), || {
+                with_stable_packet_retrieval_publication(
+                    &fixture.controller,
+                    "packet response",
+                    "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                    "foreign-run",
+                    || {
+                        build_calls += 1;
+                        Ok(TestPublicationResponse::default())
+                    },
+                )
+            })
+            .expect_err("a descriptor publication from another core must be rejected");
+
+        assert_eq!(error.code, "publication_changed");
+        assert_eq!(build_calls, 0);
     }
 
     /// Every helper that can reuse an operation's pin must actually reuse it.

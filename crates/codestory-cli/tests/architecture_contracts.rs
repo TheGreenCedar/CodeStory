@@ -725,6 +725,15 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
         "pub fn graph_neighborhood",
     );
     assert!(packet_entry.contains("self.with_complete_core_snapshot"));
+    assert!(packet_entry.contains("&publication.generation_id"));
+    assert!(packet_entry.contains("&publication.run_id"));
+    let retrieval_primary = read("crates/codestory-runtime/src/agent/retrieval_primary.rs");
+    let packet_pin = source_between(
+        &retrieval_primary,
+        "pub(crate) fn with_stable_packet_retrieval_publication",
+        "pub(crate) fn with_pinned_retrieval_publication_value",
+    );
+    assert!(packet_pin.contains("ensure_pinned_core_publication"));
     let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
     let packet_request = source_between(
         &current_dto,

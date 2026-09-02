@@ -33,7 +33,7 @@ use codestory_contracts::graph::{
     NodeKind as CoreNodeKind, ResolutionCertainty,
 };
 use codestory_store::{FileInfo, Store};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 const COMPILER_SOURCE_TRUNCATION_SUFFIX: &str = "\n// ... source truncated by packet row cap\n```";
@@ -42,6 +42,12 @@ pub(crate) struct FrozenPacketCompilationV1 {
     pub(crate) product: RepositoryDerivedCompilationV1,
     pub(crate) source_coverage: Vec<SourceCoverageObservationDto>,
     publication: PacketCompilationPublicationV1,
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedPacketAdmissionV1 {
+    receipt: PacketAdmissionReceiptV1,
+    core_node_id: CoreNodeId,
 }
 
 /// Hydrate exactly the packet-wide admitted identities and compile their
@@ -57,7 +63,7 @@ pub(crate) fn freeze_packet_compilation(
     let admissions = session.receipts();
     let mut admission_gaps = session.gaps();
     let storage = controller.open_storage_read_only()?;
-    let (admissions, mut sources) =
+    let (authenticated_admissions, mut sources) =
         hydrate_admitted_sources(controller, &storage, &admissions, &mut admission_gaps)?;
     let source_paths = sources
         .iter()
@@ -67,7 +73,11 @@ pub(crate) fn freeze_packet_compilation(
     for source in &mut sources {
         source.parser_completeness = parser_completeness_for_path(&source.path, &source_coverage);
     }
-    let relations = hydrate_induced_relations(&storage, &admissions)?;
+    let relations = hydrate_induced_relations(&storage, &authenticated_admissions)?;
+    let admissions = authenticated_admissions
+        .into_iter()
+        .map(|admission| admission.receipt)
+        .collect();
     let publication = PacketCompilationPublicationV1 {
         project_id: project_id.to_string(),
         core_generation_id: publication
@@ -115,7 +125,7 @@ fn hydrate_admitted_sources(
     admission_gaps: &mut Vec<PacketAdmissionGapV1>,
 ) -> Result<
     (
-        Vec<PacketAdmissionReceiptV1>,
+        Vec<AuthenticatedPacketAdmissionV1>,
         Vec<PacketHydratedSourceRangeV1>,
     ),
     codestory_contracts::api::ApiError,
@@ -134,7 +144,10 @@ fn hydrate_admitted_sources(
                 );
                 continue;
             };
-            authenticated.push(admission.clone());
+            authenticated.push(AuthenticatedPacketAdmissionV1 {
+                receipt: admission.clone(),
+                core_node_id: node.id,
+            });
             hydrate_admitted_node_source(controller, storage, admission, &node)
         } else if let Some(path) = admission.stable_identity.strip_prefix("path:") {
             let Some(file) = find_admitted_file(storage, &project_root, path)? else {
@@ -146,7 +159,10 @@ fn hydrate_admitted_sources(
                 );
                 continue;
             };
-            authenticated.push(admission.clone());
+            authenticated.push(AuthenticatedPacketAdmissionV1 {
+                receipt: admission.clone(),
+                core_node_id: CoreNodeId(file.id),
+            });
             hydrate_admitted_file_source(controller, admission, &file)
         } else {
             push_admission_gap(
@@ -456,13 +472,19 @@ fn parser_completeness_for_path(
 
 fn hydrate_induced_relations(
     storage: &Store,
-    admissions: &[PacketAdmissionReceiptV1],
+    admissions: &[AuthenticatedPacketAdmissionV1],
 ) -> Result<Vec<PacketDirectedRelationV1>, codestory_contracts::api::ApiError> {
+    let mut stable_identity_by_node = HashMap::new();
+    for admission in admissions {
+        stable_identity_by_node
+            .entry(admission.core_node_id)
+            .or_insert_with(|| admission.receipt.stable_identity.clone());
+    }
     let node_ids = admissions
         .iter()
-        .filter_map(|admission| admission.stable_identity.strip_prefix("node:"))
-        .filter_map(|raw_id| raw_id.parse::<i64>().ok())
-        .map(CoreNodeId)
+        .map(|admission| admission.core_node_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     if node_ids.is_empty() {
         return Ok(Vec::new());
@@ -477,15 +499,15 @@ fn hydrate_induced_relations(
         .map(|edges| {
             edges
                 .into_iter()
-                .map(|edge| {
+                .filter_map(|edge| {
                     let (from, to) = edge.effective_endpoints();
-                    PacketDirectedRelationV1 {
+                    Some(PacketDirectedRelationV1 {
                         relation_id: edge.id.0.to_string(),
-                        from_identity: format!("node:{}", from.0),
-                        to_identity: format!("node:{}", to.0),
+                        from_identity: stable_identity_by_node.get(&from)?.clone(),
+                        to_identity: stable_identity_by_node.get(&to)?.clone(),
                         relation_kind: packet_relation_kind(edge.kind),
                         certainty: relation_certainty(edge.certainty),
-                    }
+                    })
                 })
                 .collect()
         })
@@ -715,6 +737,7 @@ pub fn drill_options_from_ids(option_ids: &[String]) -> Vec<DrillOptionDto> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codestory_contracts::graph::{Edge as CoreEdge, EdgeId as CoreEdgeId};
 
     #[test]
     fn unknown_query_continuations_are_not_decoded() {
@@ -784,6 +807,95 @@ mod tests {
                 .id,
             CoreNodeId(-42)
         );
+    }
+
+    #[test]
+    fn path_admissions_participate_in_the_induced_relation_graph() {
+        let mut storage = Store::new_in_memory().expect("store");
+        storage
+            .insert_nodes_batch(&[
+                CoreNode {
+                    id: CoreNodeId(1),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/a.rs".into(),
+                    ..Default::default()
+                },
+                CoreNode {
+                    id: CoreNodeId(2),
+                    kind: CoreNodeKind::FILE,
+                    serialized_name: "src/b.rs".into(),
+                    ..Default::default()
+                },
+                CoreNode {
+                    id: CoreNodeId(3),
+                    kind: CoreNodeKind::FUNCTION,
+                    serialized_name: "crate::run".into(),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert file nodes");
+        storage
+            .insert_edges_batch(&[
+                CoreEdge {
+                    id: CoreEdgeId(10),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(2),
+                    kind: CoreEdgeKind::IMPORT,
+                    certainty: Some(ResolutionCertainty::Certain),
+                    ..Default::default()
+                },
+                CoreEdge {
+                    id: CoreEdgeId(11),
+                    source: CoreNodeId(1),
+                    target: CoreNodeId(3),
+                    kind: CoreEdgeKind::MEMBER,
+                    certainty: Some(ResolutionCertainty::Certain),
+                    ..Default::default()
+                },
+            ])
+            .expect("insert import edge");
+        let admissions = [
+            AuthenticatedPacketAdmissionV1 {
+                receipt: PacketAdmissionReceiptV1 {
+                    packet_ordinal: 0,
+                    stable_identity: "path:src/a.rs".into(),
+                    score_version: "test".into(),
+                    reserved_source_bytes: 1,
+                    origin: PacketAdmissionOriginV1::Retrieval,
+                },
+                core_node_id: CoreNodeId(1),
+            },
+            AuthenticatedPacketAdmissionV1 {
+                receipt: PacketAdmissionReceiptV1 {
+                    packet_ordinal: 1,
+                    stable_identity: "path:src/b.rs".into(),
+                    score_version: "test".into(),
+                    reserved_source_bytes: 1,
+                    origin: PacketAdmissionOriginV1::Retrieval,
+                },
+                core_node_id: CoreNodeId(2),
+            },
+            AuthenticatedPacketAdmissionV1 {
+                receipt: PacketAdmissionReceiptV1 {
+                    packet_ordinal: 2,
+                    stable_identity: "node:3".into(),
+                    score_version: "test".into(),
+                    reserved_source_bytes: 1,
+                    origin: PacketAdmissionOriginV1::Retrieval,
+                },
+                core_node_id: CoreNodeId(3),
+            },
+        ];
+
+        let relations = hydrate_induced_relations(&storage, &admissions).expect("relations");
+
+        assert_eq!(relations.len(), 2);
+        assert_eq!(relations[0].from_identity, "path:src/a.rs");
+        assert_eq!(relations[0].to_identity, "path:src/b.rs");
+        assert_eq!(relations[0].relation_kind, PacketRelationKindV1::Import);
+        assert_eq!(relations[1].from_identity, "path:src/a.rs");
+        assert_eq!(relations[1].to_identity, "node:3");
+        assert_eq!(relations[1].relation_kind, PacketRelationKindV1::Member);
     }
 
     #[test]
