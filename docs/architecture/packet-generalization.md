@@ -1,11 +1,11 @@
 # Packet generalization
 
 Packet compilation is repository-derived. The original question may seed
-generic lexical and semantic retrieval, and syntactic planning may extract
-only repository paths, canonical IDs, and qualified symbols delimited as
-inline code. Typed free-query probes remain ordinary generic retrieval seeds.
-Once retrieval returns candidate descriptors, neither the question nor any
-prompt-derived policy crosses the compiler boundary.
+generic lexical and semantic retrieval, but no part of its wording has exact
+selector authority. Repository paths, canonical IDs, and qualified symbols
+enter only through typed probes. Typed free-query probes remain ordinary
+generic retrieval seeds. Once retrieval returns candidate descriptors, neither
+the question nor any prompt-derived policy crosses the compiler boundary.
 
 ## Required sequence
 
@@ -20,7 +20,8 @@ question + typed probes
   -> 16-row / 16-KiB public projection
 ```
 
-Exact typed selectors are resolved through identity indexes and admitted first.
+Exact typed selectors are copied without interpreting the question, resolved
+through identity indexes, and admitted first.
 Remaining candidates are admitted in versioned retrieval-score order. One
 packet-scoped session admits at most sixteen stable identities and reserves at
 most 16 KiB of conservative source bounds before any candidate source, graph

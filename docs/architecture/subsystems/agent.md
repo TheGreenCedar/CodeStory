@@ -2,12 +2,12 @@
 
 `codestory-agent` owns the pure halves of packet compilation: syntactic seed
 planning and repository-derived evidence selection. The seed plan may pass the
-unchanged question to generic retrieval and recognize explicit paths, canonical
-IDs, and qualified symbols only when the caller delimits them as inline code.
-Typed free-query probes remain generic retrieval seeds. The compiler receives
-no question text. It selects only from admitted identities, hydrated source,
-certain directed relations, ambiguity, parser completeness, and publication
-identity.
+unchanged question to generic retrieval, but raw wording never creates an exact
+selector. Exact paths, canonical IDs, and qualified symbols enter only through
+typed probes. Typed free-query probes remain generic retrieval seeds. The
+compiler receives no question text. It selects only from admitted identities,
+hydrated source, certain directed relations, ambiguity, parser completeness,
+and publication identity.
 
 The crate depends on `codestory-contracts` alone. It cannot activate a
 project, open or write storage, execute retrieval, retry a publication, or
@@ -44,8 +44,9 @@ retrieval, or filesystem access.
 
 ## Extension rules
 
-- keep question interpretation inside `RetrievalSeedPlanV1`; compiler rules
-  must be functions of typed repository evidence only;
+- keep the unchanged question confined to the generic query in
+  `RetrievalSeedPlanV1`; copy exact selectors only from typed probes, and make
+  compiler rules functions of typed repository evidence only;
 - add retrieval, admission, hydration, publication retry, and assembly in
   runtime;
 - never import `codestory-runtime`, `codestory-store`, `codestory-retrieval`,

@@ -15,8 +15,7 @@ use crate::agent::packet_plan::{
     build_packet_plan_from_seed_plan, build_retrieval_seed_plan, packet_plan_annotation,
 };
 use crate::agent::packet_probe::{
-    exact_packet_probe_citations, normalize_packet_probe_request, probes_from_seed_selectors,
-    resolve_packet_probes, unresolved_packet_probe_queries,
+    exact_packet_probe_citations, normalize_packet_probe_request, resolve_packet_probes,
 };
 use crate::agent::packet_scoring::{packet_display_path, packet_stage_citation_carry_limit};
 use crate::agent::packet_terms::prompt_search_terms;
@@ -340,8 +339,6 @@ pub(crate) fn agent_packet(
         ));
     }
     let is_drill_continuation = req.parent_packet_id.is_some() || !req.option_ids.is_empty();
-    let free_queries = unresolved_packet_probe_queries(&req.probes);
-    let seed_plan = build_retrieval_seed_plan(&question, &free_queries);
     let mut probes = normalize_packet_probe_request(&req.probes);
     for option in drill_options_from_ids(&req.option_ids) {
         if let Some(path) = option.path {
@@ -350,11 +347,7 @@ pub(crate) fn agent_packet(
             probes.push(PacketProbeDto::SymbolId { id: symbol_id });
         }
     }
-    for probe in probes_from_seed_selectors(&seed_plan.exact_selectors) {
-        if !probes.contains(&probe) {
-            probes.push(probe);
-        }
-    }
+    let seed_plan = build_retrieval_seed_plan(&question, &probes);
     let probe_resolutions = resolve_packet_probes(controller, probes);
     let mut plan = build_packet_plan_from_seed_plan(&seed_plan, req.budget);
     plan.probe_resolutions = probe_resolutions;

@@ -1,18 +1,17 @@
 //! Pure packet seed planning.
 //!
-//! The original wording may reach generic retrieval unchanged. Beyond that,
-//! planning recognizes only identities the caller delimited as inline code:
-//! repository paths, canonical IDs, and qualified symbols. Typed free-query
-//! probes remain generic retrieval seeds. Planning does not infer an answer
-//! shape or translate prose into a domain-specific traversal policy.
+//! The original wording reaches generic retrieval unchanged and has no exact
+//! selector authority. Exact paths, canonical IDs, and qualified symbols enter
+//! only through typed probes. Planning does not infer an answer shape or
+//! translate prose into a domain-specific traversal policy.
 
 use crate::planning::dedupe_packet_plan_queries;
-use crate::text::exact_symbol_query_terms;
-use codestory_contracts::api::{PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto};
+use codestory_contracts::api::{
+    PacketBudgetModeDto, PacketPlanDto, PacketPlanQueryDto, PacketProbeDto,
+};
 use codestory_contracts::compilation::{
     PACKET_COMPILATION_CONTRACT_VERSION_V1, PacketSeedSelectorV1, RetrievalSeedPlanV1,
 };
-use std::path::{Component, Path};
 
 const GENERIC_RETRIEVAL_PURPOSE: &str =
     "unchanged question for generic lexical and semantic retrieval";
@@ -27,7 +26,12 @@ pub fn build_packet_plan_with_extra(
     budget: PacketBudgetModeDto,
     free_queries: &[String],
 ) -> PacketPlanDto {
-    let seed_plan = build_retrieval_seed_plan(question, free_queries);
+    let probes = free_queries
+        .iter()
+        .cloned()
+        .map(|query| PacketProbeDto::FreeQuery { query })
+        .collect::<Vec<_>>();
+    let seed_plan = build_retrieval_seed_plan(question, &probes);
     build_packet_plan_from_seed_plan(&seed_plan, budget)
 }
 
@@ -65,39 +69,81 @@ pub fn build_packet_plan_from_seed_plan(
 }
 
 /// Build the only compiler-side value permitted to carry original wording.
-/// Extraction is syntactic: inline-code repository paths, canonical `node:`
-/// IDs, and qualified symbols only. Natural-language relations are not
-/// inferred.
-pub fn build_retrieval_seed_plan(question: &str, free_queries: &[String]) -> RetrievalSeedPlanV1 {
+/// The question has generic-retrieval authority only. Exact selectors are
+/// copied from typed probes without interpreting question text.
+pub fn build_retrieval_seed_plan(
+    question: &str,
+    typed_probes: &[PacketProbeDto],
+) -> RetrievalSeedPlanV1 {
     let mut exact_selectors = Vec::new();
-    let explicit_fragments = inline_code_spans(question);
-    for path in explicit_source_paths(&explicit_fragments) {
-        push_selector(
-            &mut exact_selectors,
-            PacketSeedSelectorV1::ExactPath { path },
-        );
-    }
-    for id in explicit_canonical_ids(&explicit_fragments) {
-        push_selector(
-            &mut exact_selectors,
-            PacketSeedSelectorV1::CanonicalId { id },
-        );
-    }
-    for symbol in explicit_qualified_symbols(&explicit_fragments) {
-        push_selector(
-            &mut exact_selectors,
-            PacketSeedSelectorV1::QualifiedSymbol { symbol },
-        );
-    }
     let mut retained_free_queries = Vec::new();
-    for query in free_queries {
-        let query = query.trim();
-        if !query.is_empty()
-            && !retained_free_queries
-                .iter()
-                .any(|existing: &String| existing == query)
-        {
-            retained_free_queries.push(query.to_string());
+    for probe in typed_probes {
+        match probe {
+            PacketProbeDto::ExactPath { path } => push_selector(
+                &mut exact_selectors,
+                PacketSeedSelectorV1::ExactPath {
+                    path: path.trim().to_string(),
+                },
+            ),
+            PacketProbeDto::SymbolId { id } => push_selector(
+                &mut exact_selectors,
+                PacketSeedSelectorV1::CanonicalId {
+                    id: format!(
+                        "node:{}",
+                        id.trim().strip_prefix("node:").unwrap_or(id.trim())
+                    ),
+                },
+            ),
+            PacketProbeDto::QualifiedSymbol { symbol } => push_selector(
+                &mut exact_selectors,
+                PacketSeedSelectorV1::QualifiedSymbol {
+                    symbol: symbol.trim().to_string(),
+                },
+            ),
+            PacketProbeDto::FileSymbol { path, symbol } => {
+                push_selector(
+                    &mut exact_selectors,
+                    PacketSeedSelectorV1::ExactPath {
+                        path: path.trim().to_string(),
+                    },
+                );
+                push_selector(
+                    &mut exact_selectors,
+                    PacketSeedSelectorV1::QualifiedSymbol {
+                        symbol: symbol.trim().to_string(),
+                    },
+                );
+            }
+            PacketProbeDto::FreeQuery { query } => {
+                let query = query.trim();
+                if !query.is_empty()
+                    && !retained_free_queries
+                        .iter()
+                        .any(|existing: &String| existing == query)
+                {
+                    retained_free_queries.push(query.to_string());
+                }
+            }
+            PacketProbeDto::Continuation { selector, .. } => {
+                if let Some(symbol_id) = selector.symbol_id.as_deref() {
+                    push_selector(
+                        &mut exact_selectors,
+                        PacketSeedSelectorV1::CanonicalId {
+                            id: format!(
+                                "node:{}",
+                                symbol_id.strip_prefix("node:").unwrap_or(symbol_id)
+                            ),
+                        },
+                    );
+                } else if let Some(path) = selector.path.as_deref() {
+                    push_selector(
+                        &mut exact_selectors,
+                        PacketSeedSelectorV1::ExactPath {
+                            path: path.to_string(),
+                        },
+                    );
+                }
+            }
         }
     }
     RetrievalSeedPlanV1 {
@@ -112,134 +158,6 @@ fn push_selector(selectors: &mut Vec<PacketSeedSelectorV1>, selector: PacketSeed
     if !selectors.contains(&selector) {
         selectors.push(selector);
     }
-}
-
-fn inline_code_spans(question: &str) -> Vec<&str> {
-    #[derive(Clone, Copy)]
-    struct Fence {
-        marker: u8,
-        length: usize,
-    }
-
-    let mut spans = Vec::new();
-    let mut fence: Option<Fence> = None;
-    for line in question.split_inclusive('\n') {
-        let content = markdown_container_content(line);
-        if let Some(active) = fence {
-            if markdown_fence_run(content).is_some_and(|(marker, length, suffix)| {
-                marker == active.marker && length >= active.length && suffix.trim().is_empty()
-            }) {
-                fence = None;
-            }
-            continue;
-        }
-        if let Some((marker, length, suffix)) = markdown_fence_run(content)
-            && (marker != b'`' || !suffix.contains('`'))
-        {
-            fence = Some(Fence { marker, length });
-            continue;
-        }
-
-        let bytes = line.as_bytes();
-        let mut index = 0;
-        let mut opening = None;
-        while index < bytes.len() {
-            if bytes[index] != b'`' {
-                index += 1;
-                continue;
-            }
-            let run_start = index;
-            while index < bytes.len() && bytes[index] == b'`' {
-                index += 1;
-            }
-            if index - run_start != 1 {
-                opening = None;
-                continue;
-            }
-            match opening.take() {
-                Some(start) if start < run_start => spans.push(&line[start..run_start]),
-                Some(_) => {}
-                None => opening = Some(index),
-            }
-        }
-    }
-    spans
-}
-
-fn markdown_container_content(mut line: &str) -> &str {
-    loop {
-        let mut indent = 0;
-        while indent < 3 && line.as_bytes().get(indent) == Some(&b' ') {
-            indent += 1;
-        }
-        let after_indent = &line[indent..];
-        if let Some(after_quote) = after_indent.strip_prefix('>') {
-            line = strip_markdown_container_padding(after_quote);
-            continue;
-        }
-        if let Some(after_list) = markdown_list_item_content(after_indent) {
-            line = strip_markdown_container_padding(after_list);
-            continue;
-        }
-        return after_indent;
-    }
-}
-
-fn strip_markdown_container_padding(line: &str) -> &str {
-    line.trim_start_matches([' ', '\t'])
-}
-
-fn markdown_list_item_content(line: &str) -> Option<&str> {
-    let bytes = line.as_bytes();
-    if matches!(bytes.first(), Some(b'-' | b'+' | b'*'))
-        && matches!(bytes.get(1), Some(b' ' | b'\t'))
-    {
-        return Some(&line[2..]);
-    }
-
-    let digits = bytes
-        .iter()
-        .take(9)
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
-    if digits == 0
-        || !matches!(bytes.get(digits), Some(b'.' | b')'))
-        || !matches!(bytes.get(digits + 1), Some(b' ' | b'\t'))
-    {
-        return None;
-    }
-    Some(&line[digits + 2..])
-}
-
-fn markdown_fence_run(line: &str) -> Option<(u8, usize, &str)> {
-    let bytes = line.as_bytes();
-    let marker = *bytes.first()?;
-    if !matches!(marker, b'`' | b'~') {
-        return None;
-    }
-    let length = bytes.iter().take_while(|byte| **byte == marker).count();
-    (length >= 3).then(|| (marker, length, &line[length..]))
-}
-
-fn explicit_canonical_ids(explicit_fragments: &[&str]) -> Vec<String> {
-    explicit_fragments
-        .iter()
-        .flat_map(|fragment| fragment.split_whitespace())
-        .map(|token| {
-            token.trim_matches(|ch: char| {
-                matches!(
-                    ch,
-                    '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | '.'
-                )
-            })
-        })
-        .filter(|token| {
-            token
-                .strip_prefix("node:")
-                .is_some_and(|id| id.parse::<i64>().is_ok())
-        })
-        .map(str::to_string)
-        .collect()
 }
 
 pub fn packet_explicit_request_probe_queries(plan: &PacketPlanDto) -> Vec<String> {
@@ -270,83 +188,6 @@ fn packet_plan_query_cap(budget: PacketBudgetModeDto) -> usize {
     }
 }
 
-fn explicit_qualified_symbols(explicit_fragments: &[&str]) -> Vec<String> {
-    explicit_fragments
-        .iter()
-        .flat_map(|fragment| exact_symbol_query_terms(fragment))
-        .filter(|candidate| {
-            (candidate.contains("::") || candidate.contains('.'))
-                && !candidate.contains("://")
-                && !candidate.contains(['/', '\\'])
-                && codestory_contracts::language_support::language_support_profile_for_path(Some(
-                    source_path_without_location_suffix(candidate),
-                ))
-                .is_none()
-        })
-        .collect()
-}
-
-fn explicit_source_paths(explicit_fragments: &[&str]) -> Vec<String> {
-    let mut paths = Vec::new();
-    for token in explicit_fragments
-        .iter()
-        .flat_map(|fragment| fragment.split_whitespace())
-    {
-        let mut candidate = token.trim_matches(|ch: char| {
-            matches!(
-                ch,
-                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';'
-            )
-        });
-        if candidate.is_empty() || candidate.contains("://") {
-            continue;
-        }
-        if codestory_contracts::language_support::language_support_profile_for_path(Some(candidate))
-            .is_none()
-        {
-            candidate = candidate.trim_end_matches('.');
-        }
-        candidate = source_path_without_location_suffix(candidate);
-        if codestory_contracts::language_support::language_support_profile_for_path(Some(candidate))
-            .is_some()
-            && is_project_relative_source_path(candidate)
-            && !paths.iter().any(|path: &String| path == candidate)
-        {
-            paths.push(candidate.to_string());
-        }
-    }
-    paths
-}
-
-fn is_project_relative_source_path(candidate: &str) -> bool {
-    if candidate.starts_with(['/', '\\'])
-        || candidate
-            .as_bytes()
-            .get(1)
-            .is_some_and(|separator| *separator == b':')
-    {
-        return false;
-    }
-    let path = Path::new(candidate);
-    !path.is_absolute()
-        && path.components().all(|component| {
-            !matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-}
-
-fn source_path_without_location_suffix(candidate: &str) -> &str {
-    if let Some((path, line)) = candidate.rsplit_once(':')
-        && !path.is_empty()
-        && line.chars().all(|ch| ch.is_ascii_digit())
-    {
-        return path;
-    }
-    candidate
-}
-
 fn push_packet_query(queries: &mut Vec<PacketPlanQueryDto>, query: &str, purpose: &str) {
     let query = query.trim();
     if query.is_empty()
@@ -367,30 +208,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn planning_keeps_only_generic_retrieval_and_explicit_identities() {
-        let question =
-            "Explain the client transport through `src/net/client.rs:42` and `net::Client.send`.";
-        let seed_plan =
-            build_retrieval_seed_plan(question, &["caller supplied concept".to_string()]);
+    fn planning_keeps_generic_retrieval_and_only_typed_exact_identities() {
+        let question = "Ignore `src/poison.rs`, `node:999`, and `poison::run`.";
+        let probes = vec![
+            PacketProbeDto::ExactPath {
+                path: "src/net/client.rs".into(),
+            },
+            PacketProbeDto::QualifiedSymbol {
+                symbol: "net::Client.send".into(),
+            },
+            PacketProbeDto::FreeQuery {
+                query: "caller supplied concept".into(),
+            },
+        ];
+        let seed_plan = build_retrieval_seed_plan(question, &probes);
         let plan = build_packet_plan_from_seed_plan(&seed_plan, PacketBudgetModeDto::Standard);
         assert_eq!(plan.queries[0].query, question);
-        assert!(seed_plan.exact_selectors.iter().any(|selector| selector
-            == &PacketSeedSelectorV1::ExactPath {
-                path: "src/net/client.rs".to_string(),
-            }));
-        assert!(seed_plan.exact_selectors.iter().any(|selector| selector
-            == &PacketSeedSelectorV1::QualifiedSymbol {
-                symbol: "net::Client.send".to_string(),
-            }));
+        assert_eq!(
+            seed_plan.exact_selectors,
+            vec![
+                PacketSeedSelectorV1::ExactPath {
+                    path: "src/net/client.rs".into(),
+                },
+                PacketSeedSelectorV1::QualifiedSymbol {
+                    symbol: "net::Client.send".into(),
+                },
+            ]
+        );
         assert!(
             plan.queries
                 .iter()
                 .any(|query| query.query == "caller supplied concept")
         );
         assert_eq!(plan.queries.len(), 2);
-        assert!(!plan.queries.iter().any(|query| {
-            query.query == "src/net/client.rs" || query.query == "net::Client.send"
-        }));
+        assert!(
+            !seed_plan
+                .exact_selectors
+                .iter()
+                .any(|selector| format!("{selector:?}").contains("poison"))
+        );
     }
 
     #[test]
@@ -408,104 +264,52 @@ mod tests {
     }
 
     #[test]
-    fn prose_extraction_rejects_urls_and_paths_outside_the_project() {
+    fn typed_probes_map_to_seed_selectors_without_textual_reinterpretation() {
         let seed_plan = build_retrieval_seed_plan(
-            "Compare https://example.invalid/api with /tmp/secret.rs and ../outside.rs.",
-            &[],
+            "The question contributes no exact selectors.",
+            &[
+                PacketProbeDto::ExactPath {
+                    path: " src/lib.rs ".into(),
+                },
+                PacketProbeDto::SymbolId {
+                    id: "node:-42".into(),
+                },
+                PacketProbeDto::QualifiedSymbol {
+                    symbol: " crate::run ".into(),
+                },
+                PacketProbeDto::FileSymbol {
+                    path: "src/worker.rs".into(),
+                    symbol: "worker::run".into(),
+                },
+            ],
         );
-        assert!(
-            seed_plan.exact_selectors.is_empty(),
-            "unsafe prose tokens became exact selectors: {:?}",
-            seed_plan.exact_selectors
-        );
-    }
-
-    #[test]
-    fn source_location_is_not_also_treated_as_a_qualified_symbol() {
-        let seed_plan = build_retrieval_seed_plan("Inspect `lib.rs:42` and `crate::run`.", &[]);
         assert_eq!(
             seed_plan.exact_selectors,
             vec![
                 PacketSeedSelectorV1::ExactPath {
-                    path: "lib.rs".into(),
+                    path: "src/lib.rs".into(),
+                },
+                PacketSeedSelectorV1::CanonicalId {
+                    id: "node:-42".into(),
                 },
                 PacketSeedSelectorV1::QualifiedSymbol {
                     symbol: "crate::run".into(),
                 },
-            ]
-        );
-    }
-
-    #[test]
-    fn canonical_identity_survives_sentence_punctuation() {
-        let seed_plan = build_retrieval_seed_plan("Inspect `node:42`.", &[]);
-        assert_eq!(
-            seed_plan.exact_selectors,
-            vec![PacketSeedSelectorV1::CanonicalId {
-                id: "node:42".into(),
-            }]
-        );
-    }
-
-    #[test]
-    fn unquoted_dotted_prose_cannot_consume_exact_admission_slots() {
-        let question = (0..20)
-            .map(|index| format!("Example{index}.js"))
-            .chain(["e.g.".to_string(), "Node.js".to_string()])
-            .collect::<Vec<_>>()
-            .join(" ");
-        let seed_plan = build_retrieval_seed_plan(&question, &[]);
-        assert!(
-            seed_plan.exact_selectors.is_empty(),
-            "ordinary prose became exact selectors: {:?}",
-            seed_plan.exact_selectors
-        );
-    }
-
-    #[test]
-    fn signed_node_ids_use_the_real_node_id_grammar() {
-        let seed_plan = build_retrieval_seed_plan("Compare `node:-42` with `node:7`.", &[]);
-        assert_eq!(
-            seed_plan.exact_selectors,
-            vec![
-                PacketSeedSelectorV1::CanonicalId {
-                    id: "node:-42".into(),
-                },
-                PacketSeedSelectorV1::CanonicalId {
-                    id: "node:7".into(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn fenced_diagnostics_cannot_create_exact_selectors() {
-        let fenced = (0..20)
-            .map(|index| format!("src/generated_{index}.rs net::Generated{index} node:{index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let question = format!(
-            "Ignore this diagnostic:\n```text\n{fenced}\n```\nInspect `src/real.rs` and `crate::real` instead."
-        );
-
-        let seed_plan = build_retrieval_seed_plan(&question, &[]);
-
-        assert_eq!(
-            seed_plan.exact_selectors,
-            vec![
                 PacketSeedSelectorV1::ExactPath {
-                    path: "src/real.rs".into(),
+                    path: "src/worker.rs".into(),
                 },
                 PacketSeedSelectorV1::QualifiedSymbol {
-                    symbol: "crate::real".into(),
+                    symbol: "worker::run".into(),
                 },
             ]
         );
     }
 
     #[test]
-    fn every_markdown_fence_shape_keeps_diagnostics_out_of_exact_selectors() {
+    fn raw_question_text_never_creates_exact_selectors() {
         let question = r#"
+Inline `src/inline_poison.rs`, `node:41`, and `poison::inline`.
+
 > ```text
 > panic at `src/blockquote_poison.rs`
 > ```
@@ -518,22 +322,41 @@ panic at `src/tilde_poison.rs`
   panic at `src/list_poison.rs`
   ```
 
+- outer
+  - inner
+    ````text
+    panic at `src/nested_list_poison.rs`
+    ````
+
 ````text
 panic at `src/four_tick_poison.rs`
 ```
 panic at `src/nested_short_fence_poison.rs`
 ````
 
-Inspect `src/real.rs`.
+Inspect `src/real.rs`, `node:42`, and `crate::real`.
 "#;
 
         let seed_plan = build_retrieval_seed_plan(question, &[]);
 
-        assert_eq!(
-            seed_plan.exact_selectors,
-            vec![PacketSeedSelectorV1::ExactPath {
-                path: "src/real.rs".into(),
-            }]
+        assert!(seed_plan.exact_selectors.is_empty());
+        assert_eq!(seed_plan.generic_query, question);
+    }
+
+    #[test]
+    fn typed_free_queries_are_trimmed_and_deduplicated() {
+        let seed_plan = build_retrieval_seed_plan(
+            "ordinary wording",
+            &[
+                PacketProbeDto::FreeQuery {
+                    query: " publication recovery ".into(),
+                },
+                PacketProbeDto::FreeQuery {
+                    query: "publication recovery".into(),
+                },
+                PacketProbeDto::FreeQuery { query: " ".into() },
+            ],
         );
+        assert_eq!(seed_plan.free_queries, ["publication recovery"]);
     }
 }

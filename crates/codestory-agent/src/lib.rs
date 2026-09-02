@@ -1,6 +1,7 @@
 //! Pure packet seed planning and repository-derived evidence compilation.
 //!
-//! The original question may seed generic retrieval and explicit selectors.
+//! The original question may seed generic retrieval. Exact selectors come only
+//! from typed probes.
 //! Once retrieval has produced typed candidates, compilation sees only stable
 //! identities, source ranges, directed relations, ambiguity, and publication
 //! identity. It owns none of the machinery that answers those questions.

@@ -50,6 +50,8 @@ pub enum PacketSeedSelectorV1 {
 pub struct RetrievalSeedPlanV1 {
     pub contract_version: u16,
     pub generic_query: String,
+    /// Exact selectors copied from typed probes. Raw question text has no
+    /// authority to populate this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exact_selectors: Vec<PacketSeedSelectorV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
