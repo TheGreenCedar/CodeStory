@@ -81,7 +81,14 @@ async function answerFromRow(runDir, row) {
   if (size > MAX_TRANSCRIPT_BYTES) {
     throw new Error(`runner transcript exceeds ${MAX_TRANSCRIPT_BYTES} bytes: ${transcriptPath}`);
   }
-  return extractFinalAnswer(parseJsonl(await readFile(transcriptPath, "utf8"), "runner transcript"));
+  const transcript = await readFile(transcriptPath, "utf8");
+  if (row.status === "fail" && transcript.length === 0) {
+    return { answer: "", answerStatus: "not_produced" };
+  }
+  return {
+    answer: extractFinalAnswer(parseJsonl(transcript, "runner transcript")),
+    answerStatus: "produced",
+  };
 }
 
 function opaqueCaseId(used) {
@@ -111,7 +118,7 @@ async function prepareBlindedCases({ runDir, outputDir }) {
   const cases = [];
   const entries = [];
   for (const row of rows) {
-    const answer = await answerFromRow(runDir, row);
+    const { answer, answerStatus } = await answerFromRow(runDir, row);
     const caseId = opaqueCaseId(usedIds);
     const answerSha256 = sha256(Buffer.from(answer, "utf8"));
     cases.push({
@@ -120,6 +127,7 @@ async function prepareBlindedCases({ runDir, outputDir }) {
       repository_path: row.repo_path,
       repository_commit: row.repo_provenance?.git_head ?? null,
       question: row.task_manifest_snapshot?.prompt ?? null,
+      answer_status: answerStatus,
       answer,
       answer_sha256: answerSha256,
     });
@@ -139,6 +147,7 @@ async function prepareBlindedCases({ runDir, outputDir }) {
     instructions: {
       critical_factual_error: "Count each unique materially wrong statement about the requested code behavior that could change the answer's conclusion.",
       unsupported_relation_claim: "Count each unique material call, import, implementation, data-flow, or control-flow claim that is not established by the answer's cited source or the pinned repository source.",
+      no_answer: "A case with answer_status=not_produced contains no answer claims. Record zero counts and note that no answer was produced.",
       output: "Return the judgments contract with every case_id exactly once. Include nonnegative integer counts plus unique critical_factual_finding_ids and unsupported_relation_finding_ids arrays of the same lengths. Reuse one stable finding id when two answers make the same error. Add concise source-backed notes. Do not identify or infer experimental arms.",
     },
     cases,
@@ -235,6 +244,12 @@ async function finalizeAdjudication({ runDir, casesPath, mapPath, judgmentsPath,
       judgment.unsupported_relation_claims,
       `${caseId} unsupported_relation_claims`,
     );
+    if (
+      answer?.answer_status === "not_produced" &&
+      (criticalFactualErrors !== 0 || unsupportedRelationClaims !== 0)
+    ) {
+      throw new Error(`${caseId} not_produced answer cannot contain adjudicated claims`);
+    }
     return {
       task_id: mapped.task_id,
       arm: mapped.arm,
