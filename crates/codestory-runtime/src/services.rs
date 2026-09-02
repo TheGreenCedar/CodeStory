@@ -249,12 +249,41 @@ pub struct ActivationRun {
     pub joined: bool,
 }
 
+/// How far an activation run is asked to go.
+///
+/// `CoreOnly` stops once the complete core publication exists, which is all a
+/// complete-core observer such as exact verification or `affected` can read. It
+/// never starts search preparation, the embedding backend, retrieval
+/// finalization, or strict retrieval validation, and it never mints a ready
+/// lease, so it cannot make a broad tool look ready.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivationGoal {
+    CoreOnly,
+    #[default]
+    Full,
+}
+
+impl ActivationGoal {
+    /// Whether a run pursuing `self` delivers everything a `requested` run would.
+    fn satisfies(self, requested: Self) -> bool {
+        self == requested || (self == Self::Full && requested == Self::CoreOnly)
+    }
+
+    fn admits(self, snapshot: &ActivationSnapshot) -> bool {
+        match self {
+            Self::CoreOnly => snapshot.allows_operation("affected"),
+            Self::Full => snapshot_allows(snapshot),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ActivationCoordinatorState {
     target: Option<ActivationTarget>,
     current: Option<ActivationSnapshot>,
     ready_lease: Option<ReadyLease>,
     running: bool,
+    goal: ActivationGoal,
     current_cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -705,11 +734,35 @@ impl ActivationService {
         )
     }
 
+    /// Prepare only the complete core publication, for callers that read the
+    /// core and nothing else.
+    pub fn activate_core_only(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<ActivationRun, ApiError> {
+        self.activate_with_goal(
+            project_root,
+            storage_path,
+            cancelled,
+            DEFAULT_ACTIVATION_FOREGROUND_BUDGET,
+            ActivationGoal::CoreOnly,
+        )
+    }
+
     /// Configure the controller around an existing complete core publication
-    /// without repairing source freshness. This admission path is for
-    /// operations that explain drift from that publication. Cold or partial
-    /// state still runs normal activation; corrupt observational reads fail
-    /// directly and are never reclassified as a cold cache.
+    /// without repairing source freshness. Warm complete cores stay bind-only
+    /// observational. Cold or fenced state starts a core-only activation so
+    /// callers can return `preparing` plus `retry_after_ms`; corrupt
+    /// observational reads fail directly and are never reclassified as a cold
+    /// cache.
+    ///
+    /// The preparation is core-only on purpose. A complete-core observer reads
+    /// the core publication and never the sidecars, so starting search
+    /// preparation, the embedding backend, or retrieval finalization on its
+    /// behalf would spend a broad-retrieval activation to answer a question
+    /// that cannot consult retrieval at all.
     pub fn ensure_complete_core_for_observation(
         &self,
         project_root: &Path,
@@ -728,7 +781,7 @@ impl ActivationService {
             CompleteCoreAdmission::Cold | CompleteCoreAdmission::Fenced => {}
         }
 
-        match self.activate_project(project_root, storage_path, cancelled) {
+        match self.activate_core_only(project_root, storage_path, cancelled) {
             Ok(_) => Ok(()),
             Err(error)
                 if error.code != "cancelled"
@@ -743,9 +796,10 @@ impl ActivationService {
     }
 
     /// Bind an already-complete core publication without starting managed
-    /// activation. Strictly observational tools use this path so a cold or
-    /// fenced cache stays unavailable instead of triggering indexing or
-    /// retrieval preparation.
+    /// activation. Reserved for callers that must keep a cold or fenced cache
+    /// unavailable instead of triggering indexing or retrieval preparation.
+    /// Exact-proof admission uses [`Self::ensure_complete_core_for_observation`]
+    /// so cold projects return preparing plus retry instead of a terminal miss.
     pub fn bind_existing_complete_core_for_observation(
         &self,
         project_root: &Path,
@@ -777,8 +831,14 @@ impl ActivationService {
         project_root: &Path,
         storage_path: &Path,
     ) -> CompleteCoreAdmission {
-        if !storage_path.is_file() {
-            return CompleteCoreAdmission::Cold;
+        match codestory_store::core_database_exists(storage_path) {
+            Ok(true) => {}
+            Ok(false) => return CompleteCoreAdmission::Cold,
+            Err(error) => {
+                return CompleteCoreAdmission::Corrupt(ApiError::internal(format!(
+                    "Failed to resolve core publication admission: {error}"
+                )));
+            }
         }
         let freshness = match Store::open_freshness_observational(storage_path) {
             Ok(storage) => storage,
@@ -813,7 +873,11 @@ impl ActivationService {
         &self,
         storage_path: &Path,
     ) -> Result<Option<IndexPublicationDto>, ApiError> {
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve retained core publication: {error}"
+            ))
+        })? {
             return Ok(None);
         }
         let storage = Store::open_read_only(storage_path).map_err(|error| {
@@ -861,6 +925,23 @@ impl ActivationService {
         request_cancelled: Arc<AtomicBool>,
         foreground_budget: Duration,
     ) -> Result<ActivationRun, ApiError> {
+        self.activate_with_goal(
+            project_root,
+            storage_path,
+            request_cancelled,
+            foreground_budget,
+            ActivationGoal::Full,
+        )
+    }
+
+    fn activate_with_goal(
+        &self,
+        project_root: &Path,
+        storage_path: &Path,
+        request_cancelled: Arc<AtomicBool>,
+        foreground_budget: Duration,
+        goal: ActivationGoal,
+    ) -> Result<ActivationRun, ApiError> {
         if request_cancelled.load(Ordering::Acquire) {
             return Err(ApiError::new(
                 "cancelled",
@@ -886,6 +967,9 @@ impl ActivationService {
                             "a different logical project is already activating in this runtime context",
                         ));
                     }
+                    if !state.goal.satisfies(goal) {
+                        return Err(narrower_activation_in_flight());
+                    }
                     let operation_id = state
                         .current
                         .as_ref()
@@ -899,6 +983,7 @@ impl ActivationService {
                         true,
                         request_cancelled.as_ref(),
                         foreground_budget,
+                        goal,
                     );
                 }
                 if !state
@@ -942,6 +1027,9 @@ impl ActivationService {
                             "a different logical project started activation while the ready lease was being observed",
                         ));
                     }
+                    if !state.goal.satisfies(goal) {
+                        return Err(narrower_activation_in_flight());
+                    }
                     let operation_id = state
                         .current
                         .as_ref()
@@ -955,6 +1043,7 @@ impl ActivationService {
                         true,
                         request_cancelled.as_ref(),
                         foreground_budget,
+                        goal,
                     );
                 }
                 let candidate_is_current = state
@@ -986,6 +1075,7 @@ impl ActivationService {
                     &mut state,
                     &target,
                     probe.retained_core_publication,
+                    goal,
                 );
             }
 
@@ -1007,6 +1097,9 @@ impl ActivationService {
                         "a different logical project is already activating in this runtime context",
                     ));
                 }
+                if !state.goal.satisfies(goal) {
+                    return Err(narrower_activation_in_flight());
+                }
                 let operation_id = state
                     .current
                     .as_ref()
@@ -1020,6 +1113,7 @@ impl ActivationService {
                     true,
                     request_cancelled.as_ref(),
                     foreground_budget,
+                    goal,
                 );
             }
             if state
@@ -1031,7 +1125,12 @@ impl ActivationService {
                 drop(state);
                 continue;
             }
-            break self.begin_activation_locked(&mut state, &target, retained_core_publication);
+            break self.begin_activation_locked(
+                &mut state,
+                &target,
+                retained_core_publication,
+                goal,
+            );
         };
 
         let operation = ActivationOperation {
@@ -1075,6 +1174,7 @@ impl ActivationService {
                         &worker_operation,
                         worker_project_root,
                         worker_storage_path,
+                        goal,
                     )
                 });
             })
@@ -1093,6 +1193,7 @@ impl ActivationService {
             false,
             request_cancelled.as_ref(),
             foreground_budget,
+            goal,
         )
     }
 
@@ -1112,10 +1213,12 @@ impl ActivationService {
         let retained_core_publication =
             self.retained_core_publication(storage_path).unwrap_or(None);
         let core_matches = retained_core_publication.as_ref() == Some(&lease.core_publication);
+        let source_matches =
+            self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref());
         ReadyLeaseProbe {
             admissible: configuration_matches
                 && lease.source.is_admissible_snapshot()
-                && self.ready_lease_source_observer_unchanged(lease.source_observer.as_ref())
+                && source_matches
                 && retrieval_matches
                 && core_matches,
             retained_core_publication,
@@ -1155,7 +1258,9 @@ impl ActivationService {
         state: &mut ActivationCoordinatorState,
         target: &ActivationTarget,
         retained_core_publication: Option<IndexPublicationDto>,
+        goal: ActivationGoal,
     ) -> (String, Arc<AtomicBool>) {
+        state.goal = goal;
         if !state
             .target
             .as_ref()
@@ -1270,6 +1375,7 @@ impl ActivationService {
         joined: bool,
         request_cancelled: &AtomicBool,
         foreground_budget: Duration,
+        goal: ActivationGoal,
     ) -> Result<ActivationRun, ApiError> {
         let deadline = Instant::now()
             .checked_add(foreground_budget)
@@ -1307,7 +1413,7 @@ impl ActivationService {
                     )
                 })?;
             if !state.running {
-                return if snapshot_allows(&snapshot) {
+                return if goal.admits(&snapshot) {
                     Ok(ActivationRun { snapshot, joined })
                 } else {
                     Err(snapshot_error(&snapshot))
@@ -1418,29 +1524,46 @@ impl ActivationService {
         operation: &ActivationOperation,
         project_root: PathBuf,
         storage_path: PathBuf,
+        goal: ActivationGoal,
     ) -> Result<(), ApiError> {
+        let activation_started = Instant::now();
+        // One activation owns the observations used to build and admit its
+        // ready lease. Retrieval finalization seeds this memo with the exact
+        // pinned sidecar input, so the validation immediately following it
+        // and later packet calls do not rescan the repository or projection
+        // tables. A failed activation drops the memo with this scope.
+        let source_freshness_memo = codestory_workspace::SourceFreshnessMemo::default();
+        let _source_freshness_scope = codestory_workspace::SourceFreshnessScope::enter_with_memo(
+            source_freshness_memo.clone(),
+        );
         operation.ensure_not_cancelled("project discovery")?;
-        let mut summary = self
+        // Arm before the complete incremental probe. If this exact observer
+        // epoch still holds after both publications commit, the probe's
+        // complete inventory plus the source seals revalidated at the
+        // retrieval fence are a current source snapshot; another repository
+        // walk would prove the same thing again.
+        let source_observer_before_probe = self.controller.observed_source_epoch(&project_root);
+        let summary = self
             .controller
             .open_project_summary_with_storage_path(project_root.clone(), storage_path.clone())?;
-        summary.freshness = Some(
-            self.controller
-                .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)?,
-        );
+        let mut precomputed_core_probe = (summary.publication.is_some()
+            && summary.stats.node_count > 0)
+            .then(|| self.controller.probe_incremental_plan_for_activation())
+            .transpose()?;
+        let complete_incremental_source_inventory = precomputed_core_probe
+            .as_ref()
+            .is_some_and(|probe| probe.has_complete_source_inventory());
+        let preflight_ms =
+            u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         operation.set_stage(ActivationStage::CoreFreshness);
+        let core_refresh_started = Instant::now();
+        let mut refreshed_core = None;
         let core_stale = summary.publication.is_none()
             || summary.stats.node_count == 0
-            || self
-                .controller
-                .complete_core_requires_publication_repair(&storage_path)?
-            // A bounded freshness check cannot prove drift either way, so treating it as stale
-            // would rebuild the whole index on every activation of a large repository and never
-            // reach a different answer.
-            || summary
-                .freshness
+            || precomputed_core_probe
                 .as_ref()
-                .is_none_or(|freshness| !index_freshness_admits_operation(freshness));
+                .is_none_or(|probe| !probe.short_circuited());
         if core_stale {
             let mode = if summary.publication.is_none() || summary.stats.node_count == 0 {
                 IndexMode::Full
@@ -1448,34 +1571,39 @@ impl ActivationService {
                 IndexMode::Incremental
             };
             let token = CancellationToken::from_shared_flag(Arc::clone(&operation.cancelled));
-            self.controller
-                .run_indexing_blocking_with_cancel(mode, &token)?;
-            operation.ensure_not_cancelled("core publication validation")?;
-            summary = self.controller.open_project_summary_with_storage_path(
-                project_root.clone(),
-                storage_path.clone(),
-            )?;
-            summary.freshness = Some(
-                self.controller
-                    .index_freshness_uncached(FreshnessObservationPolicy::Unobserved)?,
-            );
-        }
-        let local_ready = summary.publication.is_some()
-            && summary.stats.node_count > 0
-            && summary.stats.fatal_error_count == 0
-            && !self
+            let evidence = self
                 .controller
-                .complete_core_requires_publication_repair(&storage_path)?
-            && summary
-                .freshness
-                .as_ref()
-                .is_some_and(index_freshness_admits_operation);
+                .run_indexing_blocking_with_cancel_for_activation(
+                    mode,
+                    &token,
+                    (mode == IndexMode::Incremental)
+                        .then(|| precomputed_core_probe.take())
+                        .flatten(),
+                )?;
+            tracing::debug!(
+                target: "codestory::activation",
+                phase_timings = ?evidence.phase_timings,
+                "managed core refresh completed"
+            );
+            operation.ensure_not_cancelled("core publication validation")?;
+            refreshed_core = Some((evidence.publication, evidence.stats));
+        }
+        let local_ready = match refreshed_core.as_ref() {
+            Some((_, stats)) => stats.node_count > 0 && stats.fatal_error_count == 0,
+            None => {
+                summary.publication.is_some()
+                    && summary.stats.node_count > 0
+                    && summary.stats.fatal_error_count == 0
+                    && precomputed_core_probe
+                        .as_ref()
+                        .is_some_and(|probe| probe.short_circuited())
+            }
+        };
+        let core_refresh_ms =
+            u64::try_from(core_refresh_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if !local_ready {
             if summary.stats.node_count > 0
                 && summary.stats.fatal_error_count == 0
-                && !self
-                    .controller
-                    .complete_core_requires_publication_repair(&storage_path)?
                 && let Some(publication) = summary.publication.clone()
             {
                 operation.set_retained_local_publication(publication);
@@ -1485,39 +1613,70 @@ impl ActivationService {
                 "activation did not produce a fresh complete core publication",
             ));
         }
-        let local_publication = summary
-            .publication
-            .clone()
+        let local_publication = refreshed_core
+            .as_ref()
+            .map(|(publication, _)| publication.clone())
+            .or_else(|| summary.publication.clone())
             .expect("fresh complete core has a publication identity");
         operation.set_local_publication(local_publication.clone());
 
+        if goal == ActivationGoal::CoreOnly {
+            operation.set_capability(false, ActivationCapabilityState::Ready);
+            let total_ms =
+                u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::debug!(
+                target: "codestory::activation",
+                preflight_ms,
+                core_refresh_ms,
+                total_ms,
+                "core-only activation completed"
+            );
+            return Ok(());
+        }
+
         operation.ensure_not_cancelled("search preparation")?;
         operation.set_stage(ActivationStage::SearchPreparation);
+        let search_preparation_started = Instant::now();
         let token = CancellationToken::from_shared_flag(Arc::clone(&operation.cancelled));
         self.controller
             .prepare_search_state_for_activation(&token)?;
+        let search_preparation_ms =
+            u64::try_from(search_preparation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         operation.ensure_not_cancelled("dense preparation")?;
         operation.set_stage(ActivationStage::DensePreparation);
+        let dense_preparation_started = Instant::now();
         self.record_preparation_phase(ActivationPreparationPhase::NativeEmbedding)?;
         codestory_retrieval::ensure_product_embedding_backend_for_runtime(
             &self.controller.runtime_config,
         )
         .map_err(map_activation_error)?;
+        let dense_preparation_ms =
+            u64::try_from(dense_preparation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         operation.ensure_not_cancelled("retrieval publication")?;
         operation.set_stage(ActivationStage::Publication);
         self.record_preparation_phase(ActivationPreparationPhase::RetrievalFinalization)?;
+        let retrieval_finalization_started = Instant::now();
         if self.should_finalize_retrieval_for_activation() {
-            codestory_retrieval::finalize_index_for_runtime_with_cancel(
+            let outcome = codestory_retrieval::finalize_index_for_runtime_with_cancel(
                 &project_root,
                 &storage_path,
                 &self.controller.runtime_config,
                 operation.cancelled.as_ref(),
             )
             .map_err(map_activation_error)?;
+            tracing::debug!(
+                target: "codestory::activation",
+                phase_timings = ?outcome.phase_timings,
+                component_work = ?outcome.component_work,
+                "managed retrieval finalization completed"
+            );
         }
+        let retrieval_finalization_ms =
+            u64::try_from(retrieval_finalization_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         operation.ensure_not_cancelled("retrieval validation")?;
         operation.set_stage(ActivationStage::Validation);
+        let validation_started = Instant::now();
         let retrieval = codestory_retrieval::ready_retrieval_identity_for_runtime(
             &project_root,
             &storage_path,
@@ -1542,19 +1701,37 @@ impl ActivationService {
                 "retrieval publication is not live-ready after activation",
             ));
         }
-        // Read the epoch *before* the scan, not after: a mutation that lands while the scan runs
-        // has to fall outside the lease's recorded epoch, or the lease would vouch for the very
-        // window the observer just proved was contested.
-        let source_observer = self.controller.observed_source_epoch(&project_root);
-        let source_freshness = self
+        let observer_after_publication = self
             .controller
-            .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?;
+            .observed_source_epoch_if_armed(&project_root);
+        let observed_refresh_file_count =
+            refreshed_core.as_ref().map(|(_, stats)| stats.file_count);
+        let observed_source_freshness = source_freshness_from_observed_incremental_refresh(
+            source_observer_before_probe.as_ref(),
+            observer_after_publication.as_ref(),
+            complete_incremental_source_inventory,
+            observed_refresh_file_count,
+        );
+        let source_validation_mode = if observed_source_freshness.is_some() {
+            "observer_receipt"
+        } else {
+            "content_scan"
+        };
+        let source_freshness = if let Some(freshness) = observed_source_freshness {
+            freshness
+        } else {
+            self.controller
+                .index_freshness_uncached(FreshnessObservationPolicy::ObserveSourceRoot)?
+        };
         if !index_freshness_admits_operation(&source_freshness) {
             return Err(ApiError::new(
                 "publication_changed",
                 index_freshness_block_message("activation", &source_freshness),
             ));
         }
+        let source_observer = self
+            .controller
+            .observed_source_epoch_if_armed(&project_root);
         let core_publication = self
             .retained_core_publication(&storage_path)?
             .ok_or_else(|| {
@@ -1595,10 +1772,32 @@ impl ActivationService {
             core_publication: revalidated_core,
             retrieval,
             source: ReadySourceIdentity::from(&source_freshness),
-            source_freshness_memo: codestory_workspace::SourceFreshnessMemo::default(),
+            source_freshness_memo,
             source_observer,
         });
         operation.set_capability(true, ActivationCapabilityState::Ready);
+        let validation_ms =
+            u64::try_from(validation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let total_ms = u64::try_from(activation_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let attributed_ms = preflight_ms
+            .saturating_add(core_refresh_ms)
+            .saturating_add(search_preparation_ms)
+            .saturating_add(dense_preparation_ms)
+            .saturating_add(retrieval_finalization_ms)
+            .saturating_add(validation_ms);
+        tracing::warn!(
+            target: "codestory::activation",
+            preflight_ms,
+            core_refresh_ms,
+            search_preparation_ms,
+            dense_preparation_ms,
+            retrieval_finalization_ms,
+            validation_ms,
+            source_validation_mode,
+            unattributed_ms = total_ms.saturating_sub(attributed_ms),
+            total_ms,
+            "managed activation wall receipt"
+        );
         Ok(())
     }
 }
@@ -1628,6 +1827,30 @@ fn index_freshness_admits_operation(freshness: &IndexFreshnessDto) -> bool {
     }
 }
 
+fn source_freshness_from_observed_incremental_refresh(
+    before: Option<&ObservedSourceEpoch>,
+    after: Option<&ObservedSourceEpoch>,
+    complete_inventory: bool,
+    refreshed_file_count: Option<u32>,
+) -> Option<IndexFreshnessDto> {
+    let file_count = refreshed_file_count?;
+    if !complete_inventory || before.is_none() || before != after {
+        return None;
+    }
+    Some(IndexFreshnessDto {
+        status: IndexFreshnessStatusDto::Fresh,
+        changed_file_count: 0,
+        new_file_count: 0,
+        removed_file_count: 0,
+        checked_file_count: file_count,
+        indexed_file_count: file_count,
+        duration_ms: 0,
+        reason: None,
+        not_checked_cause: None,
+        samples: Vec::new(),
+    })
+}
+
 fn index_freshness_block_message(operation: &str, freshness: &IndexFreshnessDto) -> String {
     // The reason is the only thing that tells an operator what to change, so it must survive.
     match freshness.reason.as_deref() {
@@ -1640,6 +1863,15 @@ fn index_freshness_block_message(operation: &str, freshness: &IndexFreshnessDto)
 
 fn snapshot_allows(snapshot: &ActivationSnapshot) -> bool {
     snapshot.allows_operation("packet")
+}
+
+/// A full request cannot borrow a core-only run's completion, because that run
+/// stops before retrieval. Retrying starts the full activation instead.
+fn narrower_activation_in_flight() -> ApiError {
+    ApiError::new(
+        "activation_retryable",
+        "a core-only activation is already running for this project; retry to start full activation",
+    )
 }
 
 fn snapshot_error(snapshot: &ActivationSnapshot) -> ApiError {
@@ -2291,6 +2523,7 @@ impl ActivationOperation {
             state.ready_lease = None;
         }
         let ready_lease_present = state.ready_lease.is_some();
+        let core_only = state.goal == ActivationGoal::CoreOnly;
         let Some(snapshot) = state
             .current
             .as_mut()
@@ -2347,6 +2580,21 @@ impl ActivationOperation {
                     )
                 });
             snapshot.failure = Some(error.message.clone());
+        } else if core_only {
+            // A core-only run proved the core and nothing else. Reporting
+            // `Ready` here would let a broad tool read full retrieval readiness
+            // out of a run that never prepared retrieval, so the terminal state
+            // stays `Updating`: local navigation is ready, and a broad caller is
+            // told to retry, which is what starts the full activation.
+            snapshot.state = ActivationState::Updating;
+            snapshot.stage = ActivationStage::CoreFreshness;
+            snapshot.progress = activation_stage_progress(ActivationStage::CoreFreshness);
+            snapshot.retry_after_ms = None;
+            snapshot.embedding_capacity = None;
+            snapshot.embedding_retry = None;
+            snapshot.failure_code = None;
+            snapshot.failure_details = None;
+            snapshot.failure = None;
         } else {
             debug_assert!(
                 ready_lease_present,
@@ -2507,6 +2755,15 @@ impl IndexService {
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.controller
             .run_indexing_blocking_without_runtime_refresh(mode)
+    }
+
+    pub fn bind_project_paths_for_refresh(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<(), ApiError> {
+        self.controller
+            .bind_project_paths_for_refresh(root, storage_path)
     }
 
     pub fn run_indexing_blocking_without_runtime_refresh_with_cancel(
@@ -2809,10 +3066,56 @@ mod embedding_start_classification_tests {
 mod freshness_gate_tests {
     use super::*;
 
+    fn observed_epoch(session_id: &str, epoch: u64) -> ObservedSourceEpoch {
+        ObservedSourceEpoch {
+            session_id: session_id.to_string(),
+            backend: "injected",
+            epoch,
+        }
+    }
+
+    #[test]
+    fn only_one_stable_observer_epoch_admits_the_complete_refresh_receipt() {
+        let before = observed_epoch("session-a", 7);
+        let same = observed_epoch("session-a", 7);
+        let advanced = observed_epoch("session-a", 8);
+        let rearmed = observed_epoch("session-b", 7);
+
+        let fresh = source_freshness_from_observed_incremental_refresh(
+            Some(&before),
+            Some(&same),
+            true,
+            Some(42),
+        )
+        .expect("stable observer carries the complete refresh receipt");
+        assert_eq!(fresh.status, IndexFreshnessStatusDto::Fresh);
+        assert_eq!(fresh.checked_file_count, 42);
+        assert_eq!(fresh.indexed_file_count, 42);
+
+        for (after, complete, count) in [
+            (Some(&advanced), true, Some(42)),
+            (Some(&rearmed), true, Some(42)),
+            (None, true, Some(42)),
+            (Some(&same), false, Some(42)),
+            (Some(&same), true, None),
+        ] {
+            assert!(
+                source_freshness_from_observed_incremental_refresh(
+                    Some(&before),
+                    after,
+                    complete,
+                    count,
+                )
+                .is_none(),
+                "changed, lost, incomplete, or refresh-free evidence must fall back to a scan",
+            );
+        }
+    }
+
     #[test]
     fn dark_indexed_call_path_builder_remains_core_only() {
         assert!(!operation_requires_retrieval(
-            codestory_agent::proof_qualification_test_support::PROOF_DOMAIN
+            crate::call_path_kernel::PROOF_DOMAIN
         ));
         for operation in ["packet", "search", "context", "drill"] {
             assert!(operation_requires_retrieval(operation));
@@ -2913,6 +3216,60 @@ pub(crate) mod activation_tests {
     };
     use crate::test_support::git;
     use std::fs;
+    use std::path::Path;
+
+    /// Must match `codestory_store`'s incomplete incremental schema sentinel.
+    const INCOMPLETE_INCREMENTAL_SCHEMA_VERSION: u32 = 0x4353_0001;
+
+    /// Hostile fixture writes belong on the active generation file via a direct
+    /// SQLite connection, never through live `Store::open` (read-only once a
+    /// publication pointer exists) and never through `Store::open_build` (which
+    /// re-inits schema on the sealed image). Checkpoint and reseal afterward so
+    /// observational immutable opens keep seeing the mutated image.
+    fn mutate_active_generation_sql(storage_path: &Path, sql: &str) {
+        let generation_db = codestory_store::resolve_core_database_path(storage_path)
+            .expect("resolve active immutable generation");
+        let metadata = fs::metadata(&generation_db).expect("generation metadata");
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() | 0o200);
+        }
+        #[cfg(not(unix))]
+        {
+            permissions.set_readonly(false);
+        }
+        fs::set_permissions(&generation_db, permissions).expect("make generation owner-writable");
+        {
+            let connection = rusqlite::Connection::open(&generation_db)
+                .expect("open active generation for hostile fixture");
+            connection
+                .execute_batch(sql)
+                .expect("apply hostile fixture mutation");
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("checkpoint hostile generation writes");
+        }
+        for suffix in ["-wal", "-journal", "-shm"] {
+            let mut sidecar = generation_db.as_os_str().to_owned();
+            sidecar.push(suffix);
+            let _ = fs::remove_file(PathBuf::from(sidecar));
+        }
+        let metadata = fs::metadata(&generation_db).expect("generation metadata after mutate");
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(permissions.mode() & !0o222);
+        }
+        #[cfg(not(unix))]
+        {
+            permissions.set_readonly(true);
+        }
+        fs::set_permissions(&generation_db, permissions)
+            .expect("reseal active generation as immutable");
+    }
 
     pub(crate) struct ReadyActivationFixture {
         pub(crate) project: tempfile::TempDir,
@@ -3506,9 +3863,7 @@ pub(crate) mod activation_tests {
         codestory_contracts::api::AgentPacketRequestDto {
             question: "how does the ready lease source anchor work".to_string(),
             budget: codestory_contracts::api::PacketBudgetModeDto::default(),
-            task_class: None,
             probes: Vec::new(),
-            extra_probes: Vec::new(),
             latency_budget_ms: Some(30_000),
             parent_packet_id: None,
             option_ids: Vec::new(),
@@ -3790,7 +4145,12 @@ pub(crate) mod activation_tests {
         };
 
         let error = service
-            .activate_once(&operation, project_root, fixture.storage_path.clone())
+            .activate_once(
+                &operation,
+                project_root,
+                fixture.storage_path.clone(),
+                ActivationGoal::Full,
+            )
             .expect_err("a source tree that moved under the scan must not be leased as ready");
 
         assert_eq!(
@@ -3877,14 +4237,17 @@ pub(crate) mod activation_tests {
     fn ready_lease_revalidation_rejects_manifest_change_after_initial_capture() {
         let fixture = ready_activation_fixture();
         let service = fixture.runtime.activation_service();
-        Store::open(&fixture.storage_path)
-            .expect("open fixture storage")
-            .get_connection()
-            .execute(
-                "UPDATE retrieval_index_manifest \
-                 SET built_at_epoch_ms = built_at_epoch_ms + 1",
-                [],
-            )
+        // Retrieval identity lives in the external publication DB, which remains
+        // writable after the core generation seals.
+        let mut storage = Store::open(&fixture.storage_path).expect("open fixture storage");
+        let project_id = fixture.lease.retrieval.manifest.project_id.clone();
+        let mut manifest = storage
+            .get_retrieval_index_manifest(&project_id)
+            .expect("read retrieval manifest")
+            .expect("ready fixture retrieval manifest");
+        manifest.built_at_epoch_ms += 1;
+        storage
+            .upsert_retrieval_index_manifest(&manifest)
             .expect("mutate retrieval pointer after initial capture");
 
         let error = service
@@ -3903,10 +4266,9 @@ pub(crate) mod activation_tests {
         let fixture = ready_activation_fixture();
         let service = fixture.runtime.activation_service();
         let ready = service.snapshot().expect("ready snapshot");
-        Store::open(&fixture.storage_path)
-            .expect("open fixture storage")
-            .get_connection()
-            .execute("DELETE FROM retrieval_index_manifest", [])
+        let mut storage = Store::open(&fixture.storage_path).expect("open fixture storage");
+        storage
+            .clear_retrieval_index_manifests()
             .expect("remove retrieval identity pointer");
 
         let worker_gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -4373,6 +4735,7 @@ pub(crate) mod activation_tests {
                 true,
                 &AtomicBool::new(true),
                 Duration::ZERO,
+                ActivationGoal::Full,
             )
             .expect_err("the cancelled waiter must return without joining");
         assert_eq!(cancelled.code, "cancelled");
@@ -4438,6 +4801,7 @@ pub(crate) mod activation_tests {
                 false,
                 &AtomicBool::new(false),
                 Duration::from_secs(1),
+                ActivationGoal::Full,
             )
             .expect_err("worker panic must become a terminal activation error");
         assert_eq!(terminal_error.code, "project_unavailable");
@@ -4646,12 +5010,12 @@ pub(crate) mod activation_tests {
             .index_service()
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish complete core");
-        let publication = Store::database_index_publication(&storage_path)
+        let previous = Store::database_index_publication(&storage_path)
             .expect("read core publication")
             .expect("complete core publication");
-        let search_path = search_index_path_for_publication(&storage_path, Some(&publication))
+        let previous_search = search_index_path_for_publication(&storage_path, Some(&previous))
             .expect("search generation path");
-        fs::remove_dir_all(&search_path).expect("remove completed search generation");
+        fs::remove_dir_all(&previous_search).expect("remove completed search generation");
 
         let runtime = Runtime::new();
         let error = runtime
@@ -4669,8 +5033,18 @@ pub(crate) mod activation_tests {
             snapshot.capabilities.local_navigation,
             ActivationCapabilityState::Ready
         );
+        let current = Store::database_index_publication(&storage_path)
+            .expect("read repaired publication")
+            .expect("repaired complete publication");
+        assert_eq!(current.generation, previous.generation + 1);
+        assert_eq!(
+            current.mode,
+            codestory_store::IndexPublicationMode::Incremental
+        );
+        let current_search = search_index_path_for_publication(&storage_path, Some(&current))
+            .expect("repaired search generation path");
         assert!(
-            read_search_generation_completion(&search_path, &publication.generation_id).is_some(),
+            read_search_generation_completion(&current_search, &current.generation_id).is_some(),
             "activation must publish a completion marker for the repaired generation"
         );
         runtime
@@ -4708,11 +5082,7 @@ pub(crate) mod activation_tests {
         let previous_search = search_index_path_for_publication(&storage_path, Some(&previous))
             .expect("search generation path");
         fs::remove_dir_all(previous_search).expect("remove completed search generation");
-        Store::open(&storage_path)
-            .expect("open migrated core")
-            .get_connection()
-            .execute("DELETE FROM dense_anchor_publication", [])
-            .expect("remove dense-anchor publication marker");
+        mutate_active_generation_sql(&storage_path, "DELETE FROM dense_anchor_publication;");
 
         let runtime = Runtime::new();
         runtime
@@ -4956,12 +5326,16 @@ pub(crate) mod activation_tests {
             .index_service()
             .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
             .expect("publish complete core");
-        {
-            let storage = Store::open(&storage_path).expect("open published storage");
-            storage
-                .begin_incremental_run()
-                .expect("install durable incomplete fence");
-        }
+        mutate_active_generation_sql(
+            &storage_path,
+            &format!(
+                "INSERT INTO incomplete_index_run (id, started_at_epoch_ms)
+                 VALUES (1, 1)
+                 ON CONFLICT(id) DO UPDATE SET
+                    started_at_epoch_ms = excluded.started_at_epoch_ms;
+                 PRAGMA user_version = {INCOMPLETE_INCREMENTAL_SCHEMA_VERSION};"
+            ),
+        );
 
         runtime
             .activation_service()

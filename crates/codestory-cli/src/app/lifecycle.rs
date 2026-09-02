@@ -15,7 +15,7 @@ pub(super) fn embedding_client_transport_mode(
 ) -> Option<embedding_server_transport::ClientTransportMode> {
     match command {
         Command::Ground(_) => Some(embedding_server_transport::ClientTransportMode::ObserveOnly),
-        Command::ProveCallPath(_) => {
+        Command::VerifyIndexedDirectCalls(_) => {
             Some(embedding_server_transport::ClientTransportMode::ObserveOnly)
         }
         Command::Retrieval(args::RetrievalCommand {
@@ -113,6 +113,7 @@ pub(super) fn run_cache(cmd: CacheCommand) -> Result<()> {
         CacheAction::Identity(cmd) => run_cache_identity(cmd),
         CacheAction::Rehydrate(cmd) => run_cache_rehydrate(cmd),
         CacheAction::Clean(cmd) => run_cache_clean(cmd),
+        CacheAction::Inventory(cmd) => run_cache_inventory(cmd),
 
         CacheAction::Reset(cmd) => crate::cache_reset::run_cache_reset(cmd),
     }
@@ -130,6 +131,79 @@ fn run_cache_clean(cmd: args::CacheCleanCommand) -> Result<()> {
     let plan = codestory_runtime::plan_cache_clean().context("cache clean plan")?;
     let markdown = render_cache_clean_plan_markdown(&plan);
     emit(cmd.format, &plan, markdown, cmd.output_file.as_deref())
+}
+
+fn run_cache_inventory(cmd: args::CacheInventoryCommand) -> Result<()> {
+    ensure_dot_only_for_trail(cmd.format, "cache inventory")?;
+    preflight_output_file(cmd.output_file.as_deref())?;
+    crate::sidecar_runtime::prepare_cache_access();
+    let report = codestory_runtime::cache_inventory().context("cache inventory")?;
+    let markdown = render_cache_inventory_markdown(&report);
+    emit(cmd.format, &report, markdown, cmd.output_file.as_deref())
+}
+
+fn render_cache_inventory_markdown(report: &codestory_runtime::CacheInventoryReport) -> String {
+    let mut markdown = String::new();
+    let _ = writeln!(markdown, "# Cache Inventory");
+    let _ = writeln!(markdown, "dry_run: `{}`", report.dry_run);
+    let _ = writeln!(markdown, "cache_root: `{}`", report.cache_root);
+    let _ = writeln!(markdown, "ownership_scope: `{}`", report.ownership_scope);
+    let _ = writeln!(markdown, "apparent_bytes: {}", report.apparent_bytes);
+    let _ = writeln!(markdown, "unique_bytes: {}", report.unique_bytes);
+    match report.allocated_bytes {
+        Some(allocated) => {
+            let _ = writeln!(markdown, "allocated_bytes: {allocated}");
+        }
+        None => {
+            let _ = writeln!(
+                markdown,
+                "allocated_bytes: unavailable (this platform does not report file allocation)"
+            );
+        }
+    }
+    let _ = writeln!(
+        markdown,
+        "hardlink_deduplicated_bytes: {}",
+        report.hardlink_deduplicated_bytes
+    );
+    match report.clone_shared_bytes {
+        Some(shared) => {
+            let _ = writeln!(
+                markdown,
+                "clone_shared_bytes: {shared} (apparent minus allocated; cause not attributed)"
+            );
+        }
+        None => {
+            let _ = writeln!(
+                markdown,
+                "clone_shared_bytes: unavailable (no allocation evidence)"
+            );
+        }
+    }
+    if report.partial_scan {
+        let _ = writeln!(
+            markdown,
+            "partial_scan: `true` (byte totals are lower bounds)"
+        );
+    }
+    let _ = writeln!(markdown, "required_bytes: {}", report.required_bytes);
+    let _ = writeln!(markdown, "reclaimable_bytes: {}", report.reclaimable_bytes);
+    let _ = writeln!(markdown, "blocked_bytes: {}", report.blocked_bytes);
+    let _ = writeln!(markdown, "\n## Top Consumers");
+    for consumer in &report.top_consumers {
+        let _ = writeln!(
+            markdown,
+            "- `{}` ({:?}): {} bytes",
+            consumer.relative_path, consumer.kind, consumer.apparent_bytes
+        );
+    }
+    if !report.errors.is_empty() {
+        let _ = writeln!(markdown, "\n## Errors");
+        for error in &report.errors {
+            let _ = writeln!(markdown, "- {error}");
+        }
+    }
+    markdown
 }
 
 fn render_cache_clean_plan_markdown(plan: &codestory_runtime::CacheCleanPlan) -> String {
@@ -348,6 +422,33 @@ fn render_cache_rehydrate_markdown(output: &codestory_runtime::CacheRehydrateOut
         "carried_policy_exclusion_rows: `{}`",
         output.carried_policy_exclusion_rows
     );
+    if let Some(bytes) = output.peak_space_required_bytes {
+        let _ = writeln!(markdown, "peak_space_required_bytes: `{bytes}`");
+    }
+    if let Some(bytes) = output.available_bytes {
+        let _ = writeln!(markdown, "available_bytes: `{bytes}`");
+    }
+    if let Some(bytes) = output.source_logical_bytes {
+        let _ = writeln!(markdown, "source_logical_bytes: `{bytes}`");
+    }
+    if let Some(bytes) = output.source_file_bytes {
+        let _ = writeln!(markdown, "source_file_bytes: `{bytes}`");
+    }
+    if let Some(count) = output.source_freelist_count {
+        let _ = writeln!(markdown, "source_freelist_count: `{count}`");
+    }
+    if let Some(bytes) = output.candidate_logical_bytes {
+        let _ = writeln!(markdown, "candidate_logical_bytes: `{bytes}`");
+    }
+    if let Some(bytes) = output.candidate_file_bytes {
+        let _ = writeln!(markdown, "candidate_file_bytes: `{bytes}`");
+    }
+    if let Some(count) = output.candidate_freelist_count {
+        let _ = writeln!(markdown, "candidate_freelist_count: `{count}`");
+    }
+    if let Some(count) = output.freelist_pages_reclaimed {
+        let _ = writeln!(markdown, "freelist_pages_reclaimed: `{count}`");
+    }
     let _ = writeln!(markdown, "retrieval: {}", output.retrieval);
     let _ = writeln!(markdown, "retrieval_status: `{}`", output.retrieval_status);
     let _ = writeln!(markdown, "retrieval_reason: {}", output.retrieval_reason);

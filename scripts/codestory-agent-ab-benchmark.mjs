@@ -50,7 +50,7 @@ const MAX_REUSED_ARTIFACT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_BENCHMARK_MODEL = "gpt-5.6-sol";
 const EXACT_CANDIDATE_ARMS = Object.freeze([
   "without_codestory",
-  "published_0_17_4",
+  "published_0_17_5",
   "candidate_0_18",
 ]);
 const EXACT_CANDIDATE_TASK_IDS = Object.freeze([
@@ -220,12 +220,12 @@ const ARMS = {
     "Do not use CodeStory, codestory-cli, or codestory-grounding. Use normal local repository exploration only. Do not use web search, browser tools, remote URLs, or upstream mirrors.",
   with_codestory:
     CODESTORY_ARM_INSTRUCTION,
-  published_0_17_4: CODESTORY_ARM_INSTRUCTION,
+  published_0_17_5: CODESTORY_ARM_INSTRUCTION,
   candidate_0_18: CODESTORY_ARM_INSTRUCTION,
 };
 
 function isCodeStoryArm(arm) {
-  return arm === "with_codestory" || arm === "published_0_17_4" || arm === "candidate_0_18";
+  return arm === "with_codestory" || arm === "published_0_17_5" || arm === "candidate_0_18";
 }
 
 function isPacketProjectionV3(packet) {
@@ -282,15 +282,15 @@ Options:
   --resume-prefix-from
                   Exact-candidate only: authenticate and reanalyze one complete-task prefix, then run only the remaining tasks.
   --reuse-comparators-from
-                  Exact-candidate only: reuse authenticated no-CodeStory and published-0.17.4 triplets while rerunning every candidate row.
+                  Exact-candidate only: reuse authenticated no-CodeStory and published-0.17.5 triplets while rerunning every candidate row.
   --reuse-comparators-ledger-sha256
                   External SHA-256 binding for the comparator source runs.jsonl.
   --reuse-comparators-artifacts-sha256
                   External SHA-256 binding for the comparator source artifact bundle.
   --exact-candidate
-                  Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.4, and the frozen 0.18 candidate.
+                  Run the fresh 18-task, three-repeat comparison of no CodeStory, published 0.17.5, and the frozen 0.18 candidate.
   --published-archive
-                  Published CodeStory 0.17.4 native archive named by the authenticated checksum manifest.
+                  Published CodeStory 0.17.5 native archive named by the authenticated checksum manifest.
   --published-checksum-manifest
                   Official published SHA256SUMS.txt containing the selected archive digest.
   --published-checksum-sha256
@@ -940,7 +940,7 @@ function selectedBenchmarkChildEnv(opts = {}, arm = null) {
 }
 
 function exactCandidatePackageIdentity(receipt, arm) {
-  if (arm !== "published_0_17_4") {
+  if (arm !== "published_0_17_5") {
     return null;
   }
   const identity = Object.fromEntries([
@@ -1599,12 +1599,12 @@ async function authenticateExactCandidatePackages(opts) {
   if (publishedMatches.length !== 1) throw new Error("official checksum data must name the published archive exactly once");
 
   const packageRoot = opts.exactCandidateStateRoot;
-  const order = opts.exactCandidatePackageAuthenticationOrder ?? ["published_0_17_4", "candidate_0_18"];
+  const order = opts.exactCandidatePackageAuthenticationOrder ?? ["published_0_17_5", "candidate_0_18"];
   const publishedDefinition = {
-    arm: "published_0_17_4",
+    arm: "published_0_17_5",
     sourceArchivePath: publishedArchive,
     archiveSha256: normalizeExternalSha256(publishedMatches[0], "official published archive sha256"),
-    expected: { package_version: "0.17.4", schema_version: 2, protocol_revision: "2024-11-05" },
+    expected: { package_version: "0.17.5", schema_version: 2, protocol_revision: "2024-11-05" },
     trustRoot: { kind: "official_published_checksum", sha256: publishedManifest.sha256 },
   };
   const packages = new Map();
@@ -1614,7 +1614,7 @@ async function authenticateExactCandidatePackages(opts) {
       throw new Error("package authentication order must contain each exact CodeStory arm once");
     }
     const armStarted = performance.now();
-    if (arm === "published_0_17_4") {
+    if (arm === "published_0_17_5") {
       const archiveInput = await ingestExactInput(
         opts,
         `${arm}_archive`,
@@ -2681,13 +2681,13 @@ function packetFirstCommandFenceLanguage(platform = process.platform) {
 
 function packetFirstCommandForPrompt(taskPrompt, task = null, platform = process.platform) {
   const question = String(taskPrompt).replace(/\r?\n/g, " ");
-  const taskClass = task?.task_class
-    ? ` --task-class ${shellSingleQuoted(validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"), platform)}`
-    : "";
-  if (platform === "win32") {
-    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget standard --format json`;
+  if (task?.task_class) {
+    validatePacketTaskClass("benchmark task", task.task_class);
   }
-  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)}${taskClass} --budget standard --format json`;
+  if (platform === "win32") {
+    return `& $env:CODESTORY_CLI packet --project . --question ${shellSingleQuoted(question, platform)} --budget standard --format json`;
+  }
+  return `"$CODESTORY_CLI" packet --project . --question ${shellSingleQuoted(question, platform)} --budget standard --format json`;
 }
 
 function packetPreludePromptBlock(prelude) {
@@ -2979,6 +2979,143 @@ function artifactNamePart(value) {
 function benchmarkRunId(parts) {
   return parts.map(artifactNamePart).join("-");
 }
+
+
+function installedAgentTimingCohortId(dimensions) {
+  const requiredStrings = [
+    "execution_window_id",
+    "model",
+    "load_policy",
+    "task_id",
+  ];
+  for (const field of requiredStrings) {
+    if (typeof dimensions?.[field] !== "string" || !dimensions[field].trim()) {
+      throw new Error(`installed timing cohort ${field} is required`);
+    }
+  }
+  if (!Number.isInteger(dimensions?.repeat) || dimensions.repeat <= 0) {
+    throw new Error("installed timing cohort repeat must be a positive integer");
+  }
+  if (!dimensions.host || typeof dimensions.host !== "object" || Array.isArray(dimensions.host)) {
+    throw new Error("installed timing cohort host is required");
+  }
+  const host = Object.fromEntries([
+    "platform",
+    "arch",
+    "cpu_model",
+    "logical_cpu_count",
+    "total_memory_bytes",
+  ].map((field) => [field, dimensions.host[field] ?? null]));
+  return sha256Bytes(stableJsonForHash({
+    contract: "codestory.installed-agent-timing-cohort/v1",
+    execution_window_id: dimensions.execution_window_id,
+    host,
+    model: dimensions.model,
+    load_policy: dimensions.load_policy,
+    task_id: dimensions.task_id,
+    repeat: dimensions.repeat,
+  }));
+}
+
+
+function installedAgentTiming(values) {
+  if (!SHA256_PATTERN.test(String(values?.timing_cohort_id ?? ""))) {
+    throw new Error("installed timing cohort id must be a lowercase SHA-256 digest");
+  }
+  const fields = [
+    "agent_runner_ms",
+    "time_to_first_packet_ms",
+    "continuation_ms",
+    "whole_task_wall_ms",
+  ];
+  for (const field of fields) {
+    if (typeof values[field] !== "number" || !Number.isFinite(values[field]) || values[field] < 0) {
+      throw new Error(`installed timing ${field} must be finite and nonnegative`);
+    }
+  }
+  const agentRunnerMs = Math.round(values.agent_runner_ms);
+  const timeToFirstPacketMs = Math.round(values.time_to_first_packet_ms);
+  const continuationMs = Math.round(values.continuation_ms);
+  const wholeTaskWallMs = Math.round(values.whole_task_wall_ms);
+  return {
+    timing_cohort_id: values.timing_cohort_id,
+    agent_runner_ms: agentRunnerMs,
+    time_to_first_packet_ms: timeToFirstPacketMs,
+    continuation_ms: continuationMs,
+    time_to_final_packet_ms: timeToFirstPacketMs + continuationMs,
+    whole_task_wall_ms: wholeTaskWallMs,
+  };
+}
+
+function installedAgentTimingFromMeasuredInteraction(values) {
+  const started = values?.interaction_started_ms;
+  const finished = values?.interaction_finished_ms;
+  if (
+    typeof started !== "number"
+    || !Number.isFinite(started)
+    || typeof finished !== "number"
+    || !Number.isFinite(finished)
+    || finished < started
+  ) {
+    throw new Error("installed interaction clock must be finite and monotonic");
+  }
+  return installedAgentTiming({
+    timing_cohort_id: values.timing_cohort_id,
+    agent_runner_ms: values.agent_runner_ms,
+    time_to_first_packet_ms: values.time_to_first_packet_ms,
+    continuation_ms: values.continuation_ms,
+    whole_task_wall_ms: finished - started,
+  });
+}
+
+function installedAgentTimingPhaseWarmMs(timing) {
+  if (!timing) return null;
+  return timing.agent_runner_ms
+    + timing.time_to_first_packet_ms
+    + timing.continuation_ms;
+}
+
+function exactCandidateLifecycleTiming(installedTiming, { cold_ms = 0, incremental_ms = 0 } = {}) {
+  if (
+    !installedTiming
+    || !Number.isFinite(installedTiming.whole_task_wall_ms)
+    || installedTiming.whole_task_wall_ms < 0
+  ) {
+    throw new Error("exact-candidate lifecycle timing requires InstalledAgentTimingV1 whole_task_wall_ms");
+  }
+  return {
+    cold_ms,
+    incremental_ms,
+  };
+}
+
+function timingEligibleExactCandidateRow(row) {
+  return row?.installed_agent_timing_eligible !== false
+    && row?.installed_agent_timing_ineligibility_reason == null
+    && !row?.comparator_reuse_provenance;
+}
+
+
+function timingIneligibleComparatorRow(row) {
+  const timing = row.installed_agent_timing;
+  return {
+    ...row,
+    ...(timing ? {
+      installed_agent_timing: Object.fromEntries([
+        "timing_cohort_id",
+        "agent_runner_ms",
+        "time_to_first_packet_ms",
+        "continuation_ms",
+        "time_to_final_packet_ms",
+        "whole_task_wall_ms",
+      ].map((field) => [field, timing[field]])),
+    } : {}),
+    comparative_wall_time_eligible: false,
+    installed_agent_timing_eligible: false,
+    installed_agent_timing_ineligibility_reason: "reused_comparator_row",
+  };
+}
+
 
 function parseJsonLines(stdout) {
   const parsed = [];
@@ -4566,9 +4703,6 @@ function packetCommandArgs(repoConfig, task, opts = {}) {
     "--format",
     "json",
   ];
-  if (task?.task_class) {
-    args.push("--task-class", validatePacketTaskClass("benchmark task", task.task_class).replace(/_/g, "-"));
-  }
   for (const probe of packetCommandExtraProbes(task, opts)) {
     args.push("--extra-probe", probe);
   }
@@ -4638,6 +4772,8 @@ function preludePublicFields(prelude) {
     signal: prelude.signal,
     error: prelude.error,
     wall_ms: prelude.wall_ms,
+    time_to_first_packet_ms: prelude.time_to_first_packet_ms ?? 0,
+    continuation_ms: prelude.continuation_ms ?? 0,
     stdout_path: prelude.stdout_path,
     stderr_path: prelude.stderr_path,
     stdout_bytes: prelude.stdout_bytes,
@@ -5861,6 +5997,11 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     timeoutMs: opts.timeoutMs,
     timeoutMessage: `CodeStory packet prelude timed out after ${opts.timeoutMs}ms.`,
   });
+  // Stop the clock when the first packet returns. A continuation, if one runs
+  // at all, is timed on its own interval below; nothing else is attributed to
+  // either of them.
+  const timeToFirstPacketMs = performance.now() - started;
+  let continuationMs = 0;
   await writeFile(stdoutPath, result.stdout, "utf8");
   await writeFile(stderrPath, result.stderr, "utf8");
 
@@ -5892,6 +6033,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     if (drillArgs) {
       const drillStdoutPath = path.join(outDir, `${runId}.codestory-packet-drill.stdout.json`);
       const drillStderrPath = path.join(outDir, `${runId}.codestory-packet-drill.stderr.txt`);
+      const drillStarted = performance.now();
       const drillResult = await runProcess(codestoryCli, drillArgs, {
         cwd: repoConfig.path,
         env,
@@ -5899,6 +6041,7 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
         timeoutMs: opts.timeoutMs,
         timeoutMessage: `CodeStory packet drill continuation timed out after ${opts.timeoutMs}ms.`,
       });
+      continuationMs = performance.now() - drillStarted;
       await writeFile(drillStdoutPath, drillResult.stdout, "utf8");
       await writeFile(drillStderrPath, drillResult.stderr, "utf8");
       if (drillResult.status === "pass") {
@@ -5952,6 +6095,8 @@ async function runCodeStoryPacketPrelude(opts, run, repoConfig, outDir, runId, c
     signal: result.signal,
     error: result.error ?? parseError ?? commandFailureReason ?? contractBlockers[0] ?? null,
     wall_ms: wallMs,
+    time_to_first_packet_ms: timeToFirstPacketMs,
+    continuation_ms: continuationMs,
     stdout_path: activeStdoutPath,
     stderr_path: activeStderrPath,
     stdout_bytes: Buffer.byteLength(result.stdout, "utf8"),
@@ -6049,6 +6194,7 @@ async function runOne(opts, run, outDir) {
     opts.agentCodexHomes?.[run.arm] ?? null,
     !opts.exactCandidate || isCodeStoryArm(run.arm),
   );
+  const interactionStarted = performance.now();
   const baselinePrelude =
     run.arm === "without_codestory"
       ? await runBaselinePrelude(opts, run, repoConfig, outDir, runId)
@@ -6102,8 +6248,35 @@ async function runOne(opts, run, outDir) {
       };
 
   const runnerWallMs = shouldRunAgent ? Math.round((performance.now() - started) * 1000) / 1000 : 0;
-  const preludeWallMs = (codestoryPrelude?.public.wall_ms ?? 0) + (baselinePrelude?.public.wall_ms ?? 0);
-  const wallMs = Math.round((runnerWallMs + preludeWallMs) * 1000) / 1000;
+  const interactionFinished = performance.now();
+  const wallMs = Math.round((interactionFinished - interactionStarted) * 1000) / 1000;
+  const timingCohortId = installedAgentTimingCohortId({
+    execution_window_id: opts.timingExecutionWindowId ?? opts.executionWindowId ?? "local-dev-window",
+    host: benchmarkHostClass([]),
+    model: opts.model ?? DEFAULT_BENCHMARK_MODEL,
+    load_policy: opts.timingLoadPolicy ?? "fresh_agent_session",
+    task_id: run.task?.id ?? run.repo,
+    repeat: run.repeat,
+  });
+  // Both packet phases are measured intervals or nothing. A run without a
+  // CodeStory prelude has no packet phases at all, and a continuation that did
+  // not run contributes zero rather than absorbing the rest of the prelude.
+  if (codestoryPrelude && !(
+    Number.isFinite(codestoryPrelude.public.time_to_first_packet_ms)
+    && Number.isFinite(codestoryPrelude.public.continuation_ms)
+  )) {
+    throw new Error("CodeStory packet prelude did not measure its first-packet and continuation intervals");
+  }
+  const timeToFirstPacketMs = codestoryPrelude?.public.time_to_first_packet_ms ?? 0;
+  const continuationMs = codestoryPrelude?.public.continuation_ms ?? 0;
+  const installedTiming = installedAgentTimingFromMeasuredInteraction({
+    timing_cohort_id: timingCohortId,
+    agent_runner_ms: runnerWallMs,
+    time_to_first_packet_ms: timeToFirstPacketMs,
+    continuation_ms: continuationMs,
+    interaction_started_ms: interactionStarted,
+    interaction_finished_ms: interactionFinished,
+  });
   const stdoutPath = path.join(outDir, `${runId}.stdout.jsonl`);
   const stderrPath = path.join(outDir, `${runId}.stderr.txt`);
   await writeFile(stdoutPath, result.stdout, "utf8");
@@ -6194,13 +6367,15 @@ async function runOne(opts, run, outDir) {
       ? `CodeStory binary identity ${codestoryBinaryIdentity.status}`
       : result.error,
     wall_ms: wallMs,
+    installed_agent_timing: installedTiming,
+    installed_agent_timing_eligible: run.comparative_wall_time_eligible !== false,
+    installed_agent_timing_ineligibility_reason:
+      run.comparative_wall_time_eligible === false ? "preparation_overlap" : null,
     exact_candidate_timing: opts.exactCandidate
-      ? {
+      ? exactCandidateLifecycleTiming(installedTiming, {
           cold_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.preparation_wall_ms ?? 0,
-          warm_ms: wallMs,
           incremental_ms: cachePreparationForRepo(opts, run.repo, run.arm)?.incremental_wall_ms ?? 0,
-          all_in_ms: wallMs,
-        }
+        })
       : null,
     agent_runner_wall_ms: runnerWallMs,
     baseline_harness_prelude: baselinePrelude?.public ?? null,
@@ -7250,7 +7425,7 @@ function cachePreparationIdentityBlockers(referencePreparation, preparation) {
   const referenceArms = referencePreparation?.arm_preparations;
   const observedArms = preparation?.arm_preparations;
   if (referenceArms || observedArms) {
-    return ["published_0_17_4", "candidate_0_18"].flatMap((arm) => {
+    return ["published_0_17_5", "candidate_0_18"].flatMap((arm) => {
       const expected = referenceArms?.[arm];
       const observed = observedArms?.[arm];
       if (!expected || !observed) {
@@ -7460,7 +7635,7 @@ async function refreshExactCandidatePreparation(
 }
 
 function exactCandidatePreparationArmOrder(index) {
-  const arms = ["published_0_17_4", "candidate_0_18"];
+  const arms = ["published_0_17_5", "candidate_0_18"];
   return index % 2 === 0 ? arms : [...arms].reverse();
 }
 
@@ -7512,18 +7687,18 @@ async function prepareCodeStoryCaches(opts, tasks) {
       }
       preparedByArm.set(arm, rows);
     }
-    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    for (const arm of ["published_0_17_5", "candidate_0_18"]) {
       for (const row of preparedByArm.get(arm)) {
         await refreshExactCandidatePreparation(opts, task, arm, row);
       }
     }
-    const publishedByRepo = new Map(preparedByArm.get("published_0_17_4").map((row) => [row.repo, row]));
+    const publishedByRepo = new Map(preparedByArm.get("published_0_17_5").map((row) => [row.repo, row]));
     const candidateByRepo = new Map(preparedByArm.get("candidate_0_18").map((row) => [row.repo, row]));
     return [task.repo].map((repo) => ({
       ...candidateByRepo.get(repo),
       arm: "candidate_0_18",
       arm_preparations: {
-        published_0_17_4: publishedByRepo.get(repo),
+        published_0_17_5: publishedByRepo.get(repo),
         candidate_0_18: candidateByRepo.get(repo),
       },
     }));
@@ -11562,9 +11737,9 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     arm,
     byArm[arm].filter((row) => row.quality?.pass === true).length,
   ]));
-  if (qualityPasses.candidate_0_18 < qualityPasses.published_0_17_4) {
+  if (qualityPasses.candidate_0_18 < qualityPasses.published_0_17_5) {
     reasons.push(
-      `candidate quality ${qualityPasses.candidate_0_18} is below published 0.17.4 ${qualityPasses.published_0_17_4}`,
+      `candidate quality ${qualityPasses.candidate_0_18} is below published 0.17.5 ${qualityPasses.published_0_17_5}`,
     );
   }
   if (qualityPasses.candidate_0_18 < qualityPasses.without_codestory) {
@@ -11574,7 +11749,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   }
 
   const comparatorErrors = new Set(
-    [...byArm.without_codestory, ...byArm.published_0_17_4].flatMap((row) =>
+    [...byArm.without_codestory, ...byArm.published_0_17_5].flatMap((row) =>
       (row.quality?.material_factual_errors?.found_anchors ?? []).map((anchor) =>
         `${row.task_id}\t${row.repeat}\t${anchor}`
       )
@@ -11598,18 +11773,19 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
 
   const taskIds = [...new Set(rows.map((row) => row.task_id).filter(Boolean))];
   for (const taskId of taskIds) {
-    const publishedPasses = byArm.published_0_17_4.filter(
+    const publishedPasses = byArm.published_0_17_5.filter(
       (row) => row.task_id === taskId && row.quality?.pass === true,
     ).length;
     const candidatePasses = byArm.candidate_0_18.filter(
       (row) => row.task_id === taskId && row.quality?.pass === true,
     ).length;
     if (publishedPasses - candidatePasses >= 2) {
-      reasons.push(`${taskId} loses 2 repeats or more versus published 0.17.4`);
+      reasons.push(`${taskId} loses 2 repeats or more versus published 0.17.5`);
     }
   }
 
-  const sum = (arm, selector) => byArm[arm].reduce((total, row) => {
+  const sum = (arm, selector, { timingEligibleOnly = false } = {}) => byArm[arm].reduce((total, row) => {
+    if (timingEligibleOnly && !timingEligibleExactCandidateRow(row)) return total;
     const value = Number(selector(row));
     return total + (Number.isFinite(value) ? value : 0);
   }, 0);
@@ -11621,16 +11797,17 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   const resourceTotals = {};
   for (const [label, selector] of resourceThresholds) {
     const baseline = sum("without_codestory", selector);
-    const published = sum("published_0_17_4", selector);
+    const published = sum("published_0_17_5", selector);
     const candidate = sum("candidate_0_18", selector);
-    resourceTotals[label] = { without_codestory: baseline, published_0_17_4: published, candidate_0_18: candidate };
-    if (candidate > published * 1.05) reasons.push(`${label} exceed 105% of published 0.17.4`);
+    resourceTotals[label] = { without_codestory: baseline, published_0_17_5: published, candidate_0_18: candidate };
+    if (candidate > published * 1.05) reasons.push(`${label} exceed 105% of published 0.17.5`);
     if (candidate > baseline * 0.8) reasons.push(`${label} exceed 80% of without_codestory`);
   }
 
   const uniqueRepoTiming = (arm, field) => {
     const byRepo = new Map();
     for (const row of byArm[arm]) {
+      if (!timingEligibleExactCandidateRow(row)) continue;
       const value = row.exact_candidate_timing?.[field];
       if (byRepo.has(row.repo) && byRepo.get(row.repo) !== value) {
         reasons.push(`${arm} ${field} timing disagrees across repeats for ${row.repo}`);
@@ -11641,9 +11818,43 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   };
   const lifecycleMs = (arm) => lifecycle?.package_authentication_ms?.[arm] ?? 0;
   const modelInitializationMs = (arm) => lifecycle?.model_initialization_ms?.[arm] ?? 0;
+  const timingEligibleCounts = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => [
+    arm,
+    byArm[arm].filter(timingEligibleExactCandidateRow).length,
+  ]));
+  if (EXACT_CANDIDATE_ARMS.some((arm) => timingEligibleCounts[arm] !== byArm[arm].length)) {
+    reasons.push(
+      `timing-ineligible rows cannot support exact-candidate warm/all-in gates: ${
+        EXACT_CANDIDATE_ARMS.map((arm) => `${arm}=${timingEligibleCounts[arm]}/${byArm[arm].length}`).join(" ")
+      }`,
+    );
+  }
+  for (const taskId of taskIds) {
+    for (const repeat of [1, 2, 3]) {
+      const cohortByArm = Object.fromEntries(EXACT_CANDIDATE_ARMS.map((arm) => {
+        const row = byArm[arm].find((entry) => entry.task_id === taskId && entry.repeat === repeat);
+        return [arm, timingEligibleExactCandidateRow(row) ? row?.installed_agent_timing?.timing_cohort_id ?? null : null];
+      }));
+      const present = Object.values(cohortByArm).filter(Boolean);
+      if (present.length >= 2 && new Set(present).size > 1) {
+        reasons.push(
+          `timing cohort ids disagree across arms for ${taskId} repeat ${repeat}`,
+        );
+      }
+    }
+  }
   const timingTotals = {};
   for (const arm of EXACT_CANDIDATE_ARMS) {
-    const warm = sum(arm, (row) => row.exact_candidate_timing?.warm_ms);
+    const warmComponent = sum(
+      arm,
+      (row) => installedAgentTimingPhaseWarmMs(row.installed_agent_timing),
+      { timingEligibleOnly: true },
+    );
+    const wholeTaskWall = sum(
+      arm,
+      (row) => row.installed_agent_timing?.whole_task_wall_ms,
+      { timingEligibleOnly: true },
+    );
     const measuredCold = arm === "without_codestory" ? 0 : uniqueRepoTiming(arm, "cold_ms");
     const oneTimeModel = arm === "without_codestory" ? 0 : modelInitializationMs(arm);
     const cold = Math.max(0, measuredCold - oneTimeModel);
@@ -11651,20 +11862,22 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     timingTotals[arm] = {
       package_authentication_ms: arm === "without_codestory" ? 0 : lifecycleMs(arm),
       model_initialization_ms: oneTimeModel,
-      warm_ms: warm,
+      warm_component_ms: warmComponent,
+      whole_task_wall_ms: wholeTaskWall,
       cold_ms: cold,
       incremental_ms: incremental,
-      all_in_ms: warm + cold + incremental + oneTimeModel +
+      all_in_ms: warmComponent + cold + incremental + oneTimeModel +
         (arm === "without_codestory" ? 0 : lifecycleMs(arm)),
     };
   }
   for (const [label, field, factor, display] of [
-    ["warm", "warm_ms", 1.05, "105%"],
+    ["warm component", "warm_component_ms", 1.05, "105%"],
+    ["whole-task", "whole_task_wall_ms", 1.05, "105%"],
     ["cold", "cold_ms", 1.05, "5%"],
     ["incremental", "incremental_ms", 1.05, "5%"],
     ["all-in", "all_in_ms", 1.10, "110%"],
   ]) {
-    const published = timingTotals.published_0_17_4[field];
+    const published = timingTotals.published_0_17_5[field];
     const candidate = timingTotals.candidate_0_18[field];
     if (candidate > published * factor) reasons.push(`${label} timing exceeds ${display} gate`);
   }
@@ -11690,16 +11903,34 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     if (!finiteNonnegativeInteger(row.tool_calls_observed) || !finiteNonnegative(row.estimated_cost_usd)) {
       reasons.push(`missing tool call or cost accounting for ${row.task_id}/${row.arm}/${row.repeat}`);
     }
-    for (const field of ["cold_ms", "warm_ms", "incremental_ms", "all_in_ms"]) {
+    for (const field of ["cold_ms", "incremental_ms"]) {
       if (!finiteNonnegative(row.exact_candidate_timing?.[field])) {
         reasons.push(`missing ${field} timing for ${row.task_id}/${row.arm}/${row.repeat}`);
       }
     }
-    if (!finiteNonnegative(row.wall_ms) || row.exact_candidate_timing?.warm_ms !== row.wall_ms) {
-      reasons.push(`whole-task warm timing does not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
+    if (
+      Object.hasOwn(row.exact_candidate_timing ?? {}, "warm_ms")
+      || Object.hasOwn(row.exact_candidate_timing ?? {}, "all_in_ms")
+    ) {
+      reasons.push(`per-row warm_ms/all_in_ms aliases are forbidden for ${row.task_id}/${row.arm}/${row.repeat}`);
     }
-    if (row.exact_candidate_timing?.all_in_ms !== row.exact_candidate_timing?.warm_ms) {
-      reasons.push(`row all-in timing must equal whole-task warm timing for ${row.task_id}/${row.arm}/${row.repeat}`);
+    const installedTiming = row.installed_agent_timing;
+    for (const field of [
+      "agent_runner_ms",
+      "time_to_first_packet_ms",
+      "continuation_ms",
+      "time_to_final_packet_ms",
+      "whole_task_wall_ms",
+    ]) {
+      if (!finiteNonnegative(installedTiming?.[field])) {
+        reasons.push(`missing InstalledAgentTimingV1 ${field} for ${row.task_id}/${row.arm}/${row.repeat}`);
+      }
+    }
+    if (
+      installedTiming?.time_to_final_packet_ms !==
+      installedTiming?.time_to_first_packet_ms + installedTiming?.continuation_ms
+    ) {
+      reasons.push(`InstalledAgentTimingV1 packet phases do not reconcile for ${row.task_id}/${row.arm}/${row.repeat}`);
     }
     if (
       !row.quality?.material_factual_errors ||
@@ -11905,7 +12136,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     }
   }
 
-  for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+  for (const arm of ["published_0_17_5", "candidate_0_18"]) {
     const candidateArm = arm === "candidate_0_18";
     const identityFields = candidateArm
       ? [
@@ -11920,10 +12151,10 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
         ];
     const identities = byArm[arm].map((row) => exactCandidateResultIdentity(row));
     const reference = identities[0];
-    const expectedVersion = arm === "published_0_17_4" ? "0.17.4" : reference?.package_version;
-    const expectedSchema = arm === "published_0_17_4" ? 2 : 3;
-    const expectedProtocol = arm === "published_0_17_4" ? "2024-11-05" : "2025-11-25";
-    const invalidDiscoveryIdentity = arm === "published_0_17_4"
+    const expectedVersion = arm === "published_0_17_5" ? "0.17.5" : reference?.package_version;
+    const expectedSchema = arm === "published_0_17_5" ? 2 : 3;
+    const expectedProtocol = arm === "published_0_17_5" ? "2024-11-05" : "2025-11-25";
+    const invalidDiscoveryIdentity = arm === "published_0_17_5"
       ? reference?.discovery_contract_sha256 !== null
       : !SHA256_PATTERN.test(String(reference?.discovery_contract_sha256 ?? "")) ||
         /^0{64}$/.test(String(reference?.discovery_contract_sha256 ?? ""));
@@ -11977,7 +12208,7 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
   if (
     lifecycle?.contract !== "codestory.agent-benchmark-exact-lifecycle/v1" ||
     !packageAuthentication || !modelInitialization ||
-    !["published_0_17_4", "candidate_0_18"].every((arm) =>
+    !["published_0_17_5", "candidate_0_18"].every((arm) =>
       typeof packageAuthentication[arm] === "number" &&
       Number.isFinite(packageAuthentication[arm]) &&
       packageAuthentication[arm] >= 0 &&
@@ -11988,11 +12219,11 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
     !Array.isArray(packageAuthenticationOrder) ||
     packageAuthenticationOrder.length !== 2 ||
     new Set(packageAuthenticationOrder).size !== 2 ||
-    packageAuthenticationOrder.some((arm) => !["published_0_17_4", "candidate_0_18"].includes(arm)) ||
+    packageAuthenticationOrder.some((arm) => !["published_0_17_5", "candidate_0_18"].includes(arm)) ||
     typeof totalPackageAuthentication !== "number" ||
     !Number.isFinite(totalPackageAuthentication) ||
     totalPackageAuthentication + 0.002 <
-      packageAuthentication.published_0_17_4 + packageAuthentication.candidate_0_18
+      packageAuthentication.published_0_17_5 + packageAuthentication.candidate_0_18
   ) {
     reasons.push("exact per-arm one-time package and model lifecycle is missing or invalid");
   }
@@ -12013,9 +12244,9 @@ function exactCandidateAcceptance(rows, lifecycle = null) {
       !Object.values(EXACT_CANDIDATE_TASK_REPOS).includes(entry.repo) ||
       entry.arms?.length !== 2 ||
       new Set(entry.arms).size !== 2 ||
-      entry.arms.some((arm) => !["published_0_17_4", "candidate_0_18"].includes(arm))
+      entry.arms.some((arm) => !["published_0_17_5", "candidate_0_18"].includes(arm))
     ) ||
-    preparationOrder.filter((entry) => entry.arms[0] === "published_0_17_4").length !== 9 ||
+    preparationOrder.filter((entry) => entry.arms[0] === "published_0_17_5").length !== 9 ||
     preparationOrder.filter((entry) => entry.arms[0] === "candidate_0_18").length !== 9
   ) {
     reasons.push("exact preparation order is not a balanced deterministic 9/9 rotation");
@@ -12349,8 +12580,8 @@ function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
     throw new Error("exact resume prefix must end at a complete task boundary");
   }
   const currentPublished = exactCandidatePackageIdentity(
-    opts.exactCandidatePackageByArm?.get("published_0_17_4"),
-    "published_0_17_4",
+    opts.exactCandidatePackageByArm?.get("published_0_17_5"),
+    "published_0_17_5",
   );
   const currentCandidate = exactCandidateSourceCliIdentity(
     opts.exactCandidatePackageByArm?.get("candidate_0_18"),
@@ -12364,7 +12595,7 @@ function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
     if (row.status !== "pass" || row.reanalysis_error) {
       throw new Error(`exact resume row ${agentRunKey(row)} is not a complete passing row`);
     }
-    if (row.arm === "published_0_17_4") {
+    if (row.arm === "published_0_17_5") {
       if (stableJsonForHash(row.package_identity) !== stableJsonForHash(currentPublished)) {
         throw new Error("exact resume published package identity does not match the authenticated package");
       }
@@ -12384,7 +12615,7 @@ function validateExactCandidateResumePrefixRows(rows, plannedRuns, opts) {
   return rows.length / runsPerTask;
 }
 
-const EXACT_COMPARATOR_ARMS = new Set(["without_codestory", "published_0_17_4"]);
+const EXACT_COMPARATOR_ARMS = new Set(["without_codestory", "published_0_17_5"]);
 const EXACT_COMPARATOR_CONTRACT_KEYS = [
   "contract_version",
   "task_id",
@@ -12418,8 +12649,8 @@ function validateExactCandidateComparatorPrefixRows(rows, plannedRuns, opts) {
     throw new Error("exact comparator source must end at a complete task boundary with comparator triplets");
   }
   const currentPublished = exactCandidatePackageIdentity(
-    opts.exactCandidatePackageByArm?.get("published_0_17_4"),
-    "published_0_17_4",
+    opts.exactCandidatePackageByArm?.get("published_0_17_5"),
+    "published_0_17_5",
   );
   for (const [index, row] of rows.entries()) {
     const planned = plannedRuns[index];
@@ -12434,7 +12665,7 @@ function validateExactCandidateComparatorPrefixRows(rows, plannedRuns, opts) {
       row.benchmark_contract,
     );
     if (contractMismatch) throw new Error(contractMismatch);
-    if (row.arm === "published_0_17_4") {
+    if (row.arm === "published_0_17_5") {
       if (stableJsonForHash(row.package_identity) !== stableJsonForHash(currentPublished)) {
         throw new Error("exact comparator published package identity does not match the authenticated package");
       }
@@ -12665,10 +12896,10 @@ async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
       throw new Error(`comparator row reanalysis failed for ${key}: ${reanalyzed.reanalysis_error}`);
     }
     const currentContract = benchmarkContractForRun(opts, planned);
-    const currentPublished = opts.exactCandidatePackageByArm.get("published_0_17_4");
+    const currentPublished = opts.exactCandidatePackageByArm.get("published_0_17_5");
     const result = {
       ...reanalyzed,
-      ...(planned.arm === "published_0_17_4" ? {
+      ...(planned.arm === "published_0_17_5" ? {
         codestory_prelude_cli: currentPublished.cli_path,
       } : {}),
       benchmark_contract: currentContract,
@@ -12682,16 +12913,16 @@ async function loadExactCandidateComparatorReuse(opts, plannedRuns, outDir) {
         original_benchmark_contract: sourceRow.benchmark_contract,
         current_benchmark_contract: currentContract,
         original_identity: sourceRow.package_identity ?? null,
-        authenticated_current_identity: planned.arm === "published_0_17_4"
-          ? exactCandidatePackageIdentity(currentPublished, "published_0_17_4")
+        authenticated_current_identity: planned.arm === "published_0_17_5"
+          ? exactCandidatePackageIdentity(currentPublished, "published_0_17_5")
           : null,
         reanalyzed_with_current_scorer: true,
       },
     };
-    reusable.set(key, {
+    reusable.set(key, timingIneligibleComparatorRow({
       ...result,
       resource_accounting: resourceAccountingForResult(result),
-    });
+    }));
   }
   if ([...reusable.values()].some((row) => row.arm === "candidate_0_18")) {
     throw new Error("comparator reuse attempted to import a candidate row");
@@ -12808,10 +13039,10 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
         authenticated_current_identity:
           row.arm === "candidate_0_18"
             ? currentCandidate
-            : row.arm === "published_0_17_4"
+            : row.arm === "published_0_17_5"
               ? exactCandidatePackageIdentity(
-                  opts.exactCandidatePackageByArm.get("published_0_17_4"),
-                  "published_0_17_4",
+                  opts.exactCandidatePackageByArm.get("published_0_17_5"),
+                  "published_0_17_5",
                 )
               : null,
         artifact_cli_sha256: row.codestory_prelude_cli_sha256 ?? null,
@@ -12830,12 +13061,12 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
     throw new Error("exact resume preparations do not match the completed task prefix");
   }
   const currentPublished = exactCandidatePackageIdentity(
-    opts.exactCandidatePackageByArm.get("published_0_17_4"),
-    "published_0_17_4",
+    opts.exactCandidatePackageByArm.get("published_0_17_5"),
+    "published_0_17_5",
   );
   const preparations = preparationRows.map((source) => {
     const { kind: _kind, recorded_at: originalRecordedAt, ...row } = source;
-    const published = row.arm_preparations?.published_0_17_4;
+    const published = row.arm_preparations?.published_0_17_5;
     const candidate = row.arm_preparations?.candidate_0_18;
     if (
       stableJsonForHash(published?.package_identity) !== stableJsonForHash(currentPublished) ||
@@ -12849,7 +13080,7 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
       ...row,
       source_cli_identity: currentCandidate,
       arm_preparations: {
-        published_0_17_4: published,
+        published_0_17_5: published,
         candidate_0_18: { ...candidate, source_cli_identity: currentCandidate },
       },
       resume_provenance: {
@@ -12862,7 +13093,7 @@ async function loadExactCandidateResumePrefix(opts, tasks, plannedRuns, outDir) 
     };
   });
   for (const [index, row] of preparations.entries()) {
-    for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+    for (const arm of ["published_0_17_5", "candidate_0_18"]) {
       const blockers = cachePreparationCanaryBlockers(
         row.arm_preparations[arm],
         selectedBenchmarkChildEnv(opts, arm),
@@ -13508,7 +13739,7 @@ async function runExactCandidatePipeline({
         throw new Error(`preparation must return exactly one row for ${group.repo}`);
       }
       const row = rows[0];
-      for (const arm of ["published_0_17_4", "candidate_0_18"]) {
+      for (const arm of ["published_0_17_5", "candidate_0_18"]) {
         const preparation = row.arm_preparations?.[arm];
         const blockers = cachePreparationCanaryBlockers(
           preparation,
@@ -14297,6 +14528,13 @@ export {
   agentPublishableBlockers,
   assertSafeWindowsCmdArgs,
   benchmarkRunId,
+  installedAgentTiming,
+  installedAgentTimingFromMeasuredInteraction,
+  installedAgentTimingCohortId,
+  installedAgentTimingPhaseWarmMs,
+  exactCandidateLifecycleTiming,
+  timingEligibleExactCandidateRow,
+  timingIneligibleComparatorRow,
   benchmarkContractEnvironmentSha256,
   benchmarkContractForRun,
   benchmarkHostClass,

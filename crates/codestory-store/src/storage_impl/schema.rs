@@ -209,6 +209,7 @@ const TABLE_STATEMENTS: &[&str] = &[
         core_run_id TEXT NOT NULL CHECK(length(core_run_id) > 0),
         anchor_count INTEGER NOT NULL CHECK(anchor_count >= 0),
         anchor_digest TEXT NOT NULL CHECK(length(anchor_digest) = 64),
+        anchor_source_identity TEXT NOT NULL CHECK(length(anchor_source_identity) > 0),
         policy_version TEXT NOT NULL CHECK(length(policy_version) > 0),
         migration_state TEXT NOT NULL CHECK(length(migration_state) > 0),
         published_at_epoch_ms INTEGER NOT NULL CHECK(published_at_epoch_ms >= 0)
@@ -511,6 +512,8 @@ const PRE_SUMMARY_SECONDARY_INDEX_STATEMENTS: &[&str] = &[
      ON index_artifact_cache(cache_key)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_proof_resolution_exact_edge
      ON proof_resolution_fact(edge_id) WHERE status = 'exact'",
+    "CREATE INDEX IF NOT EXISTS idx_proof_resolution_file
+     ON proof_resolution_fact(file_id)",
     "CREATE INDEX IF NOT EXISTS idx_proof_resolution_caller_target
      ON proof_resolution_fact(caller_node_id, target_node_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_structural_text_unit_file
@@ -784,6 +787,10 @@ pub(super) fn apply_schema_migrations(storage: &Storage) -> Result<(), StorageEr
     if stored_version < 32 {
         storage.set_schema_version(32)?;
     }
+    // Additive manifest identity. Keep the core schema compatibility number at
+    // v32 so an existing immutable generation can be CoW-cloned and upgraded
+    // by the incremental writer instead of forcing a repository-wide rebuild.
+    migrate_dense_anchor_content_identity(&storage.conn)?;
     create_llm_symbol_doc_reuse_index(&storage.conn)?;
     create_symbol_summary_indexes(&storage.conn)?;
 
@@ -1106,6 +1113,14 @@ pub(super) fn migrate_v24_dense_anchor_publication(conn: &Connection) -> Result<
         [],
     )?;
     Ok(())
+}
+
+pub(super) fn migrate_dense_anchor_content_identity(conn: &Connection) -> Result<(), StorageError> {
+    try_add_column(
+        conn,
+        "dense_anchor_publication",
+        "anchor_source_identity TEXT NOT NULL DEFAULT ''",
+    )
 }
 
 pub(super) fn migrate_v25_retrieval_rollback(conn: &Connection) -> Result<(), StorageError> {
@@ -1432,6 +1447,11 @@ pub(super) fn migrate_v32_proof_resolution_projection(
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_proof_resolution_exact_edge
          ON proof_resolution_fact(edge_id) WHERE status = 'exact'",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_proof_resolution_file
+         ON proof_resolution_fact(file_id)",
         [],
     )?;
     conn.execute(

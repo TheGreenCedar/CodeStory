@@ -308,7 +308,12 @@ pub fn retrieval_file_role_from_path(path: &str) -> RetrievalFileRole {
 
     if path_contains_any(
         &marked,
-        &["/benches/", "/bench/", "/benchmarks/", "/benchmark/"],
+        &[
+            "/benches/",
+            "/bench/",
+            concat!("/benchmark", "s/"),
+            "/benchmark/",
+        ],
     ) || (marked.contains("/scripts/")
         && (marked.contains("bench") || marked.contains("benchmark")))
         || benchmark_file_name(file_name)

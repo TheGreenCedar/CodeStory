@@ -2,7 +2,8 @@
 
 use crate::agent::nucleo_policy::with_sidecar_primary_retrieval;
 use crate::agent::packet_candidate::{
-    PacketCandidateTrailScan, PacketGraphDirection, PacketGraphEdgeProvenance, PacketSearchHit,
+    PacketAdmissionDecision, PacketGraphDirection, PacketGraphEdgeProvenance, PacketSearchHit,
+    active_packet_proof_session,
 };
 use crate::agent::packet_degradation::semantic_stage_degradation;
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
@@ -11,21 +12,16 @@ use crate::{
     node_display_name,
 };
 use anyhow::Error as AnyhowError;
-use codestory_agent::packet_flow_requirements::{
-    FlowRequirement, flow_requirement_call_boundary_is_discoverable,
-    flow_requirement_call_receipt_is_valid,
-};
 use codestory_contracts::api::NodeKind as ApiNodeKind;
 use codestory_contracts::api::{
-    AgentAnswerDto, AgentCitationDto, AgentPacketDto, ApiError,
-    EmbeddingVectorPublicationIdentityDto, GraphArtifactDto, GraphEdgeDto, GraphNodeDto,
+    AgentAnswerDto, AgentPacketDto, ApiError, EmbeddingVectorPublicationIdentityDto, GraphNodeDto,
     GraphResponse, PacketQueryCompletionDto, PacketSidecarQueryDiagnosticDto,
     RetrievalCandidateResolutionCountDto, RetrievalCandidateSummaryDto, RetrievalScoreBreakdownDto,
     RetrievalShadowDto, RetrievalStageTimingDto, SearchHit, SearchHitOrigin, SearchResultsDto,
 };
+use codestory_contracts::compilation::PacketAdmissionGapKindV1;
 use codestory_contracts::graph::{
-    EdgeKind, NodeId as CoreNodeId, NodeKind, ResolutionCertainty, TrailCallerScope, TrailConfig,
-    TrailDirection,
+    EdgeKind, NodeId as CoreNodeId, NodeKind, TrailCallerScope, TrailConfig, TrailDirection,
 };
 #[cfg(test)]
 use codestory_retrieval::SidecarRuntimeConfig;
@@ -34,7 +30,7 @@ use codestory_retrieval::{
     QueryRequest, QueryResult, QueryTrace, SidecarProfile,
     execute_retrieval_query_with_cache_for_runtime, is_phantom_sidecar_hit,
     is_retrieval_publication_changed, sidecar_project_id_for_root,
-    strict_sidecar_status_for_runtime,
+    strict_descriptor_sidecar_status_for_runtime, strict_sidecar_status_for_runtime,
 };
 use codestory_store::Store;
 use std::cell::RefCell;
@@ -61,7 +57,14 @@ const RETRIEVAL_SHADOW_ENV: &str = "CODESTORY_RETRIEVAL_SHADOW";
 struct PinnedRetrievalRead {
     session: PinnedQuerySession,
     project_root: PathBuf,
-    node_names: Arc<HashMap<CoreNodeId, String>>,
+    storage_path: PathBuf,
+    node_names: RefCell<Option<Arc<HashMap<CoreNodeId, String>>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinnedRetrievalScope {
+    Full,
+    PacketDescriptor,
 }
 
 thread_local! {
@@ -266,17 +269,49 @@ fn canonical_symbol_names_for_session(
 
 impl PinnedRetrievalRead {
     fn begin(controller: &AppController) -> Result<Self, ApiError> {
+        Self::begin_with_scope(controller, PinnedRetrievalScope::Full)
+    }
+
+    fn begin_packet_descriptor(controller: &AppController) -> Result<Self, ApiError> {
+        Self::begin_with_scope(controller, PinnedRetrievalScope::PacketDescriptor)
+    }
+
+    fn begin_with_scope(
+        controller: &AppController,
+        scope: PinnedRetrievalScope,
+    ) -> Result<Self, ApiError> {
         let project_root = controller.require_project_root()?;
         let storage_path = controller.require_storage_path()?;
-        let session =
-            PinnedQuerySession::begin(&project_root, &storage_path, &controller.runtime_config)
-                .map_err(map_pinned_query_error)?;
-        let node_names = canonical_symbol_names_for_session(controller, &storage_path, &session)?;
+        let session = match scope {
+            PinnedRetrievalScope::Full => {
+                PinnedQuerySession::begin(&project_root, &storage_path, &controller.runtime_config)
+            }
+            PinnedRetrievalScope::PacketDescriptor => PinnedQuerySession::begin_packet_descriptor(
+                &project_root,
+                &storage_path,
+                &controller.runtime_config,
+            ),
+        }
+        .map_err(map_pinned_query_error)?;
         Ok(Self {
             session,
             project_root,
-            node_names,
+            storage_path,
+            node_names: RefCell::new(None),
         })
+    }
+
+    fn canonical_node_names(
+        &self,
+        controller: &AppController,
+    ) -> Result<Arc<HashMap<CoreNodeId, String>>, ApiError> {
+        if let Some(node_names) = self.node_names.borrow().as_ref() {
+            return Ok(Arc::clone(node_names));
+        }
+        let node_names =
+            canonical_symbol_names_for_session(controller, &self.storage_path, &self.session)?;
+        self.node_names.replace(Some(Arc::clone(&node_names)));
+        Ok(node_names)
     }
 
     fn ensure_query_identity(&self, query: &QueryResult, operation: &str) -> Result<(), ApiError> {
@@ -326,7 +361,38 @@ pub(crate) fn with_stable_retrieval_publication<T: RetrievalPublicationResponse>
     if !sidecar_retrieval_primary_enabled(controller) {
         return build();
     }
-    with_stable_retrieval_publication_inner(controller, operation, build, |_| Ok(()))
+    with_stable_retrieval_publication_inner(
+        controller,
+        operation,
+        PinnedRetrievalScope::Full,
+        build,
+        |_| Ok(()),
+    )
+}
+
+/// Pin the retrieval publication for a packet without opening the graph lane
+/// before descriptor admission. Packet compilation performs the ordinary full
+/// readiness check later, after the packet-wide admission session is sealed.
+pub(crate) fn with_stable_packet_retrieval_publication<T: RetrievalPublicationResponse>(
+    controller: &AppController,
+    operation: &str,
+    mut build: impl FnMut() -> Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    if let Some(pinned) = active_pinned_retrieval_read(controller) {
+        let mut response = build()?;
+        response.attach_retrieval_publication(publication_dto(&pinned));
+        return Ok(response);
+    }
+    if !sidecar_descriptor_retrieval_enabled(controller) {
+        return build();
+    }
+    with_stable_retrieval_publication_inner(
+        controller,
+        operation,
+        PinnedRetrievalScope::PacketDescriptor,
+        build,
+        |_| Ok(()),
+    )
 }
 
 pub(crate) fn with_pinned_retrieval_publication_value<T>(
@@ -364,11 +430,17 @@ pub(crate) fn with_pinned_retrieval_publication_value<T>(
 fn with_stable_retrieval_publication_inner<T: RetrievalPublicationResponse>(
     controller: &AppController,
     operation: &str,
+    scope: PinnedRetrievalScope,
     mut build: impl FnMut() -> Result<T, ApiError>,
     mut after_retry: impl FnMut(usize) -> Result<(), ApiError>,
 ) -> Result<T, ApiError> {
     for attempt in 0..RETRIEVAL_PUBLICATION_ATTEMPTS {
-        let pinned = Rc::new(PinnedRetrievalRead::begin(controller)?);
+        let pinned = Rc::new(match scope {
+            PinnedRetrievalScope::Full => PinnedRetrievalRead::begin(controller)?,
+            PinnedRetrievalScope::PacketDescriptor => {
+                PinnedRetrievalRead::begin_packet_descriptor(controller)?
+            }
+        });
         let publication = publication_dto(&pinned);
         let result = with_active_pinned_retrieval_read(controller, Rc::clone(&pinned), || {
             build().and_then(|mut response| {
@@ -454,6 +526,33 @@ pub(crate) fn sidecar_retrieval_primary_enabled(controller: &AppController) -> b
             auto_on
         }
     }
+}
+
+fn sidecar_descriptor_retrieval_enabled(controller: &AppController) -> bool {
+    if retrieval_env_override() == Some(false) {
+        return false;
+    }
+    // The outer packet boundary admitted and pinned this exact publication
+    // using descriptor-scoped readiness. Re-running project-wide status while
+    // the pin is active cannot strengthen that identity; the descriptor batch
+    // performs its own component health check against the pinned manifest.
+    if active_pinned_retrieval_read(controller).is_some() {
+        return true;
+    }
+    if !sidecar_retrieval_eligible(controller) {
+        return false;
+    }
+    let Ok(project_root) = controller.require_project_root() else {
+        return false;
+    };
+    let Ok(storage_path) = controller.require_storage_path() else {
+        return false;
+    };
+    sidecar_status_can_serve_primary(&sidecar_descriptor_mode_status_for_runtime(
+        &project_root,
+        &storage_path,
+        &controller.runtime_config,
+    ))
 }
 
 pub(crate) fn sidecar_retrieval_unavailable_reason(controller: &AppController) -> Option<String> {
@@ -606,7 +705,7 @@ pub(crate) fn sidecar_primary_blocks_nucleo_supplement(
 }
 
 fn retrieval_manifest_exists(storage_path: &Path, project_root: &Path) -> bool {
-    if !storage_path.exists() {
+    if !codestory_store::core_database_exists(storage_path).unwrap_or(false) {
         return false;
     }
     let Ok(storage) = Store::open(storage_path) else {
@@ -657,6 +756,29 @@ fn sidecar_mode_status_for_runtime(
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
 ) -> SidecarModeStatus {
     match strict_sidecar_status_for_runtime(project_root, Some(storage_path), runtime.clone()) {
+        Ok(report) => SidecarModeStatus {
+            profile: Some(runtime.profile.as_str().to_string()),
+            mode: report.retrieval_mode,
+            degraded_reason: report.degraded_reason,
+        },
+        Err(error) => SidecarModeStatus {
+            profile: None,
+            mode: "unavailable".into(),
+            degraded_reason: Some(format!("retrieval_status_error: {error}")),
+        },
+    }
+}
+
+fn sidecar_descriptor_mode_status_for_runtime(
+    project_root: &Path,
+    storage_path: &Path,
+    runtime: &codestory_retrieval::SidecarRuntimeConfig,
+) -> SidecarModeStatus {
+    match strict_descriptor_sidecar_status_for_runtime(
+        project_root,
+        Some(storage_path),
+        runtime.clone(),
+    ) {
         Ok(report) => SidecarModeStatus {
             profile: Some(runtime.profile.as_str().to_string()),
             mode: report.retrieval_mode,
@@ -757,6 +879,161 @@ pub(crate) fn run_sidecar_query(
     })
 }
 
+/// Run every generic packet query through the descriptor-only sidecar path,
+/// rank the combined identities once, and seal packet admission before any
+/// candidate source or graph hydration begins. The later query calls reuse the
+/// sidecar cache and may hydrate only identities admitted here.
+pub(crate) fn preadmit_packet_descriptor_queries(
+    controller: &AppController,
+    queries: &[String],
+    latency_budget_ms: Option<u32>,
+) -> Result<(), ApiError> {
+    let session = active_packet_proof_session().ok_or_else(|| {
+        ApiError::internal("packet descriptor admission requires an active packet session")
+    })?;
+    if queries.is_empty() || session.remaining_hydration_slots() == 0 {
+        session.seal_retrieval_admission();
+        if let Some(pinned) = active_pinned_retrieval_read(controller) {
+            pinned
+                .session
+                .validate_full_readiness()
+                .map_err(map_pinned_query_error)?;
+        }
+        return Ok(());
+    }
+    if !sidecar_descriptor_retrieval_enabled(controller) {
+        let reason = if retrieval_env_override() == Some(false) {
+            "CODESTORY_RETRIEVAL=0 is unsupported; packet descriptor retrieval is mandatory"
+                .to_string()
+        } else if let (Ok(project_root), Ok(storage_path)) = (
+            controller.require_project_root(),
+            controller.require_storage_path(),
+        ) {
+            let status = sidecar_descriptor_mode_status_for_runtime(
+                &project_root,
+                &storage_path,
+                &controller.runtime_config,
+            );
+            format!(
+                "packet descriptor retrieval is unavailable (profile={} mode={} reason={})",
+                status.profile.as_deref().unwrap_or("unknown"),
+                status.mode,
+                status.degraded_reason.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            "packet descriptor retrieval requires an open indexed project".to_string()
+        };
+        return Err(sidecar_retrieval_unavailable_error(controller, reason));
+    }
+
+    with_pinned_retrieval_read(controller, |pinned| {
+        let per_query_budget = sidecar_packet_batch_budget_ms(latency_budget_ms)
+            .checked_div(queries.len().max(1) as u64)
+            .unwrap_or(100)
+            .max(100);
+        let batch_items = queries
+            .iter()
+            .map(|query| QueryBatchItem {
+                query,
+                budget_ms: Some(per_query_budget),
+            })
+            .collect::<Vec<_>>();
+        let query_results = with_detached_sidecar_query_cache(controller, |cache| {
+            pinned.session.execute_packet_descriptor_batch_with_cache(
+                &batch_items,
+                crate::services::active_public_operation_cancellation(),
+                cache,
+            )
+        })
+        .map_err(map_pinned_query_error)?;
+        if query_results.len() != queries.len() {
+            return Err(sidecar_retrieval_unavailable_error(
+                controller,
+                format!(
+                    "packet descriptor batch returned {} results for {} queries",
+                    query_results.len(),
+                    queries.len()
+                ),
+            ));
+        }
+
+        for (expected_query, result) in queries.iter().zip(&query_results) {
+            if result.query != *expected_query {
+                return Err(sidecar_retrieval_unavailable_error(
+                    controller,
+                    format!(
+                        "packet descriptor batch query mismatch expected `{expected_query}` got `{}`",
+                        result.query
+                    ),
+                ));
+            }
+            pinned.ensure_query_identity(result, "admitting packet descriptors")?;
+        }
+        admit_packet_candidate_descriptors(
+            &session,
+            query_results.iter().flat_map(|result| result.hits.iter()),
+        );
+        // The repository-wide freshness and core/vector attestation checks are
+        // intentionally deferred until the one packet admission session is
+        // sealed. They may inspect repository records, so running them before
+        // this point would violate the descriptor-first boundary.
+        pinned
+            .session
+            .validate_full_readiness()
+            .map_err(map_pinned_query_error)?;
+        Ok(())
+    })
+}
+
+fn admit_packet_candidate_descriptors<'a>(
+    session: &crate::agent::packet_candidate::PacketProofSession,
+    candidates: impl IntoIterator<Item = &'a CandidateHit>,
+) {
+    let mut descriptors = Vec::new();
+    for candidate in candidates
+        .into_iter()
+        .filter(|candidate| !is_phantom_sidecar_hit(candidate))
+    {
+        if let Some(descriptor) = candidate.packet_descriptor() {
+            descriptors.push(descriptor);
+        } else {
+            let kind = if candidate.node_id.as_deref().is_none_or(str::is_empty) {
+                PacketAdmissionGapKindV1::StableIdentityMissing
+            } else {
+                PacketAdmissionGapKindV1::SourceBoundMissing
+            };
+            session.record_ineligible_candidate(
+                kind,
+                candidate.node_id.as_deref().map(|id| format!("node:{id}")),
+            );
+        }
+    }
+    descriptors.sort_by(|left, right| {
+        right
+            .retrieval_score
+            .value
+            .total_cmp(&left.retrieval_score.value)
+            .then_with(|| left.stable_identity.cmp(&right.stable_identity))
+    });
+    let mut seen = HashSet::new();
+    for descriptor in descriptors {
+        if !seen.insert(descriptor.stable_identity.clone()) {
+            continue;
+        }
+        match session.admit_descriptor(&descriptor) {
+            PacketAdmissionDecision::Admitted | PacketAdmissionDecision::AlreadyAdmitted => {}
+            PacketAdmissionDecision::CountBudgetExceeded
+                if session.remaining_hydration_slots() == 0 =>
+            {
+                break;
+            }
+            PacketAdmissionDecision::CountBudgetExceeded
+            | PacketAdmissionDecision::SourceBudgetExceeded => {}
+        }
+    }
+    session.seal_retrieval_admission();
+}
+
 pub(crate) fn run_and_resolve_sidecar_query(
     controller: &AppController,
     query: &str,
@@ -765,17 +1042,30 @@ pub(crate) fn run_and_resolve_sidecar_query(
 ) -> Result<(QueryResult, SidecarCandidateResolutionOutcome), ApiError> {
     with_pinned_retrieval_read(controller, |pinned| {
         let query_result = with_detached_sidecar_query_cache(controller, |cache| {
-            pinned.session.execute_with_cache(
-                query,
-                Some(sidecar_budget_ms(latency_budget_ms)),
-                crate::services::active_public_operation_cancellation(),
-                cache,
-            )
+            if crate::agent::packet_candidate::active_packet_proof_session().is_some() {
+                pinned.session.execute_packet_descriptors_with_cache(
+                    query,
+                    Some(sidecar_budget_ms(latency_budget_ms)),
+                    crate::services::active_public_operation_cancellation(),
+                    cache,
+                )
+            } else {
+                pinned.session.execute_with_cache(
+                    query,
+                    Some(sidecar_budget_ms(latency_budget_ms)),
+                    crate::services::active_public_operation_cancellation(),
+                    cache,
+                )
+            }
         })
         .map_err(map_pinned_query_error)?;
         pinned.ensure_query_identity(&query_result, "resolving sidecar candidates")?;
-        let resolution =
-            resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)?;
+        let resolution = resolve_sidecar_candidates_in_read(
+            controller,
+            pinned,
+            &query_result.hits,
+            max_results,
+        )?;
         Ok((query_result, resolution))
     })
 }
@@ -977,8 +1267,7 @@ fn packet_sidecar_query_diagnostic(
     let semantic = semantic_stage_degradation(&stage_timings);
     // EV-8: a required query whose dense lane went dark and then resolved nothing produced no
     // evidence, but the sidecar itself reports no blocking cancel — the stage budget, not the
-    // query, ran out. Left as `Completed` it would satisfy its query obligation on an empty
-    // result. Naming the cancel here is what lets the obligation ledger demote it.
+    // query, ran out. Left as `Completed` it would misreport an empty result as complete.
     let semantic_timeout_without_hits =
         semantic.timed_out_zero_hits && resolution.resolved_hits.is_empty();
     let cancel_reason = sidecar_blocking_cancel_reason(query_result)
@@ -1044,7 +1333,7 @@ fn search_sidecar_packet_batch_inner(
             })
             .collect::<Vec<_>>();
         let query_results = with_detached_sidecar_query_cache(controller, |cache| {
-            pinned.session.execute_batch_with_cache(
+            pinned.session.execute_packet_descriptor_batch_with_cache(
                 &batch_items,
                 crate::services::active_public_operation_cancellation(),
                 cache,
@@ -1060,7 +1349,12 @@ fn search_sidecar_packet_batch_inner(
             query_results,
             clamp_elapsed_ms(batch_started_at),
             |query_result, max_results| {
-                resolve_sidecar_candidates_in_read(pinned, &query_result.hits, max_results)
+                resolve_sidecar_candidates_in_read(
+                    controller,
+                    pinned,
+                    &query_result.hits,
+                    max_results,
+                )
             },
         )
     })
@@ -1140,7 +1434,10 @@ fn build_sidecar_packet_batch_outcome(
             ));
         }
         let sidecar_query_ms = u32::try_from(query_result.trace.elapsed_ms).unwrap_or(u32::MAX);
-        let max_results = (*max_results).clamp(1, 50);
+        let max_results = (*max_results).clamp(
+            1,
+            codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES,
+        );
         let resolution_started_at = Instant::now();
         let resolution = resolve(&query_result, max_results).map_err(|error| {
             sidecar_retrieval_unavailable_error(
@@ -1223,14 +1520,6 @@ fn build_sidecar_packet_batch_outcome(
 /// added anywhere, and nothing here marks a hit as proven (contract rule 4:
 /// atom need is a selection input, never a proof input).
 fn retained_cancelled_packet_hits(hits: Vec<PacketSearchHit>) -> Vec<PacketSearchHit> {
-    let session = crate::agent::packet_candidate::active_packet_proof_session()
-        .filter(|session| session.has_atom_needed_identities());
-    let need_rank = |hit: &PacketSearchHit| {
-        session
-            .as_ref()
-            .and_then(|session| session.citation_atom_priority(&hit.hit.node_id))
-            .map_or(0, |priority| priority + 1)
-    };
     let mut retained = hits.into_iter().enumerate().collect::<Vec<_>>();
     retained.sort_by(|(left_rank, left), (right_rank, right)| {
         right
@@ -1238,7 +1527,6 @@ fn retained_cancelled_packet_hits(hits: Vec<PacketSearchHit>) -> Vec<PacketSearc
             .score
             .partial_cmp(&left.hit.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| need_rank(right).cmp(&need_rank(left)))
             .then(left_rank.cmp(right_rank))
     });
     retained.into_iter().map(|(_, hit)| hit).collect()
@@ -2043,87 +2331,39 @@ fn resolve_candidate_node_id(
 }
 
 fn resolve_sidecar_candidates_in_read(
+    controller: &AppController,
     pinned: &PinnedRetrievalRead,
     candidates: &[CandidateHit],
     max_results: usize,
 ) -> Result<SidecarCandidateResolutionOutcome, ApiError> {
+    if active_packet_proof_session().is_some() {
+        // Packet descriptors carry stable node identities. Canonical-name
+        // streaming is repository-wide core hydration and therefore cannot
+        // happen before or on behalf of a rejected packet candidate.
+        return resolve_sidecar_candidates_in_storage(
+            pinned.session.storage(),
+            &HashMap::new(),
+            &pinned.project_root,
+            candidates,
+            max_results,
+        );
+    }
+    let node_names = pinned.canonical_node_names(controller)?;
     resolve_sidecar_candidates_in_storage(
         pinned.session.storage(),
-        &pinned.node_names,
+        &node_names,
         &pinned.project_root,
         candidates,
         max_results,
     )
 }
 
-/// One resolved candidate's hydrated graph: edge provenance, the bounded
-/// candidate graph, and the per-trail coverage records (R2).
-type PacketCandidateGraphHydration = (
-    Vec<PacketGraphEdgeProvenance>,
-    Option<GraphResponse>,
-    Vec<PacketCandidateTrailScan>,
-);
+/// One resolved candidate's hydrated CALL graph: edge provenance and the
+/// bounded candidate graph.
+type PacketCandidateGraphHydration = (Vec<PacketGraphEdgeProvenance>, Option<GraphResponse>);
 
 const PACKET_CANDIDATE_DIRECTION_NODE_LIMIT: usize = 65;
-const PACKET_FILE_STRUCTURAL_TRAIL_DEPTH: u32 = 2;
-const PACKET_EXACT_CALL_BOUNDARY_EDGE_LIMIT: u32 = 128;
-const PACKET_EXACT_CALL_BOUNDARY_ARTIFACT_PREFIX: &str = "packet-exact-call-boundary-";
-
-/// Node cap of the POST-PASS depth-2 FILE structural trail (round 5.5 item 1
-/// residual, option (ii)).
-///
-/// The store's BFS accessor derives its edge budget from the node cap
-/// (`max_nodes × 3`, storage_impl/trail.rs) and breaks out of the traversal
-/// the moment that budget is exhausted — at the ROOT that break leaves only
-/// the root in the node set, and the accessor's closing endpoint filter then
-/// drops every fetched edge, so the artifact comes back EMPTY and is skipped.
-/// A real CSS entrypoint has 198+ outgoing structural edges under the uniform
-/// `[MEMBER, USAGE, IMPORT]` filter, which crosses the 65-node cap's 195-edge
-/// budget and silences the whole trail — taking C1's MODULE-member receipts
-/// with it. 130 nodes lifts the edge budget to 390, above entrypoint-scale
-/// fanout, so the root's own edges are enumerated and the depth-2 frontier is
-/// reached.
-///
-/// The trail is deliberately NOT split per kind: rule 7's deeper-rooted arm
-/// requires the absent kind AND its MEMBER witness in the SAME coverage
-/// record, so C3's covering scan must stay one traversal set. The
-/// store-accessor pathology itself is a recorded post-acceptance follow-up —
-/// it touches every trail consumer.
-const PACKET_POST_PASS_STRUCTURAL_NODE_LIMIT: usize = 130;
-
-/// Builds one narrowed scan record (F3 finding 3): the recorded coverage set
-/// keeps only the enumerated edges of absence-subject kinds plus — for
-/// depth-2 scans — the enumerated MEMBER witness edges. See
-/// [`PacketCandidateTrailScan`].
-fn packet_trail_scan_record(
-    root: &str,
-    direction: PacketGraphDirection,
-    depth: u32,
-    filter: &[EdgeKind],
-    trail: &codestory_contracts::graph::TrailResult,
-    absence_kinds: &[codestory_contracts::api::EdgeKind],
-) -> PacketCandidateTrailScan {
-    PacketCandidateTrailScan {
-        root: root.to_string(),
-        direction,
-        depth,
-        edge_kinds: filter
-            .iter()
-            .map(|kind| codestory_contracts::api::EdgeKind::from(*kind))
-            .collect(),
-        truncated: trail.truncated,
-        coverage_edge_ids: trail
-            .edges
-            .iter()
-            .filter(|edge| {
-                let kind = codestory_contracts::api::EdgeKind::from(edge.kind);
-                absence_kinds.contains(&kind)
-                    || (depth >= 2 && kind == codestory_contracts::api::EdgeKind::MEMBER)
-            })
-            .map(|edge| codestory_contracts::api::EdgeId::from(edge.id))
-            .collect(),
-    }
-}
+const PACKET_CANDIDATE_RAW_EDGE_LIMIT: usize = PACKET_CANDIDATE_DIRECTION_NODE_LIMIT * 6;
 
 fn packet_graph_for_resolved_candidate(
     storage: &Store,
@@ -2155,217 +2395,108 @@ fn packet_graph_for_resolved_candidate(
         }
     });
 
-    // R2: one SEPARATE bounded trail per atom-required edge kind for roots the
-    // packet's task-class formulas name, under the same per-trail node cap —
-    // so a widened kind can never evict the CALL edges other atoms need. FILE
-    // roots run the depth-2 uniform [MEMBER, USAGE, IMPORT] structural trail,
-    // whose single coverage record carries both the absent kind and the
-    // MEMBER witness rule 7's deeper-rooted arm reads. Outside an active
-    // packet proof session the plan list stays empty and hydration behaves
-    // exactly as before.
-    let proof_session = crate::agent::packet_candidate::active_packet_proof_session();
-    // F3 REVISE + gate round 2: in-loop widened hydration is restricted to
-    // the depth-1 IDENTITY trails R6's promotion actually consumes mid-pass —
-    // the kinds whose edges establish the role identities the active spec's
-    // formulas join on. FILE roots (C family) run one combined
-    // [MEMBER, IMPORT] trail per direction; other rooted kinds run one
-    // single-kind trail per identity kind per direction (A family: CLASS
-    // roots get [TYPE_USAGE, MEMBER] — the Builder→ConfigType edge is what
-    // establishes the beyond-window config type's identity). Every other
-    // atom-kind trail and the depth-2 FILE structural trails run in the
-    // retained-set POST-PASS (`hydrate_packet_atom_trails_post_pass`), off
-    // the sidecar stage clock.
-    let mut atom_trail_plans: Vec<(Vec<EdgeKind>, u32, TrailDirection, PacketGraphDirection)> =
-        Vec::new();
-    let mut absence_kinds: Vec<codestory_contracts::api::EdgeKind> = Vec::new();
-    if let Some(spec) = proof_session
-        .as_ref()
-        .map(|session| &session.hydration)
-        .filter(|spec| !spec.is_empty())
-    {
-        absence_kinds = spec.absence_kinds.clone();
-        let identity_filters: Vec<Vec<EdgeKind>> = if candidate_kind == Some(NodeKind::FILE) {
-            if spec.file_structural {
-                vec![
-                    crate::agent::packet_candidate::PACKET_FILE_IDENTITY_TRAIL_KINDS
-                        .iter()
-                        .map(|kind| EdgeKind::from(*kind))
-                        .collect(),
-                ]
-            } else {
-                Vec::new()
-            }
-        } else if let Some(kind) = candidate_kind {
-            spec.identity_trail_kinds_for_root(kind.into())
-                .into_iter()
-                .map(|kind| vec![EdgeKind::from(kind)])
-                .collect()
-        } else {
-            Vec::new()
-        };
-        for filter in identity_filters {
-            for (direction, packet_direction) in [
-                (TrailDirection::Outgoing, PacketGraphDirection::Outgoing),
-                (TrailDirection::Incoming, PacketGraphDirection::Incoming),
-            ] {
-                atom_trail_plans.push((filter.clone(), 1, direction, packet_direction));
-            }
-        }
-    }
-
     let run_call_trails = specific_evidence.is_some() || hydrate_outgoing_calls;
-    if !run_call_trails && atom_trail_plans.is_empty() {
-        return Ok((Vec::new(), None, Vec::new()));
+    if !run_call_trails {
+        return Ok((Vec::new(), None));
     }
 
-    let record_scans = proof_session.is_some();
-    let mut scan_records: Vec<PacketCandidateTrailScan> = Vec::new();
-    let mut scan_truncated = false;
-    let mut scan_omitted_edge_count: u32 = 0;
-    let mut seen_incident_edge_ids = HashSet::new();
-    // Edge plus its selection origin: `None` = from the CALL trails (legacy
-    // selection rules apply), `Some(direction)` = enumerated by an atom trail.
-    let mut collected: Vec<(
-        codestory_contracts::graph::Edge,
-        Option<PacketGraphDirection>,
-    )> = Vec::new();
-    let record_scan = |scan_records: &mut Vec<PacketCandidateTrailScan>,
-                       filter: &[EdgeKind],
-                       depth: u32,
-                       packet_direction: PacketGraphDirection,
-                       trail: &codestory_contracts::graph::TrailResult| {
-        scan_records.push(packet_trail_scan_record(
-            &node_id.0.to_string(),
-            packet_direction,
-            depth,
-            filter,
-            trail,
-            &absence_kinds,
-        ));
-    };
-
-    if run_call_trails {
-        let mut edge_filter = vec![EdgeKind::CALL];
-        if let Some((_, edge_kind, _)) = specific_evidence
-            && !edge_filter.contains(&edge_kind)
-        {
-            edge_filter.push(edge_kind);
-        }
-        let bounded_trail = |direction| {
-            storage.get_trail(&TrailConfig {
-                root_id: node_id,
-                depth: 1,
-                direction,
-                caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                edge_filter: edge_filter.clone(),
-                show_utility_calls: true,
-                max_nodes: PACKET_CANDIDATE_DIRECTION_NODE_LIMIT,
-                ..TrailConfig::default()
-            })
-        };
-        // Scan the two directions independently. The trail accessor bounds materialization before
-        // it returns, so high incoming fanout cannot consume the outgoing scan that may carry a
-        // packet boundary. A proof outside either scan remains absent and therefore fails closed;
-        // the trail's truncation metadata is carried into the candidate graph below.
-        let incoming = bounded_trail(TrailDirection::Incoming).map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to resolve bounded incoming packet candidate graph provenance: {error}"
-            ))
-        })?;
-        let outgoing = bounded_trail(TrailDirection::Outgoing).map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to resolve bounded outgoing packet candidate graph provenance: {error}"
-            ))
-        })?;
-        scan_truncated = incoming.truncated || outgoing.truncated;
-        scan_omitted_edge_count = incoming
-            .omitted_edge_count
-            .saturating_add(outgoing.omitted_edge_count);
-        if record_scans {
-            record_scan(
-                &mut scan_records,
-                &edge_filter,
-                1,
-                PacketGraphDirection::Incoming,
-                &incoming,
-            );
-            record_scan(
-                &mut scan_records,
-                &edge_filter,
-                1,
-                PacketGraphDirection::Outgoing,
-                &outgoing,
-            );
-        }
-        for edge in incoming.edges.into_iter().chain(outgoing.edges) {
-            if seen_incident_edge_ids.insert(edge.id) {
-                collected.push((edge, None));
+    let mut edge_filter = vec![EdgeKind::CALL];
+    if let Some((_, edge_kind, _)) = specific_evidence
+        && !edge_filter.contains(&edge_kind)
+    {
+        edge_filter.push(edge_kind);
+    }
+    let identity_scope = active_packet_proof_session();
+    let (collected, scan_truncated, scan_omitted_edge_count) =
+        if let Some(identity_scope) = identity_scope.as_ref() {
+            // Trail traversal materializes every endpoint node before it returns
+            // the incident edges. A packet may inspect only identities admitted
+            // by the packet-wide descriptor gate, so use the edge-only view and
+            // discard unadmitted endpoints before any node or file hydration.
+            let incident = storage
+                .get_bounded_raw_incident_edges(node_id, PACKET_CANDIDATE_RAW_EDGE_LIMIT)
+                .map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to resolve bounded packet candidate edge provenance: {error}"
+                    ))
+                })?;
+            let mut omitted = u32::from(incident.truncated);
+            let mut collected = Vec::new();
+            for edge in incident.edges {
+                let (source, target) = edge.effective_endpoints();
+                if !edge_filter.contains(&edge.kind)
+                    || (source != node_id && target != node_id)
+                    || !identity_scope.is_admitted_node(source)
+                    || !identity_scope.is_admitted_node(target)
+                {
+                    omitted = omitted.saturating_add(1);
+                    continue;
+                }
+                collected.push(edge);
             }
-        }
-    }
-    for (filter, depth, direction, packet_direction) in &atom_trail_plans {
-        let trail = storage
-            .get_trail(&TrailConfig {
-                root_id: node_id,
-                depth: *depth,
-                direction: *direction,
-                caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                edge_filter: filter.clone(),
-                show_utility_calls: true,
-                max_nodes: PACKET_CANDIDATE_DIRECTION_NODE_LIMIT,
-                ..TrailConfig::default()
-            })
-            .map_err(|error| {
+            (collected, incident.truncated, omitted)
+        } else {
+            let bounded_trail = |direction| {
+                storage.get_trail(&TrailConfig {
+                    root_id: node_id,
+                    depth: 1,
+                    direction,
+                    caller_scope: TrailCallerScope::IncludeTestsAndBenches,
+                    edge_filter: edge_filter.clone(),
+                    show_utility_calls: true,
+                    max_nodes: PACKET_CANDIDATE_DIRECTION_NODE_LIMIT,
+                    ..TrailConfig::default()
+                })
+            };
+            let incoming = bounded_trail(TrailDirection::Incoming).map_err(|error| {
                 ApiError::internal(format!(
-                    "Failed to resolve bounded atom-trail packet candidate hydration: {error}"
+                    "Failed to resolve bounded incoming packet candidate graph provenance: {error}"
                 ))
             })?;
-        scan_truncated = scan_truncated || trail.truncated;
-        scan_omitted_edge_count = scan_omitted_edge_count.saturating_add(trail.omitted_edge_count);
-        if record_scans {
-            record_scan(&mut scan_records, filter, *depth, *packet_direction, &trail);
-        }
-        for edge in trail.edges {
-            if seen_incident_edge_ids.insert(edge.id) {
-                collected.push((edge, Some(*packet_direction)));
+            let outgoing = bounded_trail(TrailDirection::Outgoing).map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to resolve bounded outgoing packet candidate graph provenance: {error}"
+                ))
+            })?;
+            let scan_truncated = incoming.truncated || outgoing.truncated;
+            let scan_omitted_edge_count = incoming
+                .omitted_edge_count
+                .saturating_add(outgoing.omitted_edge_count);
+            let mut seen_incident_edge_ids = HashSet::new();
+            let mut collected = Vec::new();
+            for edge in incoming.edges.into_iter().chain(outgoing.edges) {
+                if seen_incident_edge_ids.insert(edge.id) {
+                    collected.push(edge);
+                }
             }
-        }
-    }
+            (collected, scan_truncated, scan_omitted_edge_count)
+        };
 
     let mut edges = Vec::new();
-    for (edge, atom_direction) in collected {
+    for edge in collected {
         let mut selected_direction = None;
         if let Some((direction, edge_kind, hop)) = specific_evidence
             && edge.kind == edge_kind
         {
             let (source, target) = edge.effective_endpoints();
             let matches_specific = match direction {
-                // The sidecar direction is anchor-relative: an outgoing expansion lands on the
-                // target candidate, while an incoming expansion lands on the source candidate.
                 PacketGraphDirection::Outgoing => target == node_id,
                 PacketGraphDirection::Incoming => source == node_id,
             };
             if matches_specific {
-                selected_direction = Some((direction, hop, false, false));
+                selected_direction = Some((direction, hop, false));
             }
         }
         let (source, _) = edge.effective_endpoints();
         if hydrate_outgoing_calls && edge.kind == EdgeKind::CALL && source == node_id {
-            selected_direction.get_or_insert((PacketGraphDirection::Outgoing, 1, true, false));
+            selected_direction.get_or_insert((PacketGraphDirection::Outgoing, 1, true));
         }
-        if let Some(direction) = atom_direction {
-            // Every edge an atom trail enumerated is kept: the trail's scan
-            // record claims completeness over exactly this enumeration, and
-            // the extras builder refuses the coverage if any of them is
-            // missing from the live evidence.
-            selected_direction.get_or_insert((direction, 1, true, true));
-        }
-        if let Some((direction, hop, hydrated, atom_trail)) = selected_direction {
-            edges.push((edge, direction, hop, hydrated, atom_trail));
+        if let Some((direction, hop, hydrated)) = selected_direction {
+            edges.push((edge, direction, hop, hydrated));
         }
     }
     edges.sort_by(
-        |(left, _, _, left_hydrated, _), (right, _, _, right_hydrated, _)| {
+        |(left, _, _, left_hydrated), (right, _, _, right_hydrated)| {
             left_hydrated
                 .cmp(right_hydrated)
                 .then_with(|| {
@@ -2376,15 +2507,13 @@ fn packet_graph_for_resolved_candidate(
         },
     );
     if edges.is_empty() {
-        return Ok((Vec::new(), None, scan_records));
+        return Ok((Vec::new(), None));
     }
 
     let graph_flags = app_graph_flags();
     let edge_dtos = edges
         .iter()
-        .map(|(edge, _, _, _, _)| {
-            graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags)
-        })
+        .map(|(edge, _, _, _)| graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags))
         .collect::<Vec<_>>();
     let nodes = packet_graph_endpoint_nodes(storage, node_names, node_id, &edge_dtos)?;
 
@@ -2397,13 +2526,9 @@ fn packet_graph_for_resolved_candidate(
     let provenance = edges
         .iter()
         .zip(edge_dtos.iter())
-        .map(|((_, direction, hop, hydrated, atom_trail), edge)| {
+        .map(|((_, direction, hop, hydrated), edge)| {
             let mut producers = specific_producers.clone();
-            if *atom_trail {
-                producers.push("atom_trail_hydration".to_string());
-                producers.sort();
-                producers.dedup();
-            } else if *hydrated {
+            if *hydrated {
                 producers.push("core_incident_call".to_string());
                 producers.sort();
                 producers.dedup();
@@ -2427,7 +2552,6 @@ fn packet_graph_for_resolved_candidate(
             omitted_edge_count: scan_omitted_edge_count,
             canonical_layout: None,
         }),
-        scan_records,
     ))
 }
 
@@ -2492,518 +2616,6 @@ fn packet_graph_certainty_priority(
     }
 }
 
-/// Artifact id prefix of the post-pass atom-trail hydration graphs.
-const PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX: &str = "packet-atom-hydration-";
-
-/// Post-pass trail budget (F3 REVISE), COST-dimensioned rather than
-/// trail-counted: one trail costs `edge_filter.len() × depth` units — a proxy
-/// for frontier-expansion work, since every depth level re-applies each
-/// filter kind to the frontier — so a depth-2 three-kind structural trail
-/// costs 6 units while a depth-1 single-kind trail costs 1. Every trail is
-/// additionally hard-capped at `PACKET_CANDIDATE_DIRECTION_NODE_LIMIT` (65)
-/// nodes, so worst-case materialization is bounded by BUDGET × node-cap
-/// regardless of trail shape. 192 units covers 16 FILE roots (12 units each,
-/// both directions) or 32 single-kind rooted candidates — above the retained
-/// candidate set (~16-50 citations) for the shipped formulas. When the budget
-/// binds, roots are dropped from the tail of the citation order,
-/// deterministically.
-///
-/// Node-cap dimension (round 5.5 item 1 residual): the FILE structural trails
-/// run at [`PACKET_POST_PASS_STRUCTURAL_NODE_LIMIT`] (130) rather than the 65
-/// every other trail keeps, because below that the store accessor retains
-/// nothing at all on entrypoint-scale fanout. The budget absorbs the raise
-/// unchanged — 192 units still buys the same 16 FILE roots — and the
-/// worst-case materialization it bounds becomes 16 roots × 2 directions × 130
-/// nodes / 390 edges, i.e. twice the previous structural ceiling and still a
-/// fixed, root-count-independent bound. Single-kind rooted trails are
-/// untouched at 65 nodes / 195 edges.
-const PACKET_ATOM_POST_PASS_COST_BUDGET: usize = 192;
-
-/// R2 post-pass hydration (F3 REVISE): after candidate resolution completes —
-/// off the sidecar stage clock — run the remaining atom-kind trails and the
-/// depth-2 FILE structural trails over the RETAINED candidate set (the
-/// answer's citations, bounded by the stage carry limits), and fill the
-/// [`PacketProofSession`] ledger so the proof-evidence extras builder can
-/// construct honest coverage records. No-op without an active session, an
-/// empty hydration spec, or an unopened storage.
-pub(crate) fn hydrate_packet_atom_trails_post_pass(
-    controller: &AppController,
-    answer: &mut AgentAnswerDto,
-) {
-    let Some(session) = crate::agent::packet_candidate::active_packet_proof_session() else {
-        return;
-    };
-    if session.hydration.is_empty() {
-        return;
-    }
-    let Ok(storage) = controller.open_storage() else {
-        return;
-    };
-    hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, answer);
-}
-
-/// Completes exact outgoing CALL boundaries for strict Legacy carriers that already survived
-/// retrieval. Generic trail hydration is intentionally unsuitable here: its navigation policy may
-/// erase exact resolution fields and its node-shaped cap can lose a lawful edge in a high-fanout
-/// caller. This pass reads a fixed raw prefix, admits only fully correlated exact CALL rows, and
-/// retains at most one positive witness per declared boundary. Truncation never proves absence.
-pub(crate) fn hydrate_packet_exact_call_boundaries_post_pass(
-    controller: &AppController,
-    flow_requirements: &[FlowRequirement],
-    answer: &mut AgentAnswerDto,
-) {
-    let Ok(storage) = controller.open_storage() else {
-        return;
-    };
-    hydrate_packet_exact_call_boundaries_in_storage(
-        &storage,
-        &HashMap::new(),
-        flow_requirements,
-        answer,
-    );
-}
-
-fn raw_call_is_exact_boundary_candidate(
-    edge: &codestory_contracts::graph::Edge,
-    source: &codestory_contracts::graph::Node,
-) -> bool {
-    let Some(file_node_id) = edge.file_node_id else {
-        return false;
-    };
-    let Some(line) = edge.line.filter(|line| *line >= 1) else {
-        return false;
-    };
-    let Some(callsite_identity) = edge.callsite_identity.as_deref() else {
-        return false;
-    };
-    let Some(pre_marker) = callsite_identity.split('|').next() else {
-        return false;
-    };
-    let fields = pre_marker.split(':').collect::<Vec<_>>();
-    if fields.len() != 4 {
-        return false;
-    }
-    let (Ok(identity_file), Ok(identity_line), Ok(_column), Ok(identity_target)) = (
-        fields[0].parse::<i64>(),
-        fields[1].parse::<u32>(),
-        fields[2].parse::<u32>(),
-        fields[3].parse::<i64>(),
-    ) else {
-        return false;
-    };
-    let target = edge.effective_target();
-    edge.kind == EdgeKind::CALL
-        && edge.certainty == Some(ResolutionCertainty::Certain)
-        && edge.effective_source() == source.id
-        && edge.resolved_target == Some(target)
-        && edge.candidate_targets.is_empty()
-        && source.file_node_id == Some(file_node_id)
-        && source
-            .start_line
-            .zip(source.end_line)
-            .is_some_and(|(start, end)| start <= line && line <= end)
-        && identity_file == file_node_id.0
-        && identity_line == line
-        && identity_target == edge.target.0
-}
-
-fn exact_call_boundary_graph_for_citation(
-    storage: &Store,
-    node_names: &HashMap<CoreNodeId, String>,
-    flow_requirements: &[FlowRequirement],
-    citation: &AgentCitationDto,
-) -> Result<Option<GraphResponse>, ApiError> {
-    let applicable = flow_requirements
-        .iter()
-        .filter(|requirement| requirement.proof.formula().is_none())
-        .filter(|requirement| flow_requirement_call_boundary_is_discoverable(requirement, citation))
-        .collect::<Vec<_>>();
-    if applicable.is_empty() {
-        return Ok(None);
-    }
-    let Ok(source) = citation.node_id.0.parse::<i64>().map(CoreNodeId) else {
-        return Ok(None);
-    };
-    let Some(source_node) = storage.get_node(source).map_err(|error| {
-        ApiError::internal(format!(
-            "Failed to load exact packet CALL boundary source: {error}"
-        ))
-    })?
-    else {
-        return Ok(None);
-    };
-    if !matches!(
-        source_node.kind,
-        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
-    ) {
-        return Ok(None);
-    }
-    let bounded = storage
-        .get_bounded_raw_call_edges_by_effective_source(
-            source,
-            PACKET_EXACT_CALL_BOUNDARY_EDGE_LIMIT,
-        )
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "Failed to load bounded exact packet CALL boundaries: {error}"
-            ))
-        })?;
-    let graph_flags = app_graph_flags();
-    let mut selected = Vec::<GraphEdgeDto>::new();
-    let mut selected_ids = HashSet::new();
-    for requirement in applicable {
-        let Some(edge_dto) = bounded.edges.iter().find_map(|edge| {
-            if !raw_call_is_exact_boundary_candidate(edge, &source_node) {
-                return None;
-            }
-            let target = edge.effective_target();
-            let target_node = storage.get_node(target).ok().flatten()?;
-            if !matches!(
-                target_node.kind,
-                NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::MACRO
-            ) {
-                return None;
-            }
-            let label = node_names
-                .get(&target)
-                .cloned()
-                .unwrap_or_else(|| node_display_name(&target_node));
-            let edge_dto = graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags);
-            flow_requirement_call_receipt_is_valid(
-                requirement,
-                citation,
-                &edge_dto,
-                &label,
-                ApiNodeKind::from(target_node.kind),
-            )
-            .then_some(edge_dto)
-        }) else {
-            continue;
-        };
-        if selected_ids.insert(edge_dto.id.clone()) {
-            selected.push(edge_dto);
-        }
-    }
-    if selected.is_empty() {
-        return Ok(None);
-    }
-    let nodes = packet_graph_endpoint_nodes(storage, node_names, source, &selected)?;
-    let omitted =
-        bounded.edges.len().saturating_sub(selected.len()) + usize::from(bounded.truncated);
-    Ok(Some(GraphResponse {
-        center_id: source.into(),
-        nodes,
-        edges: selected,
-        truncated: omitted > 0,
-        omitted_edge_count: u32::try_from(omitted).unwrap_or(u32::MAX),
-        canonical_layout: None,
-    }))
-}
-
-fn hydrate_packet_exact_call_boundaries_in_storage(
-    storage: &Store,
-    node_names: &HashMap<CoreNodeId, String>,
-    flow_requirements: &[FlowRequirement],
-    answer: &mut AgentAnswerDto,
-) {
-    for citation in &mut answer.citations {
-        let Ok(Some(graph)) = exact_call_boundary_graph_for_citation(
-            storage,
-            node_names,
-            flow_requirements,
-            citation,
-        ) else {
-            continue;
-        };
-        for edge in &graph.edges {
-            if !citation.evidence_edge_ids.contains(&edge.id) {
-                citation.evidence_edge_ids.insert(0, edge.id.clone());
-            }
-        }
-        citation.evidence_edge_ids.truncate(12);
-        let artifact_id = format!(
-            "{PACKET_EXACT_CALL_BOUNDARY_ARTIFACT_PREFIX}{}",
-            graph.center_id.0
-        );
-        if !answer.graphs.iter().any(|artifact| match artifact {
-            GraphArtifactDto::Uml { id, .. } | GraphArtifactDto::Mermaid { id, .. } => {
-                id == &artifact_id
-            }
-        }) {
-            answer.graphs.push(GraphArtifactDto::Uml {
-                id: artifact_id.clone(),
-                title: "Exact packet CALL boundary".to_string(),
-                graph,
-            });
-        }
-        if !answer.subgraph_ids.contains(&artifact_id) {
-            answer.subgraph_ids.push(artifact_id);
-        }
-    }
-}
-
-/// Storage-level core of the post-pass, testable with an in-memory store.
-///
-/// Each retained root gets one self-contained canonical artifact holding
-/// every edge its trails enumerated (the coverage claims reference those
-/// edges, and self-containment keeps a scan's fate tied to its own artifact).
-/// A root whose trails return no edges is skipped entirely — scans included —
-/// which is sound because an absence fact's source role can only be bound by
-/// positive receipts, so a rootless scan could never be consulted.
-fn hydrate_packet_atom_trails_in_storage(
-    storage: &Store,
-    node_names: &HashMap<CoreNodeId, String>,
-    session: &crate::agent::packet_candidate::PacketProofSession,
-    answer: &mut AgentAnswerDto,
-) {
-    let spec = &session.hydration;
-    if spec.is_empty() {
-        return;
-    }
-    let live_artifact_ids = answer
-        .graphs
-        .iter()
-        .map(|artifact| match artifact {
-            GraphArtifactDto::Uml { id, .. } | GraphArtifactDto::Mermaid { id, .. } => id.clone(),
-        })
-        .collect::<HashSet<_>>();
-    let directions = [
-        (TrailDirection::Outgoing, PacketGraphDirection::Outgoing),
-        (TrailDirection::Incoming, PacketGraphDirection::Incoming),
-    ];
-    let graph_flags = app_graph_flags();
-    let mut seen_roots: HashSet<i64> = HashSet::new();
-    let mut cost_spent = 0usize;
-    let mut new_artifacts: Vec<(String, GraphResponse, Vec<PacketCandidateTrailScan>)> = Vec::new();
-
-    // NEED-ORDERED, SKIP-BOUNDED (gate 8). The traversal used to walk plain
-    // citation/rank order and `break` the moment a root did not fit the cost
-    // budget. Both halves were wrong for exactly the roots this machinery
-    // exists to serve: R6 promotion changes WHICH candidates are admitted,
-    // never their rank, so rescued roots sit at the TAIL of citation order
-    // and a rank-ordered hard break systematically never reached them —
-    // structurally the same pathology R6 itself replaced one layer up, which
-    // is why nothing changed above it could move the outcome. Their
-    // MEMBER/TYPE_USAGE receipts therefore never entered `packet.support`,
-    // could not be proven on, could not be protected as atom carriers, and
-    // the citation cap dropped them.
-    //
-    // So: roots are ordered by ATOM NEED first — the session's own
-    // multiplicity priority, which is exactly "how many role positions of
-    // the active formulas this identity occupies" — and citation order
-    // breaks ties, keeping priority-0 roots in their existing relative
-    // order behind the needed ones. Nothing outside the session's need-set
-    // enters the key: no vocabulary, no rank, no path.
-    //
-    // And the budget SKIPS rather than breaks: a root whose cost does not
-    // fit is passed over and cheaper roots behind it may still be hydrated.
-    // The total budget is unchanged, so the cost bound is identical; what
-    // changes is that one expensive early root can no longer starve every
-    // cheap one behind it.
-    let mut ordered_roots: Vec<(i64, usize)> = Vec::new();
-    for (citation_index, citation) in answer.citations.iter().enumerate() {
-        let Ok(core_id) = citation.node_id.0.parse::<i64>() else {
-            continue;
-        };
-        if !seen_roots.insert(core_id) {
-            continue;
-        }
-        ordered_roots.push((core_id, citation_index));
-    }
-    ordered_roots.sort_by_key(|(core_id, citation_index)| {
-        (
-            std::cmp::Reverse(session.promotion_priority(*core_id)),
-            *citation_index,
-        )
-    });
-
-    for (core_id, _) in ordered_roots {
-        let root_id = CoreNodeId(core_id);
-        let artifact_id = format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}{core_id}");
-        if live_artifact_ids.contains(&artifact_id) {
-            // Idempotent: this root's post-pass view already exists (its
-            // ledger entry rode the first pass, first write wins).
-            continue;
-        }
-        let Ok(Some(node)) = storage.get_node(root_id) else {
-            continue;
-        };
-        // (filter, depth, node cap). The FILE structural trail carries the
-        // raised cap: below it the store accessor retains nothing at all on
-        // entrypoint-scale fanout — see
-        // [`PACKET_POST_PASS_STRUCTURAL_NODE_LIMIT`].
-        let mut plans: Vec<(Vec<EdgeKind>, u32, usize)> = Vec::new();
-        if node.kind == NodeKind::FILE {
-            if spec.file_structural {
-                plans.push((
-                    crate::agent::packet_candidate::PACKET_FILE_STRUCTURAL_TRAIL_KINDS
-                        .iter()
-                        .map(|kind| EdgeKind::from(*kind))
-                        .collect(),
-                    PACKET_FILE_STRUCTURAL_TRAIL_DEPTH,
-                    PACKET_POST_PASS_STRUCTURAL_NODE_LIMIT,
-                ));
-            }
-        } else {
-            for edge_kind in spec.kinds_for_root(node.kind.into()) {
-                plans.push((
-                    vec![EdgeKind::from(*edge_kind)],
-                    1,
-                    PACKET_CANDIDATE_DIRECTION_NODE_LIMIT,
-                ));
-            }
-        }
-        if plans.is_empty() {
-            continue;
-        }
-        let root_cost = plans
-            .iter()
-            .map(|(filter, depth, _)| filter.len().saturating_mul(*depth as usize))
-            .sum::<usize>()
-            .saturating_mul(directions.len());
-        if cost_spent.saturating_add(root_cost) > PACKET_ATOM_POST_PASS_COST_BUDGET {
-            // Skip, never break: this root does not fit, but a cheaper root
-            // behind it still may. The total budget is unchanged.
-            continue;
-        }
-        cost_spent += root_cost;
-
-        let mut scans: Vec<PacketCandidateTrailScan> = Vec::new();
-        let mut seen_edge_ids = HashSet::new();
-        let mut collected: Vec<(codestory_contracts::graph::Edge, PacketGraphDirection)> =
-            Vec::new();
-        let mut truncated = false;
-        let mut omitted_edge_count: u32 = 0;
-        for (filter, depth, max_nodes) in &plans {
-            for (direction, packet_direction) in directions {
-                // Post-pass hydration is enrichment: a failed trail degrades
-                // to absent coverage (fail closed) instead of failing the
-                // packet.
-                let Ok(trail) = storage.get_trail(&TrailConfig {
-                    root_id,
-                    depth: *depth,
-                    direction,
-                    caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                    edge_filter: filter.clone(),
-                    show_utility_calls: true,
-                    max_nodes: *max_nodes,
-                    ..TrailConfig::default()
-                }) else {
-                    continue;
-                };
-                truncated = truncated || trail.truncated;
-                omitted_edge_count = omitted_edge_count.saturating_add(trail.omitted_edge_count);
-                scans.push(packet_trail_scan_record(
-                    &core_id.to_string(),
-                    packet_direction,
-                    *depth,
-                    filter,
-                    &trail,
-                    &spec.absence_kinds,
-                ));
-                for edge in trail.edges {
-                    if seen_edge_ids.insert(edge.id) {
-                        collected.push((edge, packet_direction));
-                    }
-                }
-            }
-        }
-        if collected.is_empty() {
-            continue;
-        }
-        let edge_dtos = collected
-            .iter()
-            .map(|(edge, _)| graph_edge_dto(edge.clone().with_effective_endpoints(), graph_flags))
-            .collect::<Vec<_>>();
-        let Ok(nodes) = packet_graph_endpoint_nodes(storage, node_names, root_id, &edge_dtos)
-        else {
-            continue;
-        };
-        new_artifacts.push((
-            artifact_id,
-            GraphResponse {
-                center_id: root_id.into(),
-                nodes,
-                edges: edge_dtos,
-                truncated,
-                omitted_edge_count,
-                canonical_layout: None,
-            },
-            scans,
-        ));
-    }
-    for (artifact_id, graph, scans) in new_artifacts {
-        session.record_artifact_scans(&artifact_id, &scans);
-        answer.graphs.push(GraphArtifactDto::Uml {
-            id: artifact_id,
-            title: "Packet atom trail hydration".to_string(),
-            graph,
-        });
-    }
-}
-
-/// R6 — atom-driven admission at the candidate-resolution boundary.
-///
-/// The materialized `Vec` + hard `break` is replaced by a re-prioritizable
-/// pending queue: at each step the next candidate is the earliest (by base
-/// order) pending candidate whose promotion key matches a receipt-established
-/// identity, else the next in base order. After each in-loop hydration, newly
-/// established identities — exact in-loop resolutions and IMPORT/MEMBER/USAGE
-/// effective endpoints from hydrated trails — re-prioritize the remaining
-/// queue. The resolution-attempt budget (`max_results` resolved hits) is
-/// preserved exactly; only MEMBERSHIP changes. The outer path-resolvability
-/// sort is deliberately demoted from invariant to base order: promoted
-/// candidates jump it, everything unpromoted keeps it, and promoted candidates
-/// keep it among themselves. Dedup key and unresolved-candidate accounting are
-/// unchanged; displaced tail candidates end un-attempted exactly as cap-cut
-/// candidates do today.
-///
-/// Promotion keys are identity-only: (a) `CandidateHit.node_id` equal to an
-/// atom-needed identity; (b) for file-shaped candidates (`target.is_some()`,
-/// where `node_id` is absent), the canonical file node id derived from the
-/// candidate's declared path via the in-crate `storage.get_file_by_path`
-/// lookup — the route the final contract review chose over exporting the
-/// indexer-private `canonical_file_node_id_for_path` (recorded here per that
-/// adjudication). `symbol_name` never participates; no substring, token, or
-/// similarity operation exists anywhere in the key.
-///
-/// PROMOTION IS ATOM-NEED-GATED (contract rev 5.3, gate round 3) and
-/// CROSS-CONTAINER-RESTRICTED (rev 5.4): an identity promotes only when a
-/// still-unproven material atom of the active formulas REQUIRES it — it is a
-/// role-constrained endpoint of a hydrated edge matching one of the
-/// formulas' IMPORT or TYPE_USAGE patterns (membership/usage kinds discharge
-/// atoms as receipts but never drive admission); the need-set is maintained
-/// by [`PacketProofSession::record_atom_needed_identities`], and the C
-/// bootstrap's import-closure identities arrive through exactly this route
-/// because the C IMPORT facts are role-to-role patterns.
-/// Identities that merely exist — exact in-loop resolutions included —
-/// never promote, and with no active formula-bearing requirements promotion
-/// is INERT: admission is bit-identical to pre-R6 behavior. The former key
-/// (c) (`graph_evidence` edge identity) is subsumed: an edge identity can
-/// only be atom-needed through its endpoints, which keys (a)/(b) already
-/// cover.
-///
-/// Gate round 2, finding 1: the need-set lives in the thread-scoped
-/// [`PacketProofSession`], NOT per call — the bootstrap chain establishes
-/// identities while resolving one sidecar query's candidates and must
-/// promote candidates sitting in OTHER queries' windows (base resolves in
-/// query X; the animation stylesheet sits at rank ~29 of query Y). The batch
-/// order is fixed, so later queries see earlier identities while earlier
-/// queries cannot retroactively benefit — a deterministic, adjudicated
-/// asymmetry. Without an active session a throwaway per-call session (empty
-/// pattern list, permanently empty need-set) keeps promotion inert.
-///
-/// Round 5.5 item 2 bounds the gate from both ends, atom-derived on each:
-/// (a) PER-ROLE PER-QUERY SLOTS — a candidate jumps the queue only through a
-/// promotion role no earlier promotion in THIS query already spent, so a
-/// re-flooded need-set can displace at most one candidate per formula role
-/// per query (A: 2, C: 4, M and all-Legacy: 0, structurally); and (b) a
-/// QUERY-BOUNDARY GROUP CHECKPOINT — once the public group matcher proves a
-/// requirement against the typed receipts accumulated in-loop, that
-/// requirement's promotion patterns retire and stop driving admission. Both
-/// silence promotion only: base-order admission, the resolution-attempt
-/// budget, dedup, and unresolved accounting are untouched, so the strictest
-/// possible outcome of either bound is exactly pre-R6 admission.
 fn resolve_sidecar_candidates_in_storage(
     storage: &Store,
     node_names: &HashMap<CoreNodeId, String>,
@@ -3016,84 +2628,116 @@ fn resolve_sidecar_candidates_in_storage(
     let mut unresolved_candidates = Vec::new();
     let mut attempted_candidate_indices = HashSet::new();
     let mut seen = HashSet::new();
-    let mut pending = ordered_sidecar_candidates(candidates, |candidate| {
-        candidate_path_resolvable(project_root, &candidate.file_path)
-    });
+    let identity_scope = crate::agent::packet_candidate::active_packet_proof_session();
+    let mut pending = if identity_scope.is_some() {
+        // Packet admission consumes the sidecar's versioned order and descriptor
+        // metadata only. Even a filesystem stat would inspect an unadmitted
+        // candidate, so path validation waits until after admission.
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| !is_phantom_sidecar_hit(candidate))
+            .map(|(index, candidate)| (index, candidate, false))
+            .collect::<Vec<_>>()
+    } else {
+        ordered_sidecar_candidates(candidates, |candidate| {
+            candidate_path_resolvable(project_root, &candidate.file_path)
+        })
+    };
+    if identity_scope.is_some() {
+        pending.sort_by(|left, right| {
+            let left_candidate = left.1;
+            let right_candidate = right.1;
+            right_candidate
+                .score
+                .total_cmp(&left_candidate.score)
+                .then_with(|| left_candidate.node_id.cmp(&right_candidate.node_id))
+                .then_with(|| left_candidate.file_path.cmp(&right_candidate.file_path))
+        });
+    }
+    let max_results =
+        max_results.min(codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES);
+    let mut admitted: Vec<(CoreNodeId, &CandidateHit)> = Vec::new();
 
-    // The cross-query promotion need-set scope (see the doc comment above).
-    let identity_scope = crate::agent::packet_candidate::active_packet_proof_session()
-        .unwrap_or_else(|| Rc::new(crate::agent::packet_candidate::PacketProofSession::default()));
-    let mut admission_trace = identity_scope.trace_enabled().then(|| {
-        crate::agent::packet_candidate::PacketQueryAdmissionTrace {
-            query_index: identity_scope.next_query_index(),
-            ..Default::default()
-        }
-    });
-
-    // Round 5.5 item 2a — the per-role promotion slots this query has spent.
-    // Roles are the endpoints of the formulas' cross-container patterns, so
-    // the bound is atom-derived (A: 2, C: 4, M and all-Legacy: 0 — no
-    // cross-container pattern, no slot, no promotion). A slot is spent when
-    // a candidate JUMPS the queue, whether or not it goes on to resolve:
-    // displacement is paid at selection, so that is where it is accounted.
-    let mut spent_promotion_roles: Vec<codestory_agent::packet_proof_atoms::ProofRole> = Vec::new();
-
-    while hits.len() < max_results && !pending.is_empty() {
-        // Gate 6 — need-set PRIORITY BY ATOM-ROLE MULTIPLICITY. Volume was
-        // never the residual: with hundreds of equally-needed identities the
-        // slots went to whatever base order surfaced first, so the chain that
-        // could complete a group-consistent proof was never admitted. The
-        // slot that is about to be filled therefore goes to the pending
-        // candidate occupying the MOST distinct (requirement, role)
-        // positions, ties broken by base order and then by stable identity —
-        // a total, deterministic key with no vocabulary, file position, or
-        // repo-specific constant in it. This decides WHICH candidate fills a
-        // slot; the per-role slot bound above still decides how many.
-        //
-        // Cost: one pass over the pending queue per admitted candidate, on
-        // identities the session caches — the same order of work the
-        // previous earliest-match scan already paid when nothing was
-        // promotable.
-        let promotion = if !identity_scope.promotion_is_active() {
-            None
-        } else {
-            pending
-                .iter()
-                .enumerate()
-                .filter_map(|(position, (_, candidate, _))| {
-                    let identity = candidate_promotion_identity(
-                        storage,
-                        project_root,
-                        candidate,
-                        &identity_scope,
-                    )?;
-                    let role =
-                        identity_scope.free_promotion_role(identity, &spent_promotion_roles)?;
-                    Some((
-                        position,
-                        role,
-                        identity_scope.promotion_priority(identity),
-                        identity,
-                    ))
-                })
-                .min_by_key(|(position, _, priority, identity)| {
-                    (std::cmp::Reverse(*priority), *position, *identity)
-                })
-                .map(|(position, role, _, _)| (position, role))
-        };
-        let promoted_position = promotion.map(|(position, _)| position);
-        if let Some((_, role)) = promotion {
-            spent_promotion_roles.push(role);
-        }
-        let (candidate_index, candidate, path_resolvable) =
-            pending.remove(promoted_position.unwrap_or(0));
+    while admitted.len() < max_results && !pending.is_empty() {
+        let (candidate_index, candidate, path_resolvable) = pending.remove(0);
         attempted_candidate_indices.insert(candidate_index);
         let rel_path = normalize_repo_relative_path(project_root, &candidate.file_path);
-        let Some(node_id) =
+        let descriptor = if let Some(identity_scope) = identity_scope.as_ref() {
+            match candidate.packet_descriptor() {
+                Some(descriptor) => Some(descriptor),
+                None => {
+                    let kind = if candidate.node_id.as_deref().is_none_or(str::is_empty) {
+                        PacketAdmissionGapKindV1::StableIdentityMissing
+                    } else {
+                        PacketAdmissionGapKindV1::SourceBoundMissing
+                    };
+                    identity_scope.record_ineligible_candidate(
+                        kind,
+                        candidate.node_id.as_deref().map(|id| format!("node:{id}")),
+                    );
+                    unresolved_candidates.push((
+                        candidate,
+                        if matches!(kind, PacketAdmissionGapKindV1::StableIdentityMissing) {
+                            "stable_identity_missing"
+                        } else {
+                            "source_bound_missing"
+                        },
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if let (Some(identity_scope), Some(descriptor)) =
+            (identity_scope.as_ref(), descriptor.as_ref())
+        {
+            // The descriptor batch sealed the packet-wide session before this
+            // hydration path began. A candidate missing from that admitted set
+            // is rejected before even a path lookup or node read.
+            match identity_scope.admit_descriptor(descriptor) {
+                PacketAdmissionDecision::Admitted | PacketAdmissionDecision::AlreadyAdmitted => {}
+                PacketAdmissionDecision::CountBudgetExceeded => {
+                    unresolved_candidates.push((candidate, "candidate_count_exceeded"));
+                    continue;
+                }
+                PacketAdmissionDecision::SourceBudgetExceeded => {
+                    unresolved_candidates.push((candidate, "source_budget_exceeded"));
+                    continue;
+                }
+            }
+        }
+        let node_id = if let Some(descriptor) = descriptor.as_ref() {
+            descriptor
+                .stable_identity
+                .strip_prefix("node:")
+                .and_then(|raw| raw.parse::<i64>().ok())
+                .map(CoreNodeId)
+                .or_else(|| {
+                    descriptor
+                        .stable_identity
+                        .strip_prefix("path:")
+                        .and_then(|_| {
+                            resolve_candidate_node_id(
+                                storage,
+                                node_names,
+                                project_root,
+                                &rel_path,
+                                candidate,
+                            )
+                        })
+                })
+        } else {
             resolve_candidate_node_id(storage, node_names, project_root, &rel_path, candidate)
-        else {
+        };
+        let Some(node_id) = node_id else {
             let label = if path_resolvable {
-                "node_unresolved"
+                if identity_scope.is_some() {
+                    "stable_identity_missing"
+                } else {
+                    "node_unresolved"
+                }
             } else {
                 "path_unresolvable"
             };
@@ -3104,6 +2748,10 @@ fn resolve_sidecar_candidates_in_storage(
         if !seen.insert(dedupe_key) {
             continue;
         }
+        admitted.push((node_id, candidate));
+    }
+
+    for (node_id, candidate) in admitted {
         let Some(hit) =
             AppController::build_search_hit(storage, node_names, node_id, candidate.score)?
         else {
@@ -3111,59 +2759,15 @@ fn resolve_sidecar_candidates_in_storage(
             continue;
         };
         let hit = classify_resolved_candidate_hit(hit, candidate);
-        let (graph_provenance, graph, trail_scans) =
+        let (graph_provenance, graph) =
             packet_graph_for_resolved_candidate(storage, node_names, node_id, candidate)?;
-        // Re-prioritization input (rev 5.3): the hydrated trails' typed
-        // edges, matched against the active formulas' patterns — only the
-        // role-constrained endpoints of matching edges join the need-set,
-        // which accumulates in the session and is visible to every later
-        // query of the same packet. Exact resolutions establish nothing by
-        // themselves.
-        if let Some(graph) = graph.as_ref() {
-            identity_scope.record_atom_needed_identities(graph);
-        }
-        if let Some(trace) = admission_trace.as_mut() {
-            trace
-                .admitted
-                .push((node_id.0.to_string(), promoted_position.is_some()));
-        }
         packet_hits.push(PacketSearchHit {
             hit: hit.clone(),
             graph_provenance,
             graph,
-            trail_scans,
         });
         hits.push(hit);
     }
-
-    // Env-gated R6 admission trace (gate round 4): attribute the
-    // un-attempted remainder — identity derivation here runs ONLY when the
-    // step-trace artifact is armed, never on a production stage clock.
-    if let Some(mut trace) = admission_trace {
-        for (_, candidate, _) in &pending {
-            let identity =
-                candidate_promotion_identity(storage, project_root, candidate, &identity_scope);
-            let needed_at_query_end =
-                identity.is_some_and(|identity| identity_scope.identity_is_atom_needed(identity));
-            let slot_free_at_query_end = identity.is_some_and(|identity| {
-                identity_scope
-                    .free_promotion_role(identity, &spent_promotion_roles)
-                    .is_some()
-            });
-            trace
-                .unattempted
-                .push((identity, needed_at_query_end, slot_free_at_query_end));
-        }
-        trace.promotion_roles_used = spent_promotion_roles;
-        identity_scope.record_query_admissions(trace);
-    }
-
-    // Round 5.5 item 2b — the QUERY BOUNDARY. The group matcher runs over the
-    // typed receipts this query accumulated (plus every earlier query's) and
-    // retires the requirements it proves, so their promotion patterns stop
-    // driving admission from the next query on. Never gated on tracing, and
-    // a no-op without cross-container patterns.
-    identity_scope.checkpoint_group_retirement();
 
     let has_resolved_hit = !hits.is_empty();
     let unresolved_candidate_count = unresolved_candidates.len();
@@ -3181,35 +2785,6 @@ fn resolve_sidecar_candidates_in_storage(
         blocking_unresolved_candidate_count,
         attempted_candidate_indices,
     })
-}
-
-/// The identity-only promotion key of one pending candidate (R6): the parsed
-/// `node_id` for symbol candidates, or the canonical file node id derived
-/// from the candidate's declared path for file-shaped candidates — an exact
-/// identity derivation through `storage.get_file_by_path`, never similarity
-/// matching. `symbol_name` and free path text never participate. File
-/// derivations are cached in the session by normalized relative path, so
-/// large candidate pools re-scanned across a packet's queries pay the
-/// storage lookup once (stage-clock hygiene).
-fn candidate_promotion_identity(
-    storage: &Store,
-    project_root: &Path,
-    candidate: &CandidateHit,
-    identity_scope: &crate::agent::packet_candidate::PacketProofSession,
-) -> Option<i64> {
-    if candidate.target.is_some() {
-        let rel_path = normalize_repo_relative_path(project_root, &candidate.file_path);
-        return identity_scope.cached_file_identity(&rel_path, || {
-            candidate_lookup_paths(project_root, &rel_path)
-                .into_iter()
-                .find_map(|path| storage.get_file_by_path(&path).ok().flatten())
-                .map(|file| file.id)
-        });
-    }
-    candidate
-        .node_id
-        .as_deref()
-        .and_then(|raw| raw.parse::<i64>().ok())
 }
 
 fn classify_resolved_candidate_hit(mut hit: SearchHit, candidate: &CandidateHit) -> SearchHit {
@@ -3320,12 +2895,11 @@ mod tests {
     use crate::agent::packet_evidence::PacketEvidenceTier;
     use crate::test_support::{git, git_available};
     use codestory_contracts::api::{
-        AgentCitationDto, NodeId, NodeKind as ApiNodeKind, PacketTaskClassDto, SearchHitOrigin,
-        SearchTargetDto,
+        NodeId, NodeKind as ApiNodeKind, SearchHitOrigin, SearchTargetDto,
     };
     use codestory_retrieval::{
-        CandidateHit, QueryTrace, RetrievalCacheKey, RetrievalStageKind, StageTrace,
-        classify_query, project_id_for_root, rank_candidates,
+        CandidateHit, CandidateSource, QueryTrace, RetrievalCacheKey, RetrievalStageKind,
+        StageTrace, classify_query, project_id_for_root, rank_candidates,
         test_support::{publish_zero_dense_pinned_query_fixture, retrieval_manifest_fixture},
     };
 
@@ -3427,7 +3001,6 @@ mod tests {
             evidence_producer: None,
             resolution_status: None,
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: None,
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -3474,6 +3047,7 @@ mod tests {
         let response = with_stable_retrieval_publication_inner(
             &fixture.controller,
             "test response",
+            PinnedRetrievalScope::Full,
             || {
                 build_calls += 1;
                 assert!(
@@ -3540,7 +3114,14 @@ mod tests {
         let fixture = pinned_operation_fixture();
 
         let first = PinnedRetrievalRead::begin(&fixture.controller).expect("first pin");
-        let first_names = Arc::clone(&first.node_names);
+        assert_eq!(
+            canonical_stream_count(&fixture.controller),
+            0,
+            "pinning alone must not stream repository node records"
+        );
+        let first_names = first
+            .canonical_node_names(&fixture.controller)
+            .expect("load first canonical map");
         drop(first);
         assert_eq!(canonical_stream_count(&fixture.controller), 1);
 
@@ -3548,15 +3129,60 @@ mod tests {
         assert_eq!(
             canonical_stream_count(&fixture.controller),
             1,
+            "pinning alone must not restream the canonical table"
+        );
+        let second_names = second
+            .canonical_node_names(&fixture.controller)
+            .expect("reuse canonical map");
+        assert_eq!(
+            canonical_stream_count(&fixture.controller),
+            1,
             "a pin on an unchanged publication must not restream the canonical table"
         );
         assert_eq!(
-            *second.node_names, *first_names,
+            *second_names, *first_names,
             "the reused map must be the map the stream produced"
         );
         assert!(
-            Arc::ptr_eq(&second.node_names, &first_names),
+            Arc::ptr_eq(&second_names, &first_names),
             "the reused map must be the cached allocation, not a fresh clone"
+        );
+    }
+
+    #[test]
+    fn rejected_packet_candidate_does_not_stream_repository_identity_records() {
+        use crate::agent::packet_candidate::{
+            PacketAdmissionDecision, PacketProofSession, install_packet_proof_session,
+        };
+
+        let fixture = pinned_operation_fixture();
+        let pinned = PinnedRetrievalRead::begin(&fixture.controller).expect("packet pin");
+        let admission = Rc::new(PacketProofSession::new());
+        for index in 0..codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES {
+            assert_eq!(
+                admission.admit(&format!("node:{index}"), 1),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let _guard = install_packet_proof_session(Rc::clone(&admission));
+        let mut rejected = CandidateHit::with_source(
+            "src/never-opened.rs",
+            Some("NeverOpened".into()),
+            1.0,
+            CandidateSource::Lexical,
+        );
+        rejected.node_id = Some("17".into());
+        rejected.source_bytes_upper_bound = Some(1);
+
+        let result =
+            resolve_sidecar_candidates_in_read(&fixture.controller, &pinned, &[rejected], 1)
+                .expect("budget rejection is diagnostic");
+
+        assert!(result.resolved_hits.is_empty());
+        assert_eq!(
+            canonical_stream_count(&fixture.controller),
+            0,
+            "the seventeenth identity must not trigger canonical node hydration"
         );
     }
 
@@ -3567,7 +3193,10 @@ mod tests {
         use codestory_store::{IndexPublicationMode, IndexPublicationRecord};
 
         let fixture = pinned_operation_fixture();
-        PinnedRetrievalRead::begin(&fixture.controller).expect("first pin");
+        PinnedRetrievalRead::begin(&fixture.controller)
+            .expect("first pin")
+            .canonical_node_names(&fixture.controller)
+            .expect("load first canonical map");
         assert_eq!(canonical_stream_count(&fixture.controller), 1);
 
         let mut writer = Store::open(&fixture.storage_path).expect("open publication writer");
@@ -3599,7 +3228,10 @@ mod tests {
         )
         .expect("republish the retrieval fixture for the new core generation");
 
-        PinnedRetrievalRead::begin(&fixture.controller).expect("pin the new publication");
+        PinnedRetrievalRead::begin(&fixture.controller)
+            .expect("pin the new publication")
+            .canonical_node_names(&fixture.controller)
+            .expect("load replacement canonical map");
         assert_eq!(
             canonical_stream_count(&fixture.controller),
             2,
@@ -3753,6 +3385,7 @@ mod tests {
         let error = with_stable_retrieval_publication_inner(
             &fixture.controller,
             "cancelled response",
+            PinnedRetrievalScope::Full,
             || Err::<TestPublicationResponse, _>(ApiError::new("cancelled", "request cancelled")),
             |_| Ok(()),
         )
@@ -4170,7 +3803,7 @@ mod tests {
             &storage,
             &HashMap::new(),
             Path::new("."),
-            &[candidate],
+            &[candidate.clone()],
             1,
         )
         .expect("resolve typed lexical candidate");
@@ -4197,7 +3830,143 @@ mod tests {
     }
 
     #[test]
-    fn packet_candidate_keeps_exact_scip_edge_provenance_without_public_hit_fields() {
+    fn seventeenth_packet_identity_is_rejected_before_core_hydration() {
+        use crate::agent::packet_candidate::{
+            PacketAdmissionDecision, PacketProofSession, install_packet_proof_session,
+        };
+
+        let storage_root = tempfile::tempdir().expect("storage root");
+        let storage_path = storage_root.path().join("codestory.db");
+        let storage = Store::open(&storage_path).expect("storage");
+        let poison = rusqlite::Connection::open(&storage_path).expect("poison connection");
+        poison
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE edge;
+                 DROP TABLE node;
+                 DROP TABLE file;",
+            )
+            .expect("remove every core hydration table");
+        drop(poison);
+        let session = Rc::new(PacketProofSession::new());
+        for index in 0..codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES {
+            assert_eq!(
+                session.admit(
+                    &format!("node:{index}"),
+                    codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND,
+                ),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let mut seventeenth = CandidateHit::with_source(
+            "src/never-opened.rs",
+            Some("NeverOpened".to_string()),
+            1.0,
+            CandidateSource::Lexical,
+        );
+        seventeenth.node_id = Some("17".to_string());
+        seventeenth.source_bytes_upper_bound =
+            Some(codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND as u32);
+
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[seventeenth],
+            1,
+        )
+        .expect("count rejection is diagnostic, not a storage failure");
+
+        assert!(outcome.resolved_hits.is_empty());
+        assert!(outcome.packet_hits.is_empty());
+        assert_eq!(outcome.unresolved_candidate_count, 1);
+        assert_eq!(*session.hydrated_admissions.borrow(), 16);
+    }
+
+    #[test]
+    fn packet_admission_consumes_versioned_retrieval_score_order() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
+
+        let storage = Store::new_in_memory().expect("storage");
+        let session = Rc::new(PacketProofSession::new());
+        let _guard = install_packet_proof_session(Rc::clone(&session));
+        let mut low = CandidateHit::with_source(
+            "src/low.rs",
+            Some("Low".to_string()),
+            0.1,
+            CandidateSource::Lexical,
+        );
+        low.node_id = Some("1".to_string());
+        low.source_bytes_upper_bound = Some(64);
+        let mut high = CandidateHit::with_source(
+            "src/high.rs",
+            Some("High".to_string()),
+            0.9,
+            CandidateSource::Lexical,
+        );
+        high.node_id = Some("2".to_string());
+        high.source_bytes_upper_bound = Some(64);
+
+        let _ = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[low, high],
+            1,
+        )
+        .expect("missing core rows are diagnostic after descriptor admission");
+
+        assert_eq!(session.receipts().len(), 1);
+        assert_eq!(session.receipts()[0].stable_identity, "node:2");
+        assert_eq!(
+            session.receipts()[0].score_version,
+            codestory_contracts::compilation::PACKET_RETRIEVAL_SCORE_VERSION_V1
+        );
+    }
+
+    #[test]
+    fn descriptor_admission_ranks_candidates_across_query_batches_before_sealing() {
+        use crate::agent::packet_candidate::{PacketAdmissionDecision, PacketProofSession};
+
+        let session = PacketProofSession::new();
+        for index in 0..15 {
+            assert_eq!(
+                session.admit_exact_selector(&format!("node:exact-{index}"), 1, index),
+                PacketAdmissionDecision::Admitted
+            );
+        }
+        let mut low = CandidateHit::with_source(
+            "src/low.rs",
+            Some("Low".to_string()),
+            0.1,
+            CandidateSource::Lexical,
+        );
+        low.node_id = Some("1".to_string());
+        low.source_bytes_upper_bound = Some(64);
+        let mut high = CandidateHit::with_source(
+            "src/high.rs",
+            Some("High".to_string()),
+            0.9,
+            CandidateSource::Semantic,
+        );
+        high.node_id = Some("2".to_string());
+        high.source_bytes_upper_bound = Some(64);
+
+        admit_packet_candidate_descriptors(&session, [&low, &high]);
+
+        assert_eq!(session.receipts().len(), 16);
+        assert_eq!(session.receipts()[15].stable_identity, "node:2");
+        assert_eq!(
+            session.admit_descriptor(&low.packet_descriptor().expect("complete low descriptor")),
+            PacketAdmissionDecision::CountBudgetExceeded,
+            "the sealed session must not admit a late lower-scoring query candidate"
+        );
+    }
+
+    #[test]
+    fn packet_graph_never_hydrates_or_projects_an_unadmitted_endpoint() {
+        use crate::agent::packet_candidate::{PacketProofSession, install_packet_proof_session};
         use codestory_retrieval::CandidateGraphEvidence;
         use codestory_store::{FileInfo, FileRole};
 
@@ -4270,17 +4039,48 @@ mod tests {
             edge_weight: 1.0,
             direction_weight: 1.0,
         });
+        candidate.source_bytes_upper_bound = Some(512);
+
+        let session = Rc::new(PacketProofSession::new());
+        let guard = install_packet_proof_session(Rc::clone(&session));
 
         let outcome = resolve_sidecar_candidates_in_storage(
             &storage,
             &HashMap::new(),
             Path::new("."),
-            &[candidate],
+            &[candidate.clone()],
             1,
         )
         .expect("resolve packet candidate");
         assert_eq!(outcome.resolved_hits.len(), 1);
         let packet_hit = outcome.packet_hits.first().expect("packet hit");
+        assert!(packet_hit.graph_provenance.is_empty());
+        assert!(packet_hit.graph.is_none());
+        drop(guard);
+
+        let mut admitted_peer = CandidateHit::with_source(
+            "requests/sessions.py",
+            Some("Session.request".into()),
+            0.7,
+            CandidateSource::Scip,
+        );
+        admitted_peer.node_id = Some("2".into());
+        admitted_peer.source_bytes_upper_bound = Some(512);
+        let session = Rc::new(PacketProofSession::new());
+        let _guard = install_packet_proof_session(session);
+        let outcome = resolve_sidecar_candidates_in_storage(
+            &storage,
+            &HashMap::new(),
+            Path::new("."),
+            &[candidate, admitted_peer],
+            2,
+        )
+        .expect("resolve both admitted packet candidates");
+        let packet_hit = outcome
+            .packet_hits
+            .iter()
+            .find(|hit| hit.hit.node_id.0 == "3")
+            .expect("target packet hit");
         assert_eq!(
             packet_hit
                 .graph_provenance
@@ -4498,316 +4298,6 @@ mod tests {
         assert!(packet_hit.has_proof_call_provenance());
     }
 
-    fn exact_boundary_test_citation(id: i64, display_name: &str) -> AgentCitationDto {
-        AgentCitationDto {
-            node_id: NodeId(id.to_string()),
-            display_name: display_name.to_string(),
-            kind: ApiNodeKind::FUNCTION,
-            file_path: Some("src/runtime.c".to_string()),
-            line: Some(2),
-            score: 1.0,
-            origin: SearchHitOrigin::IndexedSymbol,
-            target: None,
-            resolvable: true,
-            subgraph_id: None,
-            evidence_edge_ids: Vec::new(),
-            retrieval_score_breakdown: None,
-            evidence_tier: None,
-            evidence_producer: None,
-            resolution_status: None,
-            loss_reason: None,
-            coverage_role: None,
-            eligible_for_sufficiency: Some(true),
-            source_excerpt: None,
-        }
-    }
-
-    fn exact_boundary_test_requirements() -> Vec<FlowRequirement> {
-        codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-            &codestory_agent::packet_terms::packet_probe_terms(
-                "Trace how the server enters the event loop and routes a command for execution.",
-            ),
-            PacketTaskClassDto::RouteTracing,
-        )
-    }
-
-    fn exact_boundary_test_edge(
-        id: i64,
-        source: i64,
-        target: i64,
-        line: u32,
-    ) -> codestory_contracts::graph::Edge {
-        codestory_contracts::graph::Edge {
-            id: codestory_contracts::graph::EdgeId(id),
-            source: CoreNodeId(source),
-            target: CoreNodeId(target),
-            kind: EdgeKind::CALL,
-            file_node_id: Some(CoreNodeId(1)),
-            line: Some(line),
-            resolved_target: Some(CoreNodeId(target)),
-            certainty: Some(ResolutionCertainty::Certain),
-            callsite_identity: Some(format!("1:{line}:1:{target}|syntax:c-call")),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn exact_boundary_post_pass_recovers_only_correlated_router_and_loop_witnesses() {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("src/runtime.c"),
-                language: "c".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 300,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        storage
-            .insert_file(&FileInfo {
-                id: 2,
-                path: PathBuf::from("src/other.c"),
-                language: "c".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 300,
-                file_role: FileRole::Source,
-            })
-            .expect("insert other file");
-        let mut nodes = vec![
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(1),
-                kind: NodeKind::FILE,
-                serialized_name: "src/runtime.c".into(),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(2),
-                kind: NodeKind::FILE,
-                serialized_name: "src/other.c".into(),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(10),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "processCommand".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(2),
-                end_line: Some(150),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(20),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "rejectCommand".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(200),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(30),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "recordCommandMetrics".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(210),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(40),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "aeMain".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(220),
-                end_line: Some(225),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(41),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "EventLoop.processEvents".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(230),
-                ..Default::default()
-            },
-        ];
-        nodes.extend((0..70).map(|index| codestory_contracts::graph::Node {
-            id: CoreNodeId(100 + index),
-            kind: NodeKind::FUNCTION,
-            serialized_name: format!("recordMetric{index}"),
-            file_node_id: Some(CoreNodeId(1)),
-            start_line: Some(10 + index as u32),
-            ..Default::default()
-        }));
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-
-        let mut edges = (0..70)
-            .map(|index| exact_boundary_test_edge(index + 1, 10, 100 + index, 10 + index as u32))
-            .collect::<Vec<_>>();
-        let mut probable = exact_boundary_test_edge(80, 10, 20, 90);
-        probable.certainty = Some(ResolutionCertainty::Probable);
-        edges.push(probable);
-        let mut candidate_bearing = exact_boundary_test_edge(81, 10, 20, 91);
-        candidate_bearing.candidate_targets = vec![CoreNodeId(30)];
-        edges.push(candidate_bearing);
-        let mut unresolved = exact_boundary_test_edge(82, 10, 20, 92);
-        unresolved.resolved_target = None;
-        edges.push(unresolved);
-        let mut malformed = exact_boundary_test_edge(83, 10, 20, 93);
-        malformed.callsite_identity = Some("syntax:c-call".into());
-        edges.push(malformed);
-        edges.push(exact_boundary_test_edge(84, 10, 30, 94));
-        edges.push(exact_boundary_test_edge(85, 10, 20, 151));
-        let mut wrong_file = exact_boundary_test_edge(86, 10, 20, 101);
-        wrong_file.file_node_id = Some(CoreNodeId(2));
-        wrong_file.callsite_identity = Some("2:101:1:20|syntax:c-call".into());
-        edges.push(wrong_file);
-        edges.push(exact_boundary_test_edge(90, 10, 20, 100));
-        edges.push(exact_boundary_test_edge(91, 40, 41, 221));
-        storage.insert_edges_batch(&edges).expect("insert edges");
-
-        let requirements = exact_boundary_test_requirements();
-        let router = exact_call_boundary_graph_for_citation(
-            &storage,
-            &HashMap::new(),
-            &requirements,
-            &exact_boundary_test_citation(10, "processCommand"),
-        )
-        .expect("router hydration")
-        .expect("exact router boundary");
-        assert_eq!(
-            router
-                .edges
-                .iter()
-                .map(|edge| edge.id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["90"],
-            "high fanout must not hide the one exact routing witness; probable, candidate-bearing, unresolved, malformed, and wrong-target rows remain excluded"
-        );
-
-        let loop_driver = exact_call_boundary_graph_for_citation(
-            &storage,
-            &HashMap::new(),
-            &requirements,
-            &exact_boundary_test_citation(40, "aeMain"),
-        )
-        .expect("loop hydration")
-        .expect("exact loop boundary");
-        assert_eq!(loop_driver.edges[0].id.0, "91");
-
-        let mut answer = sidecar_answer_with_citation_node("10");
-        answer.citations = vec![
-            exact_boundary_test_citation(10, "processCommand"),
-            exact_boundary_test_citation(40, "aeMain"),
-        ];
-        hydrate_packet_exact_call_boundaries_in_storage(
-            &storage,
-            &HashMap::new(),
-            &requirements,
-            &mut answer,
-        );
-        assert_eq!(answer.citations[0].evidence_edge_ids[0].0, "90");
-        assert_eq!(answer.citations[1].evidence_edge_ids[0].0, "91");
-        assert_eq!(answer.graphs.len(), 2);
-        assert_eq!(answer.subgraph_ids.len(), 2);
-
-        assert!(
-            exact_call_boundary_graph_for_citation(
-                &storage,
-                &HashMap::new(),
-                &requirements,
-                &exact_boundary_test_citation(40, "Connection.rebindEventLoop"),
-            )
-            .expect("hostile carrier")
-            .is_none(),
-            "a rebind wrapper must not enter exact boundary hydration"
-        );
-    }
-
-    #[test]
-    fn exact_boundary_post_pass_never_claims_a_match_beyond_its_fixed_raw_prefix() {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("src/runtime.c"),
-                language: "c".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 400,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        let mut nodes = vec![
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(1),
-                kind: NodeKind::FILE,
-                serialized_name: "src/runtime.c".into(),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(10),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "processCommand".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(2),
-                end_line: Some(400),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(20),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "rejectCommand".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(300),
-                ..Default::default()
-            },
-        ];
-        nodes.extend((0..PACKET_EXACT_CALL_BOUNDARY_EDGE_LIMIT).map(|index| {
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(100 + i64::from(index)),
-                kind: NodeKind::FUNCTION,
-                serialized_name: format!("recordMetric{index}"),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(10 + index),
-                ..Default::default()
-            }
-        }));
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        let mut edges = (0..PACKET_EXACT_CALL_BOUNDARY_EDGE_LIMIT)
-            .map(|index| {
-                exact_boundary_test_edge(
-                    1 + i64::from(index),
-                    10,
-                    100 + i64::from(index),
-                    10 + index,
-                )
-            })
-            .collect::<Vec<_>>();
-        edges.push(exact_boundary_test_edge(10_000, 10, 20, 350));
-        storage.insert_edges_batch(&edges).expect("insert edges");
-
-        assert!(
-            exact_call_boundary_graph_for_citation(
-                &storage,
-                &HashMap::new(),
-                &exact_boundary_test_requirements(),
-                &exact_boundary_test_citation(10, "processCommand"),
-            )
-            .expect("bounded hydration")
-            .is_none(),
-            "a lawful edge beyond the fixed raw prefix remains unproven; truncation is never absence or authority"
-        );
-    }
-
     #[test]
     fn unresolved_sidecar_candidates_are_diagnostic_only() {
         let result = QueryResult {
@@ -4898,7 +4388,7 @@ mod tests {
 
     /// EV-8. The sidecar reports no blocking cancel when only a *stage* runs out of budget, so a
     /// query whose dense lane went dark and then resolved nothing used to arrive as `Completed`
-    /// and satisfy its query obligation on an empty result.
+    /// and report an empty result as complete.
     #[test]
     fn a_semantic_stage_timeout_with_no_resolved_hits_cancels_the_query() {
         let result = query_result_with_stages(vec![semantic_stage_trace(
@@ -5117,7 +4607,7 @@ mod tests {
         assert!(breakdown.semantic > 0.0);
         assert_eq!(breakdown.graph, 0.0);
         assert_eq!(hit.evidence_tier, Some(PacketEvidenceTier::DenseSemantic));
-        assert_eq!(hit.eligible_for_sufficiency, Some(false));
+        assert_eq!(hit.eligible_for_sufficiency, None);
     }
 
     #[test]
@@ -5183,7 +4673,7 @@ mod tests {
             structural.resolution_status,
             Some(PacketEvidenceResolution::SourceRangeOnly)
         );
-        assert_eq!(structural.eligible_for_sufficiency, Some(false));
+        assert_eq!(structural.eligible_for_sufficiency, None);
 
         let mut exact = undecorated_search_hit_for_candidate(&lexical);
         exact.evidence_tier = Some(PacketEvidenceTier::ExactSource);
@@ -5196,7 +4686,7 @@ mod tests {
             exact.resolution_status,
             Some(PacketEvidenceResolution::SourceRangeOnly)
         );
-        assert_eq!(exact.eligible_for_sufficiency, Some(false));
+        assert_eq!(exact.eligible_for_sufficiency, None);
 
         let mut affinity = CandidateHit::with_source(
             "src/service.rs",
@@ -5979,7 +5469,7 @@ mod tests {
             CandidateSource::Scip,
         );
         candidate.node_id = Some("2".into());
-        let resolution = resolve_sidecar_candidates_in_read(&pinned, &[candidate], 1)
+        let resolution = resolve_sidecar_candidates_in_read(&controller, &pinned, &[candidate], 1)
             .expect("resolve against pinned snapshot");
         assert_eq!(resolution.resolved_hits.len(), 1);
         assert_eq!(resolution.resolved_hits[0].display_name, "original");
@@ -6763,2790 +6253,6 @@ mod tests {
             std::env::remove_var(RETRIEVAL_ENV);
         }
         assert_eq!(retrieval_env_override(), None);
-    }
-
-    // -----------------------------------------------------------------------
-    // Stage 4: R6 admission queue and R2 widened hydration
-    // -----------------------------------------------------------------------
-
-    /// In-memory storage shaped like the C-chain bootstrap: a base stylesheet
-    /// whose file-rooted trails expose a selector member, a depth-2 var
-    /// usage, and the incoming IMPORT from the animation stylesheet.
-    fn css_bootstrap_storage() -> Store {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        for (id, path) in [
-            (1, "styles/_base.css"),
-            (2, "styles/animate.css"),
-            (4, "src/other.rs"),
-        ] {
-            storage
-                .insert_file(&FileInfo {
-                    id,
-                    path: PathBuf::from(path),
-                    language: "css".to_string(),
-                    modification_time: 1,
-                    indexed: true,
-                    complete: true,
-                    line_count: 40,
-                    file_role: FileRole::Source,
-                })
-                .expect("insert file");
-        }
-        storage
-            .insert_nodes_batch(&[
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(1),
-                    kind: NodeKind::FILE,
-                    serialized_name: "styles/_base.css".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(2),
-                    kind: NodeKind::FILE,
-                    serialized_name: "styles/animate.css".into(),
-                    file_node_id: Some(CoreNodeId(2)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(3),
-                    kind: NodeKind::CONSTANT,
-                    serialized_name: ".hero".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(5),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(4),
-                    kind: NodeKind::FILE,
-                    serialized_name: "src/other.rs".into(),
-                    file_node_id: Some(CoreNodeId(4)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(5),
-                    kind: NodeKind::FUNCTION,
-                    serialized_name: "unrelated_filler".into(),
-                    file_node_id: Some(CoreNodeId(4)),
-                    start_line: Some(2),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(6),
-                    kind: NodeKind::VARIABLE,
-                    serialized_name: "--hero-color".into(),
-                    file_node_id: Some(CoreNodeId(2)),
-                    start_line: Some(3),
-                    ..Default::default()
-                },
-                // Decoy (rev 5.3): a FIELD member matches no C typed-relation
-                // pattern, so its identity must never join the need-set.
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(9),
-                    kind: NodeKind::FIELD,
-                    serialized_name: "decoy-field".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(9),
-                    ..Default::default()
-                },
-            ])
-            .expect("insert nodes");
-        storage
-            .insert_edges_batch(&[
-                codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(101),
-                    source: CoreNodeId(1),
-                    target: CoreNodeId(3),
-                    kind: EdgeKind::MEMBER,
-                    file_node_id: Some(CoreNodeId(1)),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(102),
-                    source: CoreNodeId(2),
-                    target: CoreNodeId(1),
-                    kind: EdgeKind::IMPORT,
-                    file_node_id: Some(CoreNodeId(2)),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(103),
-                    source: CoreNodeId(3),
-                    target: CoreNodeId(6),
-                    kind: EdgeKind::USAGE,
-                    file_node_id: Some(CoreNodeId(1)),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(104),
-                    source: CoreNodeId(1),
-                    target: CoreNodeId(9),
-                    kind: EdgeKind::MEMBER,
-                    file_node_id: Some(CoreNodeId(1)),
-                    ..Default::default()
-                },
-            ])
-            .expect("insert edges");
-        storage
-    }
-
-    fn file_shaped_candidate(path: &str) -> CandidateHit {
-        let mut candidate = CandidateHit::with_source(path, None, 0.6, CandidateSource::Lexical);
-        candidate.target = Some(SearchTargetDto::FileRange {
-            file_path: path.to_string(),
-            start_byte: 0,
-            end_byte: 10,
-        });
-        candidate
-    }
-
-    fn node_candidate(path: &str, node_id: &str, symbol_name: &str) -> CandidateHit {
-        let mut candidate = CandidateHit::with_source(
-            path,
-            Some(symbol_name.to_string()),
-            0.5,
-            CandidateSource::Scip,
-        );
-        candidate.node_id = Some(node_id.to_string());
-        candidate
-    }
-
-    /// A session carrying the REAL C-family spec (patterns included), derived
-    /// from the css question exactly as the orchestrator derives it — the
-    /// rev 5.3 need-gate matches hydrated edges against these patterns.
-    fn file_structural_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
-        let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements);
-        assert!(
-            !spec.promotion_patterns.is_empty(),
-            "the css question must derive C promotion patterns"
-        );
-        Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
-            spec,
-        ))
-    }
-
-    /// R6 negative first: with no receipt-established identities (no packet
-    /// session, so hydration exposes no structural endpoints), admission is
-    /// pure base order and the budget cuts the tail exactly as before.
-    /// With the session installed, the base stylesheet's file-rooted trails
-    /// establish the animation file's canonical id through the incoming
-    /// IMPORT, the late file candidate is promoted over the filler, the
-    /// displaced filler ends un-attempted like a cap-cut candidate, and the
-    /// whole outcome is deterministic across runs.
-    #[test]
-    fn r6_established_import_identity_promotes_late_file_candidate_deterministically() {
-        let storage = css_bootstrap_storage();
-        let candidates = vec![
-            file_shaped_candidate("styles/_base.css"),
-            node_candidate("src/other.rs", "5", "unrelated_filler"),
-            file_shaped_candidate("styles/animate.css"),
-        ];
-
-        // Base order without a session: the filler consumes the second slot.
-        let unpromoted = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            2,
-        )
-        .expect("resolve without session");
-        assert_eq!(
-            unpromoted
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["1", "5"],
-            "without established identities admission stays base order"
-        );
-        assert_eq!(
-            unpromoted.attempted_candidate_indices,
-            HashSet::from([0, 1])
-        );
-
-        let run = || {
-            let session = file_structural_session();
-            let _guard =
-                crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-            resolve_sidecar_candidates_in_storage(
-                &storage,
-                &HashMap::new(),
-                Path::new("."),
-                &candidates,
-                2,
-            )
-            .expect("resolve with session")
-        };
-        let promoted = run();
-        assert_eq!(
-            promoted
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["1", "2"],
-            "the IMPORT-established canonical file id must promote the late candidate"
-        );
-        assert_eq!(promoted.attempted_candidate_indices, HashSet::from([0, 2]));
-        assert_eq!(
-            promoted.unresolved_candidate_count, 0,
-            "the displaced filler is un-attempted, not unresolved — cap-cut semantics"
-        );
-
-        // Determinism: identical inputs yield identical outcomes.
-        let second = run();
-        assert_eq!(
-            promoted
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.clone())
-                .collect::<Vec<_>>(),
-            second
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.clone())
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            promoted.attempted_candidate_indices,
-            second.attempted_candidate_indices
-        );
-
-        // F3 REVISE: the IN-LOOP hydration is bounded to the depth-1
-        // identity-establishing [IMPORT] trails (gate 5c: MEMBER dropped —
-        // it feeds nothing under rev 5.4 and its fanout shares the trail
-        // accessor's edge budget) — depth-2 structural coverage belongs to
-        // the post-pass, never to the stage clock.
-        let base_hit = promoted
-            .packet_hits
-            .iter()
-            .find(|hit| hit.hit.node_id.0 == "1")
-            .expect("base stylesheet packet hit");
-        let scans = &base_hit.trail_scans;
-        assert_eq!(scans.len(), 2, "one identity scan per direction: {scans:?}");
-        for scan in scans {
-            assert_eq!(scan.root, "1");
-            assert_eq!(scan.depth, 1, "in-loop trails stay at depth 1: {scan:?}");
-            assert_eq!(
-                scan.edge_kinds,
-                vec![codestory_contracts::api::EdgeKind::IMPORT]
-            );
-            assert!(!scan.truncated);
-        }
-        let graph = base_hit.graph.as_ref().expect("hydrated identity graph");
-        assert!(
-            graph.edges.iter().any(|edge| edge.id.0 == "102"),
-            "the incoming IMPORT identity edge must be retained in the candidate graph"
-        );
-        for structural in ["101", "103", "104"] {
-            assert!(
-                !graph.edges.iter().any(|edge| edge.id.0 == structural),
-                "MEMBER/USAGE edge {structural} must NOT be hydrated on the stage clock"
-            );
-        }
-    }
-
-    /// R6 negative: the promotion key is identity-only. Two node-id-bearing
-    /// candidates that differ only in symbol_name and file_path receive
-    /// identical promotion treatment — swapping their names changes nothing
-    /// but base order.
-    #[test]
-    fn r6_promotion_key_ignores_symbol_names_and_paths() {
-        let storage = css_bootstrap_storage();
-        let outcome_for = |first_name: &str, second_name: &str| {
-            let candidates = vec![
-                file_shaped_candidate("styles/_base.css"),
-                node_candidate("src/other.rs", "5", "unrelated_filler"),
-                // Rev 5.4: the promotable identity is the IMPORT-established
-                // entrypoint file node (2) — cross-container. Names and
-                // paths on the two carriers differ arbitrarily.
-                node_candidate("styles/animate.css", "2", first_name),
-                node_candidate("completely/else.css", "2", second_name),
-            ];
-            let session = file_structural_session();
-            let _guard =
-                crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-            let outcome = resolve_sidecar_candidates_in_storage(
-                &storage,
-                &HashMap::new(),
-                Path::new("."),
-                &candidates,
-                2,
-            )
-            .expect("resolve");
-            (
-                outcome
-                    .resolved_hits
-                    .iter()
-                    .map(|hit| hit.node_id.0.clone())
-                    .collect::<Vec<_>>(),
-                outcome.attempted_candidate_indices,
-            )
-        };
-        // The entrypoint node 2 is established through the base file's
-        // incoming IMPORT; the earliest pending candidate with that identity
-        // is promoted regardless of its display strings.
-        let (first_hits, first_attempted) = outcome_for("animate", "zzz_unrelated");
-        let (second_hits, second_attempted) = outcome_for("zzz_unrelated", "animate");
-        assert_eq!(first_hits, ["1", "2"]);
-        assert_eq!(first_hits, second_hits);
-        assert_eq!(first_attempted, HashSet::from([0, 2]));
-        assert_eq!(first_attempted, second_attempted);
-    }
-
-    /// R2: widened kinds run one separate bounded trail each, so a
-    /// high-fanout widened kind saturates its own trail (and reports
-    /// truncation for rule 7) while every CALL edge survives untouched.
-    #[test]
-    fn r2_widened_member_fanout_cannot_evict_call_and_reports_truncation() {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("src/hub.rs"),
-                language: "rust".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 400,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        let mut nodes = vec![
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(1),
-                kind: NodeKind::FILE,
-                serialized_name: "src/hub.rs".into(),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(10),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "hub".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(2),
-                ..Default::default()
-            },
-        ];
-        nodes.extend((0..3).map(|index| codestory_contracts::graph::Node {
-            id: CoreNodeId(20 + index),
-            kind: NodeKind::FUNCTION,
-            serialized_name: format!("callee_{index}"),
-            file_node_id: Some(CoreNodeId(1)),
-            start_line: Some(10 + index as u32),
-            ..Default::default()
-        }));
-        nodes.extend((0..80).map(|index| codestory_contracts::graph::Node {
-            id: CoreNodeId(100 + index),
-            kind: NodeKind::CLASS,
-            serialized_name: format!("owner_{index}"),
-            file_node_id: Some(CoreNodeId(1)),
-            start_line: Some(50 + index as u32),
-            ..Default::default()
-        }));
-        nodes.extend((0..2).map(|index| codestory_contracts::graph::Node {
-            id: CoreNodeId(200 + index),
-            kind: NodeKind::VARIABLE,
-            serialized_name: format!("used_{index}"),
-            file_node_id: Some(CoreNodeId(1)),
-            start_line: Some(200 + index as u32),
-            ..Default::default()
-        }));
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        let mut edges = (0..3)
-            .map(|index| codestory_contracts::graph::Edge {
-                id: codestory_contracts::graph::EdgeId(300 + index),
-                source: CoreNodeId(10),
-                target: CoreNodeId(20 + index),
-                kind: EdgeKind::CALL,
-                certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
-                file_node_id: Some(CoreNodeId(1)),
-                line: Some(10 + index as u32),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        edges.extend((0..80).map(|index| codestory_contracts::graph::Edge {
-            id: codestory_contracts::graph::EdgeId(1_000 + index),
-            source: CoreNodeId(100 + index),
-            target: CoreNodeId(10),
-            kind: EdgeKind::MEMBER,
-            file_node_id: Some(CoreNodeId(1)),
-            ..Default::default()
-        }));
-        edges.extend((0..2).map(|index| codestory_contracts::graph::Edge {
-            id: codestory_contracts::graph::EdgeId(500 + index),
-            source: CoreNodeId(10),
-            target: CoreNodeId(200 + index),
-            kind: EdgeKind::USAGE,
-            file_node_id: Some(CoreNodeId(1)),
-            ..Default::default()
-        }));
-        storage.insert_edges_batch(&edges).expect("insert edges");
-
-        let session = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
-            crate::agent::packet_candidate::PacketAtomHydrationSpec {
-                rooted: vec![(
-                    ApiNodeKind::FUNCTION,
-                    vec![
-                        codestory_contracts::api::EdgeKind::MEMBER,
-                        codestory_contracts::api::EdgeKind::USAGE,
-                    ],
-                )],
-                file_structural: false,
-                absence_kinds: vec![codestory_contracts::api::EdgeKind::USAGE],
-                promotion_patterns: Vec::new(),
-                role_scoring_patterns: Vec::new(),
-                formulas: Vec::new(),
-            },
-        ));
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-
-        // Gate round 2, in-loop bound: the stage clock runs the baseline
-        // CALL trails plus the depth-1 IDENTITY kinds only — MEMBER (an
-        // identity establisher, its saturating fanout recording rule-7
-        // truncation in-loop) runs; USAGE (not an identity kind) must NOT.
-        let candidate = node_candidate("src/hub.rs", "10", "hub");
-        let outcome = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &[candidate],
-            1,
-        )
-        .expect("resolve hub candidate");
-        let packet_hit = outcome.packet_hits.first().expect("packet hit");
-        let in_loop_graph = packet_hit.graph.as_ref().expect("graph");
-        for call_edge in ["300", "301", "302"] {
-            assert!(
-                in_loop_graph
-                    .edges
-                    .iter()
-                    .any(|edge| edge.id.0 == call_edge),
-                "the baseline CALL hydration must retain CALL edge {call_edge}"
-            );
-        }
-        // Gate 5c: MEMBER and USAGE are not cross-container kinds, so NO
-        // widened identity trail runs in-loop for this spec — the stage
-        // clock carries exactly the baseline CALL hydration; the MEMBER and
-        // USAGE trails (and their rule-7 truncation records) belong to the
-        // post-pass below.
-        assert!(
-            !in_loop_graph
-                .edges
-                .iter()
-                .any(|edge| edge.kind != codestory_contracts::api::EdgeKind::CALL),
-            "only baseline CALL edges may hydrate on the stage clock"
-        );
-        assert!(
-            packet_hit
-                .trail_scans
-                .iter()
-                .all(|scan| scan.edge_kinds == vec![codestory_contracts::api::EdgeKind::CALL]),
-            "in-loop scans are the baseline CALL trails only: {:?}",
-            packet_hit.trail_scans
-        );
-
-        // POST-PASS: the full atom-kind trails (including USAGE) run over
-        // the retained set, fill the ledger, keep every CALL edge untouched,
-        // and record truncation honestly for rule 7.
-        let mut answer = sidecar_answer_with_citation_node("10");
-        crate::agent::packet_candidate::merge_packet_candidate_graph_for_requirements(
-            &mut answer,
-            packet_hit,
-            &[],
-        );
-        let call_edges_before = answer
-            .graphs
-            .iter()
-            .filter_map(|artifact| match artifact {
-                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
-                GraphArtifactDto::Mermaid { .. } => None,
-            })
-            .flatten()
-            .filter(|edge| edge.kind == codestory_contracts::api::EdgeKind::CALL)
-            .count();
-        hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
-
-        let post_pass = answer
-            .graphs
-            .iter()
-            .find_map(|artifact| match artifact {
-                GraphArtifactDto::Uml { id, graph, .. }
-                    if id.starts_with(PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX) =>
-                {
-                    Some(graph)
-                }
-                _ => None,
-            })
-            .expect("post-pass hydration artifact");
-        assert!(
-            post_pass
-                .edges
-                .iter()
-                .any(|edge| edge.kind == codestory_contracts::api::EdgeKind::MEMBER),
-            "the post-pass runs the widened MEMBER trails"
-        );
-        assert!(
-            post_pass
-                .edges
-                .iter()
-                .any(|edge| edge.kind == codestory_contracts::api::EdgeKind::USAGE),
-            "the post-pass runs the deferred USAGE trails"
-        );
-        assert!(post_pass.truncated, "80 members overflow the 65-node cap");
-        let call_edges_after = answer
-            .graphs
-            .iter()
-            .filter_map(|artifact| match artifact {
-                GraphArtifactDto::Uml { graph, .. } => Some(graph.edges.iter()),
-                GraphArtifactDto::Mermaid { .. } => None,
-            })
-            .flatten()
-            .filter(|edge| edge.kind == codestory_contracts::api::EdgeKind::CALL)
-            .count();
-        assert_eq!(
-            call_edges_before, call_edges_after,
-            "the post-pass never evicts CALL evidence"
-        );
-
-        let ledger = session.artifact_scans();
-        let (_, scans) = ledger
-            .iter()
-            .find(|(artifact_id, _)| artifact_id.starts_with(PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX))
-            .expect("post-pass ledger entry");
-        let member_incoming = scans
-            .iter()
-            .find(|scan| {
-                scan.direction == PacketGraphDirection::Incoming
-                    && scan.edge_kinds == vec![codestory_contracts::api::EdgeKind::MEMBER]
-            })
-            .expect("incoming MEMBER scan record");
-        assert!(
-            member_incoming.truncated,
-            "an over-cap scan must record truncation for rule 7: {member_incoming:?}"
-        );
-        let member_outgoing = scans
-            .iter()
-            .find(|scan| {
-                scan.direction == PacketGraphDirection::Outgoing
-                    && scan.edge_kinds == vec![codestory_contracts::api::EdgeKind::MEMBER]
-            })
-            .expect("outgoing MEMBER scan record");
-        assert!(
-            !member_outgoing.truncated && member_outgoing.coverage_edge_ids.is_empty(),
-            "an empty untruncated scan is recorded — absence facts need it: {member_outgoing:?}"
-        );
-
-        // Idempotence: a second post-pass changes nothing.
-        let graphs_snapshot = serde_json::to_value(&answer.graphs).expect("graphs");
-        hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
-        assert_eq!(
-            serde_json::to_value(&answer.graphs).expect("graphs"),
-            graphs_snapshot
-        );
-        assert_eq!(session.artifact_scans().len(), ledger.len());
-    }
-
-    /// Minimal answer fixture with one citation, for post-pass tests.
-    fn sidecar_answer_with_citation_node(node_id: &str) -> AgentAnswerDto {
-        AgentAnswerDto {
-            answer_id: "post-pass".into(),
-            prompt: "post-pass".into(),
-            summary: String::new(),
-            freshness: None,
-            sections: Vec::new(),
-            citations: vec![codestory_contracts::api::AgentCitationDto {
-                node_id: NodeId(node_id.to_string()),
-                display_name: format!("node-{node_id}"),
-                kind: ApiNodeKind::FUNCTION,
-                file_path: Some("src/hub.rs".into()),
-                line: Some(2),
-                score: 0.9,
-                origin: SearchHitOrigin::IndexedSymbol,
-                target: None,
-                resolvable: true,
-                subgraph_id: None,
-                evidence_edge_ids: Vec::new(),
-                retrieval_score_breakdown: None,
-                evidence_tier: None,
-                evidence_producer: None,
-                resolution_status: None,
-                loss_reason: None,
-                coverage_role: None,
-                eligible_for_sufficiency: Some(true),
-                source_excerpt: None,
-            }],
-            subgraph_ids: Vec::new(),
-            retrieval_version: "sidecar".into(),
-            graphs: Vec::new(),
-            source_coverage: Vec::new(),
-            retrieval_trace: codestory_contracts::api::AgentRetrievalTraceDto {
-                request_id: "post-pass".into(),
-                retrieval_publication: None,
-                resolved_profile: codestory_contracts::api::AgentRetrievalPresetDto::Architecture,
-                policy_mode: codestory_contracts::api::AgentRetrievalPolicyModeDto::LatencyFirst,
-                total_latency_ms: 0,
-                sla_target_ms: None,
-                sla_missed: false,
-                semantic_fallback_count: 0,
-                semantic_fallbacks: Vec::new(),
-                semantic_stage_timeout_zero_hits: 0,
-                semantic_abstained_count: 0,
-                annotations: Vec::new(),
-                packet_claim_profile_telemetry: None,
-                source_freshness_telemetry: None,
-                steps: Vec::new(),
-                packet_sidecar_diagnostics: Vec::new(),
-                retrieval_shadow: None,
-            },
-        }
-    }
-
-    /// The post-pass over a retained FILE citation runs the depth-2 uniform
-    /// structural trails, fills the ledger with NARROWED coverage sets (the
-    /// absence-subject USAGE edges plus the depth-2 MEMBER witnesses — never
-    /// the incidental IMPORT edge), and stays within its cost budget.
-    #[test]
-    fn post_pass_fills_ledger_with_narrowed_coverage_for_retained_file_roots() {
-        let storage = css_bootstrap_storage();
-        let session = file_structural_session();
-        let mut answer = sidecar_answer_with_citation_node("1");
-        answer.citations[0].kind = ApiNodeKind::FILE;
-        answer.citations[0].file_path = Some("styles/_base.css".into());
-
-        hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
-
-        let post_pass = answer
-            .graphs
-            .iter()
-            .find_map(|artifact| match artifact {
-                GraphArtifactDto::Uml { id, graph, .. }
-                    if id == &format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}1") =>
-                {
-                    Some(graph)
-                }
-                _ => None,
-            })
-            .expect("post-pass artifact for the retained stylesheet");
-        for required in ["101", "102", "103"] {
-            assert!(
-                post_pass.edges.iter().any(|edge| edge.id.0 == required),
-                "structural edge {required} must be hydrated by the post-pass"
-            );
-        }
-
-        let ledger = session.artifact_scans();
-        let (_, scans) = ledger
-            .iter()
-            .find(|(artifact_id, _)| {
-                artifact_id == &format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}1")
-            })
-            .expect("ledger entry for the post-pass artifact");
-        assert_eq!(scans.len(), 2, "one depth-2 scan per direction: {scans:?}");
-        let outgoing = scans
-            .iter()
-            .find(|scan| scan.direction == PacketGraphDirection::Outgoing)
-            .expect("outgoing structural scan");
-        assert_eq!(outgoing.depth, 2);
-        assert_eq!(
-            outgoing.edge_kinds,
-            vec![
-                codestory_contracts::api::EdgeKind::MEMBER,
-                codestory_contracts::api::EdgeKind::USAGE,
-                codestory_contracts::api::EdgeKind::IMPORT,
-            ]
-        );
-        assert!(!outgoing.truncated);
-        // Narrowing (F3 finding 3): USAGE 103 (absence subject) and MEMBER
-        // 101 (depth-2 witness) are recorded; the IMPORT edges are not.
-        let mut recorded = outgoing
-            .coverage_edge_ids
-            .iter()
-            .map(|edge_id| edge_id.0.as_str())
-            .collect::<Vec<_>>();
-        recorded.sort_unstable();
-        assert_eq!(
-            recorded,
-            ["101", "103", "104"],
-            "the narrowed set is the absence subject plus the MEMBER witnesses"
-        );
-        let incoming = scans
-            .iter()
-            .find(|scan| scan.direction == PacketGraphDirection::Incoming)
-            .expect("incoming structural scan");
-        assert!(
-            !incoming
-                .coverage_edge_ids
-                .iter()
-                .any(|edge_id| edge_id.0 == "102"),
-            "the incidental IMPORT edge never joins a coverage set: {incoming:?}"
-        );
-    }
-
-    /// Gate round 2, finding 1 — the cross-query bootstrap shape the
-    /// single-pass test cannot catch: identities established while resolving
-    /// QUERY 1's candidates must promote candidates sitting in QUERY 2's
-    /// window, because the R6 promotion state lives in the packet-scoped
-    /// session, not per resolution call. Negative first: without a shared
-    /// session the second query falls back to base order.
-    #[test]
-    fn r6_identities_established_in_one_query_promote_candidates_in_later_queries() {
-        let storage = css_bootstrap_storage();
-        let query_one = vec![file_shaped_candidate("styles/_base.css")];
-        let query_two = vec![
-            node_candidate("src/other.rs", "5", "unrelated_filler"),
-            // Decoy (rev 5.3): node 9 was hydrated as a MEMBER endpoint in
-            // query 1, but its FIELD-kind edge matches no unproven C atom
-            // pattern — an identity that merely exists must not promote.
-            node_candidate("styles/_base.css", "9", "decoy_field"),
-            file_shaped_candidate("styles/animate.css"),
-        ];
-
-        // Without an installed session each call gets a throwaway identity
-        // scope: query 2 never sees query 1's identities and admits by base
-        // order.
-        {
-            let session = file_structural_session();
-            let _guard =
-                crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-            resolve_sidecar_candidates_in_storage(
-                &storage,
-                &HashMap::new(),
-                Path::new("."),
-                &query_one,
-                1,
-            )
-            .expect("resolve query one");
-        }
-        let isolated = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &query_two,
-            1,
-        )
-        .expect("resolve query two without shared session");
-        assert_eq!(
-            isolated
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["5"],
-            "without cross-query identity state the filler wins by base order"
-        );
-
-        // With ONE session across both queries, the base stylesheet's
-        // identity trails in query 1 establish the animation file's canonical
-        // id (incoming IMPORT), and query 2 promotes it over the filler.
-        let session = file_structural_session();
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        let first = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &query_one,
-            1,
-        )
-        .expect("resolve query one");
-        assert_eq!(first.resolved_hits.len(), 1);
-        let second = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &query_two,
-            1,
-        )
-        .expect("resolve query two under the shared session");
-        assert_eq!(
-            second
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["2"],
-            "query 1's atom-needed identity must promote query 2's beyond-window candidate"
-        );
-        assert_eq!(
-            second.attempted_candidate_indices,
-            HashSet::from([2]),
-            "the pattern-matched entrypoint promotes; the decoy and the filler are displaced"
-        );
-    }
-
-    /// Rev 5.3 point 2 — all-Legacy inertness: with no formula-bearing
-    /// requirements the promotion need-set can never populate, and admission
-    /// under an installed session is bit-identical to no session at all —
-    /// same resolved set, same order, same attempted indices.
-    #[test]
-    fn r6_all_legacy_session_admission_is_bit_identical_to_no_session() {
-        let storage = css_bootstrap_storage();
-        let candidates = vec![
-            file_shaped_candidate("styles/_base.css"),
-            node_candidate("src/other.rs", "5", "unrelated_filler"),
-            file_shaped_candidate("styles/animate.css"),
-        ];
-        let baseline = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            2,
-        )
-        .expect("resolve without session");
-
-        let legacy_requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how a server application registers middleware, handles a request, and sends the response.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::RouteTracing,
-            );
-        let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements);
-        assert!(
-            spec.promotion_patterns.is_empty(),
-            "all-Legacy requirements must derive no promotion patterns"
-        );
-        // Round 5.5 item 2: no cross-container pattern means no promotion
-        // SLOT either, so admission cannot even express a promotion.
-        assert!(
-            spec.promotion_role_slots().is_empty(),
-            "all-Legacy requirements must derive no promotion slots"
-        );
-        assert!(
-            spec.role_scoring_patterns.is_empty(),
-            "all-Legacy requirements carry no typed pattern to score with either"
-        );
-        let session = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
-            spec,
-        ));
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        let under_session = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            2,
-        )
-        .expect("resolve under all-Legacy session");
-
-        assert_eq!(
-            baseline
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.clone())
-                .collect::<Vec<_>>(),
-            under_session
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.clone())
-                .collect::<Vec<_>>(),
-            "all-Legacy admission must be bit-identical to pre-R6 behavior"
-        );
-        assert_eq!(
-            baseline.attempted_candidate_indices,
-            under_session.attempted_candidate_indices
-        );
-        assert_eq!(
-            baseline.unresolved_candidate_count,
-            under_session.unresolved_candidate_count
-        );
-        assert!(
-            !session.has_atom_needed_identities(),
-            "no pattern, no need — the set must stay empty"
-        );
-        assert!(
-            !session.promotion_is_active(),
-            "promotion stays structurally inert for all-Legacy packets"
-        );
-        assert!(
-            session.retired_requirements().is_empty(),
-            "the query-boundary checkpoint is a no-op without formulas"
-        );
-    }
-
-    /// Rev 5.3 point 3 — M-shard no-displacement: the M atoms join only
-    /// FlowOwner (the CALL source, already baseline-hydrated); M3's dispatch
-    /// target is an `Any` endpoint, so even rich need-set accumulation from
-    /// matching dispatch edges promotes nothing and admission stays
-    /// identical to no session.
-    #[test]
-    fn r6_m_shard_accumulation_produces_no_displacement() {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("src/logger.php"),
-                language: "php".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 60,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        storage
-            .insert_nodes_batch(&[
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(1),
-                    kind: NodeKind::FILE,
-                    serialized_name: "src/logger.php".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(10),
-                    kind: NodeKind::FUNCTION,
-                    serialized_name: "invokeHandlers".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(8),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(20),
-                    kind: NodeKind::METHOD,
-                    serialized_name: "Handler.handle".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(30),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(5),
-                    kind: NodeKind::FUNCTION,
-                    serialized_name: "unrelated_filler".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(50),
-                    ..Default::default()
-                },
-            ])
-            .expect("insert nodes");
-        storage
-            .insert_edges_batch(&[codestory_contracts::graph::Edge {
-                id: codestory_contracts::graph::EdgeId(600),
-                source: CoreNodeId(10),
-                target: CoreNodeId(20),
-                kind: EdgeKind::CALL,
-                resolved_target: Some(CoreNodeId(20)),
-                certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
-                callsite_identity: Some(
-                    "src/logger.php:10:5:handle|syntax:php-call|receiver-owner:handler|receiver-binding:loop-element@8-14"
-                        .to_string(),
-                ),
-                file_node_id: Some(CoreNodeId(1)),
-                line: Some(10),
-                ..Default::default()
-            }])
-            .expect("insert edge");
-
-        let candidates = vec![
-            node_candidate("src/logger.php", "10", "invokeHandlers"),
-            node_candidate("src/logger.php", "5", "unrelated_filler"),
-            node_candidate("src/logger.php", "20", "Handler.handle"),
-        ];
-        let baseline = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            2,
-        )
-        .expect("resolve without session");
-
-        let m_requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the logger creates a log record and dispatches it to each handler for processing.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
-        let spec = crate::agent::packet_candidate::packet_atom_hydration_spec(&m_requirements);
-        // Rev 5.4: the M formula names only CALL — no cross-container kind —
-        // so it derives ZERO promotion patterns and admission is
-        // structurally inert, not merely endpoint-shaped.
-        assert!(
-            spec.promotion_patterns.is_empty(),
-            "CALL is not cross-container; the M spec must derive no promotion patterns"
-        );
-        // Round 5.5 item 2: zero cross-container patterns → zero promotion
-        // slots → the M shard is structurally unchanged, not merely quiet.
-        assert!(
-            spec.promotion_role_slots().is_empty(),
-            "the M spec must derive no promotion slots"
-        );
-        assert!(
-            !spec.role_scoring_patterns.is_empty(),
-            "the M formulas do carry typed patterns — what makes the shard inert \
-             is the absent CROSS-CONTAINER pattern, not an absent formula"
-        );
-        let session = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
-            spec,
-        ));
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        let under_session = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            2,
-        )
-        .expect("resolve under M session");
-
-        assert!(
-            !session.has_atom_needed_identities(),
-            "rev 5.4: a CALL-only formula accumulates nothing at all"
-        );
-        assert!(
-            !session.identity_is_atom_needed(20),
-            "M3's dispatch target never becomes atom-needed"
-        );
-        // Gate 6: with no promotion pattern the scoring path is never
-        // entered at all — no attribution, no score, no ordering decision.
-        for identity in [10, 20, 5] {
-            assert_eq!(
-                session.promotion_priority(identity),
-                0,
-                "zero promotion patterns means zero scoring work: {identity}"
-            );
-        }
-        assert_eq!(
-            baseline
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.clone())
-                .collect::<Vec<_>>(),
-            under_session
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.clone())
-                .collect::<Vec<_>>(),
-            "rich M accumulation must produce no displacement"
-        );
-        assert_eq!(
-            baseline.attempted_candidate_indices,
-            under_session.attempted_candidate_indices
-        );
-        assert!(
-            !session.promotion_is_active(),
-            "promotion stays structurally inert for the M shard"
-        );
-        assert!(
-            session.retired_requirements().is_empty(),
-            "with no promotion pattern there is nothing the checkpoint could retire"
-        );
-    }
-
-    /// Gate round 2, finding 2 — the A-shard bootstrap: a CLASS root under an
-    /// A-family spec runs depth-1 [TYPE_USAGE, MEMBER] identity trails
-    /// in-loop, the certain TYPE_USAGE edge establishes the config type's
-    /// identity, and the TypeMap-shaped candidate beyond the window is
-    /// promoted over the filler.
-    #[test]
-    fn r6_a_shard_type_usage_identity_trail_promotes_beyond_window_candidate() {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("src/builder.cs"),
-                language: "csharp".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 60,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        storage
-            .insert_nodes_batch(&[
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(1),
-                    kind: NodeKind::FILE,
-                    serialized_name: "src/builder.cs".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(1),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(10),
-                    kind: NodeKind::CLASS,
-                    serialized_name: "TypeMapPlanBuilder".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(5),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(30),
-                    kind: NodeKind::CLASS,
-                    serialized_name: "TypeMap".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(30),
-                    ..Default::default()
-                },
-                // Gate 6: a lone configuration TARGET — one role position.
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(32),
-                    kind: NodeKind::CLASS,
-                    serialized_name: "ResolutionContext".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(32),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(5),
-                    kind: NodeKind::FUNCTION,
-                    serialized_name: "unrelated_filler".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(50),
-                    ..Default::default()
-                },
-                // Decoy (rev 5.3): a FIELD member of the builder — hydrated by
-                // the MEMBER identity trail, but A3's MEMBER pattern names
-                // METHOD targets, so this identity is never atom-needed.
-                codestory_contracts::graph::Node {
-                    id: CoreNodeId(50),
-                    kind: NodeKind::FIELD,
-                    serialized_name: "decoy_field".into(),
-                    file_node_id: Some(CoreNodeId(1)),
-                    start_line: Some(9),
-                    ..Default::default()
-                },
-            ])
-            .expect("insert nodes");
-        storage
-            .insert_edges_batch(&[
-                codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(400),
-                    source: CoreNodeId(10),
-                    target: CoreNodeId(30),
-                    kind: EdgeKind::TYPE_USAGE,
-                    certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
-                    file_node_id: Some(CoreNodeId(1)),
-                    line: Some(7),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(401),
-                    source: CoreNodeId(10),
-                    target: CoreNodeId(50),
-                    kind: EdgeKind::MEMBER,
-                    file_node_id: Some(CoreNodeId(1)),
-                    ..Default::default()
-                },
-                // Gate 6: the plan type also stands in the SOURCE position of
-                // the config atom, giving it two role positions to the lone
-                // target's one.
-                codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(402),
-                    source: CoreNodeId(30),
-                    target: CoreNodeId(10),
-                    kind: EdgeKind::TYPE_USAGE,
-                    certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
-                    file_node_id: Some(CoreNodeId(1)),
-                    line: Some(31),
-                    ..Default::default()
-                },
-                codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(403),
-                    source: CoreNodeId(10),
-                    target: CoreNodeId(32),
-                    kind: EdgeKind::TYPE_USAGE,
-                    certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
-                    file_node_id: Some(CoreNodeId(1)),
-                    line: Some(33),
-                    ..Default::default()
-                },
-            ])
-            .expect("insert edges");
-
-        let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "How does the mapper build its configuration and execution plan?",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
-        let session = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
-            crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
-        ));
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        let candidates = vec![
-            node_candidate("src/builder.cs", "10", "TypeMapPlanBuilder"),
-            node_candidate("src/builder.cs", "5", "unrelated_filler"),
-            // Decoy (rev 5.3): hydrated as a MEMBER endpoint, but matching no
-            // unproven A atom pattern — it must NOT promote.
-            node_candidate("src/builder.cs", "50", "decoy_field"),
-            // Gate 6: the lone configuration target sits EARLIER in base
-            // order than the two-position identity behind it.
-            node_candidate("src/builder.cs", "32", "ResolutionContext"),
-            node_candidate("src/builder.cs", "30", "TypeMap"),
-        ];
-        let outcome = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            2,
-        )
-        .expect("resolve A-shard candidates");
-        assert_eq!(
-            outcome
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["10", "30"],
-            "the atom-needed TYPE_USAGE identity must promote TypeMap over filler and decoy"
-        );
-        assert_eq!(outcome.attempted_candidate_indices, HashSet::from([0, 4]));
-        assert!(
-            !session.identity_is_atom_needed(50),
-            "the decoy MEMBER endpoint matches no A pattern and is never atom-needed"
-        );
-        // Gate 6: multiplicity, not base order, decided which identity got
-        // the ConfigType-family slot.
-        assert_eq!(
-            (
-                session.promotion_priority(30),
-                session.promotion_priority(32)
-            ),
-            (2, 1),
-            "the two-position plan type outranks the lone configuration target"
-        );
-        assert!(
-            session.identity_is_atom_needed(32),
-            "the lone target is still needed — it was outranked, not excluded"
-        );
-
-        let builder_hit = outcome
-            .packet_hits
-            .iter()
-            .find(|hit| hit.hit.node_id.0 == "10")
-            .expect("builder packet hit");
-        let graph = builder_hit.graph.as_ref().expect("identity graph");
-        assert!(
-            graph.edges.iter().any(|edge| edge.id.0 == "400"),
-            "the TYPE_USAGE identity edge must be hydrated in-loop"
-        );
-        for scan in &builder_hit.trail_scans {
-            assert_eq!(scan.depth, 1, "identity trails stay depth-1: {scan:?}");
-            assert_eq!(
-                scan.edge_kinds.len(),
-                1,
-                "non-FILE identity trails are single-kind: {scan:?}"
-            );
-        }
-        let scanned_kinds = builder_hit
-            .trail_scans
-            .iter()
-            .map(|scan| scan.edge_kinds[0])
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            scanned_kinds,
-            HashSet::from([codestory_contracts::api::EdgeKind::TYPE_USAGE]),
-            "gate 5c: in-loop identity kinds are the rooted kinds ∩ cross-container set"
-        );
-    }
-
-    /// Gate round 4 telemetry: the armed session records the need-set with
-    /// per-id pattern provenance, per-query admission decisions with the
-    /// promoted flag, and the derived why-not attribution for the
-    /// un-attempted remainder — rendered into the `r6_session` step-trace
-    /// section.
-    #[test]
-    fn r6_session_trace_records_need_set_provenance_and_admission_decisions() {
-        let storage = css_bootstrap_storage();
-        let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
-        let session = Rc::new(
-            crate::agent::packet_candidate::PacketProofSession::new(
-                crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
-            )
-            .with_trace_enabled(),
-        );
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        let query_one = vec![file_shaped_candidate("styles/_base.css")];
-        let query_two = vec![
-            node_candidate("src/other.rs", "5", "unrelated_filler"),
-            file_shaped_candidate("styles/animate.css"),
-        ];
-        resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &query_one,
-            1,
-        )
-        .expect("resolve query one");
-        resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &query_two,
-            1,
-        )
-        .expect("resolve query two");
-
-        let trace = session.r6_trace_json();
-        assert!(trace["promotion_pattern_count"].as_u64().unwrap() > 0);
-        let need_set = trace["need_set"].as_array().expect("need_set");
-        assert!(
-            need_set.iter().any(|entry| {
-                entry["node_id"].as_i64() == Some(2)
-                    && entry["pattern_kind"].as_str() == Some("IMPORT")
-            }),
-            "the entrypoint identity carries its IMPORT pattern provenance: {need_set:?}"
-        );
-        let admissions = trace["query_admissions"].as_array().expect("admissions");
-        assert_eq!(admissions.len(), 2, "one admission record per query");
-        assert_eq!(admissions[0]["query_index"].as_u64(), Some(0));
-        let q1_admitted = admissions[0]["admitted"].as_array().unwrap();
-        assert_eq!(q1_admitted[0]["node_id"].as_str(), Some("1"));
-        assert_eq!(q1_admitted[0]["promoted"].as_bool(), Some(false));
-        let q2_admitted = admissions[1]["admitted"].as_array().unwrap();
-        assert_eq!(q2_admitted[0]["node_id"].as_str(), Some("2"));
-        assert_eq!(
-            q2_admitted[0]["promoted"].as_bool(),
-            Some(true),
-            "the cross-query promotion is attributed"
-        );
-        let q2_unattempted = admissions[1]["unattempted"].as_array().unwrap();
-        assert!(
-            q2_unattempted
-                .iter()
-                .any(|entry| entry["why_not"].as_str() == Some("not_in_need_set")),
-            "the displaced filler is attributed: {q2_unattempted:?}"
-        );
-        assert!(
-            !trace["identity_hydrations"].as_array().unwrap().is_empty(),
-            "identity-trail hydrations are summarized per root"
-        );
-    }
-
-    /// Gate 9 item 2 — the fourth selection. A deadline-cancelled batch query
-    /// used to contribute NOTHING: every candidate it had already resolved
-    /// was discarded before scoring, ranking or carry could see it. The
-    /// AutoMapper shard measured 32 of 32 queries cancelled and 327 resolved
-    /// hits thrown away, while the single-query path was already serving such
-    /// hits — a plain asymmetry, unrelated to atoms.
-    ///
-    /// Retention is therefore NOT atom-gated: every resolved hit survives,
-    /// ordered by resolution rank, with the atom signal breaking ties among
-    /// equal ranks only.
-    #[test]
-    fn deadline_cancelled_queries_retain_resolved_hits_ordered_by_rank() {
-        let hit_with = |id: i64, score: f32| {
-            let mut hit = PacketSearchHit::without_graph(SearchHit {
-                node_id: NodeId(id.to_string()),
-                display_name: format!("symbol_{id}"),
-                kind: ApiNodeKind::CLASS,
-                file_path: Some(format!("src/f{id}.rs")),
-                line: Some(1),
-                score,
-                origin: SearchHitOrigin::IndexedSymbol,
-                target: None,
-                resolvable: true,
-                match_quality: None,
-                evidence_tier: None,
-                evidence_producer: None,
-                resolution_status: None,
-                loss_reason: None,
-                coverage_role: None,
-                eligible_for_sufficiency: Some(true),
-                source_excerpt: None,
-                verification_targets: Vec::new(),
-                score_breakdown: None,
-            });
-            hit.hit.score = score;
-            hit
-        };
-        // Ranks 0.9 / 0.5 / 0.5 / 0.2: one clear leader, one tied pair, one
-        // trailer.
-        let hits = || {
-            vec![
-                hit_with(1, 0.9),
-                hit_with(2, 0.5),
-                hit_with(3, 0.5),
-                hit_with(4, 0.2),
-            ]
-        };
-        let order = |hits: Vec<PacketSearchHit>| {
-            retained_cancelled_packet_hits(hits)
-                .into_iter()
-                .map(|hit| hit.hit.node_id.0.clone())
-                .collect::<Vec<_>>()
-        };
-
-        assert_eq!(
-            order(hits()),
-            ["1", "2", "3", "4"],
-            "with no session every resolved hit is retained in rank order — \
-             the single-query path's semantics"
-        );
-
-        let legacy_requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how a server application registers middleware, handles a request, and sends the response.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::RouteTracing,
-            );
-        let legacy = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
-            crate::agent::packet_candidate::packet_atom_hydration_spec(&legacy_requirements),
-        ));
-        {
-            let _guard =
-                crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&legacy));
-            assert_eq!(
-                order(hits()),
-                ["1", "2", "3", "4"],
-                "an all-Legacy packet has no need-set, so the order is pure rank"
-            );
-        }
-
-        // Node 3 is atom-needed and TIED with node 2 at 0.5: the atom signal
-        // breaks that tie and nothing else moves. The clear leader keeps its
-        // place and the trailer keeps its place — need never overtakes rank.
-        let session = session_needing("3", "9");
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        assert!(session.identity_is_atom_needed(3));
-        assert_eq!(
-            order(hits()),
-            ["1", "3", "2", "4"],
-            "need-first applies only among equal ranks"
-        );
-        assert_eq!(order(hits()), order(hits()), "and it is deterministic");
-    }
-
-    /// A C-family session with the R6 trace armed, so the per-query
-    /// promotion SLOT accounting is observable in assertions.
-    fn traced_file_structural_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "Trace how the css animation keyframes and custom property variables are declared and used by the base selectors in the imported stylesheets.",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
-        Rc::new(
-            crate::agent::packet_candidate::PacketProofSession::new(
-                crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
-            )
-            .with_trace_enabled(),
-        )
-    }
-
-    /// The promotion roles one traced query spent, in consumption order.
-    fn promotion_roles_used(
-        session: &crate::agent::packet_candidate::PacketProofSession,
-        query_index: usize,
-    ) -> Vec<String> {
-        session.r6_trace_json()["query_admissions"][query_index]["promotion_roles_used"]
-            .as_array()
-            .expect("promotion_roles_used")
-            .iter()
-            .map(|role| role.as_str().expect("role").to_string())
-            .collect()
-    }
-
-    /// One entrypoint stylesheet importing `targets` sibling stylesheets,
-    /// plus an unrelated filler symbol — the C-shard import-closure shape.
-    fn css_entrypoint_closure_storage(targets: i64) -> Store {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        let mut files = vec![
-            (1, "styles/entry.css", "css"),
-            (900, "src/other.rs", "rust"),
-        ];
-        let target_paths = (0..targets)
-            .map(|index| (100 + index, format!("styles/t{index:02}.css")))
-            .collect::<Vec<_>>();
-        for (id, path) in &target_paths {
-            files.push((*id, path.as_str(), "css"));
-        }
-        for (id, path, language) in files {
-            storage
-                .insert_file(&FileInfo {
-                    id,
-                    path: PathBuf::from(path),
-                    language: language.to_string(),
-                    modification_time: 1,
-                    indexed: true,
-                    complete: true,
-                    line_count: 40,
-                    file_role: FileRole::Source,
-                })
-                .expect("insert file");
-        }
-        let mut nodes = vec![
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(1),
-                kind: NodeKind::FILE,
-                serialized_name: "styles/entry.css".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(1),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(900),
-                kind: NodeKind::FILE,
-                serialized_name: "src/other.rs".into(),
-                file_node_id: Some(CoreNodeId(900)),
-                start_line: Some(1),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(5),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "unrelated_filler".into(),
-                file_node_id: Some(CoreNodeId(900)),
-                start_line: Some(2),
-                ..Default::default()
-            },
-        ];
-        nodes.extend(
-            target_paths
-                .iter()
-                .map(|(id, path)| codestory_contracts::graph::Node {
-                    id: CoreNodeId(*id),
-                    kind: NodeKind::FILE,
-                    serialized_name: path.clone(),
-                    file_node_id: Some(CoreNodeId(*id)),
-                    start_line: Some(1),
-                    ..Default::default()
-                }),
-        );
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        let edges = (0..targets)
-            .map(|index| codestory_contracts::graph::Edge {
-                id: codestory_contracts::graph::EdgeId(2_000 + index),
-                source: CoreNodeId(1),
-                target: CoreNodeId(100 + index),
-                kind: EdgeKind::IMPORT,
-                file_node_id: Some(CoreNodeId(1)),
-                line: Some(2 + index as u32),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        storage.insert_edges_batch(&edges).expect("insert edges");
-        storage
-    }
-
-    /// Round 5.5 item 2a — C shard: promotion is capped at FOUR per query,
-    /// the atom-derived slot count (the entrypoint role plus the three
-    /// source-file roles the C IMPORT patterns name). A fifth atom-needed
-    /// candidate finds no free slot and admission falls back to base order
-    /// for the rest of the query — retirement and slots silence promotion
-    /// only, they never change base-order admission.
-    #[test]
-    fn r6_c_shard_promotions_are_capped_at_the_four_atom_derived_role_slots() {
-        let storage = css_entrypoint_closure_storage(6);
-        let session = traced_file_structural_session();
-        assert_eq!(
-            session.hydration.promotion_role_slots().len(),
-            4,
-            "the C formulas derive exactly four promotion slots"
-        );
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-
-        // Query 0 bootstraps: the entrypoint resolves in base order and its
-        // depth-1 IMPORT identity trail establishes the closure.
-        resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &[file_shaped_candidate("styles/entry.css")],
-            1,
-        )
-        .expect("bootstrap query");
-        assert!(
-            promotion_roles_used(&session, 0).is_empty(),
-            "the bootstrap query has nothing to promote yet"
-        );
-
-        // Query 1 offers five atom-needed identities behind a filler: four
-        // source/entrypoint slots exist, so exactly four promotions happen.
-        let candidates = vec![
-            node_candidate("src/other.rs", "5", "unrelated_filler"),
-            node_candidate("styles/t00.css", "100", "t00"),
-            node_candidate("styles/t01.css", "101", "t01"),
-            node_candidate("styles/t02.css", "102", "t02"),
-            node_candidate("styles/entry.css", "1", "entry"),
-            node_candidate("styles/t03.css", "103", "t03"),
-        ];
-        let outcome = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            6,
-        )
-        .expect("slot-bounded query");
-        assert_eq!(
-            promotion_roles_used(&session, 1),
-            vec!["VarsSource", "BaseSource", "AnimSource", "Entrypoint"],
-            "each of the four atom-derived roles is spent exactly once"
-        );
-        assert_eq!(
-            outcome
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["100", "101", "102", "1", "5", "103"],
-            "after the four slots are spent admission returns to base order"
-        );
-        assert!(
-            session.identity_is_atom_needed(103),
-            "the fifth identity is still needed — it simply had no free slot"
-        );
-
-        // Slots are PER QUERY: the next query re-opens them.
-        let next = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &[
-                node_candidate("src/other.rs", "5", "unrelated_filler"),
-                node_candidate("styles/t03.css", "103", "t03"),
-            ],
-            1,
-        )
-        .expect("next query");
-        assert_eq!(
-            next.resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["103"],
-            "a fresh query re-opens the source slots"
-        );
-        assert!(
-            session.retired_requirements().is_empty(),
-            "the C requirements each carry a carrier-range atom, so nothing can \
-             retire mid-retrieval — the need-gate keeps hunting"
-        );
-
-        // Telemetry: a needed identity left un-attempted because its roles
-        // were all spent is attributed to the SLOT bound, not to the
-        // resolution budget — the two are different diagnoses at the gate.
-        resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &[
-                node_candidate("styles/t00.css", "100", "t00"),
-                node_candidate("styles/t01.css", "101", "t01"),
-                node_candidate("styles/t02.css", "102", "t02"),
-                node_candidate("styles/t03.css", "103", "t03"),
-                node_candidate("styles/t04.css", "104", "t04"),
-            ],
-            4,
-        )
-        .expect("slot-exhaustion query");
-        let unattempted = session.r6_trace_json()["query_admissions"][3]["unattempted"].clone();
-        assert_eq!(
-            unattempted
-                .as_array()
-                .expect("unattempted")
-                .iter()
-                .filter(|entry| entry["why_not"].as_str() == Some("slot_exhausted"))
-                .count(),
-            1,
-            "the identity whose every role was spent is attributed to the slot \
-             bound: {unattempted:?}"
-        );
-    }
-
-    /// Round 5.5 item 2a — C shard pace: four slots per query leave the gate
-    /// 5c measurement (12 promotions across 9 queries) intact, and no query
-    /// ever exceeds its slot count.
-    #[test]
-    fn r6_c_shard_role_slots_preserve_the_gate_pace_across_nine_queries() {
-        let storage = css_entrypoint_closure_storage(20);
-        let session = traced_file_structural_session();
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &[file_shaped_candidate("styles/entry.css")],
-            1,
-        )
-        .expect("bootstrap query");
-
-        let mut promotions = 0usize;
-        for query in 0..9 {
-            let first = 100 + query * 2;
-            let candidates = vec![
-                node_candidate("src/other.rs", "5", "unrelated_filler"),
-                node_candidate(
-                    &format!("styles/t{:02}.css", query * 2),
-                    &first.to_string(),
-                    "target",
-                ),
-                node_candidate(
-                    &format!("styles/t{:02}.css", query * 2 + 1),
-                    &(first + 1).to_string(),
-                    "target",
-                ),
-            ];
-            resolve_sidecar_candidates_in_storage(
-                &storage,
-                &HashMap::new(),
-                Path::new("."),
-                &candidates,
-                2,
-            )
-            .expect("pace query");
-            let spent = promotion_roles_used(&session, query + 1);
-            assert!(
-                spent.len() <= 4,
-                "no query may exceed its four atom-derived slots: {spent:?}"
-            );
-            promotions += spent.len();
-        }
-        assert!(
-            promotions >= 12,
-            "the gate 5c pace (12 promotions across 9 queries) must survive the \
-             slot bound; observed {promotions}"
-        );
-        // Gate 6 guard: multiplicity introduces NO import-order or
-        // file-position preference. Every pure import target occupies the
-        // same role positions, so their scores are equal and base order
-        // alone separates them — exactly as before.
-        let priorities = (100..120)
-            .map(|identity| session.promotion_priority(identity))
-            .collect::<HashSet<_>>();
-        assert_eq!(
-            priorities.len(),
-            1,
-            "import targets must be indistinguishable by score: {priorities:?}"
-        );
-    }
-
-    /// Round 5.5 item 2a — A shard: TWO slots per query (Builder and
-    /// ConfigType, the endpoints of A1's TYPE_USAGE pattern). The
-    /// TypeMap-shaped identity still promotes while its slot is free, a
-    /// second config-type identity finds none, and the next query re-opens
-    /// both.
-    #[test]
-    fn r6_a_shard_promotions_are_capped_at_the_two_atom_derived_role_slots() {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("src/builder.cs"),
-                language: "csharp".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 90,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        let mut nodes = vec![codestory_contracts::graph::Node {
-            id: CoreNodeId(1),
-            kind: NodeKind::FILE,
-            serialized_name: "src/builder.cs".into(),
-            file_node_id: Some(CoreNodeId(1)),
-            start_line: Some(1),
-            ..Default::default()
-        }];
-        for (id, name) in [
-            (10, "TypeMapPlanBuilder"),
-            (11, "MapperConfiguration"),
-            (30, "TypeMap"),
-            (31, "TypeMapPlan"),
-        ] {
-            nodes.push(codestory_contracts::graph::Node {
-                id: CoreNodeId(id),
-                kind: NodeKind::CLASS,
-                serialized_name: name.into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(id as u32),
-                ..Default::default()
-            });
-        }
-        for id in [5, 6] {
-            nodes.push(codestory_contracts::graph::Node {
-                id: CoreNodeId(id),
-                kind: NodeKind::FUNCTION,
-                serialized_name: format!("unrelated_filler_{id}"),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(60 + id as u32),
-                ..Default::default()
-            });
-        }
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        storage
-            .insert_edges_batch(
-                &[(400, 10, 30), (401, 10, 31), (403, 11, 10)]
-                    .into_iter()
-                    .map(|(id, source, target)| codestory_contracts::graph::Edge {
-                        id: codestory_contracts::graph::EdgeId(id),
-                        source: CoreNodeId(source),
-                        target: CoreNodeId(target),
-                        kind: EdgeKind::TYPE_USAGE,
-                        certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
-                        file_node_id: Some(CoreNodeId(1)),
-                        line: Some(7),
-                        ..Default::default()
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .expect("insert edges");
-
-        let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "How does the mapper build its configuration and execution plan?",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
-        let session = Rc::new(
-            crate::agent::packet_candidate::PacketProofSession::new(
-                crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
-            )
-            .with_trace_enabled(),
-        );
-        assert_eq!(
-            session.hydration.promotion_role_slots().len(),
-            2,
-            "the A formulas derive exactly two promotion slots"
-        );
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-
-        let candidates = vec![
-            node_candidate("src/builder.cs", "10", "TypeMapPlanBuilder"),
-            node_candidate("src/builder.cs", "5", "unrelated_filler_5"),
-            node_candidate("src/builder.cs", "6", "unrelated_filler_6"),
-            node_candidate("src/builder.cs", "30", "TypeMap"),
-            node_candidate("src/builder.cs", "11", "MapperConfiguration"),
-            node_candidate("src/builder.cs", "31", "TypeMapPlan"),
-        ];
-        let outcome = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            4,
-        )
-        .expect("A-shard slot-bounded query");
-        assert_eq!(
-            promotion_roles_used(&session, 0),
-            vec!["ConfigType", "Builder"],
-            "each of the two atom-derived roles is spent exactly once"
-        );
-        assert_eq!(
-            outcome
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["10", "30", "11", "5"],
-            "the TypeMap-shaped identity promotes while its slot is free; the \
-             second config-type identity waits and base order resumes"
-        );
-        assert!(
-            session.identity_is_atom_needed(31),
-            "the unpromoted config type stays needed — it lacked a free slot"
-        );
-
-        let next = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &[
-                node_candidate("src/builder.cs", "6", "unrelated_filler_6"),
-                node_candidate("src/builder.cs", "31", "TypeMapPlan"),
-            ],
-            1,
-        )
-        .expect("A-shard next query");
-        assert_eq!(
-            next.resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["31"],
-            "a fresh query re-opens the ConfigType slot"
-        );
-        assert!(
-            session.retired_requirements().is_empty(),
-            "mapper_config also requires a carrier range, which cannot discharge \
-             mid-retrieval — the need-gate keeps hunting"
-        );
-    }
-
-    /// An A-shaped store whose bootstrap class is incident to both
-    /// directions of the TYPE_USAGE relation, so one hydration establishes a
-    /// MULTI-POSITION identity (source and target of the config atom) beside
-    /// lone-target identities.
-    fn mapper_multiplicity_storage() -> Store {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("src/mapper.cs"),
-                language: "csharp".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 200,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        let mut nodes = vec![
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(1),
-                kind: NodeKind::FILE,
-                serialized_name: "src/mapper.cs".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(1),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(5),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "unrelated_filler".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(150),
-                ..Default::default()
-            },
-        ];
-        for (id, name) in [
-            (20, "MapperConfiguration"),
-            (40, "ResolutionContext"),
-            (41, "Conventions"),
-            (50, "TypeMapPlanBuilder"),
-        ] {
-            nodes.push(codestory_contracts::graph::Node {
-                id: CoreNodeId(id),
-                kind: NodeKind::CLASS,
-                serialized_name: name.into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(id as u32),
-                ..Default::default()
-            });
-        }
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        storage
-            .insert_edges_batch(
-                &[
-                    // Lone configuration targets: one role position each.
-                    (400, 20, 40),
-                    (401, 20, 41),
-                    // The chain identity: target of one config edge AND
-                    // source of another, i.e. two role positions.
-                    (402, 20, 50),
-                    (403, 50, 20),
-                ]
-                .into_iter()
-                .map(|(id, source, target)| codestory_contracts::graph::Edge {
-                    id: codestory_contracts::graph::EdgeId(id),
-                    source: CoreNodeId(source),
-                    target: CoreNodeId(target),
-                    kind: EdgeKind::TYPE_USAGE,
-                    certainty: Some(codestory_contracts::graph::ResolutionCertainty::Certain),
-                    file_node_id: Some(CoreNodeId(1)),
-                    line: Some(7),
-                    ..Default::default()
-                })
-                .collect::<Vec<_>>(),
-            )
-            .expect("insert edges");
-        storage
-    }
-
-    fn mapper_session() -> Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let requirements =
-            codestory_agent::packet_flow_requirements::packet_flow_requirements_for_terms(
-                &codestory_agent::packet_terms::packet_probe_terms(
-                    "How does the mapper build its configuration and execution plan?",
-                ),
-                codestory_contracts::api::PacketTaskClassDto::ArchitectureExplanation,
-            );
-        Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
-            crate::agent::packet_candidate::packet_atom_hydration_spec(&requirements),
-        ))
-    }
-
-    /// Gate 6 — the slot goes to ATOM-ROLE MULTIPLICITY, not base order.
-    /// With hundreds of equally-needed identities the earliest-match rule
-    /// spent its slots on whatever surfaced first; the identity that stands
-    /// in two role positions of the requirement group — the one that can
-    /// complete a group-consistent proof — now takes the slot even though it
-    /// sits LATER in base order.
-    #[test]
-    fn r6_promotion_priority_prefers_multi_role_identities_over_base_order() {
-        let storage = mapper_multiplicity_storage();
-        let session = mapper_session();
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        let candidates = vec![
-            node_candidate("src/mapper.cs", "20", "MapperConfiguration"),
-            node_candidate("src/mapper.cs", "5", "unrelated_filler"),
-            // Lone configuration target, EARLIER in base order.
-            node_candidate("src/mapper.cs", "40", "ResolutionContext"),
-            // Two role positions, LATER in base order.
-            node_candidate("src/mapper.cs", "50", "TypeMapPlanBuilder"),
-        ];
-        let outcome = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            2,
-        )
-        .expect("priority-ordered resolve");
-
-        assert_eq!(
-            session.promotion_priority(50),
-            2,
-            "the chain identity stands in both role positions"
-        );
-        assert_eq!(
-            session.promotion_priority(40),
-            1,
-            "the lone target stands in one"
-        );
-        assert_eq!(
-            outcome
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["20", "50"],
-            "the slot goes to the higher-multiplicity identity; under the old \
-             earliest-match rule it would have gone to node 40"
-        );
-        assert_eq!(outcome.attempted_candidate_indices, HashSet::from([0, 3]));
-    }
-
-    /// Gate 6 — the tie-break chain below multiplicity: equal scores fall
-    /// back to BASE ORDER, then to stable identity, and the whole decision
-    /// is deterministic across runs.
-    #[test]
-    fn r6_equal_priority_falls_back_to_base_order_deterministically() {
-        let storage = mapper_multiplicity_storage();
-        let run = || {
-            let session = mapper_session();
-            let _guard =
-                crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-            let candidates = vec![
-                node_candidate("src/mapper.cs", "20", "MapperConfiguration"),
-                node_candidate("src/mapper.cs", "5", "unrelated_filler"),
-                // Two lone targets, identical scores: base order decides.
-                node_candidate("src/mapper.cs", "41", "Conventions"),
-                node_candidate("src/mapper.cs", "40", "ResolutionContext"),
-            ];
-            let outcome = resolve_sidecar_candidates_in_storage(
-                &storage,
-                &HashMap::new(),
-                Path::new("."),
-                &candidates,
-                2,
-            )
-            .expect("tie-break resolve");
-            assert_eq!(
-                session.promotion_priority(40),
-                session.promotion_priority(41)
-            );
-            (
-                outcome
-                    .resolved_hits
-                    .iter()
-                    .map(|hit| hit.node_id.0.clone())
-                    .collect::<Vec<_>>(),
-                outcome.attempted_candidate_indices,
-            )
-        };
-        let (first_hits, first_attempted) = run();
-        assert_eq!(
-            first_hits,
-            ["20", "41"],
-            "equal multiplicity keeps the earlier base-order candidate"
-        );
-        let (second_hits, second_attempted) = run();
-        assert_eq!(first_hits, second_hits, "the decision is deterministic");
-        assert_eq!(first_attempted, second_attempted);
-    }
-
-    /// Round 5.5 item 2b — the query-boundary group checkpoint. A formula
-    /// whose requirement is satisfiable by TYPED atoms alone is proven by the
-    /// public group matcher over the receipts the first query accumulated, so
-    /// its promotion patterns RETIRE and the second query admits in pure base
-    /// order. The identical run under the real C spec — whose requirements
-    /// also carry carrier-range atoms that cannot discharge mid-retrieval —
-    /// keeps promoting, which is the fail-closed half of the property:
-    /// retirement is exactly as strict as the proof layer.
-    #[test]
-    fn r6_group_checkpointed_retirement_stops_promotion_at_the_next_query_boundary() {
-        use codestory_agent::packet_proof_atoms::{
-            FlowProofFormula, ProofAtomId, ProofAtomSpec, ProofEndpointPattern, ProofFactPattern,
-            ProofRole, TypedRelationPattern,
-        };
-
-        // A typed-only probe formula: one IMPORT fact, no source-aspect or
-        // absence atom, so accumulated typed receipts alone can prove it.
-        static RETIREMENT_PROBE_FORMULA: FlowProofFormula = FlowProofFormula {
-            atoms: &[ProofAtomSpec {
-                id: ProofAtomId::C2,
-                requirement: "retirement_probe",
-                facts: &[ProofFactPattern::TypedRelation(TypedRelationPattern {
-                    kind: codestory_contracts::api::EdgeKind::IMPORT,
-                    source: ProofEndpointPattern::Role(ProofRole::Entrypoint),
-                    target: ProofEndpointPattern::Role(ProofRole::VarsSource),
-                    target_kind: Some(ApiNodeKind::FILE),
-                    markers: &[],
-                    target_distinct_from_source: false,
-                })],
-            }],
-            distinct_roles: &[],
-        };
-        let ProofFactPattern::TypedRelation(probe_pattern) =
-            &RETIREMENT_PROBE_FORMULA.atoms[0].facts[0]
-        else {
-            panic!("the probe formula carries one typed-relation fact");
-        };
-        let probe_promotion_pattern = crate::agent::packet_candidate::PacketPromotionPattern {
-            requirement: "retirement_probe",
-            pattern: probe_pattern,
-            source_roles: vec![ProofRole::Entrypoint],
-            target_roles: vec![ProofRole::VarsSource],
-        };
-
-        let storage = css_bootstrap_storage();
-        let query_one = vec![file_shaped_candidate("styles/_base.css")];
-        let query_two = vec![
-            node_candidate("src/other.rs", "5", "unrelated_filler"),
-            file_shaped_candidate("styles/animate.css"),
-        ];
-        let run = |session: Rc<crate::agent::packet_candidate::PacketProofSession>| {
-            let _guard =
-                crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-            resolve_sidecar_candidates_in_storage(
-                &storage,
-                &HashMap::new(),
-                Path::new("."),
-                &query_one,
-                1,
-            )
-            .expect("query one");
-            let second = resolve_sidecar_candidates_in_storage(
-                &storage,
-                &HashMap::new(),
-                Path::new("."),
-                &query_two,
-                1,
-            )
-            .expect("query two");
-            (
-                session.retired_requirements(),
-                second
-                    .resolved_hits
-                    .iter()
-                    .map(|hit| hit.node_id.0.clone())
-                    .collect::<Vec<_>>(),
-            )
-        };
-
-        let probe_session = Rc::new(crate::agent::packet_candidate::PacketProofSession::new(
-            crate::agent::packet_candidate::PacketAtomHydrationSpec {
-                rooted: Vec::new(),
-                file_structural: true,
-                absence_kinds: Vec::new(),
-                promotion_patterns: vec![probe_promotion_pattern.clone()],
-                role_scoring_patterns: vec![probe_promotion_pattern],
-                formulas: vec![crate::agent::packet_candidate::PacketProofFormulaRef(
-                    &RETIREMENT_PROBE_FORMULA,
-                )],
-            },
-        ));
-        let (retired, probe_hits) = run(Rc::clone(&probe_session));
-        assert_eq!(
-            retired,
-            vec!["retirement_probe"],
-            "the group matcher proves the typed-only requirement at the query boundary"
-        );
-        assert!(
-            !probe_session.promotion_is_active(),
-            "a fully retired pattern set silences the need-gate"
-        );
-        assert_eq!(
-            probe_hits,
-            ["5"],
-            "after retirement the second query admits in pure base order"
-        );
-        // Monotone and deterministic: re-running the checkpoint with the same
-        // receipts changes nothing.
-        probe_session.checkpoint_group_retirement();
-        assert_eq!(
-            probe_session.retired_requirements(),
-            vec!["retirement_probe"]
-        );
-
-        let (c_retired, c_hits) = run(file_structural_session());
-        assert!(
-            c_retired.is_empty(),
-            "the shipped C requirements cannot retire mid-retrieval: their \
-             carrier-range and anchored atoms fail closed without anchors"
-        );
-        assert_eq!(
-            c_hits,
-            ["2"],
-            "with nothing retired the need-gate still promotes the entrypoint"
-        );
-    }
-
-    /// `file_count` stylesheets, each owning one selector — enough FILE and
-    /// structural roots to make the post-pass cost budget bind.
-    fn post_pass_budget_storage(file_count: i64) -> Store {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-        for index in 1..=file_count {
-            let path = format!("styles/f{index:02}.css");
-            storage
-                .insert_file(&FileInfo {
-                    id: index,
-                    path: PathBuf::from(&path),
-                    language: "css".to_string(),
-                    modification_time: 1,
-                    indexed: true,
-                    complete: true,
-                    line_count: 20,
-                    file_role: FileRole::Source,
-                })
-                .expect("insert file");
-            nodes.push(codestory_contracts::graph::Node {
-                id: CoreNodeId(index),
-                kind: NodeKind::FILE,
-                serialized_name: path,
-                file_node_id: Some(CoreNodeId(index)),
-                start_line: Some(1),
-                ..Default::default()
-            });
-            nodes.push(codestory_contracts::graph::Node {
-                id: CoreNodeId(1_000 + index),
-                kind: NodeKind::CONSTANT,
-                serialized_name: format!(".sel{index:02}"),
-                file_node_id: Some(CoreNodeId(index)),
-                start_line: Some(3),
-                ..Default::default()
-            });
-            edges.push(codestory_contracts::graph::Edge {
-                id: codestory_contracts::graph::EdgeId(5_000 + index),
-                source: CoreNodeId(index),
-                target: CoreNodeId(1_000 + index),
-                kind: EdgeKind::MEMBER,
-                file_node_id: Some(CoreNodeId(index)),
-                ..Default::default()
-            });
-        }
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        storage.insert_edges_batch(&edges).expect("insert edges");
-        storage
-    }
-
-    fn answer_citing_nodes(node_ids: &[i64]) -> AgentAnswerDto {
-        let mut answer = sidecar_answer_with_citation_node("0");
-        answer.citations.clear();
-        for node_id in node_ids {
-            let citation = sidecar_answer_with_citation_node(&node_id.to_string())
-                .citations
-                .remove(0);
-            answer.citations.push(citation);
-        }
-        answer
-    }
-
-    fn post_pass_artifact_ids(answer: &AgentAnswerDto) -> Vec<String> {
-        answer
-            .graphs
-            .iter()
-            .filter_map(|artifact| match artifact {
-                GraphArtifactDto::Uml { id, .. }
-                    if id.starts_with(PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX) =>
-                {
-                    Some(id.clone())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// A C-family session with two identities already in the promotion
-    /// need-set — the shape R6 works to rescue.
-    fn session_needing(
-        source: &str,
-        target: &str,
-    ) -> Rc<crate::agent::packet_candidate::PacketProofSession> {
-        let session = file_structural_session();
-        let node = |id: &str| codestory_contracts::api::GraphNodeDto {
-            id: NodeId(id.into()),
-            label: id.into(),
-            kind: ApiNodeKind::FILE,
-            depth: 1,
-            label_policy: None,
-            badge_visible_members: None,
-            badge_total_members: None,
-            merged_symbol_examples: Vec::new(),
-            file_path: None,
-            qualified_name: None,
-            member_access: None,
-        };
-        session.record_atom_needed_identities(&GraphResponse {
-            center_id: NodeId(source.into()),
-            nodes: vec![node(source), node(target)],
-            edges: vec![codestory_contracts::api::GraphEdgeDto {
-                id: codestory_contracts::api::EdgeId("import-1".into()),
-                source: NodeId(source.into()),
-                target: NodeId(target.into()),
-                kind: codestory_contracts::api::EdgeKind::IMPORT,
-                certainty: None,
-                confidence: None,
-                callsite_identity: None,
-                candidate_targets: Vec::new(),
-            }],
-            truncated: false,
-            omitted_edge_count: 0,
-            canonical_layout: None,
-        });
-        session
-    }
-
-    /// Gate 8 — the post-pass is NEED-ORDERED, not rank-ordered. R6 promotion
-    /// changes which candidates are admitted, never their rank, so rescued
-    /// roots land at the TAIL of citation order; under the old rank-ordered
-    /// walk with a hard budget `break` they were systematically the roots the
-    /// traversal never reached, and their receipts never entered the support.
-    /// Here the two atom-needed roots sit LAST among 18 citations while the
-    /// budget only affords 16 — and they are hydrated while priority-0 roots
-    /// ahead of them are the ones dropped.
-    #[test]
-    fn post_pass_hydrates_atom_needed_roots_before_rank_order() {
-        let storage = post_pass_budget_storage(18);
-        let session = session_needing("18", "17");
-        assert!(session.promotion_priority(18) > 0 && session.promotion_priority(17) > 0);
-        assert_eq!(session.promotion_priority(1), 0);
-
-        // 18 FILE roots at 12 units each = 216 against a 192-unit budget.
-        let citations = (1..=18).collect::<Vec<_>>();
-        let mut answer = answer_citing_nodes(&citations);
-        hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
-        let artifacts = post_pass_artifact_ids(&answer);
-        assert_eq!(
-            artifacts.len(),
-            16,
-            "the cost budget still affords exactly 16 FILE roots: {artifacts:?}"
-        );
-        for needed in [17, 18] {
-            assert!(
-                artifacts.contains(&format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}{needed}")),
-                "the atom-needed root at the tail of citation order must be hydrated: {needed}"
-            );
-        }
-        for dropped in [15, 16] {
-            assert!(
-                !artifacts.contains(&format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}{dropped}")),
-                "a priority-0 root is what the budget drops now: {dropped}"
-            );
-        }
-        assert_eq!(
-            artifacts[0],
-            format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}17"),
-            "need-ordered roots come first, and citation order breaks their tie"
-        );
-        assert_eq!(
-            artifacts[1],
-            format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}18")
-        );
-    }
-
-    /// Gate 8 — determinism of the need-ordered traversal: identical inputs
-    /// produce an identical artifact set in an identical order.
-    #[test]
-    fn post_pass_need_ordering_is_deterministic() {
-        let storage = post_pass_budget_storage(18);
-        let citations = (1..=18).collect::<Vec<_>>();
-        let run = || {
-            let session = session_needing("18", "17");
-            let mut answer = answer_citing_nodes(&citations);
-            hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
-            post_pass_artifact_ids(&answer)
-        };
-        let first = run();
-        let second = run();
-        assert_eq!(first, second, "the traversal order must be reproducible");
-        assert_eq!(first.len(), 16);
-    }
-
-    /// Gate 8 — SKIP, never BREAK. A root whose cost does not fit is passed
-    /// over and cheaper roots behind it are still hydrated; the total budget
-    /// is unchanged, so this only stops one expensive root from starving
-    /// everything behind it.
-    #[test]
-    fn post_pass_skips_an_unaffordable_root_and_keeps_hydrating_cheaper_ones() {
-        let storage = post_pass_budget_storage(17);
-        let session = file_structural_session();
-
-        // 15 FILE roots (12 each = 180) + one structural root (4) = 184 of
-        // 192. The next FILE root costs 12 and cannot fit; the structural
-        // root behind it costs 4 and still can.
-        let mut citations = (1..=15).collect::<Vec<_>>();
-        citations.push(1_001); // CONSTANT root, 4 units
-        citations.push(16); // FILE root, 12 units — must be SKIPPED
-        citations.push(1_002); // CONSTANT root, 4 units — must still hydrate
-        let mut answer = answer_citing_nodes(&citations);
-        hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
-        let artifacts = post_pass_artifact_ids(&answer);
-
-        assert!(
-            !artifacts.contains(&format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}16")),
-            "the unaffordable FILE root is skipped: {artifacts:?}"
-        );
-        assert!(
-            artifacts.contains(&format!("{PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX}1002")),
-            "a cheaper root behind it must still be hydrated — the old hard \
-             break would have ended the traversal here: {artifacts:?}"
-        );
-        assert_eq!(
-            artifacts.len(),
-            17,
-            "15 file roots plus both structural roots: {artifacts:?}"
-        );
-    }
-
-    /// Round 5.5 item 1 residual (option ii): the POST-PASS depth-2 FILE
-    /// structural trail survives entrypoint-scale fanout. Under the old
-    /// 65-node cap the store accessor's edge budget (`max_nodes × 3` = 195)
-    /// is exhausted at the root, the traversal breaks with only the root in
-    /// the node set, and the closing endpoint filter drops EVERY edge — the
-    /// artifact comes back empty and C1's MODULE-member receipts die with it.
-    /// The raised cap keeps one traversal set carrying
-    /// `[MEMBER, USAGE, IMPORT]` at depth 2, which is what rule 7's
-    /// deeper-rooted arm requires.
-    #[test]
-    fn post_pass_structural_trail_survives_entrypoint_scale_fanout() {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("styles/entry.css"),
-                language: "css".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 400,
-                file_role: FileRole::Source,
-            })
-            .expect("insert file");
-        let mut nodes = vec![codestory_contracts::graph::Node {
-            id: CoreNodeId(1),
-            kind: NodeKind::FILE,
-            serialized_name: "styles/entry.css".into(),
-            file_node_id: Some(CoreNodeId(1)),
-            start_line: Some(1),
-            ..Default::default()
-        }];
-        // 99 MODULE import-statement members + 99 imported files = the 198
-        // outgoing structural edges a real entrypoint carries.
-        nodes.extend((0..99).map(|index| codestory_contracts::graph::Node {
-            id: CoreNodeId(1_000 + index),
-            kind: NodeKind::MODULE,
-            serialized_name: format!("@import {index:02}"),
-            file_node_id: Some(CoreNodeId(1)),
-            start_line: Some(1 + index as u32),
-            ..Default::default()
-        }));
-        nodes.extend((0..99).map(|index| codestory_contracts::graph::Node {
-            id: CoreNodeId(2_000 + index),
-            kind: NodeKind::FILE,
-            serialized_name: format!("styles/imported_{index:02}.css"),
-            file_node_id: Some(CoreNodeId(2_000 + index)),
-            start_line: Some(1),
-            ..Default::default()
-        }));
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        // Interleaved ids so any retained prefix carries both kinds.
-        let mut edges = Vec::new();
-        for index in 0..99 {
-            edges.push(codestory_contracts::graph::Edge {
-                id: codestory_contracts::graph::EdgeId(10_000 + index * 2),
-                source: CoreNodeId(1),
-                target: CoreNodeId(1_000 + index),
-                kind: EdgeKind::MEMBER,
-                file_node_id: Some(CoreNodeId(1)),
-                ..Default::default()
-            });
-            edges.push(codestory_contracts::graph::Edge {
-                id: codestory_contracts::graph::EdgeId(10_001 + index * 2),
-                source: CoreNodeId(1),
-                target: CoreNodeId(2_000 + index),
-                kind: EdgeKind::IMPORT,
-                file_node_id: Some(CoreNodeId(1)),
-                ..Default::default()
-            });
-        }
-        storage.insert_edges_batch(&edges).expect("insert edges");
-
-        // The pathology this fix routes around, pinned at the store boundary:
-        // at the old cap the same trail enumerates 198 edges and returns NONE.
-        let filter = crate::agent::packet_candidate::PACKET_FILE_STRUCTURAL_TRAIL_KINDS
-            .iter()
-            .map(|kind| EdgeKind::from(*kind))
-            .collect::<Vec<_>>();
-        let starved = storage
-            .get_trail(&TrailConfig {
-                root_id: CoreNodeId(1),
-                depth: PACKET_FILE_STRUCTURAL_TRAIL_DEPTH,
-                direction: TrailDirection::Outgoing,
-                caller_scope: TrailCallerScope::IncludeTestsAndBenches,
-                edge_filter: filter.clone(),
-                show_utility_calls: true,
-                max_nodes: PACKET_CANDIDATE_DIRECTION_NODE_LIMIT,
-                ..TrailConfig::default()
-            })
-            .expect("starved trail");
-        assert!(
-            starved.edges.is_empty(),
-            "the 65-node cap's edge budget starves this root — the artifact \
-             would be empty and skipped"
-        );
-
-        let session = file_structural_session();
-        let mut answer = sidecar_answer_with_citation_node("1");
-        hydrate_packet_atom_trails_in_storage(&storage, &HashMap::new(), &session, &mut answer);
-        let post_pass = answer
-            .graphs
-            .iter()
-            .find_map(|artifact| match artifact {
-                GraphArtifactDto::Uml { id, graph, .. }
-                    if id.starts_with(PACKET_ATOM_HYDRATION_ARTIFACT_PREFIX) =>
-                {
-                    Some(graph)
-                }
-                _ => None,
-            })
-            .expect("post-pass hydration artifact");
-        assert!(
-            !post_pass.edges.is_empty(),
-            "the raised structural cap must keep the entrypoint's trail alive"
-        );
-        for kind in [
-            codestory_contracts::api::EdgeKind::MEMBER,
-            codestory_contracts::api::EdgeKind::IMPORT,
-        ] {
-            assert!(
-                post_pass.edges.iter().any(|edge| edge.kind == kind),
-                "the single traversal set must carry {kind:?} edges"
-            );
-        }
-        let scans = session.artifact_scans();
-        let (_, recorded) = scans.first().expect("ledger entry for the entrypoint root");
-        assert!(
-            recorded.iter().any(|scan| {
-                scan.root == "1"
-                    && scan.depth == PACKET_FILE_STRUCTURAL_TRAIL_DEPTH
-                    && scan.edge_kinds
-                        == crate::agent::packet_candidate::PACKET_FILE_STRUCTURAL_TRAIL_KINDS
-                            .to_vec()
-            }),
-            "rule 7 needs ONE depth-2 [MEMBER, USAGE, IMPORT] traversal set: {recorded:?}"
-        );
-    }
-
-    /// Gate 5c, item 1: an outgoing IMPORT identity trail with more targets
-    /// than the 65-node trail cap truncates — and its RETAINED edges still
-    /// contribute their identities to the need-set (truncation bars absence
-    /// claims, never positive identity receipts), so a bounce-shaped
-    /// beyond-window candidate whose file sits early in the import closure
-    /// promotes.
-    #[test]
-    fn r6_truncated_import_trail_still_contributes_retained_identities() {
-        use codestory_store::{FileInfo, FileRole};
-
-        let mut storage = Store::new_in_memory().expect("storage");
-        storage
-            .insert_file(&FileInfo {
-                id: 1,
-                path: PathBuf::from("source/animate.css"),
-                language: "css".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 120,
-                file_role: FileRole::Source,
-            })
-            .expect("insert entrypoint file");
-        storage
-            .insert_file(&FileInfo {
-                id: 4,
-                path: PathBuf::from("src/other.rs"),
-                language: "rust".to_string(),
-                modification_time: 1,
-                indexed: true,
-                complete: true,
-                line_count: 10,
-                file_role: FileRole::Source,
-            })
-            .expect("insert filler file");
-        let mut nodes = vec![
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(1),
-                kind: NodeKind::FILE,
-                serialized_name: "source/animate.css".into(),
-                file_node_id: Some(CoreNodeId(1)),
-                start_line: Some(1),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(4),
-                kind: NodeKind::FILE,
-                serialized_name: "src/other.rs".into(),
-                file_node_id: Some(CoreNodeId(4)),
-                start_line: Some(1),
-                ..Default::default()
-            },
-            codestory_contracts::graph::Node {
-                id: CoreNodeId(5),
-                kind: NodeKind::FUNCTION,
-                serialized_name: "unrelated_filler".into(),
-                file_node_id: Some(CoreNodeId(4)),
-                start_line: Some(2),
-                ..Default::default()
-            },
-        ];
-        // 99 import-target FILE nodes — well beyond the 65-node trail cap.
-        nodes.extend((0..99).map(|index| codestory_contracts::graph::Node {
-            id: CoreNodeId(1_000 + index),
-            kind: NodeKind::FILE,
-            serialized_name: format!("source/group/target_{index:02}.css"),
-            file_node_id: Some(CoreNodeId(1_000 + index)),
-            start_line: Some(1),
-            ..Default::default()
-        }));
-        storage.insert_nodes_batch(&nodes).expect("insert nodes");
-        let edges = (0..99)
-            .map(|index| codestory_contracts::graph::Edge {
-                id: codestory_contracts::graph::EdgeId(2_000 + index),
-                source: CoreNodeId(1),
-                target: CoreNodeId(1_000 + index),
-                kind: EdgeKind::IMPORT,
-                file_node_id: Some(CoreNodeId(1)),
-                line: Some(2 + index as u32),
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        storage.insert_edges_batch(&edges).expect("insert edges");
-
-        let session = file_structural_session();
-        let _guard =
-            crate::agent::packet_candidate::install_packet_proof_session(Rc::clone(&session));
-        // The bounce-shaped candidate: the 3rd import target — early in the
-        // closure, comfortably inside the trail's retained prefix, but
-        // beyond the resolution window without promotion.
-        let candidates = vec![
-            file_shaped_candidate("source/animate.css"),
-            node_candidate("src/other.rs", "5", "unrelated_filler"),
-            node_candidate("source/group/target_02.css", "1002", "bounce_shaped"),
-        ];
-        let outcome = resolve_sidecar_candidates_in_storage(
-            &storage,
-            &HashMap::new(),
-            Path::new("."),
-            &candidates,
-            2,
-        )
-        .expect("resolve over-cap entrypoint");
-        assert_eq!(
-            outcome
-                .resolved_hits
-                .iter()
-                .map(|hit| hit.node_id.0.as_str())
-                .collect::<Vec<_>>(),
-            ["1", "1002"],
-            "the retained import target must promote over the filler"
-        );
-
-        let entry_hit = outcome
-            .packet_hits
-            .iter()
-            .find(|hit| hit.hit.node_id.0 == "1")
-            .expect("entrypoint packet hit");
-        let outgoing = entry_hit
-            .trail_scans
-            .iter()
-            .find(|scan| scan.direction == PacketGraphDirection::Outgoing)
-            .expect("outgoing IMPORT identity scan");
-        assert!(
-            outgoing.truncated,
-            "99 targets overflow the 65-node cap: {outgoing:?}"
-        );
-        let retained_imports = entry_hit
-            .graph
-            .as_ref()
-            .expect("entrypoint graph")
-            .edges
-            .iter()
-            .filter(|edge| edge.kind == codestory_contracts::api::EdgeKind::IMPORT)
-            .count();
-        assert!(
-            retained_imports >= 60,
-            "the truncated trail must still retain its edge prefix: {retained_imports}"
-        );
-        assert!(
-            session.identity_is_atom_needed(1_002),
-            "retained-edge identities contribute despite truncation"
-        );
-        assert!(
-            !session.identity_is_atom_needed(1_098),
-            "identities beyond the retained prefix are not established (fail closed)"
-        );
     }
 
     #[test]

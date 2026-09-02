@@ -13,9 +13,7 @@ use crate::runtime::map_api_error;
 use anyhow::Result;
 use codestory_contracts::api::AgentPacketRequestDto;
 #[cfg(test)]
-use codestory_contracts::api::{
-    AgentPacketDto, PacketBudgetModeDto, PacketDispositionKindDto, PacketTaskClassDto,
-};
+use codestory_contracts::api::{AgentPacketDto, PacketBudgetModeDto, PacketDispositionKindDto};
 use codestory_contracts::packet_projection_v3::{
     EvidenceAvailabilityV3Dto, PacketProjectionV3Dto, RetrievalStateV3Dto,
 };
@@ -25,8 +23,7 @@ pub(in crate::app) fn run_packet(cmd: PacketCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "packet")?;
     preflight_output_file(cmd.output_file.as_deref())?;
     preflight_output_file(cmd.diagnostics_out.as_deref())?;
-    args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
-        .map_err(anyhow::Error::msg)?;
+    args::validate_packet_probe_arguments(&cmd.probes).map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } = open_agent_surface(
         &cmd.project,
         cmd.profile,
@@ -198,9 +195,7 @@ pub(in crate::app) fn packet_request_from_command(cmd: &PacketCommand) -> AgentP
     AgentPacketRequestDto {
         question: cmd.question.clone(),
         budget: cmd.budget.into(),
-        task_class: cmd.task_class.map(Into::into),
         probes: cmd.probes.clone(),
-        extra_probes: cmd.extra_probes.clone(),
         latency_budget_ms: cmd.latency_budget_ms,
         parent_packet_id: cmd.parent_packet_id.clone(),
         option_ids: cmd.option_ids.clone(),
@@ -283,11 +278,6 @@ pub(in crate::app) fn render_packet_markdown(
         markdown,
         "budget: `{}`",
         packet_budget_mode_label(packet.budget.requested)
-    );
-    let _ = writeln!(
-        markdown,
-        "task_class: `{}`",
-        packet_task_class_label(packet.plan.task_class)
     );
     if packet.budget.truncated {
         let _ = writeln!(
@@ -379,19 +369,6 @@ pub(in crate::app) fn packet_budget_mode_label(mode: PacketBudgetModeDto) -> &'s
         PacketBudgetModeDto::Compact => "compact",
         PacketBudgetModeDto::Standard => "standard",
         PacketBudgetModeDto::Deep => "deep",
-    }
-}
-
-#[cfg(test)]
-pub(in crate::app) fn packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str {
-    match task_class {
-        PacketTaskClassDto::ArchitectureExplanation => "architecture_explanation",
-        PacketTaskClassDto::BugLocalization => "bug_localization",
-        PacketTaskClassDto::ChangeImpact => "change_impact",
-        PacketTaskClassDto::RouteTracing => "route_tracing",
-        PacketTaskClassDto::SymbolOwnership => "symbol_ownership",
-        PacketTaskClassDto::DataFlow => "data_flow",
-        PacketTaskClassDto::EditPlanning => "edit_planning",
     }
 }
 

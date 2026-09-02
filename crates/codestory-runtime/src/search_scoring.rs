@@ -7,11 +7,13 @@ use super::{
 #[cfg(test)]
 use super::{
     EXACT_SYMBOL_HYBRID_MAX_RESULTS_CAP, HybridSearchConfig, HybridSearchHit, RetrievalModeDto,
-    RetrievalScoreBreakdownDto, SearchEngine, apply_hybrid_limits,
-    compare_search_hits_with_project_root, exact_symbol_query_terms, is_non_primary_source_hit,
-    looks_like_standalone_symbol_query, mixed_natural_language_query, normalized_hybrid_weights,
-    query_mentions_non_primary_source,
+    SearchEngine, apply_hybrid_limits, compare_search_hits_with_project_root,
+    exact_symbol_query_terms, is_non_primary_source_hit, looks_like_standalone_symbol_query,
+    mixed_natural_language_query, normalized_hybrid_weights, query_mentions_non_primary_source,
 };
+#[cfg(test)]
+use codestory_contracts::api::RetrievalScoreBreakdownDto;
+
 use crate::agent::packet_evidence::decorate_lexical_search_hit_evidence;
 #[cfg(test)]
 use crate::agent::packet_evidence::decorate_search_hit_evidence;
@@ -395,7 +397,6 @@ impl AppController {
             resolution_status: (structural_unit.is_some() || openapi_endpoint)
                 .then_some(codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly),
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: (structural_unit.is_some() || openapi_endpoint)
                 .then_some(false),
             source_excerpt: None,

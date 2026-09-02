@@ -212,7 +212,11 @@ impl AppController {
 
     fn core_owns_legacy_annotations(&self) -> Result<bool, ApiError> {
         let storage_path = self.require_storage_path()?;
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve core annotation ownership: {error}"
+            ))
+        })? {
             return Ok(false);
         }
         Store::database_legacy_annotation_count(&storage_path)

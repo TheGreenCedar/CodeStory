@@ -1,20 +1,28 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::args::{OutputFormat, ProjectArgs, ProveCallPathCommand};
+use crate::args::{OutputFormat, ProjectArgs, VerifyIndexedDirectCallsCommand, VerifyOutputMode};
 use crate::output::emit;
-use crate::prove_call_path::{
-    internal_projection_root, parse_request, projection_root, read_bounded_spec, validate_request,
-};
+use crate::prove_call_path::read_bounded_call_path;
 use crate::runtime::{RuntimeContext, map_api_error};
 
-pub(super) fn run_prove_call_path(cmd: ProveCallPathCommand) -> Result<()> {
-    let bytes = read_bounded_spec(&cmd.spec)?;
-    let value = serde_json::from_slice(&bytes).context("parse proof spec JSON")?;
-    let request = parse_request(value).map_err(anyhow::Error::msg)?;
-    let validation = validate_request(request).map_err(anyhow::Error::msg)?;
+pub(super) fn run_verify_indexed_direct_calls(cmd: VerifyIndexedDirectCallsCommand) -> Result<()> {
+    if cmd.output == VerifyOutputMode::Full {
+        anyhow::bail!(
+            "--output full is unavailable until proof provenance is published; use --output compact"
+        );
+    }
+    let document = read_bounded_call_path(&cmd.spec)?;
+    let contract =
+        codestory_runtime::proof_qualification_support::parse_public_call_path_document(&document)
+            .map_err(anyhow::Error::msg)?;
+    let validation =
+        codestory_runtime::proof_qualification_support::validate_public_call_path_contract(
+            contract,
+        )
+        .map_err(anyhow::Error::msg)?;
     let project = ProjectArgs {
         project: cmd.project,
         cache_dir: None,
@@ -22,13 +30,13 @@ pub(super) fn run_prove_call_path(cmd: ProveCallPathCommand) -> Result<()> {
     let runtime = RuntimeContext::new_inspect_only(&project)?;
     runtime
         .activation
-        .bind_existing_complete_core_for_observation(
+        .ensure_complete_core_for_observation(
             &runtime.project_root,
             &runtime.storage_path,
             Arc::new(AtomicBool::new(false)),
         )
         .map_err(map_api_error)?;
-    let root = match validation {
+    let public = match validation {
         codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
             contract,
             hashes,
@@ -43,7 +51,10 @@ pub(super) fn run_prove_call_path(cmd: ProveCallPathCommand) -> Result<()> {
                     Arc::new(AtomicBool::new(false)),
                 )
                 .map_err(map_api_error)?;
-            projection_root(&operation).map_err(anyhow::Error::msg)?
+            codestory_runtime::proof_qualification_support::project_observed_public_operation(
+                &operation,
+            )
+            .map_err(anyhow::Error::msg)?
         }
         codestory_runtime::proof_qualification_support::ValidationOutcome::Unknown {
             spec,
@@ -61,8 +72,11 @@ pub(super) fn run_prove_call_path(cmd: ProveCallPathCommand) -> Result<()> {
                     Arc::new(AtomicBool::new(false)),
                 )
                 .map_err(map_api_error)?;
-            internal_projection_root(&operation.value)
+            codestory_runtime::proof_qualification_support::project_internal_projection(
+                &operation.value,
+            )
+            .map_err(anyhow::Error::msg)?
         }
     };
-    emit(OutputFormat::Json, &root, String::new(), None)
+    emit(OutputFormat::Json, &public, String::new(), None)
 }

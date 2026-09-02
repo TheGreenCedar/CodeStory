@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Packet requests no longer accept `task_class`. Ordinary wording reaches
+  generic retrieval; the public packet reports `answer_sufficiency: not_asserted`.
+- The serialized public packet is capped at 16 KiB. When exact hydration cannot
+  fit, the packet records a typed `serialized_public_budget` gap instead of
+  silently dropping evidence.
+- Indexed call-path verification uses the frozen `from` / `direct-call`
+  grammar. Compact results are capped at 4 KiB, and
+  `translation_status` is `host_supplied`.
+- `affected` reports indexed tests in the same package as a changed source file
+  as focused hints when the graph walk does not reach them.
+
 - Added an observational exact call-path verifier to the CLI and MCP. It checks
   a complete host-supplied typed contract against one pinned indexed
   publication, reports proof-domain uncertainty explicitly, and never treats

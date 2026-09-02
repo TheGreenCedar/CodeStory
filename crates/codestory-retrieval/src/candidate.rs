@@ -1,4 +1,8 @@
 use codestory_contracts::api::SearchTargetDto;
+use codestory_contracts::compilation::{
+    PACKET_RETRIEVAL_SCORE_VERSION_V1, PacketCandidateDescriptorV1, PacketRetrievalLaneV1,
+    VersionedRetrievalScoreV1,
+};
 use codestory_contracts::graph::{EdgeKind, NodeKind};
 use codestory_store::FileRole;
 use serde::{Deserialize, Serialize};
@@ -102,6 +106,11 @@ pub struct CandidateHit {
     pub target: Option<SearchTargetDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_excerpt: Option<String>,
+    /// Conservative UTF-8 source-size upper bound, when known before exact
+    /// hydration. Packet admission requires this field and never invents a
+    /// speculative fallback by opening core state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_bytes_upper_bound: Option<u32>,
     pub score: f32,
     #[serde(default, skip_serializing)]
     pub lane_scores: CandidateLaneScores,
@@ -162,6 +171,46 @@ pub fn fused_candidate_identity_matches(left: &CandidateHit, right: &CandidateHi
 }
 
 impl CandidateHit {
+    /// Convert sidecar output into the descriptor-only packet admission
+    /// boundary. Missing identity or source bounds makes a candidate
+    /// ineligible; callers must not hydrate core state to fill either field.
+    pub fn packet_descriptor(&self) -> Option<PacketCandidateDescriptorV1> {
+        let stable_identity = self
+            .node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+            .map(|identity| format!("node:{identity}"))
+            .or_else(|| packet_path_identity(&self.file_path).map(|path| format!("path:{path}")))?;
+        let source_bytes_upper_bound = self.source_bytes_upper_bound?;
+        if self.file_path.trim().is_empty()
+            || source_bytes_upper_bound == 0
+            || !self.score.is_finite()
+        {
+            return None;
+        }
+        Some(PacketCandidateDescriptorV1 {
+            stable_identity,
+            path: self.file_path.clone(),
+            symbol: self
+                .qualified_name
+                .clone()
+                .or_else(|| self.symbol_name.clone()),
+            retrieval_lane: match self.source {
+                CandidateSource::Lexical => PacketRetrievalLaneV1::Lexical,
+                CandidateSource::Semantic => PacketRetrievalLaneV1::Semantic,
+                CandidateSource::Scip => PacketRetrievalLaneV1::Graph,
+                CandidateSource::Legacy => PacketRetrievalLaneV1::Legacy,
+            },
+            retrieval_score: VersionedRetrievalScoreV1 {
+                version: PACKET_RETRIEVAL_SCORE_VERSION_V1.to_string(),
+                value: self.score,
+            },
+            source_bytes_upper_bound: Some(source_bytes_upper_bound),
+            exact_selector_ordinal: None,
+        })
+    }
+
     pub fn lexical_stub(file_path: impl Into<String>, score: f32) -> Self {
         Self {
             node_id: None,
@@ -172,6 +221,7 @@ impl CandidateHit {
             start_line: None,
             target: None,
             source_excerpt: None,
+            source_bytes_upper_bound: None,
             score,
             lane_scores: CandidateLaneScores {
                 lexical: Some(CandidateLaneEvidence {
@@ -205,6 +255,7 @@ impl CandidateHit {
             start_line: None,
             target: None,
             source_excerpt: None,
+            source_bytes_upper_bound: None,
             score,
             lane_scores: CandidateLaneScores::default(),
             source,
@@ -216,6 +267,15 @@ impl CandidateHit {
         };
         hit.record_lane(source.lane(), score, 0, source.default_provenance());
         hit
+    }
+
+    /// Conservative source cost charged before exact hydration.
+    ///
+    /// A measured upper bound wins. Otherwise a present excerpt is a lower
+    /// bound only, so admission still charges the unmeasured conservative
+    /// cap. Unknown candidates pay that same cap.
+    pub fn conservative_source_bytes(&self) -> Option<usize> {
+        self.source_bytes_upper_bound.map(|bytes| bytes as usize)
     }
 
     pub fn add_provenance(&mut self, label: impl Into<String>) {
@@ -299,6 +359,34 @@ impl CandidateHit {
             self.record_lane(lane, self.score, 0, self.source.default_provenance());
         }
     }
+}
+
+/// Canonical project-relative path identity for source-file descriptors.
+/// Absolute paths, parent traversal, and URI-like values never become packet
+/// identities. The complete normalized path is retained, so equal basenames
+/// in different directories remain distinct.
+fn packet_path_identity(path: &str) -> Option<String> {
+    let normalized = path.trim().replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.contains("\0")
+        || normalized.contains("://")
+        || normalized
+            .as_bytes()
+            .get(1)
+            .is_some_and(|byte| *byte == b':')
+    {
+        return None;
+    }
+    let mut components = Vec::new();
+    for component in normalized.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            value => components.push(value),
+        }
+    }
+    (!components.is_empty()).then(|| components.join("/"))
 }
 
 impl CandidateSource {
@@ -403,5 +491,39 @@ mod tests {
                 .raw_score,
             0.87
         );
+    }
+
+    #[test]
+    fn source_file_descriptor_uses_the_complete_relative_path_identity() {
+        let mut left = CandidateHit::lexical_stub("src/a/router.rs", 0.8);
+        left.source_bytes_upper_bound = Some(512);
+        let mut right = CandidateHit::lexical_stub("src/b/router.rs", 0.8);
+        right.source_bytes_upper_bound = Some(512);
+
+        assert_eq!(
+            left.packet_descriptor()
+                .expect("left path descriptor")
+                .stable_identity,
+            "path:src/a/router.rs"
+        );
+        assert_eq!(
+            right
+                .packet_descriptor()
+                .expect("right path descriptor")
+                .stable_identity,
+            "path:src/b/router.rs"
+        );
+    }
+
+    #[test]
+    fn unsafe_or_absolute_paths_cannot_become_packet_identities() {
+        for path in ["../router.rs", "/repo/router.rs", "C:\\repo\\router.rs"] {
+            let mut candidate = CandidateHit::lexical_stub(path, 0.8);
+            candidate.source_bytes_upper_bound = Some(512);
+            assert!(
+                candidate.packet_descriptor().is_none(),
+                "unsafe path admitted: {path}"
+            );
+        }
     }
 }

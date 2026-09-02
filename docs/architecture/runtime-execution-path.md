@@ -115,24 +115,26 @@ usable, but their output must not be presented as a full packet/search result.
 
 Packet callers may supply tagged probes for an exact project-relative path,
 stable symbol ID, file-scoped symbol, free query, or continuation. CLI and
-stdio normalize those forms and legacy string probes into the same runtime
-resolver. Workspace owns native path containment; runtime resolves exact paths
-and IDs before fuzzy discovery and returns ordered ambiguity candidates rather
-than choosing one. A valid source file outside graph coverage remains a
+stdio accept the same typed forms; retired free-string probes are rejected.
+Workspace owns native path containment. Runtime resolves exact paths and IDs
+through identity indexes, preserves ordered ambiguity instead of choosing one,
+and admits identities before reading source, graph neighborhoods, node bodies,
+or file records. A valid source file outside graph coverage remains a
 `valid_uncovered_path`, and source-range-only text remains distinct from an
 indexed symbol.
 
 Resolved path and symbol probes enter packet evidence as exact citations keyed
 by normalized project path or stable node ID. They do not become display-name
-searches. Exact citations remain explicit inputs and cannot satisfy packet
-sufficiency by themselves.
+searches. Exact selectors enter the packet-wide admission session first;
+remaining candidates follow versioned retrieval-score order. Neither path has
+answer-sufficiency authority.
 
 Continuation probes carry the probe contract version, project identity, core
 generation, and optional retrieval generation. Runtime rejects a continuation
 when any bound identity differs from the selected public operation. Resolved
 free-query probes may add broad packet evidence work, but exact resolutions do
-not. Neither form changes task-class route order or packet sufficiency
-requirements.
+not. A free query receives no protection or materiality authority, and neither
+form can introduce prompt-derived traversal or answer policy after retrieval.
 
 ## Failure boundaries
 

@@ -3,6 +3,7 @@ use super::types::{
     EdgeKind, IndexMode, LayoutDirection, MemberAccess, NodeKind, TrailCallerScope, TrailDirection,
     TrailMode,
 };
+use crate::compilation::PacketContinuationSelectorV1;
 use crate::graph::FileCoverageReason;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -910,8 +911,8 @@ pub struct ReadinessVerdictDto {
 /// Search result row shared by search, citations, and packet evidence.
 ///
 /// Ranking fields (`score`, `score_breakdown`, `match_quality`) are diagnostic
-/// evidence. `evidence_tier`, `resolution_status`, `coverage_role`, and
-/// `eligible_for_sufficiency` control whether a hit may support an answer.
+/// evidence. `evidence_tier`, `resolution_status`, and
+/// `eligible_for_sufficiency` describe whether a hit can carry source support.
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct SearchHit {
     pub node_id: NodeId,
@@ -934,8 +935,6 @@ pub struct SearchHit {
     pub resolution_status: Option<PacketEvidenceResolutionDto>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_for_sufficiency: Option<bool>,
     /// Source text captured by the read operation that produced this hit.
@@ -2311,8 +2310,6 @@ pub struct AgentCitationDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loss_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eligible_for_sufficiency: Option<bool>,
     /// Source text captured while the owning publication was pinned.
     ///
@@ -2535,8 +2532,7 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub blocking_unresolved_candidate_count: u32,
     /// This query's semantic stage lost its budget and contributed no candidate.
     ///
-    /// Kept per query rather than only as a total because a required query obligation is demoted
-    /// by *its own* dense lane going dark, not by some other query's.
+    /// Kept per query so one query's lost dense lane is not attributed to another.
     #[serde(default, skip_serializing_if = "is_false")]
     pub semantic_stage_timeout_zero_hits: bool,
     /// This query's semantic stage declined to run, or returned only stub candidates.
@@ -2544,104 +2540,6 @@ pub struct PacketSidecarQueryDiagnosticDto {
     pub semantic_abstained: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
-}
-
-/// Which layer produced a packet claim.
-///
-/// Source-grounded profile claims and name-derived templates are different facts; counting
-/// them apart is what lets a field trace answer "did the fitted layer fire, or did this packet
-/// degrade to naming?".
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum PacketClaimSourceDto {
-    /// Source-text-derived claims from the versioned product claim-profile registry.
-    SourceProfile,
-    /// Claims templated from a command/subcommand shape in the question.
-    CommandProfile,
-    /// Generic flow templates that are neither profile- nor role-derived.
-    FlowTemplate,
-    /// Name-and-path-derived evidence-role sentences.
-    RoleTemplate,
-    /// Test-only evaluation-probe flow templates.
-    EvalProbe,
-}
-
-/// Fire counts for one claim profile within one packet.
-///
-/// Every field is either a registry-static profile id or an integer count. No citation display
-/// name, file path, query, or source excerpt may appear here: this is retained field telemetry,
-/// not an evidence surface.
-#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
-pub struct PacketClaimProfileFireRateDto {
-    /// Static profile id from the claim-profile registry.
-    pub profile_id: String,
-    /// Citations this profile was offered.
-    pub evaluated: u32,
-    /// Citations for which this profile emitted at least one claim.
-    pub fired: u32,
-    /// Claims this profile emitted.
-    pub claims: u32,
-    /// Citations where a runtime contract violation skipped this profile before it ran.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub skipped_invalid: u32,
-    /// Typed violation code that caused the skip, when there was one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skip_reason: Option<String>,
-}
-
-/// Claims attributed to one producing layer within one packet.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
-pub struct PacketClaimSourceCountDto {
-    pub source: PacketClaimSourceDto,
-    pub claims: u32,
-}
-
-/// Packet claim-profile fire-rate telemetry.
-///
-/// This travels on its own typed trace field rather than in
-/// [`AgentRetrievalTraceDto::annotations`] on purpose. Annotations are an evidence channel:
-/// consumers scan them for gap markers and downgrade packet confidence when one is found.
-/// Always-on telemetry pushed through that channel is read as a permanent evidence gap, so the
-/// counters are structurally separated from evidence text instead.
-#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
-pub struct PacketClaimProfileTelemetryDto {
-    /// Version of the claim-profile contract these counters describe.
-    pub contract_version: u32,
-    /// Profiles present in the registry when the counters were taken.
-    pub registered_profiles: u32,
-    /// Registry profiles carrying a runtime-enforced contract.
-    pub contracted_profiles: u32,
-    /// Registry profiles still awaiting contract migration.
-    pub pending_profiles: u32,
-    /// Ratchet ceiling for `pending_profiles`.
-    pub pending_ratchet: u32,
-    /// Registry rows the versioned-data loader refused, and therefore never served claims from.
-    ///
-    /// The loader fails closed, so a refusal always shrinks the registry. Publishing the count
-    /// keeps a packet that answered from a partially loaded registry distinguishable from one
-    /// that answered from the whole registry and found nothing.
-    #[serde(default)]
-    pub rejected_profiles: u32,
-    /// Distinct static codes for the refused rows. A count says the registry shrank; these say
-    /// why, which is the difference between a document typo and a document written for another
-    /// binary. Static slugs only — no repository text ever enters this list.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub rejected_reasons: Vec<String>,
-    /// Static code of a whole-document refusal, present only when the registry loaded empty.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_error: Option<String>,
-    /// Citations offered to the profile layer while assembling the packet.
-    pub citations_considered: u32,
-    /// Distinct profiles that emitted at least one claim.
-    pub profiles_fired: u32,
-    /// Distinct profiles skipped by a runtime contract violation.
-    pub profiles_skipped_invalid: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub profiles: Vec<PacketClaimProfileFireRateDto>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub claim_sources: Vec<PacketClaimSourceCountDto>,
 }
 
 /// Source-content work the public operation behind this response performed
@@ -2754,9 +2652,6 @@ pub struct AgentRetrievalTraceDto {
     /// use a typed field instead.
     #[serde(default)]
     pub annotations: Vec<RetrievalAnnotationDto>,
-    /// Typed claim-profile fire-rate telemetry, kept out of `annotations` by design.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packet_claim_profile_telemetry: Option<PacketClaimProfileTelemetryDto>,
     /// Typed source-freshness pass counters, kept out of `annotations` by design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_freshness_telemetry: Option<SourceFreshnessTelemetryDto>,
@@ -2799,51 +2694,6 @@ pub enum PacketBudgetModeDto {
     Deep,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ClaimReadinessDto {
-    Anchored,
-    Supported,
-    Partial,
-    Inferred,
-    NeedsSourceRead,
-    ContradictedBySource,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PacketTaskClassDto {
-    ArchitectureExplanation,
-    BugLocalization,
-    ChangeImpact,
-    RouteTracing,
-    SymbolOwnership,
-    DataFlow,
-    EditPlanning,
-}
-
-pub const PACKET_OBLIGATION_PLAN_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum PacketClaimObligationKindDto {
-    Entrypoint,
-    Dispatch,
-    Orchestration,
-    StateWrite,
-    ExternalIo,
-    ExactProbe,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PacketQueryObligationKindDto {
-    RequiredFlow,
-    RequiredProbe,
-    RequiredPath,
-    Supplemental,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PacketQueryCompletionDto {
@@ -2857,78 +2707,6 @@ impl Default for PacketQueryCompletionDto {
             reason: "completion_missing".to_string(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PacketObligationProofStatusDto {
-    Planned,
-    Proven,
-    Reported,
-    Unsupported,
-    Contradicted,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
-pub struct PacketObligationCarrierEdgeProofDto {
-    pub carrier_node_id: NodeId,
-    pub edge_id: EdgeId,
-    pub edge_kind: EdgeKind,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
-pub struct PacketClaimObligationDto {
-    pub id: String,
-    pub kind: PacketClaimObligationKindDto,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub binding_terms: Vec<String>,
-    /// Exact typed-probe resolution bound to this material row. Kept structured so input identity,
-    /// requested path/symbol casing, resolved node/path, ambiguity, and rejection cannot be inferred
-    /// from an opaque obligation ID.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub probe_binding: Option<PacketProbeResolutionDto>,
-    pub material: bool,
-    #[serde(default)]
-    pub allowed_node_kinds: Vec<NodeKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_edge_kind: Option<EdgeKind>,
-    #[serde(default)]
-    pub requires_complete_discovery: bool,
-    pub proof_status: PacketObligationProofStatusDto,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub carrier_node_ids: Vec<NodeId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub carrier_paths: Vec<String>,
-    /// Exact typed edge receipts that remain serialized with the carrier in the final packet.
-    /// Trimming the corresponding trail edge removes its receipt and demotes only that obligation;
-    /// a global omission marker never substitutes for the missing typed edge.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub carrier_edge_proofs: Vec<PacketObligationCarrierEdgeProofDto>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub open_next_candidates: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
-pub struct PacketQueryObligationDto {
-    pub id: String,
-    pub kind: PacketQueryObligationKindDto,
-    pub query: String,
-    pub material: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion: Option<PacketQueryCompletionDto>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Type, PartialEq, Eq)]
-pub struct PacketObligationPlanDto {
-    pub version: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub binding_terms: Vec<String>,
-    #[serde(default)]
-    pub claim_obligations: Vec<PacketClaimObligationDto>,
-    #[serde(default)]
-    pub query_obligations: Vec<PacketQueryObligationDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -2950,6 +2728,9 @@ pub enum PacketProbeDto {
     SymbolId {
         id: String,
     },
+    QualifiedSymbol {
+        symbol: String,
+    },
     FileSymbol {
         path: String,
         symbol: String,
@@ -2963,9 +2744,7 @@ pub enum PacketProbeDto {
         core_generation_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retrieval_generation: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        symbol_id: Option<String>,
-        query: String,
+        selector: PacketContinuationSelectorV1,
     },
 }
 
@@ -2973,6 +2752,7 @@ pub fn validate_packet_probe(probe: &PacketProbeDto) -> Result<(), String> {
     match probe {
         PacketProbeDto::ExactPath { path } => validate_packet_probe_text("path", path),
         PacketProbeDto::SymbolId { id } => validate_packet_probe_text("id", id),
+        PacketProbeDto::QualifiedSymbol { symbol } => validate_packet_probe_text("symbol", symbol),
         PacketProbeDto::FileSymbol { path, symbol } => {
             validate_packet_probe_text("path", path)?;
             validate_packet_probe_text("symbol", symbol)
@@ -2982,8 +2762,7 @@ pub fn validate_packet_probe(probe: &PacketProbeDto) -> Result<(), String> {
             project_id,
             core_generation_id,
             retrieval_generation,
-            symbol_id,
-            query,
+            selector,
             ..
         } => {
             validate_packet_probe_text("project_id", project_id)?;
@@ -2991,31 +2770,43 @@ pub fn validate_packet_probe(probe: &PacketProbeDto) -> Result<(), String> {
             if let Some(retrieval_generation) = retrieval_generation {
                 validate_packet_probe_text("retrieval_generation", retrieval_generation)?;
             }
-            if let Some(symbol_id) = symbol_id {
+            validate_packet_probe_text("stable_identity", &selector.stable_identity)?;
+            if let Some(path) = selector.path.as_deref() {
+                validate_packet_probe_text("path", path)?;
+            }
+            if let Some(symbol_id) = selector.symbol_id.as_deref() {
                 validate_packet_probe_text("symbol_id", symbol_id)?;
             }
-            validate_packet_probe_text("query", query)
+            match (selector.path.as_deref(), selector.symbol_id.as_deref()) {
+                (None, None) => Err(
+                    "continuation selector requires a stable path or symbol identity".to_string(),
+                ),
+                (_, Some(symbol_id)) => {
+                    let symbol_id = symbol_id.strip_prefix("node:").unwrap_or(symbol_id);
+                    (selector.stable_identity == format!("node:{symbol_id}"))
+                        .then_some(())
+                        .ok_or_else(|| {
+                            "continuation stable_identity does not match symbol_id".to_string()
+                        })
+                }
+                (Some(path), None) => (selector.stable_identity == format!("path:{path}"))
+                    .then_some(())
+                    .ok_or_else(|| "continuation stable_identity does not match path".to_string()),
+            }
         }
     }
 }
 
-pub fn validate_packet_probe_request(
-    probes: &[PacketProbeDto],
-    legacy_probes: &[String],
-) -> Result<(), String> {
-    let count = probes.len().saturating_add(legacy_probes.len());
-    if count > PACKET_PROBE_MAX_COUNT {
+pub fn validate_packet_probe_request(probes: &[PacketProbeDto]) -> Result<(), String> {
+    if probes.len() > PACKET_PROBE_MAX_COUNT {
         return Err(format!(
-            "packet accepts at most {PACKET_PROBE_MAX_COUNT} typed and legacy probes combined; received {count}"
+            "packet accepts at most {PACKET_PROBE_MAX_COUNT} typed probes; received {}",
+            probes.len()
         ));
     }
     for (index, probe) in probes.iter().enumerate() {
         validate_packet_probe(probe)
             .map_err(|error| format!("packet probe {index} is invalid: {error}"))?;
-    }
-    for (index, probe) in legacy_probes.iter().enumerate() {
-        validate_packet_probe_text("legacy probe", probe)
-            .map_err(|error| format!("legacy packet probe {index} is invalid: {error}"))?;
     }
     Ok(())
 }
@@ -3056,6 +2847,8 @@ pub enum PacketProbeRejectionCodeDto {
     StaleSymbolId,
     StaleContinuation,
     IncompatibleContinuation,
+    CandidateCountExceeded,
+    SourceBudgetExceeded,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -3092,14 +2885,10 @@ pub struct PacketProbeResolutionDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 pub struct PacketPlanDto {
-    pub task_class: PacketTaskClassDto,
-    pub inferred_task_class: bool,
     #[serde(default)]
     pub queries: Vec<PacketPlanQueryDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe_resolutions: Vec<PacketProbeResolutionDto>,
-    #[serde(default)]
-    pub obligations: PacketObligationPlanDto,
     #[serde(default)]
     pub trace: Vec<String>,
 }
@@ -3110,12 +2899,8 @@ pub struct AgentPacketRequestDto {
     pub question: String,
     #[serde(default)]
     pub budget: PacketBudgetModeDto,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_class: Option<PacketTaskClassDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probes: Vec<PacketProbeDto>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extra_probes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_budget_ms: Option<u32>,
     /// Parent packet identity for a generation-bound DrillOnce continuation.
@@ -3208,7 +2993,6 @@ pub enum PacketDispositionKindDto {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DrillGapKindDto {
-    DeadlineLostCandidate,
     OmittedMandatorySupport,
     BoundedSourceRead,
 }
@@ -3223,7 +3007,7 @@ pub struct DrillOptionDto {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
+    pub structural_reason: Option<crate::compilation::PacketStructuralGapReasonV1>,
 }
 
 pub const PACKET_DRILL_MAX_OPTIONS: usize = 8;
@@ -3312,7 +3096,9 @@ impl DrillOptionDto {
             kind: DrillGapKindDto::BoundedSourceRead,
             path: Some(path),
             symbol_id: None,
-            query: None,
+            structural_reason: Some(
+                crate::compilation::PacketStructuralGapReasonV1::SourceUnavailable,
+            ),
         }
     }
 
@@ -3328,7 +3114,9 @@ impl DrillOptionDto {
             kind: DrillGapKindDto::OmittedMandatorySupport,
             path: None,
             symbol_id: Some(symbol_id),
-            query: None,
+            structural_reason: Some(
+                crate::compilation::PacketStructuralGapReasonV1::DisconnectedSeed,
+            ),
         }
     }
 
@@ -3344,27 +3132,15 @@ impl DrillOptionDto {
             kind: DrillGapKindDto::OmittedMandatorySupport,
             path: Some(path),
             symbol_id: None,
-            query: None,
-        }
-    }
-
-    pub fn deadline_lost_query(gap_id: impl Into<String>, query: impl Into<String>) -> Self {
-        let query = query.into();
-        let gap_id = gap_id.into();
-        Self {
-            id: encode_drill_option_id(DrillGapKindDto::DeadlineLostCandidate, &query),
-            gap_id,
-            kind: DrillGapKindDto::DeadlineLostCandidate,
-            path: None,
-            symbol_id: None,
-            query: Some(query),
+            structural_reason: Some(
+                crate::compilation::PacketStructuralGapReasonV1::DisconnectedSeed,
+            ),
         }
     }
 }
 
 pub fn encode_drill_option_id(kind: DrillGapKindDto, target: &str) -> String {
     let kind = match kind {
-        DrillGapKindDto::DeadlineLostCandidate => "deadline_lost_candidate",
         DrillGapKindDto::OmittedMandatorySupport => "omitted_mandatory_support",
         DrillGapKindDto::BoundedSourceRead => "bounded_source_read",
     };
@@ -3374,7 +3150,6 @@ pub fn encode_drill_option_id(kind: DrillGapKindDto, target: &str) -> String {
 pub fn decode_drill_option_id(id: &str) -> Option<(DrillGapKindDto, String)> {
     let (kind, encoded) = id.split_once(':')?;
     let kind = match kind {
-        "deadline_lost_candidate" => DrillGapKindDto::DeadlineLostCandidate,
         "omitted_mandatory_support" => DrillGapKindDto::OmittedMandatorySupport,
         "bounded_source_read" => DrillGapKindDto::BoundedSourceRead,
         _ => return None,
@@ -3417,59 +3192,6 @@ fn percent_decode_drill_target(value: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PacketProofStatusDto {
-    Proven,
-    /// A carrier reported a behavior, but did not satisfy the planned kind/edge obligation.
-    /// MCP consumers can detect this additive enum value through the publication schema stamp.
-    Reported,
-    Likely,
-    Diagnostic,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type)]
-pub struct PacketClaimDto {
-    pub claim: String,
-    /// Exact obligation rows this claim asserts. Every listed row must be proven by one of this
-    /// claim's own citations before the claim can be promoted to proven.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_obligation_ids: Vec<String>,
-    /// Optional category constraints on the exact rows named by `required_obligation_ids`.
-    /// Categories never substitute for exact row identity.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required_obligation_kinds: Vec<PacketClaimObligationKindDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proof_status: Option<PacketProofStatusDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_evidence_role: Option<PacketEvidenceTierDto>,
-    #[serde(default)]
-    pub citations: Vec<AgentCitationDto>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coverage_role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eligible_for_sufficiency: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Type, Default)]
-pub struct PacketCoverageReportDto {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub covered: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub provenance_labels: Vec<String>,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub provenance_counts: std::collections::BTreeMap<String, u32>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub missing: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ineligible: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unresolved: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub budget_omitted: Vec<String>,
-}
-
 /// One executable packet follow-up, in the same `{program, args}` shape the
 /// affected surface already publishes.
 #[derive(Debug, Clone, Serialize, Deserialize, Type, PartialEq, Eq)]
@@ -3495,8 +3217,6 @@ pub struct PacketRetrievalTraceSummaryDto {
 pub struct AgentPacketDto {
     pub packet_id: String,
     pub question: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_class: Option<PacketTaskClassDto>,
     pub plan: PacketPlanDto,
     pub answer: AgentAnswerDto,
     #[serde(default)]
@@ -3505,6 +3225,9 @@ pub struct AgentPacketDto {
     pub budget: PacketBudgetDto,
     #[serde(alias = "benchmark_trace")]
     pub retrieval_trace_summary: PacketRetrievalTraceSummaryDto,
+    /// Production never asserts semantic sufficiency.
+    #[serde(default)]
+    pub answer_sufficiency: crate::compilation::AnswerSufficiencyV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -3718,6 +3441,9 @@ mod packet_tests {
                 path: "assets/desk.svg".into(),
             },
             PacketProbeDto::SymbolId { id: "42".into() },
+            PacketProbeDto::QualifiedSymbol {
+                symbol: "runtime::Publisher.commit".into(),
+            },
             PacketProbeDto::FileSymbol {
                 path: "src/lib.rs".into(),
                 symbol: "AppController".into(),
@@ -3730,8 +3456,12 @@ mod packet_tests {
                 project_id: "project-v3".into(),
                 core_generation_id: "core-generation".into(),
                 retrieval_generation: Some("retrieval-generation".into()),
-                symbol_id: Some("42".into()),
-                query: "AppController".into(),
+                selector: PacketContinuationSelectorV1 {
+                    stable_identity: "node:42".into(),
+                    path: None,
+                    symbol_id: Some("42".into()),
+                    reason: crate::compilation::PacketStructuralGapReasonV1::DisconnectedSeed,
+                },
             },
         ];
 
@@ -3753,11 +3483,17 @@ mod packet_tests {
             r#"{"kind":"unknown","query":"x"}"#,
             r#"{"kind":"exact_path"}"#,
             r#"{"kind":"exact_path","path":"src/lib.rs","query":"ignored"}"#,
+            r#"{"kind":"qualified_symbol"}"#,
             r#"{"kind":"file_symbol","path":"src/lib.rs"}"#,
             r#"{"kind":"continuation","contract_version":1,"project_id":"p","core_generation_id":"g"}"#,
         ] {
             assert!(serde_json::from_str::<PacketProbeDto>(malformed).is_err());
         }
+        let targetless: PacketProbeDto = serde_json::from_str(
+            r#"{"kind":"continuation","contract_version":1,"project_id":"p","core_generation_id":"g","selector":{"stable_identity":"node:42","reason":"disconnected_seed"}}"#,
+        )
+        .expect("closed shape may deserialize before semantic validation");
+        assert!(validate_packet_probe(&targetless).is_err());
     }
 
     #[test]
@@ -3772,14 +3508,14 @@ mod packet_tests {
             })
             .is_err()
         );
+        assert!(validate_packet_probe_request(&vec![valid; PACKET_PROBE_MAX_COUNT]).is_ok());
         assert!(
-            validate_packet_probe_request(
-                &vec![valid; PACKET_PROBE_MAX_COUNT],
-                &["overflow".to_string()]
-            )
+            validate_packet_probe_request(&vec![
+                PacketProbeDto::FreeQuery { query: "x".into() };
+                PACKET_PROBE_MAX_COUNT + 1
+            ])
             .is_err()
         );
-        assert!(validate_packet_probe_request(&[], &["   ".to_string()]).is_err());
     }
 
     #[test]
@@ -3799,10 +3535,6 @@ mod packet_tests {
             PacketQueryCompletionDto::Cancelled {
                 reason: "completion_missing".to_string()
             }
-        );
-        assert_eq!(
-            serde_json::to_value(PacketProofStatusDto::Reported).expect("reported status"),
-            serde_json::json!("reported")
         );
     }
 
@@ -3934,7 +3666,6 @@ mod packet_tests {
             semantic_stage_timeout_zero_hits: 0,
             semantic_abstained_count: 0,
             annotations: Vec::new(),
-            packet_claim_profile_telemetry: None,
             source_freshness_telemetry: None,
             steps: Vec::new(),
             packet_sidecar_diagnostics: Vec::new(),
@@ -4001,7 +3732,6 @@ mod packet_tests {
                 RetrievalAnnotationDto::observation("packet_anchor_probes reduced query_limit=2"),
                 RetrievalAnnotationDto::gap("Latency-first cutoff skipped source reads."),
             ],
-            packet_claim_profile_telemetry: None,
             steps: Vec::new(),
             packet_sidecar_diagnostics: Vec::new(),
             retrieval_shadow: None,
@@ -4026,116 +3756,6 @@ mod packet_tests {
         assert_eq!(parsed.annotations, trace.annotations);
         assert!(!parsed.annotations[0].is_gap());
         assert!(parsed.annotations[1].is_gap());
-    }
-
-    #[test]
-    fn packet_claim_profile_telemetry_is_a_typed_trace_field_separate_from_annotations() {
-        // Annotations are the packet's evidence channel; `Gap`-kind entries downgrade reported
-        // confidence. Claim-profile counters are always present, so they get their own typed
-        // field and must never be published as annotations at all.
-        let telemetry = PacketClaimProfileTelemetryDto {
-            contract_version: 2,
-            registered_profiles: 20,
-            contracted_profiles: 7,
-            pending_profiles: 13,
-            pending_ratchet: 13,
-            rejected_profiles: 0,
-            rejected_reasons: Vec::new(),
-            registry_error: None,
-            citations_considered: 3,
-            profiles_fired: 2,
-            profiles_skipped_invalid: 1,
-            profiles: vec![PacketClaimProfileFireRateDto {
-                profile_id: "session-request-dispatch".to_string(),
-                evaluated: 3,
-                fired: 0,
-                claims: 0,
-                skipped_invalid: 1,
-                skip_reason: Some("no_allowed_proof_roles".to_string()),
-            }],
-            claim_sources: vec![PacketClaimSourceCountDto {
-                source: PacketClaimSourceDto::SourceProfile,
-                claims: 4,
-            }],
-        };
-        let trace = AgentRetrievalTraceDto {
-            request_id: "r2".to_string(),
-            retrieval_publication: None,
-            resolved_profile: AgentRetrievalPresetDto::Architecture,
-            policy_mode: AgentRetrievalPolicyModeDto::LatencyFirst,
-            total_latency_ms: 10,
-            sla_target_ms: None,
-            sla_missed: false,
-            semantic_fallback_count: 0,
-            semantic_fallbacks: Vec::new(),
-            semantic_stage_timeout_zero_hits: 0,
-            semantic_abstained_count: 0,
-            annotations: Vec::new(),
-            packet_claim_profile_telemetry: Some(telemetry.clone()),
-            source_freshness_telemetry: Some(SourceFreshnessTelemetryDto {
-                content_hash_reads: 3,
-                verdict_reuses: 9,
-                readiness_fingerprint_passes: 1,
-            }),
-            steps: Vec::new(),
-            packet_sidecar_diagnostics: Vec::new(),
-            retrieval_shadow: None,
-        };
-
-        let value = serde_json::to_value(&trace).expect("serialize");
-        assert_eq!(value["annotations"], serde_json::json!([]));
-        assert_eq!(
-            value["source_freshness_telemetry"],
-            serde_json::json!({
-                "content_hash_reads": 3,
-                "verdict_reuses": 9,
-                "readiness_fingerprint_passes": 1,
-            }),
-            "the pass counters are typed fields, never annotations"
-        );
-        assert_eq!(
-            value["packet_claim_profile_telemetry"]["profiles_skipped_invalid"],
-            serde_json::json!(1)
-        );
-        assert_eq!(
-            value["packet_claim_profile_telemetry"]["claim_sources"][0]["source"],
-            serde_json::json!("source_profile")
-        );
-
-        let parsed: AgentRetrievalTraceDto = serde_json::from_value(value).expect("deserialize");
-        assert_eq!(parsed.packet_claim_profile_telemetry, Some(telemetry));
-
-        // Older payloads without the field stay readable and carry no telemetry.
-        let legacy = serde_json::json!({
-            "request_id": "r3",
-            "resolved_profile": "architecture",
-            "policy_mode": "latency_first",
-            "total_latency_ms": 4,
-            "candidate_count": 0,
-            "steps": [],
-        });
-        let parsed_legacy: AgentRetrievalTraceDto =
-            serde_json::from_value(legacy).expect("deserialize legacy trace");
-        assert!(parsed_legacy.packet_claim_profile_telemetry.is_none());
-
-        // A contract-version-1 telemetry payload predates the loader counters. It still reads,
-        // and it reads as "nothing refused" rather than as unknown, so a stored v1 trace keeps
-        // its meaning next to a v2 one.
-        let v1_shaped: PacketClaimProfileTelemetryDto = serde_json::from_value(serde_json::json!({
-            "contract_version": 1,
-            "registered_profiles": 20,
-            "contracted_profiles": 4,
-            "pending_profiles": 16,
-            "pending_ratchet": 16,
-            "citations_considered": 1,
-            "profiles_fired": 0,
-            "profiles_skipped_invalid": 0,
-        }))
-        .expect("deserialize a contract-version-1 telemetry payload");
-        assert_eq!(v1_shaped.contract_version, 1);
-        assert_eq!(v1_shaped.rejected_profiles, 0);
-        assert_eq!(v1_shaped.rejected_reasons, Vec::<String>::new());
-        assert_eq!(v1_shaped.registry_error, None);
     }
 
     #[test]
@@ -4258,9 +3878,7 @@ mod packet_tests {
         let request = AgentPacketRequestDto {
             question: "How does packet compile support?".to_string(),
             budget: PacketBudgetModeDto::Compact,
-            task_class: None,
             probes: Vec::new(),
-            extra_probes: Vec::new(),
             latency_budget_ms: None,
             parent_packet_id: Some("packet-1".to_string()),
             option_ids: vec!["bounded_source_read:src%2Fmain.rs".to_string()],
@@ -4271,6 +3889,10 @@ mod packet_tests {
         assert_eq!(value["parent_packet_id"], "packet-1");
         assert_eq!(value["option_ids"][0], "bounded_source_read:src%2Fmain.rs");
         assert_eq!(value["core_generation_id"], "core-1");
+        assert!(
+            value.get("task_class").is_none(),
+            "public packet requests must not carry task_class: {value}"
+        );
         let decoded: AgentPacketRequestDto =
             serde_json::from_value(value).expect("deserialize request");
         assert_eq!(decoded.parent_packet_id.as_deref(), Some("packet-1"));
@@ -4278,46 +3900,16 @@ mod packet_tests {
     }
 
     #[test]
-    fn packet_claim_serializes_machine_checkable_proof_metadata() {
-        let value = serde_json::to_value(PacketClaimDto {
-            claim: "Dense hits need backing source proof.".to_string(),
-            required_obligation_ids: Vec::new(),
-            required_obligation_kinds: Vec::new(),
-            proof_status: Some(PacketProofStatusDto::Diagnostic),
-            required_evidence_role: Some(PacketEvidenceTierDto::ExactSource),
-            citations: Vec::new(),
-            coverage_role: Some("source evidence".to_string()),
-            eligible_for_sufficiency: Some(false),
-        })
-        .expect("serialize packet claim");
-
-        assert_eq!(value["proof_status"], "diagnostic");
-        assert_eq!(value["required_evidence_role"], "exact_source");
-
-        let legacy: PacketClaimDto =
-            serde_json::from_str(r#"{"claim":"legacy claim","citations":[]}"#)
-                .expect("deserialize legacy packet claim");
-        assert_eq!(legacy.proof_status, None);
-        assert_eq!(legacy.required_evidence_role, None);
-        assert!(legacy.required_obligation_ids.is_empty());
-        assert!(legacy.required_obligation_kinds.is_empty());
-    }
-
-    #[test]
-    fn legacy_packet_obligation_defaults_missing_probe_binding() {
-        let legacy: PacketClaimObligationDto = serde_json::from_str(
-            r#"{
-                "id":"legacy",
-                "kind":"orchestration",
-                "material":true,
-                "proof_status":"planned"
-            }"#,
-        )
-        .expect("deserialize obligation written before exact probe bindings");
-
-        assert_eq!(legacy.probe_binding, None);
-        assert!(legacy.binding_terms.is_empty());
-        assert!(legacy.carrier_node_ids.is_empty());
+    fn agent_packet_request_rejects_task_class() {
+        let err = serde_json::from_value::<AgentPacketRequestDto>(serde_json::json!({
+            "question": "why",
+            "task_class": "architecture_explanation"
+        }))
+        .expect_err("task_class must be unknown on the public packet request");
+        assert!(
+            err.to_string().contains("task_class"),
+            "deny_unknown_fields should name task_class: {err}"
+        );
     }
 
     #[test]

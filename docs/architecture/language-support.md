@@ -17,8 +17,8 @@ profiles to parser and rule construction in `get_language_for_ext`.
 | Semantic-resolution-backed | Targeted resolver tests prove the named behavior. | Broad cross-package or polymorphic dispatch. |
 | Structural source-proof | Dedicated extractor emits exact source anchors and publishes `structural_text` / `source_range_only` result metadata. | Parser-backed graph extraction, semantic code navigation, or packet semantic proof. |
 | Parser compatibility record | A parser crate/version was checked for future use. | Runtime support. |
-| Packet proof gate | A packet-runtime artifact proves the current packet citation and sufficiency contract for the measured tasks. | Public product-grade language quality. |
-| Publishable packet-runtime pass | Success, quality, sufficiency, and cold-SLA gates all pass in one coherent run. | A change to parser-backed or structural language coverage. |
+| Packet evidence qualification | An installed-agent artifact measures bounded packet usefulness, factual correctness, and efficiency for the measured tasks. | Answer sufficiency or public product-grade language quality. |
+| Installed packet acceptance | Task success, factual integrity, source-work reduction, context, and timing gates pass in one coherent fresh run. | A change to parser-backed or structural language coverage. |
 | Development comparison | A reused-baseline or local-real artifact informs tuning and diagnosis. | Fresh publishable promotion proof. |
 
 A parser-backed file can be publishable even when the selected grammar reports
@@ -55,10 +55,10 @@ routing and structural source-proof only.
 | `source_graph_extraction` | `graph_fixture` | Fidelity or tictactoe graph fixture | Typed semantic resolution. |
 | `structural_source_proof` | `structural_collector_fixture` | Structural collector fixture with exact source spans | Parser-backed graph extraction or semantic proof. |
 | `typed_semantic_edges` | `semantic_resolver_fixture` | Targeted resolver regression | Broad semantic parity. |
-| `packet_sufficient_answer_quality` | `packet_runtime_artifact` | Publishable packet-runtime artifact | Runtime language support. |
+| `packet_evidence_product_quality` | `installed_packet_artifact` | Fresh installed-agent acceptance artifact | Runtime language support or answer sufficiency. |
 
 No current language profile claims `typed_semantic_edges` or
-`packet_sufficient_answer_quality` from the profile registry alone.
+`packet_evidence_product_quality` from the profile registry alone.
 
 ## Agent-Facing Evidence
 
@@ -123,13 +123,14 @@ does not publish reusable units. Cache identity v2 invalidates pre-limit
 artifacts, and cache hits independently enforce the same unit bound.
 
 Safe wording: structural-text anchors prove only that their collector found the
-cited source span; their `source_range_only` status and non-sufficient result
-flag must not be upgraded into graph or semantic proof. OpenAPI endpoint anchors
+cited source span; their `source_range_only` status must not be upgraded into
+graph or semantic proof. Public packets always report
+`answer_sufficiency: not_asserted`. OpenAPI endpoint anchors
 prove only that a schema declares the method/path at the cited source range.
-Packet-runtime is implemented and
-can complete measured suites, but publishable agent-facing packet quality is not
-promoted until one coherent run has all quality, sufficiency, and cold-SLA gates
-green. Run-specific scorecards belong in PRs, issues, release notes, or ignored
+Packet-runtime is implemented and can complete measured suites, but
+agent-facing packet quality is not promoted until one coherent fresh run passes
+the preregistered task-success, factual-integrity, source-work, context, and
+timing gates. Run-specific scorecards belong in PRs, issues, release notes, or ignored
 `target/` artifacts; this page records the durable claim boundaries. HTML, CSS,
 SQL, Markdown/MDX, generic YAML/TOML/JSON, basename-scoped TypeScript/JavaScript
 config JSONC, non-parser shell, PowerShell, GitHub Actions workflows, Docker

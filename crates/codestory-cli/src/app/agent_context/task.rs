@@ -11,9 +11,9 @@ use crate::display;
 use crate::output::{RenderedPublicOutput, emit_public_operation};
 use crate::runtime::map_api_error;
 use anyhow::Result;
+use codestory_contracts::api::AgentPacketRequestDto;
 #[cfg(test)]
 use codestory_contracts::api::{AgentPacketDto, BoundedDrillPlanDto, PacketDispositionKindDto};
-use codestory_contracts::api::{AgentPacketRequestDto, PacketTaskClassDto};
 use codestory_contracts::packet_projection_v3::{
     ContinuationStateV3Dto, EvidenceAvailabilityV3Dto, PacketProjectionV3Dto,
 };
@@ -30,17 +30,14 @@ pub(in crate::app) fn run_task(cmd: TaskCommand) -> Result<()> {
 fn run_task_brief(cmd: TaskBriefCommand) -> Result<()> {
     ensure_dot_only_for_trail(cmd.format, "task brief")?;
     preflight_output_file(cmd.output_file.as_deref())?;
-    args::validate_packet_probe_arguments(&cmd.probes, &cmd.extra_probes)
-        .map_err(anyhow::Error::msg)?;
+    args::validate_packet_probe_arguments(&cmd.probes).map_err(anyhow::Error::msg)?;
     let OpenedAgentSurface { runtime, .. } =
         open_agent_surface(&cmd.project, None, None, cmd.refresh, "task brief")?;
 
     let request = AgentPacketRequestDto {
         question: cmd.prompt.clone(),
         budget: cmd.budget.into(),
-        task_class: Some(PacketTaskClassDto::EditPlanning),
         probes: cmd.probes.clone(),
-        extra_probes: cmd.extra_probes.clone(),
         latency_budget_ms: cmd.latency_budget_ms,
         parent_packet_id: None,
         option_ids: Vec::new(),

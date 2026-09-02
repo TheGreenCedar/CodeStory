@@ -17,6 +17,7 @@ pub const SUMMARY_MAX_BYTES_V3: usize = 8_192;
 pub const MESSAGE_MAX_BYTES_V3: usize = 4_096;
 pub const EXCERPT_MAX_BYTES_V3: usize = 8_192;
 pub const DIAGNOSTIC_CODE_MAX_BYTES_V3: usize = 128;
+pub const PACKET_EVIDENCE_ROWS_MAX_V3: usize = 16;
 pub const EVIDENCE_ROWS_MAX_V3: usize = 256;
 pub const GAP_ROWS_MAX_V3: usize = 256;
 pub const REFERENCE_ROWS_MAX_V3: usize = 256;
@@ -348,10 +349,12 @@ pub enum PacketProjectionV3Dto {
         publication: PublicationIdentityV3Dto,
         status: EvidenceAvailabilityV3Dto,
         retrieval: RetrievalStateDescriptorV3Dto,
-        evidence: BoundedVecV3<PacketEvidenceRowV3Dto, EVIDENCE_ROWS_MAX_V3>,
+        evidence: BoundedVecV3<PacketEvidenceRowV3Dto, PACKET_EVIDENCE_ROWS_MAX_V3>,
         gaps: BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3>,
         continuation: Option<ContinuationStateV3Dto>,
         diagnostics: DiagnosticsCapabilityV3Dto,
+        #[serde(default)]
+        answer_sufficiency: crate::compilation::AnswerSufficiencyV1,
     },
     BudgetExceeded {
         schema_version: u16,
@@ -363,6 +366,8 @@ pub enum PacketProjectionV3Dto {
         gaps: BoundedVecV3<ProjectionGapRowV3Dto, GAP_ROWS_MAX_V3>,
         maximum_bytes: u64,
         required_complete_bytes: u64,
+        #[serde(default)]
+        answer_sufficiency: crate::compilation::AnswerSufficiencyV1,
     },
 }
 
@@ -654,6 +659,7 @@ mod tests {
             gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         };
         let context = ContextProjectionV3Dto {
             kind: ContextProjectionKindV3Dto::Complete,
@@ -708,6 +714,7 @@ mod tests {
             gaps: list(vec![gap(GapKindV3Dto::ContinuationRequired)]),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         };
         let budget_exceeded = PacketProjectionV3Dto::BudgetExceeded {
             schema_version: PACKET_PROJECTION_V3_SCHEMA_VERSION,
@@ -719,6 +726,7 @@ mod tests {
             gaps: list(vec![gap(GapKindV3Dto::OutputBudgetExceeded)]),
             maximum_bytes: 16_384,
             required_complete_bytes: 16_385,
+            answer_sufficiency: Default::default(),
         };
         let context = ContextProjectionV3Dto {
             kind: ContextProjectionKindV3Dto::Complete,
@@ -825,6 +833,7 @@ mod tests {
             gaps: list(Vec::new()),
             continuation: Some(continuation()),
             diagnostics: diagnostics(),
+            answer_sufficiency: Default::default(),
         })
         .expect("serialize packet root");
         assert_eq!(packet_json["kind"], "complete");

@@ -11,7 +11,7 @@ const generator = path.join(repoRoot, "scripts", "generate-codestory-skill-synta
 const catalog = path.join(repoRoot, "plugins", "codestory", "generated-mcp-catalog.json");
 const syntax = path.join(repoRoot, "plugins", "codestory", "skills", "codestory-grounding", "references", "generated-cli-syntax.md");
 
-test("catalog generator derives its preferred protocol revision from the server default", async () => {
+test("catalog generator preserves every revision-native profile and preferred mirror", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "codestory-catalog-generator-"));
   const fixtureRepo = path.join(root, "repo");
   const fixtureGenerator = path.join(fixtureRepo, "scripts", "generate-codestory-skill-syntax.mjs");
@@ -44,18 +44,20 @@ if (!args.includes("serve")) {
   process.exit(0);
 }
 const requests = fs.readFileSync(0, "utf8").trim().split(/\\r?\\n/u).filter(Boolean).map(JSON.parse);
-if (requests[0]?.params?.protocolVersion !== undefined) {
-  process.stderr.write("catalog generator must select the server default, not offer a revision\\n");
+const catalog = JSON.parse(fs.readFileSync(process.env.CATALOG_PATH, "utf8"));
+const revision = requests[0]?.params?.protocolVersion;
+const profile = catalog.revisionProfiles?.[revision];
+if (!profile || !catalog.wireContract.supportedMcpProtocolVersions.includes(revision)) {
+  process.stderr.write("catalog generator must request one supported revision-native profile\\n");
   process.exit(7);
 }
-const catalog = JSON.parse(fs.readFileSync(process.env.CATALOG_PATH, "utf8"));
 for (const request of requests) {
   const result = request.method === "initialize"
-    ? { protocolVersion: catalog.wireContract.preferredMcpProtocolVersion, _meta: { codestory_publication: { schema_version: catalog.wireContract.publicationStampSchemaVersion, minimum_compatible_schema_version: catalog.wireContract.minimumCompatiblePublicationStampSchemaVersion }, codestory_protocol: { supported: catalog.wireContract.supportedMcpProtocolVersions, negotiated: catalog.wireContract.preferredMcpProtocolVersion } } }
-    : request.method === "tools/list" ? { tools: catalog.tools }
-    : request.method === "resources/list" ? { resources: catalog.resources }
-    : request.method === "resources/templates/list" ? { resourceTemplates: catalog.resourceTemplates }
-    : { prompts: catalog.prompts };
+    ? { protocolVersion: revision, _meta: { codestory_publication: { schema_version: catalog.wireContract.publicationStampSchemaVersion, minimum_compatible_schema_version: catalog.wireContract.minimumCompatiblePublicationStampSchemaVersion }, codestory_protocol: { supported: catalog.wireContract.supportedMcpProtocolVersions, preferred: catalog.wireContract.preferredMcpProtocolVersion, negotiated: revision, discovery_contract_sha256: profile.discoveryContractSha256 } } }
+    : request.method === "tools/list" ? { tools: profile.tools }
+    : request.method === "resources/list" ? { resources: profile.resources }
+    : request.method === "resources/templates/list" ? { resourceTemplates: profile.resourceTemplates }
+    : { prompts: profile.prompts };
   process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\\n");
 }
 `, "utf8");
@@ -70,7 +72,7 @@ for (const request of requests) {
     assert.equal(
       await readFile(fixtureCatalog, "utf8"),
       await readFile(catalog, "utf8"),
-      "default-selected v2 catalog bytes must stay unchanged",
+      "revision-native catalog bytes must stay unchanged",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

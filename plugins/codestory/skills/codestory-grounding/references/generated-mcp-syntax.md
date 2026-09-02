@@ -11,7 +11,7 @@ CLI docs. Do not send CLI flags as MCP arguments.
 Live tools: `status`, `packet`, `search`, `ground`, `files`, `affected`,
 `symbol`, `trail`, `callers`, `callees`, `trace`, `get_node`, `neighbors`,
 `shortest_path`, `query_subgraph`, `definition`, `references`, `symbols`,
-`snippet`, `context`, `prove_call_path`.
+`snippet`, `context`, `verify_indexed_direct_calls`.
 
 There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 `bookmark`, `serve`, or `cache` tool. Product tools own activation.
@@ -21,7 +21,7 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | Tool | Required besides `project` | Optional | Notes |
 | --- | --- | --- | --- |
 | `status` | | | Observational. Do not call first. |
-| `packet` | `question` | `budget`, `task_class`, `probes`, `extra_probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Broad evidence questions. No `include_evidence`. |
+| `packet` | `question` | `budget`, typed `probes`, `latency_budget_ms`, continuation `parent_packet_id` / `option_ids` / generation pins | Broad evidence questions. No `include_evidence`, `task_class`, or `extra_probes`. |
 | `search` | `query` | `limit`, `repo_text` (`auto`/`on`/`off`) | Discovery, not packet recovery. |
 | `ground` | | `budget` (`strict`/`balanced`/`max`) | First call may refresh the local map. |
 | `files` | | `language`, `path`, `role`, `limit` | Refreshes the local map before dispatch. No `refresh` field. |
@@ -40,7 +40,34 @@ There is no MCP `index`, `doctor`, `ready`, `explore`, `drill`, `query`,
 | `symbols` | | `parent_id`, `limit` | Root symbols, or children of `parent_id`. |
 | `snippet` | `query`, `id`, `paths`, `path`, `file_path`, or `symbol_id` | `line`, `start_line`, `end_line`, `context`, `lines`, `scope`, `function_body`, `choose` | After packet/search/graph selects targets. |
 | `context` | `query`, `id`, or `bookmark` | `include_evidence`, `max_results` | One concrete target, not a broad question. |
-| `prove_call_path` | `source_text`, `clauses`, `spec` | | Observational exact verification of a host-supplied typed contract. Never construct one from free English or invoke this tool automatically. |
+| `verify_indexed_direct_calls` | `call_path` | | Observational exact verification of a `call-path/v1` document (see below). Never translate free English into one, and never invoke this tool automatically. |
+
+### `call-path/v1`
+
+`call_path` is a text document, not JSON. One contract per document, one clause
+per line:
+
+```text
+call-path/v1
+from symbol "crate::module::Alpha"
+direct-call symbol "crate::module::Beta"
+direct-call symbol "Gamma" in "src/gamma.rs"
+prohibit-through symbol "crate::detail::Helper"
+exclude-from-projection symbol "crate::test_support"
+```
+
+The version line comes first. Exactly one `from` and one to six `direct-call`
+lines are required. `prohibit-through` and `exclude-from-projection` are
+optional and capped at sixteen each. Selectors are
+`symbol "<qualified-name>" [in "<project-relative-path>"]` or
+`canonical "<id>"`. Signatures, wildcards, absolute paths, `..`, and internal
+node identities are not selectors.
+
+Blank lines and indentation are ignored. Any other line the grammar cannot read
+becomes an unresolved clause, and the whole verification then reports
+`graph_disposition: "unknown"` instead of proving a smaller contract than you
+wrote. The document is capped at 8192 bytes. Compact results are capped at
+4 KiB.
 
 ## Resources and prompts
 

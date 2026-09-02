@@ -4,7 +4,28 @@ use super::{V3SurfaceSet, profile::McpRevisionV3};
 
 const VENDOR_SAFETY_KEY: &str = "com.thegreencedar.codestory/safety";
 const PROJECTION_ROWS_MAX_V3: usize = 256;
+const PACKET_PROJECTION_ROWS_MAX_V3: usize =
+    codestory_contracts::packet_projection_v3::PACKET_EVIDENCE_ROWS_MAX_V3;
 const PROJECTION_REFERENCES_MAX_V3: usize = 256;
+/// The transport and MCP validator both enforce an 8 KiB UTF-8 byte cap.
+/// `maxLength` remains a character bound; `call_path` also rejects documents
+/// whose UTF-8 byte length exceeds that same 8 KiB limit.
+const PROOF_CALL_PATH_INPUT_MAX_CHARS_V3: usize =
+    crate::prove_call_path::PROVE_CALL_PATH_INPUT_MAX_BYTES;
+const PROOF_CALL_PATH_GRAMMAR_DESCRIPTION_V3: &str = concat!(
+    "A call-path/v1 document. Line-oriented, one contract per document:\n",
+    "call-path/v1\n",
+    "from symbol \"app::start\" in \"src/app.rs\"\n",
+    "direct-call symbol \"service::load\" in \"src/service.rs\"\n",
+    "direct-call canonical \"store::read\"\n",
+    "prohibit-through symbol \"legacy::shim\"\n",
+    "exclude-from-projection symbol \"tracing::span\"\n",
+    "Exactly one from, one to six ordered direct-call lines, then zero to sixteen ",
+    "prohibit-through and exclude-from-projection lines. Selectors are ",
+    "symbol \"<qualified-name>\" [in \"<project-relative-path>\"] or canonical \"<id>\". ",
+    "Any line the grammar cannot read is reported as an unresolved clause and ",
+    "yields graph_disposition \"unknown\" rather than being skipped."
+);
 
 pub(crate) fn tools_for_revision_v3(revision: McpRevisionV3) -> Vec<Value> {
     tools_for_surface_v3(revision, V3SurfaceSet::WithProof)
@@ -22,499 +43,7 @@ pub(crate) fn tools_for_surface_v3(revision: McpRevisionV3, surface: V3SurfaceSe
 }
 
 pub(crate) fn proof_output_schema_v3() -> Value {
-    json!({
-        "type": "object",
-        "oneOf": [
-            proof_complete_schema_v3(),
-            proof_budget_exceeded_schema_v3()
-        ]
-    })
-}
-
-fn proof_common_fields_v3(kind: &str) -> Vec<(&str, Value)> {
-    vec![
-        ("kind", enum_schema_v3(&[kind])),
-        ("schema_version", json!({"type":"integer","enum":[1]})),
-        ("domain", enum_schema_v3(&["indexed_source_call_path_v1"])),
-        (
-            "contract_interpretation",
-            enum_schema_v3(&["host_supplied"]),
-        ),
-        ("guard_version", enum_schema_v3(&["clause_guard_v1"])),
-        ("source_text_sha256", sha256_schema_v3()),
-        ("contract_digest", sha256_schema_v3()),
-        (
-            "core_publication",
-            closed_object_schema_v3(vec![
-                ("project_id", string_schema_v3()),
-                ("generation_id", string_schema_v3()),
-                ("run_id", string_schema_v3()),
-            ]),
-        ),
-    ]
-}
-
-fn proof_complete_schema_v3() -> Value {
-    let mut fields = proof_common_fields_v3("complete");
-    fields.extend([
-        ("disposition", proof_disposition_schema_v3()),
-        (
-            "identities",
-            closed_object_schema_v3(vec![
-                (
-                    "files",
-                    json!({"type":"array","items":proof_file_schema_v3(),"maxItems":65536}),
-                ),
-                (
-                    "symbols",
-                    json!({"type":"array","items":proof_symbol_schema_v3(),"maxItems":65536}),
-                ),
-                (
-                    "provenance_profiles",
-                    json!({"type":"array","items":proof_provenance_profile_schema_v3(),"maxItems":6}),
-                ),
-                (
-                    "evidence",
-                    json!({"type":"array","items":proof_evidence_schema_v3(),"maxItems":65536}),
-                ),
-            ]),
-        ),
-        ("spec", proof_spec_schema_v3()),
-        (
-            "clauses",
-            json!({"type":"array","items":proof_clause_schema_v3(),"minItems":1}),
-        ),
-        (
-            "steps",
-            json!({"type":"array","items":proof_step_schema_v3(),"maxItems":6}),
-        ),
-        (
-            "receipts",
-            json!({"type":"array","items":proof_receipt_schema_v3(),"maxItems":6}),
-        ),
-    ]);
-    closed_object_schema_v3(fields)
-}
-
-fn proof_budget_exceeded_schema_v3() -> Value {
-    let mut fields = proof_common_fields_v3("budget_exceeded");
-    fields.extend([
-        ("disposition", proof_budget_disposition_schema_v3()),
-        ("cap_bytes", json!({"type":"integer","minimum":1})),
-        (
-            "required_complete_size",
-            json!({"type":"integer","minimum":1}),
-        ),
-    ]);
-    closed_object_schema_v3(fields)
-}
-
-fn proof_disposition_schema_v3() -> Value {
-    let receipt_sequence = || {
-        json!({
-            "type":"array",
-            "items":unsigned_integer_schema_v3(),
-            "maxItems":6,
-            "uniqueItems":true
-        })
-    };
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["contract_proven"])),
-                ("contract_digest", sha256_schema_v3()),
-                ("receipts", receipt_sequence()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["unknown"])),
-                ("contract_digest", sha256_schema_v3()),
-                ("gaps", json!({"type":"array","items":proof_gap_schema_v3(),"minItems":1,"maxItems":256,"uniqueItems":true})),
-                ("connected_receipts", receipt_sequence()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["contract_refuted"])),
-                ("contract_digest", sha256_schema_v3()),
-                ("refutation", proof_refutation_schema_v3()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["unavailable"])),
-                ("contract_digest", sha256_schema_v3()),
-                ("reasons", json!({
-                    "type":"array",
-                    "items":enum_schema_v3(&[
-                        "validated_contract_hash_mismatch",
-                        "publication_pin_mismatch",
-                        "source_not_bound_to_publication",
-                        "proof_facts_unavailable",
-                        "proof_semantic_projection_unavailable"
-                    ]),
-                    "minItems":1,
-                    "maxItems":5,
-                    "uniqueItems":true
-                })),
-            ]),
-        ]
-    })
-}
-
-fn proof_refutation_schema_v3() -> Value {
-    let connected_receipts = || {
-        json!({
-            "type":"array",
-            "items":unsigned_integer_schema_v3(),
-            "maxItems":6,
-            "uniqueItems":true
-        })
-    };
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["prohibited_scope_traversal"])),
-                ("step_index", json!({"type":"integer","minimum":0,"maximum":5})),
-                ("prohibition_index", json!({"type":"integer","minimum":0,"maximum":255})),
-                ("connected_receipts", connected_receipts()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["certified_absence"])),
-                ("step_index", json!({"type":"integer","minimum":0,"maximum":5})),
-                ("extractor_capability_receipt_id", string_schema_v3()),
-                ("untruncated_enumeration_receipt_id", string_schema_v3()),
-                ("connected_receipts", connected_receipts()),
-            ]),
-        ]
-    })
-}
-
-fn proof_gap_schema_v3() -> Value {
-    let selector_gap = |kind| {
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&[kind])),
-            (
-                "selector_index",
-                json!({"type":"integer","minimum":0,"maximum":6}),
-            ),
-        ])
-    };
-    let step_gap = |kind| {
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&[kind])),
-            (
-                "step_index",
-                json!({"type":"integer","minimum":0,"maximum":5}),
-            ),
-        ])
-    };
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![(
-                "kind",
-                enum_schema_v3(&["unclassified_source_text"]),
-            )]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["unresolved_material_clause"])),
-                ("clause_id", string_schema_v3()),
-                (
-                    "reason",
-                    enum_schema_v3(&[
-                        "missing_selector_resolution",
-                        "ambiguous_selector_resolution",
-                        "unsupported_interpretation",
-                    ]),
-                ),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["material_token_misclassified"])),
-                ("clause_id", string_schema_v3()),
-                (
-                    "guard_families",
-                    json!({
-                        "type":"array",
-                        "items":enum_schema_v3(&[
-                            "quoted_or_backticked_identifier",
-                            "arrow_or_relation_notation",
-                            "directness",
-                            "ordering_or_ordinal",
-                            "only",
-                            "negation_or_exclusion",
-                            "path_like_string",
-                            "qualified_symbol_notation",
-                        ]),
-                        "minItems":1,
-                        "maxItems":8,
-                        "uniqueItems":true,
-                    }),
-                ),
-            ]),
-            selector_gap("selector_missing"),
-            selector_gap("selector_ambiguous"),
-            selector_gap("non_callable_selector"),
-            step_gap("direct_call_missing"),
-            step_gap("recursive_call_not_representable"),
-            step_gap("source_window_too_large"),
-            step_gap("invalid_utf8"),
-            step_gap("source_line_out_of_range"),
-            step_gap("edge_containment_unproven"),
-            step_gap("missing_direct_call_receipt"),
-            step_gap("receipt_or_edge_already_used"),
-            step_gap("projection_exclusion_conflicts_with_required_receipt")
-        ]
-    })
-}
-
-fn proof_budget_disposition_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("kind", enum_schema_v3(&["unknown"])),
-        ("contract_digest", sha256_schema_v3()),
-        (
-            "gaps",
-            json!({
-                "type":"array",
-                "items":closed_object_schema_v3(vec![(
-                    "kind",
-                    enum_schema_v3(&["output_budget_exceeded"]),
-                )]),
-                "minItems":1,
-                "maxItems":1
-            }),
-        ),
-    ])
-}
-
-fn proof_file_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("file_node_id", nullable_schema_v3(string_schema_v3())),
-        (
-            "project_file_components",
-            nullable_schema_v3(json!({"type":"array","items":string_schema_v3()})),
-        ),
-        ("indexed_sha256", nullable_schema_v3(sha256_schema_v3())),
-        ("observed_sha256", nullable_schema_v3(sha256_schema_v3())),
-    ])
-}
-
-fn proof_symbol_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("node_id", string_schema_v3()),
-        ("canonical_id", nullable_schema_v3(string_schema_v3())),
-        ("qualified_name", nullable_schema_v3(string_schema_v3())),
-        ("file", nullable_schema_v3(unsigned_integer_schema_v3())),
-    ])
-}
-
-fn proof_evidence_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("fact_id", sha256_schema_v3()),
-        ("caller", unsigned_integer_schema_v3()),
-        ("target", unsigned_integer_schema_v3()),
-        ("edge_id", string_schema_v3()),
-        ("callsite_identity", string_schema_v3()),
-        (
-            "chain",
-            json!({"type":"array","items":closed_object_schema_v3(vec![
-                ("kind", string_schema_v3()), ("symbols", json!({"type":"array","items":unsigned_integer_schema_v3()})),
-            ])}),
-        ),
-        (
-            "provenance",
-            closed_object_schema_v3(vec![
-                ("profile", unsigned_integer_schema_v3()),
-                (
-                    "dependency_files",
-                    json!({"type":"array","items":unsigned_integer_schema_v3()}),
-                ),
-                ("evidence_sha256", sha256_schema_v3()),
-            ]),
-        ),
-    ])
-}
-
-fn proof_provenance_profile_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("producer", enum_schema_v3(&["codestory-internal"])),
-        ("fact_schema_version", json!({"type":"integer","enum":[1]})),
-        ("algorithm", enum_schema_v3(&["exact-call-resolution-v1"])),
-        ("language_adapter", string_schema_v3()),
-        ("language_adapter_version", string_schema_v3()),
-        ("parser_fingerprint", sha256_schema_v3()),
-    ])
-}
-
-fn proof_spec_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("start", proof_symbol_selector_schema_v3()),
-        (
-            "steps",
-            json!({
-                "type":"array",
-                "items":closed_object_schema_v3(vec![
-                    ("relation", enum_schema_v3(&["direct_outgoing_call"])),
-                    ("target", proof_symbol_selector_schema_v3()),
-                ]),
-                "minItems":1,
-                "maxItems":6
-            }),
-        ),
-        (
-            "prohibit_traversal_through",
-            json!({"type":"array","items":proof_inline_selector_schema_v3(),"maxItems":256}),
-        ),
-        (
-            "exclude_from_projection",
-            json!({"type":"array","items":proof_inline_selector_schema_v3(),"maxItems":256}),
-        ),
-    ])
-}
-
-fn proof_symbol_selector_schema_v3() -> Value {
-    let mut variants = proof_inline_selector_variants_v3();
-    variants.extend([
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&["pinned_node_ref"])),
-            ("symbol", unsigned_integer_schema_v3()),
-        ]),
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&["canonical_id_ref"])),
-            ("symbol", unsigned_integer_schema_v3()),
-        ]),
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&["qualified_name_ref"])),
-            ("symbol", unsigned_integer_schema_v3()),
-            ("path_binding", enum_schema_v3(&["none", "exact_file"])),
-        ]),
-    ]);
-    json!({"type":"object","oneOf":variants})
-}
-
-fn proof_inline_selector_schema_v3() -> Value {
-    json!({"type":"object","oneOf":proof_inline_selector_variants_v3()})
-}
-
-fn proof_inline_selector_variants_v3() -> Vec<Value> {
-    vec![
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&["pinned_node"])),
-            ("project_id", string_schema_v3()),
-            ("core_generation_id", string_schema_v3()),
-            ("core_run_id", string_schema_v3()),
-            ("node_id", string_schema_v3()),
-        ]),
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&["canonical_id"])),
-            ("canonical_id", string_schema_v3()),
-        ]),
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&["qualified_name"])),
-            ("qualified_name", string_schema_v3()),
-            (
-                "project_file_components",
-                nullable_schema_v3(json!({"type":"array","items":string_schema_v3(),"minItems":1})),
-            ),
-        ]),
-    ]
-}
-
-fn proof_clause_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("start", unsigned_integer_schema_v3()),
-        ("end", unsigned_integer_schema_v3()),
-        ("clause_id", string_schema_v3()),
-        ("quote", string_schema_v3()),
-        (
-            "classification",
-            enum_schema_v3(&["resolved_material", "unresolved_material", "non_material"]),
-        ),
-        (
-            "fields",
-            json!({"type":"array","items":proof_contract_field_schema_v3(),"maxItems":537}),
-        ),
-        (
-            "reason",
-            nullable_schema_v3(enum_schema_v3(&[
-                "missing_selector_resolution",
-                "ambiguous_selector_resolution",
-                "unsupported_interpretation",
-            ])),
-        ),
-        (
-            "non_material_kind",
-            nullable_schema_v3(enum_schema_v3(&[
-                "whitespace",
-                "punctuation",
-                "connector",
-                "commentary",
-            ])),
-        ),
-    ])
-}
-
-fn proof_contract_field_schema_v3() -> Value {
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![("kind", enum_schema_v3(&["start"]))]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["step_target","directness","ordering","relation"])),
-                ("step", unsigned_integer_schema_v3()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["traversal_prohibition","projection_exclusion"])),
-                ("index", unsigned_integer_schema_v3()),
-            ]),
-        ]
-    })
-}
-
-fn proof_receipt_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("receipt_id", string_schema_v3()),
-        ("edge_id", string_schema_v3()),
-        ("source", unsigned_integer_schema_v3()),
-        ("target", unsigned_integer_schema_v3()),
-        ("evidence", unsigned_integer_schema_v3()),
-        ("exact_callsite_start_byte", unsigned_integer_schema_v3()),
-        ("callsite_identity", string_schema_v3()),
-        ("column_or_ordinal", unsigned_integer_schema_v3()),
-        (
-            "containment",
-            closed_object_schema_v3(vec![
-                ("file", unsigned_integer_schema_v3()),
-                ("owner", unsigned_integer_schema_v3()),
-                ("start_line", unsigned_integer_schema_v3()),
-                ("end_line", unsigned_integer_schema_v3()),
-            ]),
-        ),
-        (
-            "line_window",
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["indexed_line_v1"])),
-                ("file", unsigned_integer_schema_v3()),
-                ("anchor_line", unsigned_integer_schema_v3()),
-                ("byte_start", unsigned_integer_schema_v3()),
-                ("byte_end", unsigned_integer_schema_v3()),
-                ("text", string_schema_v3()),
-            ]),
-        ),
-    ])
-}
-
-fn proof_step_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("step_index", unsigned_integer_schema_v3()),
-        (
-            "status",
-            enum_schema_v3(&[
-                "proven",
-                "positive_contradiction",
-                "certified_absence",
-                "unavailable",
-                "unknown",
-            ]),
-        ),
-        ("receipt", nullable_schema_v3(unsigned_integer_schema_v3())),
-    ])
+    codestory_contracts::call_path_public::public_call_path_result_schema()
 }
 
 fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
@@ -578,20 +107,20 @@ fn project_tool_v3(revision: McpRevisionV3, source: &Value) -> Value {
 }
 
 fn annotations_v3(activates: bool) -> Value {
-    let mut annotations = Map::from_iter([
-        ("destructiveHint".to_string(), json!(false)),
-        ("idempotentHint".to_string(), json!(true)),
-        ("openWorldHint".to_string(), json!(activates)),
-    ]);
-    if !activates {
-        annotations.insert("readOnlyHint".to_string(), json!(true));
-    }
-    Value::Object(annotations)
+    // Match stdio_catalog policy: readOnlyHint is true for every tool, including
+    // those that activate managed cache state. None write the repository; managed
+    // activation is disclosed through openWorldHint and vendor safety metadata.
+    json!({
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": activates
+    })
 }
 
 fn output_schema_for_tool_v3(name: &str, source: &Value, activates: bool) -> Value {
     let success = match name {
-        "prove_call_path" => proof_output_schema_v3(),
+        "verify_indexed_direct_calls" => proof_output_schema_v3(),
         "packet" => packet_output_schema_v3(),
         "context" => context_output_schema_v3(),
         "search" => search_output_schema_v3(),
@@ -600,7 +129,7 @@ fn output_schema_for_tool_v3(name: &str, source: &Value, activates: bool) -> Val
             .cloned()
             .unwrap_or_else(|| json!({"type":"object"})),
     };
-    if activates {
+    if activates || name == "verify_indexed_direct_calls" {
         successful_with_preparing_schema_v3(success)
     } else {
         success
@@ -624,7 +153,7 @@ fn packet_complete_schema_v3() -> Value {
         ("retrieval", retrieval_state_schema_v3()),
         (
             "evidence",
-            bounded_array_schema_v3(packet_evidence_schema_v3(), PROJECTION_ROWS_MAX_V3),
+            bounded_array_schema_v3(packet_evidence_schema_v3(), PACKET_PROJECTION_ROWS_MAX_V3),
         ),
         (
             "gaps",
@@ -632,6 +161,7 @@ fn packet_complete_schema_v3() -> Value {
         ),
         ("continuation", nullable_schema_v3(continuation_schema_v3())),
         ("diagnostics", diagnostics_capability_schema_v3()),
+        ("answer_sufficiency", enum_schema_v3(&["not_asserted"])),
     ])
 }
 
@@ -659,6 +189,7 @@ fn packet_budget_exceeded_schema_v3() -> Value {
         ),
         ("maximum_bytes", unsigned_integer_schema_v3()),
         ("required_complete_bytes", unsigned_integer_schema_v3()),
+        ("answer_sufficiency", enum_schema_v3(&["not_asserted"])),
     ])
 }
 
@@ -914,6 +445,15 @@ fn unsigned_integer_schema_v3() -> Value {
     json!({"type":"integer","minimum":0})
 }
 
+/// A preparing result states the smallest sufficient next action, so a caller
+/// never has to infer whether the request needs rewriting.
+fn preparing_minimum_next_schema_v3() -> Value {
+    closed_object_schema_v3(vec![
+        ("kind", enum_schema_v3(&["retry_same_request"])),
+        ("after_ms", json!({"type":"integer","minimum":1})),
+    ])
+}
+
 fn successful_with_preparing_schema_v3(success: Value) -> Value {
     json!({
         "type": "object",
@@ -930,9 +470,10 @@ fn successful_with_preparing_schema_v3(success: Value) -> Value {
                     "kind": {"type":"string","enum":["preparing"]},
                     "state": {"type":"string","enum":["preparing"]},
                     "retry_after_ms": {"type":"integer","minimum":1},
+                    "minimum_next": preparing_minimum_next_schema_v3(),
                     "operation": {"type":"object"}
                 },
-                "required": ["kind", "state", "retry_after_ms", "operation"],
+                "required": ["kind", "state", "retry_after_ms", "minimum_next", "operation"],
                 "additionalProperties": false
             }
         ]
@@ -941,14 +482,14 @@ fn successful_with_preparing_schema_v3(success: Value) -> Value {
 
 pub(crate) fn proof_tool_source_v3() -> Value {
     json!({
-        "name": "prove_call_path",
-        "description": "Verify one host-translated exact indexed source call-path contract against a pinned publication.",
+        "name": "verify_indexed_direct_calls",
+        "description": "Verify one exact indexed source call path, written in the call-path/v1 grammar, against a pinned publication.",
         "inputSchema": proof_input_schema_v3(),
         "outputSchema": proof_output_schema_v3(),
         "safety": {
-            "effect": "read_only",
-            "activatesProject": false,
-            "sideEffects": false
+            "effect": "managed_activation",
+            "activatesProject": true,
+            "sideEffects": true
         }
     })
 }
@@ -956,141 +497,16 @@ pub(crate) fn proof_tool_source_v3() -> Value {
 fn proof_input_schema_v3() -> Value {
     closed_object_schema_v3(vec![
         ("project", json!({"type":"string","minLength":1})),
-        ("source_text", json!({"type":"string","minLength":1})),
         (
-            "clauses",
-            json!({"type":"array","items":proof_clause_anchor_input_schema_v3()}),
-        ),
-        ("spec", proof_spec_input_schema_v3()),
-    ])
-}
-
-fn proof_clause_anchor_input_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("clause_id", json!({"type":"string","minLength":1})),
-        ("start_byte", unsigned_integer_schema_v3()),
-        ("end_byte_exclusive", unsigned_integer_schema_v3()),
-        ("quote", string_schema_v3()),
-        (
-            "classification",
-            proof_clause_classification_input_schema_v3(),
-        ),
-    ])
-}
-
-fn proof_clause_classification_input_schema_v3() -> Value {
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["resolved_material"])),
-                ("fields", json!({
-                    "type":"array",
-                    "items":proof_contract_field_input_schema_v3(),
-                    "minItems":1,
-                })),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["unresolved_material"])),
-                ("reason", enum_schema_v3(&[
-                    "missing_selector_resolution",
-                    "ambiguous_selector_resolution",
-                    "unsupported_interpretation",
-                ])),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["non_material"])),
-                ("reason", enum_schema_v3(&[
-                    "whitespace",
-                    "punctuation",
-                    "connector",
-                    "commentary",
-                ])),
-            ]),
-        ],
-    })
-}
-
-fn proof_contract_field_input_schema_v3() -> Value {
-    let step = |kind| {
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&[kind])),
-            ("step", json!({"type":"integer","minimum":0,"maximum":5})),
-        ])
-    };
-    let scope = |kind| {
-        closed_object_schema_v3(vec![
-            ("kind", enum_schema_v3(&[kind])),
-            ("index", json!({"type":"integer","minimum":0,"maximum":255})),
-        ])
-    };
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![("kind", enum_schema_v3(&["start"]))]),
-            step("step_target"),
-            step("directness"),
-            step("ordering"),
-            step("relation"),
-            scope("traversal_prohibition"),
-            scope("projection_exclusion"),
-        ],
-    })
-}
-
-fn proof_spec_input_schema_v3() -> Value {
-    closed_object_schema_v3(vec![
-        ("start", proof_selector_input_schema_v3()),
-        (
-            "steps",
+            "call_path",
             json!({
-                "type":"array",
-                "items":closed_object_schema_v3(vec![("target", proof_selector_input_schema_v3())]),
-                "minItems":1,
-                "maxItems":6,
+                "type":"string",
+                "minLength":1,
+                "maxLength":PROOF_CALL_PATH_INPUT_MAX_CHARS_V3,
+                "description":PROOF_CALL_PATH_GRAMMAR_DESCRIPTION_V3,
             }),
         ),
-        (
-            "prohibit_traversal_through",
-            json!({"type":"array","items":proof_selector_input_schema_v3(),"maxItems":256}),
-        ),
-        (
-            "exclude_from_projection",
-            json!({"type":"array","items":proof_selector_input_schema_v3(),"maxItems":256}),
-        ),
     ])
-}
-
-fn proof_selector_input_schema_v3() -> Value {
-    let file_components = json!({
-        "type":["array","null"],
-        "items":{"type":"string","minLength":1},
-    });
-    json!({
-        "type":"object",
-        "oneOf":[
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["pinned_node"])),
-                ("project_id", string_schema_v3()),
-                ("core_generation_id", string_schema_v3()),
-                ("core_run_id", string_schema_v3()),
-                ("node_id", string_schema_v3()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["canonical_id"])),
-                ("canonical_id", string_schema_v3()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["qualified_name"])),
-                ("qualified_name", string_schema_v3()),
-            ]),
-            closed_object_schema_v3(vec![
-                ("kind", enum_schema_v3(&["qualified_name"])),
-                ("qualified_name", string_schema_v3()),
-                ("project_file_components", file_components),
-            ]),
-        ],
-    })
 }
 
 fn title_v3(name: &str) -> String {
@@ -1136,6 +552,7 @@ mod tests {
                 .map(|tool| tool["name"].as_str().expect("tool name"))
                 .collect::<BTreeSet<_>>();
             assert!(!names.contains("prove_call_path"));
+            assert!(!names.contains("verify_indexed_direct_calls"));
             for required in ["packet", "context", "search"] {
                 assert!(names.contains(required), "missing evidence tool {required}");
             }
@@ -1176,15 +593,15 @@ mod tests {
                     Some(&json!(true))
                 );
                 assert_eq!(
-                    tool(&tools, "prove_call_path").pointer("/annotations/readOnlyHint"),
+                    tool(&tools, "verify_indexed_direct_calls")
+                        .pointer("/annotations/readOnlyHint"),
                     Some(&json!(true))
                 );
                 for activation_capable in ["packet", "search", "ground", "context"] {
-                    assert!(
-                        tool(&tools, activation_capable)
-                            .pointer("/annotations/readOnlyHint")
-                            .is_none(),
-                        "activation-capable {activation_capable} must omit readOnlyHint"
+                    assert_eq!(
+                        tool(&tools, activation_capable).pointer("/annotations/readOnlyHint"),
+                        Some(&json!(true)),
+                        "activation-capable {activation_capable} must emit readOnlyHint=true"
                     );
                 }
             }
@@ -1241,7 +658,8 @@ mod tests {
                     "evidence":[{"identity":{"evidence_id":"evidence-1"},"kind":"exact_source","path":"src/lib.rs","symbol_id":"crate::entry","start_line":4,"end_line":9,"summary":"entry calls runtime"}],
                     "gaps":[{"identity":{"gap_id":"gap-1"},"kind":"continuation_required","message":"one round remains"}],
                     "continuation":{"continuation_id":"continuation-1","remaining_rounds":1,"gap_ids":[{"gap_id":"gap-1"}]},
-                    "diagnostics":diagnostics
+                    "diagnostics":diagnostics,
+                    "answer_sufficiency":"not_asserted"
                 }),
             ),
             (
@@ -1251,7 +669,8 @@ mod tests {
                     "status":"unavailable","retrieval":{"state":"degraded","generation_id":"retrieval-1"},
                     "diagnostics":diagnostics,
                     "gaps":[{"identity":{"gap_id":"packet-output-budget-exceeded"},"kind":"output_budget_exceeded","message":null}],
-                    "maximum_bytes":16384,"required_complete_bytes":16385
+                    "maximum_bytes":16384,"required_complete_bytes":16385,
+                    "answer_sufficiency":"not_asserted"
                 }),
             ),
             (
@@ -1285,9 +704,10 @@ mod tests {
                 "kind":"preparing",
                 "state":"preparing",
                 "retry_after_ms":250,
+                "minimum_next":{"kind":"retry_same_request","after_ms":250},
                 "operation":{"stage":"publication"}
             });
-            for name in ["packet", "context", "search"] {
+            for name in ["packet", "context", "search", "verify_indexed_direct_calls"] {
                 assert!(
                     crate::stdio_arguments::validate_structured_content(
                         &tool(&tools, name)["outputSchema"],
@@ -1312,12 +732,15 @@ mod tests {
         let complete = json!({
             "kind": "complete",
             "schema_version": 1,
-            "domain": "indexed_source_call_path_v1",
-            "contract_interpretation": "host_supplied",
+            "domain": "call-path/v1",
+            "translation_status": "host_supplied",
+            "graph_disposition": "unknown",
+            "runtime_execution_proven": false,
             "guard_version": "clause_guard_v1",
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
+            "provenance": {"availability":"unavailable"},
             "identities": {"files":[],"symbols":[],"provenance_profiles":[],"evidence":[]},
             "spec": {"start":{"kind":"canonical_id","canonical_id":"A"},"steps":[{"relation":"direct_outgoing_call","target":{"kind":"canonical_id","canonical_id":"B"}}],"prohibit_traversal_through":[],"exclude_from_projection":[]},
             "clauses": [{
@@ -1332,15 +755,18 @@ mod tests {
         let budget = json!({
             "kind": "budget_exceeded",
             "schema_version": 1,
-            "domain": "indexed_source_call_path_v1",
-            "contract_interpretation": "host_supplied",
+            "domain": "call-path/v1",
+            "translation_status": "host_supplied",
+            "graph_disposition": "unknown",
+            "runtime_execution_proven": false,
             "guard_version": "clause_guard_v1",
             "source_text_sha256": "a".repeat(64),
             "contract_digest": "b".repeat(64),
             "core_publication": {"project_id":"p","generation_id":"g","run_id":"r"},
+            "provenance": {"availability":"unavailable"},
             "disposition": {"kind":"unknown","contract_digest":"b".repeat(64),"gaps":[{"kind":"output_budget_exceeded"}]},
-            "cap_bytes": 65536,
-            "required_complete_size": 65537
+            "cap_bytes": 8192,
+            "required_complete_size": 8193
         });
         let schema = proof_output_schema_v3();
         assert_eq!(
@@ -1388,7 +814,8 @@ mod tests {
         certified_absence["steps"][0]["status"] = json!("certified_absence");
         assert!(
             crate::stdio_arguments::validate_structured_content(&schema, &certified_absence)
-                .is_ok()
+                .is_err(),
+            "public call-path schema must reject certified_absence refutation"
         );
 
         let mut invalid = complete;
@@ -1415,14 +842,16 @@ mod tests {
                 "identity":{"evidence_id":"evidence-1"},"kind":"exact_source",
                 "path":"src/lib.rs","symbol_id":null,"start_line":4,"end_line":9,"summary":null
             }],
-            "gaps":[],"continuation":null,"diagnostics":diagnostics
+            "gaps":[],"continuation":null,"diagnostics":diagnostics,
+            "answer_sufficiency":"not_asserted"
         });
         let packet_budget = json!({
             "kind":"budget_exceeded","schema_version":3,"identity":identity,"publication":publication,
             "status":"unavailable","retrieval":{"state":"degraded","generation_id":null},
             "diagnostics":diagnostics,
             "gaps":[{"identity":{"gap_id":"packet-output-budget-exceeded"},"kind":"output_budget_exceeded","message":null}],
-            "maximum_bytes":16384,"required_complete_bytes":16385
+            "maximum_bytes":16384,"required_complete_bytes":16385,
+            "answer_sufficiency":"not_asserted"
         });
         let context = json!({
             "kind":"complete","schema_version":3,"identity":identity,"publication":publication,

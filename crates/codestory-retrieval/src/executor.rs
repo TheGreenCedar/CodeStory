@@ -3,8 +3,9 @@ use crate::cache::RetrievalCache;
 use crate::cache::RetrievalCacheKey;
 use crate::candidate::{CandidateHit, CandidateLane, fused_candidate_identity_matches};
 use crate::health::{
-    probe_sidecar_health, probe_sidecar_health_for_runtime,
-    probe_sidecar_health_with_embedding_device,
+    probe_descriptor_sidecar_health, probe_descriptor_sidecar_health_for_runtime,
+    probe_descriptor_sidecar_health_with_embedding_device, probe_sidecar_health,
+    probe_sidecar_health_for_runtime, probe_sidecar_health_with_embedding_device,
 };
 use crate::index::query_fingerprint;
 use crate::mode::{RetrievalDegradedMode, derive_degraded_mode};
@@ -138,17 +139,49 @@ pub struct QueryExecutor<'a> {
     pub mode_override: Option<RetrievalDegradedMode>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidatePayloadMode {
+    Full,
+    DescriptorOnly,
+}
+
+impl CandidatePayloadMode {
+    fn cache_fingerprint(self, fingerprint: String) -> String {
+        match self {
+            Self::Full => fingerprint,
+            Self::DescriptorOnly => format!("packet-descriptor/v1:{fingerprint}"),
+        }
+    }
+}
+
 impl<'a> QueryExecutor<'a> {
     /// Run one query within the provided total budget.
     ///
     /// `total_budget_ms` caps retrieval work only; it does not include runtime candidate
     /// resolution, packet sufficiency checks, or answer composition.
     pub fn execute(&mut self, query: &str, total_budget_ms: Option<u64>) -> Result<QueryResult> {
+        self.execute_with_payload(query, total_budget_ms, CandidatePayloadMode::Full)
+    }
+
+    pub(crate) fn execute_packet_descriptors(
+        &mut self,
+        query: &str,
+        total_budget_ms: Option<u64>,
+    ) -> Result<QueryResult> {
+        self.execute_with_payload(query, total_budget_ms, CandidatePayloadMode::DescriptorOnly)
+    }
+
+    fn execute_with_payload(
+        &mut self,
+        query: &str,
+        total_budget_ms: Option<u64>,
+        payload: CandidatePayloadMode,
+    ) -> Result<QueryResult> {
         let request_started = Instant::now();
         let features = classify_query(query);
-        let fingerprint = query_fingerprint(&features.raw_query);
+        let fingerprint = payload.cache_fingerprint(query_fingerprint(&features.raw_query));
 
-        let (mode, degraded_reason) = self.resolve_mode();
+        let (mode, degraded_reason) = self.resolve_mode(payload);
         if mode != RetrievalDegradedMode::Full {
             bail!(
                 "retrieval sidecar is mandatory; project is not in full mode (mode={}, reason={})",
@@ -190,6 +223,19 @@ impl<'a> QueryExecutor<'a> {
         }
 
         let mut plan = crate::planner::plan_query(&features, mode);
+        if payload == CandidatePayloadMode::DescriptorOnly {
+            // Both SCIP stages open the graph query view. The anchor stage
+            // constructs its adjacency map even when it returns only anchors,
+            // while expansion materializes neighbor evidence. Packet
+            // descriptors must reach the shared admission gate before either
+            // graph path is opened.
+            plan.stages.retain(|stage| {
+                !matches!(
+                    stage.kind,
+                    RetrievalStageKind::Stage0ScipAnchor | RetrievalStageKind::Stage2ScipExpand
+                )
+            });
+        }
         let planned_budget_ms = plan.stages.iter().map(|stage| stage.budget_ms).sum::<u64>();
         if let Some(budget) = total_budget_ms {
             if is_broad_query(features.shape) && budget < planned_budget_ms {
@@ -215,10 +261,15 @@ impl<'a> QueryExecutor<'a> {
             StageSequenceOptions {
                 stop_marginal_gain_threshold: Some(plan.stop_marginal_gain_threshold),
                 stop_after_low_gain_streak: plan.stop_after_low_gain_streak,
+                payload,
             },
         )?;
 
-        enrich_candidates_with_file_roles(&mut candidates, &self.file_roles);
+        if payload == CandidatePayloadMode::Full {
+            enrich_candidates_with_file_roles(&mut candidates, &self.file_roles);
+        } else {
+            sanitize_descriptor_candidates(&mut candidates);
+        }
         let ranked = rank_candidates(&features, candidates);
         let hits = ranked;
 
@@ -260,7 +311,10 @@ impl<'a> QueryExecutor<'a> {
         })
     }
 
-    fn resolve_mode(&self) -> (RetrievalDegradedMode, Option<String>) {
+    fn resolve_mode(
+        &self,
+        payload: CandidatePayloadMode,
+    ) -> (RetrievalDegradedMode, Option<String>) {
         if let Some(mode) = self.mode_override {
             return (mode, None);
         }
@@ -271,7 +325,33 @@ impl<'a> QueryExecutor<'a> {
                     Some("sidecar_layout_missing".into()),
                 );
             };
-            let report = if let (Some(embedding_device), Some(runtime)) = (
+            let report = if payload == CandidatePayloadMode::DescriptorOnly {
+                if let (Some(embedding_device), Some(runtime)) = (
+                    self.sidecars.embedding_device_readiness(),
+                    self.sidecars.runtime_config(),
+                ) {
+                    probe_descriptor_sidecar_health_for_runtime(
+                        layout,
+                        &manifest.project_id,
+                        Some(manifest.clone()),
+                        embedding_device,
+                        runtime,
+                    )
+                } else if let Some(embedding_device) = self.sidecars.embedding_device_readiness() {
+                    probe_descriptor_sidecar_health_with_embedding_device(
+                        layout,
+                        &manifest.project_id,
+                        Some(manifest.clone()),
+                        embedding_device,
+                    )
+                } else {
+                    probe_descriptor_sidecar_health(
+                        layout,
+                        &manifest.project_id,
+                        Some(manifest.clone()),
+                    )
+                }
+            } else if let (Some(embedding_device), Some(runtime)) = (
                 self.sidecars.embedding_device_readiness(),
                 self.sidecars.runtime_config(),
             ) {
@@ -292,7 +372,11 @@ impl<'a> QueryExecutor<'a> {
             } else {
                 probe_sidecar_health(layout, &manifest.project_id, Some(manifest.clone()))
             };
-            return derive_degraded_mode(&report.lexical, &report.semantic, &report.scip);
+            return if payload == CandidatePayloadMode::DescriptorOnly {
+                crate::mode::derive_descriptor_mode(&report.lexical, &report.semantic)
+            } else {
+                derive_degraded_mode(&report.lexical, &report.semantic, &report.scip)
+            };
         }
         (
             RetrievalDegradedMode::LexicalOnly,
@@ -306,6 +390,7 @@ impl<'a> QueryExecutor<'a> {
         features: &QueryFeatures,
         anchors: &[CandidateHit],
         context: &SearchExecutionContext,
+        payload: CandidatePayloadMode,
     ) -> Result<Vec<CandidateHit>> {
         let query = &features.raw_query;
         match stage.kind {
@@ -313,7 +398,11 @@ impl<'a> QueryExecutor<'a> {
                 sidecars.scip_anchor_with_context(query, stage.top_k, context)
             }
             RetrievalStageKind::Stage1Lexical => {
-                sidecars.lexical_search_with_context(query, stage.top_k, context)
+                if payload == CandidatePayloadMode::DescriptorOnly {
+                    sidecars.lexical_descriptor_search_with_context(query, stage.top_k, context)
+                } else {
+                    sidecars.lexical_search_with_context(query, stage.top_k, context)
+                }
             }
             RetrievalStageKind::Stage1bSemantic => {
                 sidecars.semantic_search_with_context(query, stage.top_k, context)
@@ -333,6 +422,7 @@ impl<'a> QueryExecutor<'a> {
         features: &QueryFeatures,
         anchors: &[CandidateHit],
         request_deadline: Instant,
+        payload: CandidatePayloadMode,
     ) -> Result<StageRun> {
         let stage = stage.clone();
         let stage_deadline = request_deadline.min(
@@ -369,7 +459,14 @@ impl<'a> QueryExecutor<'a> {
             queued_at,
             state: Arc::clone(&state),
             task: Box::new(move || {
-                Self::run_stage(sidecars.as_ref(), &stage, &features, &anchors, &context)
+                Self::run_stage(
+                    sidecars.as_ref(),
+                    &stage,
+                    &features,
+                    &anchors,
+                    &context,
+                    payload,
+                )
             }),
             sender,
             _permit: permit,
@@ -495,41 +592,46 @@ impl<'a> QueryExecutor<'a> {
             let stage_anchors = (stage.kind == RetrievalStageKind::Stage2ScipExpand)
                 .then(|| fused_base_anchors_for_graph_expansion(features, candidates));
             let anchors = stage_anchors.as_deref().unwrap_or(candidates.as_slice());
-            let (mut stage_hits, admission_wait_ms, queue_wait_ms, execution_ms) =
-                match self.run_stage_bounded(&stage, features, anchors, deadline)? {
-                    StageRun::Completed {
-                        hits,
-                        admission_wait_ms,
-                        queue_wait_ms,
-                        execution_ms,
-                    } => (hits, admission_wait_ms, queue_wait_ms, execution_ms),
-                    StageRun::Cancelled {
-                        reason,
-                        admission_wait_ms,
-                        queue_wait_ms,
-                        execution_ms,
-                        completion_status,
-                    } => {
-                        let mut trace = stage_trace(
-                            &stage,
-                            stage_started.elapsed().as_millis() as u64,
-                            0,
-                            0.0,
-                            Some(reason.into()),
-                            false,
-                            None,
-                        );
-                        trace.admission_wait_ms = admission_wait_ms;
-                        trace.queue_wait_ms = queue_wait_ms;
-                        trace.execution_ms = execution_ms;
-                        trace.completion_status = completion_status;
-                        stage_traces.push(trace);
-                        cancel_reason.get_or_insert_with(|| reason.into());
-                        continue;
-                    }
-                };
-            self.sidecars.enrich_candidates(&mut stage_hits)?;
-            enrich_candidates_with_file_roles(&mut stage_hits, &self.file_roles);
+            let (mut stage_hits, admission_wait_ms, queue_wait_ms, execution_ms) = match self
+                .run_stage_bounded(&stage, features, anchors, deadline, options.payload)?
+            {
+                StageRun::Completed {
+                    hits,
+                    admission_wait_ms,
+                    queue_wait_ms,
+                    execution_ms,
+                } => (hits, admission_wait_ms, queue_wait_ms, execution_ms),
+                StageRun::Cancelled {
+                    reason,
+                    admission_wait_ms,
+                    queue_wait_ms,
+                    execution_ms,
+                    completion_status,
+                } => {
+                    let mut trace = stage_trace(
+                        &stage,
+                        stage_started.elapsed().as_millis() as u64,
+                        0,
+                        0.0,
+                        Some(reason.into()),
+                        false,
+                        None,
+                    );
+                    trace.admission_wait_ms = admission_wait_ms;
+                    trace.queue_wait_ms = queue_wait_ms;
+                    trace.execution_ms = execution_ms;
+                    trace.completion_status = completion_status;
+                    stage_traces.push(trace);
+                    cancel_reason.get_or_insert_with(|| reason.into());
+                    continue;
+                }
+            };
+            if options.payload == CandidatePayloadMode::Full {
+                self.sidecars.enrich_candidates(&mut stage_hits)?;
+                enrich_candidates_with_file_roles(&mut stage_hits, &self.file_roles);
+            } else {
+                sanitize_descriptor_candidates(&mut stage_hits);
+            }
             retain_primary_candidates_for_query(features, &mut stage_hits);
             annotate_stage_provenance(&stage, &mut stage_hits);
             let (stub_reason, stage_degraded) = stage_stub_metadata(&stage_hits);
@@ -848,6 +950,7 @@ fn cancelled_stage_run(
 struct StageSequenceOptions {
     stop_marginal_gain_threshold: Option<f32>,
     stop_after_low_gain_streak: u32,
+    payload: CandidatePayloadMode,
 }
 
 fn is_broad_query(shape: crate::query_features::QueryShape) -> bool {
@@ -1065,6 +1168,16 @@ fn enrich_candidates_with_file_roles(
     }
 }
 
+fn sanitize_descriptor_candidates(candidates: &mut [CandidateHit]) {
+    for candidate in candidates {
+        candidate.target = None;
+        candidate.source_excerpt = None;
+        candidate.structural_kind = None;
+        candidate.graph_evidence = None;
+        candidate.rank_features = None;
+    }
+}
+
 fn lookup_file_role(
     file_roles: &HashMap<String, codestory_store::FileRole>,
     file_path: &str,
@@ -1176,6 +1289,112 @@ mod tests {
         let result = executor.execute("cached-query", None).expect("cache hit");
         assert!(result.trace.cache_hit);
         assert_eq!(result.hits[0].file_path, "cached.rs");
+    }
+
+    #[test]
+    fn descriptor_execution_skips_core_enrichment_and_has_an_independent_cache_namespace() {
+        struct DescriptorTrackingSidecars {
+            enrich_calls: Arc<AtomicUsize>,
+            scip_anchor_calls: Arc<AtomicUsize>,
+            scip_expand_calls: Arc<AtomicUsize>,
+        }
+
+        impl SidecarSearch for DescriptorTrackingSidecars {
+            fn enrich_candidates(&self, candidates: &mut [CandidateHit]) -> Result<()> {
+                self.enrich_calls.fetch_add(1, Ordering::SeqCst);
+                for candidate in candidates {
+                    candidate.score = 99.0;
+                    candidate.source_excerpt = Some("core hydrated source".into());
+                }
+                Ok(())
+            }
+
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                let mut hit = CandidateHit::with_source(
+                    "src/descriptor.rs",
+                    Some("descriptor_symbol".into()),
+                    0.9,
+                    CandidateSource::Lexical,
+                );
+                hit.node_id = Some("17".into());
+                hit.source_bytes_upper_bound = Some(512);
+                hit.source_excerpt = Some("sidecar source excerpt".into());
+                Ok(vec![hit])
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                self.scip_anchor_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                self.scip_expand_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+
+        let enrich_calls = Arc::new(AtomicUsize::new(0));
+        let scip_anchor_calls = Arc::new(AtomicUsize::new(0));
+        let scip_expand_calls = Arc::new(AtomicUsize::new(0));
+        let sidecars = Arc::new(DescriptorTrackingSidecars {
+            enrich_calls: Arc::clone(&enrich_calls),
+            scip_anchor_calls: Arc::clone(&scip_anchor_calls),
+            scip_expand_calls: Arc::clone(&scip_expand_calls),
+        });
+        let mut cache = RetrievalCache::new();
+        let mut executor = QueryExecutor {
+            sidecars,
+            cache: &mut cache,
+            manifest: Some(sample_manifest()),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+        let ordinary = executor
+            .execute("descriptor_symbol", Some(800))
+            .expect("ordinary query");
+        assert!(
+            ordinary
+                .hits
+                .iter()
+                .any(|hit| hit.source_excerpt.as_deref() == Some("core hydrated source"))
+        );
+        let calls_after_ordinary = enrich_calls.load(Ordering::SeqCst);
+        let anchor_calls_after_ordinary = scip_anchor_calls.load(Ordering::SeqCst);
+        let graph_calls_after_ordinary = scip_expand_calls.load(Ordering::SeqCst);
+        assert!(calls_after_ordinary > 0);
+        assert!(anchor_calls_after_ordinary > 0);
+        assert!(graph_calls_after_ordinary > 0);
+
+        let descriptors = executor
+            .execute_packet_descriptors("descriptor_symbol", Some(800))
+            .expect("descriptor query");
+        assert!(!descriptors.trace.cache_hit);
+        assert_eq!(enrich_calls.load(Ordering::SeqCst), calls_after_ordinary);
+        assert_eq!(
+            scip_anchor_calls.load(Ordering::SeqCst),
+            anchor_calls_after_ordinary,
+            "descriptor admission must not open the SCIP graph view"
+        );
+        assert_eq!(
+            scip_expand_calls.load(Ordering::SeqCst),
+            graph_calls_after_ordinary,
+            "descriptor admission must not traverse SCIP adjacency"
+        );
+        assert!(
+            descriptors
+                .hits
+                .iter()
+                .all(|hit| hit.source_excerpt.is_none() && hit.target.is_none())
+        );
     }
 
     #[test]
@@ -1602,7 +1821,7 @@ mod tests {
             mode_override: None,
         };
 
-        let (mode, reason) = executor.resolve_mode();
+        let (mode, reason) = executor.resolve_mode(CandidatePayloadMode::Full);
 
         assert_eq!(sidecars.layout_calls.load(Ordering::Relaxed), 1);
         assert_eq!(mode, RetrievalDegradedMode::Unavailable);

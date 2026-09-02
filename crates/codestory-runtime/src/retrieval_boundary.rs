@@ -1,12 +1,13 @@
 use std::path::Path;
 
 pub use codestory_retrieval::{
-    CacheCleanPlan, CacheCleanReport, FinalizeComponentWork, FinalizeIndexOutcome,
-    FinalizePhaseTiming, GenerationRetentionApplyReport, GenerationRetentionPlan,
-    ProcessOwnerState, ProcessStartProbe, QueryResult, RetainedRollbackObservation,
-    RetrievalIndexManifest, RetrievalStatusReport, RollbackActivationError,
-    RollbackActivationOutcome, RollbackActivationRefusal, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
-    SidecarGcReport, SidecarInventoryReport, SidecarProcessDefaults as RetrievalProcessDefaults,
+    CacheCleanPlan, CacheCleanReport, CacheInventoryReport, FinalizeComponentWork,
+    FinalizeIndexOutcome, FinalizePhaseTiming, GenerationRetentionApplyReport,
+    GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
+    RetainedRollbackObservation, RetrievalIndexManifest, RetrievalStatusReport,
+    RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
+    SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarGcReport, SidecarInventoryReport,
+    SidecarProcessDefaults as RetrievalProcessDefaults,
     SidecarRuntimeDefaults as RetrievalRuntimeDefaults,
     SidecarRuntimeOverrides as RetrievalRuntimeOverrides,
 };
@@ -180,6 +181,11 @@ impl From<codestory_retrieval::SidecarRuntimeConfig> for RuntimeRetrievalConfig 
 /// Plan process-wide cache cleanup without mutating the cache tree.
 pub fn plan_cache_clean() -> anyhow::Result<CacheCleanPlan> {
     codestory_retrieval::plan_cache_clean()
+}
+
+/// Build the process-wide cache inventory without mutating the cache tree.
+pub fn cache_inventory() -> anyhow::Result<codestory_retrieval::CacheInventoryReport> {
+    codestory_retrieval::cache_inventory()
 }
 
 /// Apply process-wide cache cleanup under the retrieval owner's global lock.

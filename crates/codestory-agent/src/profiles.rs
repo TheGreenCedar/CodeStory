@@ -42,46 +42,8 @@ pub fn resolve_profile(
     }
 }
 
-pub fn route_auto_preset(prompt: &str) -> AgentRetrievalPresetDto {
-    let normalized = prompt.to_ascii_lowercase();
-
-    if contains_any(&normalized, &["inherit", "override", "base class", "trait"]) {
-        return AgentRetrievalPresetDto::Inheritance;
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "call flow",
-            "callflow",
-            "sequence",
-            "who calls",
-            "execution path",
-            "runtime path",
-        ],
-    ) {
-        return AgentRetrievalPresetDto::Callflow;
-    }
-
-    if contains_any(
-        &normalized,
-        &[
-            "impact",
-            "blast radius",
-            "what breaks",
-            "downstream",
-            "upstream",
-            "depend",
-        ],
-    ) {
-        return AgentRetrievalPresetDto::Impact;
-    }
-
+pub fn route_auto_preset(_prompt: &str) -> AgentRetrievalPresetDto {
     AgentRetrievalPresetDto::Architecture
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn from_preset(preset: AgentRetrievalPresetDto) -> ResolvedProfile {
@@ -195,13 +157,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_profile_routes_callflow_keywords() {
+    fn auto_profile_does_not_steer_on_wording_taxonomies() {
         let profile = resolve_profile(
             "Show call flow and sequence for checkout",
             &AgentRetrievalProfileSelectionDto::Auto,
         );
 
-        assert_eq!(profile.preset, AgentRetrievalPresetDto::Callflow);
+        assert_eq!(profile.preset, AgentRetrievalPresetDto::Architecture);
         assert_eq!(
             profile.policy_mode,
             AgentRetrievalPolicyModeDto::LatencyFirst

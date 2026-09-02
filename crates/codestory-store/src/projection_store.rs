@@ -65,4 +65,27 @@ impl<'a> ProjectionStore<'a> {
                 file_errors: batch.file_errors,
             })
     }
+
+    /// Persist a batch whose callable and structural fences proved that only
+    /// source identity changed. Grounding rows are rebound by the publication
+    /// owner, while the graph-derived resolution support remains valid.
+    pub fn flush_source_identity_batch(
+        &mut self,
+        batch: ProjectionBatch<'_>,
+    ) -> Result<ProjectionFlushBreakdown, StorageError> {
+        self.storage
+            .flush_source_identity_projection_batch(crate::storage_impl::ProjectionBatch {
+                files: batch.files,
+                file_content_hashes: batch.file_content_hashes,
+                nodes: batch.nodes,
+                structural_text_units: batch.structural_text_units,
+                structural_text_projections: batch.structural_text_projections,
+                structural_text_cache_writes: batch.structural_text_cache_writes,
+                edges: batch.edges,
+                occurrences: batch.occurrences,
+                component_access: batch.component_access,
+                callable_projection_states: batch.callable_projection_states,
+                file_errors: batch.file_errors,
+            })
+    }
 }

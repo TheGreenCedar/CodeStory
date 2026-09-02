@@ -228,6 +228,77 @@ impl ArtifactSeal {
     pub fn observe_all(paths: &[PathBuf]) -> Result<Vec<Self>, ArtifactSealError> {
         paths.iter().map(|path| Self::observe(path)).collect()
     }
+
+    /// Whether this pre-link observation still describes the source after an
+    /// owned hard-link operation.
+    ///
+    /// Creating a hard link changes the inode-change instant on Unix even
+    /// though it cannot change the file bytes. Every other observable field,
+    /// including the native file identity where available, must remain fixed.
+    fn same_source_after_hard_link(&self, after: &Self) -> bool {
+        if self.path != after.path {
+            return false;
+        }
+        match (self.presence, after.presence) {
+            (SealPresence::Absent, SealPresence::Absent) => true,
+            (
+                SealPresence::Present {
+                    len,
+                    modified_nanos,
+                    created_nanos,
+                    device,
+                    inode,
+                    readonly,
+                    ..
+                },
+                SealPresence::Present {
+                    len: after_len,
+                    modified_nanos: after_modified_nanos,
+                    created_nanos: after_created_nanos,
+                    device: after_device,
+                    inode: after_inode,
+                    readonly: after_readonly,
+                    ..
+                },
+            ) => {
+                len == after_len
+                    && modified_nanos == after_modified_nanos
+                    && created_nanos == after_created_nanos
+                    && native_identity_matches(device, inode, after_device, after_inode)
+                    && readonly == after_readonly
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether two post-link paths are observations of the same hard-linked
+    /// state. The caller has already established the native hard-link relation;
+    /// this comparison proves the artifact metadata did not drift around it.
+    fn same_hard_link_state(&self, destination: &Self) -> bool {
+        match (self.presence, destination.presence) {
+            (SealPresence::Absent, SealPresence::Absent) => true,
+            (SealPresence::Present { .. }, SealPresence::Present { .. }) => {
+                self.presence == destination.presence
+            }
+            _ => false,
+        }
+    }
+}
+
+fn native_identity_matches(
+    left_device: u64,
+    left_inode: u64,
+    right_device: u64,
+    right_inode: u64,
+) -> bool {
+    if left_device == 0 && left_inode == 0 && right_device == 0 && right_inode == 0 {
+        // The hard-link creator must independently prove identity on platforms
+        // where std::fs exposes only timestamps. Metadata equality still fences
+        // drift before and after that owned operation.
+        true
+    } else {
+        left_device == right_device && left_inode == right_inode
+    }
 }
 
 fn system_time_nanos(time: SystemTime) -> i128 {
@@ -280,6 +351,19 @@ pub struct ReceiptStats {
 }
 
 struct Receipt<V> {
+    seals: Vec<ArtifactSeal>,
+    value: V,
+    stats: ReceiptStats,
+}
+
+/// A short-lived copy of a valid sealed receipt captured immediately before an
+/// owned hard-link operation.
+///
+/// Callers cannot manufacture one. Installing it under another key still
+/// requires both the original and destination artifact sets to prove the
+/// expected post-link state.
+#[derive(Clone)]
+pub struct TransferableReceipt<V> {
     seals: Vec<ArtifactSeal>,
     value: V,
     stats: ReceiptStats,
@@ -379,6 +463,190 @@ where
             );
         }
         Ok(value)
+    }
+
+    /// Capture a currently valid receipt before creating hard links for an
+    /// equivalent immutable generation.
+    pub fn transferable_receipt(
+        &self,
+        key: &K,
+        artifacts: &[PathBuf],
+    ) -> Option<TransferableReceipt<V>> {
+        let observed = ArtifactSeal::observe_all(artifacts).ok()?;
+        let entries = self.locked_entries();
+        let receipt = entries.get(key)?;
+        (receipt.seals == observed).then(|| TransferableReceipt {
+            seals: observed,
+            value: receipt.value.clone(),
+            stats: receipt.stats,
+        })
+    }
+
+    /// Reuse a currently sealed verdict without creating a replacement on a
+    /// miss. Producers use this when the fallback is a distinct bounded
+    /// validation path that must not be promoted into the stronger receipt.
+    pub fn reuse_sealed(&self, key: &K, artifacts: &[PathBuf]) -> Option<V> {
+        let observed = ArtifactSeal::observe_all(artifacts).ok()?;
+        let mut entries = self.locked_entries();
+        {
+            let receipt = entries.get_mut(key)?;
+            if receipt.seals == observed {
+                receipt.stats.reuses = receipt.stats.reuses.saturating_add(1);
+                return Some(receipt.value.clone());
+            }
+        }
+        entries.remove(key);
+        None
+    }
+
+    /// Transfer a deep-validation fact to paths just proven to be hard links
+    /// of the validated source artifacts.
+    ///
+    /// The caller must invoke this only after its hard-link helper has verified
+    /// native file identity. The transfer accepts the expected inode-change
+    /// caused by link creation, but no byte-affecting metadata drift. Absent
+    /// SQLite sidecars may pair with absent destination sidecars. Any mismatch
+    /// returns `Ok(false)` and the destination must be deep-validated normally.
+    pub fn install_hard_link_alias<E>(
+        &self,
+        source_key: &K,
+        source_artifacts: &[PathBuf],
+        destination_key: K,
+        destination_artifacts: &[PathBuf],
+        transferable: TransferableReceipt<V>,
+        map_value: impl FnOnce(V) -> Result<V, E>,
+    ) -> Result<bool, E> {
+        let Ok(source_after) = ArtifactSeal::observe_all(source_artifacts) else {
+            return Ok(false);
+        };
+        let Ok(destination_after) = ArtifactSeal::observe_all(destination_artifacts) else {
+            return Ok(false);
+        };
+        if transferable.seals.len() != source_after.len()
+            || source_after.len() != destination_after.len()
+            || !transferable
+                .seals
+                .iter()
+                .zip(&source_after)
+                .all(|(before, after)| before.same_source_after_hard_link(after))
+            || !source_after
+                .iter()
+                .zip(&destination_after)
+                .all(|(source, destination)| source.same_hard_link_state(destination))
+        {
+            return Ok(false);
+        }
+
+        let source_value = transferable.value.clone();
+        let value = map_value(transferable.value)?;
+        if ArtifactSeal::observe_all(source_artifacts).ok().as_ref() != Some(&source_after)
+            || ArtifactSeal::observe_all(destination_artifacts)
+                .ok()
+                .as_ref()
+                != Some(&destination_after)
+        {
+            return Ok(false);
+        }
+
+        let mut entries = self.locked_entries();
+        entries.remove(source_key);
+        if self.capacity > 1 {
+            if entries.len() >= self.capacity {
+                entries.clear();
+            }
+            entries.insert(
+                source_key.clone(),
+                Receipt {
+                    seals: source_after,
+                    value: source_value,
+                    stats: transferable.stats,
+                },
+            );
+        }
+        if entries.len() >= self.capacity && !entries.contains_key(&destination_key) {
+            entries.clear();
+        }
+        let mut destination_stats = transferable.stats;
+        destination_stats.reuses = destination_stats.reuses.saturating_add(1);
+        entries.insert(
+            destination_key,
+            Receipt {
+                seals: destination_after,
+                value,
+                stats: destination_stats,
+            },
+        );
+        Ok(true)
+    }
+
+    /// Refresh the source key after one or more owned hard links changed only
+    /// inode link metadata for artifacts covered by its receipt.
+    pub fn refresh_after_hard_links(
+        &self,
+        key: K,
+        artifacts: &[PathBuf],
+        transferable: TransferableReceipt<V>,
+    ) -> bool {
+        let Ok(after) = ArtifactSeal::observe_all(artifacts) else {
+            return false;
+        };
+        if transferable.seals.len() != after.len()
+            || !transferable
+                .seals
+                .iter()
+                .zip(&after)
+                .all(|(before, after)| before.same_source_after_hard_link(after))
+            || ArtifactSeal::observe_all(artifacts).ok().as_ref() != Some(&after)
+        {
+            return false;
+        }
+        let mut entries = self.locked_entries();
+        if entries.len() >= self.capacity && !entries.contains_key(&key) {
+            entries.clear();
+        }
+        let mut stats = transferable.stats;
+        stats.reuses = stats.reuses.saturating_add(1);
+        entries.insert(
+            key,
+            Receipt {
+                seals: after,
+                value: transferable.value,
+                stats,
+            },
+        );
+        true
+    }
+
+    /// Seal a value already validated by the artifact's owning producer.
+    ///
+    /// This is for staged producers that have constructed and checked the
+    /// complete immutable value in memory before publication. Consumers must
+    /// continue to use [`Self::validate_sealed`]; calling this without an
+    /// owning construction proof would turn an assertion into evidence.
+    pub fn seal_produced(&self, key: K, artifacts: &[PathBuf], value: V) -> bool {
+        let Ok(observed) = ArtifactSeal::observe_all(artifacts) else {
+            return false;
+        };
+        if ArtifactSeal::observe_all(artifacts).ok().as_ref() != Some(&observed) {
+            return false;
+        }
+        let mut entries = self.locked_entries();
+        if entries.len() >= self.capacity && !entries.contains_key(&key) {
+            entries.clear();
+        }
+        entries.insert(
+            key,
+            Receipt {
+                seals: observed,
+                value,
+                stats: ReceiptStats {
+                    validations: 1,
+                    reuses: 0,
+                    invalidations: 0,
+                },
+            },
+        );
+        true
     }
 
     /// Accounting for `key`, or `None` when no receipt is held.
@@ -523,6 +791,195 @@ mod tests {
                 invalidations: 0,
             })
         );
+    }
+
+    #[test]
+    fn an_owned_hard_link_can_inherit_the_source_validation_without_reading_bytes() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let source = dir.path().join("source.sqlite3");
+        let destination = dir.path().join("destination.sqlite3");
+        let source_wal = dir.path().join("source.sqlite3-wal");
+        let destination_wal = dir.path().join("destination.sqlite3-wal");
+        write(&source, "immutable-generation");
+        let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
+        let validator = CountingValidator::new();
+        let source_artifacts = vec![source.clone(), source_wal];
+        let destination_artifacts = vec![destination.clone(), destination_wal];
+
+        cache
+            .validate_sealed(source.clone(), &source_artifacts, || {
+                validator.ok("validated-contents")
+            })
+            .expect("validate source");
+        let transferable = cache
+            .transferable_receipt(&source, &source_artifacts)
+            .expect("capture source receipt");
+        std::fs::hard_link(&source, &destination).expect("create owned hard link");
+        assert!(
+            cache
+                .install_hard_link_alias(
+                    &source,
+                    &source_artifacts,
+                    destination.clone(),
+                    &destination_artifacts,
+                    transferable,
+                    Ok::<_, String>,
+                )
+                .expect("install alias")
+        );
+
+        let inherited = cache
+            .validate_sealed(destination.clone(), &destination_artifacts, || {
+                validator.ok("unexpected-second-validation")
+            })
+            .expect("reuse destination receipt");
+        assert_eq!(inherited, "validated-contents");
+        assert_eq!(validator.runs.get(), 1);
+        assert_eq!(
+            cache.stats(&destination).map(|stats| stats.reuses),
+            Some(2),
+            "one reuse transfers the receipt and one answers the destination"
+        );
+    }
+
+    #[test]
+    fn a_transformed_hard_link_alias_preserves_the_source_receipt_value() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let source = dir.path().join("source.sqlite3");
+        let destination = dir.path().join("destination.sqlite3");
+        write(&source, "immutable-generation");
+        let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
+        let validator = CountingValidator::new();
+
+        cache
+            .validate_sealed(source.clone(), std::slice::from_ref(&source), || {
+                validator.ok("source-generation")
+            })
+            .expect("validate source");
+        let transferable = cache
+            .transferable_receipt(&source, std::slice::from_ref(&source))
+            .expect("capture source receipt");
+        std::fs::hard_link(&source, &destination).expect("create owned hard link");
+        assert!(
+            cache
+                .install_hard_link_alias(
+                    &source,
+                    std::slice::from_ref(&source),
+                    destination.clone(),
+                    std::slice::from_ref(&destination),
+                    transferable,
+                    |value| Ok::<_, String>(format!("{value}-destination")),
+                )
+                .expect("install transformed alias")
+        );
+
+        let source_value = cache
+            .validate_sealed(source.clone(), std::slice::from_ref(&source), || {
+                validator.ok("unexpected-source-validation")
+            })
+            .expect("reuse source receipt");
+        let destination_value = cache
+            .validate_sealed(
+                destination.clone(),
+                std::slice::from_ref(&destination),
+                || validator.ok("unexpected-destination-validation"),
+            )
+            .expect("reuse destination receipt");
+
+        assert_eq!(source_value, "source-generation");
+        assert_eq!(destination_value, "source-generation-destination");
+        assert_eq!(validator.runs.get(), 1);
+    }
+
+    #[test]
+    fn a_byte_copy_cannot_be_admitted_as_a_hard_link_alias() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let source = dir.path().join("source.sqlite3");
+        let destination = dir.path().join("destination.sqlite3");
+        write(&source, "immutable-generation");
+        let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
+        cache
+            .validate_sealed(source.clone(), std::slice::from_ref(&source), || {
+                Ok::<_, String>("validated-contents".to_string())
+            })
+            .expect("validate source");
+        let transferable = cache
+            .transferable_receipt(&source, std::slice::from_ref(&source))
+            .expect("capture source receipt");
+        std::fs::copy(&source, &destination).expect("copy bytes");
+
+        assert!(
+            !cache
+                .install_hard_link_alias(
+                    &source,
+                    std::slice::from_ref(&source),
+                    destination.clone(),
+                    std::slice::from_ref(&destination),
+                    transferable,
+                    Ok::<_, String>,
+                )
+                .expect("refuse alias")
+        );
+        assert_eq!(cache.stats(&destination), None);
+    }
+
+    #[test]
+    fn a_dependent_source_receipt_can_follow_owned_link_metadata_churn() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let source = dir.path().join("source.sqlite3");
+        let destination = dir.path().join("destination.sqlite3");
+        write(&source, "immutable-generation");
+        let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
+        let validator = CountingValidator::new();
+        cache
+            .validate_sealed(source.clone(), std::slice::from_ref(&source), || {
+                validator.ok("validated-contents")
+            })
+            .expect("validate source");
+        let transferable = cache
+            .transferable_receipt(&source, std::slice::from_ref(&source))
+            .expect("capture source receipt");
+        std::fs::hard_link(&source, &destination).expect("create owned hard link");
+        assert!(cache.refresh_after_hard_links(
+            source.clone(),
+            std::slice::from_ref(&source),
+            transferable,
+        ));
+        cache
+            .validate_sealed(source.clone(), std::slice::from_ref(&source), || {
+                validator.ok("unexpected-second-validation")
+            })
+            .expect("reuse refreshed source receipt");
+        assert_eq!(validator.runs.get(), 1);
+    }
+
+    #[test]
+    fn an_owning_producer_can_seal_its_checked_immutable_output() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let artifact = dir.path().join("produced.sqlite3");
+        write(&artifact, "producer-checked-generation");
+        let cache: SealedReceiptCache<PathBuf, String> = SealedReceiptCache::new(4);
+        let validator = CountingValidator::new();
+        assert!(cache.seal_produced(
+            artifact.clone(),
+            std::slice::from_ref(&artifact),
+            "producer-checked-value".to_string(),
+        ));
+        let observed = cache
+            .validate_sealed(artifact.clone(), std::slice::from_ref(&artifact), || {
+                validator.ok("unexpected-validation")
+            })
+            .expect("reuse producer receipt");
+        assert_eq!(observed, "producer-checked-value");
+        assert_eq!(validator.runs.get(), 0);
+
+        write(&artifact, "producer-output-mutated");
+        cache
+            .validate_sealed(artifact.clone(), std::slice::from_ref(&artifact), || {
+                validator.ok("revalidated")
+            })
+            .expect("mutation invalidates producer receipt");
+        assert_eq!(validator.runs.get(), 1);
     }
 
     /// The seal's strength against a deliberate in-place rewrite, stated

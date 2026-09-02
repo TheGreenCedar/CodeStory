@@ -148,6 +148,9 @@ pub(crate) fn make_file_immutable(path: &Path) -> Result<()> {
     if !metadata.file_type().is_file() {
         bail!("immutable component is not a regular file");
     }
+    if metadata.permissions().readonly() {
+        return Ok(());
+    }
     let permissions = immutable_permissions(metadata.permissions());
     if permissions.readonly() {
         std::fs::set_permissions(path, permissions)

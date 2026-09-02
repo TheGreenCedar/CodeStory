@@ -12,6 +12,28 @@ use codestory_contracts::proof_resolution::{
 const EVIDENCE_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-evidence-v1\0";
 const FACT_ID_DOMAIN: &[u8] = b"codestory-proof-resolution-fact-id-v1\0";
 const PUBLICATION_DIGEST_DOMAIN: &[u8] = b"codestory-proof-resolution-publication-v1\0";
+const PUBLICATION_FACT_ID_DIGEST_DOMAIN: &[u8] =
+    b"codestory-proof-resolution-publication-fact-ids-v2\0";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProofResolutionPublicationValidation {
+    pub(crate) manifest: ProofResolutionPublication,
+    pub(crate) sorted_fact_ids: Vec<String>,
+    fact_ids_by_dependency_file: BTreeMap<FileId, Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProofResolutionReceiptKey {
+    database_path: PathBuf,
+    core_generation_id: String,
+    core_run_id: String,
+}
+
+const PROOF_RESOLUTION_RECEIPT_CAPACITY: usize = 64;
+static PROOF_RESOLUTION_PUBLICATION_RECEIPTS: SealedReceiptCache<
+    ProofResolutionReceiptKey,
+    ProofResolutionPublicationValidation,
+> = SealedReceiptCache::new(PROOF_RESOLUTION_RECEIPT_CAPACITY);
 
 #[cfg(debug_assertions)]
 thread_local! {
@@ -2706,6 +2728,80 @@ impl ProofResolutionValidationContext {
     }
 }
 
+fn parse_stored_proof_resolution_fact(
+    row: &rusqlite::Row<'_>,
+) -> Result<CallResolutionFact, StorageError> {
+    let callee_form_text: String = row.get(10)?;
+    let status_text: String = row.get(14)?;
+    let reason_text: String = row.get(15)?;
+    let evidence_json: String = row.get(16)?;
+    let dependency_json: String = row.get(17)?;
+    let callee_form = CalleeForm::from_label(&callee_form_text)
+        .ok_or_else(|| proof_error("stored callee form is outside the closed domain"))?;
+    let status = ProofResolutionStatus::from_label(&status_text)
+        .ok_or_else(|| proof_error("stored status is outside the closed domain"))?;
+    let reason = ProofResolutionReason::from_label(&reason_text)
+        .ok_or_else(|| proof_error("stored reason is outside the closed domain"))?;
+    let evidence_chain: Vec<ResolutionEvidence> =
+        parse_canonical_json(&evidence_json, "evidence").map_err(proof_error)?;
+    let dependency_file_hashes: Vec<DependencyFileHash> =
+        parse_canonical_json(&dependency_json, "dependency").map_err(proof_error)?;
+    let fact = CallResolutionFact {
+        fact_id: row.get(0)?,
+        edge_id: row.get::<_, Option<i64>>(1)?.map(EdgeId),
+        raw_edge_target: row.get::<_, Option<i64>>(2)?.map(NodeId),
+        raw_callsite_identity: row.get(3)?,
+        callsite: ExactCallsite {
+            file_id: FileId(row.get(4)?),
+            source_sha256: row.get(5)?,
+            start_byte: row
+                .get::<_, i64>(6)?
+                .try_into()
+                .map_err(|_| proof_error("stored callsite start byte is negative"))?,
+            end_byte_exclusive: row
+                .get::<_, i64>(7)?
+                .try_into()
+                .map_err(|_| proof_error("stored callsite end byte is negative"))?,
+            line: row
+                .get::<_, i64>(8)?
+                .try_into()
+                .map_err(|_| proof_error("stored callsite line is outside u32"))?,
+            column: row
+                .get::<_, i64>(9)?
+                .try_into()
+                .map_err(|_| proof_error("stored callsite column is outside u32"))?,
+            callee_form,
+            raw_target: row.get(11)?,
+        },
+        caller: NodeId(row.get(12)?),
+        target: row.get::<_, Option<i64>>(13)?.map(NodeId),
+        status,
+        reason,
+        evidence_chain,
+        lookup_domain_complete: row.get::<_, i64>(18)? == 1,
+        provenance: ResolutionProvenance {
+            producer: row.get(19)?,
+            fact_schema_version: row.get::<_, i64>(20)?.max(0) as u32,
+            algorithm: row.get(21)?,
+            language_adapter: row.get(22)?,
+            language_adapter_version: row.get(23)?,
+            parser_fingerprint: row.get(24)?,
+            dependency_file_hashes,
+            evidence_sha256: row.get(25)?,
+        },
+    };
+    if fact.provenance.language_adapter == "bash" {
+        count_bash_store_resolution_work(
+            BashStoreResolutionPhase::Replay,
+            fact.evidence_chain
+                .len()
+                .saturating_add(fact.provenance.dependency_file_hashes.len())
+                .saturating_add(1),
+        );
+    }
+    Ok(fact)
+}
+
 impl Storage {
     pub fn proof_resolution_fact_count(&self) -> Result<u64, StorageError> {
         let count: i64 =
@@ -2804,76 +2900,40 @@ impl Storage {
         };
         let mut facts = Vec::new();
         while let Some(row) = rows.next()? {
-            let callee_form_text: String = row.get(10)?;
-            let status_text: String = row.get(14)?;
-            let reason_text: String = row.get(15)?;
-            let evidence_json: String = row.get(16)?;
-            let dependency_json: String = row.get(17)?;
-            let callee_form = CalleeForm::from_label(&callee_form_text)
-                .ok_or_else(|| proof_error("stored callee form is outside the closed domain"))?;
-            let status = ProofResolutionStatus::from_label(&status_text)
-                .ok_or_else(|| proof_error("stored status is outside the closed domain"))?;
-            let reason = ProofResolutionReason::from_label(&reason_text)
-                .ok_or_else(|| proof_error("stored reason is outside the closed domain"))?;
-            let evidence_chain: Vec<ResolutionEvidence> =
-                parse_canonical_json(&evidence_json, "evidence").map_err(proof_error)?;
-            let dependency_file_hashes: Vec<DependencyFileHash> =
-                parse_canonical_json(&dependency_json, "dependency").map_err(proof_error)?;
-            let fact = CallResolutionFact {
-                fact_id: row.get(0)?,
-                edge_id: row.get::<_, Option<i64>>(1)?.map(EdgeId),
-                raw_edge_target: row.get::<_, Option<i64>>(2)?.map(NodeId),
-                raw_callsite_identity: row.get(3)?,
-                callsite: ExactCallsite {
-                    file_id: FileId(row.get(4)?),
-                    source_sha256: row.get(5)?,
-                    start_byte: row
-                        .get::<_, i64>(6)?
-                        .try_into()
-                        .map_err(|_| proof_error("stored callsite start byte is negative"))?,
-                    end_byte_exclusive: row
-                        .get::<_, i64>(7)?
-                        .try_into()
-                        .map_err(|_| proof_error("stored callsite end byte is negative"))?,
-                    line: row
-                        .get::<_, i64>(8)?
-                        .try_into()
-                        .map_err(|_| proof_error("stored callsite line is outside u32"))?,
-                    column: row
-                        .get::<_, i64>(9)?
-                        .try_into()
-                        .map_err(|_| proof_error("stored callsite column is outside u32"))?,
-                    callee_form,
-                    raw_target: row.get(11)?,
-                },
-                caller: NodeId(row.get(12)?),
-                target: row.get::<_, Option<i64>>(13)?.map(NodeId),
-                status,
-                reason,
-                evidence_chain,
-                lookup_domain_complete: row.get::<_, i64>(18)? == 1,
-                provenance: ResolutionProvenance {
-                    producer: row.get(19)?,
-                    fact_schema_version: row.get::<_, i64>(20)?.max(0) as u32,
-                    algorithm: row.get(21)?,
-                    language_adapter: row.get(22)?,
-                    language_adapter_version: row.get(23)?,
-                    parser_fingerprint: row.get(24)?,
-                    dependency_file_hashes,
-                    evidence_sha256: row.get(25)?,
-                },
-            };
-            if fact.provenance.language_adapter == "bash" {
-                count_bash_store_resolution_work(
-                    BashStoreResolutionPhase::Replay,
-                    fact.evidence_chain
-                        .len()
-                        .saturating_add(fact.provenance.dependency_file_hashes.len())
-                        .saturating_add(1),
-                );
-            }
-            facts.push(fact);
+            facts.push(parse_stored_proof_resolution_fact(row)?);
         }
+        Ok(facts)
+    }
+
+    fn read_proof_resolution_facts_by_ids(
+        &self,
+        fact_ids: &[String],
+    ) -> Result<Vec<CallResolutionFact>, StorageError> {
+        if fact_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut facts = Vec::with_capacity(fact_ids.len());
+        for chunk in fact_ids.chunks(400) {
+            let placeholders = numbered_placeholders(1, chunk.len());
+            let sql = format!(
+                "SELECT fact_id, edge_id, raw_edge_target_id, raw_callsite_identity,
+                        file_id, source_sha256, start_byte,
+                        end_byte_exclusive, line, column, callee_form, raw_target,
+                        caller_node_id, target_node_id, status, reason, evidence_json,
+                        dependency_json, lookup_domain_complete, producer,
+                        fact_schema_version, algorithm, language_adapter,
+                        language_adapter_version, parser_fingerprint, evidence_digest
+                 FROM proof_resolution_fact
+                 WHERE fact_id IN ({placeholders})
+                 ORDER BY fact_id"
+            );
+            let mut statement = self.conn.prepare(&sql)?;
+            let mut rows = statement.query(params_from_iter(chunk.iter()))?;
+            while let Some(row) = rows.next()? {
+                facts.push(parse_stored_proof_resolution_fact(row)?);
+            }
+        }
+        facts.sort_by(|left, right| left.fact_id.cmp(&right.fact_id));
         Ok(facts)
     }
 
@@ -4055,6 +4115,7 @@ impl Storage {
         publication: &IndexPublicationRecord,
         projection: &ProofResolutionProjection,
     ) -> Result<ProofResolutionPublication, StorageError> {
+        *self.cache.produced_proof_resolution_validation.write() = None;
         if publication.generation_id.trim().is_empty()
             || publication.run_id.trim().is_empty()
             || publication.published_at_epoch_ms < 0
@@ -4177,7 +4238,8 @@ impl Storage {
                 "funnel does not deterministically match the fact rows",
             ));
         }
-        let fact_digest = publication_integrity_digest(&facts, &adapter_roster, &funnel)?;
+        let fact_digest =
+            publication_fact_id_integrity_digest_for_facts(&facts, &adapter_roster, &funnel)?;
         let manifest = ProofResolutionPublication {
             core_generation_id: publication.generation_id.clone(),
             core_run_id: publication.run_id.clone(),
@@ -4189,6 +4251,8 @@ impl Storage {
             funnel,
             published_at_epoch_ms: publication.published_at_epoch_ms,
         };
+        let produced_validation =
+            proof_resolution_publication_validation(manifest.clone(), &facts)?;
         let adapter_roster_json = serde_json::to_string(&manifest.adapter_roster)
             .map_err(|error| proof_error(format!("failed to serialize adapter roster: {error}")))?;
         let funnel_json = serde_json::to_string(&manifest.funnel)
@@ -4283,25 +4347,373 @@ impl Storage {
             ],
         )?;
         tx.commit()?;
+        *self.cache.produced_proof_resolution_validation.write() = Some(produced_validation);
         Ok(manifest)
+    }
+
+    /// Rebind an inherited proof projection after verified source identities
+    /// changed while the graph projection stayed byte-for-byte equivalent.
+    ///
+    /// The caller owns the graph-equivalence proof. This method authenticates
+    /// the inherited immutable receipt, reseals only facts that name a changed
+    /// file, updates those rows in place, and binds the resulting digest to the
+    /// next core publication. It never changes a status, target, edge, evidence
+    /// chain, or lookup-domain disposition.
+    pub fn rebind_proof_resolution_source_identities(
+        &mut self,
+        previous: &IndexPublicationRecord,
+        next: &IndexPublicationRecord,
+        changed_file_ids: &[i64],
+    ) -> Result<Option<ProofResolutionPublication>, StorageError> {
+        let Some(_) = self.get_proof_resolution_publication()? else {
+            return Ok(None);
+        };
+        let (manifest, facts) = self.validate_proof_resolution_receipt(previous)?;
+        self.validate_facts_against_graph(&facts, false)?;
+        let inherited = proof_resolution_publication_validation(manifest, &facts)?;
+        self.rebind_validated_proof_resolution_source_identities(
+            &inherited,
+            previous,
+            next,
+            changed_file_ids,
+        )
+    }
+
+    pub(crate) fn rebind_validated_proof_resolution_source_identities(
+        &mut self,
+        inherited: &ProofResolutionPublicationValidation,
+        previous: &IndexPublicationRecord,
+        next: &IndexPublicationRecord,
+        changed_file_ids: &[i64],
+    ) -> Result<Option<ProofResolutionPublication>, StorageError> {
+        *self.cache.produced_proof_resolution_validation.write() = None;
+        let prior = &inherited.manifest;
+        if !prior.complete
+            || prior.fact_schema_version != PROOF_RESOLUTION_FACT_SCHEMA_VERSION
+            || prior.core_generation_id != previous.generation_id
+            || prior.core_run_id != previous.run_id
+            || prior.published_at_epoch_ms != previous.published_at_epoch_ms
+            || inherited.sorted_fact_ids.len() as u64 != prior.fact_count
+        {
+            return Ok(None);
+        }
+        if next.generation_id.trim().is_empty()
+            || next.run_id.trim().is_empty()
+            || next.published_at_epoch_ms < 0
+        {
+            return Err(proof_error("new core publication identity is invalid"));
+        }
+        let current = self
+            .get_proof_resolution_publication()?
+            .ok_or_else(|| proof_error("inherited proof publication disappeared before rebind"))?;
+        if current != *prior {
+            return Err(proof_error(
+                "proof publication changed before source-identity rebind",
+            ));
+        }
+        let mut current_hashes = HashMap::<FileId, String>::new();
+        for file_id in changed_file_ids.iter().copied().collect::<BTreeSet<_>>() {
+            let source_sha256 = self.get_file_content_hash(file_id)?.ok_or_else(|| {
+                proof_error(format!(
+                    "source-identity rebind file {file_id} has no verified content hash"
+                ))
+            })?;
+            current_hashes.insert(FileId(file_id), source_sha256);
+        }
+
+        let affected_fact_ids = current_hashes
+            .keys()
+            .filter_map(|file_id| inherited.fact_ids_by_dependency_file.get(file_id))
+            .flat_map(|fact_ids| fact_ids.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut facts = self.read_proof_resolution_facts_by_ids(&affected_fact_ids)?;
+        let observed_fact_ids = facts
+            .iter()
+            .map(|fact| fact.fact_id.clone())
+            .collect::<BTreeSet<_>>();
+        if observed_fact_ids.len() != affected_fact_ids.len()
+            || observed_fact_ids != affected_fact_ids.iter().cloned().collect::<BTreeSet<_>>()
+        {
+            return Err(proof_error(
+                "source-identity rebind could not load every affected proof fact",
+            ));
+        }
+        let mut updates = Vec::<(String, CallResolutionFact)>::new();
+        for fact in &mut facts {
+            validate_fact_seal(fact)?;
+            let mut changed = false;
+            if let Some(source_sha256) = current_hashes.get(&fact.callsite.file_id)
+                && fact.callsite.source_sha256 != *source_sha256
+            {
+                fact.callsite.source_sha256 = source_sha256.clone();
+                changed = true;
+            }
+            for dependency in &mut fact.provenance.dependency_file_hashes {
+                if let Some(source_sha256) = current_hashes.get(&dependency.file_id)
+                    && dependency.source_sha256 != *source_sha256
+                {
+                    dependency.source_sha256 = source_sha256.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                let previous_fact_id = fact.fact_id.clone();
+                let resealed = seal_call_resolution_fact(fact.clone())?;
+                *fact = resealed.clone();
+                updates.push((previous_fact_id, resealed));
+            }
+        }
+
+        let old_ids = updates
+            .iter()
+            .map(|(old, _)| old.clone())
+            .collect::<BTreeSet<_>>();
+        if old_ids.len() != updates.len()
+            || updates
+                .iter()
+                .any(|(old, fact)| fact.fact_id != *old && old_ids.contains(&fact.fact_id))
+        {
+            return Err(proof_error(
+                "source-identity rebind produced an ambiguous fact identity replacement",
+            ));
+        }
+        let replacements = updates
+            .iter()
+            .map(|(old, fact)| (old.clone(), fact.fact_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut next_fact_ids = inherited
+            .sorted_fact_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for old in replacements.keys() {
+            if !next_fact_ids.remove(old) {
+                return Err(proof_error(
+                    "source-identity rebind replacement was absent from the inherited receipt",
+                ));
+            }
+        }
+        for new in replacements.values() {
+            if !next_fact_ids.insert(new.clone()) {
+                return Err(proof_error(
+                    "source-identity rebind produced a duplicate fact identity",
+                ));
+            }
+        }
+        let sorted_fact_ids = next_fact_ids.into_iter().collect::<Vec<_>>();
+        if sorted_fact_ids.len() as u64 != prior.fact_count {
+            return Err(proof_error(
+                "source-identity rebind changed the proof fact count",
+            ));
+        }
+        let fact_digest = publication_fact_id_integrity_digest_for_sorted_ids(
+            &sorted_fact_ids,
+            &prior.adapter_roster,
+            &prior.funnel,
+        )?;
+        let manifest = ProofResolutionPublication {
+            core_generation_id: next.generation_id.clone(),
+            core_run_id: next.run_id.clone(),
+            fact_schema_version: prior.fact_schema_version,
+            adapter_roster: prior.adapter_roster.clone(),
+            complete: true,
+            fact_count: prior.fact_count,
+            fact_digest,
+            funnel: prior.funnel.clone(),
+            published_at_epoch_ms: next.published_at_epoch_ms,
+        };
+        let funnel_json = serde_json::to_string(&manifest.funnel)
+            .map_err(|error| proof_error(format!("failed to serialize funnel: {error}")))?;
+        let tx = self.conn.transaction()?;
+        {
+            let mut statement = tx.prepare(
+                "UPDATE proof_resolution_fact
+                 SET fact_id = ?2,
+                     source_sha256 = ?3,
+                     dependency_json = ?4,
+                     evidence_digest = ?5
+                 WHERE fact_id = ?1",
+            )?;
+            for (previous_fact_id, fact) in &updates {
+                let dependency_json = serde_json::to_string(
+                    &fact.provenance.dependency_file_hashes,
+                )
+                .map_err(|error| {
+                    proof_error(format!("failed to serialize dependency hashes: {error}"))
+                })?;
+                let changed = statement.execute(params![
+                    previous_fact_id,
+                    fact.fact_id,
+                    fact.callsite.source_sha256,
+                    dependency_json,
+                    fact.provenance.evidence_sha256,
+                ])?;
+                if changed != 1 {
+                    return Err(proof_error(
+                        "source-identity fact changed during its staged rebind",
+                    ));
+                }
+            }
+        }
+        let changed = tx.execute(
+            "UPDATE proof_resolution_publication
+             SET core_generation_id = ?1,
+                 core_run_id = ?2,
+                 fact_count = ?3,
+                 fact_digest = ?4,
+                 funnel_json = ?5,
+                 published_at_epoch_ms = ?6
+             WHERE id = 1
+               AND core_generation_id = ?7
+               AND core_run_id = ?8
+               AND published_at_epoch_ms = ?9
+               AND fact_digest = ?10",
+            params![
+                next.generation_id,
+                next.run_id,
+                i64::try_from(manifest.fact_count)
+                    .map_err(|_| proof_error("fact count exceeds SQLite integer"))?,
+                manifest.fact_digest,
+                funnel_json,
+                next.published_at_epoch_ms,
+                previous.generation_id,
+                previous.run_id,
+                previous.published_at_epoch_ms,
+                prior.fact_digest,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(proof_error(
+                "proof publication changed during source-identity rebind",
+            ));
+        }
+        tx.commit()?;
+        let mut fact_ids_by_dependency_file = inherited.fact_ids_by_dependency_file.clone();
+        for fact_ids in fact_ids_by_dependency_file.values_mut() {
+            for fact_id in fact_ids.iter_mut() {
+                if let Some(replacement) = replacements.get(fact_id) {
+                    *fact_id = replacement.clone();
+                }
+            }
+            fact_ids.sort_unstable();
+            fact_ids.dedup();
+        }
+        *self.cache.produced_proof_resolution_validation.write() =
+            Some(ProofResolutionPublicationValidation {
+                manifest: manifest.clone(),
+                sorted_fact_ids,
+                fact_ids_by_dependency_file,
+            });
+        Ok(Some(manifest))
     }
 
     pub fn validate_proof_resolution_publication(
         &self,
         publication: &IndexPublicationRecord,
     ) -> Result<ProofResolutionPublication, StorageError> {
-        let (manifest, facts) = self.validate_proof_resolution_receipt(publication)?;
-        self.validate_facts_against_graph(&facts, true)?;
-        Ok(manifest)
+        let validation = self.validate_proof_resolution_publication_contents(publication, true)?;
+        *self.cache.produced_proof_resolution_validation.write() = Some(validation.clone());
+        Ok(validation.manifest)
     }
 
     pub(crate) fn validate_stored_proof_resolution_publication(
         &self,
         publication: &IndexPublicationRecord,
     ) -> Result<ProofResolutionPublication, StorageError> {
+        self.validate_proof_resolution_publication_contents(publication, false)
+            .map(|validation| validation.manifest)
+    }
+
+    fn validate_proof_resolution_publication_contents(
+        &self,
+        publication: &IndexPublicationRecord,
+        authenticate_live_go_sources: bool,
+    ) -> Result<ProofResolutionPublicationValidation, StorageError> {
         let (manifest, facts) = self.validate_proof_resolution_receipt(publication)?;
-        self.validate_facts_against_graph(&facts, false)?;
-        Ok(manifest)
+        self.validate_facts_against_graph(&facts, authenticate_live_go_sources)?;
+        proof_resolution_publication_validation(manifest, &facts)
+    }
+
+    pub(crate) fn load_proof_resolution_rebind_validation(
+        &self,
+        database_path: &Path,
+        publication: &IndexPublicationRecord,
+    ) -> Result<ProofResolutionPublicationValidation, StorageError> {
+        let receipt_key = proof_resolution_receipt_key(database_path, publication);
+        let receipt_artifacts = proof_resolution_receipt_artifacts(database_path);
+        if let Some(validation) =
+            PROOF_RESOLUTION_PUBLICATION_RECEIPTS.reuse_sealed(&receipt_key, &receipt_artifacts)
+        {
+            return Ok(validation);
+        }
+        let manifest = self
+            .get_proof_resolution_publication()?
+            .ok_or_else(|| proof_error("complete proof publication receipt is missing"))?;
+        if !manifest.complete
+            || manifest.fact_schema_version != PROOF_RESOLUTION_FACT_SCHEMA_VERSION
+            || manifest.core_generation_id != publication.generation_id
+            || manifest.core_run_id != publication.run_id
+            || manifest.published_at_epoch_ms != publication.published_at_epoch_ms
+            || manifest.fact_digest.is_empty()
+        {
+            return Err(proof_error(
+                "proof publication is not eligible for bounded source-identity rebind",
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT fact_id, file_id, dependency_json
+             FROM proof_resolution_fact ORDER BY fact_id",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut sorted_fact_ids = Vec::with_capacity(manifest.fact_count as usize);
+        let mut fact_ids_by_dependency_file = BTreeMap::<FileId, Vec<String>>::new();
+        while let Some(row) = rows.next()? {
+            let fact_id = row.get::<_, String>(0)?;
+            if fact_id.len() != 64 || !fact_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(proof_error(
+                    "proof publication contains an invalid fact identity",
+                ));
+            }
+            let callsite_file_id = FileId(row.get::<_, i64>(1)?);
+            let dependencies =
+                serde_json::from_str::<Vec<DependencyFileHash>>(&row.get::<_, String>(2)?)
+                    .map_err(|error| {
+                        proof_error(format!(
+                            "proof publication contains invalid dependency evidence: {error}"
+                        ))
+                    })?;
+            let mut file_ids = dependencies
+                .into_iter()
+                .map(|dependency| dependency.file_id)
+                .collect::<BTreeSet<_>>();
+            file_ids.insert(callsite_file_id);
+            for file_id in file_ids {
+                fact_ids_by_dependency_file
+                    .entry(file_id)
+                    .or_default()
+                    .push(fact_id.clone());
+            }
+            sorted_fact_ids.push(fact_id);
+        }
+        if sorted_fact_ids.len() as u64 != manifest.fact_count
+            || sorted_fact_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || publication_fact_id_integrity_digest_for_sorted_ids(
+                &sorted_fact_ids,
+                &manifest.adapter_roster,
+                &manifest.funnel,
+            )? != manifest.fact_digest
+        {
+            return Err(proof_error(
+                "proof fact identities do not match their bounded rebind receipt",
+            ));
+        }
+        Ok(ProofResolutionPublicationValidation {
+            manifest,
+            sorted_fact_ids,
+            fact_ids_by_dependency_file,
+        })
     }
 
     fn validate_proof_resolution_receipt(
@@ -4324,10 +4736,20 @@ impl Storage {
         let facts = self.get_proof_resolution_facts()?;
         validate_adapter_roster(&facts, &manifest.adapter_roster)?;
         let expected_funnel = recompute_funnel(&facts);
+        let fact_id_digest = publication_fact_id_integrity_digest_for_facts(
+            &facts,
+            &manifest.adapter_roster,
+            &manifest.funnel,
+        )?;
+        let legacy_digest = (manifest.fact_digest != fact_id_digest)
+            .then(|| {
+                publication_integrity_digest(&facts, &manifest.adapter_roster, &manifest.funnel)
+            })
+            .transpose()?;
         if manifest.funnel != expected_funnel
             || manifest.fact_count != facts.len() as u64
-            || manifest.fact_digest
-                != publication_integrity_digest(&facts, &manifest.adapter_roster, &manifest.funnel)?
+            || (manifest.fact_digest != fact_id_digest
+                && legacy_digest.as_deref() != Some(manifest.fact_digest.as_str()))
         {
             return Err(proof_error(
                 "fact rows do not match their publication digest",
@@ -4385,8 +4807,9 @@ impl Storage {
             ));
         }
         tx.commit()?;
-        self.validate_stored_proof_resolution_publication(next)
-            .map(Some)
+        let validation = self.validate_proof_resolution_publication_contents(next, false)?;
+        *self.cache.produced_proof_resolution_validation.write() = Some(validation.clone());
+        Ok(Some(validation.manifest))
     }
 }
 
@@ -4704,6 +5127,130 @@ fn publication_integrity_digest(
         hasher.update(bytes);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn publication_fact_id_integrity_hasher(
+    adapter_roster: &[ProofResolutionAdapter],
+    funnel: &[ProofResolutionFunnelRow],
+) -> Result<Sha256, StorageError> {
+    let mut hasher = Sha256::new();
+    hasher.update(PUBLICATION_FACT_ID_DIGEST_DOMAIN);
+    for value in [
+        serde_json::to_vec(adapter_roster),
+        serde_json::to_vec(funnel),
+    ] {
+        let bytes = value.map_err(|error| {
+            proof_error(format!(
+                "failed to serialize publication integrity row: {error}"
+            ))
+        })?;
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hasher)
+}
+
+fn publication_fact_id_integrity_digest_for_facts(
+    facts: &[CallResolutionFact],
+    adapter_roster: &[ProofResolutionAdapter],
+    funnel: &[ProofResolutionFunnelRow],
+) -> Result<String, StorageError> {
+    let mut fact_ids = facts
+        .iter()
+        .map(|fact| fact.fact_id.as_str())
+        .collect::<Vec<_>>();
+    fact_ids.sort_unstable();
+    let mut hasher = publication_fact_id_integrity_hasher(adapter_roster, funnel)?;
+    hasher.update((fact_ids.len() as u64).to_be_bytes());
+    for fact_id in fact_ids {
+        hasher.update((fact_id.len() as u64).to_be_bytes());
+        hasher.update(fact_id.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn publication_fact_id_integrity_digest_for_sorted_ids(
+    fact_ids: &[String],
+    adapter_roster: &[ProofResolutionAdapter],
+    funnel: &[ProofResolutionFunnelRow],
+) -> Result<String, StorageError> {
+    let mut hasher = publication_fact_id_integrity_hasher(adapter_roster, funnel)?;
+    hasher.update((fact_ids.len() as u64).to_be_bytes());
+    for fact_id in fact_ids {
+        hasher.update((fact_id.len() as u64).to_be_bytes());
+        hasher.update(fact_id.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn proof_resolution_publication_validation(
+    manifest: ProofResolutionPublication,
+    facts: &[CallResolutionFact],
+) -> Result<ProofResolutionPublicationValidation, StorageError> {
+    let mut sorted_fact_ids = facts
+        .iter()
+        .map(|fact| fact.fact_id.clone())
+        .collect::<Vec<_>>();
+    sorted_fact_ids.sort_unstable();
+    if sorted_fact_ids.windows(2).any(|pair| pair[0] == pair[1])
+        || sorted_fact_ids.len() as u64 != manifest.fact_count
+    {
+        return Err(proof_error(
+            "proof validation contains duplicate or missing fact identities",
+        ));
+    }
+    let mut fact_ids_by_dependency_file = BTreeMap::<FileId, Vec<String>>::new();
+    for fact in facts {
+        let mut file_ids = fact
+            .provenance
+            .dependency_file_hashes
+            .iter()
+            .map(|dependency| dependency.file_id)
+            .collect::<BTreeSet<_>>();
+        file_ids.insert(fact.callsite.file_id);
+        for file_id in file_ids {
+            fact_ids_by_dependency_file
+                .entry(file_id)
+                .or_default()
+                .push(fact.fact_id.clone());
+        }
+    }
+    for fact_ids in fact_ids_by_dependency_file.values_mut() {
+        fact_ids.sort_unstable();
+        fact_ids.dedup();
+    }
+    Ok(ProofResolutionPublicationValidation {
+        manifest,
+        sorted_fact_ids,
+        fact_ids_by_dependency_file,
+    })
+}
+
+fn proof_resolution_receipt_key(
+    database_path: &Path,
+    publication: &IndexPublicationRecord,
+) -> ProofResolutionReceiptKey {
+    ProofResolutionReceiptKey {
+        database_path: database_path.to_path_buf(),
+        core_generation_id: publication.generation_id.clone(),
+        core_run_id: publication.run_id.clone(),
+    }
+}
+
+fn proof_resolution_receipt_artifacts(database_path: &Path) -> Vec<PathBuf> {
+    owned_artifacts::sqlite_file_with_sidecars(database_path)
+}
+
+pub(super) fn seal_proof_resolution_publication_receipt(
+    database_path: &Path,
+    publication: &IndexPublicationRecord,
+    validation: ProofResolutionPublicationValidation,
+) -> bool {
+    PROOF_RESOLUTION_PUBLICATION_RECEIPTS.seal_produced(
+        proof_resolution_receipt_key(database_path, publication),
+        &proof_resolution_receipt_artifacts(database_path),
+        validation,
+    )
 }
 
 fn recompute_funnel(facts: &[CallResolutionFact]) -> Vec<ProofResolutionFunnelRow> {

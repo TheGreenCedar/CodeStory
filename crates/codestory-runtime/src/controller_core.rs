@@ -262,9 +262,12 @@ impl AppController {
                 "Failed to finish public operation snapshot: {error}"
             ))
         })?;
-        let live = Store::database_complete_index_publication(&storage_path).map_err(|error| {
-            ApiError::internal(format!("Failed to revalidate public operation: {error}"))
-        })?;
+        let revalidate_path =
+            codestory_store::resolve_core_database_path(&storage_path).unwrap_or(storage_path);
+        let live =
+            Store::database_complete_index_publication(&revalidate_path).map_err(|error| {
+                ApiError::internal(format!("Failed to revalidate public operation: {error}"))
+            })?;
         if live.as_ref() != Some(&publication) {
             return Err(ApiError::new(
                 "publication_changed",

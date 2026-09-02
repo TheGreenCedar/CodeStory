@@ -17,16 +17,16 @@ use codestory_contracts::api::{
     IndexFreshnessChangeKindDto, IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto,
     IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
     IndexingPhaseTimings, NodeDetailsRequest, NodeId, NodeKind, RepoTextScanStatsDto,
-    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalScoreBreakdownDto, RetrievalStateDto,
-    RouteEndpointKindDto, RouteEndpointMetadataDto, SearchHit, SearchHitOrigin,
-    SearchHybridLimitsDto, SearchMatchQualityDto, SearchPlanAnchorGroupDto,
-    SearchPlanBridgeConfidenceDto, SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto,
-    SearchPlanBridgeStatusDto, SearchPlanCandidateWindowDto, SearchPlanChannelDto,
-    SearchPlanDroppedTermDto, SearchPlanDto, SearchPlanNextActionDto, SearchPlanPromotionStatusDto,
-    SearchPlanRejectedHitDto, SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto,
-    SearchRepoTextMode, SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto,
-    StorageStatsDto, StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto,
-    TrailContextDto, WorkspaceMemberIndexDto,
+    RetrievalFallbackReasonDto, RetrievalModeDto, RetrievalStateDto, RouteEndpointKindDto,
+    RouteEndpointMetadataDto, SearchHit, SearchHitOrigin, SearchHybridLimitsDto,
+    SearchMatchQualityDto, SearchPlanAnchorGroupDto, SearchPlanBridgeConfidenceDto,
+    SearchPlanBridgeDto, SearchPlanBridgeEvidenceKindDto, SearchPlanBridgeStatusDto,
+    SearchPlanCandidateWindowDto, SearchPlanChannelDto, SearchPlanDroppedTermDto, SearchPlanDto,
+    SearchPlanNextActionDto, SearchPlanPromotionStatusDto, SearchPlanRejectedHitDto,
+    SearchPlanSubqueryDto, SearchPlanTermsDto, SearchQueryAssessmentDto, SearchRepoTextMode,
+    SearchRequest, SearchResultsDto, SemanticModeDto, SnippetContextDto, StorageStatsDto,
+    StoredSemanticDocsContractDto, SymbolContextDto, TrailConfigDto, TrailContextDto,
+    WorkspaceMemberIndexDto,
 };
 use codestory_contracts::bounded_locks::{
     self, FileLockKind, LockDeadline, PUBLICATION_LOCK_WAIT, acquire_with_deadline,
@@ -63,8 +63,28 @@ use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// Resolve whether the logical project storage path has a published core.
+pub fn core_database_exists(storage_path: &Path) -> Result<bool, ApiError> {
+    codestory_store::core_database_exists(storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to resolve core storage: {error}")))
+}
+
+/// Resolve the active published core database for a logical storage path.
+pub fn resolve_core_database_path(storage_path: &Path) -> Result<PathBuf, ApiError> {
+    codestory_store::resolve_core_database_path(storage_path)
+        .map_err(|error| ApiError::internal(format!("Failed to resolve core storage: {error}")))
+}
+
 mod affected;
 mod agent;
+mod call_path_grammar;
+#[allow(unused_imports)]
+#[cfg(any(
+    test,
+    feature = "test-support",
+    feature = "proof-qualification-support"
+))]
+mod call_path_kernel;
 mod evidence_projection_v3;
 mod index_commit;
 mod index_coverage;
@@ -109,18 +129,15 @@ pub use agent::{
 };
 pub use evidence_projection_v3::{
     PacketDiagnosticProjectionV3, PacketEvidenceProductV3,
-    finalize_packet_projection_v3_for_representation, project_context_v3, project_packet_v3,
+    finalize_packet_projection_v3_for_representation,
+    packet_budget_exceeded_projection_v3_from_envelope, project_context_v3, project_packet_v3,
     project_search_v3,
 };
 
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod agent_test_support {
-    use codestory_contracts::api::{AgentAnswerDto, IndexFreshnessDto, PacketClaimDto};
-
-    pub fn packet_supported_claims(answer: &AgentAnswerDto) -> Vec<PacketClaimDto> {
-        crate::agent::packet_claims::packet_supported_claims_with_telemetry(answer).0
-    }
+    use codestory_contracts::api::IndexFreshnessDto;
 
     pub fn fresh_index_observation() -> IndexFreshnessDto {
         crate::agent::packet_freshness::fresh_index_observation()
@@ -296,8 +313,6 @@ use semantic_projection::{
     sort_pending_dense_anchor_inputs, stream_pending_llm_symbol_docs_from_env,
     truncate_semantic_doc_text_to_token_budget,
 };
-#[cfg(test)]
-pub(crate) use snippets::markdown_snippet;
 pub(crate) use snippets::{
     BoundedSnippetRangeOptions, DIRECT_SNIPPET_MAX_BYTES, DIRECT_SNIPPET_TRUNCATION_SUFFIX,
 };
@@ -367,15 +382,15 @@ pub use repository_identity::{
     REPOSITORY_IDENTITY_SCHEMA_VERSION, RepositoryIdentityReport, inspect_repository_identity,
 };
 pub use retrieval_boundary::{
-    CacheCleanPlan, CacheCleanReport, FinalizeComponentWork, FinalizeIndexOutcome,
-    FinalizePhaseTiming, GenerationRetentionApplyReport, GenerationRetentionPlan,
-    ProcessOwnerState, ProcessStartProbe, QueryResult, RetainedRollbackObservation,
-    RetrievalIndexManifest, RetrievalProcessDefaults, RetrievalRuntimeDefaults,
-    RetrievalRuntimeOverrides, RetrievalStatusReport, RollbackActivationError,
-    RollbackActivationOutcome, RollbackActivationRefusal, RuntimeRetrievalConfig,
-    RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED, SidecarGcReport,
-    SidecarInventoryReport, apply_cache_clean, ensure_product_embedding_backend_for_runtime,
-    plan_cache_clean, retrieval_process_defaults,
+    CacheCleanPlan, CacheCleanReport, CacheInventoryReport, FinalizeComponentWork,
+    FinalizeIndexOutcome, FinalizePhaseTiming, GenerationRetentionApplyReport,
+    GenerationRetentionPlan, ProcessOwnerState, ProcessStartProbe, QueryResult,
+    RetainedRollbackObservation, RetrievalIndexManifest, RetrievalProcessDefaults,
+    RetrievalRuntimeDefaults, RetrievalRuntimeOverrides, RetrievalStatusReport,
+    RollbackActivationError, RollbackActivationOutcome, RollbackActivationRefusal,
+    RuntimeRetrievalConfig, RuntimeRetrievalProfile, SIDECAR_SEMANTIC_DOC_CONTRACT_CHANGED,
+    SidecarGcReport, SidecarInventoryReport, apply_cache_clean, cache_inventory,
+    ensure_product_embedding_backend_for_runtime, plan_cache_clean, retrieval_process_defaults,
 };
 pub(crate) use search_runtime::SearchEngine;
 
@@ -413,8 +428,8 @@ use semantic_doc_text::{
 pub use services::set_before_retrieval_pin_test_hook;
 pub use services::{
     ACTIVATION_QUIESCENCE_FAIL_STOP, ActivationCapabilities, ActivationCapabilityState,
-    ActivationFailStopHook, ActivationOperation, ActivationQuiescence, ActivationRun,
-    ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
+    ActivationFailStopHook, ActivationGoal, ActivationOperation, ActivationQuiescence,
+    ActivationRun, ActivationService, ActivationSnapshot, ActivationStage, ActivationState,
     ActivePublicOperationPublication, AgentService, BookmarkService, GroundingService,
     IndexService, ProjectService, PublicOperation, PublicOperationService, SearchService,
     TrailService, embedding_api_error, set_activation_fail_stop_hook,
@@ -477,6 +492,9 @@ thread_local! {
     static ACTIVE_CORE_READ: RefCell<Option<ActiveCoreRead>> = const { RefCell::new(None) };
 }
 
+// Pinned is a cheap Rc; Owned holds the full Storage. Prefer the size skew over
+// boxing every owned open on the observational read path.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ReadStorage {
     Pinned(Rc<Storage>),
     Owned(Storage),

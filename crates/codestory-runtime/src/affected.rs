@@ -1878,31 +1878,122 @@ fn affected_symbol_impacts(
     }
 }
 
-fn affected_test_impacts(symbols: &[AffectedSymbolDto]) -> Vec<AffectedTestFileDto> {
-    let mut by_file = BTreeMap::<String, (u32, u32, String)>::new();
-    for symbol in symbols {
-        if let Some(path) = symbol.file_path.as_deref()
-            && path_role_from_key(&normalize_path_key(path)) == IndexedFileRoleDto::Test
+fn package_root(project_root: &Path, relative_path: &str) -> PathBuf {
+    let mut dir = project_root.join(relative_path);
+    if dir.is_file() || dir.extension().is_some() {
+        dir.pop();
+    }
+    loop {
+        if dir.join("Cargo.toml").is_file()
+            || dir.join("package.json").is_file()
+            || dir.join("pyproject.toml").is_file()
+            || dir.join("go.mod").is_file()
         {
+            return dir;
+        }
+        if dir == *project_root || !dir.pop() {
+            return project_root.to_path_buf();
+        }
+    }
+}
+
+fn affected_test_impacts(
+    symbols: &[AffectedSymbolDto],
+    distances: &BTreeMap<GraphNodeId, u32>,
+    evidence: &BTreeMap<GraphNodeId, AffectedGraphEvidence>,
+    graph: &AffectedGraphIndex,
+    project_root: &Path,
+    files: &[FileInfo],
+    matched_files: &[AffectedMatchedFileDto],
+) -> Vec<AffectedTestFileDto> {
+    let mut by_file = BTreeMap::<String, (u32, u32, String, &'static str)>::new();
+    let mut record =
+        |path: &str, graph_depth: u32, confidence: String, count: u32, reason: &'static str| {
+            if path_role_from_key(&normalize_path_key(path)) != IndexedFileRoleDto::Test {
+                return;
+            }
             let entry = by_file.entry(path.to_string()).or_insert((
                 0,
+                graph_depth,
+                confidence.clone(),
+                reason,
+            ));
+            entry.0 = entry.0.saturating_add(count);
+            if graph_depth < entry.1 {
+                entry.1 = graph_depth;
+                entry.2 = confidence;
+                entry.3 = reason;
+            }
+        };
+    for symbol in symbols {
+        if let Some(path) = symbol.file_path.as_deref() {
+            record(
+                path,
                 symbol.graph_depth,
                 symbol.confidence.clone(),
-            ));
-            entry.0 += 1;
-            if symbol.graph_depth < entry.1 {
-                entry.1 = symbol.graph_depth;
-                entry.2.clone_from(&symbol.confidence);
+                1,
+                "focused test hint: test-like path reached by affected graph walk",
+            );
+        }
+    }
+    // Symbol impacts omit FILE nodes, but reverse-walk can still land on a
+    // test file identity when the only stored dependent is the file itself.
+    for (node_id, distance) in distances {
+        let Some(node) = graph.nodes_by_id.get(node_id) else {
+            continue;
+        };
+        if node.kind != codestory_contracts::graph::NodeKind::FILE {
+            continue;
+        }
+        let Some(path) = graph.file_path_by_id.get(node_id).cloned().or_else(|| {
+            node.file_node_id
+                .and_then(|file_id| graph.file_path_by_id.get(&file_id).cloned())
+        }) else {
+            continue;
+        };
+        let graph_evidence = evidence.get(node_id);
+        let confidence = graph_evidence
+            .map(|item| item.confidence_floor.label().to_string())
+            .unwrap_or_else(|| "graph".to_string());
+        let depth = graph_evidence
+            .map(|item| item.distance)
+            .unwrap_or(*distance);
+        record(
+            &path,
+            depth,
+            confidence,
+            1,
+            "focused test hint: test-like path reached by affected graph walk",
+        );
+    }
+    let package_roots = matched_files
+        .iter()
+        .filter(|file| file.role == IndexedFileRoleDto::Source)
+        .map(|file| package_root(project_root, &file.path))
+        .collect::<BTreeSet<_>>();
+    if !package_roots.is_empty() {
+        for file in files {
+            let relative = runtime_relative_path(project_root, &file.path);
+            if path_role_from_key(&normalize_path_key(&relative)) != IndexedFileRoleDto::Test {
+                continue;
+            }
+            if package_roots.contains(&package_root(project_root, &relative)) {
+                record(
+                    &relative,
+                    1,
+                    "bounded".to_string(),
+                    0,
+                    "focused test hint: indexed test in the same package as a changed source file",
+                );
             }
         }
     }
     by_file
         .into_iter()
         .map(
-            |(path, (impacted_symbol_count, distance, confidence))| AffectedTestFileDto {
+            |(path, (impacted_symbol_count, distance, confidence, reason))| AffectedTestFileDto {
                 path,
-                reason: "focused test hint: test-like path reached by affected graph walk"
-                    .to_string(),
+                reason: reason.to_string(),
                 confidence,
                 distance,
                 graph_depth: distance,
@@ -2385,7 +2476,15 @@ impl AppController {
         let impacted_routes = route_impacts.routes;
         let impacted_route_total = route_impacts.total;
         let impacted_routes_truncated = route_impacts.truncated;
-        let impacted_tests = affected_test_impacts(&impacted_symbols);
+        let impacted_tests = affected_test_impacts(
+            &impacted_symbols,
+            &distances,
+            &evidence,
+            &graph,
+            &root,
+            &files,
+            &matched_files,
+        );
 
         let AffectedCompletion {
             project,

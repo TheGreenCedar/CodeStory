@@ -406,12 +406,21 @@ fn semantic_projection_phase_timings(
     phase_timings
 }
 
+/// A staged-core write that must ride along with the next semantic projection
+/// publication.
+///
+/// Published core generations are immutable, so any caller that needs to change
+/// core rows joins this republish instead of opening the live database. It runs
+/// on the validated clone before the new publication identity is minted.
+pub(super) type StagedCoreMutation<'a> = &'a dyn Fn(&mut Store) -> Result<(), ApiError>;
+
 pub(super) fn semantic_projection_republish_for_runtime(
     root: &Path,
     storage_path: &Path,
     cancel_token: Option<&CancellationToken>,
     runtime: &codestory_retrieval::SidecarRuntimeConfig,
     source_index_policy: &SourceIndexPolicy,
+    staged_mutation: Option<StagedCoreMutation<'_>>,
 ) -> Result<
     (
         IndexingRunSummary,
@@ -423,7 +432,11 @@ pub(super) fn semantic_projection_republish_for_runtime(
     ApiError,
 > {
     ensure_indexing_active(cancel_token)?;
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+        ApiError::internal(format!(
+            "Failed to resolve semantic projection core publication: {error}"
+        ))
+    })? {
         return Err(ApiError::new(
             "semantic_projection_core_missing",
             "Semantic projection republish requires an existing complete core publication.",
@@ -463,6 +476,9 @@ pub(super) fn semantic_projection_republish_for_runtime(
             &expected_publication,
             source_index_policy,
         )?;
+        if let Some(mutate) = staged_mutation {
+            mutate(staged.store_mut())?;
+        }
         let publication = next_index_publication(
             Some(&expected_publication),
             IndexPublicationMode::SemanticProjection,

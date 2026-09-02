@@ -1,9 +1,9 @@
-//! Packet planning contracts and policy.
+//! Prompt-blind packet seed planning and evidence-policy helpers.
 //!
-//! This crate decides *what to ask for*: the terms a prompt carries, the flow
-//! requirements a task class implies, the evidence roles and carriers a
-//! citation can play, and the deduplicated query plan that comes out the other
-//! side. It owns none of the machinery that answers those questions.
+//! Horizon A forwards the unchanged question to generic retrieval and records
+//! caller-supplied free-query seeds. It does not infer answer shapes, material
+//! roles, lifecycle stages, or structural traversal from prompt wording. The
+//! repository-derived evidence compiler belongs to Horizon B (`#2106`).
 //!
 //! Specifically, nothing here may activate a publication, open or write
 //! storage, execute retrieval, retry a publication, or move readiness. The only
@@ -16,84 +16,16 @@
 pub mod citation;
 #[cfg(any(test, feature = "test-support"))]
 pub mod eval_probes;
-#[cfg(any(
-    test,
-    feature = "test-support",
-    feature = "proof-qualification-support"
-))]
-#[doc(hidden)]
-mod indexed_source_call_path_v1;
-#[cfg(feature = "proof-qualification-support")]
-#[doc(hidden)]
-pub mod proof_qualification_support {
-    use serde::Serialize;
-
-    pub use super::indexed_source_call_path_v1::{
-        AdmittedRawCallEdge, BuiltCallPathFacts, CallPathSpec, CallableContainmentEvidence,
-        CheckedBuiltCallPathIntegration, ClauseAnchor, ClauseClassification, ExactScopeSelector,
-        ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
-        InternalCorePublicationIdentity, InternalProjection, NonMaterialKind, PROOF_DOMAIN,
-        PinnedNodeIdentity, ProofContractField, ProofHashes, RawAdmissionFailure,
-        RawCallEdgeAdmission, ReceiptRef, ResolvedNodeIdentity, TranslationGap, UnavailableReason,
-        UnresolvedMaterialReason, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
-        UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector,
-        ValidatedCallPathContract, ValidatedContractRendering, ValidationOutcome,
-        VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
-        check_built_call_path_integration, diagnose_raw_call_edge,
-        project_internal_call_path_result, project_translation_unknown_result,
-        validate_compact_projection, validate_contract,
-    };
-
-    /// Identifies the sealed request domain observed by benchmark qualification.
-    pub fn proof_domain() -> &'static str {
-        super::indexed_source_call_path_v1::PROOF_DOMAIN
-    }
-
-    /// Serialize a qualification artifact with the repository-pinned RFC 8785
-    /// implementation without exposing that dependency to the benchmark crate.
-    pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
-        serde_json_canonicalizer::to_vec(value).map_err(|error| error.to_string())
-    }
-}
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub mod proof_qualification_test_support {
-    pub use super::indexed_source_call_path_v1::{
-        AdmittedRawCallEdge, BuiltCallPathFacts, CallPathSpec, CallableContainmentEvidence,
-        CheckedBuiltCallPathIntegration, ClauseAnchor, ClauseClassification, ExactScopeSelector,
-        ExactSymbolSelector, FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow,
-        InternalCorePublicationIdentity, InternalProjection, PROOF_DOMAIN, PinnedNodeIdentity,
-        ProofContractField, ProofDisposition, ProofGap, ProofHashes, RawAdmissionFailure,
-        RawCallEdgeAdmission, ReceiptRef, Refutation, ResolvedNodeIdentity, TranslationGap,
-        UnavailableReason, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
-        UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector,
-        ValidatedCallPathContract, ValidatedContractRendering, ValidationOutcome,
-        VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
-        check_built_call_path_integration, check_call_path, diagnose_raw_call_edge,
-        project_internal_call_path_result, project_translation_unknown_result, validate_contract,
-    };
-}
 pub mod packet_citations;
-pub mod packet_claim_profile_registry;
-pub mod packet_claim_profiles;
-pub mod packet_claims;
 pub mod packet_command;
 pub mod packet_coverage;
 pub mod packet_degradation;
 pub mod packet_evidence;
-pub mod packet_evidence_carriers;
-pub mod packet_evidence_roles;
 pub mod packet_execution_graphs;
 #[doc(hidden)]
-pub mod packet_execution_plan_v3;
-pub mod packet_flow_requirements;
 pub mod packet_freshness;
-pub mod packet_obligations;
 pub mod packet_plan;
 pub mod packet_probes;
-pub mod packet_profile_telemetry;
-pub mod packet_proof_atoms;
-pub mod packet_required_probes;
 pub mod packet_scoring;
 pub mod packet_terms;
 pub mod pinned_reader;

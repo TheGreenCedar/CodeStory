@@ -11,7 +11,7 @@ use codestory_contracts::{
 
 use crate::agent::{
     packet_execution_record_v3::{
-        FinalizedPacketExecutionInputV3, PacketProfileV3, PacketRequestFingerprintV3,
+        FinalizedPacketExecutionInputV3, PacketRequestFingerprintV3,
         build_packet_execution_record_fixture_v3,
     },
     packet_projection_v3::{
@@ -39,9 +39,7 @@ pub fn real_projection_fixtures(
     let request = AgentPacketRequestDto {
         question: "sealed evidence-only conformance".to_owned(),
         budget: PacketBudgetModeDto::Standard,
-        task_class: None,
         probes: Vec::new(),
-        extra_probes: Vec::new(),
         latency_budget_ms: None,
         parent_packet_id: None,
         option_ids: Vec::new(),
@@ -55,7 +53,7 @@ pub fn real_projection_fixtures(
     let input = FinalizedPacketExecutionInputV3::new(
         identity("evidence-only-conformance")?,
         identity("evidence-only-request")?,
-        PacketRequestFingerprintV3::from_current_request(&request, PacketProfileV3::Auto),
+        PacketRequestFingerprintV3::from_current_request(&request),
         Vec::new(),
         Vec::new(),
         None,

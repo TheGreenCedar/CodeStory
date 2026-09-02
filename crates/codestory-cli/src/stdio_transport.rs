@@ -14,10 +14,11 @@ use codestory_contracts::api::{
     IndexFreshnessSampleDto, IndexFreshnessStatusDto, IndexPublicationDto, IndexedFileRoleDto,
     IndexedFilesRequest, ListChildrenSymbolsRequest, ListRootSymbolsRequest, NodeDetailsDto,
     NodeDetailsRequest, NodeId, NodeKind, PACKET_PROBE_CONTRACT_VERSION, PacketBudgetModeDto,
-    PacketProbeDto, PacketTaskClassDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto,
-    ReadinessVerdictDto, SearchRepoTextMode, SearchRequest, StorageStatsDto, TrailCallerScope,
-    TrailDirection, TrailMode,
+    PacketProbeDto, ProjectSummary, ReadinessGoalDto, ReadinessStatusDto, ReadinessVerdictDto,
+    SearchRepoTextMode, SearchRequest, StorageStatsDto, TrailCallerScope, TrailDirection,
+    TrailMode,
 };
+use codestory_contracts::compilation::{PacketContinuationSelectorV1, PacketStructuralGapReasonV1};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1665,7 +1666,7 @@ fn handle_stdio_request(
                     "Invalid params: missing tool name",
                 ));
             };
-            if !is_stdio_tool_name(name) && name != "prove_call_path" {
+            if !is_stdio_tool_name(name) && !crate::prove_call_path::is_proof_tool_name(name) {
                 return Some(stdio_jsonrpc_error(
                     id,
                     -32602,
@@ -1688,7 +1689,7 @@ fn handle_stdio_request(
             }
             let prepared = match prepare_stdio_tool_call(session, name, &request) {
                 Ok(prepared) => prepared,
-                Err(error) if name == "prove_call_path" => {
+                Err(error) if crate::prove_call_path::is_proof_tool_name(name) => {
                     return Some(crate::stdio_v3::jsonrpc_invalid_params_v3(
                         id,
                         &error.message,
@@ -1735,15 +1736,10 @@ fn handle_stdio_request(
                     });
                     return Some(stdio_jsonrpc_success(id, stdio_tool_call_error_v3(&error)));
                 }
-                let activation = if name == "prove_call_path" {
-                    runtime
-                        .activation
-                        .bind_existing_complete_core_for_observation(
-                            &runtime.project_root,
-                            &runtime.storage_path,
-                            Arc::clone(cancelled),
-                        )
-                } else if observes_complete_core {
+                // Exact proof and affected share complete-core admission: a warm
+                // complete publication stays observational, while cold/fenced
+                // state starts managed preparation and returns preparing+retry.
+                let activation = if observes_complete_core {
                     runtime.activation.ensure_complete_core_for_observation(
                         &runtime.project_root,
                         &runtime.storage_path,
@@ -1841,14 +1837,21 @@ fn handle_stdio_request(
                             "diagnostics_uri": diagnostics_uri,
                         });
                         if preparing {
+                            let retry_after_ms = operation
+                                .as_ref()
+                                .and_then(|snapshot| snapshot.retry_after_ms)
+                                .unwrap_or(250)
+                                .max(1);
                             let preparing = serde_json::json!({
                                 "kind": "preparing",
                                 "state": "preparing",
-                                "retry_after_ms": operation
-                                    .as_ref()
-                                    .and_then(|snapshot| snapshot.retry_after_ms)
-                                    .unwrap_or(250)
-                                    .max(1),
+                                "retry_after_ms": retry_after_ms,
+                                // The caller need not re-plan: the same request,
+                                // unchanged, is the whole next action.
+                                "minimum_next": {
+                                    "kind": "retry_same_request",
+                                    "after_ms": retry_after_ms,
+                                },
                                 "operation": operation
                                     .as_ref()
                                     .and_then(|snapshot| serde_json::to_value(snapshot).ok())
@@ -1870,12 +1873,14 @@ fn handle_stdio_request(
                 }
                 state.status_cache = None;
             }
-            if name == "prove_call_path" {
+            if crate::prove_call_path::is_proof_tool_name(name) {
                 let PreparedStdioToolCall::ProveCallPath(proof_request) = &prepared else {
                     return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
                 };
                 let validation =
-                    match crate::prove_call_path::validate_request(proof_request.clone()) {
+                    match codestory_runtime::proof_qualification_support::
+                        validate_public_call_path_contract(proof_request.clone())
+                    {
                         Ok(validation) => validation,
                         Err(message) => {
                             return Some(stdio_jsonrpc_success(
@@ -1884,7 +1889,7 @@ fn handle_stdio_request(
                             ));
                         }
                     };
-                let root = match validation {
+                let public = match validation {
                     codestory_runtime::proof_qualification_support::ValidationOutcome::Validated {
                         contract,
                         hashes,
@@ -1906,8 +1911,10 @@ fn handle_stdio_request(
                                 ));
                             }
                         };
-                        match crate::prove_call_path::projection_root(&operation) {
-                            Ok(root) => root,
+                        match codestory_runtime::proof_qualification_support::
+                            project_observed_public_operation(&operation)
+                        {
+                            Ok(public) => public,
                             Err(_) => {
                                 return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
                             }
@@ -1936,11 +1943,18 @@ fn handle_stdio_request(
                                 ));
                             }
                         };
-                        crate::prove_call_path::internal_projection_root(&operation.value)
+                        match codestory_runtime::proof_qualification_support::
+                            project_internal_projection(&operation.value)
+                        {
+                            Ok(public) => public,
+                            Err(_) => {
+                                return Some(stdio_jsonrpc_error(id, -32603, "Internal error"));
+                            }
+                        }
                     }
                 };
                 return Some(
-                    match crate::stdio_v3::build_proof_tool_result_v3(revision, &root) {
+                    match crate::stdio_v3::build_proof_tool_result_v3(revision, &public) {
                         Ok(result) => stdio_jsonrpc_success(id, result),
                         Err(error) => crate::stdio_v3::jsonrpc_internal_error_v3(id, &error),
                     },
@@ -2186,11 +2200,7 @@ fn project_stdio_tool_execution_v3(
                     .to_owned(),
                 budget: stdio_packet_budget(request)
                     .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
-                task_class: stdio_packet_task_class(request)
-                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
                 probes: stdio_packet_probes(request)
-                    .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
-                extra_probes: stdio_packet_extra_probes(request)
                     .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
                 latency_budget_ms: stdio_packet_latency_budget(request)
                     .map_err(|error| ApiError::invalid_argument(error.to_string()))?,
@@ -2371,6 +2381,26 @@ fn build_served_tool_result_v3(
     Ok(result)
 }
 
+fn build_unchecked_served_tool_result_v3(
+    revision: crate::stdio_v3::McpRevisionV3,
+    root: &serde_json::Value,
+    publication_meta: Option<&serde_json::Value>,
+) -> std::result::Result<serde_json::Value, crate::stdio_v3::StdioV3InternalError> {
+    let mut result = crate::stdio_v3::revision_native_tool_result_unchecked_v3(revision, root)?;
+    if revision.profile().structured_content
+        && let Some(publication_meta) = publication_meta
+        && let Some(meta) = result
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        meta.insert(
+            "codestory_publication".to_string(),
+            publication_meta.clone(),
+        );
+    }
+    Ok(result)
+}
+
 fn finalize_packet_projection_for_stdio_v3(
     root: &mut serde_json::Value,
     revision: crate::stdio_v3::McpRevisionV3,
@@ -2384,10 +2414,85 @@ fn finalize_packet_projection_for_stdio_v3(
     {
         reference.remove("uri");
     }
-    let mut projection = serde_json::from_value::<
+    let projection_result = serde_json::from_value::<
         codestory_contracts::packet_projection_v3::PacketProjectionV3Dto,
-    >(typed_root)
-    .map_err(|error| crate::stdio_v3::StdioV3InternalError::InvalidProjection(error.to_string()))?;
+    >(typed_root.clone());
+    let mut projection = match projection_result {
+        Ok(projection) => projection,
+        Err(error)
+            if typed_root
+                .get("evidence")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|rows| {
+                    rows.len()
+                        > codestory_contracts::packet_projection_v3::PACKET_EVIDENCE_ROWS_MAX_V3
+                }) =>
+        {
+            let complete_result =
+                build_unchecked_served_tool_result_v3(revision, root, publication_meta)?;
+            let required_complete_bytes = v3_serialize_call_tool_result(&complete_result)
+                .map_err(|serialize_error| {
+                    crate::stdio_v3::StdioV3InternalError::Serialization(
+                        serialize_error.to_string(),
+                    )
+                })?
+                .len();
+            let schema_version = typed_root
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .ok_or_else(|| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(
+                        "packet schema_version is missing or invalid".to_string(),
+                    )
+                })?;
+            let parse_envelope = |field: &str| {
+                typed_root.get(field).cloned().ok_or_else(|| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet {field} is missing"
+                    ))
+                })
+            };
+            let identity =
+                serde_json::from_value(parse_envelope("identity")?).map_err(|field_error| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet identity is invalid: {field_error}"
+                    ))
+                })?;
+            let publication =
+                serde_json::from_value(parse_envelope("publication")?).map_err(|field_error| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet publication is invalid: {field_error}"
+                    ))
+                })?;
+            let retrieval =
+                serde_json::from_value(parse_envelope("retrieval")?).map_err(|field_error| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet retrieval is invalid: {field_error}"
+                    ))
+                })?;
+            let diagnostics =
+                serde_json::from_value(parse_envelope("diagnostics")?).map_err(|field_error| {
+                    crate::stdio_v3::StdioV3InternalError::InvalidProjection(format!(
+                        "packet diagnostics are invalid: {field_error}"
+                    ))
+                })?;
+            let _ = error;
+            codestory_runtime::packet_budget_exceeded_projection_v3_from_envelope(
+                schema_version,
+                identity,
+                publication,
+                retrieval,
+                diagnostics,
+                required_complete_bytes,
+            )
+        }
+        Err(error) => {
+            return Err(crate::stdio_v3::StdioV3InternalError::InvalidProjection(
+                error.to_string(),
+            ));
+        }
+    };
     let measured = codestory_runtime::finalize_packet_projection_v3_for_representation(
         &mut projection,
         |candidate| {
@@ -2664,7 +2769,7 @@ fn stdio_tool_reads_publication(name: &str) -> bool {
 }
 
 fn stdio_tool_observes_complete_core(name: &str) -> bool {
-    matches!(name, "affected" | "prove_call_path")
+    name == "affected" || crate::prove_call_path::is_proof_tool_name(name)
 }
 
 fn stdio_public_operation_name<'a>(name: &'a str, request: &serde_json::Value) -> &'a str {
@@ -3099,11 +3204,6 @@ fn stdio_packet_text(packet: &serde_json::Value) -> String {
         "question",
         packet.get("question").and_then(|value| value.as_str()),
     );
-    append_packet_text_field(
-        &mut text,
-        "task_class",
-        packet.get("task_class").and_then(|value| value.as_str()),
-    );
     text.push_str(REPO_CONTENT_BOUNDARY_LINE);
     text.push('\n');
 
@@ -3488,7 +3588,7 @@ enum PreparedStdioToolCall {
     Raw,
     Affected(AffectedAnalysisRequest),
     Snippet(StdioSnippetRequest),
-    ProveCallPath(crate::prove_call_path::ProveCallPathRequestDto),
+    ProveCallPath(codestory_runtime::proof_qualification_support::UnvalidatedCallPathContract),
 }
 
 #[derive(Debug, Clone)]
@@ -3511,7 +3611,7 @@ fn prepare_stdio_tool_call(
             Ok(PreparedStdioToolCall::Affected(affected))
         }
         "snippet" => stdio_snippet_request(request).map(PreparedStdioToolCall::Snippet),
-        "prove_call_path" => {
+        name if crate::prove_call_path::is_proof_tool_name(name) => {
             let mut arguments = request
                 .pointer("/params/arguments")
                 .cloned()
@@ -4303,10 +4403,6 @@ fn handle_stdio_packet(
         Ok(budget) => budget,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    let task_class = match stdio_packet_task_class(request) {
-        Ok(task_class) => task_class,
-        Err(error) => return serde_json::json!({"error": error.to_string()}),
-    };
     let latency_budget_ms = match stdio_packet_latency_budget(request) {
         Ok(latency_budget_ms) => latency_budget_ms,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
@@ -4315,13 +4411,7 @@ fn handle_stdio_packet(
         Ok(probes) => probes,
         Err(error) => return serde_json::json!({"error": error.to_string()}),
     };
-    let extra_probes = match stdio_packet_extra_probes(request) {
-        Ok(extra_probes) => extra_probes,
-        Err(error) => return serde_json::json!({"error": error.to_string()}),
-    };
-    if let Err(error) =
-        codestory_contracts::api::validate_packet_probe_request(&probes, &extra_probes)
-    {
+    if let Err(error) = codestory_contracts::api::validate_packet_probe_request(&probes) {
         return serde_json::json!({"error": error});
     }
     let parent_packet_id = request
@@ -4349,9 +4439,7 @@ fn handle_stdio_packet(
             publication,
             question,
             budget,
-            task_class,
             probes: &probes,
-            extra_probes: &extra_probes,
             latency_budget_ms,
             parent_packet_id: parent_packet_id.as_deref(),
             option_ids: &option_ids,
@@ -4371,9 +4459,7 @@ fn handle_stdio_packet(
         .packet(AgentPacketRequestDto {
             question: question.to_string(),
             budget,
-            task_class,
             probes,
-            extra_probes,
             latency_budget_ms,
             parent_packet_id,
             option_ids,
@@ -4476,9 +4562,7 @@ struct StdioPacketCacheKey {
     publication: StdioProductPublicationKey,
     question: String,
     budget: &'static str,
-    task_class: Option<&'static str>,
     probes: Vec<PacketProbeDto>,
-    extra_probes: Vec<String>,
     latency_budget_ms: Option<u32>,
     parent_packet_id: Option<String>,
     option_ids: Vec<String>,
@@ -4551,9 +4635,7 @@ struct StdioPacketCacheKeyInput<'a> {
     publication: StdioProductPublicationKey,
     question: &'a str,
     budget: PacketBudgetModeDto,
-    task_class: Option<PacketTaskClassDto>,
     probes: &'a [PacketProbeDto],
-    extra_probes: &'a [String],
     latency_budget_ms: Option<u32>,
     parent_packet_id: Option<&'a str>,
     option_ids: &'a [String],
@@ -4566,9 +4648,7 @@ fn stdio_packet_cache_key(input: StdioPacketCacheKeyInput<'_>) -> StdioPacketCac
         publication: input.publication,
         question: input.question.to_string(),
         budget: stdio_packet_budget_label(input.budget),
-        task_class: input.task_class.map(stdio_packet_task_class_label),
         probes: input.probes.to_vec(),
-        extra_probes: input.extra_probes.to_vec(),
         latency_budget_ms: input.latency_budget_ms,
         parent_packet_id: input.parent_packet_id.map(str::to_string),
         option_ids: input.option_ids.to_vec(),
@@ -4586,25 +4666,35 @@ fn stdio_packet_budget_label(budget: PacketBudgetModeDto) -> &'static str {
     }
 }
 
-fn stdio_packet_task_class_label(task_class: PacketTaskClassDto) -> &'static str {
-    match task_class {
-        PacketTaskClassDto::ArchitectureExplanation => "architecture_explanation",
-        PacketTaskClassDto::BugLocalization => "bug_localization",
-        PacketTaskClassDto::ChangeImpact => "change_impact",
-        PacketTaskClassDto::RouteTracing => "route_tracing",
-        PacketTaskClassDto::SymbolOwnership => "symbol_ownership",
-        PacketTaskClassDto::DataFlow => "data_flow",
-        PacketTaskClassDto::EditPlanning => "edit_planning",
-    }
-}
-
 fn stdio_storage_modified(
     storage_path: &std::path::Path,
 ) -> std::io::Result<std::time::SystemTime> {
-    let paths = [
+    // Immutable core generations publish by writing `core/publication.json` and a
+    // generation database. The legacy live `codestory.db` path can remain an empty
+    // compatibility stub whose mtime does not advance on republish, so dirty-marker
+    // freshness must consider the published core surfaces too.
+    let mut paths = vec![
         storage_path.to_path_buf(),
         storage_path.with_extension("db-wal"),
     ];
+    if let Some(parent) = storage_path.parent() {
+        let core_root = parent.join("core");
+        let publication_path = core_root.join("publication.json");
+        paths.push(publication_path.clone());
+        if let Ok(bytes) = fs::read(&publication_path)
+            && let Ok(pointer) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Some(generation_id) = pointer
+                .pointer("/active/generation_id")
+                .and_then(|value| value.as_str())
+        {
+            let generation_db = core_root
+                .join("generations")
+                .join(generation_id)
+                .join("codestory.db");
+            paths.push(generation_db.with_extension("db-wal"));
+            paths.push(generation_db);
+        }
+    }
     let mut newest: Option<std::time::SystemTime> = None;
     for path in paths {
         let Ok(modified) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
@@ -4657,30 +4747,6 @@ fn stdio_packet_budget(request: &serde_json::Value) -> Result<PacketBudgetModeDt
     }
 }
 
-fn stdio_packet_task_class(request: &serde_json::Value) -> Result<Option<PacketTaskClassDto>> {
-    let Some(task_class) = request
-        .pointer("/params/arguments/task_class")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(None);
-    };
-    let task_class = match task_class {
-        "architecture_explanation" => PacketTaskClassDto::ArchitectureExplanation,
-        "bug_localization" => PacketTaskClassDto::BugLocalization,
-        "change_impact" => PacketTaskClassDto::ChangeImpact,
-        "route_tracing" => PacketTaskClassDto::RouteTracing,
-        "symbol_ownership" => PacketTaskClassDto::SymbolOwnership,
-        "data_flow" => PacketTaskClassDto::DataFlow,
-        "edit_planning" => PacketTaskClassDto::EditPlanning,
-        value => bail!(
-            "packet.task_class must be one of architecture_explanation, bug_localization, change_impact, route_tracing, symbol_ownership, data_flow, or edit_planning; got {value}"
-        ),
-    };
-    Ok(Some(task_class))
-}
-
 fn stdio_packet_latency_budget(request: &serde_json::Value) -> Result<Option<u32>> {
     let Some(value) = request.pointer("/params/arguments/latency_budget_ms") else {
         return Ok(None);
@@ -4716,25 +4782,6 @@ fn stdio_packet_probes(request: &serde_json::Value) -> Result<Vec<PacketProbeDto
             Ok(probe)
         })
         .collect()
-}
-
-fn stdio_packet_extra_probes(request: &serde_json::Value) -> Result<Vec<String>> {
-    let Some(value) = request.pointer("/params/arguments/extra_probes") else {
-        return Ok(Vec::new());
-    };
-    let Some(values) = value.as_array() else {
-        bail!("packet.extra_probes must be an array of strings");
-    };
-    let mut probes = Vec::with_capacity(values.len());
-    for value in values {
-        let Some(probe) = value.as_str() else {
-            bail!("packet.extra_probes must be an array of strings");
-        };
-        codestory_contracts::api::validate_packet_probe_request(&[], &[probe.to_string()])
-            .map_err(anyhow::Error::msg)?;
-        probes.push(probe.to_string());
-    }
-    Ok(probes)
 }
 
 fn handle_stdio_search(
@@ -6360,6 +6407,8 @@ fn read_stdio_status_resource(
     local_refresh: Option<crate::readiness::LocalRefreshOutput>,
     index_publication: serde_json::Value,
 ) -> Result<serde_json::Value> {
+    let storage_exists = codestory_runtime::core_database_exists(&runtime.storage_path)
+        .map_err(|error| anyhow::anyhow!(error.message))?;
     let retrieval_status = crate::doctor_sidecar_status(runtime);
     let (server_executable, server_executable_sha256, server_warnings) =
         stdio_server_executable_status();
@@ -6389,7 +6438,7 @@ fn read_stdio_status_resource(
         "warnings": server_warnings,
         "project_root": crate::display::clean_path_string(&runtime.project_root.to_string_lossy()),
         "storage_path": crate::display::clean_path_string(&runtime.storage_path.to_string_lossy()),
-        "storage_exists": runtime.storage_path.exists(),
+        "storage_exists": storage_exists,
         "retrieval_mode": retrieval_status.retrieval_mode,
         "degraded_reason": retrieval_status.degraded_reason,
         "live_ready": stdio_status_is_live_ready(
@@ -7538,21 +7587,22 @@ fn stdio_continuation_binding(runtime: &RuntimeContext) -> Option<StdioContinuat
 
 fn stdio_node_links(
     node_id: &str,
-    query: Option<&str>,
+    _query: Option<&str>,
     continuation: Option<&StdioContinuationBinding>,
     project_root: &Path,
 ) -> serde_json::Value {
-    let continuation_probe =
-        query
-            .zip(continuation)
-            .map(|(query, continuation)| PacketProbeDto::Continuation {
-                contract_version: PACKET_PROBE_CONTRACT_VERSION,
-                project_id: continuation.project_id.clone(),
-                core_generation_id: continuation.core_generation_id.clone(),
-                retrieval_generation: continuation.retrieval_generation.clone(),
-                symbol_id: Some(node_id.to_string()),
-                query: query.to_string(),
-            });
+    let continuation_probe = continuation.map(|continuation| PacketProbeDto::Continuation {
+        contract_version: PACKET_PROBE_CONTRACT_VERSION,
+        project_id: continuation.project_id.clone(),
+        core_generation_id: continuation.core_generation_id.clone(),
+        retrieval_generation: continuation.retrieval_generation.clone(),
+        selector: PacketContinuationSelectorV1 {
+            stable_identity: format!("node:{node_id}"),
+            path: None,
+            symbol_id: Some(node_id.to_string()),
+            reason: PacketStructuralGapReasonV1::DisconnectedSeed,
+        },
+    });
     let mut links = serde_json::json!([
         {
             "rel": "symbol",
@@ -8024,6 +8074,7 @@ mod tests {
                     "retrieval":null
                 },
                 "status":"available",
+                "answer_sufficiency":"not_asserted",
                 "retrieval":{"state":"full","generation_id":"retrieval-generation-1"},
                 "evidence":evidence,
                 "gaps":[],
@@ -8616,9 +8667,7 @@ mod tests {
             publication: product_publication(1),
             question,
             budget: PacketBudgetModeDto::Compact,
-            task_class: Some(PacketTaskClassDto::ArchitectureExplanation),
             probes: &[],
-            extra_probes: &[],
             latency_budget_ms: Some(15_000),
             parent_packet_id: None,
             option_ids: &[],
@@ -9734,7 +9783,6 @@ version = "0.11.20"
         let text = stdio_packet_text(&json!({
             "packet_id": "packet-1",
             "question": "summarize repo docs",
-            "task_class": "architecture_explanation",
             "support": [{"id": "symbol:docs", "kind": "symbol_location", "summary": "Docs at README.md:1"}],
             "disposition": {
                 "kind": "supported",
@@ -9958,8 +10006,10 @@ version = "0.11.20"
         assert_eq!(probe["project_id"], "project-v3");
         assert_eq!(probe["core_generation_id"], "core-generation");
         assert_eq!(probe["retrieval_generation"], "retrieval-generation");
-        assert_eq!(probe["symbol_id"], "42");
-        assert_eq!(probe["query"], "AppController");
+        assert_eq!(probe["selector"]["stable_identity"], "node:42");
+        assert_eq!(probe["selector"]["symbol_id"], "42");
+        assert_eq!(probe["selector"]["reason"], "disconnected_seed");
+        assert!(probe.get("query").is_none());
 
         let definition_links =
             stdio_definition_links("42", "AppController", Some(&binding), Path::new("/repo"));
@@ -9985,7 +10035,6 @@ version = "0.11.20"
                 codestory_contracts::api::PacketEvidenceResolutionDto::SourceRangeOnly,
             ),
             loss_reason: None,
-            coverage_role: None,
             eligible_for_sufficiency: Some(false),
             source_excerpt: None,
             verification_targets: Vec::new(),
@@ -10636,22 +10685,7 @@ version = "0.11.20"
         assert_ne!(
             base,
             stdio_packet_cache_key(StdioPacketCacheKeyInput {
-                task_class: Some(PacketTaskClassDto::EditPlanning),
-                ..base_packet_cache_key_input("Explain packet caching.")
-            })
-        );
-        assert_ne!(
-            base,
-            stdio_packet_cache_key(StdioPacketCacheKeyInput {
                 latency_budget_ms: Some(30_000),
-                ..base_packet_cache_key_input("Explain packet caching.")
-            })
-        );
-        let extra_probes = ["src/lib.rs run".to_string()];
-        assert_ne!(
-            base,
-            stdio_packet_cache_key(StdioPacketCacheKeyInput {
-                extra_probes: &extra_probes,
                 ..base_packet_cache_key_input("Explain packet caching.")
             })
         );
@@ -10704,6 +10738,7 @@ version = "0.11.20"
                     "probes": [
                         {"kind": "exact_path", "path": "assets/desk.svg"},
                         {"kind": "symbol_id", "id": "42"},
+                        {"kind": "qualified_symbol", "symbol": "crate::runtime::run"},
                         {"kind": "file_symbol", "path": "src/lib.rs", "symbol": "run"},
                         {"kind": "free_query", "query": "runtime path"},
                         {
@@ -10712,8 +10747,11 @@ version = "0.11.20"
                             "project_id": "project",
                             "core_generation_id": "core",
                             "retrieval_generation": "retrieval",
-                            "symbol_id": "42",
-                            "query": "run"
+                            "selector": {
+                                "stable_identity": "node:42",
+                                "symbol_id": "42",
+                                "reason": "disconnected_seed"
+                            }
                         }
                     ]
                 }
@@ -10721,7 +10759,7 @@ version = "0.11.20"
         });
         assert_eq!(
             stdio_packet_probes(&request).expect("tagged probes").len(),
-            5
+            6
         );
 
         let malformed = serde_json::json!({
@@ -10737,19 +10775,11 @@ version = "0.11.20"
         });
         assert!(stdio_packet_probes(&too_long).is_err());
 
-        let empty_legacy = serde_json::json!({
-            "params": {"arguments": {"extra_probes": ["   "]}}
-        });
-        assert!(stdio_packet_extra_probes(&empty_legacy).is_err());
-
         let probes = vec![
             PacketProbeDto::FreeQuery { query: "x".into() };
-            codestory_contracts::api::PACKET_PROBE_MAX_COUNT
+            codestory_contracts::api::PACKET_PROBE_MAX_COUNT + 1
         ];
-        assert!(
-            codestory_contracts::api::validate_packet_probe_request(&probes, &["overflow".into()])
-                .is_err()
-        );
+        assert!(codestory_contracts::api::validate_packet_probe_request(&probes).is_err());
     }
 
     #[test]
@@ -12297,6 +12327,119 @@ version = "0.11.20"
                 constructions + 1
             );
         });
+    }
+
+    /// A cold verification prepares the core it reads and stops there. Before
+    /// the core-only goal existed it fell through to full activation, so an
+    /// observational proof paid for search preparation, embedding startup,
+    /// retrieval finalization, and strict validation it can never consult.
+    #[test]
+    fn cold_exact_verification_prepares_the_core_without_activating_retrieval() {
+        let cache = tempfile::tempdir().expect("cache");
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("core_only.rs"),
+            "fn callee() {}\nfn caller() { callee(); }\n",
+        )
+        .expect("write core-only verification fixture");
+
+        let mut session = StdioServerSession::new(None);
+        session.startup = crate::config::CliStartupConfig {
+            user_home: None,
+            allow_sensitive_project_root: false,
+            project_network_config_allowed: false,
+            stdio_cache_root: Some(cache.path().join("stdio-cache")),
+            sidecar_defaults: codestory_retrieval::SidecarProcessDefaults::new(
+                cache.path().join("sidecar-cache"),
+                codestory_retrieval::SidecarRuntimeDefaults::default(),
+            ),
+            source_index_policy: codestory_contracts::workspace::SourceIndexPolicy::default(),
+        };
+        session
+            .select_project(project.path().to_str())
+            .expect("select cold verification project");
+        let activation = session
+            .active_project
+            .as_ref()
+            .expect("active cold project")
+            .runtime
+            .activation
+            .clone();
+        assert_eq!(
+            activation.preparation_counts_for_test(),
+            (0, 0),
+            "the fixture must start cold"
+        );
+
+        let call_path = concat!(
+            "call-path/v1\n",
+            "from symbol \"caller\"\n",
+            "direct-call symbol \"callee\"\n",
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut converged = None;
+        for attempt in 0..40 {
+            let response = handle_stdio_message(
+                &mut session,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("core-only-{attempt}"),
+                    "method": "tools/call",
+                    "params": {
+                        "name": "verify_indexed_direct_calls",
+                        "arguments": {
+                            "project": project.path().to_string_lossy(),
+                            "call_path": call_path,
+                        }
+                    }
+                })
+                .to_string(),
+                &Arc::new(AtomicBool::new(false)),
+            )
+            .expect("verification response");
+            let content = response["result"]["structuredContent"].clone();
+            if content.get("code") == Some(&json!("codestory_preparing")) {
+                assert!(
+                    Instant::now() < deadline,
+                    "cold verification did not converge: {content}"
+                );
+                std::thread::sleep(Duration::from_millis(
+                    content["retry_after_ms"].as_u64().unwrap_or(50).min(500),
+                ));
+                continue;
+            }
+            converged = Some(content);
+            break;
+        }
+        let converged = converged.expect("cold verification converged within the retry budget");
+        assert_eq!(
+            converged["domain"], "call-path/v1",
+            "cold verification must return a verification result: {converged}"
+        );
+
+        assert_eq!(
+            activation.preparation_counts_for_test(),
+            (0, 0),
+            "core-only verification must not start the embedding backend or finalize retrieval"
+        );
+        let snapshot = activation
+            .snapshot()
+            .expect("core-only activation snapshot");
+        assert_eq!(
+            snapshot.capabilities.local_navigation,
+            codestory_runtime::ActivationCapabilityState::Ready,
+            "the core the verifier reads must be ready"
+        );
+        assert_ne!(
+            snapshot.capabilities.broad_search,
+            codestory_runtime::ActivationCapabilityState::Ready,
+            "a core-only run must never report broad retrieval readiness"
+        );
+        assert_ne!(
+            snapshot.state,
+            codestory_runtime::ActivationState::Ready,
+            "a core-only run must not terminate in the full-readiness state"
+        );
     }
 
     #[test]

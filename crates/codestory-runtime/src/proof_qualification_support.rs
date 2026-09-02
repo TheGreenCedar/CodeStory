@@ -7,7 +7,23 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use codestory_contracts::api::ApiError;
+pub use codestory_contracts::call_path_public::{
+    PUBLIC_CALL_PATH_DOMAIN, PublicCallPathResultDto, public_call_path_result_schema,
+};
+use serde_json::{Value, json};
 
+pub use crate::call_path_kernel::{
+    AdmittedRawCallEdge, BuiltCallPathFacts, COMPACT_PROOF_MAX_BYTES, CONTRACT_INTERPRETATION,
+    CallPathSpec, CallableContainmentEvidence, ClauseAnchor, ClauseClassification, FactBuildGap,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    NonMaterialKind, PinnedNodeIdentity, ProofContractField, ProofHashes, RawAdmissionFailure,
+    ReceiptRef, ResolvedNodeIdentity, TranslationGap, UnavailableReason, UnresolvedMaterialReason,
+    UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
+    UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
+    ValidatedContractRendering, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
+    check_built_call_path_integration, diagnose_raw_call_edge, project_internal_call_path_result,
+    project_translation_unknown_result, validate_compact_projection, validate_contract,
+};
 pub use crate::indexed_source_call_path_v1::{
     CandidateFailure, CandidateFailureHistogram, CandidateGate, ContainmentFailure,
     FinalizationFailure, FinalizationTrace, IntegratedProjectedCallPathResult,
@@ -16,26 +32,234 @@ pub use crate::indexed_source_call_path_v1::{
     ResolutionFactFailure, SelectorFailure, SelectorGateOutcome, SelectorQualificationTrace,
     SourceBindingFailure, StepQualificationOutcome, StepQualificationTrace,
 };
-pub use codestory_agent::proof_qualification_support::{
-    BuiltCallPathFacts, CallableContainmentEvidence, ClauseAnchor, ClauseClassification,
-    FactBuildGap, IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity,
-    InternalProjection, NonMaterialKind, PinnedNodeIdentity, ProofContractField, ProofHashes,
-    ReceiptRef, ResolvedNodeIdentity, UnavailableReason, UnresolvedMaterialReason,
-    UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
-    UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector, ValidatedCallPathContract,
-    ValidatedContractRendering, ValidationOutcome, VerifiedDirectCallFact, VerifiedProofFact,
-    check_built_call_path_integration, project_internal_call_path_result,
-    project_translation_unknown_result, validate_contract,
-};
+use serde::Serialize;
+
+/// Parse the public `call-path/v1` document inside the runtime boundary.
+///
+/// Transport adapters supply only the bounded UTF-8 document. They do not own
+/// selector interpretation, clause classification, or proof-kernel inputs.
+pub fn parse_public_call_path_document(
+    document: &str,
+) -> Result<UnvalidatedCallPathContract, String> {
+    crate::call_path_grammar::parse_call_path_document(document).map_err(|error| error.message)
+}
+
+/// Validate the runtime-parsed contract through the proof kernel.
+pub fn validate_public_call_path_contract(
+    contract: UnvalidatedCallPathContract,
+) -> Result<ValidationOutcome, String> {
+    validate_contract(contract).map_err(|error| format!("{error:?}"))
+}
+
+/// Project a kernel-owned internal root into the one shared public DTO.
+///
+/// Adapters receive no opportunity to rewrite dispositions, claim runtime
+/// execution, or manufacture their own budget envelope.
+pub fn project_public_verification_result(
+    internal: Value,
+) -> Result<PublicCallPathResultDto, String> {
+    validate_compact_projection(&internal)
+        .map_err(|error| format!("invalid internal call-path projection: {error}"))?;
+    let object = internal
+        .as_object()
+        .ok_or_else(|| "proof projection root must be an object".to_owned())?;
+    let mut public = object.clone();
+    public.insert(
+        "domain".to_owned(),
+        Value::String(PUBLIC_CALL_PATH_DOMAIN.to_owned()),
+    );
+    let translation_status = public
+        .remove("contract_interpretation")
+        .unwrap_or_else(|| Value::String(CONTRACT_INTERPRETATION.to_owned()));
+    public.insert("translation_status".to_owned(), translation_status);
+    rewrite_forbidden_public_absence(&mut public)?;
+    public.insert(
+        "graph_disposition".to_owned(),
+        Value::String(
+            public
+                .get("disposition")
+                .map(graph_disposition_from_disposition)
+                .unwrap_or("unknown")
+                .to_owned(),
+        ),
+    );
+    public.insert("runtime_execution_proven".to_owned(), Value::Bool(false));
+    attach_proof_provenance_capability(&mut public);
+    apply_public_compact_budget(Value::Object(public))
+}
+
+/// Extract and project the observed result of one runtime-owned operation.
+pub fn project_observed_public_operation(
+    operation: &crate::PublicOperation<ObservedIntegratedProjectedCallPathResult>,
+) -> Result<PublicCallPathResultDto, String> {
+    let result = operation
+        .value
+        .result
+        .as_ref()
+        .map_err(|error| error.message.clone())?;
+    project_internal_projection(&result.projection)
+}
+
+/// Project an internal result without exposing its raw root to an adapter.
+pub fn project_internal_projection(
+    projection: &InternalProjection,
+) -> Result<PublicCallPathResultDto, String> {
+    let root = match projection {
+        InternalProjection::Complete { root, .. }
+        | InternalProjection::BudgetExceeded { root, .. } => root.clone(),
+    };
+    project_public_verification_result(root)
+}
+
+/// Replace a complete public result with the runtime-owned typed budget result
+/// when a transport envelope duplicates or escapes the compact JSON.
+pub fn project_public_transport_budget_result(
+    complete: &PublicCallPathResultDto,
+    required_transport_size: usize,
+) -> Result<PublicCallPathResultDto, String> {
+    let object = complete
+        .as_value()
+        .as_object()
+        .ok_or_else(|| "public proof projection root must be an object".to_owned())?;
+    if object.get("kind") != Some(&json!("complete")) {
+        return Err("only a complete public call-path result can be budget-projected".to_owned());
+    }
+    let required = |name: &str| {
+        object
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("public call-path result is missing `{name}`"))
+    };
+    let contract_digest = required("contract_digest")?;
+    PublicCallPathResultDto::try_from_projected_value(json!({
+        "kind": "budget_exceeded",
+        "schema_version": required("schema_version")?,
+        "domain": PUBLIC_CALL_PATH_DOMAIN,
+        "translation_status": required("translation_status")?,
+        "graph_disposition": "unknown",
+        "runtime_execution_proven": false,
+        "guard_version": required("guard_version")?,
+        "source_text_sha256": required("source_text_sha256")?,
+        "contract_digest": contract_digest,
+        "core_publication": required("core_publication")?,
+        "provenance": { "availability": "unavailable" },
+        "disposition": {
+            "kind": "unknown",
+            "contract_digest": contract_digest,
+            "gaps": [{"kind":"output_budget_exceeded"}]
+        },
+        "cap_bytes": COMPACT_PROOF_MAX_BYTES,
+        "required_complete_size": required_transport_size
+    }))
+}
+
+fn apply_public_compact_budget(root: Value) -> Result<PublicCallPathResultDto, String> {
+    let serialized = serde_json::to_vec(&root)
+        .map_err(|error| format!("serialize public verification result: {error}"))?;
+    if serialized.len() <= COMPACT_PROOF_MAX_BYTES {
+        return PublicCallPathResultDto::try_from_projected_value(root);
+    }
+    let object = root
+        .as_object()
+        .ok_or_else(|| "proof projection root must be an object".to_owned())?;
+    let contract_digest = object.get("contract_digest").cloned().unwrap_or(json!(""));
+    let compact = json!({
+        "kind": "budget_exceeded",
+        "schema_version": object.get("schema_version").cloned().unwrap_or(json!(1)),
+        "domain": PUBLIC_CALL_PATH_DOMAIN,
+        "translation_status": object.get("translation_status").cloned().unwrap_or(json!(CONTRACT_INTERPRETATION)),
+        "graph_disposition": "unknown",
+        "runtime_execution_proven": false,
+        "guard_version": object.get("guard_version").cloned().unwrap_or(json!(codestory_contracts::call_path::CLAUSE_GUARD_VERSION)),
+        "source_text_sha256": object.get("source_text_sha256").cloned().unwrap_or(json!("")),
+        "contract_digest": contract_digest.clone(),
+        "core_publication": object.get("core_publication").cloned().unwrap_or(json!({})),
+        "provenance": { "availability": "unavailable" },
+        "disposition": {
+            "kind": "unknown",
+            "contract_digest": contract_digest,
+            "gaps": [{"kind": "output_budget_exceeded"}]
+        },
+        "cap_bytes": COMPACT_PROOF_MAX_BYTES,
+        "required_complete_size": serialized.len(),
+    });
+    let compact_bytes = serde_json::to_vec(&compact)
+        .map_err(|error| format!("serialize public verification budget envelope: {error}"))?;
+    if compact_bytes.len() > COMPACT_PROOF_MAX_BYTES {
+        return Err(format!(
+            "public verification result exceeds {COMPACT_PROOF_MAX_BYTES} bytes even after budget projection ({} bytes)",
+            compact_bytes.len()
+        ));
+    }
+    PublicCallPathResultDto::try_from_projected_value(compact)
+}
+
+fn rewrite_forbidden_public_absence(
+    public: &mut serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let Some(disposition) = public.get("disposition").cloned() else {
+        return Ok(());
+    };
+    let is_certified_absence = disposition.get("kind").and_then(Value::as_str)
+        == Some("contract_refuted")
+        && disposition
+            .pointer("/refutation/kind")
+            .and_then(Value::as_str)
+            == Some("certified_absence");
+    if !is_certified_absence {
+        return Ok(());
+    }
+    let contract_digest = disposition
+        .get("contract_digest")
+        .cloned()
+        .ok_or_else(|| "certified_absence refutation missing contract_digest".to_owned())?;
+    public.insert(
+        "disposition".to_owned(),
+        json!({
+            "kind": "unavailable",
+            "contract_digest": contract_digest,
+            "reasons": ["proof_facts_unavailable"]
+        }),
+    );
+    if let Some(steps) = public.get_mut("steps").and_then(Value::as_array_mut) {
+        for step in steps {
+            if step.get("status").and_then(Value::as_str) == Some("certified_absence") {
+                step["status"] = json!("unavailable");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn graph_disposition_from_disposition(disposition: &Value) -> &'static str {
+    match disposition.get("kind").and_then(Value::as_str) {
+        Some("contract_proven") => "proven",
+        Some("contract_refuted")
+            if disposition
+                .pointer("/refutation/kind")
+                .and_then(Value::as_str)
+                != Some("certified_absence") =>
+        {
+            "refuted"
+        }
+        _ => "unknown",
+    }
+}
+
+fn attach_proof_provenance_capability(public: &mut serde_json::Map<String, Value>) {
+    public
+        .entry("provenance".to_owned())
+        .or_insert_with(|| json!({ "availability": "unavailable" }));
+}
 
 /// Executes one proof through the runtime's existing core-only public
 /// operation. Callers cannot obtain the controller or add a second publication
 /// retry around this call.
 pub fn run_observed_call_path_public_operation(
     runtime: &crate::Runtime,
-    contract: &codestory_agent::proof_qualification_support::ValidatedCallPathContract,
-    hashes: &codestory_agent::proof_qualification_support::ProofHashes,
-    rendering: &codestory_agent::proof_qualification_support::ValidatedContractRendering,
+    contract: &ValidatedCallPathContract,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
     cancelled: Arc<AtomicBool>,
 ) -> Result<crate::PublicOperation<ObservedIntegratedProjectedCallPathResult>, ApiError> {
     runtime.controller.arm_proof_publication_validation();
@@ -66,10 +290,10 @@ pub fn run_observed_call_path_public_operation(
 /// publication without reading graph or retrieval state.
 pub fn run_translation_unknown_public_operation(
     runtime: &crate::Runtime,
-    spec: &codestory_agent::proof_qualification_support::CallPathSpec,
-    hashes: &codestory_agent::proof_qualification_support::ProofHashes,
-    rendering: &codestory_agent::proof_qualification_support::ValidatedContractRendering,
-    gaps: &[codestory_agent::proof_qualification_support::TranslationGap],
+    spec: &CallPathSpec,
+    hashes: &ProofHashes,
+    rendering: &ValidatedContractRendering,
+    gaps: &[TranslationGap],
     cancelled: Arc<AtomicBool>,
 ) -> Result<crate::PublicOperation<InternalProjection>, ApiError> {
     runtime
@@ -103,13 +327,13 @@ pub fn run_translation_unknown_public_operation(
 
 /// Identifies the request domain observed by proof qualification.
 pub fn proof_domain() -> &'static str {
-    codestory_agent::proof_qualification_support::proof_domain()
+    crate::call_path_kernel::PROOF_DOMAIN
 }
 
-/// The sealed CLI seam validates every compact numeric reference before a
-/// revision-native transport serializes it.
-pub fn validate_compact_projection(root: &serde_json::Value) -> Result<(), String> {
-    codestory_agent::proof_qualification_support::validate_compact_projection(root)
+/// Serialize a qualification artifact with the repository-pinned RFC 8785
+/// implementation without exposing that dependency to the benchmark crate.
+pub fn canonical_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    serde_json_canonicalizer::to_vec(value).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -123,9 +347,10 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use codestory_agent::proof_qualification_test_support::{
-        ClauseAnchor, ClauseClassification, ProofContractField, UnvalidatedCallPathContract,
-        UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector,
+    use super::{
+        ClauseAnchor, ClauseClassification, InternalProjection, ProofContractField, ProofHashes,
+        UnvalidatedCallPathContract, UnvalidatedCallPathSpec, UnvalidatedDirectCallStep,
+        UnvalidatedExactSymbolSelector, ValidatedCallPathContract, ValidatedContractRendering,
         ValidationOutcome, validate_contract,
     };
     use codestory_contracts::api::IndexMode;
@@ -159,9 +384,9 @@ mod tests {
         start: &str,
         target: &str,
     ) -> (
-        codestory_agent::proof_qualification_support::ValidatedCallPathContract,
-        codestory_agent::proof_qualification_support::ProofHashes,
-        codestory_agent::proof_qualification_support::ValidatedContractRendering,
+        ValidatedCallPathContract,
+        ProofHashes,
+        ValidatedContractRendering,
     ) {
         let source = "exact direct ordered call path";
         let outcome = validate_contract(UnvalidatedCallPathContract::new(
@@ -206,14 +431,8 @@ mod tests {
     ) -> &str {
         let result = operation.value.result.as_ref().expect("product result");
         let root = match &result.projection {
-            codestory_agent::proof_qualification_test_support::InternalProjection::Complete {
-                root,
-                ..
-            }
-            | codestory_agent::proof_qualification_test_support::InternalProjection::BudgetExceeded {
-                root,
-                ..
-            } => root,
+            InternalProjection::Complete { root, .. }
+            | InternalProjection::BudgetExceeded { root, .. } => root,
         };
         root["disposition"]["kind"]
             .as_str()
@@ -300,8 +519,8 @@ mod tests {
         assert_eq!(disposition_kind(&unknown_operation), "unknown");
         assert_eq!(
             full_proof_publication_validation_count(),
-            1,
-            "the real sealed facade must reuse its one validation receipt on the second call"
+            2,
+            "a sealed generation re-validates because no mutable WAL observer can fence reuse"
         );
         assert_eq!(retrieval_pin_calls.get(), 0);
         assert_eq!(

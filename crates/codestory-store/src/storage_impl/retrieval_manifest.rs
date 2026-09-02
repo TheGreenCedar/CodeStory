@@ -1,8 +1,72 @@
 use super::{Storage, StorageError};
-use rusqlite::Row;
+use rusqlite::{Connection, OpenFlags, Row};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+const RETRIEVAL_PUBLICATION_SCHEMA_VERSION: u32 = 1;
+const CREATE_RETRIEVAL_PUBLICATION_TABLE: &str =
+    "CREATE TABLE IF NOT EXISTS retrieval_index_manifest (
+    project_id TEXT PRIMARY KEY,
+    core_generation_id TEXT NOT NULL,
+    core_run_id TEXT NOT NULL,
+    lexical_version TEXT NOT NULL,
+    semantic_generation TEXT NOT NULL,
+    scip_revision TEXT,
+    built_at_epoch_ms INTEGER NOT NULL,
+    disk_bytes INTEGER,
+    degraded_modes_json TEXT NOT NULL DEFAULT '[]',
+    embedding_backend TEXT,
+    embedding_dim INTEGER,
+    sidecar_schema_version INTEGER,
+    sidecar_input_hash TEXT,
+    sidecar_generation TEXT,
+    projection_count INTEGER,
+    symbol_doc_count INTEGER,
+    dense_projection_count INTEGER,
+    semantic_policy_version TEXT,
+    graph_artifact_hash TEXT,
+    dense_reason_counts_json TEXT,
+    precise_semantic_import_status TEXT,
+    precise_semantic_import_reason TEXT,
+    precise_semantic_import_revision TEXT,
+    precise_semantic_import_producer TEXT,
+    rollback_record_json TEXT,
+    rollback_core_generation_id TEXT,
+    rollback_core_run_id TEXT
+)";
 
 const MANIFEST_SELECT: &str = "
+    SELECT
+        project_id,
+        lexical_version,
+        semantic_generation,
+        scip_revision,
+        built_at_epoch_ms,
+        disk_bytes,
+        degraded_modes_json,
+        embedding_backend,
+        embedding_dim,
+        sidecar_schema_version,
+        sidecar_input_hash,
+        sidecar_generation,
+        projection_count,
+        symbol_doc_count,
+        dense_projection_count,
+        semantic_policy_version,
+        graph_artifact_hash,
+        dense_reason_counts_json,
+        precise_semantic_import_status,
+        precise_semantic_import_reason,
+        precise_semantic_import_revision,
+        precise_semantic_import_producer,
+        rollback_record_json,
+        core_generation_id,
+        core_run_id,
+        rollback_core_generation_id,
+        rollback_core_run_id
+    FROM retrieval_index_manifest";
+
+const EMBEDDED_MANIFEST_SELECT: &str = "
     SELECT
         project_id,
         lexical_version,
@@ -79,7 +143,33 @@ pub struct RetrievalIndexRollbackRecord {
     pub verified_at_epoch_ms: i64,
 }
 
+/// Immutable core generation named by one retrieval publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalCoreGenerationBinding {
+    pub generation_id: String,
+    pub run_id: String,
+}
+
+/// Current retrieval manifest paired with the exact core generation it indexes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundRetrievalIndexManifest {
+    pub manifest: RetrievalIndexManifest,
+    pub core: RetrievalCoreGenerationBinding,
+}
+
 impl Storage {
+    fn with_retrieval_publication_connection<T>(
+        &self,
+        writable: bool,
+        operation: impl FnOnce(&Connection, bool) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let Some(path) = self.retrieval_publication_path.as_deref() else {
+            return operation(&self.conn, false);
+        };
+        let connection = open_external_retrieval_publication(path, writable)?;
+        operation(&connection, true)
+    }
+
     /// Insert or replace the retrieval manifest and clear any stale rollback.
     pub fn upsert_retrieval_index_manifest(
         &mut self,
@@ -102,7 +192,264 @@ impl Storage {
                 .map_err(|error| {
                     StorageError::Other(format!("Failed to serialize retrieval rollback: {error}"))
                 })?;
-        self.conn.execute(
+        let core_binding = self.get_complete_index_publication()?.map(|publication| {
+            RetrievalCoreGenerationBinding {
+                generation_id: publication.generation_id,
+                run_id: publication.run_id,
+            }
+        });
+        self.with_retrieval_publication_connection(true, |connection, external| {
+            if external {
+                let current_core = core_binding.as_ref().ok_or_else(|| {
+                    StorageError::Other(
+                        "Retrieval publication requires a complete core generation".into(),
+                    )
+                })?;
+                let rollback_core = rollback
+                    .map(|rollback| {
+                        read_bound_manifest_on(connection, &manifest.project_id)?
+                            .and_then(|bound| {
+                                (bound.manifest == rollback.manifest).then_some(bound.core)
+                            })
+                            .ok_or_else(|| {
+                                StorageError::Other(
+                                    "Retrieval rollback is not the currently bound publication"
+                                        .into(),
+                                )
+                            })
+                    })
+                    .transpose()?;
+                publish_external_retrieval_index_publication_on(
+                    connection,
+                    manifest,
+                    rollback_record_json.as_deref(),
+                    current_core,
+                    rollback_core.as_ref(),
+                )
+            } else {
+                publish_embedded_retrieval_index_publication_on(
+                    connection,
+                    manifest,
+                    rollback_record_json.as_deref(),
+                )
+            }
+        })?;
+        Ok(())
+    }
+
+    /// Load the authoritative current and rollback pointers from one SQLite row.
+    pub fn get_retrieval_index_publication(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
+    {
+        self.with_retrieval_publication_connection(false, |connection, external| {
+            let select = if external {
+                MANIFEST_SELECT
+            } else {
+                EMBEDDED_MANIFEST_SELECT
+            };
+            let mut stmt = connection.prepare(&format!("{select} WHERE project_id = ?1"))?;
+            let mut rows = stmt.query(rusqlite::params![project_id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            Ok(Some(publication_from_row(row)?))
+        })
+    }
+
+    /// Load the retrieval manifest for a project id, if one has been built.
+    pub fn get_retrieval_index_manifest(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<RetrievalIndexManifest>, StorageError> {
+        self.with_retrieval_publication_connection(false, |connection, external| {
+            let select = if external {
+                MANIFEST_SELECT
+            } else {
+                EMBEDDED_MANIFEST_SELECT
+            };
+            let mut stmt = connection.prepare(&format!("{select} WHERE project_id = ?1"))?;
+            let mut rows = stmt.query(rusqlite::params![project_id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            Ok(Some(manifest_from_row(row)?))
+        })
+    }
+
+    /// Load the current retrieval publication with its exact immutable core.
+    pub fn get_bound_retrieval_index_manifest(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<BoundRetrievalIndexManifest>, StorageError> {
+        self.with_retrieval_publication_connection(false, |connection, external| {
+            if external {
+                return read_bound_manifest_on(connection, project_id);
+            }
+            let mut statement =
+                connection.prepare(&format!("{EMBEDDED_MANIFEST_SELECT} WHERE project_id = ?1"))?;
+            let mut rows = statement.query(rusqlite::params![project_id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let manifest = manifest_from_row(row)?;
+            let publication = self.get_complete_index_publication()?;
+            Ok(Some(BoundRetrievalIndexManifest {
+                manifest,
+                core: RetrievalCoreGenerationBinding {
+                    generation_id: publication
+                        .as_ref()
+                        .map(|publication| publication.generation_id.clone())
+                        .unwrap_or_default(),
+                    run_id: publication
+                        .map(|publication| publication.run_id)
+                        .unwrap_or_default(),
+                },
+            }))
+        })
+    }
+
+    /// Load the sole current retrieval publication bound to an exact immutable
+    /// core generation, independent of the artifact-scope id selected by the
+    /// repository's current source state.
+    ///
+    /// A source mutation may deliberately select a new artifact scope while
+    /// the coherent predecessor remains published under the prior scope. The
+    /// core binding is the authority for that transition. Multiple current
+    /// rows for one core are refused because choosing between distinct
+    /// retrieval publications would be ambiguous.
+    pub fn get_retrieval_index_manifest_bound_to_core(
+        &self,
+        generation_id: &str,
+        run_id: &str,
+    ) -> Result<Option<BoundRetrievalIndexManifest>, StorageError> {
+        if generation_id.trim().is_empty() || run_id.trim().is_empty() {
+            return Err(StorageError::Other(
+                "Retrieval predecessor core binding is incomplete".into(),
+            ));
+        }
+        self.with_retrieval_publication_connection(false, |connection, external| {
+            if external {
+                return read_bound_manifest_for_core_on(connection, generation_id, run_id);
+            }
+            let Some(publication) = self.get_complete_index_publication()? else {
+                return Ok(None);
+            };
+            if publication.generation_id != generation_id || publication.run_id != run_id {
+                return Ok(None);
+            }
+            let mut statement = connection.prepare(EMBEDDED_MANIFEST_SELECT)?;
+            let mut rows = statement.query([])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            let manifest = manifest_from_row(row)?;
+            if rows.next()?.is_some() {
+                return Err(StorageError::Other(
+                    "Embedded retrieval predecessor binding is ambiguous".into(),
+                ));
+            }
+            Ok(Some(BoundRetrievalIndexManifest {
+                manifest,
+                core: RetrievalCoreGenerationBinding {
+                    generation_id: generation_id.to_string(),
+                    run_id: run_id.to_string(),
+                },
+            }))
+        })
+    }
+
+    /// Return every authoritative current and rollback pointer pair.
+    pub fn list_retrieval_index_publications(
+        &self,
+    ) -> Result<Vec<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
+    {
+        self.with_retrieval_publication_connection(false, |connection, external| {
+            let select = if external {
+                MANIFEST_SELECT
+            } else {
+                EMBEDDED_MANIFEST_SELECT
+            };
+            let mut stmt = connection.prepare(select)?;
+            let rows = stmt.query_map([], publication_from_row)?;
+            let mut publications = Vec::new();
+            for row in rows {
+                publications.push(row?);
+            }
+            Ok(publications)
+        })
+    }
+
+    /// Return every current retrieval manifest in this store.
+    ///
+    /// Retention scans use the complete set so a shared sidecar root never
+    /// removes a generation still referenced by another project row.
+    pub fn list_retrieval_index_manifests(
+        &self,
+    ) -> Result<Vec<RetrievalIndexManifest>, StorageError> {
+        self.with_retrieval_publication_connection(false, |connection, external| {
+            let select = if external {
+                MANIFEST_SELECT
+            } else {
+                EMBEDDED_MANIFEST_SELECT
+            };
+            let mut stmt = connection.prepare(select)?;
+            let rows = stmt.query_map([], manifest_from_row)?;
+            let mut manifests = Vec::new();
+            for row in rows {
+                manifests.push(row?);
+            }
+            Ok(manifests)
+        })
+    }
+
+    /// Return Semantic collection names referenced by stored retrieval manifests.
+    pub fn list_retrieval_semantic_generations(&self) -> Result<Vec<String>, StorageError> {
+        let mut collections = Vec::new();
+        for (current, rollback) in self.list_retrieval_index_publications()? {
+            collections.push(current.semantic_generation);
+            if let Some(rollback) = rollback {
+                collections.push(rollback.manifest.semantic_generation);
+            }
+        }
+        collections.sort();
+        collections.dedup();
+        Ok(collections)
+    }
+
+    pub fn clear_retrieval_index_manifests(&mut self) -> Result<usize, StorageError> {
+        self.with_retrieval_publication_connection(true, |connection, _external| {
+            Ok(connection.execute("DELETE FROM retrieval_index_manifest", [])?)
+        })
+    }
+
+    /// Latest manifest `built_at_epoch_ms` per Semantic collection (for retention ranking).
+    pub fn list_retrieval_semantic_generations_with_recency(
+        &self,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let mut collections = Vec::new();
+        for (current, rollback) in self.list_retrieval_index_publications()? {
+            collections.push((current.semantic_generation, current.built_at_epoch_ms));
+            if let Some(rollback) = rollback {
+                collections.push((
+                    rollback.manifest.semantic_generation,
+                    rollback.manifest.built_at_epoch_ms,
+                ));
+            }
+        }
+        collections.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
+        collections.dedup_by(|left, right| left.0 == right.0);
+        Ok(collections)
+    }
+}
+
+fn publish_embedded_retrieval_index_publication_on(
+    connection: &Connection,
+    manifest: &RetrievalIndexManifest,
+    rollback_record_json: Option<&str>,
+) -> Result<(), StorageError> {
+    connection.execute(
             "INSERT INTO retrieval_index_manifest (
                 project_id,
                 lexical_version,
@@ -177,109 +524,262 @@ impl Storage {
                 rollback_record_json,
             ],
         )?;
-        Ok(())
-    }
+    Ok(())
+}
 
-    /// Load the authoritative current and rollback pointers from one SQLite row.
-    pub fn get_retrieval_index_publication(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
-    {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{MANIFEST_SELECT} WHERE project_id = ?1"))?;
-        let mut rows = stmt.query(rusqlite::params![project_id])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        Ok(Some(publication_from_row(row)?))
+fn publish_external_retrieval_index_publication_on(
+    connection: &Connection,
+    manifest: &RetrievalIndexManifest,
+    rollback_record_json: Option<&str>,
+    core: &RetrievalCoreGenerationBinding,
+    rollback_core: Option<&RetrievalCoreGenerationBinding>,
+) -> Result<(), StorageError> {
+    if core.generation_id.trim().is_empty() || core.run_id.trim().is_empty() {
+        return Err(StorageError::Other(
+            "Retrieval publication core binding is incomplete".into(),
+        ));
     }
-
-    /// Load the retrieval manifest for a project id, if one has been built.
-    pub fn get_retrieval_index_manifest(
-        &self,
-        project_id: &str,
-    ) -> Result<Option<RetrievalIndexManifest>, StorageError> {
-        let mut stmt = self
-            .conn
-            .prepare(&format!("{MANIFEST_SELECT} WHERE project_id = ?1"))?;
-        let mut rows = stmt.query(rusqlite::params![project_id])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        Ok(Some(manifest_from_row(row)?))
+    if rollback_record_json.is_some() != rollback_core.is_some() {
+        return Err(StorageError::Other(
+            "Retrieval rollback record and core binding must be published together".into(),
+        ));
     }
+    connection.execute(
+        "INSERT INTO retrieval_index_manifest (
+            project_id,
+            core_generation_id,
+            core_run_id,
+            lexical_version,
+            semantic_generation,
+            scip_revision,
+            built_at_epoch_ms,
+            disk_bytes,
+            degraded_modes_json,
+            embedding_backend,
+            embedding_dim,
+            sidecar_schema_version,
+            sidecar_input_hash,
+            sidecar_generation,
+            projection_count,
+            symbol_doc_count,
+            dense_projection_count,
+            semantic_policy_version,
+            graph_artifact_hash,
+            dense_reason_counts_json,
+            precise_semantic_import_status,
+            precise_semantic_import_reason,
+            precise_semantic_import_revision,
+            precise_semantic_import_producer,
+            rollback_record_json,
+            rollback_core_generation_id,
+            rollback_core_run_id
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
+        )
+        ON CONFLICT(project_id) DO UPDATE SET
+            core_generation_id = excluded.core_generation_id,
+            core_run_id = excluded.core_run_id,
+            lexical_version = excluded.lexical_version,
+            semantic_generation = excluded.semantic_generation,
+            scip_revision = excluded.scip_revision,
+            built_at_epoch_ms = excluded.built_at_epoch_ms,
+            disk_bytes = excluded.disk_bytes,
+            degraded_modes_json = excluded.degraded_modes_json,
+            embedding_backend = excluded.embedding_backend,
+            embedding_dim = excluded.embedding_dim,
+            sidecar_schema_version = excluded.sidecar_schema_version,
+            sidecar_input_hash = excluded.sidecar_input_hash,
+            sidecar_generation = excluded.sidecar_generation,
+            projection_count = excluded.projection_count,
+            symbol_doc_count = excluded.symbol_doc_count,
+            dense_projection_count = excluded.dense_projection_count,
+            semantic_policy_version = excluded.semantic_policy_version,
+            graph_artifact_hash = excluded.graph_artifact_hash,
+            dense_reason_counts_json = excluded.dense_reason_counts_json,
+            precise_semantic_import_status = excluded.precise_semantic_import_status,
+            precise_semantic_import_reason = excluded.precise_semantic_import_reason,
+            precise_semantic_import_revision = excluded.precise_semantic_import_revision,
+            precise_semantic_import_producer = excluded.precise_semantic_import_producer,
+            rollback_record_json = excluded.rollback_record_json,
+            rollback_core_generation_id = excluded.rollback_core_generation_id,
+            rollback_core_run_id = excluded.rollback_core_run_id",
+        rusqlite::params![
+            manifest.project_id,
+            core.generation_id,
+            core.run_id,
+            manifest.lexical_version,
+            manifest.semantic_generation,
+            manifest.scip_revision,
+            manifest.built_at_epoch_ms,
+            manifest.disk_bytes,
+            manifest.degraded_modes_json,
+            manifest.embedding_backend,
+            manifest.embedding_dim,
+            manifest.sidecar_schema_version,
+            manifest.sidecar_input_hash,
+            manifest.sidecar_generation,
+            manifest.projection_count,
+            manifest.symbol_doc_count,
+            manifest.dense_projection_count,
+            manifest.semantic_policy_version,
+            manifest.graph_artifact_hash,
+            manifest.dense_reason_counts_json,
+            manifest.precise_semantic_import_status,
+            manifest.precise_semantic_import_reason,
+            manifest.precise_semantic_import_revision,
+            manifest.precise_semantic_import_producer,
+            rollback_record_json,
+            rollback_core.map(|binding| binding.generation_id.as_str()),
+            rollback_core.map(|binding| binding.run_id.as_str()),
+        ],
+    )?;
+    Ok(())
+}
 
-    /// Return every authoritative current and rollback pointer pair.
-    pub fn list_retrieval_index_publications(
-        &self,
-    ) -> Result<Vec<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError>
-    {
-        let mut stmt = self.conn.prepare(MANIFEST_SELECT)?;
-        let rows = stmt.query_map([], publication_from_row)?;
-        let mut publications = Vec::new();
-        for row in rows {
-            publications.push(row?);
+fn open_external_retrieval_publication(
+    path: &Path,
+    writable: bool,
+) -> Result<Connection, StorageError> {
+    if writable {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                StorageError::Other(format!(
+                    "Failed to create retrieval publication directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
         }
-        Ok(publications)
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_millis(2_500))?;
+        connection.pragma_update(None, "journal_mode", "DELETE")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.execute(CREATE_RETRIEVAL_PUBLICATION_TABLE, [])?;
+        connection.pragma_update(None, "user_version", RETRIEVAL_PUBLICATION_SCHEMA_VERSION)?;
+        return Ok(connection);
     }
 
-    /// Return every current retrieval manifest in this store.
-    ///
-    /// Retention scans use the complete set so a shared sidecar root never
-    /// removes a generation still referenced by another project row.
-    pub fn list_retrieval_index_manifests(
-        &self,
-    ) -> Result<Vec<RetrievalIndexManifest>, StorageError> {
-        let mut stmt = self.conn.prepare(MANIFEST_SELECT)?;
-        let rows = stmt.query_map([], manifest_from_row)?;
-        let mut manifests = Vec::new();
-        for row in rows {
-            manifests.push(row?);
-        }
-        Ok(manifests)
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        StorageError::Other(format!(
+            "Retrieval publication pointer is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(StorageError::Other(format!(
+            "Retrieval publication pointer is not a regular file: {}",
+            path.display()
+        )));
     }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_millis(2_500))?;
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?
+        .max(0) as u32;
+    if version != RETRIEVAL_PUBLICATION_SCHEMA_VERSION {
+        return Err(StorageError::Other(format!(
+            "Retrieval publication pointer has schema {version}, expected {RETRIEVAL_PUBLICATION_SCHEMA_VERSION}"
+        )));
+    }
+    Ok(connection)
+}
 
-    /// Return Semantic collection names referenced by stored retrieval manifests.
-    pub fn list_retrieval_semantic_generations(&self) -> Result<Vec<String>, StorageError> {
-        let mut collections = Vec::new();
-        for (current, rollback) in self.list_retrieval_index_publications()? {
-            collections.push(current.semantic_generation);
-            if let Some(rollback) = rollback {
-                collections.push(rollback.manifest.semantic_generation);
-            }
-        }
-        collections.sort();
-        collections.dedup();
-        Ok(collections)
+pub(super) fn initialize_external_retrieval_publication(
+    path: &Path,
+    publications: &[(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)],
+    core: &RetrievalCoreGenerationBinding,
+) -> Result<(), StorageError> {
+    let mut connection = open_external_retrieval_publication(path, true)?;
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM retrieval_index_manifest", [])?;
+    for (manifest, _legacy_rollback) in publications {
+        // The fixed-path store can authenticate only its current core bytes.
+        // A legacy retrieval rollback may have indexed an older core image
+        // which is no longer present, so migration deliberately drops it.
+        publish_external_retrieval_index_publication_on(&transaction, manifest, None, core, None)?;
     }
+    transaction.commit()?;
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    Ok(())
+}
 
-    pub fn clear_retrieval_index_manifests(&mut self) -> Result<usize, StorageError> {
-        let removed = self
-            .conn
-            .execute("DELETE FROM retrieval_index_manifest", [])?;
-        Ok(removed)
+pub(super) fn read_embedded_retrieval_publications(
+    path: &Path,
+) -> Result<Vec<(RetrievalIndexManifest, Option<RetrievalIndexRollbackRecord>)>, StorageError> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(std::time::Duration::from_millis(2_500))?;
+    let table_exists: i64 = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'retrieval_index_manifest'
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(Vec::new());
     }
+    let mut statement = connection.prepare(EMBEDDED_MANIFEST_SELECT)?;
+    let rows = statement.query_map([], publication_from_row)?;
+    let mut publications = Vec::new();
+    for row in rows {
+        publications.push(row?);
+    }
+    Ok(publications)
+}
 
-    /// Latest manifest `built_at_epoch_ms` per Semantic collection (for retention ranking).
-    pub fn list_retrieval_semantic_generations_with_recency(
-        &self,
-    ) -> Result<Vec<(String, i64)>, StorageError> {
-        let mut collections = Vec::new();
-        for (current, rollback) in self.list_retrieval_index_publications()? {
-            collections.push((current.semantic_generation, current.built_at_epoch_ms));
-            if let Some(rollback) = rollback {
-                collections.push((
-                    rollback.manifest.semantic_generation,
-                    rollback.manifest.built_at_epoch_ms,
-                ));
-            }
-        }
-        collections.sort_by(|left, right| left.0.cmp(&right.0).then(right.1.cmp(&left.1)));
-        collections.dedup_by(|left, right| left.0 == right.0);
-        Ok(collections)
+fn read_bound_manifest_on(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Option<BoundRetrievalIndexManifest>, StorageError> {
+    let mut statement = connection.prepare(&format!("{MANIFEST_SELECT} WHERE project_id = ?1"))?;
+    let mut rows = statement.query(rusqlite::params![project_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let manifest = manifest_from_row(row)?;
+    let generation_id = row.get::<_, String>(23)?;
+    let run_id = row.get::<_, String>(24)?;
+    if generation_id.trim().is_empty() || run_id.trim().is_empty() {
+        return Err(StorageError::Other(
+            "Retrieval publication has an incomplete core generation binding".into(),
+        ));
     }
+    Ok(Some(BoundRetrievalIndexManifest {
+        manifest,
+        core: RetrievalCoreGenerationBinding {
+            generation_id,
+            run_id,
+        },
+    }))
+}
+
+fn read_bound_manifest_for_core_on(
+    connection: &Connection,
+    generation_id: &str,
+    run_id: &str,
+) -> Result<Option<BoundRetrievalIndexManifest>, StorageError> {
+    let mut statement = connection.prepare(&format!(
+        "{MANIFEST_SELECT} WHERE core_generation_id = ?1 AND core_run_id = ?2 \
+         ORDER BY built_at_epoch_ms DESC, project_id"
+    ))?;
+    let mut rows = statement.query(rusqlite::params![generation_id, run_id])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    let manifest = manifest_from_row(row)?;
+    if rows.next()?.is_some() {
+        return Err(StorageError::Other(format!(
+            "Retrieval predecessor binding is ambiguous for core {generation_id}:{run_id}"
+        )));
+    }
+    Ok(Some(BoundRetrievalIndexManifest {
+        manifest,
+        core: RetrievalCoreGenerationBinding {
+            generation_id: generation_id.to_string(),
+            run_id: run_id.to_string(),
+        },
+    }))
 }
 
 fn manifest_from_row(row: &Row<'_>) -> rusqlite::Result<RetrievalIndexManifest> {

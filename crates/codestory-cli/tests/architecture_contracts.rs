@@ -365,6 +365,7 @@ fn ordinary_cli_retrieval_operations_route_through_runtime() {
         "codestory_retrieval::observe_retained_rollback_generation(",
         "codestory_retrieval::sidecar_inventory_with_storage(",
         "codestory_retrieval::sidecar_gc_apply_with_storage(",
+        "codestory_retrieval::cache_inventory(",
         "codestory_retrieval::execute_retrieval_query_with_cache_for_runtime(",
         "codestory_retrieval::finalize_index_for_runtime_with_cancel(",
     ];
@@ -592,28 +593,17 @@ fn indexer_crate_stays_decoupled_from_runtime_and_cli() {
 /// `agent_module_allowlist_stays_in_sync_with_the_agent_source_tree` enforces
 /// that, so adding a module to the crate without extending this list fails
 /// loudly instead of silently escaping every contract built on it.
-const AGENT_PLANNING_MODULES: [&str; 28] = [
+const AGENT_PLANNING_MODULES: [&str; 17] = [
     "citation.rs",
     "packet_citations.rs",
-    "packet_claim_profile_registry.rs",
-    "packet_claim_profiles.rs",
-    "packet_claims.rs",
     "packet_command.rs",
     "packet_coverage.rs",
     "packet_degradation.rs",
     "packet_evidence.rs",
-    "packet_evidence_carriers.rs",
-    "packet_evidence_roles.rs",
     "packet_execution_graphs.rs",
-    "packet_execution_plan_v3.rs",
-    "packet_flow_requirements.rs",
     "packet_freshness.rs",
-    "packet_obligations.rs",
     "packet_plan.rs",
     "packet_probes.rs",
-    "packet_profile_telemetry.rs",
-    "packet_proof_atoms.rs",
-    "packet_required_probes.rs",
     "packet_scoring.rs",
     "packet_terms.rs",
     "pinned_reader.rs",
@@ -633,22 +623,32 @@ const AGENT_PLANNING_MODULES: [&str; 28] = [
 ///   `agent_eval_hooks_stay_on_for_runtime_tests_and_off_for_product_builds`
 ///   pins how it compiles. Listing it as a planning module would hand the
 ///   import-DAG guard a file no product build links.
-/// - `indexed_source_call_path_v1.rs` is the private v3 proof kernel. Public
-///   callers reach it only through the sealed exact-verifier facades.
-const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 3] =
-    ["lib.rs", "eval_probes.rs", "indexed_source_call_path_v1.rs"];
+const AGENT_MODULE_ALLOWLIST_EXCLUSIONS: [&str; 2] = ["lib.rs", "eval_probes.rs"];
 
 #[test]
-fn packet_execution_plan_v3_is_the_public_evidence_planning_boundary() {
+fn horizon_a_exposes_only_prompt_blind_seed_planning_and_admission() {
     let agent_lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
-        agent_lib.contains("pub mod packet_execution_plan_v3;"),
-        "the v3 evidence planner must compile in the public product graph"
+        !agent_lib.contains("pub mod evidence_compiler;"),
+        "the Horizon B compiler must not enter the Horizon A product graph"
     );
-    assert!(
-        AGENT_PLANNING_MODULES.contains(&"packet_execution_plan_v3.rs"),
-        "the v3 evidence planner must count as a production planning module"
-    );
+    let contracts = read("crates/codestory-contracts/src/compilation.rs");
+    for required in [
+        "PacketCandidateDescriptorV1",
+        "PacketAdmissionReceiptV1",
+        "PacketContinuationSelectorV1",
+    ] {
+        assert!(
+            contracts.contains(required),
+            "the typed Horizon A admission boundary lost {required}"
+        );
+    }
+    for deferred in ["RetrievalSeedPlanV1", "PacketCompilationInputV1"] {
+        assert!(
+            !contracts.contains(deferred),
+            "Horizon B contract {deferred} entered Horizon A"
+        );
+    }
     let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
     let packet_request = source_between(
         &current_dto,
@@ -656,6 +656,7 @@ fn packet_execution_plan_v3_is_the_public_evidence_planning_boundary() {
         "pub struct PacketBudgetLimitsDto",
     );
     assert!(!packet_request.contains("include_evidence"));
+    assert!(!packet_request.contains("task_class"));
 }
 
 #[test]
@@ -679,162 +680,6 @@ fn packet_v3_record_projection_and_public_facade_are_product_wired() {
             "{surface} must project through the public evidence-only v3 facade"
         );
     }
-}
-
-#[allow(dead_code)]
-fn legacy_dark_packet_v3_preparation_stays_inert_and_unshipped() {
-    let runtime_agent_modules = read("crates/codestory-runtime/src/agent/mod.rs");
-    assert!(
-        runtime_agent_modules.contains(
-            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\npub(crate) mod packet_execution_record_v3;"
-        ),
-        "the runtime-owned v3 record must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
-    );
-    assert!(
-        runtime_agent_modules.contains(
-            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"v3-evidence-separation-support\"\n))]\npub(crate) mod packet_projection_v3;"
-        ),
-        "the runtime-owned v3 projector must remain sealed behind test/Q1 evidence support until the atomic v3 cut"
-    );
-
-    let record_path = "crates/codestory-runtime/src/agent/packet_execution_record_v3.rs";
-    let record = production_source(&read(record_path));
-    assert_eq!(
-        record.matches(".active_publication()").count(),
-        1,
-        "the record builder must capture the already-active publication exactly once"
-    );
-    for forbidden in [
-        "AgentPacketDto",
-        "enforce_packet_output_budget",
-        "serde_json::Value",
-        "ToolSpec",
-        "run_with_cancel",
-        "with_pinned_retrieval",
-        "retrieval_primary",
-        "DiagnosticsCapabilityV3Dto",
-        "SystemTime",
-        "Instant",
-        "include_evidence",
-        "operation_id",
-        "published_at_epoch_ms",
-        "capability_uri",
-        "session_secret",
-        "ClaimDisposition",
-        "evaluate_execution_plan_v3",
-        "Supported",
-    ] {
-        assert!(
-            !record.contains(forbidden),
-            "the dark record source crosses a forbidden execution/serialization boundary via {forbidden}"
-        );
-    }
-
-    let projector_path = "crates/codestory-runtime/src/agent/packet_projection_v3.rs";
-    let projector = production_source(&read(projector_path));
-    for forbidden in [
-        "AgentPacketDto",
-        "AgentAnswerDto",
-        "SearchResultsDto",
-        "ToolSpec",
-        "run_with_cancel",
-        ".active_publication()",
-        "with_pinned_retrieval",
-        "retrieval_primary",
-        "include_evidence",
-        "operation_id",
-        "published_at_epoch_ms",
-        "capability_uri",
-        "session_secret",
-        "Hmac",
-        "SystemTime",
-        "Instant",
-        ".question()",
-        "source_text",
-        "ClaimDisposition",
-        "CompleteQueryNegative",
-        "Supported",
-        "Proven",
-        "eligible_for_sufficiency",
-    ] {
-        assert!(
-            !projector.contains(forbidden),
-            "the dark projector source crosses a forbidden execution/authority boundary via {forbidden}"
-        );
-    }
-
-    let surfaces = [
-        (
-            "runtime source outside the gated record/projector and their module declarations",
-            read_source_tree_excluding_many(
-                "crates/codestory-runtime/src",
-                &[
-                    "agent/packet_execution_record_v3.rs",
-                    "agent/packet_projection_v3.rs",
-                    "v3_evidence_qualification_support.rs",
-                ],
-            )
-            .replace("pub(crate) mod packet_execution_record_v3;", "")
-            .replace("pub(crate) mod packet_projection_v3;", ""),
-        ),
-        ("CLI source", read_source_tree("crates/codestory-cli/src")),
-        (
-            "current public API DTO source",
-            format!(
-                "{}\n{}",
-                read("crates/codestory-contracts/src/api.rs"),
-                read_source_tree("crates/codestory-contracts/src/api")
-            ),
-        ),
-        (
-            "current wire source",
-            read("crates/codestory-contracts/src/wire.rs"),
-        ),
-        (
-            "generated MCP catalog",
-            read("plugins/codestory/generated-mcp-catalog.json"),
-        ),
-        (
-            "generated grounding syntax",
-            read("plugins/codestory/skills/codestory-grounding/references/generated-mcp-syntax.md"),
-        ),
-        (
-            "plugin launcher",
-            format!(
-                "{}\n{}",
-                read("plugins/codestory/scripts/codestory-mcp.cjs"),
-                read("plugins/codestory/hooks/codestory-runtime.cjs")
-            ),
-        ),
-    ];
-    for (surface, source) in surfaces {
-        for forbidden in [
-            "PacketExecutionRecordV3",
-            "PacketRequestFingerprintV3",
-            "build_packet_execution_record_v3",
-            "packet_projection_v3",
-            "build_packet_projection_v3",
-            "build_context_projection_v3",
-            "build_search_projection_v3",
-            "build_diagnostic_artifact_v3",
-            "DiagnosticArtifactBuildV3",
-        ] {
-            assert!(
-                !source.contains(forbidden),
-                "{surface} references dark Task-3B vocabulary via {forbidden}"
-            );
-        }
-    }
-
-    let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
-    assert!(
-        current_dto.contains("pub include_evidence: bool"),
-        "current packet include_evidence must remain present throughout PR 3"
-    );
-    assert!(
-        current_dto.contains("pub const PACKET_OBLIGATION_PLAN_VERSION: u32 = 1;"),
-        "the current packet obligation plan must remain version 1 throughout PR 3"
-    );
 }
 
 #[test]
@@ -881,7 +726,8 @@ fn public_exact_verifier_uses_the_revision_native_transport_once() {
 
     let args = read("crates/codestory-cli/src/args.rs");
     assert_eq!(
-        args.matches("ProveCallPath(ProveCallPathCommand)").count(),
+        args.matches("VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand)")
+            .count(),
         1,
         "the public CLI verifier command must be registered exactly once"
     );
@@ -931,24 +777,31 @@ fn public_exact_verifier_uses_the_revision_native_transport_once() {
 #[test]
 fn public_exact_verifier_compiles_through_the_sealed_proof_facades() {
     const SUPPORT_FEATURE: &str = "proof-qualification-support";
-    for manifest_path in [
-        "crates/codestory-agent/Cargo.toml",
-        "crates/codestory-runtime/Cargo.toml",
-    ] {
-        let crate_manifest = manifest(manifest_path);
-        let features = crate_manifest
-            .get("features")
-            .and_then(Value::as_table)
-            .expect("exact verifier features");
-        assert!(
-            features
-                .get("default")
-                .is_some_and(|default| default.to_string().contains(SUPPORT_FEATURE)),
-            "{manifest_path} must compile the sealed proof facade for the public verifier"
-        );
-    }
+    let agent_manifest = manifest("crates/codestory-agent/Cargo.toml");
+    let agent_features = agent_manifest
+        .get("features")
+        .and_then(Value::as_table)
+        .expect("agent features");
+    assert!(
+        !agent_features
+            .get("default")
+            .is_some_and(|default| default.to_string().contains(SUPPORT_FEATURE)),
+        "the proof kernel must not compile in the default agent crate"
+    );
+    let runtime_manifest = manifest("crates/codestory-runtime/Cargo.toml");
+    let runtime_features = runtime_manifest
+        .get("features")
+        .and_then(Value::as_table)
+        .expect("runtime features");
+    assert!(
+        runtime_features
+            .get("default")
+            .is_some_and(|default| default.to_string().contains(SUPPORT_FEATURE)),
+        "crates/codestory-runtime/Cargo.toml must compile the sealed proof facade for the public verifier"
+    );
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(runtime_lib.contains("pub mod proof_qualification_support;"));
+    assert!(runtime_lib.contains("mod call_path_kernel;"));
     let cli = read_source_tree("crates/codestory-cli/src");
     assert!(cli.contains("run_observed_call_path_public_operation"));
     assert!(cli.contains("run_translation_unknown_public_operation"));
@@ -1008,12 +861,13 @@ process.stdout.write(JSON.stringify(
 
 #[test]
 fn proof_qualification_facades_seal_the_kernel_and_preserve_transport_errors() {
-    let agent_lib = read("crates/codestory-agent/src/lib.rs");
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(
-        agent_lib.contains("mod indexed_source_call_path_v1;")
-            && !agent_lib.contains("pub mod indexed_source_call_path_v1;"),
-        "proof qualification must not make the dark agent kernel directly reachable"
+        runtime_lib.contains("mod call_path_kernel;")
+            && !runtime_lib.contains("pub mod call_path_kernel;"),
+        "proof qualification must not make the dark runtime kernel directly reachable"
     );
+    let facade = read("crates/codestory-runtime/src/proof_qualification_support.rs");
     for required in [
         "AdmittedRawCallEdge",
         "BuiltCallPathFacts",
@@ -1022,8 +876,8 @@ fn proof_qualification_facades_seal_the_kernel_and_preserve_transport_errors() {
         "project_internal_call_path_result",
     ] {
         assert!(
-            agent_lib.contains(required),
-            "the sealed agent facade must name the runtime-required {required} API explicitly"
+            facade.contains(required),
+            "the sealed runtime facade must name the required {required} API explicitly"
         );
     }
 
@@ -1054,38 +908,35 @@ fn runtime_test_support_never_reaches_the_private_agent_kernel() {
     for surface in [
         "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
         "crates/codestory-runtime/src/services.rs",
+        "crates/codestory-runtime/src/proof_qualification_support.rs",
     ] {
         let source = read(surface);
         assert!(
-            !source.contains("codestory_agent::indexed_source_call_path_v1"),
-            "{surface} reaches the private agent kernel instead of its explicit test-support facade"
+            !source.contains("codestory_agent::indexed_source_call_path_v1")
+                && !source.contains("codestory_agent::proof_qualification"),
+            "{surface} reaches the removed agent proof kernel"
         );
     }
     let agent_lib = read("crates/codestory-agent/src/lib.rs");
     assert!(
-        agent_lib.contains(
-            "#[cfg(any(test, feature = \"test-support\"))]\n#[doc(hidden)]\npub mod proof_qualification_test_support"
-        ),
-        "runtime tests need an explicit test-support-only facade rather than kernel access"
+        !agent_lib.contains("mod indexed_source_call_path_v1;")
+            && !agent_lib.contains("proof_qualification_support"),
+        "the default agent crate must not host the proof kernel"
     );
 }
 
 #[test]
 fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
-    let lib = read("crates/codestory-agent/src/lib.rs");
+    let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
     assert!(
-        lib.contains(
-            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\n#[doc(hidden)]\nmod indexed_source_call_path_v1;"
+        runtime_lib.contains(
+            "#[cfg(any(\n    test,\n    feature = \"test-support\",\n    feature = \"proof-qualification-support\"\n))]\nmod call_path_kernel;"
         ),
         "the dark call-path kernel must remain private behind test or sealed qualification support"
     );
     assert!(
-        !lib.contains("pub mod indexed_source_call_path_v1;"),
+        !runtime_lib.contains("pub mod call_path_kernel;"),
         "the dark call-path kernel must never become a qualification-visible module"
-    );
-    assert!(
-        AGENT_MODULE_ALLOWLIST_EXCLUSIONS.contains(&"indexed_source_call_path_v1.rs"),
-        "the dark proof kernel must not be counted as a production packet-planning module"
     );
 
     let runtime_lib = read("crates/codestory-runtime/src/lib.rs");
@@ -1117,14 +968,47 @@ fn dark_call_path_kernel_stays_on_the_test_support_side_of_the_crate_root() {
 }
 
 #[test]
-fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
-    let module = production_source(&read(
-        "crates/codestory-agent/src/indexed_source_call_path_v1.rs",
-    ));
-    let mut outside_allowed_regions = module.clone();
+fn call_path_shared_types_live_in_contracts() {
+    let contracts = read("crates/codestory-contracts/src/call_path.rs");
     for item in [
         "pub struct UnvalidatedCallPathContract",
-        "impl UnvalidatedCallPathContract",
+        "pub struct ClauseAnchor",
+        "pub enum ClauseClassification",
+        "pub enum ProofContractField",
+        "pub struct UnvalidatedCallPathSpec",
+        "pub struct ValidatedCallPathContract",
+        "pub struct ProofHashes",
+        "pub enum InternalProjection",
+    ] {
+        assert!(
+            contracts.contains(item),
+            "call-path shared type {item} must live in codestory-contracts"
+        );
+    }
+
+    let kernel = read("crates/codestory-runtime/src/call_path_kernel.rs");
+    assert!(
+        kernel.contains("pub use codestory_contracts::call_path::{"),
+        "the kernel must re-export shared call-path types from contracts"
+    );
+    for item in [
+        "pub struct UnvalidatedCallPathContract",
+        "pub struct ValidatedCallPathContract",
+        "pub struct ProofHashes",
+        "pub enum InternalProjection",
+    ] {
+        assert!(
+            !kernel.contains(item),
+            "shared call-path type {item} must not be redefined in runtime"
+        );
+    }
+}
+
+#[test]
+fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
+    let module = production_source(&read("crates/codestory-runtime/src/call_path_kernel.rs"));
+    let mut outside_allowed_regions = module.clone();
+    for item in [
         "fn validate_contract_with_domain",
         "fn validate_and_normalize_clauses",
         "fn classify_translation_gaps",
@@ -1141,7 +1025,7 @@ fn dark_call_path_raw_source_text_stays_out_of_the_proof_boundary() {
 #[test]
 fn exact_resolution_facts_are_a_one_way_proof_overlay() {
     for proof_module in [
-        "crates/codestory-agent/src/indexed_source_call_path_v1.rs",
+        "crates/codestory-runtime/src/call_path_kernel.rs",
         "crates/codestory-runtime/src/indexed_source_call_path_v1.rs",
     ] {
         let source = read(proof_module);
@@ -1156,14 +1040,13 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
     for (consumer, source) in [
         (
             "retrieval",
-            read_source_tree("crates/codestory-retrieval/src"),
+            // Fixture helpers rebind inherited store overlays when replacing a
+            // core; that is not a product retrieval consumer of proof facts.
+            read_source_tree_excluding_many("crates/codestory-retrieval/src", &["test_support.rs"]),
         ),
         (
             "packet planner",
-            read_source_tree("crates/codestory-agent/src").replace(
-                &read("crates/codestory-agent/src/indexed_source_call_path_v1.rs"),
-                "",
-            ),
+            read_source_tree("crates/codestory-agent/src"),
         ),
         (
             "search",
@@ -1186,6 +1069,7 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
                     "index_full.rs",
                     "index_incremental.rs",
                     "indexed_source_call_path_v1.rs",
+                    "call_path_kernel.rs",
                     "proof_qualification_support.rs",
                     "semantic_republish.rs",
                     "tests.rs",
@@ -1245,7 +1129,8 @@ fn exact_resolution_facts_are_a_one_way_proof_overlay() {
 fn public_call_path_release_surfaces_are_unique_and_legacy_unreachable() {
     let args = read("crates/codestory-cli/src/args.rs");
     assert_eq!(
-        args.matches("ProveCallPath(ProveCallPathCommand)").count(),
+        args.matches("VerifyIndexedDirectCalls(VerifyIndexedDirectCallsCommand)")
+            .count(),
         1
     );
 
@@ -1261,9 +1146,10 @@ fn public_call_path_release_surfaces_are_unique_and_legacy_unreachable() {
     let stdio_catalog = read("crates/codestory-cli/src/stdio_catalog.rs");
     let legacy_tools = source_between(&stdio_catalog, "static TOOLS:", "static RESOURCES:");
     assert!(!legacy_tools.contains("prove_call_path"));
+    assert!(!legacy_tools.contains("verify_indexed_direct_calls"));
     let public_proof = source_between(
         &dispatcher,
-        "if name == \"prove_call_path\"",
+        "if crate::prove_call_path::is_proof_tool_name(name)",
         "// Public-operation retry belongs",
     );
     assert_eq!(
@@ -1504,15 +1390,9 @@ fn find_planning_import_cycle<'a>(
     None
 }
 
-/// S4-10a dissolved the planning strongly-connected component: in release code
-/// the moved planning modules import each other along a DAG
-/// (obligations ≺ plan ≺ claims ≺ sufficiency ≺ budget was the dissolving
-/// order). Until now that order was conventional — the M2 mutation recorded on
-/// #1865 reintroduced a release-code back-edge (obligations importing
-/// sufficiency) and nothing failed, because rustc is perfectly happy to compile
-/// a module cycle inside one crate.
-///
-/// This is the assertion that mutation must fail by name: the release-compiled
+/// The release-compiled planning modules must remain acyclic. This assertion
+/// makes a newly introduced sibling-module back-edge fail by name: the
+/// release-compiled
 /// source of every allowlisted planning module (top-level `#[cfg(test)]` items
 /// stripped by the same helper the other source contracts use; line comments
 /// dropped so prose mentioning a module path is not an edge) is scanned for
@@ -1544,27 +1424,15 @@ fn agent_planning_import_graph_stays_acyclic() {
         graph.insert(module, imports);
     }
 
-    // Scanner self-check: packet_obligations imports packet_required_probes in release
-    // code today. If the reference extraction regresses to matching nothing,
+    // Scanner self-check: packet_plan imports planning in release code today.
+    // If the reference extraction regresses to matching nothing,
     // the acyclicity assertion below would pass vacuously; fail here instead.
     assert!(
         graph
-            .get("packet_obligations")
-            .is_some_and(|imports| imports.contains("packet_required_probes")),
-        "planning import scan lost the known packet_obligations -> packet_required_probes edge; \
+            .get("packet_plan")
+            .is_some_and(|imports| imports.contains("planning")),
+        "planning import scan lost the known packet_plan -> planning edge; \
          the DAG guard is no longer reading real imports"
-    );
-
-    // packet_proof_atoms is the stage-1 typed-proof leaf: its matcher consumes
-    // codestory_contracts types only, so its release-code planning-import set
-    // must stay empty. A sibling import added there must fail here by name,
-    // not only as an eventual cycle somewhere else in the DAG.
-    assert_eq!(
-        graph.get("packet_proof_atoms").map(BTreeSet::len),
-        Some(0),
-        "packet_proof_atoms must stay a leaf planning module: it may import contracts types \
-         only, never a crate::/super:: planning sibling; found imports: {:?}",
-        graph.get("packet_proof_atoms")
     );
 
     if let Some(cycle) = find_planning_import_cycle(&graph) {
@@ -2538,14 +2406,14 @@ fn runtime_snapshot_lifecycle_flows_through_store_snapshot_surface() {
         full_refresh.contains("SnapshotStore::open_disposable_full_refresh(storage_path)")
             && full_refresh.contains("staged.snapshots().finalize_staged()")
             && full_refresh.contains("staged.snapshots().refresh_detail()")
-            && commit.contains(".publish_with_stats(&self.storage_path)"),
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path)"),
         "full refresh should stage, finalize, and publish snapshots through the store snapshot surface"
     );
     assert!(
         incremental_refresh.contains("SnapshotStore::clone_live_to_staged(storage_path)")
-            && incremental_refresh.contains(".snapshots()\n        .finalize_staged()")
-            && incremental_refresh.contains(".snapshots()\n        .refresh_detail()")
-            && commit.contains(".publish_with_stats(&self.storage_path)"),
+            && incremental_refresh.contains(".snapshots()\n            .finalize_staged()")
+            && incremental_refresh.contains(".snapshots()\n            .refresh_detail()")
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path)"),
         "incremental refresh should clone, finalize both snapshot tiers, and publish through the staged snapshot surface"
     );
     for forbidden in [
@@ -2582,7 +2450,7 @@ fn staged_publication_identity_and_fence_are_complete_before_publication() {
         commit.contains("pub(super) fn next_index_publication(")
             && commit.contains(".put_index_publication(publication)")
             && commit.contains(".finish_incremental_run()")
-            && commit.contains(".publish_with_stats(&self.storage_path)")
+            && commit.contains(".publish_receipted_with_stats(&self.storage_path)")
             && full_refresh.contains("next_index_publication(")
             && full_refresh.contains("stage_core_publication_identity(")
             && full_refresh.contains("CoreCommitMode::Full")
@@ -3182,93 +3050,6 @@ fn owned_artifact_identities_are_declared_only_in_the_registry() {
     }
 }
 
-#[test]
-fn retired_packet_claim_profile_registry_stays_empty_versioned_and_fail_closed() {
-    // Source-text claim profiles are retired. The empty versioned registry remains in the
-    // shipped telemetry path, and its loader must keep rejecting malformed or incompatible
-    // documents rather than letting a heuristic profile re-enter production.
-    let profiles = read("crates/codestory-agent/src/packet_claim_profiles.rs");
-    let production = production_source_prefix(&profiles);
-    let registry = read("crates/codestory-agent/src/packet_claim_profile_registry.rs");
-    let registry_production = production_source_prefix(&registry);
-    for source in [&production, &registry_production] {
-        assert!(
-            !source.contains("debug_assert"),
-            "claim-profile contract validation must not be compiled out of release builds"
-        );
-    }
-    for required in [
-        // The registry is versioned data now, and the loader is the only way in.
-        "include_str!(\"data/claim_profiles.v2.json\")",
-        "load_claim_profile_registry(CLAIM_PROFILE_DOCUMENT, &[])",
-    ] {
-        assert!(
-            production.contains(required),
-            "retired packet claim-profile registry must stay empty and versioned: missing {required}"
-        );
-    }
-    for required in [
-        "-> Result<(), ClaimProfileContractViolation>",
-        "enum ClaimProfileContractViolation",
-        "const PACKET_CLAIM_PROFILE_PENDING_MIGRATION_RATCHET: usize = 0",
-        // Every load failure removes profiles; none may add one.
-        "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::Malformed)",
-        "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::SchemaVersionMismatch)",
-        "ClaimProfileRegistry::refused(ClaimProfileDocumentRejection::RatchetAboveCeiling)",
-    ] {
-        assert!(
-            registry_production.contains(required),
-            "packet claim-profile loader must stay typed and fail closed: missing {required}"
-        );
-    }
-
-    let telemetry = read("crates/codestory-agent/src/packet_profile_telemetry.rs");
-    assert!(
-        production_source_prefix(&telemetry).contains("PACKET_CLAIM_PROFILE_CONTRACT_VERSION"),
-        "packet claim-profile telemetry must publish a contract version"
-    );
-}
-
-#[test]
-fn packet_profile_telemetry_travels_on_a_typed_field_not_the_evidence_annotation_channel() {
-    // `retrieval_trace.annotations` is an evidence channel: `Gap`-kind entries downgrade packet
-    // confidence. Always-on telemetry published there was classified as a gap on every packet and
-    // moved every answer from high/ready to medium/review. The counters must therefore be
-    // structurally separated from evidence text, not merely reclassified as observations.
-    let telemetry = read("crates/codestory-agent/src/packet_profile_telemetry.rs");
-    let telemetry_production = production_source_prefix(&telemetry);
-    assert!(
-        telemetry_production.contains("-> PacketClaimProfileTelemetryDto"),
-        "claim-profile telemetry must be published as a typed DTO"
-    );
-    assert!(
-        !telemetry_production.contains("fn trace_annotations"),
-        "claim-profile telemetry must not render itself as trace annotations"
-    );
-
-    let orchestrator = read("crates/codestory-runtime/src/agent/orchestrator.rs");
-    let orchestrator_production = production_source_prefix(&orchestrator);
-    for required in [
-        "answer.retrieval_trace.packet_claim_profile_telemetry =",
-        "claim_telemetry.to_dto(",
-    ] {
-        assert!(
-            orchestrator_production.contains(required),
-            "packet assembly must attach claim-profile telemetry to the typed trace field: missing {required}"
-        );
-    }
-    for forbidden in [
-        ".extend(claim_telemetry",
-        "claim_telemetry.trace_annotations(",
-        "annotations.push(claim_telemetry",
-    ] {
-        assert!(
-            !orchestrator_production.contains(forbidden),
-            "claim-profile telemetry must not be appended to the evidence annotation channel: {forbidden}"
-        );
-    }
-}
-
 /// `[workspace.dependencies]` is a shared version register, not a parking lot.
 ///
 /// An entry no member consumes still reads as a supported, version-pinned
@@ -3639,7 +3420,6 @@ const PRODUCTION_GAP_ANNOTATION_PRODUCERS: &[(&str, &[&str])] = &[
             "\"Investigation discarded low-confidence unanchored hits for a natural-language query.\"",
             "\"Repo-text diagnostics are disabled for packet evidence; weak unanchored hits were not promoted.\"",
             "\"Investigation low confidence gap after sidecar query expansion.\"",
-            "\"Grounding snapshot supplement skipped because sidecar-primary retrieval is mandatory.\"",
             "\"Trail filter options unavailable; continuing with unsanitized filters.\"",
             "\"Neighborhood retrieval failed; continuing with trail retrieval.\"",
             "trail_truncated_annotation(idx + 1, plan.max_nodes)",

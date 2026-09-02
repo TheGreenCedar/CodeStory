@@ -3,23 +3,35 @@
 use anyhow::{Context, Result, bail};
 use codestory_contracts::api::SearchTargetDto;
 use codestory_contracts::owned_artifacts::sqlite_file_with_sidecars;
-use codestory_contracts::validation_receipts::{ArtifactSeal, SealedReceiptCache};
+use codestory_contracts::validation_receipts::{
+    ArtifactSeal, SealedReceiptCache, TransferableReceipt,
+};
 #[cfg(test)]
 use codestory_store::FileRole;
 use codestory_store::{SourcePolicyExclusionPolicyIdentity, Store, SymbolSearchDoc};
 use codestory_workspace::paths::sqlite_open_path;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(not(test))]
+use tracing::warn;
 
-pub const LEXICAL_INDEX_VERSION: &str = "sqlite-fts5-v1";
+pub const LEXICAL_INDEX_VERSION: &str = "sqlite-fts5-v2";
 pub const LEXICAL_INDEX_FILE: &str = "lexical-index.sqlite3";
 const LEXICAL_COMPONENT_ENVELOPE_FILE: &str = "lexical-component-envelope.json";
 const LEXICAL_COMPONENT_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+const LEXICAL_COMPONENT_SET_FILE: &str = "lexical-component-set.json";
+const LEXICAL_COMPONENT_SET_SCHEMA_VERSION: u32 = 1;
+const LEXICAL_STATE_FILE: &str = "lexical-state.sqlite3";
+const LEXICAL_STATE_SCHEMA_VERSION: i32 = 2;
+const LEXICAL_DELTA_FILE_PREFIX: &str = "lexical-delta-";
+const LEXICAL_DELTA_COMPACTION_COUNT: usize = 8;
+const LEXICAL_DELTA_COMPACTION_PERCENT: u64 = 10;
 #[cfg(any(test, feature = "test-support"))]
 const LEGACY_INDEX_FILE: &str = "lexical-index.jsonl";
 #[cfg(any(test, feature = "test-support"))]
@@ -52,6 +64,13 @@ const LEXICAL_SHARD_RECEIPT_CAPACITY: usize = 256;
 /// identity the registry owns, so an in-place rewrite, a replacement, or a
 /// stray write-ahead log invalidates the receipt instead of hiding behind it.
 static LEXICAL_SHARD_RECEIPTS: SealedReceiptCache<PathBuf, LexicalShardMetadata> =
+    SealedReceiptCache::new(LEXICAL_SHARD_RECEIPT_CAPACITY);
+
+/// The state database is much smaller than the FTS component and exists only
+/// to compute bounded deltas without scanning the immutable lexical base.
+static LEXICAL_STATE_RECEIPTS: SealedReceiptCache<PathBuf, Arc<LexicalLogicalState>> =
+    SealedReceiptCache::new(LEXICAL_SHARD_RECEIPT_CAPACITY);
+static LEXICAL_COMPONENT_SET_RECEIPTS: SealedReceiptCache<PathBuf, Arc<LexicalLogicalState>> =
     SealedReceiptCache::new(LEXICAL_SHARD_RECEIPT_CAPACITY);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -140,13 +159,64 @@ struct LexicalDocument {
     start_line: Option<u32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct LexicalShardMetadata {
     project_id: String,
     sidecar_input_hash: String,
     lexical_hash: String,
     file_count: u32,
     coverage: LexicalCoverage,
+    binding_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LexicalComponentDescriptor {
+    file_name: String,
+    metadata: LexicalShardMetadata,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LexicalDeltaDescriptor {
+    ordinal: u32,
+    component: LexicalComponentDescriptor,
+    upsert_keys: Vec<String>,
+    tombstone_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LexicalComponentSet {
+    schema_version: u32,
+    generation: String,
+    sidecar_input_hash: String,
+    lexical_hash: String,
+    file_count: u32,
+    coverage: LexicalCoverage,
+    base: LexicalComponentDescriptor,
+    deltas: Vec<LexicalDeltaDescriptor>,
+    state_file: String,
+    state_sha256: String,
+    binding_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct LexicalLogicalState {
+    fingerprint: LexicalInputFingerprint,
+    documents: BTreeMap<String, String>,
+    state_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+struct LexicalStateDelta<'a> {
+    retained: u64,
+    upserts: Vec<(String, &'a LexicalDocument)>,
+    tombstones: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LexicalStateDatabaseMetadata {
+    fingerprint: LexicalInputFingerprint,
+    state_sha256: String,
     binding_sha256: String,
 }
 
@@ -207,6 +277,294 @@ impl LexicalComponentEnvelope {
     }
 }
 
+impl LexicalComponentSet {
+    fn new(
+        generation: &str,
+        sidecar_input_hash: &str,
+        fingerprint: &LexicalInputFingerprint,
+        base: LexicalComponentDescriptor,
+        deltas: Vec<LexicalDeltaDescriptor>,
+        state_sha256: String,
+    ) -> Self {
+        let mut component_set = Self {
+            schema_version: LEXICAL_COMPONENT_SET_SCHEMA_VERSION,
+            generation: generation.to_string(),
+            sidecar_input_hash: sidecar_input_hash.to_string(),
+            lexical_hash: fingerprint.hash.clone(),
+            file_count: fingerprint.file_count,
+            coverage: fingerprint.coverage.clone(),
+            base,
+            deltas,
+            state_file: LEXICAL_STATE_FILE.to_string(),
+            state_sha256,
+            binding_sha256: String::new(),
+        };
+        component_set.binding_sha256 = lexical_component_set_binding(&component_set);
+        component_set
+    }
+
+    fn fingerprint(&self) -> LexicalInputFingerprint {
+        LexicalInputFingerprint {
+            file_count: self.file_count,
+            hash: self.lexical_hash.clone(),
+            coverage: self.coverage.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != LEXICAL_COMPONENT_SET_SCHEMA_VERSION
+            || self.generation.trim().is_empty()
+            || self.sidecar_input_hash.trim().is_empty()
+            || self.lexical_hash.len() != 64
+            || self.state_sha256.len() != 64
+            || self.binding_sha256 != lexical_component_set_binding(self)
+        {
+            bail!("lexical component-set manifest is invalid");
+        }
+        validate_lexical_component_file_name(&self.state_file)?;
+        validate_lexical_component_descriptor(&self.base)?;
+        let mut files = HashSet::from([self.base.file_name.as_str(), self.state_file.as_str()]);
+        let mut ordinals = HashSet::new();
+        for delta in &self.deltas {
+            validate_lexical_component_descriptor(&delta.component)?;
+            if !files.insert(delta.component.file_name.as_str())
+                || !ordinals.insert(delta.ordinal)
+                || delta.ordinal == 0
+            {
+                bail!("lexical component-set contains duplicate component identity");
+            }
+            let mut delta_keys = HashSet::new();
+            for key in delta.upsert_keys.iter().chain(&delta.tombstone_keys) {
+                if key.is_empty() || !delta_keys.insert(key) {
+                    bail!("lexical delta contains an empty or duplicate document key");
+                }
+            }
+            if delta.upsert_keys.len() as u32 != delta.component.metadata.file_count {
+                bail!("lexical delta upsert count does not match its component");
+            }
+        }
+        if self
+            .deltas
+            .windows(2)
+            .any(|pair| pair[0].ordinal >= pair[1].ordinal)
+        {
+            bail!("lexical deltas are not strictly ordered");
+        }
+        Ok(())
+    }
+}
+
+fn lexical_component_descriptor(
+    path: &Path,
+    metadata: LexicalShardMetadata,
+) -> Result<LexicalComponentDescriptor> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("lexical component path has no UTF-8 file name")?
+        .to_string();
+    let bytes = std::fs::metadata(path)
+        .with_context(|| format!("inspect lexical component {}", path.display()))?
+        .len();
+    let descriptor = LexicalComponentDescriptor {
+        file_name,
+        metadata,
+        bytes,
+    };
+    validate_lexical_component_descriptor(&descriptor)?;
+    Ok(descriptor)
+}
+
+fn read_lexical_component_set(
+    shard_dir: &Path,
+    expected_generation: Option<&str>,
+    expected_sidecar_input_hash: Option<&str>,
+) -> Result<Option<LexicalComponentSet>> {
+    let path = shard_dir.join(LEXICAL_COMPONENT_SET_FILE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect lexical component set {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("lexical component-set manifest is not a regular file");
+    }
+    let component_set: LexicalComponentSet = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("read lexical component set {}", path.display()))?,
+    )
+    .with_context(|| format!("parse lexical component set {}", path.display()))?;
+    component_set.validate()?;
+    if expected_generation.is_some_and(|expected| component_set.generation != expected)
+        || expected_sidecar_input_hash
+            .is_some_and(|expected| component_set.sidecar_input_hash != expected)
+    {
+        bail!("lexical component set does not match the retrieval publication");
+    }
+    Ok(Some(component_set))
+}
+
+fn publish_lexical_component_set(
+    shard_dir: &Path,
+    component_set: &LexicalComponentSet,
+) -> Result<()> {
+    component_set.validate()?;
+    let path = shard_dir.join(LEXICAL_COMPONENT_SET_FILE);
+    let bytes = serde_json::to_vec_pretty(component_set)?;
+    codestory_workspace::atomic_file::write_file_atomic(
+        &path,
+        "lexical-component-set",
+        |file| {
+            use std::io::Write;
+            file.write_all(&bytes)?;
+            Ok(())
+        },
+        |temp_path| {
+            let observed: LexicalComponentSet = serde_json::from_slice(&std::fs::read(temp_path)?)?;
+            observed.validate()?;
+            if &observed != component_set {
+                bail!("staged lexical component set changed before publication");
+            }
+            Ok(())
+        },
+    )
+}
+
+fn validate_component_descriptor_at(
+    shard_dir: &Path,
+    descriptor: &LexicalComponentDescriptor,
+) -> Result<()> {
+    let path = shard_dir.join(&descriptor.file_name);
+    let metadata = LEXICAL_SHARD_RECEIPTS.validate_sealed(
+        path.clone(),
+        &sqlite_file_with_sidecars(&path),
+        || verify_lexical_database_contents(&path),
+    )?;
+    let bytes = std::fs::metadata(&path)
+        .with_context(|| format!("inspect lexical component {}", path.display()))?
+        .len();
+    if metadata != descriptor.metadata || bytes != descriptor.bytes {
+        bail!("lexical component does not match its component-set descriptor");
+    }
+    Ok(())
+}
+
+fn validate_lexical_component_set_files(
+    shard_dir: &Path,
+    component_set: &LexicalComponentSet,
+) -> Result<Arc<LexicalLogicalState>> {
+    let artifacts = lexical_component_set_artifacts(shard_dir, component_set);
+    LEXICAL_COMPONENT_SET_RECEIPTS.validate_sealed(
+        shard_dir.join(LEXICAL_COMPONENT_SET_FILE),
+        &artifacts,
+        || verify_lexical_component_set_files(shard_dir, component_set),
+    )
+}
+
+fn lexical_component_set_artifacts(
+    shard_dir: &Path,
+    component_set: &LexicalComponentSet,
+) -> Vec<PathBuf> {
+    let mut artifacts = vec![shard_dir.join(LEXICAL_COMPONENT_SET_FILE)];
+    for descriptor in std::iter::once(&component_set.base)
+        .chain(component_set.deltas.iter().map(|delta| &delta.component))
+    {
+        artifacts.extend(sqlite_file_with_sidecars(
+            &shard_dir.join(&descriptor.file_name),
+        ));
+    }
+    artifacts.extend(sqlite_file_with_sidecars(
+        &shard_dir.join(&component_set.state_file),
+    ));
+    artifacts
+}
+
+fn verify_lexical_component_set_files(
+    shard_dir: &Path,
+    component_set: &LexicalComponentSet,
+) -> Result<Arc<LexicalLogicalState>> {
+    validate_component_descriptor_at(shard_dir, &component_set.base)?;
+    let mut logical =
+        read_lexical_component_document_state(&shard_dir.join(&component_set.base.file_name))?;
+    for delta in &component_set.deltas {
+        validate_component_descriptor_at(shard_dir, &delta.component)?;
+        let upserts =
+            read_lexical_component_document_state(&shard_dir.join(&delta.component.file_name))?;
+        if upserts.keys().cloned().collect::<BTreeSet<_>>()
+            != delta.upsert_keys.iter().cloned().collect::<BTreeSet<_>>()
+        {
+            bail!("lexical delta keys do not match its component rows");
+        }
+        for key in &delta.tombstone_keys {
+            logical.remove(key);
+        }
+        logical.extend(upserts);
+    }
+    let state = load_lexical_state_database(
+        &shard_dir.join(&component_set.state_file),
+        &component_set.fingerprint(),
+        &component_set.state_sha256,
+    )?;
+    if logical != state.documents {
+        bail!("lexical component chain does not reproduce its logical state");
+    }
+    Ok(state)
+}
+
+fn read_lexical_component_document_state(path: &Path) -> Result<BTreeMap<String, String>> {
+    let connection = open_read_only(path)?;
+    let mut statement = connection.prepare(
+        "SELECT document_key, document_hash FROM lexical_documents ORDER BY document_key",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut documents = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let key = row.get::<_, String>(0)?;
+        let hash = row.get::<_, String>(1)?;
+        if key.is_empty() || hash.len() != 64 || documents.insert(key.clone(), hash).is_some() {
+            bail!("lexical component contains an invalid document identity");
+        }
+    }
+    Ok(documents)
+}
+
+fn validate_lexical_component_file_name(file_name: &str) -> Result<()> {
+    let path = Path::new(file_name);
+    let mut components = path.components();
+    if file_name.is_empty()
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+        || matches!(file_name, "." | "..")
+    {
+        bail!("lexical component file name is not a safe path atom");
+    }
+    Ok(())
+}
+
+fn validate_lexical_component_descriptor(descriptor: &LexicalComponentDescriptor) -> Result<()> {
+    validate_lexical_component_file_name(&descriptor.file_name)?;
+    if descriptor.bytes == 0
+        || descriptor.metadata.project_id.trim().is_empty()
+        || descriptor.metadata.sidecar_input_hash.trim().is_empty()
+        || descriptor.metadata.lexical_hash.len() != 64
+        || descriptor.metadata.binding_sha256.len() != 64
+    {
+        bail!("lexical component descriptor is invalid");
+    }
+    Ok(())
+}
+
+fn lexical_component_set_binding(component_set: &LexicalComponentSet) -> String {
+    let mut canonical = component_set.clone();
+    canonical.binding_sha256.clear();
+    let bytes =
+        serde_json::to_vec(&canonical).expect("lexical component-set serialization is infallible");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 #[derive(Debug, Clone)]
 pub struct LexicalHit {
     pub path: String,
@@ -219,23 +577,32 @@ pub struct LexicalHit {
     pub score: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LexicalHitPayload {
+    Full,
+    DescriptorOnly,
+}
+
 pub(crate) struct LexicalSourceInput {
-    hasher: Sha256,
-    file_count: u32,
     coverage: LexicalCoverage,
     documents: Vec<LexicalDocument>,
     source_seals: Vec<ArtifactSeal>,
 }
 
+#[derive(Clone)]
 pub(crate) struct PreparedLexicalInput {
     pub fingerprint: LexicalInputFingerprint,
     documents: Vec<LexicalDocument>,
     source_seals: Vec<ArtifactSeal>,
+    /// Present for a bounded transition whose `documents` contain only the
+    /// changed rows. The complete key/hash state remains canonical and is what
+    /// binds the published base-plus-delta view.
+    bounded_state: Option<Arc<LexicalLogicalState>>,
 }
 
 impl PreparedLexicalInput {
     pub(crate) fn document_count(&self) -> u64 {
-        u64::try_from(self.documents.len()).unwrap_or(u64::MAX)
+        u64::from(self.fingerprint.file_count)
     }
 
     pub(crate) fn revalidate_source_seals(
@@ -261,36 +628,24 @@ pub fn lexical_input_fingerprint(
     project_root: &Path,
     storage_path: Option<&Path>,
 ) -> Result<LexicalInputFingerprint> {
-    let mut hasher = lexical_documents_hasher();
-    let mut file_count = 0_u32;
+    let mut documents = Vec::new();
     let scan = scan_lexical_documents(project_root, storage_path, storage_path, &mut |document| {
-        hash_lexical_document(&mut hasher, document);
-        file_count = file_count.saturating_add(1);
+        documents.push(document.clone());
         Ok(())
     })?;
-    Ok(LexicalInputFingerprint {
-        file_count,
-        hash: finish_lexical_documents_hash(hasher, &scan.coverage),
-        coverage: scan.coverage,
-    })
+    prepared_lexical_fingerprint(&documents, &scan.coverage)
 }
 
 pub(crate) fn lexical_source_input(
     project_root: &Path,
     storage_path: &Path,
 ) -> Result<LexicalSourceInput> {
-    let mut hasher = lexical_documents_hasher();
-    let mut file_count = 0_u32;
     let mut documents = Vec::new();
     let scan = scan_lexical_documents(project_root, Some(storage_path), None, &mut |document| {
-        hash_lexical_document(&mut hasher, document);
-        file_count = file_count.saturating_add(1);
         documents.push(document.clone());
         Ok(())
     })?;
     Ok(LexicalSourceInput {
-        hasher,
-        file_count,
         coverage: scan.coverage,
         documents,
         source_seals: scan.source_seals,
@@ -311,20 +666,155 @@ pub(crate) fn prepare_lexical_input_for_store(
     storage: &Store,
 ) -> Result<PreparedLexicalInput> {
     scan_symbol_documents_from_store(project_root, storage, &mut |document| {
-        hash_lexical_document(&mut source.hasher, document);
-        source.file_count = source.file_count.saturating_add(1);
         source.documents.push(document.clone());
         Ok(())
     })?;
+    let fingerprint = prepared_lexical_fingerprint(&source.documents, &source.coverage)?;
     Ok(PreparedLexicalInput {
-        fingerprint: LexicalInputFingerprint {
-            file_count: source.file_count,
-            hash: finish_lexical_documents_hash(source.hasher, &source.coverage),
-            coverage: source.coverage,
-        },
+        fingerprint,
         documents: source.documents,
         source_seals: source.source_seals,
+        bounded_state: None,
     })
+}
+
+/// Prepare a source-identity-only lexical transition from the predecessor's
+/// validated logical state. Symbol and component-report documents are retained
+/// by hash; only the exact changed source rows are read from the workspace.
+///
+/// `Ok(None)` is a deliberate fail-closed fallback to the complete scan. It is
+/// returned for policy drift, a legacy/corrupt predecessor, additions/removals,
+/// or a changed source that was not already represented in the lexical state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_bounded_lexical_input(
+    project_root: &Path,
+    current_storage_path: &Path,
+    previous_storage_path: &Path,
+    lexical_data_dir: &Path,
+    previous_generation: &str,
+    changed_existing_sources: &[String],
+    source_seals: &[ArtifactSeal],
+    expected_policy: &codestory_contracts::workspace::SourceIndexPolicy,
+) -> Result<Option<PreparedLexicalInput>> {
+    macro_rules! bounded_ineligible {
+        ($_reason:literal) => {{
+            return Ok(None);
+        }};
+    }
+    if previous_generation.trim().is_empty()
+        || changed_existing_sources.is_empty()
+        || source_seals.is_empty()
+    {
+        bounded_ineligible!("missing_generation_changes_or_seals");
+    }
+    let current_policy = lexical_source_policy(project_root, Some(current_storage_path))?;
+    let previous_policy = lexical_source_policy(project_root, Some(previous_storage_path))?;
+    if current_policy != previous_policy
+        || current_policy.policy_version != expected_policy.policy_version
+        || current_policy.max_file_bytes != expected_policy.byte_cap
+        || current_policy.structural_unit_cap != expected_policy.structural_unit_cap
+    {
+        bounded_ineligible!("source_policy_changed");
+    }
+
+    let previous_shard = shard_dir_for(lexical_data_dir, previous_generation);
+    let Some(previous_set) =
+        read_lexical_component_set(&previous_shard, Some(previous_generation), None)
+            .ok()
+            .flatten()
+    else {
+        bounded_ineligible!("previous_component_set_missing");
+    };
+    let previous_state = match validate_lexical_component_set_files(&previous_shard, &previous_set)
+    {
+        Ok(state) => state,
+        Err(_) => bounded_ineligible!("previous_component_set_invalid"),
+    };
+
+    let mut changed_documents = Vec::with_capacity(changed_existing_sources.len());
+    let mut desired_documents = previous_state.documents.clone();
+    let mut previous_path: Option<&str> = None;
+    for relative in changed_existing_sources {
+        let relative_path = Path::new(relative);
+        if relative.trim().is_empty()
+            || relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+            || previous_path.is_some_and(|previous| previous >= relative.as_str())
+            || current_policy.excluded_paths.contains(relative)
+        {
+            bounded_ineligible!("changed_path_not_canonical");
+        }
+        previous_path = Some(relative.as_str());
+        let path = project_root.join(relative_path);
+        let before = match ArtifactSeal::observe(&path) {
+            Ok(seal) => seal,
+            Err(_) => bounded_ineligible!("changed_source_unsealable"),
+        };
+        if !source_seals
+            .binary_search_by(|seal| seal.path().cmp(&path))
+            .ok()
+            .is_some_and(|position| source_seals[position] == before)
+        {
+            bounded_ineligible!("changed_source_not_in_core_inventory");
+        }
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => bounded_ineligible!("changed_source_missing_or_not_file"),
+        };
+        if metadata.len() > current_policy.max_file_bytes {
+            bounded_ineligible!("changed_source_oversized");
+        }
+        let Some(content) =
+            (match read_lexical_file_text_limited(&path, current_policy.max_file_bytes) {
+                Ok(content) => content,
+                Err(_) => bounded_ineligible!("changed_source_unreadable"),
+            })
+        else {
+            bounded_ineligible!("changed_source_invalid_utf8_or_oversized");
+        };
+        let after = ArtifactSeal::observe(&path).with_context(|| {
+            format!("seal bounded lexical source after read {}", path.display())
+        })?;
+        if after != before {
+            bail!(
+                "bounded lexical source changed while reading {}",
+                path.display()
+            );
+        }
+        let document = LexicalDocument {
+            path: relative.clone(),
+            content,
+            source: LexicalDocumentSource::LexicalSource,
+            node_id: None,
+            symbol_name: None,
+            start_line: None,
+        };
+        let key = lexical_document_key(&document)?;
+        if !previous_state.documents.contains_key(&key) {
+            bounded_ineligible!("changed_source_not_in_previous_lexical_state");
+        }
+        desired_documents.insert(key, lexical_document_hash(&document));
+        changed_documents.push(document);
+    }
+
+    let fingerprint = lexical_fingerprint_from_document_hashes(
+        &desired_documents,
+        &previous_state.fingerprint.coverage,
+    )?;
+    let state_sha256 = lexical_state_digest(&fingerprint, &desired_documents);
+    let desired_state = Arc::new(LexicalLogicalState {
+        fingerprint: fingerprint.clone(),
+        documents: desired_documents,
+        state_sha256,
+    });
+    Ok(Some(PreparedLexicalInput {
+        fingerprint,
+        documents: changed_documents,
+        source_seals: source_seals.to_vec(),
+        bounded_state: Some(desired_state),
+    }))
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -394,6 +884,378 @@ pub(crate) struct IncrementalLexicalWork {
     pub direct_reference: bool,
 }
 
+fn publish_lexical_state_for_generation(
+    shard_dir: &Path,
+    previous_state_path: Option<&Path>,
+    desired: &LexicalLogicalState,
+    delta: Option<&LexicalStateDelta<'_>>,
+) -> Result<()> {
+    let state_path = shard_dir.join(LEXICAL_STATE_FILE);
+    if state_path.is_file()
+        && load_lexical_state_database(&state_path, &desired.fingerprint, &desired.state_sha256)
+            .is_ok()
+    {
+        return Ok(());
+    }
+    if state_path.exists() {
+        let _ = crate::copy_on_write::make_file_owner_writable(&state_path);
+        std::fs::remove_file(&state_path)?;
+    }
+    if delta.is_some_and(|delta| delta.upserts.is_empty() && delta.tombstones.is_empty())
+        && let Some(previous_state_path) = previous_state_path
+    {
+        let previous_artifacts = sqlite_file_with_sidecars(previous_state_path);
+        let transferable = LEXICAL_STATE_RECEIPTS
+            .transferable_receipt(&previous_state_path.to_path_buf(), &previous_artifacts);
+        if crate::copy_on_write::reference_file(previous_state_path, &state_path)? {
+            if let Some(transferable) = transferable {
+                let _ = LEXICAL_STATE_RECEIPTS.install_hard_link_alias(
+                    &previous_state_path.to_path_buf(),
+                    &previous_artifacts,
+                    state_path.clone(),
+                    &sqlite_file_with_sidecars(&state_path),
+                    transferable,
+                    Ok::<_, anyhow::Error>,
+                )?;
+            }
+            return Ok(());
+        }
+    }
+
+    let (temp_path, reserved) =
+        codestory_workspace::atomic_file::create_unique_temp_file(&state_path, "lexical-state")?;
+    drop(reserved);
+    std::fs::remove_file(&temp_path)?;
+    let result = (|| {
+        let mut reconciled = false;
+        if let (Some(previous_state_path), Some(delta)) = (previous_state_path, delta)
+            && crate::copy_on_write::clone_file(previous_state_path, &temp_path)?
+        {
+            crate::copy_on_write::make_file_owner_writable(&temp_path)?;
+            reconcile_cloned_lexical_state_database(&temp_path, desired, delta)?;
+            reconciled = true;
+        }
+        if !reconciled {
+            if temp_path.exists() {
+                std::fs::remove_file(&temp_path)?;
+            }
+            write_lexical_state_database(&temp_path, desired)?;
+        }
+        let observed = read_lexical_state_database(&temp_path)?;
+        if observed.fingerprint != desired.fingerprint
+            || observed.documents != desired.documents
+            || observed.state_sha256 != desired.state_sha256
+        {
+            bail!("staged lexical state does not match desired logical state");
+        }
+        crate::copy_on_write::publish_immutable_file_atomic(&temp_path, &state_path)
+    })();
+    if result.is_err() && temp_path.exists() {
+        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn install_lexical_component_reference(source: &Path, destination: &Path) -> Result<bool> {
+    if destination.is_file() {
+        if codestory_workspace::same_workspace_path(source, destination) {
+            return Ok(true);
+        }
+        let _ = crate::copy_on_write::make_file_owner_writable(destination);
+        std::fs::remove_file(destination)?;
+    }
+    let source_key = source.to_path_buf();
+    let source_artifacts = sqlite_file_with_sidecars(source);
+    let transferable = LEXICAL_SHARD_RECEIPTS.transferable_receipt(&source_key, &source_artifacts);
+    if crate::copy_on_write::reference_file(source, destination)? {
+        if let Some(transferable) = transferable {
+            let _ = LEXICAL_SHARD_RECEIPTS.install_hard_link_alias(
+                &source_key,
+                &source_artifacts,
+                destination.to_path_buf(),
+                &sqlite_file_with_sidecars(destination),
+                transferable,
+                Ok::<_, anyhow::Error>,
+            )?;
+        }
+        return Ok(true);
+    }
+    if crate::copy_on_write::clone_file(source, destination)? {
+        crate::copy_on_write::make_file_immutable(destination)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn install_previous_lexical_components(
+    previous_shard: &Path,
+    shard_dir: &Path,
+    component_set: &LexicalComponentSet,
+) -> Result<bool> {
+    for descriptor in std::iter::once(&component_set.base)
+        .chain(component_set.deltas.iter().map(|delta| &delta.component))
+    {
+        if !install_lexical_component_reference(
+            &previous_shard.join(&descriptor.file_name),
+            &shard_dir.join(&descriptor.file_name),
+        )? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn write_lexical_delta_component(
+    shard_dir: &Path,
+    generation: &str,
+    sidecar_input_hash: &str,
+    ordinal: u32,
+    delta: &LexicalStateDelta<'_>,
+) -> Result<LexicalDeltaDescriptor> {
+    let file_name = format!("{LEXICAL_DELTA_FILE_PREFIX}{ordinal:04}.sqlite3");
+    let path = shard_dir.join(&file_name);
+    let documents = delta
+        .upserts
+        .iter()
+        .map(|(_, document)| (*document).clone())
+        .collect::<Vec<_>>();
+    let coverage = LexicalCoverage::default();
+    let fingerprint = prepared_lexical_fingerprint(&documents, &coverage)?;
+    let physical_project_id = format!("{generation}:delta:{ordinal}");
+    let (temp_path, reserved) =
+        codestory_workspace::atomic_file::create_unique_temp_file(&path, "lexical-delta")?;
+    drop(reserved);
+    let result = (|| {
+        let rebuilt = write_lexical_database(
+            &temp_path,
+            &physical_project_id,
+            sidecar_input_hash,
+            &fingerprint,
+            |visit| {
+                for document in &documents {
+                    visit(document)?;
+                }
+                Ok(coverage.clone())
+            },
+        )?;
+        if rebuilt != fingerprint {
+            bail!("staged lexical delta fingerprint changed during construction");
+        }
+        let metadata = verify_lexical_database_contents(&temp_path)?;
+        publish_immutable_lexical_database(&temp_path, &path)?;
+        Ok(LexicalDeltaDescriptor {
+            ordinal,
+            component: lexical_component_descriptor(&path, metadata)?,
+            upsert_keys: delta.upserts.iter().map(|(key, _)| key.clone()).collect(),
+            tombstone_keys: delta.tombstones.clone(),
+        })
+    })();
+    if result.is_err() && temp_path.exists() {
+        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn publish_full_lexical_component_set(
+    shard_dir: &Path,
+    generation: &str,
+    sidecar_input_hash: &str,
+    expected: &PreparedLexicalInput,
+    desired_state: &LexicalLogicalState,
+    before_publish: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
+    let (temp_path, reserved) =
+        codestory_workspace::atomic_file::create_unique_temp_file(&index_path, "lexical-index")?;
+    drop(reserved);
+    let result = (|| {
+        let rebuilt = write_lexical_database(
+            &temp_path,
+            generation,
+            sidecar_input_hash,
+            &expected.fingerprint,
+            |visit| {
+                for document in &expected.documents {
+                    visit(document)?;
+                }
+                Ok(expected.fingerprint.coverage.clone())
+            },
+        )?;
+        if rebuilt != expected.fingerprint {
+            bail!("staged lexical base fingerprint changed during construction");
+        }
+        let base_metadata = verify_lexical_database_contents(&temp_path)?;
+        before_publish()?;
+        publish_lexical_state_for_generation(shard_dir, None, desired_state, None)?;
+        publish_immutable_lexical_database(&temp_path, &index_path)?;
+        let base = lexical_component_descriptor(&index_path, base_metadata.clone())?;
+        publish_lexical_component_envelope(
+            shard_dir,
+            &LexicalComponentEnvelope::new(generation, sidecar_input_hash, &base_metadata),
+        )?;
+        publish_lexical_component_set(
+            shard_dir,
+            &LexicalComponentSet::new(
+                generation,
+                sidecar_input_hash,
+                &expected.fingerprint,
+                base,
+                Vec::new(),
+                desired_state.state_sha256.clone(),
+            ),
+        )
+    })();
+    if result.is_err() && temp_path.exists() {
+        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn lexical_component_set_needs_compaction(component_set: &LexicalComponentSet) -> bool {
+    let delta_bytes = component_set
+        .deltas
+        .iter()
+        .map(|delta| delta.component.bytes)
+        .sum::<u64>();
+    component_set.deltas.len() >= LEXICAL_DELTA_COMPACTION_COUNT
+        || delta_bytes.saturating_mul(100)
+            > component_set
+                .base
+                .bytes
+                .saturating_mul(LEXICAL_DELTA_COMPACTION_PERCENT)
+}
+
+pub(crate) fn lexical_component_bytes(shard_dir: &Path) -> Option<u64> {
+    let project_id = shard_dir.file_name()?.to_str()?;
+    if let Ok(Some(component_set)) = read_lexical_component_set(shard_dir, Some(project_id), None) {
+        let component_bytes = component_set
+            .deltas
+            .iter()
+            .fold(component_set.base.bytes, |total, delta| {
+                total.saturating_add(delta.component.bytes)
+            });
+        let state_bytes = std::fs::metadata(shard_dir.join(LEXICAL_STATE_FILE))
+            .ok()
+            .map_or(0, |metadata| metadata.len());
+        return Some(component_bytes.saturating_add(state_bytes));
+    }
+    std::fs::metadata(shard_dir.join(LEXICAL_INDEX_FILE))
+        .ok()
+        .map(|metadata| metadata.len())
+}
+
+fn schedule_lexical_compaction_if_needed(
+    shard_dir: PathBuf,
+    expected: &PreparedLexicalInput,
+    component_set: LexicalComponentSet,
+) {
+    if !lexical_component_set_needs_compaction(&component_set) {
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        let expected = expected.clone();
+        let name = format!("codestory-lexical-compact-{}", component_set.generation);
+        if let Err(error) = std::thread::Builder::new().name(name).spawn(move || {
+            if let Err(error) = compact_lexical_component_set(&shard_dir, &expected, &component_set)
+            {
+                warn!(detail = %error, "background lexical compaction did not publish");
+            }
+        }) {
+            warn!(detail = %error, "background lexical compaction could not start");
+        }
+    }
+    #[cfg(test)]
+    let _ = (shard_dir, expected, component_set);
+}
+
+fn compact_lexical_component_set(
+    shard_dir: &Path,
+    expected: &PreparedLexicalInput,
+    source: &LexicalComponentSet,
+) -> Result<()> {
+    if !lexical_component_set_needs_compaction(source) {
+        return Ok(());
+    }
+    let Some(current) = read_lexical_component_set(
+        shard_dir,
+        Some(&source.generation),
+        Some(&source.sidecar_input_hash),
+    )?
+    else {
+        bail!("lexical component set disappeared before compaction");
+    };
+    if &current != source {
+        return Ok(());
+    }
+    let compact_name = format!(
+        "lexical-base-compacted-{}.sqlite3",
+        &source.lexical_hash[..16]
+    );
+    let compact_path = shard_dir.join(&compact_name);
+    let (temp_path, reserved) = codestory_workspace::atomic_file::create_unique_temp_file(
+        &compact_path,
+        "lexical-compaction",
+    )?;
+    drop(reserved);
+    let result = (|| {
+        let physical_id = format!("{}:compacted", source.generation);
+        let rebuilt = write_lexical_database(
+            &temp_path,
+            &physical_id,
+            &source.sidecar_input_hash,
+            &expected.fingerprint,
+            |visit| {
+                for document in &expected.documents {
+                    visit(document)?;
+                }
+                Ok(expected.fingerprint.coverage.clone())
+            },
+        )?;
+        if rebuilt != expected.fingerprint {
+            bail!("compacted lexical base does not match its logical fingerprint");
+        }
+        let metadata = verify_lexical_database_contents(&temp_path)?;
+        publish_immutable_lexical_database(&temp_path, &compact_path)?;
+        let compacted = LexicalComponentSet::new(
+            &source.generation,
+            &source.sidecar_input_hash,
+            &expected.fingerprint,
+            lexical_component_descriptor(&compact_path, metadata.clone())?,
+            Vec::new(),
+            source.state_sha256.clone(),
+        );
+        let Some(still_current) = read_lexical_component_set(
+            shard_dir,
+            Some(&source.generation),
+            Some(&source.sidecar_input_hash),
+        )?
+        else {
+            bail!("lexical component set disappeared during compaction");
+        };
+        if &still_current != source {
+            return Ok(());
+        }
+        publish_lexical_component_envelope(
+            shard_dir,
+            &LexicalComponentEnvelope::new(
+                &source.generation,
+                &source.sidecar_input_hash,
+                &metadata,
+            ),
+        )?;
+        publish_lexical_component_set(shard_dir, &compacted)
+    })();
+    if result.is_err() && temp_path.exists() {
+        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
 pub(crate) fn build_prepared_lexical_shard(
     lexical_data_dir: &Path,
     project_id: &str,
@@ -402,93 +1264,159 @@ pub(crate) fn build_prepared_lexical_shard(
     previous_project_id: Option<&str>,
     before_publish: impl FnOnce() -> Result<()>,
 ) -> Result<(LexicalInputFingerprint, Option<IncrementalLexicalWork>)> {
-    if prepared_lexical_fingerprint(&expected.documents, &expected.fingerprint.coverage)?
-        != expected.fingerprint
+    if expected.bounded_state.is_none()
+        && prepared_lexical_fingerprint(&expected.documents, &expected.fingerprint.coverage)?
+            != expected.fingerprint
     {
         bail!("prepared lexical documents do not match their fingerprint");
     }
     let shard_dir = shard_dir_for(lexical_data_dir, project_id);
     std::fs::create_dir_all(&shard_dir)?;
-    let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
-    let (temp_path, reserved) =
-        codestory_workspace::atomic_file::create_unique_temp_file(&index_path, "lexical-index")?;
-    drop(reserved);
+    let desired_state = prepared_lexical_state(expected)?;
+    let mut before_publish = Some(before_publish);
 
-    let result: Result<(LexicalInputFingerprint, Option<IncrementalLexicalWork>)> = (|| {
-        std::fs::remove_file(&temp_path)?;
-        let mut incremental = None;
-        if let Some(previous_project_id) = previous_project_id {
-            let previous_shard = shard_dir_for(lexical_data_dir, previous_project_id);
+    if let Some(previous_project_id) = previous_project_id {
+        let previous_shard = shard_dir_for(lexical_data_dir, previous_project_id);
+        let previous_component_set =
+            read_lexical_component_set(&previous_shard, Some(previous_project_id), None)
+                .ok()
+                .flatten();
+        let predecessor = if let Some(component_set) = previous_component_set {
+            validate_lexical_component_set_files(&previous_shard, &component_set)
+                .ok()
+                .map(|state| {
+                    let receipt_key = previous_shard.join(LEXICAL_COMPONENT_SET_FILE);
+                    let receipt_artifacts =
+                        lexical_component_set_artifacts(&previous_shard, &component_set);
+                    let receipt = LEXICAL_COMPONENT_SET_RECEIPTS
+                        .transferable_receipt(&receipt_key, &receipt_artifacts);
+                    (
+                        component_set,
+                        state,
+                        Some(previous_shard.join(LEXICAL_STATE_FILE)),
+                        receipt.map(|receipt| (receipt_key, receipt_artifacts, receipt)),
+                    )
+                })
+        } else {
             let previous_path = previous_shard.join(LEXICAL_INDEX_FILE);
-            let predecessor =
-                read_lexical_component_envelope(&previous_shard, Some(previous_project_id), None)
-                    .ok()
-                    .and_then(|envelope| {
-                        verify_lexical_database_contents(&previous_path)
-                            .ok()
-                            .filter(|metadata| envelope.matches_physical(metadata))
-                            .map(|metadata| (envelope, metadata))
-                    });
-            if let Some((_, predecessor_metadata)) = predecessor {
-                let same_component = predecessor_metadata.lexical_hash == expected.fingerprint.hash
-                    && predecessor_metadata.file_count == expected.fingerprint.file_count
-                    && predecessor_metadata.coverage == expected.fingerprint.coverage;
-                if same_component
-                    && crate::copy_on_write::reference_file(&previous_path, &temp_path)?
-                {
-                    incremental = Some(IncrementalLexicalWork {
-                        retained: expected.document_count(),
-                        inserted: 0,
-                        removed: 0,
-                        direct_reference: true,
-                    });
-                } else if crate::copy_on_write::clone_file(&previous_path, &temp_path)? {
-                    crate::copy_on_write::make_file_owner_writable(&temp_path)?;
-                    incremental = Some(reconcile_cloned_lexical_database(
-                        &temp_path,
+            read_lexical_component_envelope(&previous_shard, Some(previous_project_id), None)
+                .ok()
+                .and_then(|envelope| {
+                    verify_lexical_database_contents(&previous_path)
+                        .ok()
+                        .filter(|metadata| envelope.matches_physical(metadata))
+                        .and_then(|metadata| {
+                            let state = legacy_lexical_state(&previous_path).ok()?;
+                            let base =
+                                lexical_component_descriptor(&previous_path, metadata).ok()?;
+                            Some((
+                                LexicalComponentSet::new(
+                                    previous_project_id,
+                                    &envelope.sidecar_input_hash,
+                                    &state.fingerprint,
+                                    base,
+                                    Vec::new(),
+                                    state.state_sha256.clone(),
+                                ),
+                                state,
+                                None,
+                                None,
+                            ))
+                        })
+                })
+        };
+
+        if let Some((previous_set, previous_state, previous_state_path, previous_receipt)) =
+            predecessor
+        {
+            let delta = lexical_state_delta(&previous_state, &desired_state, &expected.documents)?;
+            before_publish
+                .take()
+                .expect("lexical publication callback runs once")()?;
+            if install_previous_lexical_components(&previous_shard, &shard_dir, &previous_set)? {
+                publish_lexical_state_for_generation(
+                    &shard_dir,
+                    previous_state_path.as_deref(),
+                    &desired_state,
+                    Some(&delta),
+                )?;
+                if let Some((key, artifacts, receipt)) = previous_receipt {
+                    let _ = LEXICAL_COMPONENT_SET_RECEIPTS
+                        .refresh_after_hard_links(key, &artifacts, receipt);
+                }
+                let mut deltas = previous_set.deltas.clone();
+                if !delta.upserts.is_empty() || !delta.tombstones.is_empty() {
+                    let ordinal = deltas
+                        .last()
+                        .map_or(1, |delta| delta.ordinal.saturating_add(1));
+                    deltas.push(write_lexical_delta_component(
+                        &shard_dir,
                         project_id,
                         sidecar_input_hash,
-                        &expected.fingerprint,
-                        &expected.documents,
+                        ordinal,
+                        &delta,
                     )?);
                 }
+                let base_path = shard_dir.join(&previous_set.base.file_name);
+                let base_metadata = previous_set.base.metadata.clone();
+                let component_set = LexicalComponentSet::new(
+                    project_id,
+                    sidecar_input_hash,
+                    &expected.fingerprint,
+                    lexical_component_descriptor(&base_path, base_metadata.clone())?,
+                    deltas,
+                    desired_state.state_sha256.clone(),
+                );
+                publish_lexical_component_envelope(
+                    &shard_dir,
+                    &LexicalComponentEnvelope::new(project_id, sidecar_input_hash, &base_metadata),
+                )?;
+                publish_lexical_component_set(&shard_dir, &component_set)?;
+                let _ = LEXICAL_COMPONENT_SET_RECEIPTS.seal_produced(
+                    shard_dir.join(LEXICAL_COMPONENT_SET_FILE),
+                    &lexical_component_set_artifacts(&shard_dir, &component_set),
+                    Arc::clone(&desired_state),
+                );
+                if expected.bounded_state.is_none() {
+                    schedule_lexical_compaction_if_needed(
+                        shard_dir.clone(),
+                        expected,
+                        component_set,
+                    );
+                }
+                let inserted = u64::try_from(delta.upserts.len()).unwrap_or(u64::MAX);
+                let removed = u64::try_from(previous_state.documents.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(delta.retained);
+                return Ok((
+                    expected.fingerprint.clone(),
+                    Some(IncrementalLexicalWork {
+                        retained: delta.retained,
+                        inserted,
+                        removed,
+                        direct_reference: inserted == 0 && removed == 0,
+                    }),
+                ));
             }
         }
-        if incremental.is_none() {
-            if temp_path.exists() {
-                std::fs::remove_file(&temp_path)?;
-            }
-            write_lexical_database(
-                &temp_path,
-                project_id,
-                sidecar_input_hash,
-                &expected.fingerprint,
-                |visit| {
-                    for document in &expected.documents {
-                        visit(document)?;
-                    }
-                    Ok(expected.fingerprint.coverage.clone())
-                },
-            )?;
-        }
-        let staged = verify_lexical_database_contents(&temp_path)?;
-        if staged.lexical_hash != expected.fingerprint.hash
-            || staged.file_count != expected.fingerprint.file_count
-            || staged.coverage != expected.fingerprint.coverage
-        {
-            bail!("staged lexical component does not match current lexical input");
-        }
-        let envelope = LexicalComponentEnvelope::new(project_id, sidecar_input_hash, &staged);
-        before_publish()?;
-        publish_immutable_lexical_database(&temp_path, &index_path)?;
-        publish_lexical_component_envelope(&shard_dir, &envelope)?;
-        Ok((expected.fingerprint.clone(), incremental))
-    })();
-    if result.is_err() {
-        let _ = crate::copy_on_write::make_file_owner_writable(&temp_path);
-        let _ = std::fs::remove_file(&temp_path);
     }
-    result
+
+    if expected.bounded_state.is_some() {
+        bail!("bounded lexical refresh has no compatible predecessor");
+    }
+    let remaining_before_publish = before_publish.take();
+    publish_full_lexical_component_set(
+        &shard_dir,
+        project_id,
+        sidecar_input_hash,
+        expected,
+        &desired_state,
+        move || match remaining_before_publish {
+            Some(before_publish) => before_publish(),
+            None => Ok(()),
+        },
+    )?;
+    Ok((expected.fingerprint.clone(), None))
 }
 
 fn publish_immutable_lexical_database(temp_path: &Path, index_path: &Path) -> Result<()> {
@@ -499,6 +1427,17 @@ pub fn shard_has_lexical_index(shard_dir: &Path, expected_sidecar_input_hash: &s
     let Some(project_id) = shard_dir.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
+    match read_lexical_component_set(
+        shard_dir,
+        Some(project_id),
+        Some(expected_sidecar_input_hash),
+    ) {
+        Ok(Some(component_set)) => {
+            return validate_lexical_component_set_files(shard_dir, &component_set).is_ok();
+        }
+        Ok(None) => {}
+        Err(_) => return false,
+    }
     validate_lexical_database(
         &shard_dir.join(LEXICAL_INDEX_FILE),
         project_id,
@@ -515,8 +1454,22 @@ pub fn shard_matches_lexical_input(
     expected_hash: &str,
     expected_sidecar_input_hash: &str,
 ) -> bool {
+    let shard_dir = shard_dir_for(lexical_data_dir, sidecar_generation);
+    match read_lexical_component_set(
+        &shard_dir,
+        Some(sidecar_generation),
+        Some(expected_sidecar_input_hash),
+    ) {
+        Ok(Some(component_set)) => {
+            return component_set.file_count == expected_file_count
+                && component_set.lexical_hash == expected_hash
+                && validate_lexical_component_set_files(&shard_dir, &component_set).is_ok();
+        }
+        Ok(None) => {}
+        Err(_) => return false,
+    }
     validate_lexical_database(
-        &shard_dir_for(lexical_data_dir, sidecar_generation).join(LEXICAL_INDEX_FILE),
+        &shard_dir.join(LEXICAL_INDEX_FILE),
         sidecar_generation,
         expected_sidecar_input_hash,
         Some((expected_file_count, expected_hash)),
@@ -529,8 +1482,17 @@ pub fn lexical_shard_coverage(
     sidecar_generation: &str,
     expected_sidecar_input_hash: &str,
 ) -> Result<LexicalCoverage> {
+    let shard_dir = shard_dir_for(lexical_data_dir, sidecar_generation);
+    if let Some(component_set) = read_lexical_component_set(
+        &shard_dir,
+        Some(sidecar_generation),
+        Some(expected_sidecar_input_hash),
+    )? {
+        validate_lexical_component_set_files(&shard_dir, &component_set)?;
+        return Ok(component_set.coverage);
+    }
     Ok(validate_lexical_database(
-        &shard_dir_for(lexical_data_dir, sidecar_generation).join(LEXICAL_INDEX_FILE),
+        &shard_dir.join(LEXICAL_INDEX_FILE),
         sidecar_generation,
         expected_sidecar_input_hash,
         None,
@@ -545,8 +1507,137 @@ pub(crate) fn lexical_shard_receipt_stats(
     lexical_data_dir: &Path,
     sidecar_generation: &str,
 ) -> Option<codestory_contracts::validation_receipts::ReceiptStats> {
-    LEXICAL_SHARD_RECEIPTS
-        .stats(&shard_dir_for(lexical_data_dir, sidecar_generation).join(LEXICAL_INDEX_FILE))
+    let shard_dir = shard_dir_for(lexical_data_dir, sidecar_generation);
+    let path = read_lexical_component_set(&shard_dir, Some(sidecar_generation), None)
+        .ok()
+        .flatten()
+        .map_or_else(
+            || shard_dir.join(LEXICAL_INDEX_FILE),
+            |component_set| shard_dir.join(component_set.base.file_name),
+        );
+    LEXICAL_SHARD_RECEIPTS.stats(&path)
+}
+
+struct LexicalShardReceiptRefresh {
+    key: PathBuf,
+    artifacts: Vec<PathBuf>,
+    receipt: TransferableReceipt<LexicalShardMetadata>,
+}
+
+struct LexicalStateReceiptRefresh {
+    key: PathBuf,
+    artifacts: Vec<PathBuf>,
+    receipt: TransferableReceipt<Arc<LexicalLogicalState>>,
+}
+
+/// Receipts for one validated generation captured immediately before owned
+/// retention cleanup can remove sibling hard links.
+pub(crate) struct LexicalGenerationReceiptRefresh {
+    shards: Vec<LexicalShardReceiptRefresh>,
+    component_set: Option<LexicalStateReceiptRefresh>,
+    state: Option<LexicalStateReceiptRefresh>,
+}
+
+pub(crate) fn capture_lexical_generation_receipts(
+    lexical_data_dir: &Path,
+    generation: &str,
+) -> Result<LexicalGenerationReceiptRefresh> {
+    let shard_dir = shard_dir_for(lexical_data_dir, generation);
+    let component_set = read_lexical_component_set(&shard_dir, Some(generation), None)?;
+    let mut shards = Vec::new();
+    let mut component_set_refresh = None;
+    if let Some(component_set) = component_set.as_ref() {
+        for descriptor in std::iter::once(&component_set.base)
+            .chain(component_set.deltas.iter().map(|delta| &delta.component))
+        {
+            let key = shard_dir.join(&descriptor.file_name);
+            let artifacts = sqlite_file_with_sidecars(&key);
+            if let Some(receipt) = LEXICAL_SHARD_RECEIPTS.transferable_receipt(&key, &artifacts) {
+                shards.push(LexicalShardReceiptRefresh {
+                    key,
+                    artifacts,
+                    receipt,
+                });
+            }
+        }
+        let key = shard_dir.join(LEXICAL_COMPONENT_SET_FILE);
+        let artifacts = lexical_component_set_artifacts(&shard_dir, component_set);
+        if let Some(receipt) = LEXICAL_COMPONENT_SET_RECEIPTS.transferable_receipt(&key, &artifacts)
+        {
+            component_set_refresh = Some(LexicalStateReceiptRefresh {
+                key,
+                artifacts,
+                receipt,
+            });
+        }
+    } else {
+        let key = shard_dir.join(LEXICAL_INDEX_FILE);
+        let artifacts = sqlite_file_with_sidecars(&key);
+        if let Some(receipt) = LEXICAL_SHARD_RECEIPTS.transferable_receipt(&key, &artifacts) {
+            shards.push(LexicalShardReceiptRefresh {
+                key,
+                artifacts,
+                receipt,
+            });
+        }
+    }
+    let state_key = shard_dir.join(LEXICAL_STATE_FILE);
+    let state_artifacts = sqlite_file_with_sidecars(&state_key);
+    let state = LEXICAL_STATE_RECEIPTS
+        .transferable_receipt(&state_key, &state_artifacts)
+        .map(|receipt| LexicalStateReceiptRefresh {
+            key: state_key,
+            artifacts: state_artifacts,
+            receipt,
+        });
+    Ok(LexicalGenerationReceiptRefresh {
+        shards,
+        component_set: component_set_refresh,
+        state,
+    })
+}
+
+impl LexicalGenerationReceiptRefresh {
+    /// Reseal only metadata churn caused by an owned hard-link deletion.
+    /// Byte-affecting drift is refused and the next reader deep-validates.
+    pub(crate) fn refresh_after_owned_link_cleanup(self) -> (usize, usize) {
+        let mut refreshed = 0_usize;
+        let mut refused = 0_usize;
+        for shard in self.shards {
+            if LEXICAL_SHARD_RECEIPTS.refresh_after_hard_links(
+                shard.key,
+                &shard.artifacts,
+                shard.receipt,
+            ) {
+                refreshed += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        if let Some(component_set) = self.component_set {
+            if LEXICAL_COMPONENT_SET_RECEIPTS.refresh_after_hard_links(
+                component_set.key,
+                &component_set.artifacts,
+                component_set.receipt,
+            ) {
+                refreshed += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        if let Some(state) = self.state {
+            if LEXICAL_STATE_RECEIPTS.refresh_after_hard_links(
+                state.key,
+                &state.artifacts,
+                state.receipt,
+            ) {
+                refreshed += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        (refreshed, refused)
+    }
 }
 
 #[cfg(test)]
@@ -578,9 +1669,35 @@ where
         query,
         limit,
         Arc::clone(&cancelled),
+        LexicalHitPayload::Full,
     );
     if result.is_err() && cancelled() {
         bail!("lexical search cancelled");
+    }
+    result
+}
+
+pub(crate) fn search_lexical_index_descriptors_with_cancel<F>(
+    shard_dir: &Path,
+    expected_sidecar_input_hash: &str,
+    query: &str,
+    limit: usize,
+    cancelled: F,
+) -> Result<Vec<LexicalHit>>
+where
+    F: Fn() -> bool + Send + Sync + 'static,
+{
+    let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(cancelled);
+    let result = search_lexical_index_with_cancel_inner(
+        shard_dir,
+        expected_sidecar_input_hash,
+        query,
+        limit,
+        Arc::clone(&cancelled),
+        LexicalHitPayload::DescriptorOnly,
+    );
+    if result.is_err() && cancelled() {
+        bail!("lexical descriptor search cancelled");
     }
     result
 }
@@ -591,6 +1708,7 @@ fn search_lexical_index_with_cancel_inner(
     query: &str,
     limit: usize,
     cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -601,6 +1719,20 @@ fn search_lexical_index_with_cancel_inner(
     let Some(project_id) = shard_dir.file_name().and_then(|name| name.to_str()) else {
         bail!("lexical shard path has no generation directory");
     };
+    if let Some(component_set) = read_lexical_component_set(
+        shard_dir,
+        Some(project_id),
+        Some(expected_sidecar_input_hash),
+    )? {
+        return search_lexical_component_set(
+            shard_dir,
+            &component_set,
+            query,
+            limit,
+            cancelled,
+            payload,
+        );
+    }
     let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
     let connection = open_read_only(&index_path)?;
     let progress_cancelled = Arc::clone(&cancelled);
@@ -625,6 +1757,7 @@ fn search_lexical_index_with_cancel_inner(
         document_count,
         &mut HashMap::new(),
         cancelled.as_ref(),
+        payload,
     )
 }
 
@@ -643,6 +1776,25 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
     let Some(project_id) = shard_dir.file_name().and_then(|name| name.to_str()) else {
         bail!("lexical shard path has no generation directory");
     };
+    if let Some(component_set) = read_lexical_component_set(
+        shard_dir,
+        Some(project_id),
+        Some(expected_sidecar_input_hash),
+    )? {
+        return queries
+            .iter()
+            .map(|(query, limit)| {
+                search_lexical_component_set(
+                    shard_dir,
+                    &component_set,
+                    query,
+                    *limit,
+                    Arc::clone(&cancelled),
+                    LexicalHitPayload::Full,
+                )
+            })
+            .collect();
+    }
     let index_path = shard_dir.join(LEXICAL_INDEX_FILE);
     let connection = open_read_only(&index_path)?;
     let progress_cancelled = Arc::clone(&cancelled);
@@ -671,9 +1823,142 @@ pub(crate) fn search_lexical_index_batch_with_cancel(
                 document_count,
                 &mut token_frequencies,
                 cancelled.as_ref(),
+                LexicalHitPayload::Full,
             )
         })
         .collect()
+}
+
+fn search_lexical_component_set(
+    shard_dir: &Path,
+    component_set: &LexicalComponentSet,
+    query: &str,
+    limit: usize,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    payload: LexicalHitPayload,
+) -> Result<Vec<LexicalHit>> {
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    validate_lexical_component_set_files(shard_dir, component_set)?;
+    let mut latest = HashMap::<String, Option<usize>>::new();
+    for (index, delta) in component_set.deltas.iter().enumerate() {
+        for key in &delta.upsert_keys {
+            latest.insert(key.clone(), Some(index));
+        }
+        for key in &delta.tombstone_keys {
+            latest.insert(key.clone(), None);
+        }
+    }
+
+    let logical_count = component_set.file_count as usize;
+    let component_limit = MAX_CANDIDATES;
+    let base_hits = search_lexical_component(
+        shard_dir,
+        &component_set.base,
+        query,
+        component_limit,
+        logical_count,
+        Arc::clone(&cancelled),
+        payload,
+    )?;
+    let mut hits = Vec::new();
+    for hit in base_hits {
+        let key = lexical_hit_document_key(&hit)?;
+        if !latest.contains_key(&key) {
+            hits.push(hit);
+        }
+    }
+    for (index, delta) in component_set.deltas.iter().enumerate() {
+        let delta_hits = search_lexical_component(
+            shard_dir,
+            &delta.component,
+            query,
+            component_limit,
+            logical_count,
+            Arc::clone(&cancelled),
+            payload,
+        )?;
+        for hit in delta_hits {
+            let key = lexical_hit_document_key(&hit)?;
+            if latest.get(&key) == Some(&Some(index)) {
+                hits.push(hit);
+            }
+        }
+    }
+    if cancelled() {
+        bail!("lexical search cancelled");
+    }
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.node_id.cmp(&right.node_id))
+            .then_with(|| left.symbol_name.cmp(&right.symbol_name))
+            .then_with(|| left.start_line.cmp(&right.start_line))
+    });
+    let mut seen = HashSet::new();
+    hits.retain(|hit| seen.insert(lexical_hit_identity(hit)));
+    hits.truncate(limit);
+    Ok(hits)
+}
+
+fn search_lexical_component(
+    shard_dir: &Path,
+    descriptor: &LexicalComponentDescriptor,
+    query: &str,
+    limit: usize,
+    logical_document_count: usize,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+    payload: LexicalHitPayload,
+) -> Result<Vec<LexicalHit>> {
+    validate_component_descriptor_at(shard_dir, descriptor)?;
+    let path = shard_dir.join(&descriptor.file_name);
+    let connection = open_read_only(&path)?;
+    let progress_cancelled = Arc::clone(&cancelled);
+    connection.progress_handler(1_000, Some(move || progress_cancelled()))?;
+    let metadata = read_open_database_metadata(&connection, cancelled.as_ref())?;
+    if metadata != descriptor.metadata {
+        bail!("lexical component metadata changed after validation");
+    }
+    search_lexical_index_on_connection(
+        &connection,
+        query,
+        limit,
+        logical_document_count,
+        &mut HashMap::new(),
+        cancelled.as_ref(),
+        payload,
+    )
+}
+
+fn lexical_hit_document_key(hit: &LexicalHit) -> Result<String> {
+    match hit.source {
+        LexicalDocumentSource::LexicalSource => Ok(format!("source\0{}", hit.path)),
+        LexicalDocumentSource::SymbolDoc | LexicalDocumentSource::ComponentReport => {
+            let node_id = hit
+                .node_id
+                .as_deref()
+                .context("lexical component hit is missing its node identity")?;
+            Ok(format!("{}\0{node_id}", hit.source.provenance_label()))
+        }
+    }
+}
+
+fn lexical_hit_identity(hit: &LexicalHit) -> LexicalCandidateIdentity {
+    let source = match hit.source {
+        LexicalDocumentSource::LexicalSource => 0,
+        LexicalDocumentSource::SymbolDoc => 1,
+        LexicalDocumentSource::ComponentReport => 2,
+    };
+    (
+        hit.path.clone(),
+        source,
+        hit.node_id.clone(),
+        hit.symbol_name.clone(),
+        hit.start_line,
+    )
 }
 
 fn search_lexical_index_on_connection(
@@ -683,6 +1968,7 @@ fn search_lexical_index_on_connection(
     document_count: usize,
     frequency_cache: &mut HashMap<String, usize>,
     cancelled: &(dyn Fn() -> bool + Send + Sync),
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalHit>> {
     if cancelled() {
         bail!("lexical search cancelled");
@@ -733,24 +2019,27 @@ fn search_lexical_index_on_connection(
     // the documented two-of-three or forty-percent admission contracts.
     let required_match_count = required_lexical_match_count(tokens.len());
 
-    let exact_candidates = query_exact_candidates(connection, query, candidate_limit)?;
+    let exact_candidates = query_exact_candidates(connection, query, candidate_limit, payload)?;
     let path_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Path,
+        payload,
     )?;
     let content_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::Content,
+        payload,
     )?;
     let mut symbol_candidates = query_fts_candidates(
         connection,
         &fts_query,
         candidate_limit,
         LexicalCandidateOrder::SymbolDocument,
+        payload,
     )?;
     rank_symbol_candidates_by_identifier_overlap(&mut symbol_candidates, &tokens, &token_weights);
 
@@ -776,16 +2065,17 @@ fn search_lexical_index_on_connection(
         content_candidates,
         symbol_candidates,
     ]));
+    if payload == LexicalHitPayload::DescriptorOnly {
+        populate_descriptor_token_matches(connection, &mut candidates, &tokens)?;
+    }
 
     let mut hits = Vec::new();
     let mut seen = HashSet::new();
-    for (index, (document, normalized_path, normalized_content)) in
-        candidates.into_iter().enumerate()
-    {
+    for (index, candidate) in candidates.into_iter().enumerate() {
         if index % 64 == 0 && cancelled() {
             bail!("lexical search cancelled");
         }
-        let identity = lexical_candidate_identity(&document);
+        let identity = lexical_candidate_identity(&candidate.document);
         let sublane_ranks = best_sublane_ranks
             .get(&identity)
             .copied()
@@ -800,30 +2090,36 @@ fn search_lexical_index_on_connection(
         let token_match = lexical_token_match(
             &tokens,
             &token_weights,
-            &normalized_path,
-            &normalized_content,
+            &candidate.normalized_path,
+            &candidate.normalized_content,
         );
         if token_match.matched_count >= required_match_count
-            && mandatory_tokens_match(&mandatory_tokens, &normalized_path, &normalized_content)
+            && mandatory_tokens_match(
+                &mandatory_tokens,
+                &candidate.normalized_path,
+                &candidate.normalized_content,
+            )
         {
-            let (target, matched_line, source_excerpt) =
-                if document.source == LexicalDocumentSource::LexicalSource {
-                    lexical_source_target(
-                        &document.path,
-                        &document.content,
-                        &tokens,
-                        token_match.content_weight > 0.0,
-                    )
-                } else {
-                    (None, None, None)
-                };
+            let (target, matched_line, source_excerpt) = if candidate.document.source
+                == LexicalDocumentSource::LexicalSource
+                && payload == LexicalHitPayload::Full
+            {
+                lexical_source_target(
+                    &candidate.document.path,
+                    &candidate.document.content,
+                    &tokens,
+                    token_match.content_weight > 0.0,
+                )
+            } else {
+                (None, None, None)
+            };
             hits.push(LexicalHit {
                 score: lexical_sublane_score(sublane_ranks, query_shape),
-                path: document.path,
-                source: document.source,
-                node_id: document.node_id,
-                symbol_name: document.symbol_name,
-                start_line: document.start_line.or(matched_line),
+                path: candidate.document.path,
+                source: candidate.document.source,
+                node_id: candidate.document.node_id,
+                symbol_name: candidate.document.symbol_name,
+                start_line: candidate.document.start_line.or(matched_line),
                 target,
                 source_excerpt,
             });
@@ -862,13 +2158,20 @@ enum LexicalCandidateOrder {
     SymbolDocument,
 }
 
-type LexicalCandidate = (LexicalDocument, String, String);
+#[derive(Debug, Clone)]
+struct LexicalCandidate {
+    row_id: i64,
+    document: LexicalDocument,
+    normalized_path: String,
+    normalized_content: String,
+}
 
 fn query_fts_candidates(
     connection: &Connection,
     fts_query: &str,
     candidate_limit: usize,
     order: LexicalCandidateOrder,
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalCandidate>> {
     let scoped_query = match order {
         LexicalCandidateOrder::Path => format!("path : ({fts_query})"),
@@ -876,9 +2179,9 @@ fn query_fts_candidates(
             format!("content : ({fts_query})")
         }
     };
-    let sql = match order {
-        LexicalCandidateOrder::Path => {
-            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+    let sql = match (order, payload) {
+        (LexicalCandidateOrder::Path, LexicalHitPayload::Full) => {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -886,8 +2189,8 @@ fn query_fts_candidates(
              ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
              LIMIT ?2"
         }
-        LexicalCandidateOrder::Content => {
-            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+        (LexicalCandidateOrder::Content, LexicalHitPayload::Full) => {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -895,8 +2198,35 @@ fn query_fts_candidates(
              ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
              LIMIT ?2"
         }
-        LexicalCandidateOrder::SymbolDocument => {
-            "SELECT d.path, d.content, lexical_fts.path, lexical_fts.content,
+        (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::Full) => {
+            "SELECT d.id, d.path, d.content, lexical_fts.path, lexical_fts.content,
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1 AND d.source = 'symbol_doc'
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+        (LexicalCandidateOrder::Path, LexicalHitPayload::DescriptorOnly) => {
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 8.0, 1.0), d.path, d.id
+             LIMIT ?2"
+        }
+        (LexicalCandidateOrder::Content, LexicalHitPayload::DescriptorOnly) => {
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
+                    d.source, d.node_id, d.symbol_name, d.start_line
+             FROM lexical_fts
+             JOIN lexical_documents d ON d.id = lexical_fts.rowid
+             WHERE lexical_fts MATCH ?1
+             ORDER BY bm25(lexical_fts, 1.0, 4.0), d.path, d.id
+             LIMIT ?2"
+        }
+        (LexicalCandidateOrder::SymbolDocument, LexicalHitPayload::DescriptorOnly) => {
+            "SELECT d.id, d.path, '', lexical_fts.path, '',
                     d.source, d.node_id, d.symbol_name, d.start_line
              FROM lexical_fts
              JOIN lexical_documents d ON d.id = lexical_fts.rowid
@@ -908,20 +2238,25 @@ fn query_fts_candidates(
     let mut statement = connection.prepare_cached(sql)?;
     let rows = statement.query_map(params![scoped_query, candidate_limit as i64], |row| {
         let document = LexicalDocument {
-            path: row.get(0)?,
-            content: row.get(1)?,
-            source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(|error| {
+            path: row.get(1)?,
+            content: row.get(2)?,
+            source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    4,
+                    5,
                     rusqlite::types::Type::Text,
                     error.into(),
                 )
             })?,
-            node_id: row.get(5)?,
-            symbol_name: row.get(6)?,
-            start_line: row.get(7)?,
+            node_id: row.get(6)?,
+            symbol_name: row.get(7)?,
+            start_line: row.get(8)?,
         };
-        Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        Ok(LexicalCandidate {
+            row_id: row.get(0)?,
+            document,
+            normalized_path: row.get(3)?,
+            normalized_content: row.get(4)?,
+        })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
@@ -931,6 +2266,7 @@ fn query_exact_candidates(
     connection: &Connection,
     query: &str,
     candidate_limit: usize,
+    payload: LexicalHitPayload,
 ) -> Result<Vec<LexicalCandidate>> {
     let mut needles = quoted_query_tokens(query);
     let intent = crate::query_features::classify_query(query).intent;
@@ -945,8 +2281,9 @@ fn query_exact_candidates(
     needles.dedup();
 
     let mut candidates = Vec::new();
-    let mut statement = connection.prepare_cached(
-        "SELECT d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
+    let sql = match payload {
+        LexicalHitPayload::Full => {
+            "SELECT d.id, d.path, d.content, lower(lexical_fts.path), lower(lexical_fts.content),
                 d.source, d.node_id, d.symbol_name, d.start_line
          FROM lexical_documents d
          JOIN lexical_fts ON lexical_fts.rowid = d.id
@@ -955,27 +2292,46 @@ fn query_exact_candidates(
             OR lower(d.symbol_name) LIKE '%::' || ?1
             OR lower(d.symbol_name) LIKE '%.' || ?1
          ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
-         LIMIT ?2",
-    )?;
+         LIMIT ?2"
+        }
+        LexicalHitPayload::DescriptorOnly => {
+            "SELECT d.id, d.path, '', lower(lexical_fts.path), '',
+                d.source, d.node_id, d.symbol_name, d.start_line
+         FROM lexical_documents d
+         JOIN lexical_fts ON lexical_fts.rowid = d.id
+         WHERE lower(d.path) = ?1
+            OR lower(d.symbol_name) = ?1
+            OR lower(d.symbol_name) LIKE '%::' || ?1
+            OR lower(d.symbol_name) LIKE '%.' || ?1
+         ORDER BY d.path, d.source, d.node_id, d.symbol_name, d.start_line, d.id
+         LIMIT ?2"
+        }
+    };
+    let mut statement = connection.prepare_cached(sql)?;
     for needle in needles {
         let rows = statement.query_map(params![needle, candidate_limit as i64], |row| {
             let document = LexicalDocument {
-                path: row.get(0)?,
-                content: row.get(1)?,
-                source: LexicalDocumentSource::parse(&row.get::<_, String>(4)?).map_err(
+                path: row.get(1)?,
+                content: row.get(2)?,
+                source: LexicalDocumentSource::parse(&row.get::<_, String>(5)?).map_err(
                     |error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            4,
+                            5,
                             rusqlite::types::Type::Text,
                             error.into(),
                         )
                     },
                 )?,
-                node_id: row.get(5)?,
-                symbol_name: row.get(6)?,
-                start_line: row.get(7)?,
+                node_id: row.get(6)?,
+                symbol_name: row.get(7)?,
+                start_line: row.get(8)?,
             };
-            Ok((document, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            Ok(LexicalCandidate {
+                row_id: row.get(0)?,
+                document,
+                normalized_path: row.get(3)?,
+                normalized_content: row.get(4)?,
+            })
         })?;
         candidates.extend(rows.collect::<std::result::Result<Vec<_>, _>>()?);
         if candidates.len() >= candidate_limit {
@@ -984,6 +2340,53 @@ fn query_exact_candidates(
     }
     candidates.truncate(candidate_limit);
     Ok(candidates)
+}
+
+/// Derive descriptor coverage from FTS row membership only. The packet path
+/// must rank candidates before admission without selecting either stored copy
+/// of the source body (`lexical_documents.content` or `lexical_fts.content`).
+fn populate_descriptor_token_matches(
+    connection: &Connection,
+    candidates: &mut [LexicalCandidate],
+    tokens: &[String],
+) -> Result<()> {
+    const ROW_ID_CHUNK: usize = 500;
+
+    let mut row_ids = candidates
+        .iter()
+        .map(|candidate| candidate.row_id)
+        .collect::<Vec<_>>();
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    let mut matches = HashMap::<i64, Vec<&str>>::new();
+    for token in tokens {
+        let token_query = format!("\"{}\"*", token.replace('"', "\"\""));
+        for chunk in row_ids.chunks(ROW_ID_CHUNK) {
+            let placeholders = (0..chunk.len())
+                .map(|index| format!("?{}", index + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT rowid FROM lexical_fts
+                 WHERE lexical_fts MATCH ?1 AND rowid IN ({placeholders})"
+            );
+            let mut values = Vec::with_capacity(chunk.len() + 1);
+            values.push(SqlValue::Text(token_query.clone()));
+            values.extend(chunk.iter().copied().map(SqlValue::Integer));
+            let mut statement = connection.prepare_cached(&sql)?;
+            let rows = statement.query_map(params_from_iter(values), |row| row.get::<_, i64>(0))?;
+            for row_id in rows {
+                matches.entry(row_id?).or_default().push(token);
+            }
+        }
+    }
+    for candidate in candidates {
+        candidate.normalized_content = matches
+            .remove(&candidate.row_id)
+            .unwrap_or_default()
+            .join(" ");
+    }
+    Ok(())
 }
 
 fn interleave_candidate_lanes(lanes: Vec<Vec<LexicalCandidate>>) -> Vec<LexicalCandidate> {
@@ -1039,10 +2442,10 @@ fn record_lexical_sublane_ranks(
     candidates: &[LexicalCandidate],
     lane: LexicalSublane,
 ) {
-    for (index, (document, _, _)) in candidates.iter().enumerate() {
+    for (index, candidate) in candidates.iter().enumerate() {
         let candidate_rank = u32::try_from(index + 1).unwrap_or(u32::MAX);
         ranks
-            .entry(lexical_candidate_identity(document))
+            .entry(lexical_candidate_identity(&candidate.document))
             .or_default()
             .record(lane, candidate_rank);
     }
@@ -1056,15 +2459,19 @@ fn rank_symbol_candidates_by_identifier_overlap(
     let original_order = candidates
         .iter()
         .enumerate()
-        .map(|(index, (document, _, _))| (lexical_candidate_identity(document), index))
+        .map(|(index, candidate)| (lexical_candidate_identity(&candidate.document), index))
         .collect::<HashMap<_, _>>();
     candidates.sort_by(|left, right| {
-        symbol_identifier_overlap(&right.0, tokens, token_weights)
-            .partial_cmp(&symbol_identifier_overlap(&left.0, tokens, token_weights))
+        symbol_identifier_overlap(&right.document, tokens, token_weights)
+            .partial_cmp(&symbol_identifier_overlap(
+                &left.document,
+                tokens,
+                token_weights,
+            ))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                original_order[&lexical_candidate_identity(&left.0)]
-                    .cmp(&original_order[&lexical_candidate_identity(&right.0)])
+                original_order[&lexical_candidate_identity(&left.document)]
+                    .cmp(&original_order[&lexical_candidate_identity(&right.document)])
             })
     });
 }
@@ -1131,6 +2538,360 @@ pub fn shard_dir_for(lexical_data_dir: &Path, project_id: &str) -> PathBuf {
     lexical_data_dir.join("shards").join(project_id)
 }
 
+fn prepared_lexical_state(expected: &PreparedLexicalInput) -> Result<Arc<LexicalLogicalState>> {
+    if let Some(state) = expected.bounded_state.as_ref() {
+        if state.fingerprint != expected.fingerprint
+            || lexical_state_digest(&state.fingerprint, &state.documents) != state.state_sha256
+        {
+            bail!("bounded lexical state does not match its fingerprint");
+        }
+        return Ok(Arc::clone(state));
+    }
+    let mut documents = BTreeMap::new();
+    for document in &expected.documents {
+        let key = lexical_document_key(document)?;
+        if documents
+            .insert(key.clone(), lexical_document_hash(document))
+            .is_some()
+        {
+            bail!("duplicate prepared lexical document key {key:?}");
+        }
+    }
+    if documents.len() != expected.fingerprint.file_count as usize {
+        bail!("prepared lexical state count does not match its fingerprint");
+    }
+    let state_sha256 = lexical_state_digest(&expected.fingerprint, &documents);
+    Ok(Arc::new(LexicalLogicalState {
+        fingerprint: expected.fingerprint.clone(),
+        documents,
+        state_sha256,
+    }))
+}
+
+fn lexical_state_delta<'a>(
+    previous: &LexicalLogicalState,
+    desired: &LexicalLogicalState,
+    documents: &'a [LexicalDocument],
+) -> Result<LexicalStateDelta<'a>> {
+    let by_key = documents
+        .iter()
+        .map(|document| Ok((lexical_document_key(document)?, document)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for (key, document) in &by_key {
+        if desired.documents.get(key) != Some(&lexical_document_hash(document)) {
+            bail!("prepared lexical delta document does not match desired logical state");
+        }
+    }
+    let upserts = desired
+        .documents
+        .iter()
+        .filter(|(key, hash)| previous.documents.get(*key) != Some(*hash))
+        .map(|(key, _)| {
+            by_key
+                .get(key)
+                .copied()
+                .map(|document| (key.clone(), document))
+                .context("desired lexical state is missing its source document")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let tombstones = previous
+        .documents
+        .keys()
+        .filter(|key| !desired.documents.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(LexicalStateDelta {
+        retained: u64::try_from(desired.documents.len().saturating_sub(upserts.len()))
+            .unwrap_or(u64::MAX),
+        upserts,
+        tombstones,
+    })
+}
+
+fn lexical_state_digest(
+    fingerprint: &LexicalInputFingerprint,
+    documents: &BTreeMap<String, String>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-lexical-state-v1\0");
+    hasher.update(fingerprint.file_count.to_le_bytes());
+    {
+        let value = fingerprint.hash.as_str();
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let coverage = serde_json::to_vec(&fingerprint.coverage)
+        .expect("lexical coverage serialization is infallible");
+    hasher.update((coverage.len() as u64).to_le_bytes());
+    hasher.update(coverage);
+    for (key, hash) in documents {
+        for value in [key, hash] {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn lexical_state_metadata_binding(metadata: &LexicalStateDatabaseMetadata) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-lexical-state-metadata-v1\0");
+    hasher.update(metadata.fingerprint.file_count.to_le_bytes());
+    for value in [
+        metadata.fingerprint.hash.as_str(),
+        metadata.state_sha256.as_str(),
+    ] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let coverage = serde_json::to_vec(&metadata.fingerprint.coverage)
+        .expect("lexical coverage serialization is infallible");
+    hasher.update((coverage.len() as u64).to_le_bytes());
+    hasher.update(coverage);
+    format!("{:x}", hasher.finalize())
+}
+
+fn write_lexical_state_database(path: &Path, state: &LexicalLogicalState) -> Result<()> {
+    let mut connection = Connection::open(sqlite_open_path(path))
+        .with_context(|| format!("create lexical state database {}", path.display()))?;
+    connection.execute_batch(
+        "PRAGMA journal_mode = OFF;
+         PRAGMA synchronous = FULL;
+         PRAGMA user_version = 2;
+         CREATE TABLE lexical_state_documents (
+             document_key TEXT PRIMARY KEY NOT NULL,
+             document_hash TEXT NOT NULL
+         ) WITHOUT ROWID;
+         CREATE TABLE lexical_state_metadata (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             lexical_hash TEXT NOT NULL,
+             file_count INTEGER NOT NULL,
+             coverage_json TEXT NOT NULL,
+             state_sha256 TEXT NOT NULL,
+             binding_sha256 TEXT NOT NULL
+         );",
+    )?;
+    let transaction = connection.transaction()?;
+    {
+        let mut insert = transaction.prepare(
+            "INSERT INTO lexical_state_documents (document_key, document_hash) VALUES (?1, ?2)",
+        )?;
+        for (key, hash) in &state.documents {
+            insert.execute(params![key, hash])?;
+        }
+    }
+    write_lexical_state_metadata(&transaction, state)?;
+    install_lexical_state_immutability(&transaction)?;
+    transaction.commit()?;
+    connection.execute_batch("PRAGMA optimize;")?;
+    drop(connection);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    Ok(())
+}
+
+fn write_lexical_state_metadata(
+    connection: &Connection,
+    state: &LexicalLogicalState,
+) -> Result<()> {
+    let mut metadata = LexicalStateDatabaseMetadata {
+        fingerprint: state.fingerprint.clone(),
+        state_sha256: state.state_sha256.clone(),
+        binding_sha256: String::new(),
+    };
+    metadata.binding_sha256 = lexical_state_metadata_binding(&metadata);
+    connection.execute("DELETE FROM lexical_state_metadata", [])?;
+    connection.execute(
+        "INSERT INTO lexical_state_metadata
+         (singleton, lexical_hash, file_count, coverage_json, state_sha256, binding_sha256)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+        params![
+            metadata.fingerprint.hash,
+            metadata.fingerprint.file_count,
+            serde_json::to_string(&metadata.fingerprint.coverage)?,
+            metadata.state_sha256,
+            metadata.binding_sha256,
+        ],
+    )?;
+    Ok(())
+}
+
+fn install_lexical_state_immutability(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TRIGGER lexical_state_documents_no_insert
+             BEFORE INSERT ON lexical_state_documents
+             BEGIN SELECT RAISE(ABORT, 'immutable lexical state'); END;
+         CREATE TRIGGER lexical_state_documents_no_update
+             BEFORE UPDATE ON lexical_state_documents
+             BEGIN SELECT RAISE(ABORT, 'immutable lexical state'); END;
+         CREATE TRIGGER lexical_state_documents_no_delete
+             BEFORE DELETE ON lexical_state_documents
+             BEGIN SELECT RAISE(ABORT, 'immutable lexical state'); END;
+         CREATE TRIGGER lexical_state_metadata_no_insert
+             BEFORE INSERT ON lexical_state_metadata
+             BEGIN SELECT RAISE(ABORT, 'immutable lexical state'); END;
+         CREATE TRIGGER lexical_state_metadata_no_update
+             BEFORE UPDATE ON lexical_state_metadata
+             BEGIN SELECT RAISE(ABORT, 'immutable lexical state'); END;
+         CREATE TRIGGER lexical_state_metadata_no_delete
+             BEFORE DELETE ON lexical_state_metadata
+             BEGIN SELECT RAISE(ABORT, 'immutable lexical state'); END;",
+    )?;
+    Ok(())
+}
+
+fn reconcile_cloned_lexical_state_database(
+    path: &Path,
+    desired: &LexicalLogicalState,
+    delta: &LexicalStateDelta<'_>,
+) -> Result<()> {
+    let mut connection = Connection::open(sqlite_open_path(path))?;
+    connection.execute_batch(
+        "PRAGMA journal_mode = OFF;
+         PRAGMA synchronous = FULL;
+         DROP TRIGGER lexical_state_documents_no_insert;
+         DROP TRIGGER lexical_state_documents_no_update;
+         DROP TRIGGER lexical_state_documents_no_delete;
+         DROP TRIGGER lexical_state_metadata_no_insert;
+         DROP TRIGGER lexical_state_metadata_no_update;
+         DROP TRIGGER lexical_state_metadata_no_delete;",
+    )?;
+    let transaction = connection.transaction()?;
+    for key in &delta.tombstones {
+        transaction.execute(
+            "DELETE FROM lexical_state_documents WHERE document_key = ?1",
+            params![key],
+        )?;
+    }
+    for (key, document) in &delta.upserts {
+        transaction.execute(
+            "INSERT INTO lexical_state_documents (document_key, document_hash)
+             VALUES (?1, ?2)
+             ON CONFLICT(document_key) DO UPDATE SET document_hash = excluded.document_hash",
+            params![key, lexical_document_hash(document)],
+        )?;
+    }
+    write_lexical_state_metadata(&transaction, desired)?;
+    install_lexical_state_immutability(&transaction)?;
+    transaction.commit()?;
+    drop(connection);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)?
+        .sync_all()?;
+    Ok(())
+}
+
+fn read_lexical_state_database(path: &Path) -> Result<Arc<LexicalLogicalState>> {
+    let connection = open_read_only(path)?;
+    let schema_version: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version != LEXICAL_STATE_SCHEMA_VERSION {
+        bail!("lexical state database schema version is not current");
+    }
+    let quick_check: String =
+        connection.query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        bail!("lexical state database failed quick_check: {quick_check}");
+    }
+    let metadata = connection
+        .query_row(
+            "SELECT lexical_hash, file_count, coverage_json, state_sha256, binding_sha256
+             FROM lexical_state_metadata WHERE singleton = 1",
+            [],
+            |row| {
+                let coverage_json: String = row.get(2)?;
+                Ok(LexicalStateDatabaseMetadata {
+                    fingerprint: LexicalInputFingerprint {
+                        hash: row.get(0)?,
+                        file_count: row.get(1)?,
+                        coverage: serde_json::from_str(&coverage_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                error.into(),
+                            )
+                        })?,
+                    },
+                    state_sha256: row.get(3)?,
+                    binding_sha256: row.get(4)?,
+                })
+            },
+        )
+        .optional()?
+        .context("lexical state database metadata is missing")?;
+    if metadata.binding_sha256 != lexical_state_metadata_binding(&metadata) {
+        bail!("lexical state database metadata binding is invalid");
+    }
+    let mut statement = connection.prepare(
+        "SELECT document_key, document_hash FROM lexical_state_documents ORDER BY document_key",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut documents = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let key = row.get::<_, String>(0)?;
+        let hash = row.get::<_, String>(1)?;
+        if key.is_empty() || hash.len() != 64 || documents.insert(key, hash).is_some() {
+            bail!("lexical state database contains an invalid document identity");
+        }
+    }
+    if documents.len() != metadata.fingerprint.file_count as usize
+        || lexical_state_digest(&metadata.fingerprint, &documents) != metadata.state_sha256
+    {
+        bail!("lexical state database content digest does not match metadata");
+    }
+    Ok(Arc::new(LexicalLogicalState {
+        fingerprint: metadata.fingerprint,
+        documents,
+        state_sha256: metadata.state_sha256,
+    }))
+}
+
+fn load_lexical_state_database(
+    path: &Path,
+    expected_fingerprint: &LexicalInputFingerprint,
+    expected_state_sha256: &str,
+) -> Result<Arc<LexicalLogicalState>> {
+    let state = LEXICAL_STATE_RECEIPTS.validate_sealed(
+        path.to_path_buf(),
+        &sqlite_file_with_sidecars(path),
+        || read_lexical_state_database(path),
+    )?;
+    if &state.fingerprint != expected_fingerprint || state.state_sha256 != expected_state_sha256 {
+        bail!("lexical state database does not match its component-set manifest");
+    }
+    Ok(state)
+}
+
+fn legacy_lexical_state(path: &Path) -> Result<Arc<LexicalLogicalState>> {
+    let metadata = verify_lexical_database_contents(path)?;
+    let connection = open_read_only(path)?;
+    let mut statement = connection.prepare(
+        "SELECT document_key, document_hash FROM lexical_documents ORDER BY document_key",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut documents = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let key = row.get::<_, String>(0)?;
+        let hash = row.get::<_, String>(1)?;
+        if documents.insert(key.clone(), hash).is_some() {
+            bail!("legacy lexical database contains duplicate key {key:?}");
+        }
+    }
+    let fingerprint = LexicalInputFingerprint {
+        file_count: metadata.file_count,
+        hash: metadata.lexical_hash,
+        coverage: metadata.coverage,
+    };
+    let state_sha256 = lexical_state_digest(&fingerprint, &documents);
+    Ok(Arc::new(LexicalLogicalState {
+        fingerprint,
+        documents,
+        state_sha256,
+    }))
+}
+
 fn write_lexical_database<F>(
     path: &Path,
     project_id: &str,
@@ -1173,8 +2934,8 @@ where
          CREATE VIRTUAL TABLE lexical_fts USING fts5(path, content);",
     )?;
     let transaction = connection.transaction()?;
-    let mut hasher = lexical_documents_hasher();
-    let mut file_count = 0_u32;
+    let mut document_hashes = BTreeMap::new();
+    let mut stable_ids = HashMap::new();
     let actual = {
         let mut insert_document = transaction.prepare(
             "INSERT INTO lexical_documents
@@ -1185,13 +2946,20 @@ where
         let mut insert_fts = transaction
             .prepare("INSERT INTO lexical_fts(rowid, path, content) VALUES (?1, ?2, ?3)")?;
         let coverage = scan(&mut |document| {
-            file_count = file_count
-                .checked_add(1)
-                .context("lexical document count overflow")?;
             let document_key = lexical_document_key(document)?;
             let document_hash = lexical_document_hash(document);
             let id = stable_lexical_document_id(&document_key);
-            hash_lexical_document(&mut hasher, document);
+            if document_hashes
+                .insert(document_key.clone(), document_hash.clone())
+                .is_some()
+            {
+                bail!("duplicate lexical document key");
+            }
+            if let Some(previous) = stable_ids.insert(id, document_key.clone()) {
+                bail!(
+                    "lexical document identity collision between {previous:?} and {document_key:?}"
+                );
+            }
             insert_document.execute(params![
                 id,
                 document_key,
@@ -1213,11 +2981,7 @@ where
         drop(insert_fts);
         drop(insert_document);
 
-        let actual = LexicalInputFingerprint {
-            file_count,
-            hash: finish_lexical_documents_hash(hasher, &coverage),
-            coverage,
-        };
+        let actual = lexical_fingerprint_from_document_hashes(&document_hashes, &coverage)?;
         if &actual != expected {
             return Err(crate::index::SidecarInputChanged::new(
                 "lexical shard build",
@@ -1279,185 +3043,22 @@ fn prepared_lexical_fingerprint(
     documents: &[LexicalDocument],
     coverage: &LexicalCoverage,
 ) -> Result<LexicalInputFingerprint> {
-    let mut hasher = lexical_documents_hasher();
-    let mut keys = HashSet::new();
+    let mut hashes = BTreeMap::new();
     let mut ids = HashMap::new();
     for document in documents {
         let key = lexical_document_key(document)?;
-        if !keys.insert(key.clone()) {
+        if hashes
+            .insert(key.clone(), lexical_document_hash(document))
+            .is_some()
+        {
             bail!("duplicate prepared lexical document key");
         }
         let id = stable_lexical_document_id(&key);
         if let Some(previous) = ids.insert(id, key.clone()) {
             bail!("lexical document identity collision between {previous:?} and {key:?}");
         }
-        hash_lexical_document(&mut hasher, document);
     }
-    Ok(LexicalInputFingerprint {
-        file_count: u32::try_from(documents.len()).context("lexical document count overflow")?,
-        hash: finish_lexical_documents_hash(hasher, coverage),
-        coverage: coverage.clone(),
-    })
-}
-
-fn reconcile_cloned_lexical_database(
-    path: &Path,
-    project_id: &str,
-    sidecar_input_hash: &str,
-    expected: &LexicalInputFingerprint,
-    documents: &[LexicalDocument],
-) -> Result<IncrementalLexicalWork> {
-    let mut desired = BTreeMap::new();
-    let mut desired_ids = HashMap::new();
-    for document in documents {
-        let key = lexical_document_key(document)?;
-        let id = stable_lexical_document_id(&key);
-        if let Some(previous) = desired_ids.insert(id, key.clone()) {
-            bail!("lexical document identity collision between {previous:?} and {key:?}");
-        }
-        if desired
-            .insert(key.clone(), (id, lexical_document_hash(document), document))
-            .is_some()
-        {
-            bail!("duplicate prepared lexical document key {key:?}");
-        }
-    }
-
-    let mut connection = Connection::open(sqlite_open_path(path))?;
-    let schema_version: i32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if schema_version != 2 {
-        bail!("cloned lexical component does not support differential reconciliation");
-    }
-    connection.execute_batch(
-        "PRAGMA journal_mode = OFF;
-         PRAGMA synchronous = FULL;
-         DROP TRIGGER lexical_documents_no_insert;
-         DROP TRIGGER lexical_documents_no_update;
-         DROP TRIGGER lexical_documents_no_delete;
-         DROP TRIGGER lexical_metadata_no_insert;
-         DROP TRIGGER lexical_metadata_no_update;
-         DROP TRIGGER lexical_metadata_no_delete;",
-    )?;
-    let transaction = connection.transaction()?;
-    let existing = {
-        let mut statement = transaction.prepare(
-            "SELECT id, document_key, document_hash FROM lexical_documents
-             ORDER BY document_key",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let existing_by_key = existing
-        .iter()
-        .map(|(_, key, hash)| (key.as_str(), hash.as_str()))
-        .collect::<HashMap<_, _>>();
-    let desired_hash_by_key = desired
-        .iter()
-        .map(|(key, (_, hash, _))| (key.as_str(), hash.as_str()))
-        .collect::<HashMap<_, _>>();
-    let retained = existing
-        .iter()
-        .filter(|(_, key, hash)| desired_hash_by_key.get(key.as_str()) == Some(&hash.as_str()))
-        .count();
-    let removed = existing.len().saturating_sub(retained);
-    for (id, key, hash) in &existing {
-        if desired_hash_by_key.get(key.as_str()) != Some(&hash.as_str()) {
-            transaction.execute("DELETE FROM lexical_fts WHERE rowid = ?1", params![id])?;
-            transaction.execute("DELETE FROM lexical_documents WHERE id = ?1", params![id])?;
-        }
-    }
-    let missing = desired
-        .iter()
-        .filter(|(key, (_, hash, _))| existing_by_key.get(key.as_str()) != Some(&hash.as_str()))
-        .map(|(_, value)| (value.0, value.1.clone(), value.2))
-        .collect::<Vec<_>>();
-    {
-        let mut insert_document = transaction.prepare(
-            "INSERT INTO lexical_documents
-             (id, document_key, document_hash, path, content, source, node_id, symbol_name,
-              start_line)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
-        let mut insert_fts = transaction
-            .prepare("INSERT INTO lexical_fts(rowid, path, content) VALUES (?1, ?2, ?3)")?;
-        for (id, hash, document) in &missing {
-            let key = lexical_document_key(document)?;
-            insert_document.execute(params![
-                id,
-                key,
-                hash,
-                document.path,
-                document.content,
-                document.source.provenance_label(),
-                document.node_id,
-                document.symbol_name,
-                document.start_line,
-            ])?;
-            insert_fts.execute(params![
-                id,
-                normalize_lexical_text(&document.path),
-                normalize_lexical_text(&document.content),
-            ])?;
-        }
-    }
-    transaction.execute("DELETE FROM lexical_metadata", [])?;
-    let coverage_json = serde_json::to_string(&expected.coverage)?;
-    transaction.execute(
-        "INSERT INTO lexical_metadata
-         (id, version, project_id, sidecar_input_hash, lexical_hash, file_count,
-          coverage_json, binding_sha256, indexed_at_epoch_ms)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            LEXICAL_INDEX_VERSION,
-            project_id,
-            sidecar_input_hash,
-            expected.hash,
-            expected.file_count,
-            coverage_json,
-            metadata_binding(
-                project_id,
-                sidecar_input_hash,
-                &expected.hash,
-                expected.file_count,
-                &coverage_json,
-            ),
-            chrono::Utc::now().timestamp_millis(),
-        ],
-    )?;
-    transaction.execute_batch(
-        "CREATE TRIGGER lexical_documents_no_insert BEFORE INSERT ON lexical_documents
-         BEGIN SELECT RAISE(ABORT, 'immutable lexical generation'); END;
-         CREATE TRIGGER lexical_documents_no_update BEFORE UPDATE ON lexical_documents
-         BEGIN SELECT RAISE(ABORT, 'immutable lexical generation'); END;
-         CREATE TRIGGER lexical_documents_no_delete BEFORE DELETE ON lexical_documents
-         BEGIN SELECT RAISE(ABORT, 'immutable lexical generation'); END;
-         CREATE TRIGGER lexical_metadata_no_insert BEFORE INSERT ON lexical_metadata
-         BEGIN SELECT RAISE(ABORT, 'immutable lexical generation'); END;
-         CREATE TRIGGER lexical_metadata_no_update BEFORE UPDATE ON lexical_metadata
-         BEGIN SELECT RAISE(ABORT, 'immutable lexical generation'); END;
-         CREATE TRIGGER lexical_metadata_no_delete BEFORE DELETE ON lexical_metadata
-         BEGIN SELECT RAISE(ABORT, 'immutable lexical generation'); END;",
-    )?;
-    transaction.commit()?;
-    connection.execute_batch("PRAGMA optimize;")?;
-    connection.close().map_err(|(_, error)| error)?;
-    std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)?
-        .sync_all()?;
-    Ok(IncrementalLexicalWork {
-        retained: u64::try_from(retained).unwrap_or(u64::MAX),
-        inserted: u64::try_from(missing.len()).unwrap_or(u64::MAX),
-        removed: u64::try_from(removed).unwrap_or(u64::MAX),
-        direct_reference: false,
-    })
+    lexical_fingerprint_from_document_hashes(&hashes, coverage)
 }
 
 /// Deep-verify one immutable lexical shard, reusing a sealed receipt when the
@@ -1953,9 +3554,13 @@ fn read_lexical_text_limited(reader: impl Read, max_bytes: u64) -> std::io::Resu
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LexicalSourcePolicy {
     max_file_bytes: u64,
+    policy_version: String,
+    structural_unit_cap: u64,
     excluded_paths: HashSet<String>,
+    exclusion_evidence: Vec<(String, String, u64, u64, String, u64, u64)>,
 }
 
 fn lexical_source_policy(
@@ -1965,10 +3570,15 @@ fn lexical_source_policy(
     let Some(storage_path) = source_storage_path else {
         return Ok(LexicalSourcePolicy {
             max_file_bytes: MAX_FILE_BYTES,
+            policy_version: codestory_contracts::workspace::OVERSIZED_SOURCE_POLICY_VERSION.into(),
+            structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
             excluded_paths: HashSet::new(),
+            exclusion_evidence: Vec::new(),
         });
     };
-    if !storage_path.is_file() {
+    if !codestory_store::core_database_exists(storage_path)
+        .context("resolve pinned core publication for lexical source policy")?
+    {
         bail!(
             "pinned core storage for lexical source policy is missing: {}",
             storage_path.display()
@@ -2017,12 +3627,30 @@ fn lexical_source_policy(
         bail!("lexical source policy publication changed while it was being pinned");
     }
 
+    let mut exclusion_evidence = records
+        .iter()
+        .map(|record| {
+            (
+                record.normalized_path.clone(),
+                record.content_hash.clone(),
+                record.observed_size,
+                record.observed_unit_count,
+                record.policy_version.clone(),
+                record.byte_cap,
+                record.structural_unit_cap,
+            )
+        })
+        .collect::<Vec<_>>();
+    exclusion_evidence.sort();
     Ok(LexicalSourcePolicy {
         max_file_bytes: validated.byte_cap,
+        policy_version: validated.policy_version,
+        structural_unit_cap: validated.structural_unit_cap,
         excluded_paths: records
             .into_iter()
             .map(|record| record.normalized_path)
             .collect(),
+        exclusion_evidence,
     })
 }
 
@@ -2109,13 +3737,6 @@ fn push_coverage_sample(sample: &mut Vec<String>, path: String) {
     }
 }
 
-fn lexical_documents_hasher() -> Sha256 {
-    let mut hasher = Sha256::new();
-    hasher.update(b"codestory-sqlite-lexical-v1");
-    hasher.update(LEXICAL_INDEX_VERSION.as_bytes());
-    hasher
-}
-
 fn hash_lexical_document(hasher: &mut Sha256, document: &LexicalDocument) {
     for value in [
         document.path.as_str(),
@@ -2157,18 +3778,42 @@ fn stable_lexical_document_id(document_key: &str) -> i64 {
     i64::from_le_bytes(prefix) & i64::MAX
 }
 
-fn finish_lexical_documents_hash(mut hasher: Sha256, coverage: &LexicalCoverage) -> String {
-    hasher.update(serde_json::to_vec(coverage).unwrap_or_default());
-    format!("{:x}", hasher.finalize())
+fn lexical_fingerprint_from_document_hashes(
+    documents: &BTreeMap<String, String>,
+    coverage: &LexicalCoverage,
+) -> Result<LexicalInputFingerprint> {
+    let file_count = u32::try_from(documents.len()).context("lexical document count overflow")?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"codestory-sqlite-lexical-key-hash-v2\0");
+    hasher.update(LEXICAL_INDEX_VERSION.as_bytes());
+    hasher.update(file_count.to_le_bytes());
+    let coverage_bytes = serde_json::to_vec(coverage)?;
+    hasher.update((coverage_bytes.len() as u64).to_le_bytes());
+    hasher.update(coverage_bytes);
+    for (key, document_hash) in documents {
+        if key.is_empty()
+            || document_hash.len() != 64
+            || !document_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("lexical document state contains an invalid key or hash");
+        }
+        for value in [key.as_bytes(), document_hash.as_bytes()] {
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+    }
+    Ok(LexicalInputFingerprint {
+        file_count,
+        hash: format!("{:x}", hasher.finalize()),
+        coverage: coverage.clone(),
+    })
 }
 
 #[cfg(test)]
 fn lexical_documents_hash(documents: &[LexicalDocument], coverage: &LexicalCoverage) -> String {
-    let mut hasher = lexical_documents_hasher();
-    for document in documents {
-        hash_lexical_document(&mut hasher, document);
-    }
-    finish_lexical_documents_hash(hasher, coverage)
+    prepared_lexical_fingerprint(documents, coverage)
+        .expect("test lexical documents are valid")
+        .hash
 }
 
 fn normalize_lexical_text(value: &str) -> String {
@@ -2587,6 +4232,7 @@ mod tests {
             fingerprint: prepared_lexical_fingerprint(&documents, &coverage).expect("fingerprint"),
             documents,
             source_seals: Vec::new(),
+            bounded_state: None,
         }
     }
 
@@ -2664,6 +4310,108 @@ mod tests {
     }
 
     #[test]
+    fn one_document_refresh_appends_a_bounded_delta_and_compacts_off_path() {
+        let root = TempDir::new().expect("tempdir");
+        let data = root.path().join("delta-chain");
+        let mut documents = (0..256)
+            .map(|index| {
+                source_document(
+                    &format!("src/{index}.rs"),
+                    &format!("stable_{index} {}", "padding ".repeat(96)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let initial = prepared_documents(documents.clone());
+        build_prepared_lexical_shard(&data, "g0", &initial, "input-0", None, || Ok(()))
+            .expect("initial lexical base");
+        let initial_base = shard_dir_for(&data, "g0").join(LEXICAL_INDEX_FILE);
+        let initial_identity = codestory_workspace::workspace_path_identity(&initial_base)
+            .expect("initial base identity");
+
+        let mut previous = "g0".to_string();
+        let mut current = initial;
+        for revision in 1..=LEXICAL_DELTA_COMPACTION_COUNT {
+            documents[0] = source_document(
+                "src/0.rs",
+                &format!(
+                    "bounded_delta_revision_{revision} {}",
+                    "padding ".repeat(96)
+                ),
+            );
+            current = prepared_documents(documents.clone());
+            let generation = format!("g{revision}");
+            let (_, work) = build_prepared_lexical_shard(
+                &data,
+                &generation,
+                &current,
+                &format!("input-{revision}"),
+                Some(&previous),
+                || Ok(()),
+            )
+            .expect("append lexical delta");
+            let work = work.expect("incremental work");
+            assert_eq!(work.retained, 255);
+            assert_eq!(work.inserted, 1);
+            assert_eq!(work.removed, 1);
+            previous = generation;
+        }
+
+        let final_shard = shard_dir_for(&data, &previous);
+        let component_set = read_lexical_component_set(
+            &final_shard,
+            Some(&previous),
+            Some(&format!("input-{}", LEXICAL_DELTA_COMPACTION_COUNT)),
+        )
+        .expect("read delta component set")
+        .expect("delta component set");
+        assert_eq!(component_set.deltas.len(), LEXICAL_DELTA_COMPACTION_COUNT);
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(
+                &final_shard.join(&component_set.base.file_name)
+            )
+            .expect("retained base identity"),
+            initial_identity,
+            "foreground one-document refreshes must retain the immutable base by identity",
+        );
+        assert_eq!(
+            search_lexical_index(
+                &final_shard,
+                &format!("input-{}", LEXICAL_DELTA_COMPACTION_COUNT),
+                &format!("bounded_delta_revision_{}", LEXICAL_DELTA_COMPACTION_COUNT),
+                8,
+            )
+            .expect("search delta chain")
+            .first()
+            .map(|hit| hit.path.as_str()),
+            Some("src/0.rs")
+        );
+
+        compact_lexical_component_set(&final_shard, &current, &component_set)
+            .expect("compact outside foreground publication");
+        let compacted = read_lexical_component_set(
+            &final_shard,
+            Some(&previous),
+            Some(&format!("input-{}", LEXICAL_DELTA_COMPACTION_COUNT)),
+        )
+        .expect("read compacted set")
+        .expect("compacted set");
+        assert!(compacted.deltas.is_empty());
+        assert_ne!(compacted.base.file_name, component_set.base.file_name);
+        assert_eq!(
+            search_lexical_index(
+                &final_shard,
+                &format!("input-{}", LEXICAL_DELTA_COMPACTION_COUNT),
+                &format!("bounded_delta_revision_{}", LEXICAL_DELTA_COMPACTION_COUNT),
+                8,
+            )
+            .expect("search compacted base")
+            .first()
+            .map(|hit| hit.path.as_str()),
+            Some("src/0.rs")
+        );
+    }
+
+    #[test]
     fn publication_only_lexical_churn_directly_references_the_component_without_clone() {
         let root = TempDir::new().expect("tempdir");
         let data = root.path().join("data");
@@ -2699,11 +4447,133 @@ mod tests {
             codestory_workspace::workspace_path_identity(&current_path).expect("current identity"),
             "publication-only churn must retain the exact immutable physical component",
         );
+        let aliased_receipt = lexical_shard_receipt_stats(&data, "current")
+            .expect("direct reference inherits the validated lexical receipt");
+        assert_eq!(aliased_receipt.validations, 1);
+        let component_set_key = shard_dir_for(&data, "current").join(LEXICAL_COMPONENT_SET_FILE);
+        let produced_set_receipt = LEXICAL_COMPONENT_SET_RECEIPTS
+            .stats(&component_set_key)
+            .expect("the owning producer seals the reconciled component set");
+        assert_eq!(produced_set_receipt.validations, 1);
         assert_eq!(
             search_lexical_index(&shard_dir_for(&data, "current"), "input-v2", "alpha", 8)
                 .expect("search current envelope")
                 .len(),
             1,
+        );
+        let reused_receipt = lexical_shard_receipt_stats(&data, "current")
+            .expect("current lexical receipt remains sealed");
+        assert_eq!(reused_receipt.validations, 1);
+        assert!(reused_receipt.reuses > aliased_receipt.reuses);
+        let reused_set_receipt = LEXICAL_COMPONENT_SET_RECEIPTS
+            .stats(&component_set_key)
+            .expect("component-set receipt remains sealed");
+        assert_eq!(reused_set_receipt.validations, 1);
+        assert!(reused_set_receipt.reuses > produced_set_receipt.reuses);
+
+        let refresh = capture_lexical_generation_receipts(&data, "current")
+            .expect("capture current receipts before owned cleanup");
+        std::fs::remove_file(&previous_path).expect("retire predecessor hard link");
+        let (refreshed, refused) = refresh.refresh_after_owned_link_cleanup();
+        assert!(refreshed >= 2);
+        assert_eq!(refused, 0);
+        assert_eq!(
+            search_lexical_index(&shard_dir_for(&data, "current"), "input-v2", "beta", 8)
+                .expect("search after predecessor cleanup")
+                .len(),
+            1,
+        );
+        assert_eq!(
+            lexical_shard_receipt_stats(&data, "current")
+                .expect("cleanup refreshed current receipt")
+                .validations,
+            1,
+            "owned hard-link cleanup must not force another full lexical scan",
+        );
+    }
+
+    #[test]
+    fn bounded_source_transition_matches_full_fingerprint_and_reads_one_document() {
+        let root = TempDir::new().expect("tempdir");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(project.join("src")).expect("create source directory");
+        std::fs::write(project.join("src/a.rs"), "old alpha\n").expect("write changed source");
+        std::fs::write(project.join("src/b.rs"), "stable beta\n").expect("write stable source");
+
+        let previous_storage_path = root.path().join("previous.sqlite3");
+        let current_storage_path = root.path().join("current.sqlite3");
+        let mut previous_storage = Store::open(&previous_storage_path).expect("previous store");
+        let mut current_storage = Store::open(&current_storage_path).expect("current store");
+        publish_test_source_policy(&mut previous_storage, &project, MAX_FILE_BYTES, &[]);
+        publish_test_source_policy(&mut current_storage, &project, MAX_FILE_BYTES, &[]);
+        drop(previous_storage);
+        drop(current_storage);
+
+        let data = root.path().join("lexical");
+        let previous = prepared_documents(vec![
+            source_document("src/a.rs", "old alpha\n"),
+            source_document("src/b.rs", "stable beta\n"),
+        ]);
+        build_prepared_lexical_shard(&data, "previous", &previous, "input-v1", None, || Ok(()))
+            .expect("previous lexical generation");
+        let previous_base = shard_dir_for(&data, "previous").join(LEXICAL_INDEX_FILE);
+        let previous_base_identity = codestory_workspace::workspace_path_identity(&previous_base)
+            .expect("previous base identity");
+
+        std::fs::write(project.join("src/a.rs"), "changed gamma\n").expect("change one source");
+        let policy = codestory_contracts::workspace::SourceIndexPolicy::default();
+        let source_seals = observe_lexical_source_seals(&project, Some(&current_storage_path))
+            .expect("seal complete core inventory");
+        let bounded = prepare_bounded_lexical_input(
+            &project,
+            &current_storage_path,
+            &previous_storage_path,
+            &data,
+            "previous",
+            &["src/a.rs".into()],
+            &source_seals,
+            &policy,
+        )
+        .expect("prepare bounded transition")
+        .expect("bounded transition eligible");
+        assert_eq!(bounded.documents.len(), 1);
+        let full = prepared_documents(vec![
+            source_document("src/a.rs", "changed gamma\n"),
+            source_document("src/b.rs", "stable beta\n"),
+        ]);
+        assert_eq!(bounded.fingerprint, full.fingerprint);
+
+        let (_, work) = build_prepared_lexical_shard(
+            &data,
+            "current",
+            &bounded,
+            "input-v2",
+            Some("previous"),
+            || Ok(()),
+        )
+        .expect("publish bounded transition");
+        let work = work.expect("bounded delta work");
+        assert_eq!((work.retained, work.inserted, work.removed), (1, 1, 1));
+        let current_set = read_lexical_component_set(
+            &shard_dir_for(&data, "current"),
+            Some("current"),
+            Some("input-v2"),
+        )
+        .expect("read current component set")
+        .expect("current component set");
+        assert_eq!(
+            codestory_workspace::workspace_path_identity(
+                &shard_dir_for(&data, "current").join(&current_set.base.file_name),
+            )
+            .expect("current base identity"),
+            previous_base_identity,
+        );
+        assert_eq!(
+            search_lexical_index(&shard_dir_for(&data, "current"), "input-v2", "gamma", 8,)
+                .expect("search bounded transition")
+                .first()
+                .map(|hit| hit.path.as_str()),
+            Some("src/a.rs"),
         );
     }
 
@@ -2851,12 +4721,71 @@ mod tests {
                 end_byte: 7,
             })
         );
+        let descriptor_hits =
+            search_lexical_index_descriptors_with_cancel(&shard_a, "input-a", "handler", 1, || {
+                false
+            })
+            .expect("descriptor search");
+        assert_eq!(descriptor_hits[0].path, "src/z_strong_handler.rs");
+        assert_eq!(descriptor_hits[0].source_excerpt, None);
+        assert_eq!(descriptor_hits[0].target, None);
         assert!(
             search_lexical_index(&shard_a, "input-a", "project_b_handler", 8)
                 .expect("isolated search")
                 .is_empty()
         );
         assert!(search_lexical_index(&shard_a, "wrong-input", "handler", 8).is_err());
+    }
+
+    #[test]
+    fn descriptor_search_never_materializes_the_stored_source_body() {
+        let connection = Connection::open_in_memory().expect("in-memory lexical database");
+        connection
+            .execute_batch(
+                "CREATE TABLE lexical_documents (
+                     id INTEGER PRIMARY KEY,
+                     path TEXT NOT NULL,
+                     content TEXT NOT NULL,
+                     source TEXT NOT NULL,
+                     node_id TEXT,
+                     symbol_name TEXT,
+                     start_line INTEGER
+                 );
+                 CREATE VIRTUAL TABLE lexical_fts USING fts5(path, content);
+                 INSERT INTO lexical_documents
+                     (id, path, content, source, node_id, symbol_name, start_line)
+                 VALUES (1, 'src/needle.rs', X'80', 'lexical_source', '7', 'needle', 1);
+                 INSERT INTO lexical_fts(rowid, path, content)
+                 VALUES (1, 'src/needle.rs', 'needle implementation');",
+            )
+            .expect("descriptor fixture");
+
+        let descriptors = search_lexical_index_on_connection(
+            &connection,
+            "needle",
+            1,
+            1,
+            &mut HashMap::new(),
+            &|| false,
+            LexicalHitPayload::DescriptorOnly,
+        )
+        .expect("descriptor path reads FTS membership and metadata only");
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].node_id.as_deref(), Some("7"));
+        assert!(descriptors[0].source_excerpt.is_none());
+        assert!(
+            search_lexical_index_on_connection(
+                &connection,
+                "needle",
+                1,
+                1,
+                &mut HashMap::new(),
+                &|| false,
+                LexicalHitPayload::Full,
+            )
+            .is_err(),
+            "the hostile stored body must fail if a query tries to materialize it"
+        );
     }
 
     #[test]

@@ -130,8 +130,16 @@ pub(crate) fn build_callable_projection_states(
         });
     }
 
-    states.sort_by(|lhs, rhs| lhs.symbol_key.cmp(&rhs.symbol_key));
-    states
+    // SQLite owns one row per `(file_id, symbol_key)` and its UPSERT contract
+    // retains the last projected row. Canonicalize to that exact shape before
+    // comparing a refresh: otherwise an earlier duplicate can disagree with
+    // the stored last row and manufacture a full replacement even though the
+    // database-visible projection is unchanged.
+    let mut states_by_key = BTreeMap::new();
+    for state in states {
+        states_by_key.insert(state.symbol_key.clone(), state);
+    }
+    states_by_key.into_values().collect()
 }
 
 /// Tag for a normalized signature whose body projected at least one part.

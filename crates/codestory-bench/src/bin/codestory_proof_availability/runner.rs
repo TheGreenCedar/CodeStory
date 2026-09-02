@@ -18,7 +18,7 @@ use super::report::QualificationReportInputV1;
 use super::resolution_funnel::build_repository_resolution_funnel;
 use super::trails::count_store_trails;
 use anyhow::{Context, Result, bail};
-use codestory_agent::proof_qualification_support::{
+use codestory_runtime::proof_qualification_support::{
     InternalProjection, ValidationOutcome, validate_contract,
 };
 use codestory_runtime::proof_qualification_support::{
@@ -479,7 +479,7 @@ fn build_failure_funnel(cases: &[CaseReportV1]) -> Result<FailureFunnelReportV1>
                     .checked_add(1)
                     .context("proof_availability_classified_overflow")?;
                 let key =
-                    codestory_agent::proof_qualification_support::canonical_json_bytes(&outcome)
+                    codestory_runtime::proof_qualification_support::canonical_json_bytes(&outcome)
                         .map_err(|error| anyhow::anyhow!(error))?;
                 let entry = buckets.entry(key).or_insert((outcome, 0));
                 entry.1 = entry
@@ -531,12 +531,12 @@ fn duration_sum_millis<const N: usize>(durations: [Duration; N]) -> Result<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codestory_agent::proof_qualification_support::{
+    use codestory_contracts::api::IndexMode;
+    use codestory_contracts::graph::NodeKind;
+    use codestory_runtime::proof_qualification_support::{
         ClauseAnchor, ClauseClassification, ProofContractField, UnvalidatedCallPathContract,
         UnvalidatedCallPathSpec, UnvalidatedDirectCallStep, UnvalidatedExactSymbolSelector,
     };
-    use codestory_contracts::api::IndexMode;
-    use codestory_contracts::graph::NodeKind;
     use std::fs;
 
     #[test]

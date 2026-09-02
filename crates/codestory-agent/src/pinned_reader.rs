@@ -54,8 +54,6 @@ pub enum ContinuationRefusal {
     /// The continuation named a retrieval generation that is not the pinned one
     /// (including the case where no retrieval publication is selected).
     RetrievalGenerationChanged,
-    /// The continuation carries no query to continue.
-    EmptyQuery,
 }
 
 impl ContinuationRefusal {
@@ -69,7 +67,6 @@ impl ContinuationRefusal {
             | Self::ProjectChanged
             | Self::CoreGenerationChanged
             | Self::RetrievalGenerationChanged => PacketProbeRejectionCodeDto::StaleContinuation,
-            Self::EmptyQuery => PacketProbeRejectionCodeDto::MalformedProbe,
         }
     }
 
@@ -87,25 +84,22 @@ impl ContinuationRefusal {
             Self::RetrievalGenerationChanged => {
                 "continuation retrieval generation is no longer selected".to_string()
             }
-            Self::EmptyQuery => "continuation query must not be empty".to_string(),
         }
     }
 }
 
 /// Decide whether a continuation probe may be planned against the pinned state.
 ///
-/// Returns the trimmed continuation query on admission. The checks run in
-/// pin-widening order — contract, project, core generation, retrieval
-/// generation, query — so a caller learns the outermost reason first and the
-/// reader is never asked for a pin the previous check already refused.
+/// The checks run in pin-widening order — contract, project, core generation,
+/// retrieval generation — so a caller learns the outermost reason first and
+/// the reader is never asked for a pin the previous check already refused.
 pub fn admit_continuation_probe(
     reader: &dyn PinnedReader,
     contract_version: u32,
     project_id: &str,
     core_generation_id: &str,
     retrieval_generation: Option<&str>,
-    query: &str,
-) -> Result<String, ContinuationRefusal> {
+) -> Result<(), ContinuationRefusal> {
     if contract_version != PACKET_PROBE_CONTRACT_VERSION {
         return Err(ContinuationRefusal::IncompatibleContract {
             requested: contract_version,
@@ -130,11 +124,7 @@ pub fn admit_continuation_probe(
     {
         return Err(ContinuationRefusal::RetrievalGenerationChanged);
     }
-    let query = query.trim();
-    if query.is_empty() {
-        return Err(ContinuationRefusal::EmptyQuery);
-    }
-    Ok(query.to_string())
+    Ok(())
 }
 
 #[cfg(test)]
@@ -200,20 +190,18 @@ mod tests {
         project_id: &str,
         core_generation_id: &str,
         retrieval_generation: Option<&str>,
-        query: &str,
-    ) -> Result<String, ContinuationRefusal> {
+    ) -> Result<(), ContinuationRefusal> {
         admit_continuation_probe(
             reader,
             contract_version,
             project_id,
             core_generation_id,
             retrieval_generation,
-            query,
         )
     }
 
     #[test]
-    fn a_continuation_matching_every_pin_is_admitted_with_a_trimmed_query() {
+    fn a_continuation_matching_every_pin_is_admitted() {
         let reader = RecordingReader::pinned();
         assert_eq!(
             admit(
@@ -222,9 +210,8 @@ mod tests {
                 "project-a",
                 "core-7",
                 Some("retrieval-7"),
-                "  AppController::open  ",
             ),
-            Ok("AppController::open".to_string())
+            Ok(())
         );
         assert_eq!(reader.reads(), ["project", "core", "retrieval"]);
     }
@@ -237,7 +224,6 @@ mod tests {
         &'static str,
         &'static str,
         Option<&'static str>,
-        &'static str,
         PacketProbeRejectionCodeDto,
         String,
     );
@@ -265,7 +251,6 @@ mod tests {
                 "project-a",
                 "core-7",
                 None,
-                "query",
                 PacketProbeRejectionCodeDto::IncompatibleContinuation,
                 format!(
                     "continuation contract {} is incompatible with {PACKET_PROBE_CONTRACT_VERSION}",
@@ -278,7 +263,6 @@ mod tests {
                 "project-a",
                 "core-7",
                 None,
-                "query",
                 PacketProbeRejectionCodeDto::StaleContinuation,
                 "continuation requires an open project".to_string(),
             ),
@@ -288,7 +272,6 @@ mod tests {
                 "project-b",
                 "core-7",
                 None,
-                "query",
                 PacketProbeRejectionCodeDto::StaleContinuation,
                 "continuation belongs to a different project".to_string(),
             ),
@@ -298,7 +281,6 @@ mod tests {
                 "project-a",
                 "core-6",
                 None,
-                "query",
                 PacketProbeRejectionCodeDto::StaleContinuation,
                 "continuation core generation is no longer selected".to_string(),
             ),
@@ -308,7 +290,6 @@ mod tests {
                 "project-a",
                 "core-7",
                 None,
-                "query",
                 PacketProbeRejectionCodeDto::StaleContinuation,
                 "continuation core generation is no longer selected".to_string(),
             ),
@@ -318,7 +299,6 @@ mod tests {
                 "project-a",
                 "core-7",
                 Some("retrieval-6"),
-                "query",
                 PacketProbeRejectionCodeDto::StaleContinuation,
                 "continuation retrieval generation is no longer selected".to_string(),
             ),
@@ -328,24 +308,13 @@ mod tests {
                 "project-a",
                 "core-7",
                 Some("retrieval-7"),
-                "query",
                 PacketProbeRejectionCodeDto::StaleContinuation,
                 "continuation retrieval generation is no longer selected".to_string(),
             ),
-            (
-                pinned(),
-                PACKET_PROBE_CONTRACT_VERSION,
-                "project-a",
-                "core-7",
-                Some("retrieval-7"),
-                "   ",
-                PacketProbeRejectionCodeDto::MalformedProbe,
-                "continuation query must not be empty".to_string(),
-            ),
         ];
 
-        for (reader, contract, project, core, retrieval, query, code, message) in cases {
-            let refusal = admit(&reader, contract, project, core, retrieval, query)
+        for (reader, contract, project, core, retrieval, code, message) in cases {
+            let refusal = admit(&reader, contract, project, core, retrieval)
                 .expect_err("this continuation must be refused");
             assert_eq!(refusal.code(), code, "code for {refusal:?}");
             assert_eq!(refusal.message(), message, "message for {refusal:?}");
@@ -361,7 +330,6 @@ mod tests {
             "project-a",
             "core-7",
             Some("retrieval-7"),
-            "query",
         )
         .expect_err("an incompatible contract is refused before any pin is read");
         assert_eq!(reader.reads(), Vec::<&str>::new());
@@ -373,7 +341,6 @@ mod tests {
             "project-b",
             "core-7",
             Some("retrieval-7"),
-            "query",
         )
         .expect_err("a foreign project is refused before the generations are read");
         assert_eq!(reader.reads(), ["project"]);
@@ -385,7 +352,6 @@ mod tests {
             "project-a",
             "core-6",
             Some("retrieval-7"),
-            "query",
         )
         .expect_err("a stale core generation is refused before retrieval is read");
         assert_eq!(reader.reads(), ["project", "core"]);
@@ -404,9 +370,8 @@ mod tests {
                 "project-a",
                 "core-7",
                 None,
-                "query",
             ),
-            Ok("query".to_string())
+            Ok(())
         );
         assert_eq!(reader.reads(), ["project", "core"]);
     }

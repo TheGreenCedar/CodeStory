@@ -117,6 +117,20 @@ pub trait SidecarSearch: Send + Sync {
         context.run(|| self.lexical_search(query, limit))
     }
 
+    fn lexical_descriptor_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        let mut hits = self.lexical_search_with_context(query, limit, context)?;
+        for hit in &mut hits {
+            hit.source_excerpt = None;
+            hit.target = None;
+        }
+        Ok(hits)
+    }
+
     fn semantic_search_with_context(
         &self,
         query: &str,
@@ -294,6 +308,23 @@ impl SidecarSearch for LiveSidecarSearch {
     ) -> Result<Vec<CandidateHit>> {
         let context = context.clone();
         self.lexical.search_with_cancel(
+            &self.layout,
+            &self.sidecar_generation,
+            &self.sidecar_input_hash,
+            query,
+            limit,
+            move || context.is_cancelled(),
+        )
+    }
+
+    fn lexical_descriptor_search_with_context(
+        &self,
+        query: &str,
+        limit: usize,
+        context: &SearchExecutionContext,
+    ) -> Result<Vec<CandidateHit>> {
+        let context = context.clone();
+        self.lexical.search_descriptors_with_cancel(
             &self.layout,
             &self.sidecar_generation,
             &self.sidecar_input_hash,

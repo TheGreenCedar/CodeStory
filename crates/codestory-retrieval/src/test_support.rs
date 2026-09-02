@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use codestory_contracts::api::EmbeddingVectorPublicationIdentityDto;
 use codestory_contracts::owned_artifacts::embedded_model_digest_root;
 use codestory_store::{
-    RetrievalIndexManifest, RetrievalIndexRollbackRecord, SourcePolicyExclusionPolicyIdentity,
-    Store,
+    RetrievalIndexManifest, RetrievalIndexRollbackRecord, SnapshotStore,
+    SourcePolicyExclusionPolicyIdentity, Store,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -41,6 +41,9 @@ pub fn publish_complete_core_fixture(
             &[],
         )
         .context("publish empty source policy exclusion fixture")?;
+    storage
+        .publish_dense_anchor_generation(publication, crate::generation::SEMANTIC_POLICY_VERSION)
+        .context("publish empty dense-anchor fixture")?;
     storage
         .put_index_publication(publication)
         .context("publish complete core fixture")?;
@@ -195,14 +198,45 @@ pub fn publish_zero_dense_pinned_query_fixture(
             None,
             u32::try_from(embedding_dim).context("negative embedding dimension")?,
         )?;
-    let mut storage = Store::open(storage_path).context("open pinned query fixture storage")?;
-    let publication = storage
-        .get_complete_index_publication()
-        .context("load pinned query fixture publication")?
-        .context("pinned query fixture requires a complete core publication")?;
-    storage
-        .publish_dense_anchor_generation(&publication, crate::generation::SEMANTIC_POLICY_VERSION)
-        .context("publish pinned query fixture dense-anchor manifest")?;
+    // Published cores are immutable: Live `Store::open` becomes read-only once
+    // a generation pointer exists. Dense-anchor publication must already be
+    // sealed into that generation. Mutable opens remain only for pre-pointer
+    // fixture cores that still need an empty dense-anchor marker written.
+    // Retrieval manifests still publish through the external retrieval DB when
+    // a pointer is present.
+    let layout = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
+        .context("resolve pinned query fixture core layout")?;
+    let (mut storage, publication) = if layout
+        .read_pointer()
+        .context("read pinned query fixture publication pointer")?
+        .is_some()
+    {
+        let storage =
+            Store::open_read_only(storage_path).context("open sealed pinned query fixture")?;
+        let publication = storage
+            .get_complete_index_publication()
+            .context("load sealed pinned query fixture publication")?
+            .context("pinned query fixture requires a complete core publication")?;
+        storage
+            .validate_dense_anchor_publication(&publication)
+            .context(
+                "immutable core fixture requires a sealed dense-anchor publication from staging",
+            )?;
+        (storage, publication)
+    } else {
+        let mut storage = Store::open(storage_path).context("open pinned query fixture storage")?;
+        let publication = storage
+            .get_complete_index_publication()
+            .context("load pinned query fixture publication")?
+            .context("pinned query fixture requires a complete core publication")?;
+        storage
+            .publish_dense_anchor_generation(
+                &publication,
+                crate::generation::SEMANTIC_POLICY_VERSION,
+            )
+            .context("publish pinned query fixture dense-anchor manifest")?;
+        (storage, publication)
+    };
     let input = crate::index::compute_sidecar_input_fingerprint(
         &storage,
         project_root,
@@ -368,12 +402,25 @@ pub fn publish_replacement_core_and_zero_dense_fixture(
     generation_id: &str,
     run_id: &str,
 ) -> Result<RetrievalIndexManifest> {
-    let mut storage = Store::open(storage_path).context("open replacement core fixture storage")?;
-    let source_policy = storage
+    let mut staged = SnapshotStore::clone_live_to_staged(storage_path)
+        .context("clone live core for replacement fixture")?;
+    let previous = staged
+        .store_mut()
+        .get_complete_index_publication()
+        .context("load replacement core previous publication")?
+        .context("replacement core fixture requires a previous complete publication")?;
+    let dense_policy_version = staged
+        .store_mut()
+        .get_dense_anchor_publication_manifest()
+        .context("load replacement core dense-anchor publication")?
+        .map(|manifest| manifest.policy_version);
+    let source_policy = staged
+        .store_mut()
         .get_source_policy_exclusion_manifest()
         .context("load replacement core source policy manifest")?
         .context("replacement core fixture requires a source policy manifest")?;
-    let source_policy_candidates = storage
+    let source_policy_candidates = staged
+        .store_mut()
         .get_source_policy_exclusions()
         .context("load replacement core source policy exclusions")?
         .into_iter()
@@ -396,26 +443,39 @@ pub fn publish_replacement_core_and_zero_dense_fixture(
         mode: codestory_store::IndexPublicationMode::Full,
         published_at_epoch_ms: 2,
     };
-    storage
-        .publish_structural_text_unit_generation(&publication)
-        .context("publish replacement core structural text unit manifest")?;
-    storage
-        .publish_source_policy_exclusion_generation(
-            &publication,
-            &source_policy.project_id,
-            &source_policy.workspace_id,
-            SourcePolicyExclusionPolicyIdentity::new(
-                &source_policy.policy_version,
-                source_policy.byte_cap,
-                source_policy.structural_unit_cap,
-            ),
-            &source_policy_candidates,
-        )
-        .context("publish replacement core source policy manifest")?;
-    storage
-        .put_index_publication(&publication)
-        .context("publish replacement core fixture identity")?;
-    drop(storage);
+    if let Some(policy_version) = dense_policy_version.as_deref() {
+        staged
+            .rebind_inherited_dense_anchor_generation(&previous, &publication, policy_version)
+            .context("rebind replacement core dense-anchor identity")?;
+    }
+    staged
+        .rebind_inherited_structural_text_generation(&previous, &publication, &[])
+        .context("rebind replacement core structural text identity")?;
+    staged
+        .rebind_inherited_proof_resolution_source_identities(&previous, &publication, &[])
+        .context("rebind replacement core proof resolution identity")?;
+    {
+        let storage = staged.store_mut();
+        storage
+            .publish_source_policy_exclusion_generation(
+                &publication,
+                &source_policy.project_id,
+                &source_policy.workspace_id,
+                SourcePolicyExclusionPolicyIdentity::new(
+                    &source_policy.policy_version,
+                    source_policy.byte_cap,
+                    source_policy.structural_unit_cap,
+                ),
+                &source_policy_candidates,
+            )
+            .context("publish replacement core source policy manifest")?;
+        storage
+            .put_index_publication(&publication)
+            .context("publish replacement core fixture identity")?;
+    }
+    staged
+        .publish(storage_path)
+        .context("publish replacement core fixture")?;
     publish_zero_dense_pinned_query_fixture(project_root, storage_path, runtime)
 }
 

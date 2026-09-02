@@ -12,10 +12,15 @@
 
 pub mod api;
 pub mod bounded_locks;
+pub mod call_path;
+pub mod call_path_public;
+pub mod compilation;
 pub mod config_registry;
+pub mod core_publication;
 pub mod events;
 pub mod graph;
 pub mod grounding;
+pub mod installed_agent_timing;
 pub mod language_support;
 pub mod owned_artifacts;
 pub mod packet_projection_v3;

@@ -1,5 +1,5 @@
 use anyhow::{Result, bail};
-use codestory_agent::proof_qualification_support as product_proof;
+use codestory_runtime::proof_qualification_support as product_proof;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1212,22 +1212,22 @@ pub enum RawAdmissionFailureV1 {
     CallsiteLineMismatch,
     CallsiteRawTargetMismatch,
 }
-impl From<codestory_agent::proof_qualification_support::RawAdmissionFailure>
+impl From<codestory_runtime::proof_qualification_support::RawAdmissionFailure>
     for RawAdmissionFailureV1
 {
-    fn from(value: codestory_agent::proof_qualification_support::RawAdmissionFailure) -> Self {
+    fn from(value: codestory_runtime::proof_qualification_support::RawAdmissionFailure) -> Self {
         match value {
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongKind => Self::WrongKind,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource => Self::WrongEffectiveSource,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget => Self::WrongEffectiveTarget,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget => Self::MissingExactResolvedTarget,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CandidateAlternativesRetained => Self::CandidateAlternativesRetained,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingFileNode => Self::MissingFileNode,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::MissingLine => Self::MissingLine,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity => Self::InvalidOrLegacyCallsiteIdentity,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteFileMismatch => Self::CallsiteFileMismatch,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteLineMismatch => Self::CallsiteLineMismatch,
-            codestory_agent::proof_qualification_support::RawAdmissionFailure::CallsiteRawTargetMismatch => Self::CallsiteRawTargetMismatch,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::WrongKind => Self::WrongKind,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::WrongEffectiveSource => Self::WrongEffectiveSource,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::WrongEffectiveTarget => Self::WrongEffectiveTarget,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::MissingExactResolvedTarget => Self::MissingExactResolvedTarget,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::CandidateAlternativesRetained => Self::CandidateAlternativesRetained,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::MissingFileNode => Self::MissingFileNode,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::MissingLine => Self::MissingLine,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::InvalidOrLegacyCallsiteIdentity => Self::InvalidOrLegacyCallsiteIdentity,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::CallsiteFileMismatch => Self::CallsiteFileMismatch,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::CallsiteLineMismatch => Self::CallsiteLineMismatch,
+            codestory_runtime::proof_qualification_support::RawAdmissionFailure::CallsiteRawTargetMismatch => Self::CallsiteRawTargetMismatch,
         }
     }
 }
@@ -1402,14 +1402,16 @@ impl From<codestory_runtime::proof_qualification_support::SelectorFailure> for S
     }
 }
 
-impl From<codestory_agent::proof_qualification_support::UnavailableReason> for UnavailableReasonV1 {
-    fn from(value: codestory_agent::proof_qualification_support::UnavailableReason) -> Self {
+impl From<codestory_runtime::proof_qualification_support::UnavailableReason>
+    for UnavailableReasonV1
+{
+    fn from(value: codestory_runtime::proof_qualification_support::UnavailableReason) -> Self {
         match value {
-            codestory_agent::proof_qualification_support::UnavailableReason::ValidatedContractHashMismatch => Self::ValidatedContractHashMismatch,
-            codestory_agent::proof_qualification_support::UnavailableReason::PublicationPinMismatch => Self::PublicationPinMismatch,
-            codestory_agent::proof_qualification_support::UnavailableReason::SourceNotBoundToPublication => Self::SourceNotBoundToPublication,
-            codestory_agent::proof_qualification_support::UnavailableReason::ProofFactsUnavailable => Self::ProofFactsUnavailable,
-            codestory_agent::proof_qualification_support::UnavailableReason::ProofSemanticProjectionUnavailable => Self::ProofFactsUnavailable,
+            codestory_runtime::proof_qualification_support::UnavailableReason::ValidatedContractHashMismatch => Self::ValidatedContractHashMismatch,
+            codestory_runtime::proof_qualification_support::UnavailableReason::PublicationPinMismatch => Self::PublicationPinMismatch,
+            codestory_runtime::proof_qualification_support::UnavailableReason::SourceNotBoundToPublication => Self::SourceNotBoundToPublication,
+            codestory_runtime::proof_qualification_support::UnavailableReason::ProofFactsUnavailable => Self::ProofFactsUnavailable,
+            codestory_runtime::proof_qualification_support::UnavailableReason::ProofSemanticProjectionUnavailable => Self::ProofFactsUnavailable,
         }
     }
 }
@@ -2382,13 +2384,13 @@ pub struct ResolvedNodeIdentityV1 {
     pub qualified_name: String,
     pub project_file_components: Vec<String>,
 }
-impl TryFrom<&codestory_agent::proof_qualification_support::ResolvedNodeIdentity>
+impl TryFrom<&codestory_runtime::proof_qualification_support::ResolvedNodeIdentity>
     for ResolvedNodeIdentityV1
 {
     type Error = anyhow::Error;
 
     fn try_from(
-        value: &codestory_agent::proof_qualification_support::ResolvedNodeIdentity,
+        value: &codestory_runtime::proof_qualification_support::ResolvedNodeIdentity,
     ) -> Result<Self> {
         let pinned = PinnedNodeIdentityV1 {
             project_id: value.pinned.project_id.clone(),
@@ -2466,7 +2468,7 @@ pub struct ObservedReceiptV1 {
 impl ObservedReceiptV1 {
     pub fn from_task6(
         step_index: u8,
-        receipt: &codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt,
+        receipt: &codestory_runtime::proof_qualification_support::IndexedCallEdgeReceipt,
         oracle_comparison: ReceiptOracleComparisonV1,
     ) -> Result<Self> {
         if receipt.resolution_fact_id.len() != 64 || receipt.resolution_evidence_sha256.len() != 64
@@ -2516,7 +2518,7 @@ impl ObservedReceiptV1 {
 
 pub(crate) fn compare_task6_receipt_to_oracle(
     step_index: u8,
-    receipt: &codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt,
+    receipt: &codestory_runtime::proof_qualification_support::IndexedCallEdgeReceipt,
     oracle: &OracleStepV1,
 ) -> Result<ReceiptOracleComparisonV1> {
     let oracle_step = ReceiptOracleStepV1::from(oracle);
@@ -2560,7 +2562,7 @@ pub(crate) fn compare_task6_receipt_to_oracle(
 
 pub(crate) fn observed_receipt_from_task6(
     step_index: u8,
-    receipt: &codestory_agent::proof_qualification_support::IndexedCallEdgeReceipt,
+    receipt: &codestory_runtime::proof_qualification_support::IndexedCallEdgeReceipt,
     oracle: &OracleStepV1,
 ) -> Result<ObservedReceiptV1> {
     ObservedReceiptV1::from_task6(
@@ -3814,7 +3816,7 @@ pub(crate) fn canonical_observations_sha256(
 }
 
 fn canonical_artifact_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    codestory_agent::proof_qualification_support::canonical_json_bytes(value)
+    codestory_runtime::proof_qualification_support::canonical_json_bytes(value)
         .map_err(|error| anyhow::anyhow!(error))
 }
 

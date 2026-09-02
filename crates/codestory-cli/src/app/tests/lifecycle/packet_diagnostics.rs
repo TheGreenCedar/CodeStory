@@ -2,13 +2,13 @@ use super::super::test_support::{sample_retrieval, sample_task_brief_packet};
 use super::agent_surface::assert_order;
 use crate::app::agent_context::enforce_packet_cli_json_output_budget;
 use crate::app::diagnostics::{index_next_commands, semantic_contract_check};
-use crate::app::{packet_budget_mode_label, packet_task_class_label, render_packet_markdown};
+use crate::app::{packet_budget_mode_label, render_packet_markdown};
 use crate::output::{REPO_CONTENT_BOUNDARY_LINE, render_public_operation_json_content};
 use codestory_contracts::api::{
     AgentResponseBlockDto, AgentResponseSectionDto, EmbeddingVectorPublicationIdentityDto,
     IndexFreshnessDto, IndexFreshnessNotCheckedCauseDto, IndexFreshnessStatusDto,
-    IndexPublicationDto, IndexPublicationModeDto, PacketBudgetModeDto, PacketTaskClassDto,
-    RetrievalFallbackReasonDto, SearchHitOrigin,
+    IndexPublicationDto, IndexPublicationModeDto, PacketBudgetModeDto, RetrievalFallbackReasonDto,
+    SearchHitOrigin,
 };
 use codestory_contracts::packet_projection_v3::PacketProjectionV3Dto;
 use std::path::Path;
@@ -18,14 +18,6 @@ fn packet_markdown_labels_use_public_wire_values() {
     assert_eq!(
         packet_budget_mode_label(PacketBudgetModeDto::Compact),
         "compact"
-    );
-    assert_eq!(
-        packet_task_class_label(PacketTaskClassDto::ArchitectureExplanation),
-        "architecture_explanation"
-    );
-    assert_eq!(
-        packet_task_class_label(PacketTaskClassDto::BugLocalization),
-        "bug_localization"
     );
 }
 

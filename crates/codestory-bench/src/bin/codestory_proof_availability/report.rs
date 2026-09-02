@@ -832,7 +832,7 @@ fn path_matches_held_directory(reservation: &CaseDiagnosticReservation) -> Resul
 }
 
 fn canonical_json_bytes(value: &Value) -> Result<Vec<u8>> {
-    codestory_agent::proof_qualification_support::canonical_json_bytes(value)
+    codestory_runtime::proof_qualification_support::canonical_json_bytes(value)
         .map_err(|_| anyhow::anyhow!("proof_availability_case_diagnostic_write_failed"))
 }
 
@@ -2079,7 +2079,7 @@ fn closed_enum_name<T: Serialize>(value: &T) -> Result<String> {
 }
 
 fn canonical_json_file<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut bytes = codestory_agent::proof_qualification_support::canonical_json_bytes(value)
+    let mut bytes = codestory_runtime::proof_qualification_support::canonical_json_bytes(value)
         .map_err(|error| anyhow::anyhow!(error))?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -3217,11 +3217,11 @@ mod tests {
     ))]
     #[test]
     fn task6_receipt_paths_are_bound_before_public_artifact_publication() {
-        use codestory_agent::proof_qualification_support::{
+        use codestory_contracts::graph::NodeId;
+        use codestory_runtime::proof_qualification_support::{
             CallableContainmentEvidence, IndexedCallEdgeReceipt, IndexedLineWindow,
             PinnedNodeIdentity, ReceiptRef, ResolvedNodeIdentity,
         };
-        use codestory_contracts::graph::NodeId;
 
         const SOURCE_CANONICAL_ID: &str = "/Users/private/worktree/src/caller.rs::caller";
         const TARGET_CANONICAL_ID: &str = r"C:\private\worktree\src\target.rs::target";

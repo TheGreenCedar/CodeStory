@@ -240,6 +240,7 @@ fn storage_owned_discovery_directory_roots(storage_path: &Path) -> Vec<PathBuf> 
         legacy_search_directory_for_storage(storage_path),
         search_generation_directory_for_storage(storage_path),
         codestory_contracts::owned_artifacts::derived_reset_quarantine_root(storage_path),
+        codestory_contracts::owned_artifacts::core_publication_root(storage_path),
     ]
 }
 
@@ -321,6 +322,8 @@ pub struct WorkspaceFileInventory {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspacePolicyFileInventory {
     pub files: Vec<PathBuf>,
+    /// Complete pre-route discovery used by lexical source publication.
+    pub discovered_files: Vec<PathBuf>,
     pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     pub outcome: WorkspaceInventoryOutcome,
     pub issues: Vec<WorkspaceInventoryIssue>,
@@ -343,6 +346,12 @@ pub struct WorkspacePolicyRefreshOutcome {
     pub policy_exclusions: Vec<OversizedSourceExclusionCandidate>,
     /// Files admitted by discovery before source-route and policy classification.
     pub admitted_file_count: usize,
+    /// Exact current files retained by the same complete discovery pass.
+    ///
+    /// Runtime carries these paths into the retrieval publication fence so an
+    /// incremental refresh does not rediscover the repository merely to seal
+    /// inputs the core planner already enumerated.
+    pub inventory_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -790,6 +799,29 @@ fn legacy_positional_policy(byte_cap: u64, policy_version: &str) -> SourceIndexP
     }
 }
 
+fn lexical_inventory_files(
+    manifest: &WorkspaceManifest,
+    inventory: &WorkspacePolicyFileInventory,
+) -> Result<Vec<PathBuf>> {
+    let root = workspace_root(manifest);
+    let excluded = inventory
+        .policy_exclusions
+        .iter()
+        .map(|candidate| candidate.normalized_path.as_str())
+        .collect::<HashSet<_>>();
+    Ok(inventory
+        .discovered_files
+        .iter()
+        .filter(|path| match normalized_policy_path(&root, path) {
+            // Policy exclusions are UTF-8 relative paths; a non-normalizable
+            // source cannot match one and must stay in the lexical inventory.
+            Ok(relative) => !excluded.contains(relative.as_str()),
+            Err(_) => true,
+        })
+        .cloned()
+        .collect())
+}
+
 impl WorkspaceDiscovery {
     /// Discover all source files for `manifest`.
     pub fn source_files(&self, manifest: &WorkspaceManifest) -> Result<Vec<PathBuf>> {
@@ -909,10 +941,12 @@ impl WorkspaceDiscovery {
         }
         let inventory = self.source_inventory_inner(manifest, max_files)?;
         let admitted_file_count = inventory.files.len();
+        let discovered_files = inventory.files.clone();
         if !inventory.outcome.is_complete() {
             return Ok((
                 WorkspacePolicyFileInventory {
                     files: inventory.files,
+                    discovered_files,
                     policy_exclusions: Vec::new(),
                     outcome: inventory.outcome,
                     issues: inventory.issues,
@@ -1005,6 +1039,7 @@ impl WorkspaceDiscovery {
         Ok((
             WorkspacePolicyFileInventory {
                 files,
+                discovered_files,
                 policy_exclusions,
                 outcome,
                 issues,
@@ -1306,6 +1341,7 @@ impl WorkspaceDiscovery {
             &legacy_positional_policy(byte_cap, policy_version),
             None,
         )?;
+        let inventory_files = lexical_inventory_files(manifest, &inventory)?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1318,6 +1354,7 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
+            inventory_files,
         })
     }
 
@@ -1331,6 +1368,7 @@ impl WorkspaceDiscovery {
         let (mut inventory, admitted_file_count) =
             self.source_inventory_with_policy_inner(manifest, policy, None)?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
+        let inventory_files = lexical_inventory_files(manifest, &inventory)?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1343,6 +1381,7 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
+            inventory_files,
         })
     }
 
@@ -1360,6 +1399,7 @@ impl WorkspaceDiscovery {
             &legacy_positional_policy(byte_cap, policy_version),
             Some(max_current_files),
         )?;
+        let inventory_files = lexical_inventory_files(manifest, &inventory)?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1372,6 +1412,7 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
+            inventory_files,
         })
     }
 
@@ -1386,6 +1427,7 @@ impl WorkspaceDiscovery {
         let (mut inventory, admitted_file_count) =
             self.source_inventory_with_policy_inner(manifest, policy, Some(max_current_files))?;
         self.carry_forward_verified_policy_exclusions(manifest, inputs, policy, &mut inventory);
+        let inventory_files = lexical_inventory_files(manifest, &inventory)?;
         let refresh = build_refresh_outcome_from_inventory(
             manifest,
             inputs,
@@ -1398,6 +1440,7 @@ impl WorkspaceDiscovery {
             refresh,
             policy_exclusions: inventory.policy_exclusions,
             admitted_file_count,
+            inventory_files,
         })
     }
 

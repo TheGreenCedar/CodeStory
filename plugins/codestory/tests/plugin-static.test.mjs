@@ -155,13 +155,19 @@ test("fail-open tool schemas are the generated canonical MCP catalog", async () 
   for (const [revision, profile] of Object.entries(catalog.revisionProfiles)) {
     assert.equal(profile.tools.length, 21, `${revision} must advertise exactly 21 tools`);
     assert.equal(
-      profile.tools.filter(({ name }) => name === "prove_call_path").length,
+      profile.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length,
       1,
-      `${revision} must advertise prove_call_path exactly once`,
+      `${revision} must advertise verify_indexed_direct_calls exactly once`,
+    );
+    assert.equal(
+      profile.tools.filter(({ name }) => name === "prove_call_path").length,
+      0,
+      `${revision} must not advertise legacy prove_call_path in the public catalog`,
     );
   }
   assert.equal(catalog.tools.length, 21);
-  assert.equal(catalog.tools.filter(({ name }) => name === "prove_call_path").length, 1);
+  assert.equal(catalog.tools.filter(({ name }) => name === "verify_indexed_direct_calls").length, 1);
+  assert.equal(catalog.tools.filter(({ name }) => name === "prove_call_path").length, 0);
   assert.deepEqual(catalog.resources.map(({ uri }) => uri), ["codestory://agent-guide"]);
   assert.ok(
     catalog.resourceTemplates.some(({ uriTemplate }) =>
@@ -572,7 +578,7 @@ test("fail-open validates every selected profile input schema before dispatch", 
     ["packet-tagged-probe", "packet", { project: repoRoot, question: "why", probes: [{ kind: "exact_path", id: "wrong" }] }, "/arguments/probes/0", "invalid_selector"],
     ["packet-array-bound", "packet", { project: repoRoot, question: "why", probes: [...exactPathProbes, { kind: "exact_path", path: "src/overflow.rs" }] }, "/arguments/probes", "above_max_items"],
     ["packet-string-bound", "packet", { project: repoRoot, question: "why", probes: [{ kind: "exact_path", path: "x".repeat(241) }] }, "/arguments/probes/0", "invalid_selector"],
-    ["packet-combined-bound", "packet", { project: repoRoot, question: "why", probes: exactPathProbes, extra_probes: ["overflow"] }, "/arguments", "combined_item_limit"],
+    ["packet-retired-extra-probes", "packet", { project: repoRoot, question: "why", extra_probes: ["retired"] }, "/arguments/extra_probes", "unknown_property"],
     ["context-selector-required", "context", { project: repoRoot }, "/arguments", "invalid_selector"],
     ["context-selector-exclusive", "context", { project: repoRoot, query: "entry", id: "node-1" }, "/arguments", "invalid_selector"],
     ["search-query-type", "search", { project: repoRoot, query: 7 }, "/arguments/query", "invalid_type"],
@@ -4190,6 +4196,7 @@ test("mcp launcher blocks when managed runtime is unavailable", async () => {
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: true,
+      readOnlyHint: true,
     });
     const coldStatusTool = responses[2].result.tools.find((tool) => tool.name === "status");
     assert.deepEqual(coldStatusTool.annotations, {
@@ -5113,7 +5120,11 @@ test("mcp launcher serves diagnostics while managed provisioning runs, then hand
     });
     assert.equal(coldTools.result.tools.length, 21);
     assert.ok(coldTools.result.tools.some((tool) => tool.name === "ground"));
-    assert.equal(coldTools.result.tools.filter((tool) => tool.name === "prove_call_path").length, 1);
+    assert.equal(
+      coldTools.result.tools.filter((tool) => tool.name === "verify_indexed_direct_calls").length,
+      1,
+    );
+    assert.equal(coldTools.result.tools.filter((tool) => tool.name === "prove_call_path").length, 0);
     const coldGround = await request({
       jsonrpc: "2.0",
       id: "cold-ground",

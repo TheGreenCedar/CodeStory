@@ -81,6 +81,7 @@ pub(super) fn with_index_freshness_caps_for_test<T>(
 /// one, because their verdict is the thing an observer can keep honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FreshnessObservationPolicy {
+    #[allow(dead_code)]
     Unobserved,
     ObserveSourceRoot,
 }
@@ -986,6 +987,7 @@ pub(super) fn workspace_member_storage_summaries(
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(super) struct CachedIndexFreshness {
     pub(super) root: PathBuf,
     pub(super) storage_path: PathBuf,
@@ -994,6 +996,7 @@ pub(super) struct CachedIndexFreshness {
     pub(super) cached_at: Instant,
 }
 
+#[allow(dead_code)]
 pub(super) fn index_freshness_cache_ttl_secs() -> u64 {
     std::env::var("CODESTORY_INDEX_FRESHNESS_TTL_SECS")
         .ok()
@@ -1002,6 +1005,7 @@ pub(super) fn index_freshness_cache_ttl_secs() -> u64 {
         .unwrap_or(INDEX_FRESHNESS_CACHE_DEFAULT_TTL_SECS)
 }
 
+#[allow(dead_code)]
 pub(super) fn storage_fingerprint(path: &Path) -> String {
     [
         storage_path_fingerprint(path),
@@ -1040,13 +1044,17 @@ pub(super) fn open_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
 }
 
 pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, ApiError> {
-    if !path.is_file() {
-        return Err(ApiError::new(
-            "project_unavailable",
-            "no complete project storage is available",
-        ));
-    }
-    let schema = Storage::database_schema_version(path).map_err(|error| {
+    let resolved = match codestory_store::resolve_core_database_path(path) {
+        Ok(resolved) => resolved,
+        Err(_) if path.is_file() => path.to_path_buf(),
+        Err(_) => {
+            return Err(ApiError::new(
+                "project_unavailable",
+                "no complete project storage is available",
+            ));
+        }
+    };
+    let schema = Storage::database_schema_version(&resolved).map_err(|error| {
         ApiError::internal(format!("Failed to inspect storage schema: {error}"))
     })?;
     if schema != CURRENT_SCHEMA_VERSION {
@@ -1058,6 +1066,7 @@ pub(super) fn open_existing_storage_for_read(path: &Path) -> Result<Storage, Api
         ));
     }
     Storage::open_read_only(path)
+        .or_else(|_| Storage::open_read_only(&resolved))
         .map_err(|error| ApiError::internal(format!("Failed to open storage: {error}")))
 }
 

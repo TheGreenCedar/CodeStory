@@ -14,7 +14,8 @@ pub(crate) use discovery::discovery_contract_v3;
 pub(crate) use profile::McpRevisionV3;
 pub(crate) use transport::{
     FrameResponseV3, build_proof_tool_result_v3, build_tool_result_v3, jsonrpc_internal_error_v3,
-    jsonrpc_invalid_params_v3, process_jsonrpc_frame_v3, semantic_tool_error_v3,
+    jsonrpc_invalid_params_v3, process_jsonrpc_frame_v3, revision_native_tool_result_unchecked_v3,
+    semantic_tool_error_v3,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,11 +56,16 @@ pub(crate) enum StdioV3InternalError {
 pub(crate) fn measure_revision_native_proof_result_v3(
     root: &serde_json::Value,
 ) -> Result<Vec<RevisionNativeToolResultMeasurementV3>, StdioV3InternalError> {
+    let public =
+        codestory_runtime::proof_qualification_support::project_public_verification_result(
+            root.clone(),
+        )
+        .map_err(StdioV3InternalError::InvalidProjection)?;
     McpRevisionV3::all()
         .iter()
         .map(|revision| {
             let started = std::time::Instant::now();
-            let result = transport::build_proof_tool_result_v3(*revision, root)?;
+            let result = transport::build_proof_tool_result_v3(*revision, &public)?;
             let call_tool_result_bytes =
                 crate::stdio_transport::v3_serialize_call_tool_result(&result)
                     .map_err(|error| StdioV3InternalError::Serialization(error.to_string()))?;
@@ -110,9 +116,12 @@ pub(crate) fn validate_evidence_only_surface_v3() -> Result<(), String> {
     ];
     for revision in McpRevisionV3::all() {
         let tools = catalog::tools_for_surface_v3(*revision, V3SurfaceSet::EvidenceOnly);
-        if tools.iter().any(|tool| tool["name"] == "prove_call_path") {
+        if tools.iter().any(|tool| {
+            let name = tool["name"].as_str().unwrap_or_default();
+            name == "prove_call_path" || name == "verify_indexed_direct_calls"
+        }) {
             return Err(format!(
-                "evidence-only {} advertised prove_call_path",
+                "evidence-only {} advertised a proof verification tool",
                 revision.as_str()
             ));
         }

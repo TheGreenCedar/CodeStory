@@ -2,329 +2,67 @@ use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 
 use codestory_runtime::proof_qualification_support as proof;
 
-pub(crate) const PROVE_CALL_PATH_INPUT_MAX_BYTES: usize = 64 * 1024;
+pub(crate) const PUBLIC_VERIFY_TOOL_NAME: &str = "verify_indexed_direct_calls";
+pub(crate) const PROVE_CALL_PATH_INPUT_MAX_BYTES: usize = 8 * 1024;
+/// The one public request field: the `call-path/v1` document itself.
+pub(crate) const CALL_PATH_ARGUMENT: &str = "call_path";
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ProveCallPathRequestDto {
-    source_text: String,
-    clauses: Vec<ClauseAnchorDto>,
-    spec: CallPathSpecDto,
+pub(crate) fn is_proof_tool_name(name: &str) -> bool {
+    name == PUBLIC_VERIFY_TOOL_NAME
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClauseAnchorDto {
-    clause_id: String,
-    start_byte: u32,
-    end_byte_exclusive: u32,
-    quote: String,
-    classification: ClauseClassificationDto,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-#[allow(clippy::enum_variant_names)]
-enum ClauseClassificationDto {
-    ResolvedMaterial { fields: Vec<ProofContractFieldDto> },
-    UnresolvedMaterial { reason: UnresolvedMaterialReasonDto },
-    NonMaterial { reason: NonMaterialReasonDto },
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ProofContractFieldDto {
-    Start,
-    StepTarget { step: u8 },
-    Directness { step: u8 },
-    Ordering { step: u8 },
-    Relation { step: u8 },
-    TraversalProhibition { index: u8 },
-    ProjectionExclusion { index: u8 },
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum UnresolvedMaterialReasonDto {
-    MissingSelectorResolution,
-    AmbiguousSelectorResolution,
-    UnsupportedInterpretation,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum NonMaterialReasonDto {
-    Whitespace,
-    Punctuation,
-    Connector,
-    Commentary,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CallPathSpecDto {
-    start: ExactSymbolSelectorDto,
-    steps: Vec<DirectCallStepDto>,
-    prohibit_traversal_through: Vec<ExactScopeSelectorDto>,
-    exclude_from_projection: Vec<ExactScopeSelectorDto>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DirectCallStepDto {
-    target: ExactSymbolSelectorDto,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ExactSymbolSelectorDto {
-    PinnedNode {
-        project_id: String,
-        core_generation_id: String,
-        core_run_id: String,
-        node_id: String,
-    },
-    CanonicalId {
-        canonical_id: String,
-    },
-    QualifiedName {
-        qualified_name: String,
-        project_file_components: Option<Vec<String>>,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum ExactScopeSelectorDto {
-    PinnedNode {
-        project_id: String,
-        core_generation_id: String,
-        core_run_id: String,
-        node_id: String,
-    },
-    CanonicalId {
-        canonical_id: String,
-    },
-    QualifiedName {
-        qualified_name: String,
-        project_file_components: Option<Vec<String>>,
-    },
-}
-
-impl ProveCallPathRequestDto {
-    fn into_contract(self) -> proof::UnvalidatedCallPathContract {
-        proof::UnvalidatedCallPathContract::new(
-            self.source_text,
-            self.clauses
-                .into_iter()
-                .map(ClauseAnchorDto::into_contract)
-                .collect(),
-            self.spec.into_contract(),
-        )
+/// Reads the single public request field and parses the grammar. The internal
+/// contract, its clause anchors, and its selectors are produced here; no caller
+/// can supply a classification or a pinned internal node identity.
+pub(crate) fn parse_request(
+    arguments: Value,
+) -> Result<proof::UnvalidatedCallPathContract, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| format!("{PUBLIC_VERIFY_TOOL_NAME} arguments must be an object"))?;
+    let unexpected = object
+        .keys()
+        .filter(|key| key.as_str() != CALL_PATH_ARGUMENT)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "{PUBLIC_VERIFY_TOOL_NAME} accepts only `{CALL_PATH_ARGUMENT}`; unexpected {}",
+            unexpected.join(", ")
+        ));
     }
-}
-
-impl ClauseAnchorDto {
-    fn into_contract(self) -> proof::ClauseAnchor {
-        proof::ClauseAnchor {
-            clause_id: self.clause_id,
-            start: self.start_byte as usize,
-            end: self.end_byte_exclusive as usize,
-            quote: self.quote,
-            classification: match self.classification {
-                ClauseClassificationDto::ResolvedMaterial { fields } => {
-                    proof::ClauseClassification::ResolvedMaterial {
-                        fields: fields.into_iter().map(Into::into).collect(),
-                    }
-                }
-                ClauseClassificationDto::UnresolvedMaterial { reason } => {
-                    proof::ClauseClassification::UnresolvedMaterial {
-                        reason: reason.into(),
-                    }
-                }
-                ClauseClassificationDto::NonMaterial { reason } => {
-                    proof::ClauseClassification::NonMaterial {
-                        kind: reason.into(),
-                    }
-                }
-            },
-        }
+    let document = object
+        .get(CALL_PATH_ARGUMENT)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!("{PUBLIC_VERIFY_TOOL_NAME} requires `{CALL_PATH_ARGUMENT}` as a call-path/v1 text document")
+        })?;
+    if document.len() > PROVE_CALL_PATH_INPUT_MAX_BYTES {
+        return Err(format!(
+            "{PUBLIC_VERIFY_TOOL_NAME} `{CALL_PATH_ARGUMENT}` exceeds the {PROVE_CALL_PATH_INPUT_MAX_BYTES} byte input limit"
+        ));
     }
+    codestory_runtime::proof_qualification_support::parse_public_call_path_document(document)
 }
 
-impl CallPathSpecDto {
-    fn into_contract(self) -> proof::UnvalidatedCallPathSpec {
-        proof::UnvalidatedCallPathSpec {
-            start: self.start.into_contract(),
-            steps: self
-                .steps
-                .into_iter()
-                .map(|step| proof::UnvalidatedDirectCallStep {
-                    target: step.target.into_contract(),
-                })
-                .collect(),
-            prohibit_traversal_through: self
-                .prohibit_traversal_through
-                .into_iter()
-                .map(ExactScopeSelectorDto::into_contract)
-                .collect(),
-            exclude_from_projection: self
-                .exclude_from_projection
-                .into_iter()
-                .map(ExactScopeSelectorDto::into_contract)
-                .collect(),
-        }
-    }
-}
-
-impl ExactSymbolSelectorDto {
-    fn into_contract(self) -> proof::UnvalidatedExactSymbolSelector {
-        match self {
-            Self::PinnedNode {
-                project_id,
-                core_generation_id,
-                core_run_id,
-                node_id,
-            } => proof::UnvalidatedExactSymbolSelector::PinnedNode(proof::PinnedNodeIdentity {
-                project_id,
-                core_generation_id,
-                core_run_id,
-                node_id,
-            }),
-            Self::CanonicalId { canonical_id } => {
-                proof::UnvalidatedExactSymbolSelector::CanonicalId(canonical_id)
-            }
-            Self::QualifiedName {
-                qualified_name,
-                project_file_components,
-            } => proof::UnvalidatedExactSymbolSelector::QualifiedName {
-                qualified_name,
-                project_file_components,
-            },
-        }
-    }
-}
-
-impl ExactScopeSelectorDto {
-    fn into_contract(self) -> proof::UnvalidatedExactScopeSelector {
-        match self {
-            Self::PinnedNode {
-                project_id,
-                core_generation_id,
-                core_run_id,
-                node_id,
-            } => proof::UnvalidatedExactScopeSelector::PinnedNode(proof::PinnedNodeIdentity {
-                project_id,
-                core_generation_id,
-                core_run_id,
-                node_id,
-            }),
-            Self::CanonicalId { canonical_id } => {
-                proof::UnvalidatedExactScopeSelector::CanonicalId(canonical_id)
-            }
-            Self::QualifiedName {
-                qualified_name,
-                project_file_components,
-            } => proof::UnvalidatedExactScopeSelector::QualifiedName {
-                qualified_name,
-                project_file_components,
-            },
-        }
-    }
-}
-
-impl From<ProofContractFieldDto> for proof::ProofContractField {
-    fn from(value: ProofContractFieldDto) -> Self {
-        match value {
-            ProofContractFieldDto::Start => Self::Start,
-            ProofContractFieldDto::StepTarget { step } => Self::StepTarget { step },
-            ProofContractFieldDto::Directness { step } => Self::Directness { step },
-            ProofContractFieldDto::Ordering { step } => Self::Ordering { step },
-            ProofContractFieldDto::Relation { step } => Self::Relation { step },
-            ProofContractFieldDto::TraversalProhibition { index } => {
-                Self::TraversalProhibition { index }
-            }
-            ProofContractFieldDto::ProjectionExclusion { index } => {
-                Self::ProjectionExclusion { index }
-            }
-        }
-    }
-}
-
-impl From<UnresolvedMaterialReasonDto> for proof::UnresolvedMaterialReason {
-    fn from(value: UnresolvedMaterialReasonDto) -> Self {
-        match value {
-            UnresolvedMaterialReasonDto::MissingSelectorResolution => {
-                Self::MissingSelectorResolution
-            }
-            UnresolvedMaterialReasonDto::AmbiguousSelectorResolution => {
-                Self::AmbiguousSelectorResolution
-            }
-            UnresolvedMaterialReasonDto::UnsupportedInterpretation => {
-                Self::UnsupportedInterpretation
-            }
-        }
-    }
-}
-
-impl From<NonMaterialReasonDto> for proof::NonMaterialKind {
-    fn from(value: NonMaterialReasonDto) -> Self {
-        match value {
-            NonMaterialReasonDto::Whitespace => Self::Whitespace,
-            NonMaterialReasonDto::Punctuation => Self::Punctuation,
-            NonMaterialReasonDto::Connector => Self::Connector,
-            NonMaterialReasonDto::Commentary => Self::Commentary,
-        }
-    }
-}
-
-pub(crate) fn parse_request(value: Value) -> Result<ProveCallPathRequestDto, String> {
-    serde_json::from_value(value).map_err(|error| error.to_string())
-}
-
-pub(crate) fn validate_request(
-    request: ProveCallPathRequestDto,
-) -> Result<proof::ValidationOutcome, String> {
-    proof::validate_contract(request.into_contract()).map_err(|error| format!("{error:?}"))
-}
-
-pub(crate) fn projection_root(
-    operation: &codestory_runtime::PublicOperation<
-        proof::ObservedIntegratedProjectedCallPathResult,
-    >,
-) -> Result<Value, String> {
-    let result = operation
-        .value
-        .result
-        .as_ref()
-        .map_err(|error| error.message.clone())?;
-    let root = match &result.projection {
-        proof::InternalProjection::Complete { root, .. }
-        | proof::InternalProjection::BudgetExceeded { root, .. } => root,
-    };
-    Ok(root.clone())
-}
-
-pub(crate) fn internal_projection_root(projection: &proof::InternalProjection) -> Value {
-    match projection {
-        proof::InternalProjection::Complete { root, .. }
-        | proof::InternalProjection::BudgetExceeded { root, .. } => root.clone(),
-    }
-}
-
-pub(crate) fn read_bounded_spec(path: &Path) -> Result<Vec<u8>> {
-    if path.as_os_str() == "-" {
-        read_bounded(std::io::stdin().lock(), "stdin")
+/// Reads a `call-path/v1` document from a file or stdin under the same 8 KiB
+/// request cap the MCP surface applies, so both transports accept exactly the
+/// same contracts.
+pub(crate) fn read_bounded_call_path(path: &Path) -> Result<String> {
+    let bytes = if path.as_os_str() == "-" {
+        read_bounded(std::io::stdin().lock(), "stdin")?
     } else {
         let file = std::fs::File::open(path)
-            .with_context(|| format!("open proof spec {}", path.display()))?;
-        read_bounded(file, &format!("proof spec {}", path.display()))
-    }
+            .with_context(|| format!("open call path document {}", path.display()))?;
+        read_bounded(file, &format!("call path document {}", path.display()))?
+    };
+    String::from_utf8(bytes).context("call path document must be UTF-8 text")
 }
 
 fn read_bounded(reader: impl Read, source: &str) -> Result<Vec<u8>> {
@@ -335,9 +73,68 @@ fn read_bounded(reader: impl Read, source: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("read {source}"))?;
     if bytes.len() > PROVE_CALL_PATH_INPUT_MAX_BYTES {
         bail!(
-            "proof spec exceeds the {} byte input limit",
+            "call path document exceeds the {} byte input limit",
             PROVE_CALL_PATH_INPUT_MAX_BYTES
         );
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_retired_proof_tool_alias_is_not_recognized() {
+        assert!(is_proof_tool_name(PUBLIC_VERIFY_TOOL_NAME));
+        assert!(!is_proof_tool_name("prove_call_path"));
+        assert!(!is_proof_tool_name("packet"));
+    }
+
+    #[test]
+    fn proof_input_cap_is_eight_kib() {
+        assert_eq!(PROVE_CALL_PATH_INPUT_MAX_BYTES, 8 * 1024);
+    }
+
+    #[test]
+    fn the_request_accepts_only_the_call_path_document() {
+        let document =
+            "call-path/v1\nfrom symbol \"crate::Alpha\"\ndirect-call symbol \"crate::Beta\"\n"
+                .to_owned();
+        parse_request(json!({ "call_path": document.clone() })).expect("a grammar document parses");
+
+        for hostile in [
+            json!({}),
+            json!({ "call_path": 1 }),
+            json!({"call_path": document.clone(), "source_text": "x"}),
+            json!({"source_text": document.clone(), "clauses": [], "spec": {}}),
+        ] {
+            assert!(
+                parse_request(hostile.clone()).is_err(),
+                "the public request must reject {hostile}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_request_rejects_multibyte_documents_over_eight_kib() {
+        let oversized = format!(
+            "call-path/v1\nfrom symbol \"{}\"\ndirect-call symbol \"crate::Beta\"\n",
+            "字".repeat(3 * 1024)
+        );
+        assert!(oversized.len() > PROVE_CALL_PATH_INPUT_MAX_BYTES);
+        assert!(oversized.chars().count() <= PROVE_CALL_PATH_INPUT_MAX_BYTES);
+        let error = parse_request(json!({ "call_path": oversized }))
+            .expect_err("UTF-8 byte length, not character count, is the input cap");
+        assert!(error.contains("byte"), "{error}");
+    }
+
+    #[test]
+    fn a_pinned_internal_node_is_not_a_public_selector() {
+        let error = parse_request(json!({
+            "call_path": "call-path/v1\nfrom symbol \"{\\\"kind\\\":\\\"pinned_node\\\",\\\"node_id\\\":\\\"7\\\"}\"\ndirect-call symbol \"crate::Beta\"\n"
+        }))
+        .expect_err("internal node identities never cross the public surface");
+        assert!(error.contains("start"), "{error}");
+    }
 }

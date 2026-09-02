@@ -95,7 +95,7 @@ pub(crate) fn validate_tool_arguments(
     arguments: Option<&Value>,
 ) -> Result<(), Vec<ArgumentViolation>> {
     let proof_schema;
-    let schema = if tool == "prove_call_path" {
+    let schema = if crate::prove_call_path::is_proof_tool_name(tool) {
         proof_schema = crate::stdio_v3::catalog::proof_tool_source_v3();
         proof_schema
             .get("inputSchema")
@@ -278,6 +278,16 @@ fn validate_string_length(
             pointer,
             format!("expected at most {maximum} character(s)"),
         ));
+    }
+    if pointer == "/call_path" || pointer.ends_with("/call_path") {
+        let max_bytes = crate::prove_call_path::PROVE_CALL_PATH_INPUT_MAX_BYTES as u64;
+        if text.len() as u64 > max_bytes {
+            out.push(ArgumentViolation::new(
+                "above_max_length",
+                pointer,
+                format!("expected at most {max_bytes} byte(s)"),
+            ));
+        }
     }
 }
 
@@ -1206,9 +1216,7 @@ mod tests {
                     "project": "/repo",
                     "question": "how does routing work",
                     "budget": "compact",
-                    "task_class": null,
                     "probes": [{"kind": "free_query", "query": "router"}],
-                    "extra_probes": ["router"],
                     "latency_budget_ms": 5000,
                     "parent_packet_id": "packet-1",
                     "option_ids": ["bounded_source_read:src%2Funread.rs"],
@@ -1395,7 +1403,7 @@ mod tests {
             ),
             vec!["/arguments/probes/1".to_string()]
         );
-        let probes = (0..codestory_contracts::api::PACKET_PROBE_MAX_COUNT - 1)
+        let probes = (0..=codestory_contracts::api::PACKET_PROBE_MAX_COUNT)
             .map(|index| json!({"kind": "free_query", "query": format!("probe-{index}")}))
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1404,11 +1412,10 @@ mod tests {
                 json!({
                     "project": "/repo",
                     "question": "why",
-                    "probes": probes,
-                    "extra_probes": ["one", "two"]
+                    "probes": probes
                 })
             ),
-            vec!["combined_item_limit"]
+            vec!["above_max_items"]
         );
     }
 
@@ -1416,14 +1423,13 @@ mod tests {
     fn nullable_members_accept_null_and_non_nullable_members_do_not() {
         assert!(
             crate::stdio_catalog::tool_input_schema("packet")
-                .and_then(|schema| schema.pointer("/properties/task_class/enum"))
-                .and_then(Value::as_array)
-                .is_some_and(|values| values.contains(&Value::Null))
+                .and_then(|schema| schema.pointer("/properties/latency_budget_ms"))
+                .is_some()
         );
         assert_eq!(
             validate_tool_arguments(
                 "packet",
-                Some(&json!({"project": "/repo", "question": "why", "task_class": null}))
+                Some(&json!({"project": "/repo", "question": "why", "latency_budget_ms": null}))
             ),
             Ok(())
         );

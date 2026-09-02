@@ -104,7 +104,10 @@ use codestory_contracts::graph::{
     ResolutionCertainty, SourceLocation,
 };
 use codestory_indexer::WorkspaceIndexer as V2WorkspaceIndexer;
-use codestory_store::{IndexPublicationMode, SnapshotStore, SourcePolicyExclusionRecord};
+use codestory_store::{
+    IndexPublicationMode, SnapshotStore, SourcePolicyExclusionRecord, StorageOpenMode,
+    with_core_clone_disabled,
+};
 use codestory_workspace::{OversizedSourceExclusionCandidate, RefreshMode, project_identity_v3};
 use crossbeam_channel::unbounded;
 use sha2::{Digest, Sha256};
@@ -2098,7 +2101,6 @@ fn search_plan_test_hit(
         evidence_producer: None,
         resolution_status: None,
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
         verification_targets: Vec::new(),
@@ -2404,6 +2406,50 @@ fn publishing_incremental_refresh_rebinds_the_complete_dense_anchor_generation()
             .expect("legacy docs")
             .is_empty()
     );
+}
+
+#[test]
+fn incremental_escalates_to_complete_build_when_core_cow_is_unavailable() {
+    let _env = hybrid_test_env();
+    let workspace = tempdir().expect("workspace");
+    write_reindex_semantic_fixture(workspace.path(), "cow escalate baseline");
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let controller = AppController::new_with_config(test_sidecar_runtime_from_env());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project summary");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("baseline full index");
+    let baseline = controller
+        .index_publication()
+        .expect("read baseline publication")
+        .expect("baseline publication");
+    assert_eq!(baseline.mode, IndexPublicationMode::Full);
+
+    write_reindex_semantic_fixture(workspace.path(), "cow escalate changed");
+    let timings = with_core_clone_disabled(|| {
+        controller
+            .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
+            .expect("incremental must recover via disposable complete-build")
+    });
+    assert!(
+        timings.full_refresh_wall.is_some(),
+        "CoW-unavailable incremental must run the complete-build wall path"
+    );
+    assert!(
+        timings.incremental_core_wall.is_none(),
+        "escalated refresh must not report an incremental core wall"
+    );
+    let published = controller
+        .index_publication()
+        .expect("read escalated publication")
+        .expect("escalated publication");
+    assert_eq!(published.mode, IndexPublicationMode::Full);
+    assert_ne!(published.generation_id, baseline.generation_id);
 }
 
 #[test]
@@ -3641,10 +3687,31 @@ fn first_full_refresh_publishes_verified_oversized_exclusion_without_graph_cover
     .expect("workspace manifest");
     let freshness = index_freshness_from_storage(workspace.path(), &workspace_manifest, &storage);
     assert_eq!(freshness.status, IndexFreshnessStatusDto::Fresh);
-    storage
-        .get_connection()
-        .execute("DELETE FROM source_policy_exclusion_publication", [])
-        .expect("corrupt exclusion publication identity");
+    drop(storage);
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute("DELETE FROM source_policy_exclusion_publication", [])
+            .expect("corrupt exclusion publication identity");
+    });
+    let storage = Storage::open(&storage_path).expect("open corrupted publication");
+    assert!(
+        storage
+            .get_source_policy_exclusion_manifest()
+            .expect("read corrupted exclusion manifest")
+            .is_none(),
+        "hostile mutation must remove the active generation's exclusion manifest"
+    );
+    let corrupted_publication = storage
+        .get_complete_index_publication()
+        .expect("read corrupted core publication");
+    assert!(
+        corrupted_publication.is_some(),
+        "hostile mutation must preserve the complete core identity: raw={:?} incomplete={:?} schema={:?}",
+        storage.get_index_publication(),
+        storage.has_incomplete_incremental_run(),
+        Storage::database_schema_version(&storage_path),
+    );
     assert!(
         controller
             .complete_core_requires_publication_repair(&storage_path)
@@ -4164,8 +4231,8 @@ fn a_partially_parsed_file_is_reported_incomplete_not_indexed() {
     let input =
         crate::agent::packet_coverage::PacketCoverageInput::from_observations(&observations);
     assert!(
-        input.caps_sufficiency(),
-        "an incompletely parsed file must stop a packet claiming sufficiency"
+        input.blocks_packet_availability(),
+        "an incompletely parsed file must keep the packet from presenting partial evidence as complete"
     );
 }
 
@@ -4362,13 +4429,15 @@ fn semantic_projection_republish_rebinds_valid_proof_and_preserves_absence() {
     assert_eq!(after_proof.funnel, before_proof.funnel);
     assert_eq!(storage.get_proof_resolution_facts().unwrap(), before_facts);
 
-    storage
-        .get_connection()
-        .execute_batch(
-            "DELETE FROM proof_resolution_publication; DELETE FROM proof_resolution_fact;",
-        )
-        .unwrap();
     drop(storage);
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM proof_resolution_publication; DELETE FROM proof_resolution_fact;",
+            )
+            .unwrap();
+    });
     controller
         .republish_semantic_projections_blocking()
         .expect("semantic republish preserves migrated absence");
@@ -4399,15 +4468,15 @@ fn semantic_projection_republish_rejects_corrupt_proof_and_preserves_old_core() 
     let before = Storage::database_complete_index_publication(&storage_path)
         .unwrap()
         .unwrap();
-    let storage = Storage::open(&storage_path).unwrap();
-    storage
-        .get_connection()
-        .execute(
-            "UPDATE proof_resolution_publication SET funnel_json = '[]' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-    drop(storage);
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute(
+                "UPDATE proof_resolution_publication SET funnel_json = '[]' WHERE id = 1",
+                [],
+            )
+            .unwrap();
+    });
     let error = controller
         .republish_semantic_projections_blocking()
         .expect_err("corrupt old proof must reject semantic rebind");
@@ -4573,11 +4642,6 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("publish complete core");
     let identity = project_identity_v3(workspace.path());
-    let mut before_storage = Storage::open(&storage_path).expect("open complete core");
-    let before = before_storage
-        .get_complete_index_publication()
-        .expect("read complete core")
-        .expect("complete publication");
     let exclusions = (0_u64..112)
         .map(|index| OversizedSourceExclusionCandidate {
             normalized_path: format!("legacy/excluded-{index}.rs"),
@@ -4589,70 +4653,84 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
             structural_unit_cap: codestory_contracts::workspace::DEFAULT_STRUCTURAL_UNIT_CAP,
         })
         .collect::<Vec<_>>();
-    before_storage
-        .publish_source_policy_exclusion_generation(
-            &before,
-            &identity.project_id,
-            &identity.workspace_id,
-            legacy_source_policy_identity(),
-            &exclusions,
-        )
-        .expect("replace retained source-policy publication");
-    let legacy_source_policy_digest = legacy_source_policy_exclusion_digest_for_test(
-        &before_storage
-            .get_source_policy_exclusions()
-            .expect("read retained source-policy exclusions"),
-    );
-    let dense_before = before_storage
-        .validate_dense_anchor_publication(&before)
-        .expect("retained dense publication");
-    assert!(dense_before.anchor_count > 0);
-    let symbol_doc_count = before_storage
-        .get_symbol_search_docs_batch_after(None, 10_000)
-        .expect("retained symbol documents")
-        .len();
-    assert!(symbol_doc_count > 0);
-    before_storage
-        .upsert_retrieval_index_manifest(&test_retrieval_manifest(
-            &identity.project_id,
-            symbol_doc_count as i64,
-            dense_before.anchor_count as i64,
-        ))
-        .expect("publish retained retrieval manifest");
-    let before_retrieval = before_storage
-        .get_retrieval_index_publication(&identity.project_id)
-        .expect("read retrieval publication")
-        .expect("retained retrieval publication");
-    drop(before_storage);
+    let (before, dense_anchor_count, symbol_doc_count) =
+        mutate_published_core(&storage_path, |storage| {
+            let before = storage
+                .get_complete_index_publication()
+                .expect("read complete core")
+                .expect("complete publication");
+            storage
+                .publish_source_policy_exclusion_generation(
+                    &before,
+                    &identity.project_id,
+                    &identity.workspace_id,
+                    legacy_source_policy_identity(),
+                    &exclusions,
+                )
+                .expect("replace retained source-policy publication");
+            let legacy_source_policy_digest = legacy_source_policy_exclusion_digest_for_test(
+                &storage
+                    .get_source_policy_exclusions()
+                    .expect("read retained source-policy exclusions"),
+            );
+            let dense_before = storage
+                .validate_dense_anchor_publication(&before)
+                .expect("retained dense publication");
+            assert!(dense_before.anchor_count > 0);
+            let symbol_doc_count = storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("retained symbol documents")
+                .len();
+            assert!(symbol_doc_count > 0);
 
-    let legacy = rusqlite::Connection::open(&storage_path).expect("open retained v1 core");
-    legacy
-        .execute(
-            "UPDATE source_policy_exclusion_publication
-             SET schema_version = 1, exclusion_digest = ?1",
-            rusqlite::params![legacy_source_policy_digest],
-        )
-        .expect("restore authentic retained v1 publication identity");
-    legacy
-        .execute_batch(
-            "DELETE FROM structural_text_unit_publication;
-             ALTER TABLE index_publication RENAME TO index_publication_v30;
-             CREATE TABLE index_publication (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                generation INTEGER NOT NULL CHECK (generation > 0),
-                generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
-                run_id TEXT NOT NULL CHECK (length(run_id) > 0),
-                mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
-                published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
-             );
-             INSERT INTO index_publication
-             SELECT * FROM index_publication_v30;
-             DROP TABLE index_publication_v30;
-             PRAGMA user_version = 29;
-             PRAGMA wal_checkpoint(TRUNCATE);",
-        )
-        .expect("downgrade retained core to schema 29");
-    drop(legacy);
+            storage
+                .get_connection()
+                .execute(
+                    "UPDATE source_policy_exclusion_publication
+                     SET schema_version = 1, exclusion_digest = ?1",
+                    rusqlite::params![legacy_source_policy_digest],
+                )
+                .expect("restore authentic retained v1 publication identity");
+            (before, dense_before.anchor_count, symbol_doc_count)
+        });
+    // The retrieval publication lives beside the core, not inside the
+    // generation, so it is written through the live storage path — and while
+    // the core still reads at the current schema.
+    let before_retrieval = {
+        let mut storage = Storage::open(&storage_path).expect("open retained retrieval state");
+        storage
+            .upsert_retrieval_index_manifest(&test_retrieval_manifest(
+                &identity.project_id,
+                symbol_doc_count as i64,
+                dense_anchor_count as i64,
+            ))
+            .expect("publish retained retrieval manifest");
+        storage
+            .get_retrieval_index_publication(&identity.project_id)
+            .expect("read retrieval publication")
+            .expect("retained retrieval publication")
+    };
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch(
+                "DELETE FROM structural_text_unit_publication;
+                 ALTER TABLE index_publication RENAME TO index_publication_v30;
+                 CREATE TABLE index_publication (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    generation INTEGER NOT NULL CHECK (generation > 0),
+                    generation_id TEXT NOT NULL UNIQUE CHECK (length(generation_id) > 0),
+                    run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+                    mode TEXT NOT NULL CHECK (mode IN ('full', 'incremental')),
+                    published_at_epoch_ms INTEGER NOT NULL CHECK (published_at_epoch_ms >= 0)
+                 );
+                 INSERT INTO index_publication
+                 SELECT * FROM index_publication_v30;
+                 DROP TABLE index_publication_v30;
+                 PRAGMA user_version = 29;",
+            )
+            .expect("downgrade retained core to schema 29");
+    });
     for entry in fs::read_dir(workspace.path()).expect("list fixture root") {
         let path = entry.expect("fixture entry").path();
         if path.file_name().is_some_and(|name| name == ".cache") {
@@ -4759,23 +4837,24 @@ fn semantic_projection_republish_uses_stored_core_after_source_is_removed() {
     );
     assert_no_staged_publication_artifacts(&storage_path);
 
-    let tampered = rusqlite::Connection::open(&storage_path).expect("open rebound core");
-    let go_edge_id = tampered
-        .query_row(
-            "SELECT edge_id FROM proof_resolution_fact
-             WHERE status = 'exact' AND language_adapter = 'go'
-             ORDER BY edge_id LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .expect("stored fixture has one exact Go edge");
-    tampered
-        .execute(
-            "UPDATE edge SET line = line + 1 WHERE id = ?1",
-            [go_edge_id],
-        )
-        .expect("tamper stored Go correlation");
-    drop(tampered);
+    mutate_published_core(&storage_path, |storage| {
+        let tampered = storage.get_connection();
+        let go_edge_id = tampered
+            .query_row(
+                "SELECT edge_id FROM proof_resolution_fact
+                 WHERE status = 'exact' AND language_adapter = 'go'
+                 ORDER BY edge_id LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("stored fixture has one exact Go edge");
+        tampered
+            .execute(
+                "UPDATE edge SET line = line + 1 WHERE id = ?1",
+                [go_edge_id],
+            )
+            .expect("tamper stored Go correlation");
+    });
     let error = controller
         .republish_semantic_projections_at_blocking(
             workspace.path().to_path_buf(),
@@ -4806,8 +4885,7 @@ fn semantic_projection_republish_fails_closed_when_stored_document_is_missing() 
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("publish complete core");
-    let before = {
-        let mut storage = Storage::open(&storage_path).expect("open complete core");
+    let before = mutate_published_core(&storage_path, |storage| {
         let publication = storage
             .get_complete_index_publication()
             .expect("read complete core")
@@ -4819,7 +4897,7 @@ fn semantic_projection_republish_fails_closed_when_stored_document_is_missing() 
                 > 0
         );
         publication
-    };
+    });
 
     let error = controller
         .republish_semantic_projections_blocking()
@@ -4851,28 +4929,29 @@ fn previous_semantic_body_contract_requires_source_refresh_before_republish() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("publish current semantic core");
 
-    let mut storage = Storage::open(&storage_path).expect("open current semantic core");
-    let before = storage
-        .get_complete_index_publication()
-        .expect("read current publication")
-        .expect("complete current publication");
-    let mut retained_docs = storage
-        .get_symbol_search_docs_batch_after(None, 10_000)
-        .expect("read current semantic documents");
-    assert!(
-        !retained_docs.is_empty(),
-        "fixture must contain semantic documents"
-    );
-    for doc in &mut retained_docs {
-        assert_eq!(doc.doc_hash, llm_symbol_doc_hash(&doc.doc_text));
-        assert_eq!(doc.policy_version, SEMANTIC_POLICY_VERSION);
-        doc.doc_version = UNPROVEN_SOURCE_BODY_DOC_VERSION;
-    }
-    let retained_count = retained_docs.len();
-    storage
-        .upsert_symbol_search_docs_batch(&retained_docs)
-        .expect("persist retained pre-cap-provenance semantic documents");
-    drop(storage);
+    let (before, retained_count) = mutate_published_core(&storage_path, |storage| {
+        let before = storage
+            .get_complete_index_publication()
+            .expect("read current publication")
+            .expect("complete current publication");
+        let mut retained_docs = storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("read current semantic documents");
+        assert!(
+            !retained_docs.is_empty(),
+            "fixture must contain semantic documents"
+        );
+        for doc in &mut retained_docs {
+            assert_eq!(doc.doc_hash, llm_symbol_doc_hash(&doc.doc_text));
+            assert_eq!(doc.policy_version, SEMANTIC_POLICY_VERSION);
+            doc.doc_version = UNPROVEN_SOURCE_BODY_DOC_VERSION;
+        }
+        let retained_count = retained_docs.len();
+        storage
+            .upsert_symbol_search_docs_batch(&retained_docs)
+            .expect("persist retained pre-cap-provenance semantic documents");
+        (before, retained_count)
+    });
 
     assert!(
         controller
@@ -4976,8 +5055,7 @@ fn semantic_projection_republish_rejects_manifestless_nonempty_structural_state(
         .expect("publish complete core");
     let before = Storage::database_complete_index_publication(&storage_path)
         .expect("read complete publication");
-    {
-        let storage = Storage::open(&storage_path).expect("open structural fixture");
+    mutate_published_core(&storage_path, |storage| {
         storage
             .get_connection()
             .execute_batch(
@@ -4993,7 +5071,7 @@ fn semantic_projection_republish_rejects_manifestless_nonempty_structural_state(
                     X'01', 1);",
             )
             .expect("seed nonempty unmanifested structural state");
-    }
+    });
 
     let error = controller
         .republish_semantic_projections_blocking()
@@ -5026,11 +5104,12 @@ fn semantic_projection_republish_rejects_manifestless_current_schema() {
         .expect("publish complete core");
     let before = Storage::database_complete_index_publication(&storage_path)
         .expect("read complete publication");
-    Storage::open(&storage_path)
-        .expect("open current core")
-        .get_connection()
-        .execute("DELETE FROM structural_text_unit_publication", [])
-        .expect("remove current structural manifest");
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute("DELETE FROM structural_text_unit_publication", [])
+            .expect("remove current structural manifest");
+    });
 
     let error = controller
         .republish_semantic_projections_blocking()
@@ -5193,6 +5272,82 @@ fn semantic_projection_republish_runtime_cache_fault_completes_committed_generat
     }
 }
 
+/// `index --summarize` writes `symbol_summary`, which lives in the core
+/// database. Once a publication pointer exists the live handle is read-only, so
+/// the summaries have to reach disk through a staged republish instead.
+#[test]
+fn symbol_summaries_persist_into_a_published_immutable_core() {
+    let _env = hybrid_test_env();
+    let workspace = copy_tictactoe_workspace();
+    let storage_path = workspace.path().join(".cache").join("codestory.db");
+    let runtime = test_sidecar_runtime_from_env();
+    let controller = AppController::new_with_config(runtime.clone());
+    controller
+        .open_project_summary_with_storage_path(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+        )
+        .expect("open project");
+    controller
+        .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
+        .expect("publish baseline core");
+    let baseline = Storage::database_complete_index_publication(&storage_path)
+        .expect("read baseline publication")
+        .expect("baseline publication");
+
+    let summarized_node = Storage::open(&storage_path)
+        .expect("open published core")
+        .get_nodes()
+        .expect("read published nodes")
+        .first()
+        .expect("indexed fixture must produce a node")
+        .id;
+    let record = codestory_store::SymbolSummaryRecord {
+        node_id: summarized_node,
+        content_hash: "published-core-summary-hash".to_string(),
+        summary: "summary written after publication".to_string(),
+        model: "test-model".to_string(),
+        updated_at_epoch_ms: 7,
+    };
+
+    // The direct write the old path attempted is refused by the published core.
+    let direct = Storage::open(&storage_path)
+        .expect("open published core")
+        .upsert_symbol_summaries_batch(std::slice::from_ref(&record));
+    assert!(
+        direct.is_err(),
+        "a published core must refuse a direct symbol-summary write"
+    );
+
+    let staged_record = record.clone();
+    let outcome = controller
+        .republish_core_with_staged_mutation_blocking(
+            workspace.path().to_path_buf(),
+            storage_path.clone(),
+            &move |store: &mut Storage| {
+                store
+                    .upsert_symbol_summaries_batch(std::slice::from_ref(&staged_record))
+                    .map_err(|error| {
+                        codestory_contracts::api::ApiError::internal(error.to_string())
+                    })
+            },
+        )
+        .expect("republish the core with the generated summaries");
+
+    assert_eq!(outcome.publication.generation, baseline.generation + 1);
+    let stored: String = Storage::open(&storage_path)
+        .expect("open republished core")
+        .get_connection()
+        .query_row(
+            "SELECT summary FROM symbol_summary WHERE node_id = ?1",
+            [summarized_node.0],
+            |row| row.get(0),
+        )
+        .expect("read the republished summary");
+    assert_eq!(stored, "summary written after publication");
+    assert_no_staged_publication_artifacts(&storage_path);
+}
+
 #[test]
 fn semantic_projection_republish_detects_generation_drift_and_keeps_competing_publication() {
     let _env = hybrid_test_env();
@@ -5240,6 +5395,7 @@ fn semantic_projection_republish_detects_generation_drift_and_keeps_competing_pu
         None,
         &runtime,
         controller.source_index_policy.as_ref(),
+        None,
     ) {
         Err(error) => error,
         Ok(_) => panic!("outer writer must detect competing generation"),
@@ -5385,15 +5541,16 @@ fn full_recovery_publishes_verified_exclusion_and_clears_recovery_fence() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("initial full index");
 
-    let first_storage = Storage::open(&storage_path).expect("first storage");
-    let first_publication = first_storage
-        .get_complete_index_publication()
-        .expect("first publication")
-        .expect("complete first publication");
-    first_storage
-        .begin_incremental_run()
-        .expect("mark interrupted incremental run");
-    drop(first_storage);
+    let first_publication = mutate_published_core(&storage_path, |storage| {
+        let first_publication = storage
+            .get_complete_index_publication()
+            .expect("first publication")
+            .expect("complete first publication");
+        storage
+            .begin_incremental_run()
+            .expect("mark interrupted incremental run");
+        first_publication
+    });
 
     make_source_exceed_default_index_byte_cap(
         &source_path,
@@ -5534,45 +5691,45 @@ fn unchanged_incremental_refresh_rebuilds_previous_dense_anchor_contract() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("initial full index");
 
-    let mut contaminated_docs = Storage::open(&storage_path)
-        .expect("open storage before contract downgrade")
-        .get_dense_anchor_inputs_batch_after(None, 10_000)
-        .expect("dense anchor inputs before contract downgrade");
-    assert!(
-        !contaminated_docs.is_empty(),
-        "fixture should persist dense anchor inputs"
-    );
-    for doc in &mut contaminated_docs {
-        doc.policy_version = "graph_first_v0".to_string();
-        doc.source_identity = "core:legacy-publication".to_string();
-        doc.text
-            .push_str("domain_aliases: benchmark-shaped legacy text\n");
-        doc.document_hash = format!("legacy-{}", doc.node_id.0);
-    }
-    let contaminated_count = contaminated_docs.len();
-    Storage::open(&storage_path)
-        .expect("reopen storage for contract downgrade")
-        .upsert_dense_anchor_inputs_batch(&contaminated_docs)
-        .expect("persist downgraded dense anchor inputs");
+    let (contaminated_count, contaminated_symbol_count) =
+        mutate_published_core(&storage_path, |storage| {
+            let mut contaminated_docs = storage
+                .get_dense_anchor_inputs_batch_after(None, 10_000)
+                .expect("dense anchor inputs before contract downgrade");
+            assert!(
+                !contaminated_docs.is_empty(),
+                "fixture should persist dense anchor inputs"
+            );
+            for doc in &mut contaminated_docs {
+                doc.policy_version = "graph_first_v0".to_string();
+                doc.source_identity = "core:legacy-publication".to_string();
+                doc.text
+                    .push_str("domain_aliases: benchmark-shaped legacy text\n");
+                doc.document_hash = format!("legacy-{}", doc.node_id.0);
+            }
+            let contaminated_count = contaminated_docs.len();
+            storage
+                .upsert_dense_anchor_inputs_batch(&contaminated_docs)
+                .expect("persist downgraded dense anchor inputs");
 
-    let mut contaminated_symbol_docs = Storage::open(&storage_path)
-        .expect("open graph-native docs before schema downgrade")
-        .get_symbol_search_docs_batch_after(None, 10_000)
-        .expect("graph-native docs before schema downgrade");
-    assert!(
-        !contaminated_symbol_docs.is_empty(),
-        "fixture should persist graph-native semantic docs"
-    );
-    for doc in &mut contaminated_symbol_docs {
-        doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
-        doc.doc_text
-            .push_str("domain_aliases: benchmark-shaped legacy text\n");
-    }
-    let contaminated_symbol_count = contaminated_symbol_docs.len();
-    Storage::open(&storage_path)
-        .expect("reopen storage for graph-native schema downgrade")
-        .upsert_symbol_search_docs_batch(&contaminated_symbol_docs)
-        .expect("persist downgraded graph-native semantic docs");
+            let mut contaminated_symbol_docs = storage
+                .get_symbol_search_docs_batch_after(None, 10_000)
+                .expect("graph-native docs before schema downgrade");
+            assert!(
+                !contaminated_symbol_docs.is_empty(),
+                "fixture should persist graph-native semantic docs"
+            );
+            for doc in &mut contaminated_symbol_docs {
+                doc.doc_version = LLM_SYMBOL_DOC_SCHEMA_VERSION - 1;
+                doc.doc_text
+                    .push_str("domain_aliases: benchmark-shaped legacy text\n");
+            }
+            let contaminated_symbol_count = contaminated_symbol_docs.len();
+            storage
+                .upsert_symbol_search_docs_batch(&contaminated_symbol_docs)
+                .expect("persist downgraded graph-native semantic docs");
+            (contaminated_count, contaminated_symbol_count)
+        });
 
     let repair_timings = controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
@@ -5639,36 +5796,37 @@ fn unchanged_incremental_refresh_repairs_zero_dense_previous_policy() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("initial full index");
 
-    let mut storage = Storage::open(&storage_path).expect("open current semantic publication");
-    let publication = storage
-        .get_complete_index_publication()
-        .expect("load core publication")
-        .expect("complete core publication");
-    assert!(
-        storage
-            .clear_dense_anchor_inputs()
-            .expect("remove current dense anchors")
-            > 0,
-        "fixture must begin with current dense anchors"
-    );
-    let legacy_manifest = storage
-        .publish_dense_anchor_generation(&publication, "graph_first_v1")
-        .expect("publish valid zero-dense previous policy");
-    assert_eq!(legacy_manifest.anchor_count, 0);
-    assert_eq!(legacy_manifest.policy_version, "graph_first_v1");
+    let symbol_count = mutate_published_core(&storage_path, |storage| {
+        let publication = storage
+            .get_complete_index_publication()
+            .expect("load core publication")
+            .expect("complete core publication");
+        assert!(
+            storage
+                .clear_dense_anchor_inputs()
+                .expect("remove current dense anchors")
+                > 0,
+            "fixture must begin with current dense anchors"
+        );
+        let legacy_manifest = storage
+            .publish_dense_anchor_generation(&publication, "graph_first_v1")
+            .expect("publish valid zero-dense previous policy");
+        assert_eq!(legacy_manifest.anchor_count, 0);
+        assert_eq!(legacy_manifest.policy_version, "graph_first_v1");
 
-    let mut symbol_docs = storage
-        .get_symbol_search_docs_batch_after(None, 10_000)
-        .expect("load graph-native docs");
-    assert!(!symbol_docs.is_empty(), "fixture must contain symbol docs");
-    for doc in &mut symbol_docs {
-        doc.policy_version = "graph_first_v1".to_string();
-    }
-    let symbol_count = symbol_docs.len();
-    storage
-        .upsert_symbol_search_docs_batch(&symbol_docs)
-        .expect("persist previous-policy symbol docs");
-    drop(storage);
+        let mut symbol_docs = storage
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("load graph-native docs");
+        assert!(!symbol_docs.is_empty(), "fixture must contain symbol docs");
+        for doc in &mut symbol_docs {
+            doc.policy_version = "graph_first_v1".to_string();
+        }
+        let symbol_count = symbol_docs.len();
+        storage
+            .upsert_symbol_search_docs_batch(&symbol_docs)
+            .expect("persist previous-policy symbol docs");
+        symbol_count
+    });
 
     let repair_timings = controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
@@ -5730,22 +5888,22 @@ fn full_refresh_repairs_reused_dense_anchors_missing_contract_metadata() {
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("first full index");
 
-    let mut legacy_docs = Storage::open(&storage_path)
-        .expect("open storage before legacy rewrite")
-        .get_dense_anchor_inputs_batch_after(None, 10_000)
-        .expect("dense anchor inputs before legacy rewrite");
-    assert!(
-        !legacy_docs.is_empty(),
-        "initial full index should persist dense anchor inputs"
-    );
-    for doc in &mut legacy_docs {
-        doc.policy_version.clear();
-        doc.source_identity = "core:legacy-unknown".to_string();
-    }
-    Storage::open(&storage_path)
-        .expect("reopen storage for legacy rewrite")
-        .upsert_dense_anchor_inputs_batch(&legacy_docs)
-        .expect("rewrite legacy dense anchor inputs");
+    mutate_published_core(&storage_path, |storage| {
+        let mut legacy_docs = storage
+            .get_dense_anchor_inputs_batch_after(None, 10_000)
+            .expect("dense anchor inputs before legacy rewrite");
+        assert!(
+            !legacy_docs.is_empty(),
+            "initial full index should persist dense anchor inputs"
+        );
+        for doc in &mut legacy_docs {
+            doc.policy_version.clear();
+            doc.source_identity = "core:legacy-unknown".to_string();
+        }
+        storage
+            .upsert_dense_anchor_inputs_batch(&legacy_docs)
+            .expect("rewrite legacy dense anchor inputs");
+    });
 
     let repair_timings = controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
@@ -5782,19 +5940,19 @@ fn full_refresh_repairs_reused_dense_anchors_missing_contract_metadata() {
 fn incremental_refresh_rebuilds_untouched_dense_anchor_after_cross_file_edge_removal() {
     let _env = hybrid_test_env();
     let workspace = tempdir().expect("workspace dir");
-    let src = workspace.path().join("src");
-    fs::create_dir_all(&src).expect("create source directory");
+    let package = workspace.path().join("pkg");
+    fs::create_dir_all(&package).expect("create package directory");
+    fs::write(workspace.path().join("README.md"), "# fixture\n").expect("write root marker");
+    let callee_path = package.join("helper.go");
+    let caller_path = package.join("main.go");
     fs::write(
-        workspace.path().join("Cargo.toml"),
-        "[package]\nname = \"semantic-scope-fixture\"\nversion = \"0.1.0\"\n",
+        &callee_path,
+        "package fixture\n\nfunc helper() int { return 1 }\n",
     )
-    .expect("write package manifest");
-    let callee_path = src.join("lib.rs");
-    let caller_path = src.join("main.rs");
-    fs::write(&callee_path, "pub struct Helper;\n").expect("write callee source");
+    .expect("write callee source");
     fs::write(
         &caller_path,
-        "mod lib;\nuse crate::lib::Helper;\npub fn run() -> Helper { Helper }\n",
+        "package fixture\n\nfunc run() int { return helper() }\n",
     )
     .expect("write caller source");
     let storage_path = workspace.path().join(".cache").join("codestory.db");
@@ -5816,7 +5974,7 @@ fn incremental_refresh_rebuilds_untouched_dense_anchor_after_cross_file_edge_rem
     let first_anchor = first_anchors
         .iter()
         .find(|anchor| {
-            anchor.display_name == "Helper" && anchor.file_path.as_deref() == Some("src/lib.rs")
+            anchor.display_name == "helper" && anchor.file_path.as_deref() == Some("pkg/helper.go")
         })
         .cloned()
         .unwrap_or_else(|| {
@@ -5834,14 +5992,18 @@ fn incremental_refresh_rebuilds_untouched_dense_anchor_after_cross_file_edge_rem
             )
         });
     assert!(
-        first_anchor.text.contains("edge_digest: IMPORT=1"),
-        "the initial callee document must expose the cross-file import edge: {}",
+        first_anchor.text.contains("edge_digest: CALL=1"),
+        "the initial callee document must expose the cross-file call edge: {}",
         first_anchor.text
     );
     let callee_bytes = fs::read(&callee_path).expect("read untouched callee source");
     drop(first_storage);
 
-    fs::write(&caller_path, "pub fn run() -> i32 { 2 }\n").expect("remove cross-file edge");
+    fs::write(
+        &caller_path,
+        "package fixture\n\nfunc run() int { return 2 }\n",
+    )
+    .expect("remove cross-file edge");
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
         .expect("incremental caller refresh");
@@ -5870,7 +6032,7 @@ fn incremental_refresh_rebuilds_untouched_dense_anchor_after_cross_file_edge_rem
         "removing a cross-file edge must rebuild the connected untouched endpoint"
     );
     assert!(
-        !rebuilt_anchor.text.contains("edge_digest: IMPORT=1"),
+        !rebuilt_anchor.text.contains("edge_digest: CALL=1"),
         "the rebuilt endpoint must not retain the removed cross-file edge: {}",
         rebuilt_anchor.text
     );
@@ -6011,21 +6173,21 @@ fn incremental_refresh_removes_stale_component_reports() {
         "an incremental change should preserve unaffected component reports"
     );
 
-    let before_removal = Storage::open(&storage_path).expect("open changed index");
-    let beta_report_id = before_removal
-        .get_nodes()
-        .expect("component report nodes")
-        .into_iter()
-        .find(|node| node.serialized_name == "component_report:dir:beta")
-        .map(|node| node.id)
-        .expect("beta component report");
-    let category_id = before_removal
-        .create_bookmark_category("Reports")
-        .expect("create report bookmark category");
-    before_removal
-        .add_bookmark(category_id, beta_report_id, Some("temporary report"))
-        .expect("bookmark component report");
-    drop(before_removal);
+    mutate_published_core(&storage_path, |storage| {
+        let beta_report_id = storage
+            .get_nodes()
+            .expect("component report nodes")
+            .into_iter()
+            .find(|node| node.serialized_name == "component_report:dir:beta")
+            .map(|node| node.id)
+            .expect("beta component report");
+        let category_id = storage
+            .create_bookmark_category("Reports")
+            .expect("create report bookmark category");
+        storage
+            .add_bookmark(category_id, beta_report_id, Some("temporary report"))
+            .expect("bookmark component report");
+    });
 
     fs::remove_file(workspace.path().join("beta").join("lib.rs")).expect("remove beta source");
     controller
@@ -6860,7 +7022,6 @@ fn embedded_exact_symbol_terms_count_and_annotate_exact_hits() {
         evidence_producer: None,
         resolution_status: None,
         loss_reason: None,
-        coverage_role: None,
         eligible_for_sufficiency: None,
         source_excerpt: None,
         verification_targets: Vec::new(),
@@ -7348,7 +7509,8 @@ fn empty_full_refresh_reports_adaptive_chunk_config() {
 fn full_and_incremental_publications_advance_one_durable_generation() {
     let assert_promotion_reconciles = |promotion: &CorePromotionTimings| {
         let named_ms = promotion
-            .lock_recovery_ms
+            .lock_wait_ms
+            .saturating_add(promotion.lock_recovery_ms)
             .saturating_add(promotion.candidate_validation_ms)
             .saturating_add(promotion.previous_validation_ms)
             .saturating_add(promotion.rollback_backup_copy_ms.unwrap_or_default())
@@ -7359,6 +7521,8 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
             .saturating_add(promotion.staged_to_live_restore_ms)
             .saturating_add(promotion.promoted_validation_ms)
             .saturating_add(promotion.committed_journal_ms)
+            .saturating_add(promotion.generation_install_ms)
+            .saturating_add(promotion.pointer_publication_ms)
             .saturating_add(promotion.cleanup_ms);
         assert_eq!(
             named_ms.saturating_add(promotion.unattributed_ms),
@@ -7449,11 +7613,11 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
     assert!(full_promotion.rollback_backup_copy_ms.is_none());
     assert!(full_promotion.backup_validation_ms.is_none());
     assert!(full_promotion.rollback_backup_bytes.is_none());
+    assert!(full_promotion.rollback_generation_bytes.is_none());
     assert!(full_promotion.candidate_bytes > 0);
-    // Whole-database restore publishes a file byte-identical to the candidate
-    // it validated, so the post-restore fence is satisfied by that receipt
-    // rather than by re-deriving the verdict. Any publication design that
-    // assembles the live image in place cannot report this.
+    // The validated candidate is renamed into its owned immutable generation,
+    // so the installed database keeps the candidate receipt without a second
+    // full validation or a fixed-path restore.
     assert_eq!(
         full_promotion.promoted_validation,
         PromotedValidationDto::ReusedCandidateReceipt
@@ -7623,12 +7787,13 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
         incremental_promotion.previous_live_bytes,
         Some(incremental_copy.source_bytes)
     );
+    assert!(incremental_promotion.rollback_backup_bytes.is_none());
+    assert!(incremental_promotion.rollback_backup_copy_ms.is_none());
+    assert!(incremental_promotion.backup_validation_ms.is_none());
     assert_eq!(
-        incremental_promotion.rollback_backup_bytes,
+        incremental_promotion.rollback_generation_bytes,
         incremental_promotion.previous_live_bytes
     );
-    assert!(incremental_promotion.rollback_backup_copy_ms.is_some());
-    assert!(incremental_promotion.backup_validation_ms.is_some());
     assert_eq!(
         incremental_promotion.promoted_validation,
         PromotedValidationDto::ReusedCandidateReceipt
@@ -7660,10 +7825,11 @@ fn full_and_incremental_publications_advance_one_durable_generation() {
         .as_ref()
         .expect("replacement full promotion telemetry");
     assert!(second_full_promotion.previous_live_bytes.is_some());
-    assert!(second_full_promotion.rollback_backup_copy_ms.is_some());
-    assert!(second_full_promotion.backup_validation_ms.is_some());
+    assert!(second_full_promotion.rollback_backup_copy_ms.is_none());
+    assert!(second_full_promotion.backup_validation_ms.is_none());
+    assert!(second_full_promotion.rollback_backup_bytes.is_none());
     assert_eq!(
-        second_full_promotion.rollback_backup_bytes,
+        second_full_promotion.rollback_generation_bytes,
         second_full_promotion.previous_live_bytes
     );
     assert_eq!(
@@ -8312,12 +8478,12 @@ fn explicit_incremental_rejects_incompatible_structural_publication_before_sourc
     let previous = Store::database_index_publication(&storage_path)
         .expect("read baseline")
         .expect("baseline publication");
-    let storage = Store::open(&storage_path).expect("open baseline");
-    storage
-        .get_connection()
-        .execute("DELETE FROM structural_text_unit_publication", [])
-        .expect("remove structural manifest");
-    drop(storage);
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute("DELETE FROM structural_text_unit_publication", [])
+            .expect("remove structural manifest");
+    });
     fs::write(
         workspace.path().join("malformed.json"),
         "{\"missing_value\":",
@@ -8397,13 +8563,12 @@ fn precurrent_schema_requires_typed_full_without_mutating_database_or_sidecars()
     controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Full)
         .expect("publish current baseline");
-    {
-        let storage = Storage::open(&storage_path).expect("open schema fixture");
+    mutate_published_core(&storage_path, |storage| {
         storage
             .get_connection()
             .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION - 1)
             .expect("stamp supported pre-current schema");
-    }
+    });
     let database_before = fs::read(&storage_path).expect("read old-schema database");
     let wal_path = storage_path.with_extension("db-wal");
     let wal_before = fs::read(&wal_path).ok();
@@ -8791,13 +8956,51 @@ fn incremental_publication_ignores_changed_files_without_graph_collectors() {
 
     assert_eq!(second.generation, first.generation + 1);
     assert_eq!(second.mode, IndexPublicationMode::Incremental);
+    let published = Storage::open(&storage_path).expect("open published storage");
+    let collectorless_file = published
+        .get_file_by_path(&collectorless)
+        .expect("look up collectorless file")
+        .expect("discovery must retain an observational file record");
     assert!(
-        Storage::open(&storage_path)
-            .expect("open published storage")
-            .get_file_by_path(&collectorless)
-            .expect("look up collectorless file")
-            .is_none(),
-        "files without graph collectors should not be invented in semantic scope"
+        !collectorless_file.complete,
+        "a collectorless companion file must never claim a complete graph projection"
+    );
+    let collectorless_id = codestory_contracts::graph::NodeId(collectorless_file.id);
+    let nodes = published.get_nodes().expect("published graph nodes");
+    let file_sentinel = nodes
+        .iter()
+        .find(|node| node.id == collectorless_id)
+        .expect("collectorless file sentinel");
+    assert_eq!(file_sentinel.kind, NodeKind::FILE);
+    assert!(file_sentinel.canonical_id.is_none());
+    assert!(file_sentinel.file_node_id.is_none());
+    assert!(
+        nodes.iter().all(|node| {
+            node.id == collectorless_id || node.file_node_id != Some(collectorless_id)
+        }),
+        "collectorless inventory must not invent semantic child nodes"
+    );
+    assert!(
+        published
+            .get_edges()
+            .expect("published graph edges")
+            .iter()
+            .all(|edge| {
+                edge.file_node_id != Some(collectorless_id)
+                    && edge.source != collectorless_id
+                    && edge.target != collectorless_id
+                    && edge.resolved_source != Some(collectorless_id)
+                    && edge.resolved_target != Some(collectorless_id)
+            }),
+        "collectorless inventory must not invent semantic relations"
+    );
+    assert!(
+        published
+            .get_symbol_search_docs_batch_after(None, 10_000)
+            .expect("published symbol documents")
+            .iter()
+            .all(|doc| doc.file_node_id != Some(collectorless_id)),
+        "collectorless inventory must not enter semantic search documents"
     );
 }
 
@@ -8823,10 +9026,11 @@ fn incomplete_legacy_run_is_not_a_servable_complete_publication() {
             .is_some()
     );
 
-    Storage::open(&storage_path)
-        .expect("open live storage")
-        .begin_incremental_run()
-        .expect("mark legacy incomplete run");
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .begin_incremental_run()
+            .expect("mark legacy incomplete run");
+    });
 
     assert!(
         controller
@@ -9088,13 +9292,12 @@ fn assert_incremental_boundary_is_atomic(boundary: IncrementalFailureBoundary) {
         "pub fn caller() -> i32 { target() }\npub fn target() -> i32 { 2 }\n",
     )
     .expect("write new source");
-    {
-        let storage = Storage::open(&storage_path).expect("open storage for fault trigger");
+    mutate_published_core(&storage_path, |storage| {
         storage
             .get_connection()
             .execute_batch(incremental_failure_trigger(boundary))
             .expect("install fault trigger");
-    }
+    });
 
     let error = controller
         .run_indexing_blocking_without_runtime_refresh(IndexMode::Incremental)
@@ -9165,11 +9368,13 @@ fn assert_incremental_boundary_is_atomic(boundary: IncrementalFailureBoundary) {
         baseline_symbol_doc_count,
         "pre-publish failure must preserve graph-native semantic docs"
     );
-    storage
-        .get_connection()
-        .execute_batch("DROP TRIGGER fail_incremental_boundary;")
-        .expect("remove injected live trigger");
     drop(storage);
+    mutate_published_core(&storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch("DROP TRIGGER fail_incremental_boundary;")
+            .expect("remove injected live trigger");
+    });
 
     let dry_run = controller
         .dry_run_index(IndexMode::Incremental)
@@ -9273,19 +9478,13 @@ fn unchanged_incremental_refresh_short_circuits_without_publishing_or_rebuilding
     );
     assert_eq!(probe.files_to_index, 0);
     assert_eq!(probe.files_to_remove, 0);
-    assert_eq!(
-        probe.skipped_database_copies, 3,
-        "skipping the staged pipeline avoids the staged clone, the rollback backup copy, and the staged-to-live restore"
-    );
+    assert_eq!(probe.skipped_database_copies, 0);
     assert!(probe.skipped_search_state_rebuild);
     assert!(
         probe.live_database_file_bytes > 0,
         "the saved work must be measured against the published core size"
     );
-    assert_eq!(
-        probe.skipped_database_copy_bytes,
-        probe.live_database_file_bytes * 3
-    );
+    assert_eq!(probe.skipped_database_copy_bytes, 0);
     assert_eq!(
         timings.publish_ms, None,
         "a short-circuited refresh must not record a publication"
@@ -9422,11 +9621,12 @@ fn incremental_refresh_republishes_when_the_completed_search_generation_is_missi
 #[test]
 fn incremental_refresh_republishes_when_the_dense_anchor_manifest_is_missing() {
     let fixture = publish_empty_plan_short_circuit_baseline();
-    Storage::open(&fixture.storage_path)
-        .expect("open live storage")
-        .get_connection()
-        .execute_batch("DELETE FROM dense_anchor_publication;")
-        .expect("clear dense anchor manifest");
+    mutate_published_core(&fixture.storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch("DELETE FROM dense_anchor_publication;")
+            .expect("clear dense anchor manifest");
+    });
 
     let timings = fixture
         .controller
@@ -9543,13 +9743,14 @@ fn incremental_refresh_refuses_an_empty_plan_over_a_stored_coverage_gap() {
     // An indexed file published without verified content and without completion
     // is a stored `CollectorFailure` gap. It does not schedule any work, so only
     // the coverage check stands between it and a successful refresh.
-    Storage::open(&fixture.storage_path)
-        .expect("open live storage")
-        .get_connection()
-        .execute_batch(
-            "UPDATE file SET complete = 0, content_hash = NULL WHERE path LIKE '%lib.rs';",
-        )
-        .expect("stage a stored coverage gap");
+    mutate_published_core(&fixture.storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch(
+                "UPDATE file SET complete = 0, content_hash = NULL WHERE path LIKE '%lib.rs';",
+            )
+            .expect("stage a stored coverage gap");
+    });
 
     let error = fixture
         .controller
@@ -9589,8 +9790,7 @@ fn incremental_refresh_rebinds_a_dense_anchor_carrying_a_stale_source_identity()
         "core:{}:{}",
         fixture.baseline_publication.generation_id, fixture.baseline_publication.run_id
     );
-    {
-        let storage = Storage::open(&fixture.storage_path).expect("open live storage");
+    mutate_published_core(&fixture.storage_path, |storage| {
         assert!(
             !storage
                 .get_dense_anchor_inputs_batch_after(None, 10_000)
@@ -9613,7 +9813,7 @@ fn incremental_refresh_rebinds_a_dense_anchor_carrying_a_stale_source_identity()
                 .is_err(),
             "the staged drift must be visible to the strict publication validation"
         );
-    }
+    });
 
     let timings = fixture
         .controller
@@ -9659,14 +9859,15 @@ fn incremental_refresh_adjudicates_mixed_dense_anchor_policy_versions() {
     // `publish_dense_anchor_generation` refuses a mixed anchor policy set. That
     // refusal is unreachable on a short-circuited run, so the mixed set must at
     // minimum reach the staged pipeline that owns it.
-    Storage::open(&fixture.storage_path)
-        .expect("open live storage")
-        .get_connection()
-        .execute_batch(
-            "UPDATE dense_anchor_input SET policy_version = 'superseded-anchor-policy'
-             WHERE node_id = (SELECT MIN(node_id) FROM dense_anchor_input);",
-        )
-        .expect("stage a mixed dense anchor policy version");
+    mutate_published_core(&fixture.storage_path, |storage| {
+        storage
+            .get_connection()
+            .execute_batch(
+                "UPDATE dense_anchor_input SET policy_version = 'superseded-anchor-policy'
+                 WHERE node_id = (SELECT MIN(node_id) FROM dense_anchor_input);",
+            )
+            .expect("stage a mixed dense anchor policy version");
+    });
 
     let timings = fixture
         .controller
@@ -9829,6 +10030,72 @@ pub(crate) fn assert_no_staged_publication_artifacts(storage_path: &Path) {
         .filter(|name| name.contains(".staged."))
         .collect::<Vec<_>>();
     assert!(staged.is_empty(), "staged publication debris: {staged:?}");
+}
+
+/// Apply a hostile fixture write to the published core.
+///
+/// A published generation is immutable: `Storage::open` on the live path is
+/// read-only. Fixtures that must corrupt or backdate a published core therefore
+/// mutate a private same-directory copy, checkpoint it, and replace the exact
+/// generation file. Replacing the inode also invalidates in-process artifact
+/// seals, which is part of the hostile mutation these tests need to exercise.
+pub(crate) fn mutate_published_core<R>(
+    storage_path: &Path,
+    mutate: impl FnOnce(&mut Storage) -> R,
+) -> R {
+    let generation_db = codestory_store::resolve_core_database_path(storage_path)
+        .expect("resolve active immutable generation");
+    let generation_dir = generation_db.parent().expect("generation directory");
+    let scratch = tempfile::Builder::new()
+        .prefix(".hostile-core-")
+        .suffix(".db")
+        .tempfile_in(generation_dir)
+        .expect("create hostile generation copy")
+        .into_temp_path();
+    fs::copy(&generation_db, &scratch).expect("copy active generation for hostile fixture");
+    set_generation_owner_writable(&scratch, true);
+    let result = {
+        let mut storage = Storage::open_with_mode(&scratch, StorageOpenMode::Build)
+            .expect("open active generation for hostile fixture");
+        let result = mutate(&mut storage);
+        storage
+            .get_connection()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint hostile generation writes");
+        result
+    };
+    for suffix in ["-wal", "-journal", "-shm"] {
+        let mut sidecar = scratch.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(sidecar));
+    }
+    set_generation_owner_writable(&generation_db, true);
+    fs::remove_file(&generation_db).expect("remove active generation for hostile replacement");
+    scratch
+        .persist(&generation_db)
+        .expect("install hostile generation replacement");
+    set_generation_owner_writable(&generation_db, false);
+    result
+}
+
+fn set_generation_owner_writable(generation_db: &Path, writable: bool) {
+    let metadata = fs::metadata(generation_db).expect("generation metadata");
+    let mut permissions = metadata.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = permissions.mode();
+        permissions.set_mode(if writable {
+            mode | 0o200
+        } else {
+            mode & !0o222
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        permissions.set_readonly(!writable);
+    }
+    fs::set_permissions(generation_db, permissions).expect("set generation writability");
 }
 
 fn storage_has_symbol(storage: &Storage, name: &str) -> bool {
@@ -10333,10 +10600,11 @@ fn full_recovery_marker_completion_fault_preserves_fenced_live_generation() {
             &backup_cache,
             storage_path.parent().expect("recovery cache directory"),
         );
-        Storage::open(&storage_path)
-            .expect("open interrupted live storage")
-            .begin_incremental_run()
-            .expect("fence interrupted live storage");
+        mutate_published_core(&storage_path, |storage| {
+            storage
+                .begin_incremental_run()
+                .expect("fence interrupted live storage");
+        });
         fs::write(&source_path, "pub fn new_generation() -> i32 { 2 }\n")
             .expect("write recovery source");
         let controller = AppController::new();
@@ -10355,7 +10623,8 @@ fn full_recovery_marker_completion_fault_preserves_fenced_live_generation() {
             PublicationTestAction::Fail => assert_eq!(error.code, "internal"),
             PublicationTestAction::Cancel => assert_eq!(error.code, "cancelled"),
         }
-        let storage = Storage::open(&storage_path).expect("open preserved fenced live storage");
+        let storage = Storage::open_freshness_observational(&storage_path)
+            .expect("open preserved fenced live storage");
         assert_eq!(
             storage
                 .get_index_publication()
@@ -11263,13 +11532,14 @@ impl AnnotationProject {
     /// Seed the retained core tables the way a pre-cutover release would have.
     fn seed_legacy_bookmark(&self, symbol: &str, comment: &str) -> i64 {
         let node_id = self.node_id_for(symbol).to_core().expect("core node id");
-        let storage = Storage::open(&self.storage_path).expect("open core");
-        let category_id = storage
-            .create_bookmark_category("Legacy")
-            .expect("legacy category");
-        storage
-            .add_bookmark(category_id, node_id, Some(comment))
-            .expect("legacy bookmark")
+        mutate_published_core(&self.storage_path, |storage| {
+            let category_id = storage
+                .create_bookmark_category("Legacy")
+                .expect("legacy category");
+            storage
+                .add_bookmark(category_id, node_id, Some(comment))
+                .expect("legacy bookmark")
+        })
     }
 
     fn sidecar_path(&self) -> PathBuf {
@@ -11354,19 +11624,7 @@ fn the_cutover_imports_legacy_annotations_once_and_never_writes_them_again() {
     let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
     project.index();
     // Seed the retained core tables the way a pre-cutover release would have.
-    let node_id = project
-        .node_id_for("alpha")
-        .to_core()
-        .expect("core node id");
-    {
-        let storage = Storage::open(&project.storage_path).expect("open core");
-        let category_id = storage
-            .create_bookmark_category("Legacy")
-            .expect("legacy category");
-        storage
-            .add_bookmark(category_id, node_id, Some("legacy note"))
-            .expect("legacy bookmark");
-    }
+    project.seed_legacy_bookmark("alpha", "legacy note");
     let legacy_before = project.legacy_row_counts();
     assert_eq!(legacy_before, (1, 1));
 
@@ -11533,10 +11791,9 @@ fn a_cache_reset_leaves_annotations_intact_and_user_owned() {
 
     // A derived-cache reset removes the core projections; the sidecar sits
     // outside the promotion fence and is untouched.
-    {
-        let storage = Storage::open(&project.storage_path).expect("open core");
+    mutate_published_core(&project.storage_path, |storage| {
         storage.clear().expect("clear derived core state");
-    }
+    });
 
     let after = project
         .controller
@@ -11562,19 +11819,7 @@ fn a_cache_reset_leaves_annotations_intact_and_user_owned() {
 fn a_full_refresh_rescues_legacy_annotations_before_it_replaces_core() {
     let project = AnnotationProject::open("pub fn alpha() -> i32 { 1 }\n");
     project.index();
-    let node_id = project
-        .node_id_for("alpha")
-        .to_core()
-        .expect("core node id");
-    {
-        let storage = Storage::open(&project.storage_path).expect("open core");
-        let category_id = storage
-            .create_bookmark_category("Legacy")
-            .expect("legacy category");
-        storage
-            .add_bookmark(category_id, node_id, Some("legacy note"))
-            .expect("legacy bookmark");
-    }
+    project.seed_legacy_bookmark("alpha", "legacy note");
     assert!(!project.sidecar_path().exists());
 
     // A full refresh installs a database built from scratch, which never

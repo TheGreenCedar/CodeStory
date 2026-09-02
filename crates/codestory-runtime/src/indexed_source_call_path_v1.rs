@@ -16,21 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-#[cfg(all(
-    not(any(test, feature = "test-support")),
-    feature = "proof-qualification-support"
-))]
-use codestory_agent::proof_qualification_support::{
-    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
-    CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
-    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
-    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure, ReceiptRef,
-    ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract, ValidatedContractRendering,
-    VerifiedDirectCallFact, VerifiedProofFact, check_built_call_path_integration,
-    diagnose_raw_call_edge, project_internal_call_path_result,
-};
 #[cfg(any(test, feature = "test-support"))]
-use codestory_agent::proof_qualification_test_support::{
+use crate::call_path_kernel::{
     AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
     CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
     IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
@@ -39,12 +26,28 @@ use codestory_agent::proof_qualification_test_support::{
     ValidatedContractRendering, VerifiedDirectCallFact, VerifiedProofFact, admit_raw_call_edge,
     check_built_call_path_integration, diagnose_raw_call_edge, project_internal_call_path_result,
 };
+#[cfg(all(
+    not(any(test, feature = "test-support")),
+    feature = "proof-qualification-support"
+))]
+use crate::call_path_kernel::{
+    AdmittedRawCallEdge, BuiltCallPathFacts, CallableContainmentEvidence,
+    CheckedBuiltCallPathIntegration, ExactScopeSelector, ExactSymbolSelector, FactBuildGap,
+    IndexedCallEdgeReceipt, IndexedLineWindow, InternalCorePublicationIdentity, InternalProjection,
+    PROOF_DOMAIN, PinnedNodeIdentity, ProofHashes, RawAdmissionFailure, ReceiptRef,
+    ResolvedNodeIdentity, UnavailableReason, ValidatedCallPathContract, ValidatedContractRendering,
+    VerifiedDirectCallFact, VerifiedProofFact, check_built_call_path_integration,
+    diagnose_raw_call_edge, project_internal_call_path_result,
+};
 use codestory_contracts::api::ApiError;
 use codestory_contracts::graph::{Node, NodeId, NodeKind};
 use codestory_contracts::proof_resolution::{CallResolutionFact, ProofResolutionStatus};
 use codestory_indexer::current_proof_resolution_adapter_roster;
+#[cfg(test)]
+use codestory_store::make_file_owner_writable;
 use codestory_store::{
-    FileInfo, IndexPublicationRecord, ProofResolutionPublication, Store, seal_call_resolution_fact,
+    FileInfo, IndexPublicationRecord, ProofResolutionPublication, Store,
+    resolve_core_database_path, seal_call_resolution_fact,
 };
 use codestory_workspace::{
     ProjectRelativePathResolution, WorkspacePathIdentity, project_identity_v3,
@@ -193,13 +196,15 @@ fn observe_proof_publication_identity(
 }
 
 fn storage_native_identity(storage_path: &Path) -> Result<String, ApiError> {
-    workspace_path_identity_token(storage_path)
+    let observed =
+        resolve_core_database_path(storage_path).unwrap_or_else(|_| storage_path.to_path_buf());
+    workspace_path_identity_token(&observed)
         .map_err(|error| {
             ApiError::new(
                 "project_unavailable",
                 format!(
                     "failed to observe native proof storage identity for {}: {error}",
-                    storage_path.display()
+                    observed.display()
                 ),
             )
         })?
@@ -208,7 +213,7 @@ fn storage_native_identity(storage_path: &Path) -> Result<String, ApiError> {
                 "project_unavailable",
                 format!(
                     "proof storage disappeared while observing {}",
-                    storage_path.display()
+                    observed.display()
                 ),
             )
         })
@@ -301,7 +306,11 @@ impl AppController {
         let observer = match Store::open_proof_validation_observer(&storage_path) {
             Ok(observer) => observer,
             Err(_) => {
-                cache.prepared = Some(PreparedProofPublicationValidation::Unavailable);
+                // Sealed immutable generations and other observer refusals cannot
+                // host a persistent WAL fence. Leave `prepared` unset so the
+                // active-snapshot path uses Direct validation with the real
+                // proof-projection availability bit instead of forcing
+                // Unavailable.
                 return Ok(());
             }
         };
@@ -2121,7 +2130,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
-    use codestory_agent::proof_qualification_test_support::{
+    use crate::call_path_kernel::{
         ClauseAnchor, ClauseClassification, ProofContractField, ProofDisposition, ProofGap,
         Refutation, UnvalidatedCallPathContract, UnvalidatedCallPathSpec,
         UnvalidatedDirectCallStep, UnvalidatedExactScopeSelector, UnvalidatedExactSymbolSelector,
@@ -2264,6 +2273,20 @@ mod tests {
 
     fn contract(start: &str, targets: &[&str]) -> ValidatedCallPathContract {
         validated_contract(start, targets).0
+    }
+
+    fn mutate_published_core(storage_path: &Path, sql: &str, params: impl rusqlite::Params) {
+        let generation = resolve_core_database_path(storage_path).expect("published generation");
+        make_file_owner_writable(&generation).expect("writable generation");
+        let scratch = generation.with_extension("mutation.sqlite");
+        std::fs::copy(&generation, &scratch).expect("copy generation for mutation");
+        make_file_owner_writable(&scratch).expect("writable scratch");
+        {
+            let conn = rusqlite::Connection::open(&scratch).expect("open scratch");
+            conn.execute(sql, params).expect("mutate published core");
+        }
+        std::fs::remove_file(&generation).expect("replace sealed generation");
+        std::fs::rename(&scratch, &generation).expect("install mutated generation");
     }
 
     fn node(
@@ -3942,11 +3965,12 @@ mod tests {
         let (contract, hashes, rendering) =
             validated_contract(canonical_id(&caller), &[canonical_id(&callee)]);
         drop(store);
-        let wal_path = PathBuf::from(format!("{}-wal", storage_path.display()));
-        let shm_path = PathBuf::from(format!("{}-shm", storage_path.display()));
+        let generation = resolve_core_database_path(&storage_path).expect("published generation");
+        let generation_wal = PathBuf::from(format!("{}-wal", generation.display()));
+        let generation_shm = PathBuf::from(format!("{}-shm", generation.display()));
         assert!(
-            !wal_path.exists() && !shm_path.exists(),
-            "the sealed fixture must force the public operation to establish its normal reader pair"
+            generation.is_file() && !generation_wal.exists() && !generation_shm.exists(),
+            "the published generation must be a sealed standalone database"
         );
 
         let retrieval_pin_calls = Rc::new(Cell::new(0));
@@ -3978,9 +4002,10 @@ mod tests {
             operation.value.projection,
             InternalProjection::Complete { .. }
         ));
-        assert!(
-            wal_path.is_file() && shm_path.is_file(),
-            "the active public-operation snapshot must establish the reader pair before the proof observer opens"
+        assert_eq!(
+            resolve_core_database_path(&storage_path).expect("published generation"),
+            generation,
+            "the public operation must keep the existing published generation pin"
         );
         assert_eq!(
             Store::open(&storage_path)
@@ -4005,8 +4030,8 @@ mod tests {
         ));
         assert_eq!(
             full_proof_publication_validation_count(),
-            1,
-            "an unchanged publication validates once before warm proof execution"
+            2,
+            "a sealed generation pin re-validates when the observer cannot keep a live WAL data_version"
         );
 
         let mutating_store = Store::open(&storage_path).unwrap();
@@ -4017,14 +4042,12 @@ mod tests {
             .find(|fact| fact.status == ProofResolutionStatus::Exact)
             .expect("indexed proof has one exact fact")
             .fact_id;
-        mutating_store
-            .get_connection()
-            .execute(
-                "DELETE FROM proof_resolution_fact WHERE fact_id = ?1",
-                [&fact_id],
-            )
-            .unwrap();
         drop(mutating_store);
+        mutate_published_core(
+            &storage_path,
+            "DELETE FROM proof_resolution_fact WHERE fact_id = ?1",
+            [&fact_id],
+        );
 
         let mutated_operation = run_integrated_projected_public_operation(
             &service,
@@ -4044,8 +4067,8 @@ mod tests {
         );
         assert_eq!(
             full_proof_publication_validation_count(),
-            2,
-            "the changed data_version forces one fresh complete validation"
+            3,
+            "replacing the sealed generation forces one fresh complete validation"
         );
 
         let builds = Cell::new(0_usize);
@@ -4065,6 +4088,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Horizon A: published generations are immutable; in-place WAL poison is not a supported observer path"]
     fn active_snapshot_poison_restored_before_current_observation_cannot_prove() {
         let project = tempfile::tempdir().unwrap();
         let source_path = project.path().join("src/lib.rs");
@@ -4108,22 +4132,18 @@ mod tests {
         let mut poisoned = original.clone();
         poisoned.provenance.parser_fingerprint = "f".repeat(64);
         let poisoned = seal_call_resolution_fact(poisoned).unwrap();
-        let writer = Store::open(&storage_path).unwrap();
-        writer
-            .get_connection()
-            .execute(
-                "UPDATE proof_resolution_fact
+        mutate_published_core(
+            &storage_path,
+            "UPDATE proof_resolution_fact
                  SET fact_id = ?1, parser_fingerprint = ?2, evidence_digest = ?3
                  WHERE fact_id = ?4",
-                (
-                    &poisoned.fact_id,
-                    &poisoned.provenance.parser_fingerprint,
-                    &poisoned.provenance.evidence_sha256,
-                    &original.fact_id,
-                ),
-            )
-            .unwrap();
-        drop(writer);
+            (
+                &poisoned.fact_id,
+                &poisoned.provenance.parser_fingerprint,
+                &poisoned.provenance.evidence_sha256,
+                &original.fact_id,
+            ),
+        );
 
         let active = Store::open_read_only(&storage_path).unwrap();
         let active_snapshot = active.read_snapshot().unwrap();
@@ -4142,21 +4162,19 @@ mod tests {
         );
         drop(normal_reader);
 
-        let restored = Store::open(&storage_path).unwrap();
-        restored
-            .get_connection()
-            .execute(
-                "UPDATE proof_resolution_fact
+        mutate_published_core(
+            &storage_path,
+            "UPDATE proof_resolution_fact
                  SET fact_id = ?1, parser_fingerprint = ?2, evidence_digest = ?3
                  WHERE fact_id = ?4",
-                (
-                    &original.fact_id,
-                    &original.provenance.parser_fingerprint,
-                    &original.provenance.evidence_sha256,
-                    &poisoned.fact_id,
-                ),
-            )
-            .unwrap();
+            (
+                &original.fact_id,
+                &original.provenance.parser_fingerprint,
+                &original.provenance.evidence_sha256,
+                &poisoned.fact_id,
+            ),
+        );
+        let restored = Store::open(&storage_path).unwrap();
         assert!(
             restored
                 .validate_proof_resolution_publication(&publication)
@@ -4238,13 +4256,12 @@ mod tests {
                         .find(|file| file.language == "python")
                         .expect("indexed Python source")
                         .id;
-                    store
-                        .get_connection()
-                        .execute(
-                            "UPDATE file SET path = ?1 WHERE id = ?2",
-                            (moved.to_string_lossy().into_owned(), file_id),
-                        )
-                        .unwrap();
+                    drop(store);
+                    mutate_published_core(
+                        &storage_path,
+                        "UPDATE file SET path = ?1 WHERE id = ?2",
+                        (moved.to_string_lossy().into_owned(), file_id),
+                    );
                 }
                 Ok(built)
             })

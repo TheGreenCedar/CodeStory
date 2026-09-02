@@ -967,6 +967,12 @@ impl ArtifactCacheFamilyStats {
 /// Timings and counters collected during a workspace indexing run.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IncrementalIndexingStats {
+    /// Whether this run changed any graph-owned projection row rather than
+    /// only refreshing verified file identity and diagnostics.
+    pub graph_projection_changed: bool,
+    /// Existing files whose parser projection was byte-for-byte stable while
+    /// their source identity changed.
+    pub source_identity_only_files: usize,
     pub setup_existing_projection_ids_ms: u64,
     pub setup_seed_symbol_table_ms: u64,
     /// Full source preparation wall time, including artifact-cache lookups.
@@ -1293,6 +1299,7 @@ struct ProjectionWriter<'a> {
     existing_projection_file_ids: &'a HashSet<i64>,
     replaced_projection_ids: HashSet<i64>,
     batched_storage: IntermediateStorage,
+    batched_source_identity_only: bool,
     all_errors: Vec<codestory_contracts::graph::ErrorInfo>,
     pending_file_errors: Vec<codestory_contracts::graph::ErrorInfo>,
     fallback_file_error_ids: HashSet<i64>,
@@ -1318,6 +1325,7 @@ impl<'a> ProjectionWriter<'a> {
             existing_projection_file_ids,
             replaced_projection_ids: HashSet::new(),
             batched_storage: IntermediateStorage::default(),
+            batched_source_identity_only: true,
             all_errors: Vec::new(),
             pending_file_errors: Vec::new(),
             fallback_file_error_ids: HashSet::new(),
@@ -1398,6 +1406,8 @@ impl<'a> ProjectionWriter<'a> {
                     .delete_files_batch(&[exclusion.file_id])
                     .map_err(|error| anyhow!("Storage policy-exclusion cleanup error: {error}"))?;
                 self.replaced_projection_ids.insert(exclusion.file_id);
+                self.stats.graph_projection_changed = true;
+                self.batched_source_identity_only = false;
             }
             self.policy_exclusions.push(exclusion.candidate);
         }
@@ -1412,41 +1422,74 @@ impl<'a> ProjectionWriter<'a> {
     }
 
     fn accept_storage(&mut self, mut local_storage: IntermediateStorage) -> Result<()> {
-        if let Some((file_id, file_complete)) = local_storage
+        let mut source_identity_only = false;
+        if let Some((file_id, file_complete, file_path)) = local_storage
             .files
             .first()
-            .map(|file_info| (file_info.id, file_info.complete))
+            .map(|file_info| (file_info.id, file_info.complete, file_info.path.clone()))
             && self.mode == codestory_workspace::BuildMode::Incremental
             && self.existing_projection_file_ids.contains(&file_id)
             && self.replaced_projection_ids.insert(file_id)
         {
-            if !file_complete {
+            let previous_file = self
+                .storage
+                .get_files_by_paths(std::slice::from_ref(&file_path))
+                .map_err(|error| anyhow!("Storage file lookup error: {error}"))?
+                .remove(&file_path);
+            let existing_states = self
+                .storage
+                .get_callable_projection_states_for_file(file_id)
+                .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
+            let replace_file_owned_projection =
+                !local_storage.structural_text_projections.is_empty()
+                    || local_storage
+                        .files
+                        .first()
+                        .is_some_and(|file| file.language == "openapi");
+            let update_mode = if replace_file_owned_projection {
+                ProjectionUpdateMode::FullReplace
+            } else {
+                classify_projection_update(
+                    &existing_states,
+                    &local_storage.callable_projection_states,
+                )
+            };
+            source_identity_only = matches!(&update_mode, ProjectionUpdateMode::NoChanges)
+                && previous_file.as_ref().is_some_and(|previous| {
+                    local_storage.files.first().is_some_and(|current| {
+                        previous.complete == current.complete
+                            && previous.language == current.language
+                            && previous.file_role == current.file_role
+                    })
+                });
+            if source_identity_only {
+                // The callable and file-structural fences prove the graph is
+                // unchanged. Keep the inherited immutable rows and flush only
+                // the new file identity, content hash, and diagnostics.
+                local_storage
+                    .nodes
+                    .retain(|node| node.id == NodeId(file_id));
+                local_storage.structural_unit_node_ids.clear();
+                local_storage.structural_text_units.clear();
+                local_storage.structural_text_projections.clear();
+                local_storage.structural_text_cache_writes.clear();
+                local_storage.edges.clear();
+                local_storage.occurrences.clear();
+                local_storage.component_access.clear();
+                local_storage.callable_projection_states.clear();
+                local_storage.impl_anchor_node_ids.clear();
+                self.stats.source_identity_only_files =
+                    self.stats.source_identity_only_files.saturating_add(1);
+            } else if !file_complete {
                 // An unreadable, drifting, oversized, or parser-partial source is retry
                 // evidence, not proof that its previous symbols disappeared. Preserve the
                 // last verified projection and update only the file/error rows below.
                 local_storage
                     .nodes
                     .retain(|node| node.id != NodeId(file_id));
+                self.stats.graph_projection_changed = true;
             } else {
-                let existing_states = self
-                    .storage
-                    .get_callable_projection_states_for_file(file_id)
-                    .map_err(|e| anyhow!("Storage state lookup error: {:?}", e))?;
                 let cleanup_started = Instant::now();
-                let replace_file_owned_projection =
-                    !local_storage.structural_text_projections.is_empty()
-                        || local_storage
-                            .files
-                            .first()
-                            .is_some_and(|file| file.language == "openapi");
-                let update_mode = if replace_file_owned_projection {
-                    ProjectionUpdateMode::FullReplace
-                } else {
-                    classify_projection_update(
-                        &existing_states,
-                        &local_storage.callable_projection_states,
-                    )
-                };
                 match update_mode {
                     ProjectionUpdateMode::InsertFresh | ProjectionUpdateMode::NoChanges => {}
                     ProjectionUpdateMode::Delta { changed_callers } => {
@@ -1471,11 +1514,16 @@ impl<'a> ProjectionWriter<'a> {
                             .map_err(|e| anyhow!("Storage cleanup error: {:?}", e))?;
                     }
                 }
+                self.stats.graph_projection_changed = true;
                 self.stats.cleanup_ms = self
                     .stats
                     .cleanup_ms
                     .saturating_add(duration_ms_u64(cleanup_started.elapsed()));
             }
+        } else if self.mode == codestory_workspace::BuildMode::Incremental
+            && !local_storage.files.is_empty()
+        {
+            self.stats.graph_projection_changed = true;
         }
         let owning_file_ids = self
             .batched_storage
@@ -1517,6 +1565,7 @@ impl<'a> ProjectionWriter<'a> {
                 .structural_text_cache_writes
                 .retain(|write| !incoming_file_ids.contains(&write.file_id));
         }
+        self.batched_source_identity_only &= source_identity_only;
         self.batched_storage.merge(local_storage);
 
         let should_flush = !self.batched_storage.files.is_empty()
@@ -1544,7 +1593,9 @@ impl<'a> ProjectionWriter<'a> {
                 &mut self.pending_file_errors,
                 &mut self.had_edges,
                 &mut self.stats,
+                self.batched_source_identity_only,
             )?;
+            self.batched_source_identity_only = true;
             accumulate_flush_breakdown(&mut self.stats, breakdown);
             WorkspaceIndexer::flush_fallback_file_errors(
                 self.storage,
@@ -1576,6 +1627,7 @@ impl<'a> ProjectionWriter<'a> {
             &mut self.pending_file_errors,
             &mut self.had_edges,
             &mut self.stats,
+            self.batched_source_identity_only,
         )?;
         accumulate_flush_breakdown(&mut self.stats, breakdown);
         WorkspaceIndexer::flush_fallback_file_errors(
@@ -1941,6 +1993,7 @@ impl WorkspaceIndexer {
         if plan.mode == codestory_workspace::BuildMode::Incremental
             && !plan.files_to_remove.is_empty()
         {
+            stats.graph_projection_changed = true;
             let cleanup_started = Instant::now();
             let removal = storage
                 .delete_files_batch(&plan.files_to_remove)
@@ -1980,9 +2033,10 @@ impl WorkspaceIndexer {
             } else {
                 (HashSet::new(), 0)
             };
-        if had_edges
-            || expanded_resolution_scope_files > 0
-            || !removal_affected_caller_file_ids.is_empty()
+        if stats.graph_projection_changed
+            && (had_edges
+                || expanded_resolution_scope_files > 0
+                || !removal_affected_caller_file_ids.is_empty())
         {
             let resolver = resolution::ResolutionPass::new();
             let resolution_scope = if plan.mode == codestory_workspace::BuildMode::Incremental {
@@ -2918,6 +2972,7 @@ impl WorkspaceIndexer {
         file_errors: &mut Vec<codestory_contracts::graph::ErrorInfo>,
         had_edges: &mut bool,
         stats: &mut IncrementalIndexingStats,
+        preserve_graph_derived_state: bool,
     ) -> Result<codestory_store::ProjectionFlushBreakdown> {
         reconcile_rust_impl_anchors(storage, batched_storage)?;
         let has_rows = projection_batch_has_rows(batched_storage);
@@ -2932,22 +2987,29 @@ impl WorkspaceIndexer {
                 artifact_blob: &write.artifact_blob,
             })
             .collect::<Vec<_>>();
-        let breakdown = storage
-            .projections()
-            .flush_projection_batch(codestory_store::ProjectionBatch {
-                files: &batched_storage.files,
-                file_content_hashes: &batched_storage.file_content_hashes,
-                nodes: &batched_storage.nodes,
-                structural_text_units: &batched_storage.structural_text_units,
-                structural_text_projections: &batched_storage.structural_text_projections,
-                structural_text_cache_writes: &structural_cache_writes,
-                edges: &batched_storage.edges,
-                occurrences: &batched_storage.occurrences,
-                component_access: &batched_storage.component_access,
-                callable_projection_states: &batched_storage.callable_projection_states,
-                file_errors,
-            })
-            .map_err(|e| anyhow!("Storage error: {:?}", e))?;
+        let projection_batch = codestory_store::ProjectionBatch {
+            files: &batched_storage.files,
+            file_content_hashes: &batched_storage.file_content_hashes,
+            nodes: &batched_storage.nodes,
+            structural_text_units: &batched_storage.structural_text_units,
+            structural_text_projections: &batched_storage.structural_text_projections,
+            structural_text_cache_writes: &structural_cache_writes,
+            edges: &batched_storage.edges,
+            occurrences: &batched_storage.occurrences,
+            component_access: &batched_storage.component_access,
+            callable_projection_states: &batched_storage.callable_projection_states,
+            file_errors,
+        };
+        let breakdown = if preserve_graph_derived_state {
+            storage
+                .projections()
+                .flush_source_identity_batch(projection_batch)
+        } else {
+            storage
+                .projections()
+                .flush_projection_batch(projection_batch)
+        }
+        .map_err(|e| anyhow!("Storage error: {:?}", e))?;
         if let Some(flush_started) = flush_started {
             let batch_wall_ms = duration_ms_u64(flush_started.elapsed());
             debug_assert!(batch_wall_ms >= projection_flush_breakdown_ms(&breakdown));
@@ -2996,7 +3058,8 @@ impl WorkspaceIndexer {
             .or_else(|| {
                 is_text_only_candidate_path(&full_path).then(|| text_only_language_name(&full_path))
             })
-            .or_else(|| is_openapi_candidate_path(&full_path).then_some("openapi"));
+            .or_else(|| is_openapi_candidate_path(&full_path).then_some("openapi"))
+            .or_else(|| companion_inventory_language(&full_path));
         let Some(source_language) = source_language else {
             return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
         };
@@ -3108,7 +3171,26 @@ impl WorkspaceIndexer {
                     }
                 };
             }
-            return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
+            return match index_inventory_only_file(&full_path, source_language) {
+                Ok(local_storage) => Ok(PreparedIndexWork::Immediate(local_storage)),
+                Err(error) => Err(incomplete_file_storage(
+                    &full_path,
+                    None,
+                    source_language,
+                    codestory_contracts::graph::ErrorInfo {
+                        message: format!(
+                            "Failed to inventory companion source file {:?}: {}",
+                            path, error
+                        ),
+                        file_id: None,
+                        line: None,
+                        column: None,
+                        is_fatal: false,
+                        index_step: codestory_contracts::graph::IndexStep::Collection,
+                        coverage_reason: Some(FileCoverageReason::Unreadable),
+                    },
+                )),
+            };
         };
 
         let bytes = match std::fs::read(&full_path) {
@@ -3275,6 +3357,8 @@ impl WorkspaceIndexer {
                             });
                             return Err(local_storage);
                         }
+                        stats.source_identity_only_files =
+                            stats.source_identity_only_files.saturating_add(1);
                         return Ok(PreparedIndexWork::Immediate(IntermediateStorage::default()));
                     }
                     Self::seed_symbol_table_from_nodes(symbol_table, &artifact.nodes);
@@ -4192,6 +4276,10 @@ fn accumulate_projection_writer_stats(
     stats: &mut IncrementalIndexingStats,
     writer_stats: &IncrementalIndexingStats,
 ) {
+    stats.graph_projection_changed |= writer_stats.graph_projection_changed;
+    stats.source_identity_only_files = stats
+        .source_identity_only_files
+        .saturating_add(writer_stats.source_identity_only_files);
     stats.artifact_cache_write_ms = stats
         .artifact_cache_write_ms
         .saturating_add(writer_stats.artifact_cache_write_ms);
@@ -12018,6 +12106,52 @@ fn text_only_language_name(path: &Path) -> &'static str {
         "cs" | "cshtml" => "csharp",
         _ => "text",
     }
+}
+
+/// Return the source-group identity for a companion extension that discovery
+/// admits but no parser or structural collector owns.
+///
+/// This identity is inventory metadata only. It must not be added to the
+/// public language-support registry because doing so would advertise a graph
+/// or source-proof claim that the indexer cannot make.
+fn companion_inventory_language(path: &Path) -> Option<&'static str> {
+    let extension = path.extension()?.to_str()?;
+    let profile = codestory_contracts::language_support::companion_extension_profile(extension)?;
+    profile
+        .surface_language
+        .or_else(|| profile.source_group_languages.first().copied())
+}
+
+/// Persist exact source identity for a discovered companion file without
+/// emitting non-file graph evidence.
+///
+/// `complete = false` keeps proof and absence reasoning conservative. The
+/// verified content hash makes an unchanged file stable across incremental
+/// refreshes, while an actual byte change still schedules the file again.
+fn index_inventory_only_file(path: &Path, language: &str) -> Result<IntermediateStorage> {
+    let bytes = std::fs::read(path)?;
+    let content_hash = source_content_hash(&bytes);
+    let source = String::from_utf8_lossy(&bytes);
+    let (file_node, _file_name, file_id) = file_node_from_source(path, &source);
+    let mut local_storage = IntermediateStorage::default();
+    local_storage.files.push(codestory_store::FileInfo {
+        id: file_id.0,
+        path: path.to_path_buf(),
+        language: language.to_string(),
+        modification_time: file_modification_time(path),
+        indexed: true,
+        complete: false,
+        line_count: source.lines().count() as u32,
+        file_role: codestory_store::FileRole::classify_path(path),
+    });
+    local_storage.nodes.push(file_node);
+    local_storage
+        .file_content_hashes
+        .push(codestory_store::FileContentHash {
+            file_id: file_id.0,
+            content_hash,
+        });
+    Ok(local_storage)
 }
 
 fn prepare_template_index_work(

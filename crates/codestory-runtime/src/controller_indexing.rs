@@ -1,13 +1,13 @@
 use crate::index_commit::{IndexWriterGuard, index_publication_dto};
 use crate::index_coverage::indexed_files_from_storage;
 use crate::index_freshness::{
-    CachedIndexFreshness, FreshnessObservation, index_freshness_cache_ttl_secs,
-    index_freshness_from_storage_with_policy, open_storage_for_read, storage_fingerprint,
+    FreshnessObservation, index_freshness_from_storage_with_policy, open_storage_for_read,
     workspace_member_index_summaries, workspace_member_storage_summaries,
 };
 use crate::index_full::index_full_for_runtime;
 use crate::index_incremental::{
-    ensure_incremental_refresh_compatible, index_incremental_for_runtime,
+    IncrementalPlanProbe, ensure_incremental_refresh_compatible, index_incremental_for_runtime,
+    index_incremental_for_runtime_with_probe, probe_incremental_plan,
 };
 use crate::index_timings::IndexingRunSummary;
 #[cfg(test)]
@@ -22,17 +22,21 @@ use crate::search_state_cache::{
     indexing_cancelled_error, publish_prepared_search_state,
     rebuild_search_state_from_storage_for_runtime, refresh_caches, workspace_refresh_inputs,
 };
+#[cfg(test)]
+use crate::semantic_projection::LLM_SYMBOL_DOC_SCHEMA_VERSION;
 use crate::semantic_projection::{
-    CacheRefreshStats, LLM_SYMBOL_DOC_SCHEMA_VERSION, SEMANTIC_POLICY_VERSION,
-    SemanticProjectionRepublishOutcome, apply_cache_refresh_stats, summarize_symbol_doc,
+    CacheRefreshStats, SEMANTIC_POLICY_VERSION, SemanticProjectionRepublishOutcome,
+    apply_cache_refresh_stats, summarize_symbol_doc,
 };
-use crate::semantic_republish::semantic_projection_republish_for_runtime;
+use crate::semantic_republish::{StagedCoreMutation, semantic_projection_republish_for_runtime};
 use crate::support::{clamp_i64_to_u32, clamp_u128_to_u32};
+#[cfg(test)]
+use crate::validate_source_policy_exclusions;
 use crate::workspace_state::runtime_workspace_manifest;
 use crate::{
     AppController, Storage, clear_search_engine, current_epoch_ms,
     full_refresh_execution_plan_with_coverage, no_project_error, publish_search_engine,
-    runtime_relative_path, validate_source_policy_exclusions,
+    runtime_relative_path,
 };
 use codestory_contracts::api::{
     ApiError, AppEventPayload, IndexDryRunDto, IndexFreshnessDto, IndexMode, IndexPublicationDto,
@@ -44,7 +48,13 @@ use codestory_store::{CURRENT_SCHEMA_VERSION, IndexPublicationRecord, Store, Sym
 use codestory_workspace::{RefreshInputs, WorkspaceManifest};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
+
+pub(crate) struct ActivationIndexingEvidence {
+    pub(crate) phase_timings: IndexingPhaseTimings,
+    pub(crate) publication: IndexPublicationDto,
+    pub(crate) stats: StorageStatsDto,
+}
 
 impl AppController {
     pub(crate) fn project_summary_from_storage(
@@ -102,7 +112,11 @@ impl AppController {
         &self,
         storage_path: &Path,
     ) -> Result<Option<IndexPublicationDto>, ApiError> {
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve complete core publication: {error}"
+            ))
+        })? {
             return Ok(None);
         }
         Store::open_observational(storage_path)
@@ -120,17 +134,37 @@ impl AppController {
         root: PathBuf,
         storage_path: PathBuf,
     ) -> Result<ProjectSummary, ApiError> {
-        let storage = open_storage_for_read(&storage_path)?;
-        let snapshot = storage.read_snapshot().map_err(|error| {
-            ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
-        })?;
-        let summary =
-            self.project_summary_from_storage(&root, &storage_path, snapshot.storage())?;
-        snapshot.finish().map_err(|error| {
+        // Incomplete-run fences use the incomplete schema sentinel. Ordinary
+        // live/read-only opens reject that sentinel, and freshness observation
+        // already pins one deferred transaction, so skip a nested read_snapshot.
+        let summary = if codestory_store::core_database_exists(&storage_path).map_err(|error| {
             ApiError::internal(format!(
-                "Failed to finish project summary snapshot: {error}"
+                "Failed to resolve core publication for project summary: {error}"
             ))
-        })?;
+        })? && Storage::database_has_incomplete_incremental_run(&storage_path)
+            .unwrap_or(false)
+        {
+            let storage =
+                Storage::open_freshness_observational(&storage_path).map_err(|error| {
+                    ApiError::internal(format!(
+                        "Failed to open fenced storage for project summary: {error}"
+                    ))
+                })?;
+            self.project_summary_from_storage(&root, &storage_path, &storage)?
+        } else {
+            let storage = open_storage_for_read(&storage_path)?;
+            let snapshot = storage.read_snapshot().map_err(|error| {
+                ApiError::internal(format!("Failed to begin project summary snapshot: {error}"))
+            })?;
+            let summary =
+                self.project_summary_from_storage(&root, &storage_path, snapshot.storage())?;
+            snapshot.finish().map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to finish project summary snapshot: {error}"
+                ))
+            })?;
+            summary
+        };
 
         let changed = {
             let mut s = self.state.lock();
@@ -305,7 +339,11 @@ impl AppController {
                 root.display()
             )));
         }
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve observational core publication: {error}"
+            ))
+        })? {
             return Ok(None);
         }
         let storage = Storage::open_observational(&storage_path).map_err(|error| {
@@ -439,6 +477,21 @@ impl AppController {
         refresh_runtime_caches: bool,
         cancel_token: Option<&CancellationToken>,
     ) -> Result<IndexingPhaseTimings, ApiError> {
+        self.run_indexing_blocking_inner_with_probe(
+            mode,
+            refresh_runtime_caches,
+            cancel_token,
+            None,
+        )
+    }
+
+    fn run_indexing_blocking_inner_with_probe(
+        &self,
+        mode: IndexMode,
+        refresh_runtime_caches: bool,
+        cancel_token: Option<&CancellationToken>,
+        precomputed_probe: Option<IncrementalPlanProbe>,
+    ) -> Result<IndexingPhaseTimings, ApiError> {
         let (root, storage_path) = {
             let s = self.state.lock();
             if s.is_indexing {
@@ -496,7 +549,7 @@ impl AppController {
                 &self.source_index_policy,
                 &annotations_owned,
             ),
-            IndexMode::Incremental => index_incremental_for_runtime(
+            IndexMode::Incremental => index_incremental_for_runtime_with_probe(
                 &root,
                 &storage_path,
                 &self.events_tx,
@@ -504,6 +557,7 @@ impl AppController {
                 &self.runtime_config,
                 &self.source_index_policy,
                 &annotations_owned,
+                precomputed_probe,
             ),
         };
 
@@ -740,11 +794,16 @@ impl AppController {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_core_requires_publication_repair(
         &self,
         storage_path: &Path,
     ) -> Result<bool, ApiError> {
-        if !storage_path.is_file() {
+        if !codestory_store::core_database_exists(storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to resolve core publication readiness: {error}"
+            ))
+        })? {
             return Ok(false);
         }
         let storage = Store::open_read_only(storage_path).map_err(|error| {
@@ -819,11 +878,129 @@ impl AppController {
         self.run_indexing_blocking_inner(mode, true, Some(cancel_token))
     }
 
+    /// Complete one activation-owned refresh and return the exact committed
+    /// core facts that the staged publication already validated. Activation
+    /// uses this receipt instead of rebuilding a broad project summary and
+    /// revalidating the same derived publications before retrieval can start.
+    pub(crate) fn run_indexing_blocking_with_cancel_for_activation(
+        &self,
+        mode: IndexMode,
+        cancel_token: &CancellationToken,
+        precomputed_probe: Option<IncrementalPlanProbe>,
+    ) -> Result<ActivationIndexingEvidence, ApiError> {
+        let phase_timings = self.run_indexing_blocking_inner_with_probe(
+            mode,
+            true,
+            Some(cancel_token),
+            precomputed_probe,
+        )?;
+        let storage_path = self.require_storage_path()?;
+        let storage = Store::open_read_only(&storage_path).map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to open the committed activation core: {error}"
+            ))
+        })?;
+        let publication = storage
+            .get_complete_index_publication()
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read the committed activation publication: {error}"
+                ))
+            })?
+            .map(index_publication_dto)
+            .ok_or_else(|| {
+                ApiError::new(
+                    "publication_changed",
+                    "the successful activation refresh has no complete core publication",
+                )
+            })?;
+        let stats = storage.get_stats().map_err(|error| {
+            ApiError::internal(format!(
+                "Failed to read the committed activation core statistics: {error}"
+            ))
+        })?;
+        let file_count = if stats.file_count > 0 {
+            stats.file_count
+        } else {
+            storage.get_file_node_count().map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to read the committed activation file count: {error}"
+                ))
+            })?
+        };
+        Ok(ActivationIndexingEvidence {
+            phase_timings,
+            publication,
+            stats: StorageStatsDto {
+                node_count: clamp_i64_to_u32(stats.node_count),
+                edge_count: clamp_i64_to_u32(stats.edge_count),
+                file_count: clamp_i64_to_u32(file_count),
+                error_count: clamp_i64_to_u32(stats.error_count),
+                fatal_error_count: clamp_i64_to_u32(stats.fatal_error_count),
+            },
+        })
+    }
+
+    pub(crate) fn probe_incremental_plan_for_activation(
+        &self,
+    ) -> Result<IncrementalPlanProbe, ApiError> {
+        let root = self.require_project_root()?;
+        let storage_path = self.require_storage_path()?;
+        Ok(probe_incremental_plan(
+            &root,
+            &storage_path,
+            &self.source_index_policy,
+        ))
+    }
+
     pub fn run_indexing_blocking_without_runtime_refresh(
         &self,
         mode: IndexMode,
     ) -> Result<IndexingPhaseTimings, ApiError> {
         self.run_indexing_blocking_inner(mode, false, None)
+    }
+
+    /// Bind project/storage paths for a recovery refresh without opening the
+    /// live core. Compatibility recovery (schema upgrade, incomplete fence)
+    /// must not call read-only open before the replacement generation exists.
+    pub fn bind_project_paths_for_refresh(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+    ) -> Result<(), ApiError> {
+        if !root.is_dir() {
+            return Err(ApiError::not_found(format!(
+                "Project path does not exist or is not a directory: {}",
+                root.display()
+            )));
+        }
+        let changed = {
+            let mut state = self.state.lock();
+            let changed =
+                state.project_root.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &root)
+                }) || state.storage_path.as_ref().is_none_or(|current| {
+                    !codestory_workspace::same_workspace_path(current, &storage_path)
+                });
+            if changed {
+                state.node_names.clear();
+                clear_search_engine(&mut state);
+                state.observed_core_publication = None;
+            }
+            state.project_root = Some(root);
+            state.storage_path = Some(storage_path);
+            changed
+        };
+        if changed {
+            self.sidecar_query_cache.lock().clear();
+            #[cfg(any(
+                test,
+                feature = "test-support",
+                feature = "proof-qualification-support"
+            ))]
+            self.clear_proof_publication_validation_cache();
+        }
+        Ok(())
     }
 
     pub fn run_indexing_blocking_without_runtime_refresh_with_cancel(
@@ -871,11 +1048,37 @@ impl AppController {
         self.republish_semantic_projections_at_blocking_inner(root, storage_path, None)
     }
 
+    /// Republish the core to carry a staged write that the immutable live
+    /// generation cannot accept.
+    pub(crate) fn republish_core_with_staged_mutation_blocking(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        staged_mutation: StagedCoreMutation<'_>,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_at_blocking_with(
+            root,
+            storage_path,
+            None,
+            Some(staged_mutation),
+        )
+    }
+
     fn republish_semantic_projections_at_blocking_inner(
         &self,
         root: PathBuf,
         storage_path: PathBuf,
         cancel_token: Option<&CancellationToken>,
+    ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
+        self.republish_semantic_projections_at_blocking_with(root, storage_path, cancel_token, None)
+    }
+
+    fn republish_semantic_projections_at_blocking_with(
+        &self,
+        root: PathBuf,
+        storage_path: PathBuf,
+        cancel_token: Option<&CancellationToken>,
+        staged_mutation: Option<StagedCoreMutation<'_>>,
     ) -> Result<SemanticProjectionRepublishOutcome, ApiError> {
         if !root.is_dir() {
             return Err(ApiError::not_found(format!(
@@ -918,6 +1121,7 @@ impl AppController {
             cancel_token,
             &self.runtime_config,
             &self.source_index_policy,
+            staged_mutation,
         );
         match result {
             Ok((
@@ -955,27 +1159,30 @@ impl AppController {
         }
         let workspace = runtime_workspace_manifest(&root, &storage_path)
             .map_err(|e| ApiError::internal(format!("Failed to open project: {e}")))?;
-        let refresh_inputs = if storage_path.exists() {
-            let schema_version = Store::database_schema_version_observational(&storage_path)
-                .map_err(|error| {
-                    ApiError::internal(format!(
-                        "Failed to inspect dry-run storage without recovery: {error}"
-                    ))
-                })?;
-            if schema_version < CURRENT_SCHEMA_VERSION {
-                RefreshInputs::default()
-            } else {
-                let store =
-                    Store::open_freshness_observational(&storage_path).map_err(|error| {
+        let refresh_inputs =
+            if codestory_store::core_database_exists(&storage_path).map_err(|error| {
+                ApiError::internal(format!("Failed to resolve dry-run core storage: {error}"))
+            })? {
+                let schema_version = Store::database_schema_version_observational(&storage_path)
+                    .map_err(|error| {
                         ApiError::internal(format!(
-                            "Failed to inspect dry-run storage without mutation: {error}"
+                            "Failed to inspect dry-run storage without recovery: {error}"
                         ))
                     })?;
-                workspace_refresh_inputs(&store)?
-            }
-        } else {
-            RefreshInputs::default()
-        };
+                if schema_version < CURRENT_SCHEMA_VERSION {
+                    RefreshInputs::default()
+                } else {
+                    let store =
+                        Store::open_freshness_observational(&storage_path).map_err(|error| {
+                            ApiError::internal(format!(
+                                "Failed to inspect dry-run storage without mutation: {error}"
+                            ))
+                        })?;
+                    workspace_refresh_inputs(&store)?
+                }
+            } else {
+                RefreshInputs::default()
+            };
         let execution_plan = match mode {
             IndexMode::Full => {
                 full_refresh_execution_plan_with_coverage(
@@ -1034,51 +1241,48 @@ impl AppController {
             })?;
         let model = self.runtime_config.summary.model.clone();
         let storage_path = self.require_storage_path()?;
-        let mut storage = Store::open(&storage_path)
-            .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
-        let docs = storage
-            .get_all_llm_symbol_docs()
-            .map_err(|e| ApiError::internal(format!("Failed to load symbol docs: {e}")))?;
-        let current_summaries = storage
-            .get_all_current_symbol_summaries()
-            .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
 
+        // Generate first, write once. A published core is immutable, so the
+        // summaries can only land through a staged republish, and that stage
+        // must not be held open across the model calls.
         let mut generated = 0u32;
         let mut reused = 0u32;
         let mut skipped = 0u32;
         let mut pending = Vec::new();
-        for doc in docs {
-            if current_summaries.contains_key(&doc.node_id) {
-                reused = reused.saturating_add(1);
-                continue;
-            }
-            if doc.doc_text.trim().is_empty() {
-                skipped = skipped.saturating_add(1);
-                continue;
-            }
-            let summary =
-                summarize_symbol_doc(&endpoint, &model, &doc, &self.runtime_config.summary)?;
-            pending.push(SymbolSummaryRecord {
-                node_id: doc.node_id,
-                content_hash: doc.doc_hash,
-                summary,
-                model: model.clone(),
-                updated_at_epoch_ms: current_epoch_ms(),
-            });
-            generated = generated.saturating_add(1);
-
-            if pending.len() >= 32 {
-                storage
-                    .upsert_symbol_summaries_batch(&pending)
-                    .map_err(|e| {
-                        ApiError::internal(format!("Failed to store symbol summaries: {e}"))
-                    })?;
-                pending.clear();
+        {
+            let storage = Store::open(&storage_path)
+                .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+            let docs = storage
+                .get_all_llm_symbol_docs()
+                .map_err(|e| ApiError::internal(format!("Failed to load symbol docs: {e}")))?;
+            let current_summaries = storage
+                .get_all_current_symbol_summaries()
+                .map_err(|e| ApiError::internal(format!("Failed to load symbol summaries: {e}")))?;
+            for doc in docs {
+                if current_summaries.contains_key(&doc.node_id) {
+                    reused = reused.saturating_add(1);
+                    continue;
+                }
+                if doc.doc_text.trim().is_empty() {
+                    skipped = skipped.saturating_add(1);
+                    continue;
+                }
+                let summary =
+                    summarize_symbol_doc(&endpoint, &model, &doc, &self.runtime_config.summary)?;
+                pending.push(SymbolSummaryRecord {
+                    node_id: doc.node_id,
+                    content_hash: doc.doc_hash,
+                    summary,
+                    model: model.clone(),
+                    updated_at_epoch_ms: current_epoch_ms(),
+                });
+                generated = generated.saturating_add(1);
             }
         }
-        storage
-            .upsert_symbol_summaries_batch(&pending)
-            .map_err(|e| ApiError::internal(format!("Failed to store symbol summaries: {e}")))?;
+
+        if !pending.is_empty() {
+            self.persist_symbol_summaries(&storage_path, pending)?;
+        }
 
         Ok(SummaryGenerationDto {
             generated,
@@ -1086,6 +1290,48 @@ impl AppController {
             skipped,
             endpoint,
         })
+    }
+
+    /// Durably store freshly generated symbol summaries.
+    ///
+    /// `symbol_summary` is a core table, so once a core publication pointer
+    /// exists the live database is read-only and the rows can only be installed
+    /// by republishing a new generation. An unpublished cache still takes the
+    /// direct write.
+    fn persist_symbol_summaries(
+        &self,
+        storage_path: &Path,
+        summaries: Vec<SymbolSummaryRecord>,
+    ) -> Result<(), ApiError> {
+        let published = codestory_store::CorePublicationLayout::from_storage_path(storage_path)
+            .and_then(|layout| layout.read_pointer())
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "Failed to resolve the core publication pointer: {error}"
+                ))
+            })?
+            .is_some();
+        if !published {
+            let mut storage = Store::open(storage_path)
+                .map_err(|e| ApiError::internal(format!("Failed to open storage: {e}")))?;
+            return storage
+                .upsert_symbol_summaries_batch(&summaries)
+                .map_err(|e| ApiError::internal(format!("Failed to store symbol summaries: {e}")));
+        }
+
+        let root = self.require_project_root()?;
+        self.republish_core_with_staged_mutation_blocking(
+            root,
+            storage_path.to_path_buf(),
+            &move |store: &mut Store| {
+                store
+                    .upsert_symbol_summaries_batch(&summaries)
+                    .map_err(|e| {
+                        ApiError::internal(format!("Failed to store symbol summaries: {e}"))
+                    })
+            },
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn finalize_indexing_without_runtime_refresh_with<F>(
@@ -1158,47 +1404,19 @@ impl AppController {
         workspace: &WorkspaceManifest,
         storage: &Storage,
     ) -> IndexFreshnessDto {
-        if !matches!(storage.has_incomplete_incremental_run(), Ok(false)) {
-            self.state.lock().index_freshness_cache = None;
-            return index_freshness_from_storage_with_policy(
-                root,
-                workspace,
-                storage,
-                &self.source_index_policy,
-                FreshnessObservation::Unobserved,
-            );
-        }
-        let ttl = Duration::from_secs(index_freshness_cache_ttl_secs());
-        let storage_fingerprint = storage_fingerprint(storage_path);
-        {
-            let state = self.state.lock();
-            if let Some(cached) = state.index_freshness_cache.as_ref()
-                && cached.root == root
-                && cached.storage_path == storage_path
-                && cached.storage_fingerprint == storage_fingerprint
-                && cached.cached_at.elapsed() < ttl
-            {
-                return cached.value.clone();
-            }
-        }
-
-        // The cached project summary feeds observational surfaces. They read what already
-        // exists and never create observers.
-        let freshness = index_freshness_from_storage_with_policy(
+        // Observational status/doctor must re-compare source against the pinned
+        // core on every read. Caching a source-drift verdict behind a storage
+        // mtime fingerprint is incorrect for immutable generations: sealed
+        // cores no longer churn WAL/SHM mtimes on read, so a warmup status
+        // would otherwise hide later working-tree edits for the full TTL.
+        let _ = storage_path;
+        self.state.lock().index_freshness_cache = None;
+        index_freshness_from_storage_with_policy(
             root,
             workspace,
             storage,
             &self.source_index_policy,
             FreshnessObservation::Unobserved,
-        );
-        let mut state = self.state.lock();
-        state.index_freshness_cache = Some(CachedIndexFreshness {
-            root: root.to_path_buf(),
-            storage_path: storage_path.to_path_buf(),
-            storage_fingerprint,
-            value: freshness.clone(),
-            cached_at: Instant::now(),
-        });
-        freshness
+        )
     }
 }

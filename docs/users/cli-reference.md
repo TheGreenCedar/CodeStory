@@ -78,19 +78,42 @@ Degraded retrieval is navigation help only. See [Glossary](../glossary.md#retrie
 
 ## Exact call-path verification
 
-Use the exact verifier only with a complete host-supplied translation containing
-the original source text, typed clause anchors, and exact ordered call spec:
+The verifier reads one contract written in the `call-path/v1` grammar. Write the
+document yourself; CodeStory parses it and does not translate prose into one.
 
-```sh
-codestory-cli prove-call-path --project <repo> --spec <request.json>
-cat request.json | codestory-cli prove-call-path --project <repo> --spec -
+```text
+call-path/v1
+from symbol "crate::module::Alpha"
+direct-call symbol "crate::module::Beta"
+direct-call symbol "Gamma" in "src/gamma.rs"
+prohibit-through symbol "crate::detail::Helper"
+exclude-from-projection symbol "crate::test_support"
 ```
 
+The version line comes first. Exactly one `from` and one to six `direct-call`
+lines are required. `prohibit-through` and `exclude-from-projection` are
+optional and capped at sixteen each. Selectors are
+`symbol "<qualified-name>" [in "<project-relative-path>"]` or
+`canonical "<id>"`. Signatures, wildcards, absolute paths, `..`, and internal
+identities are not selectors. Blank lines and indentation are ignored.
+
+```sh
+codestory-cli verify-indexed-direct-calls --project <repo> --spec <call-path.txt>
+cat call-path.txt | codestory-cli verify-indexed-direct-calls --project <repo> --spec -
+```
+
+The MCP tool `verify_indexed_direct_calls` takes the same document as its
+`call_path` argument. Both transports cap the document at 8192 bytes.
+
 The command is observational and does not start broad semantic retrieval.
-`contract_proven` and `contract_refuted` apply only to the supplied indexed
-source-call contract. Translation gaps and unsupported proof-domain cases return
-typed `unknown` or `unavailable` results. CodeStory does not translate prose or
-recommend automatic verifier invocation.
+`contract_proven` and `contract_refuted` apply only to the indexed source-call
+contract you wrote. Any line the grammar cannot read is reported as an
+unresolved clause and makes the whole result `unknown`, so the verifier never
+proves a smaller contract than the one you supplied. Unsupported proof-domain
+cases return typed `unknown` or `unavailable` results.
+
+Verification results carry `provenance.availability: "unavailable"`. There is no
+proof-provenance artifact registry yet, so no artifact reference is offered.
 
 ## Stale local cache
 
