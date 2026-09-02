@@ -5,6 +5,11 @@
 Scope: transcript analysis and manifest-backed quality scoring for
 `scripts/codestory-agent-ab-benchmark.mjs`.
 
+The historical 18-task language-expansion corpus is builder-visible and
+contaminated. Runs against it can diagnose the harness and guide one general
+compiler revision; they cannot authorize a release or support product-facing
+accuracy claims.
+
 The harness exposes pure analyzer/scorer functions and keeps a built-in
 fixture smoke test:
 
@@ -17,6 +22,12 @@ The focused Node fixture lives at
 
 ```sh
 node --test ./scripts/tests/codestory-agent-ab-analyzer.test.mjs
+```
+
+The evidence-compiler ablation has a separate frozen contract test:
+
+```sh
+node --test ./scripts/tests/codestory-evidence-compiler-ablation.test.mjs
 ```
 
 The fixture verifies:
@@ -56,7 +67,88 @@ owns query planning.
 Keep `node ./scripts/codestory-agent-ab-benchmark.mjs --list` as the cheapest
 configuration smoke check.
 
-The language-support promotion packet-runtime suite is:
+The five-arm builder-visible evidence-compiler ablation is:
+
+```sh
+cargo build --locked --release -p codestory-cli --features benchmark-support
+node scripts/codestory-agent-ab-benchmark.mjs \
+  --builder-ablation \
+  --materialize-repos \
+  --codestory-cli target/release/codestory-cli \
+  --out-dir target/agent-benchmark/evidence-compiler-builder
+```
+
+It runs three fresh repeats of native tools, exact identity/source, exact plus
+explicit relations, packet without dense candidates, and packet with dense
+candidates. The agent may inspect source and adapt in every arm. The two packet
+arms use one benchmark-only binary and record whether the dense candidate stage
+actually executed. The harness never follows a continuation automatically.
+Each agent session has an opaque, treatment-blind ephemeral Codex home with no
+MCP configuration. Exact-operation arguments are allowlisted and bind the
+pinned project plus prepared agent namespace; cache, refresh, and output-path
+overrides invalidate the row. If the agent chooses the one permitted typed
+continuation, it must use the same checksum-bound CLI and write a second
+execution receipt; the join rejects a failed call, an option not offered by the
+initial packet, a changed request or publication, or a changed dense-stage
+policy. The agent sees neither the initial harness command nor its task-shaped
+artifact paths. Typed
+continuations hold dense retrieval disabled in both packet arms, so only the
+withheld initial packet prelude differs between the dense treatments.
+Packet exploration is the median paired ratio of observed local
+repository-context actions after the matched first successful CodeStory action
+begins. The slice starts at the action boundary rather than the result boundary,
+so context gathered in parallel while CodeStory runs cannot disappear between
+the first-action fence and the exploration metric. A
+known local search, source-read, Git, build/test, or CodeStory command is an
+observed action even when it produces no output. Any other command is an
+observed action when it emits non-whitespace output while running in the pinned
+repository. Non-command tool calls are observed actions as well. Exit status
+does not erase context that already reached the agent, so a failing command
+that printed source still counts. The first-action fence uses this same
+observed-action boundary. This deliberately overcounts ambiguous output rather
+than letting an unfamiliar reader, extensionless file, glob, or failing shell
+pipeline make a treatment look better. Command-shaped source reads and output
+bytes remain diagnostic only. Equal zero-work rows count as equal, not as a
+packet reduction.
+
+Prepare the arm-blinded case bundle and keep the case map from the independent
+reviewer:
+
+```sh
+node scripts/codestory-evidence-compiler-ablation-adjudication.mjs \
+  --prepare \
+  --run-dir target/agent-benchmark/evidence-compiler-builder \
+  --output-dir target/agent-benchmark/evidence-compiler-builder/adjudication
+```
+
+The independent reviewer adjudicates all 96 CodeStory-arm answers for critical
+factual and unsupported relation claims, without the map or experimental arm
+names. Join
+the returned judgments to the withheld map, then evaluate the receipt:
+
+```sh
+node scripts/codestory-evidence-compiler-ablation-adjudication.mjs \
+  --finalize \
+  --run-dir target/agent-benchmark/evidence-compiler-builder \
+  --cases target/agent-benchmark/evidence-compiler-builder/adjudication/blinded-cases.json \
+  --map target/agent-benchmark/evidence-compiler-builder/adjudication/private-case-map.json \
+  --judgments <blinded-judgments.json> \
+  --output target/agent-benchmark/evidence-compiler-builder/adjudication.json
+node scripts/codestory-evidence-compiler-ablation-evaluate.mjs \
+  --run-dir target/agent-benchmark/evidence-compiler-builder \
+  --adjudication target/agent-benchmark/evidence-compiler-builder/adjudication.json \
+  --attempt initial
+```
+
+The resulting receipt is development evidence only. A failed packet gate
+must be classified by rerunning evaluation with
+`--causal-classification new|equivalent`. A new causal class permits one
+general compiler revision; an equivalent failure or any failed
+`--attempt general_revision` emits the machine `stop` decision. The same
+receipt explicitly keeps or disables graph and dense-semantic defaults from
+their independently adjudicated marginal comparisons.
+
+The legacy language-support packet-runtime diagnostic is:
 
 ```powershell
 $env:CODESTORY_EMBED_MODEL_SOURCE = (node scripts/prepare-embedded-model.mjs).Trim()
@@ -72,16 +164,16 @@ node scripts/codestory-agent-ab-benchmark.mjs `
   --codestory-cli target/release/codestory-cli.exe `
   --out-dir target/agent-benchmark/language-expansion-publishable-full-form-command-shapes `
   --timeout-ms 180000 `
-  --max-source-reads-after-packet 0 `
-  --publishable
+  --max-source-reads-after-packet 0
 ```
 
 The run ledger records per-run `wall_ms`, token usage, estimated cost when
 `CODESTORY_BENCH_INPUT_COST_PER_MTOK` and
 `CODESTORY_BENCH_OUTPUT_COST_PER_MTOK` are configured, observed tool calls, tool
 categories, web searches, command counts, command categories, direct source
-reads, ordinary source reads after the first CodeStory command, ordinary source
-reads after the first packet, duplicate file reads, and manifest quality scores.
+reads, observed repository-context actions after the first CodeStory action,
+ordinary source reads after the first packet, duplicate file reads, and
+manifest quality scores.
 For the `without_codestory` arm, the harness mechanically runs a strictly
 no-CodeStory local-context prelude before starting the nested agent. It derives
 plain `rg` search terms from the prompt, reads bounded snippets from selected
@@ -230,9 +322,9 @@ with the harness's trusted-checkout mode and confirm the summary shows local
 command/tool counts and zero web searches.
 
 Do not make public savings claims from these fixtures. They only prove
-transcript analyzer/parser and scorer behavior. Promotion evidence still
-requires real benchmark runs with raw transcripts, repeated medians, and quality
-thresholds.
+transcript analyzer/parser and scorer behavior. Release acceptance requires the
+separately owned sealed task set, fresh installed sessions, raw transcripts,
+repeated task-level results, and its preregistered gates.
 
 ## README with/without row
 

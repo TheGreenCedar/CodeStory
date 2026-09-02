@@ -41,6 +41,13 @@ pub struct BrowserQueryItem {
     pub source: String,
 }
 
+#[cfg(feature = "benchmark-support")]
+#[derive(Debug, Clone)]
+pub struct BenchmarkPacketExecution {
+    pub packet: AgentPacketDto,
+    pub retrieval_proof: serde_json::Value,
+}
+
 /// Runtime-owned read-only codebase browser boundary.
 ///
 /// This facade intentionally exposes repository lookup, grounding, and DB-first
@@ -157,6 +164,32 @@ impl ReadOnlyBrowserService {
 
     pub fn packet(&self, req: AgentPacketRequestDto) -> Result<AgentPacketDto, ApiError> {
         self.run_public("packet", || self.controller.agent_packet(req.clone()))
+    }
+
+    /// Measurement-only packet control that executes the same compiler while
+    /// recording whether the dense descriptor stage actually ran.
+    #[cfg(feature = "benchmark-support")]
+    #[doc(hidden)]
+    pub fn packet_for_benchmark(
+        &self,
+        req: AgentPacketRequestDto,
+        include_dense_semantic: bool,
+    ) -> Result<BenchmarkPacketExecution, ApiError> {
+        self.run_public("packet", || {
+            let execution = self
+                .controller
+                .agent_packet_for_benchmark(req.clone(), include_dense_semantic)?;
+            Ok(BenchmarkPacketExecution {
+                packet: execution.packet,
+                retrieval_proof: serde_json::to_value(execution.retrieval_proof).map_err(
+                    |error| {
+                        ApiError::internal(format!(
+                            "serialize benchmark packet retrieval proof: {error}"
+                        ))
+                    },
+                )?,
+            })
+        })
     }
 
     pub fn search(&self, req: SearchRequest) -> Result<Vec<SearchHit>, ApiError> {

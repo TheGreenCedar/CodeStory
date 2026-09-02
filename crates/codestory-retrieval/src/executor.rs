@@ -146,11 +146,18 @@ pub(crate) enum CandidatePayloadMode {
 }
 
 impl CandidatePayloadMode {
-    fn cache_fingerprint(self, fingerprint: String) -> String {
+    fn cache_fingerprint(self, fingerprint: String, include_dense_semantic: bool) -> String {
         match self {
             Self::Full => fingerprint,
-            Self::DescriptorOnly => format!("packet-descriptor/v1:{fingerprint}"),
+            Self::DescriptorOnly if include_dense_semantic => {
+                format!("packet-descriptor/v1:dense-on:{fingerprint}")
+            }
+            Self::DescriptorOnly => format!("packet-descriptor/v1:dense-off:{fingerprint}"),
         }
+    }
+
+    fn is_descriptor(self) -> bool {
+        self == Self::DescriptorOnly
     }
 }
 
@@ -160,7 +167,7 @@ impl<'a> QueryExecutor<'a> {
     /// `total_budget_ms` caps retrieval work only; it does not include runtime candidate
     /// resolution, packet sufficiency checks, or answer composition.
     pub fn execute(&mut self, query: &str, total_budget_ms: Option<u64>) -> Result<QueryResult> {
-        self.execute_with_payload(query, total_budget_ms, CandidatePayloadMode::Full)
+        self.execute_with_payload(query, total_budget_ms, CandidatePayloadMode::Full, true)
     }
 
     pub(crate) fn execute_packet_descriptors(
@@ -168,7 +175,31 @@ impl<'a> QueryExecutor<'a> {
         query: &str,
         total_budget_ms: Option<u64>,
     ) -> Result<QueryResult> {
-        self.execute_with_payload(query, total_budget_ms, CandidatePayloadMode::DescriptorOnly)
+        self.execute_with_payload(
+            query,
+            total_budget_ms,
+            CandidatePayloadMode::DescriptorOnly,
+            true,
+        )
+    }
+
+    /// Execute the production descriptor path with the dense semantic stage
+    /// removed for the builder-visible packet ablation.
+    ///
+    /// Full publication health is still required. This changes one retrieval
+    /// lane for measurement; it is unavailable to product builds.
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn execute_packet_descriptors_without_dense_semantic_for_benchmark(
+        &mut self,
+        query: &str,
+        total_budget_ms: Option<u64>,
+    ) -> Result<QueryResult> {
+        self.execute_with_payload(
+            query,
+            total_budget_ms,
+            CandidatePayloadMode::DescriptorOnly,
+            false,
+        )
     }
 
     fn execute_with_payload(
@@ -176,10 +207,14 @@ impl<'a> QueryExecutor<'a> {
         query: &str,
         total_budget_ms: Option<u64>,
         payload: CandidatePayloadMode,
+        include_dense_semantic: bool,
     ) -> Result<QueryResult> {
         let request_started = Instant::now();
         let features = classify_query(query);
-        let fingerprint = payload.cache_fingerprint(query_fingerprint(&features.raw_query));
+        let fingerprint = payload.cache_fingerprint(
+            query_fingerprint(&features.raw_query),
+            include_dense_semantic,
+        );
 
         let (mode, degraded_reason) = self.resolve_mode(payload);
         if mode != RetrievalDegradedMode::Full {
@@ -223,7 +258,7 @@ impl<'a> QueryExecutor<'a> {
         }
 
         let mut plan = crate::planner::plan_query(&features, mode);
-        if payload == CandidatePayloadMode::DescriptorOnly {
+        if payload.is_descriptor() {
             // Both SCIP stages open the graph query view. The anchor stage
             // constructs its adjacency map even when it returns only anchors,
             // while expansion materializes neighbor evidence. Packet
@@ -235,6 +270,11 @@ impl<'a> QueryExecutor<'a> {
                     RetrievalStageKind::Stage0ScipAnchor | RetrievalStageKind::Stage2ScipExpand
                 )
             });
+        }
+        if !include_dense_semantic {
+            debug_assert!(payload.is_descriptor());
+            plan.stages
+                .retain(|stage| stage.kind != RetrievalStageKind::Stage1bSemantic);
         }
         let planned_budget_ms = plan.stages.iter().map(|stage| stage.budget_ms).sum::<u64>();
         if let Some(budget) = total_budget_ms {
@@ -325,7 +365,7 @@ impl<'a> QueryExecutor<'a> {
                     Some("sidecar_layout_missing".into()),
                 );
             };
-            let report = if payload == CandidatePayloadMode::DescriptorOnly {
+            let report = if payload.is_descriptor() {
                 if let (Some(embedding_device), Some(runtime)) = (
                     self.sidecars.embedding_device_readiness(),
                     self.sidecars.runtime_config(),
@@ -372,7 +412,7 @@ impl<'a> QueryExecutor<'a> {
             } else {
                 probe_sidecar_health(layout, &manifest.project_id, Some(manifest.clone()))
             };
-            return if payload == CandidatePayloadMode::DescriptorOnly {
+            return if payload.is_descriptor() {
                 crate::mode::derive_descriptor_mode(&report.lexical, &report.semantic)
             } else {
                 derive_degraded_mode(&report.lexical, &report.semantic, &report.scip)
@@ -398,7 +438,7 @@ impl<'a> QueryExecutor<'a> {
                 sidecars.scip_anchor_with_context(query, stage.top_k, context)
             }
             RetrievalStageKind::Stage1Lexical => {
-                if payload == CandidatePayloadMode::DescriptorOnly {
+                if payload.is_descriptor() {
                     sidecars.lexical_descriptor_search_with_context(query, stage.top_k, context)
                 } else {
                     sidecars.lexical_search_with_context(query, stage.top_k, context)
@@ -1394,6 +1434,84 @@ mod tests {
                 .hits
                 .iter()
                 .all(|hit| hit.source_excerpt.is_none() && hit.target.is_none())
+        );
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[test]
+    fn benchmark_packet_descriptor_control_executes_no_dense_semantic_stage() {
+        struct DenseSemanticTripwire;
+
+        impl SidecarSearch for DenseSemanticTripwire {
+            fn lexical_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                let mut hit = CandidateHit::with_source(
+                    "src/lexical.rs",
+                    Some("lexical_anchor".into()),
+                    0.9,
+                    CandidateSource::Lexical,
+                );
+                hit.node_id = Some("17".into());
+                hit.source_bytes_upper_bound = Some(512);
+                Ok(vec![hit])
+            }
+
+            fn semantic_search(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                panic!("dense semantic retrieval must not execute in the benchmark control")
+            }
+
+            fn scip_anchor(&self, _query: &str, _limit: usize) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+
+            fn scip_expand(
+                &self,
+                _anchors: &[CandidateHit],
+                _limit: usize,
+            ) -> Result<Vec<CandidateHit>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let query = "explain the unfamiliar subsystem";
+        let manifest = sample_manifest();
+        let mut cache = RetrievalCache::new();
+        let dense_on_key = RetrievalCacheKey::from_manifest(
+            &manifest,
+            CandidatePayloadMode::DescriptorOnly.cache_fingerprint(query_fingerprint(query), true),
+        );
+        cache.insert(
+            dense_on_key,
+            vec![CandidateHit::lexical_stub("src/stale-dense-on.rs", 1.0)],
+        );
+        let mut executor = QueryExecutor {
+            sidecars: Arc::new(DenseSemanticTripwire),
+            cache: &mut cache,
+            manifest: Some(manifest),
+            file_roles: Arc::new(HashMap::new()),
+            cancelled: cancellation_flag(),
+            mode_override: Some(RetrievalDegradedMode::Full),
+        };
+
+        let result = executor
+            .execute_packet_descriptors_without_dense_semantic_for_benchmark(query, Some(800))
+            .expect("lexical descriptor control");
+
+        assert!(
+            !result.trace.cache_hit,
+            "dense-on cache entries must not cross into the control"
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| hit.file_path == "src/lexical.rs")
+        );
+        assert!(
+            result
+                .trace
+                .stages
+                .iter()
+                .all(|stage| { stage.stage != RetrievalStageKind::Stage1bSemantic })
         );
     }
 

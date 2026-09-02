@@ -392,6 +392,23 @@ impl AppController {
         })
     }
 
+    #[cfg(feature = "benchmark-support")]
+    pub(crate) fn agent_packet_for_benchmark(
+        &self,
+        req: AgentPacketRequestDto,
+        include_dense_semantic: bool,
+    ) -> Result<agent::orchestrator::BenchmarkPacketExecution, ApiError> {
+        self.with_complete_core_snapshot(|publication| {
+            agent::retrieval_primary::with_stable_packet_retrieval_publication(
+                self,
+                "packet output",
+                &publication.generation_id,
+                &publication.run_id,
+                || agent::agent_packet_for_benchmark(self, req.clone(), include_dense_semantic),
+            )
+        })
+    }
+
     pub fn graph_neighborhood(&self, req: GraphRequest) -> Result<GraphResponse, ApiError> {
         graph_builders::graph_neighborhood(self, req)
     }

@@ -5,7 +5,7 @@ edition = "2024"
 
 [features]
 default = ["proof-qualification-support"]
-benchmark-support = []
+benchmark-support = ["codestory-retrieval/benchmark-support"]
 proof-qualification-support = []
 v3-evidence-separation-support = ["codestory-agent/v3-evidence-separation-support"]
 # The runtime test hooks now partly live in codestory-agent (fresh_index_observation

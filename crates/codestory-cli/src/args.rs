@@ -589,6 +589,12 @@ pub(crate) struct PacketCommand {
         help = "Write the immutable packet diagnostic projection atomically to this path."
     )]
     pub(crate) diagnostics_out: Option<PathBuf>,
+    #[cfg(feature = "benchmark-support")]
+    #[arg(long, hide = true)]
+    pub(crate) benchmark_disable_dense_semantic: bool,
+    #[cfg(feature = "benchmark-support")]
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub(crate) benchmark_retrieval_proof_out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -2956,6 +2962,50 @@ mod tests {
         assert!(help.contains("--option-id <ID>"));
         assert!(help.contains("--core-generation-id <ID>"));
         assert!(help.contains("--retrieval-generation <ID>"));
+        assert!(!help.contains("benchmark-disable-dense-semantic"));
+    }
+
+    #[cfg(not(feature = "benchmark-support"))]
+    #[test]
+    fn product_packet_rejects_dense_semantic_ablation_flag() {
+        let error = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--benchmark-disable-dense-semantic",
+        ])
+        .expect_err("product builds must not expose the benchmark-only ablation switch");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[cfg(feature = "benchmark-support")]
+    #[test]
+    fn packet_parses_hidden_dense_semantic_ablation_flag() {
+        let packet = Cli::try_parse_from([
+            "codestory-cli",
+            "packet",
+            "--project",
+            "/tmp/project",
+            "--question",
+            "explain indexing",
+            "--benchmark-disable-dense-semantic",
+            "--benchmark-retrieval-proof-out",
+            "/tmp/retrieval-proof.json",
+        ])
+        .expect("benchmark build should parse the hidden packet ablation flag");
+        match packet.command {
+            Command::Packet(cmd) => {
+                assert!(cmd.benchmark_disable_dense_semantic);
+                assert_eq!(
+                    cmd.benchmark_retrieval_proof_out.as_deref(),
+                    Some(std::path::Path::new("/tmp/retrieval-proof.json")),
+                );
+            }
+            _ => panic!("expected packet command"),
+        }
     }
 
     #[test]
