@@ -40,6 +40,7 @@ pub fn compile_repository_evidence(
     let mut support = Vec::new();
     let mut source_budget_omissions = BTreeSet::new();
     let mut relation_budget_omissions = BTreeSet::new();
+    let mut represented_identities = BTreeSet::new();
 
     // Weave the path-diverse source order with the directed forest. This keeps
     // exact selectors and first-path witnesses ahead of repeated ranges while
@@ -48,14 +49,19 @@ pub fn compile_repository_evidence(
     let mut relation_index = 0;
     while source_index < sources.len() || relation_index < relations.len() {
         if let Some(source) = sources.get(source_index) {
-            if !push_if_within_public_budget(&mut support, source_support_unit(source.witness)) {
+            if push_if_within_public_budget(&mut support, source_support_unit(source.witness)) {
+                represented_identities.insert(source.witness.stable_identity.clone());
+            } else {
                 source_budget_omissions.extend(source.represented_identities.iter().cloned());
             }
             source_index += 1;
         }
 
         if let Some(relation) = relations.get(relation_index) {
-            if !push_if_within_public_budget(&mut support, relation_support_unit(relation)) {
+            if push_if_within_public_budget(&mut support, relation_support_unit(relation)) {
+                represented_identities.insert(relation.from_identity.clone());
+                represented_identities.insert(relation.to_identity.clone());
+            } else {
                 relation_budget_omissions.insert(relation.from_identity.clone());
                 relation_budget_omissions.insert(relation.to_identity.clone());
             }
@@ -63,10 +69,10 @@ pub fn compile_repository_evidence(
         }
     }
 
-    let source_identities = support
+    let source_identities = sources
         .iter()
-        .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
-        .filter_map(|unit| unit.symbol_id.clone())
+        .filter(|source| represented_identities.contains(&source.witness.stable_identity))
+        .map(|source| source.witness.stable_identity.as_str())
         .collect::<BTreeSet<_>>();
     let represented_source_paths = sources
         .iter()
@@ -82,16 +88,22 @@ pub fn compile_repository_evidence(
         if source_identities.contains(admission.stable_identity.as_str()) {
             continue;
         }
-        let _ = push_if_within_public_budget(
+        let retained = push_if_within_public_budget(
             &mut support,
             SupportUnitDto {
                 id: format!("symbol:{}", admission.stable_identity),
                 kind: SupportUnitKindDto::SymbolLocation,
                 summary: admission.stable_identity.clone(),
-                path: represented_source_paths
-                    .get(admission.stable_identity.as_str())
-                    .map(|path| (*path).to_string()),
-                symbol_id: Some(admission.stable_identity.clone()),
+                path: admission
+                    .stable_identity
+                    .strip_prefix("path:")
+                    .map(ToOwned::to_owned)
+                    .or_else(|| {
+                        represented_source_paths
+                            .get(admission.stable_identity.as_str())
+                            .map(|path| (*path).to_string())
+                    }),
+                symbol_id: public_symbol_id(&admission.stable_identity),
                 start_line: None,
                 end_line: None,
                 snippet: None,
@@ -101,6 +113,9 @@ pub fn compile_repository_evidence(
                 query: None,
             },
         );
+        if retained {
+            represented_identities.insert(admission.stable_identity.clone());
+        }
     }
 
     support.truncate(INTERIM_MAX_ADMITTED_CANDIDATES);
@@ -110,7 +125,7 @@ pub fn compile_repository_evidence(
         &relations,
         &source_budget_omissions,
         &relation_budget_omissions,
-        &support,
+        &represented_identities,
     );
     RepositoryDerivedCompilationV1 {
         support,
@@ -257,10 +272,12 @@ fn selected_relations<'a>(
             admission_order.contains_key(relation.from_identity.as_str())
                 && admission_order.contains_key(relation.to_identity.as_str())
         })
+        .filter(|relation| relation.from_identity != relation.to_identity)
         .collect::<Vec<_>>();
     certain.sort_by(|left, right| {
         relation_priority(left, admission_order)
             .cmp(&relation_priority(right, admission_order))
+            .then_with(|| left.relation_kind.cmp(&right.relation_kind))
             .then_with(|| left.relation_id.cmp(&right.relation_id))
     });
 
@@ -318,7 +335,7 @@ fn selected_relations<'a>(
 fn relation_priority(
     relation: &PacketDirectedRelationV1,
     admission_order: &HashMap<&str, usize>,
-) -> (u8, usize, usize) {
+) -> (u8, usize, usize, usize, usize) {
     let from = admission_order
         .get(relation.from_identity.as_str())
         .copied()
@@ -331,6 +348,8 @@ fn relation_priority(
         u8::from(from == usize::MAX || to == usize::MAX),
         from.max(to),
         from.min(to),
+        from,
+        to,
     )
 }
 
@@ -353,7 +372,7 @@ fn source_support_unit(source: &PacketHydratedSourceRangeV1) -> SupportUnitDto {
             .clone()
             .unwrap_or_else(|| source.stable_identity.clone()),
         path: Some(source.path.clone()),
-        symbol_id: Some(source.stable_identity.clone()),
+        symbol_id: public_symbol_id(&source.stable_identity),
         start_line: Some(source.start_line),
         end_line: Some(source.end_line),
         snippet: Some(source.source.clone()),
@@ -375,13 +394,13 @@ fn relation_support_unit(relation: &PacketDirectedRelationV1) -> SupportUnitDto 
             relation.to_identity
         ),
         path: None,
-        symbol_id: Some(relation.from_identity.clone()),
+        symbol_id: public_symbol_id(&relation.from_identity),
         start_line: None,
         end_line: None,
         snippet: None,
         edge_kind: Some(relation.relation_kind.as_str().to_string()),
-        from_symbol: Some(relation.from_identity.clone()),
-        to_symbol: Some(relation.to_identity.clone()),
+        from_symbol: public_symbol_id(&relation.from_identity),
+        to_symbol: public_symbol_id(&relation.to_identity),
         query: None,
     }
 }
@@ -404,17 +423,28 @@ fn push_if_within_public_budget(
     true
 }
 
+fn public_symbol_id(stable_identity: &str) -> Option<String> {
+    stable_identity.strip_prefix("node:").map(ToOwned::to_owned)
+}
+
 fn continuation_selectors(
     input: &PacketCompilationInputV1,
     sources: &[SelectedSourceRange<'_>],
     relations: &[&PacketDirectedRelationV1],
     source_budget_omissions: &BTreeSet<String>,
     relation_budget_omissions: &BTreeSet<String>,
-    support: &[SupportUnitDto],
+    represented_identities: &BTreeSet<String>,
 ) -> Vec<PacketContinuationSelectorV1> {
     let mut selectors = Vec::new();
     let mut identities_with_explicit_gaps = BTreeSet::new();
-    for gap in &input.admission_gaps {
+    let mut ordered_gaps = input.admission_gaps.iter().enumerate().collect::<Vec<_>>();
+    ordered_gaps.sort_by(|(left_index, left), (right_index, right)| {
+        left.exact_selector_ordinal
+            .unwrap_or(u32::MAX)
+            .cmp(&right.exact_selector_ordinal.unwrap_or(u32::MAX))
+            .then_with(|| left_index.cmp(right_index))
+    });
+    for (_, gap) in ordered_gaps {
         let Some(stable_identity) = gap.stable_identity.clone() else {
             continue;
         };
@@ -455,23 +485,6 @@ fn continuation_selectors(
         .iter()
         .flat_map(|relation| [relation.from_identity.clone(), relation.to_identity.clone()])
         .collect::<BTreeSet<_>>();
-    let represented_identities = support
-        .iter()
-        .flat_map(|unit| {
-            let mut identities = Vec::new();
-            if let Some(identity) = unit.symbol_id.clone() {
-                identities.push(identity);
-            }
-            if let Some(identity) = unit.from_symbol.clone() {
-                identities.push(identity);
-            }
-            if let Some(identity) = unit.to_symbol.clone() {
-                identities.push(identity);
-            }
-            identities
-        })
-        .collect::<BTreeSet<_>>();
-
     for admission in ordered_admissions(input) {
         let identity = &admission.stable_identity;
         if identities_with_explicit_gaps.contains(identity) {
@@ -494,25 +507,17 @@ fn continuation_selectors(
         }
     }
 
-    selectors.sort_by(|left, right| {
-        left.stable_identity
-            .cmp(&right.stable_identity)
-            .then_with(|| structural_gap_rank(left.reason).cmp(&structural_gap_rank(right.reason)))
-    });
-    selectors.dedup_by(|left, right| {
-        left.stable_identity == right.stable_identity && left.reason == right.reason
+    let mut seen = Vec::new();
+    selectors.retain(|selector| {
+        let key = (selector.stable_identity.clone(), selector.reason);
+        if seen.contains(&key) {
+            false
+        } else {
+            seen.push(key);
+            true
+        }
     });
     selectors
-}
-
-fn structural_gap_rank(reason: PacketStructuralGapReasonV1) -> u8 {
-    match reason {
-        PacketStructuralGapReasonV1::CandidateCountExceeded => 0,
-        PacketStructuralGapReasonV1::SourceBudgetExceeded => 1,
-        PacketStructuralGapReasonV1::SourceUnavailable => 2,
-        PacketStructuralGapReasonV1::AmbiguousSelector => 3,
-        PacketStructuralGapReasonV1::DisconnectedSeed => 4,
-    }
 }
 
 fn continuation_selector(
@@ -555,14 +560,14 @@ mod tests {
             admissions: vec![
                 PacketAdmissionReceiptV1 {
                     packet_ordinal: 1,
-                    stable_identity: "retrieved".into(),
+                    stable_identity: "node:retrieved".into(),
                     score_version: "v1".into(),
                     reserved_source_bytes: 128,
                     origin: PacketAdmissionOriginV1::Retrieval,
                 },
                 PacketAdmissionReceiptV1 {
                     packet_ordinal: 0,
-                    stable_identity: "exact".into(),
+                    stable_identity: "node:exact".into(),
                     score_version: "v1".into(),
                     reserved_source_bytes: 128,
                     origin: PacketAdmissionOriginV1::ExactTypedSelector,
@@ -570,7 +575,7 @@ mod tests {
             ],
             sources: vec![
                 PacketHydratedSourceRangeV1 {
-                    stable_identity: "retrieved".into(),
+                    stable_identity: "node:retrieved".into(),
                     path: "src/shared.rs".into(),
                     symbol: Some("retrieved".into()),
                     start_line: 5,
@@ -579,7 +584,7 @@ mod tests {
                     parser_completeness: PacketParserCompletenessV1::Complete,
                 },
                 PacketHydratedSourceRangeV1 {
-                    stable_identity: "exact".into(),
+                    stable_identity: "node:exact".into(),
                     path: "src/exact.rs".into(),
                     symbol: Some("exact".into()),
                     start_line: 1,
@@ -588,7 +593,7 @@ mod tests {
                     parser_completeness: PacketParserCompletenessV1::Complete,
                 },
                 PacketHydratedSourceRangeV1 {
-                    stable_identity: "exact".into(),
+                    stable_identity: "node:exact".into(),
                     path: "src/exact.rs".into(),
                     symbol: Some("exact".into()),
                     start_line: 3,
@@ -623,15 +628,15 @@ mod tests {
         input.relations = vec![
             PacketDirectedRelationV1 {
                 relation_id: "certain".into(),
-                from_identity: "exact".into(),
-                to_identity: "retrieved".into(),
+                from_identity: "node:exact".into(),
+                to_identity: "node:retrieved".into(),
                 relation_kind: PacketRelationKindV1::Call,
                 certainty: PacketRelationCertaintyV1::Certain,
             },
             PacketDirectedRelationV1 {
                 relation_id: "uncertain".into(),
-                from_identity: "exact".into(),
-                to_identity: "retrieved".into(),
+                from_identity: "node:exact".into(),
+                to_identity: "node:retrieved".into(),
                 relation_kind: PacketRelationKindV1::Call,
                 certainty: PacketRelationCertaintyV1::Uncertain,
             },
@@ -651,11 +656,11 @@ mod tests {
         let mut input = input();
         input
             .sources
-            .retain(|source| source.stable_identity == "exact");
+            .retain(|source| source.stable_identity == "node:exact");
         input.relations = vec![PacketDirectedRelationV1 {
             relation_id: "connects-seeds".into(),
-            from_identity: "exact".into(),
-            to_identity: "retrieved".into(),
+            from_identity: "node:exact".into(),
+            to_identity: "node:retrieved".into(),
             relation_kind: PacketRelationKindV1::Call,
             certainty: PacketRelationCertaintyV1::Certain,
         }];
@@ -669,7 +674,7 @@ mod tests {
         let fallback_index = product
             .support
             .iter()
-            .position(|unit| unit.id == "symbol:retrieved")
+            .position(|unit| unit.id == "symbol:node:retrieved")
             .expect("symbol fallback");
         assert!(relation_index < fallback_index);
     }
@@ -680,7 +685,7 @@ mod tests {
         input.sources.insert(
             0,
             PacketHydratedSourceRangeV1 {
-                stable_identity: "retrieved".into(),
+                stable_identity: "node:retrieved".into(),
                 path: "src/shared.rs".into(),
                 symbol: Some("retrieved".into()),
                 start_line: 5,
@@ -706,15 +711,15 @@ mod tests {
         input.relations = vec![
             PacketDirectedRelationV1 {
                 relation_id: "first-incident".into(),
-                from_identity: "retrieved".into(),
-                to_identity: "external-a".into(),
+                from_identity: "node:retrieved".into(),
+                to_identity: "node:external-a".into(),
                 relation_kind: PacketRelationKindV1::Usage,
                 certainty: PacketRelationCertaintyV1::Certain,
             },
             PacketDirectedRelationV1 {
                 relation_id: "second-incident".into(),
-                from_identity: "retrieved".into(),
-                to_identity: "external-b".into(),
+                from_identity: "node:retrieved".into(),
+                to_identity: "node:external-b".into(),
                 relation_kind: PacketRelationKindV1::Usage,
                 certainty: PacketRelationCertaintyV1::Certain,
             },

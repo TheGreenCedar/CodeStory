@@ -3,7 +3,6 @@ use crate::agent::citation::to_citation_from_hit;
 use crate::agent::packet_candidate::{PacketAdmissionDecision, active_packet_proof_session};
 use crate::agent::retrieval_primary::active_pinned_retrieval_publication;
 use crate::target_resolution::{TargetResolution, TargetSelection};
-pub(crate) use codestory_agent::packet_probes::exact_packet_probe_paths;
 use codestory_agent::{PinnedReader, admit_continuation_probe};
 use codestory_contracts::api::{
     AgentCitationDto, NodeId, NodeKind, PacketEvidenceResolutionDto, PacketEvidenceTierDto,

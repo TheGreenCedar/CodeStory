@@ -1,9 +1,10 @@
 //! Pure packet seed planning.
 //!
 //! The original wording may reach generic retrieval unchanged. Beyond that,
-//! planning recognizes only identities the caller wrote explicitly: repository
-//! paths, qualified symbols, and typed free-query probes. It does not infer an
-//! answer shape or translate prose into a domain-specific traversal policy.
+//! planning recognizes only identities the caller delimited as inline code:
+//! repository paths, canonical IDs, and qualified symbols. Typed free-query
+//! probes remain generic retrieval seeds. Planning does not infer an answer
+//! shape or translate prose into a domain-specific traversal policy.
 
 use crate::planning::dedupe_packet_plan_queries;
 use crate::text::exact_symbol_query_terms;
@@ -64,23 +65,25 @@ pub fn build_packet_plan_from_seed_plan(
 }
 
 /// Build the only compiler-side value permitted to carry original wording.
-/// Extraction is syntactic: explicit repository paths, canonical `node:` IDs,
-/// and qualified symbols only. Natural-language relations are not inferred.
+/// Extraction is syntactic: inline-code repository paths, canonical `node:`
+/// IDs, and qualified symbols only. Natural-language relations are not
+/// inferred.
 pub fn build_retrieval_seed_plan(question: &str, free_queries: &[String]) -> RetrievalSeedPlanV1 {
     let mut exact_selectors = Vec::new();
-    for path in explicit_source_paths(question) {
+    let explicit_fragments = inline_code_spans(question);
+    for path in explicit_source_paths(&explicit_fragments) {
         push_selector(
             &mut exact_selectors,
             PacketSeedSelectorV1::ExactPath { path },
         );
     }
-    for id in explicit_canonical_ids(question) {
+    for id in explicit_canonical_ids(&explicit_fragments) {
         push_selector(
             &mut exact_selectors,
             PacketSeedSelectorV1::CanonicalId { id },
         );
     }
-    for symbol in explicit_qualified_symbols(question) {
+    for symbol in explicit_qualified_symbols(&explicit_fragments) {
         push_selector(
             &mut exact_selectors,
             PacketSeedSelectorV1::QualifiedSymbol { symbol },
@@ -111,9 +114,18 @@ fn push_selector(selectors: &mut Vec<PacketSeedSelectorV1>, selector: PacketSeed
     }
 }
 
-fn explicit_canonical_ids(question: &str) -> Vec<String> {
+fn inline_code_spans(question: &str) -> Vec<&str> {
     question
-        .split_whitespace()
+        .split('`')
+        .enumerate()
+        .filter_map(|(index, span)| (index % 2 == 1).then_some(span))
+        .collect()
+}
+
+fn explicit_canonical_ids(explicit_fragments: &[&str]) -> Vec<String> {
+    explicit_fragments
+        .iter()
+        .flat_map(|fragment| fragment.split_whitespace())
         .map(|token| {
             token.trim_matches(|ch: char| {
                 matches!(
@@ -125,7 +137,7 @@ fn explicit_canonical_ids(question: &str) -> Vec<String> {
         .filter(|token| {
             token
                 .strip_prefix("node:")
-                .is_some_and(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()))
+                .is_some_and(|id| id.parse::<i64>().is_ok())
         })
         .map(str::to_string)
         .collect()
@@ -159,9 +171,10 @@ fn packet_plan_query_cap(budget: PacketBudgetModeDto) -> usize {
     }
 }
 
-fn explicit_qualified_symbols(question: &str) -> Vec<String> {
-    exact_symbol_query_terms(question)
-        .into_iter()
+fn explicit_qualified_symbols(explicit_fragments: &[&str]) -> Vec<String> {
+    explicit_fragments
+        .iter()
+        .flat_map(|fragment| exact_symbol_query_terms(fragment))
         .filter(|candidate| {
             (candidate.contains("::") || candidate.contains('.'))
                 && !candidate.contains("://")
@@ -174,9 +187,12 @@ fn explicit_qualified_symbols(question: &str) -> Vec<String> {
         .collect()
 }
 
-fn explicit_source_paths(question: &str) -> Vec<String> {
+fn explicit_source_paths(explicit_fragments: &[&str]) -> Vec<String> {
     let mut paths = Vec::new();
-    for token in question.split_whitespace() {
+    for token in explicit_fragments
+        .iter()
+        .flat_map(|fragment| fragment.split_whitespace())
+    {
         let mut candidate = token.trim_matches(|ch: char| {
             matches!(
                 ch,
@@ -323,12 +339,43 @@ mod tests {
 
     #[test]
     fn canonical_identity_survives_sentence_punctuation() {
-        let seed_plan = build_retrieval_seed_plan("Inspect node:42.", &[]);
+        let seed_plan = build_retrieval_seed_plan("Inspect `node:42`.", &[]);
         assert_eq!(
             seed_plan.exact_selectors,
             vec![PacketSeedSelectorV1::CanonicalId {
                 id: "node:42".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn unquoted_dotted_prose_cannot_consume_exact_admission_slots() {
+        let question = (0..20)
+            .map(|index| format!("Example{index}.js"))
+            .chain(["e.g.".to_string(), "Node.js".to_string()])
+            .collect::<Vec<_>>()
+            .join(" ");
+        let seed_plan = build_retrieval_seed_plan(&question, &[]);
+        assert!(
+            seed_plan.exact_selectors.is_empty(),
+            "ordinary prose became exact selectors: {:?}",
+            seed_plan.exact_selectors
+        );
+    }
+
+    #[test]
+    fn signed_node_ids_use_the_real_node_id_grammar() {
+        let seed_plan = build_retrieval_seed_plan("Compare `node:-42` with `node:7`.", &[]);
+        assert_eq!(
+            seed_plan.exact_selectors,
+            vec![
+                PacketSeedSelectorV1::CanonicalId {
+                    id: "node:-42".into(),
+                },
+                PacketSeedSelectorV1::CanonicalId {
+                    id: "node:7".into(),
+                },
+            ]
         );
     }
 }

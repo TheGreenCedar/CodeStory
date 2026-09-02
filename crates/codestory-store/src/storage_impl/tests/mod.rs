@@ -8887,6 +8887,62 @@ fn bounded_raw_incident_edges_do_not_open_endpoint_nodes_or_files() -> Result<()
 }
 
 #[test]
+fn induced_certain_edge_representatives_keep_connectors_after_dense_early_edges()
+-> Result<(), StorageError> {
+    let mut storage = Storage::new_in_memory()?;
+    storage.insert_nodes_batch(
+        &(1..=16)
+            .map(|id| Node {
+                id: NodeId(id),
+                kind: NodeKind::FUNCTION,
+                serialized_name: format!("node_{id}"),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let mut edges = (1..=20)
+        .map(|id| Edge {
+            id: EdgeId(id),
+            source: NodeId(1),
+            target: NodeId(1),
+            kind: EdgeKind::CALL,
+            certainty: Some(ResolutionCertainty::Certain),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    edges.extend((2..=16).map(|target| Edge {
+        id: EdgeId(100 + target),
+        source: NodeId(target - 1),
+        target: NodeId(target),
+        kind: EdgeKind::MEMBER,
+        certainty: Some(ResolutionCertainty::Certain),
+        ..Default::default()
+    }));
+    storage.insert_edges_batch(&edges)?;
+
+    let selected = storage.get_certain_edge_representatives_between_node_ids(
+        &(1..=16).map(NodeId).collect::<Vec<_>>(),
+    )?;
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|edge| edge.source != edge.target)
+            .count(),
+        15,
+        "dense self edges hid the connecting forest"
+    );
+    assert_eq!(
+        selected
+            .iter()
+            .filter(|edge| edge.source == edge.target)
+            .count(),
+        1,
+        "parallel self edges were not represented once"
+    );
+    Ok(())
+}
+
+#[test]
 fn file_error_replacement_deletes_the_unique_file_set_with_a_batched_predicate()
 -> Result<(), StorageError> {
     let mut storage = Storage::new_in_memory()?;

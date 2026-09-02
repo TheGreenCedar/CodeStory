@@ -8058,6 +8058,71 @@ impl Storage {
         Ok(BoundedRawIncidentEdges { edges, truncated })
     }
 
+    /// Return one certain typed edge representative for every directed pair
+    /// whose effective endpoints are both in `node_ids`.
+    ///
+    /// This is an induced-edge read: it never opens endpoint nodes or file
+    /// records, and dense parallel edges for one pair cannot consume the rows
+    /// needed to expose a different admitted pair.
+    pub fn get_certain_edge_representatives_between_node_ids(
+        &self,
+        node_ids: &[NodeId],
+    ) -> Result<Vec<Edge>, StorageError> {
+        let unique_node_ids = node_ids.iter().copied().collect::<BTreeSet<_>>();
+        if unique_node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if unique_node_ids.len() > EDGE_NODE_LOOKUP_BATCH_SIZE {
+            return Err(StorageError::Other(format!(
+                "induced edge lookup accepts at most {EDGE_NODE_LOOKUP_BATCH_SIZE} node ids"
+            )));
+        }
+
+        let admitted_values = (1..=unique_node_ids.len())
+            .map(|index| format!("(?{index})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "WITH admitted(id) AS (VALUES {admitted_values}),
+             ranked AS (
+                 SELECT e.id, e.source_node_id, e.target_node_id, e.kind, e.file_node_id,
+                        e.line, e.resolved_source_node_id, e.resolved_target_node_id,
+                        e.confidence, e.callsite_identity, e.certainty,
+                        e.candidate_target_node_ids,
+                        COALESCE(e.resolved_source_node_id, e.source_node_id) AS effective_source,
+                        COALESCE(e.resolved_target_node_id, e.target_node_id) AS effective_target,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                COALESCE(e.resolved_source_node_id, e.source_node_id),
+                                COALESCE(e.resolved_target_node_id, e.target_node_id)
+                            ORDER BY e.kind ASC, e.id ASC
+                        ) AS pair_rank
+                 FROM edge e
+                 JOIN admitted source_node
+                   ON source_node.id = COALESCE(e.resolved_source_node_id, e.source_node_id)
+                 JOIN admitted target_node
+                   ON target_node.id = COALESCE(e.resolved_target_node_id, e.target_node_id)
+                 WHERE e.certainty = 'certain'
+             )
+             SELECT id, source_node_id, target_node_id, kind, file_node_id, line,
+                    resolved_source_node_id, resolved_target_node_id, confidence,
+                    callsite_identity, certainty, candidate_target_node_ids
+             FROM ranked
+             WHERE pair_rank = 1
+             ORDER BY CASE WHEN effective_source = effective_target THEN 1 ELSE 0 END ASC,
+                      effective_source ASC, effective_target ASC, kind ASC, id ASC"
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query(params_from_iter(
+            unique_node_ids.iter().map(|node_id| Value::from(node_id.0)),
+        ))?;
+        let mut edges = Vec::new();
+        while let Some(row) = rows.next()? {
+            edges.push(Self::edge_from_row(row)?);
+        }
+        Ok(edges)
+    }
+
     pub fn get_edges_for_node_ids(
         &self,
         node_ids: &[NodeId],

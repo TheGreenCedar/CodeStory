@@ -3,8 +3,9 @@
 `codestory-agent` owns the pure halves of packet compilation: syntactic seed
 planning and repository-derived evidence selection. The seed plan may pass the
 unchanged question to generic retrieval and recognize explicit paths, canonical
-IDs, qualified symbols, and typed free-query probes. The compiler receives no
-question text. It selects only from admitted identities, hydrated source,
+IDs, and qualified symbols only when the caller delimits them as inline code.
+Typed free-query probes remain generic retrieval seeds. The compiler receives
+no question text. It selects only from admitted identities, hydrated source,
 certain directed relations, ambiguity, parser completeness, and publication
 identity.
 

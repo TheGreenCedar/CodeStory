@@ -2,9 +2,10 @@
 
 Packet compilation is repository-derived. The original question may seed
 generic lexical and semantic retrieval, and syntactic planning may extract
-only explicit repository paths, canonical IDs, qualified symbols, and typed
-free-query probes. Once retrieval returns candidate descriptors, neither the
-question nor any prompt-derived policy crosses the compiler boundary.
+only repository paths, canonical IDs, and qualified symbols delimited as
+inline code. Typed free-query probes remain ordinary generic retrieval seeds.
+Once retrieval returns candidate descriptors, neither the question nor any
+prompt-derived policy crosses the compiler boundary.
 
 ## Required sequence
 

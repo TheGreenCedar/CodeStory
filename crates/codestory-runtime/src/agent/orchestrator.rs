@@ -7,7 +7,7 @@ use crate::agent::packet_candidate::{
     PacketProofSession, PacketSearchHit, install_packet_proof_session,
 };
 use crate::agent::packet_compiler::{
-    apply_compiled_evidence_for_project, directed_relations_from_graphs, drill_options_from_ids,
+    apply_frozen_packet_compilation, drill_options_from_ids, freeze_packet_compilation,
 };
 use crate::agent::packet_degradation::apply_packet_semantic_degradation_counters;
 use crate::agent::packet_evidence::decorate_citation_from_hit;
@@ -15,8 +15,8 @@ use crate::agent::packet_plan::{
     build_packet_plan_from_seed_plan, build_retrieval_seed_plan, packet_plan_annotation,
 };
 use crate::agent::packet_probe::{
-    exact_packet_probe_citations, exact_packet_probe_paths, normalize_packet_probe_request,
-    probes_from_seed_selectors, resolve_packet_probes, unresolved_packet_probe_queries,
+    exact_packet_probe_citations, normalize_packet_probe_request, probes_from_seed_selectors,
+    resolve_packet_probes, unresolved_packet_probe_queries,
 };
 use crate::agent::packet_scoring::{packet_display_path, packet_stage_citation_carry_limit};
 use crate::agent::packet_terms::prompt_search_terms;
@@ -39,14 +39,14 @@ use codestory_contracts::api::{
     AgentAnswerDto, AgentAskRequest, AgentCitationDto, AgentCustomRetrievalConfigDto,
     AgentHybridWeightsDto, AgentPacketDto, AgentPacketRequestDto, AgentResponseBlockDto,
     AgentResponseModeDto, AgentResponseSectionDto, AgentRetrievalPolicyModeDto,
-    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepDto,
-    AgentRetrievalStepKindDto, AgentRetrievalStepStatusDto, ApiError, EdgeKind, GraphArtifactDto,
-    GraphNodeDto, GraphRequest, GraphResponse, IndexFreshnessDto, IndexFreshnessStatusDto,
-    NodeDetailsDto, NodeDetailsRequest, NodeId, NodeKind, NodeOccurrencesRequest,
-    PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS, PacketBudgetLimitsDto, PacketBudgetModeDto,
-    PacketDispositionDto, PacketProbeDto, RetrievalAnnotationDto, RetrievalScoreBreakdownDto,
-    SearchHit, SearchHitOrigin, SearchRepoTextMode, SearchRequest, SupportUnitDto,
-    SupportUnitKindDto, TrailConfigDto, TrailFilterOptionsDto,
+    AgentRetrievalPresetDto, AgentRetrievalProfileSelectionDto, AgentRetrievalStepKindDto,
+    ApiError, EdgeKind, GraphArtifactDto, GraphNodeDto, GraphRequest, GraphResponse,
+    IndexFreshnessDto, IndexFreshnessStatusDto, NodeDetailsDto, NodeDetailsRequest, NodeId,
+    NodeKind, NodeOccurrencesRequest, PACKET_DRILL_MAX_DEPTH, PACKET_DRILL_MAX_HITS,
+    PacketBudgetLimitsDto, PacketBudgetModeDto, PacketDispositionDto, PacketProbeDto,
+    RetrievalAnnotationDto, RetrievalScoreBreakdownDto, SearchHit, SearchHitOrigin,
+    SearchRepoTextMode, SearchRequest, SupportUnitDto, SupportUnitKindDto, TrailConfigDto,
+    TrailFilterOptionsDto,
 };
 use codestory_contracts::compilation::INTERIM_MAX_ADMITTED_CANDIDATES;
 use std::cmp::Ordering;
@@ -466,37 +466,24 @@ pub(crate) fn agent_packet(
     apply_packet_semantic_degradation_counters(&mut answer);
     append_packet_non_trace_phase(&mut answer, "shadow_and_trace", phase_started);
 
-    let exact_probe_paths = exact_packet_probe_paths(&plan.probe_resolutions);
-
-    // Capture admitted repository evidence before presentation-only capping.
-    // The pure compiler, rather than legacy graph/citation budgets, decides
-    // which source ranges and directed edges enter the public packet.
-    let source_support = append_packet_source_evidence(controller, &mut answer);
-    let compilation_relations =
-        directed_relations_from_graphs(&answer.graphs, &proof_session.receipts());
-
-    // Coverage belongs only to exact selectors and deterministic source reads
-    // that survived admission. Prompt-ranked citations have no authority here.
-    let mut covered_paths = exact_probe_paths.clone();
-    covered_paths.extend(
-        source_support
-            .iter()
-            .filter_map(|source| source.path.clone()),
-    );
-    answer.source_coverage =
-        crate::source_coverage::observe_source_coverage(controller, &covered_paths);
-    let retained_coverage_paths = exact_probe_paths
-        .into_iter()
-        .chain(
-            source_support
-                .iter()
-                .filter_map(|source| source.path.clone()),
-        )
-        .map(|path| packet_display_path(&path))
-        .collect::<HashSet<_>>();
-    answer.source_coverage.retain(|observation| {
-        retained_coverage_paths.contains(&packet_display_path(&observation.path))
-    });
+    // The retrieval publication must be attached before compiler input is
+    // frozen. The compiler then hydrates source and the induced relation set
+    // directly from the admitted identities, never from legacy citations,
+    // graph views, or presentation sections.
+    let active_retrieval_publication =
+        crate::agent::retrieval_primary::active_pinned_retrieval_publication(controller);
+    if let Some(publication) = active_retrieval_publication.clone() {
+        answer.retrieval_trace.retrieval_publication = Some(publication);
+    }
+    let frozen_compilation = freeze_packet_compilation(
+        controller,
+        &project_id,
+        &plan.probe_resolutions,
+        active_retrieval_publication.as_ref(),
+        &proof_session,
+    )?;
+    answer.source_coverage = frozen_compilation.source_coverage.clone();
+    append_compiled_source_evidence(&mut answer, &frozen_compilation.product.support);
 
     let phase_started = Instant::now();
     let budget = apply_packet_budget(
@@ -516,16 +503,6 @@ pub(crate) fn agent_packet(
     order_packet_sections(&mut answer.sections);
     append_packet_non_trace_phase(&mut answer, "evidence_sections", phase_started);
 
-    // `agent_packet` executes inside one stable retrieval-publication scope. Compile the packet
-    // while that pin is still active so a one-shot drill carries the exact generations it must
-    // send back. Attaching publication only to the returned DTO was too late: the compiler had
-    // already emitted empty drill pins, and the continuation could not validate them.
-    if let Some(publication) =
-        crate::agent::retrieval_primary::active_pinned_retrieval_publication(controller)
-    {
-        answer.retrieval_trace.retrieval_publication = Some(publication);
-    }
-
     // Typed field, not `annotations`: readiness re-verification was previously
     // invisible, which is what let one packet pay for several full content
     // passes unnoticed. Publishing it here — before the trace summary is taken
@@ -543,13 +520,14 @@ pub(crate) fn agent_packet(
         question,
         plan,
         answer,
-        support: source_support,
+        support: Vec::new(),
         disposition: PacketDispositionDto::not_established("compile pending"),
         budget,
         retrieval_trace_summary,
         answer_sufficiency: Default::default(),
     };
     append_packet_non_trace_phase(&mut packet.answer, "packet_dto", phase_started);
+    apply_frozen_packet_compilation(&mut packet, Some(&req), frozen_compilation);
     enforce_packet_output_budget(&project_root, &mut packet);
 
     if let Some(diagnostic) = trace_export::write_packet_step_trace_from_env(&packet.answer) {
@@ -561,14 +539,6 @@ pub(crate) fn agent_packet(
             .push(RetrievalAnnotationDto::observation(diagnostic));
         enforce_packet_output_budget(&project_root, &mut packet);
     }
-    apply_compiled_evidence_for_project(
-        &mut packet,
-        Some(&req),
-        &project_id,
-        compilation_relations,
-    );
-    enforce_packet_output_budget(&project_root, &mut packet);
-
     Ok(packet)
 }
 
@@ -758,83 +728,25 @@ fn order_packet_sections(sections: &mut [AgentResponseSectionDto]) {
 /// bytes are bounded by the descriptor reservation contract.
 const PACKET_SOURCE_MAX_TOTAL_BYTES: usize = 14_336;
 
-struct PacketSourceRange {
-    path: String,
-    start_line: u32,
-    body: String,
-}
-
-/// Truncate on a UTF-8 character boundary, never mid-codepoint.
-fn truncate_packet_source(body: &str, max_bytes: usize) -> &str {
-    if body.len() <= max_bytes {
-        return body;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !body.is_char_boundary(end) {
-        end -= 1;
-    }
-    &body[..end]
-}
-
-fn append_packet_source_evidence(
-    controller: &AppController,
-    answer: &mut AgentAnswerDto,
-) -> Vec<SupportUnitDto> {
-    if answer.citations.is_empty() {
-        return Vec::new();
-    }
-
+fn append_compiled_source_evidence(answer: &mut AgentAnswerDto, support: &[SupportUnitDto]) {
     let mut rendered = String::new();
-    let mut source_support = Vec::new();
-    let mut steps = Vec::new();
-    for citation in answer
-        .citations
+    for source in support
         .iter()
-        .take(INTERIM_MAX_ADMITTED_CANDIDATES)
+        .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
     {
-        let started = Instant::now();
-        let Some(source) = repository_source_range(controller, citation) else {
+        let Some(body) = source.snippet.as_deref() else {
             continue;
         };
-        let retained = truncate_packet_source(
-            source.body.trim_end(),
-            codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND,
-        );
+        let retained = body.trim_end();
         if retained.is_empty() {
             continue;
         }
-        let entry = format!("### {}\n\n{}\n\n", citation.display_name, retained);
+        let entry = format!("### {}\n\n{}\n\n", source.summary, retained);
         if rendered.len().saturating_add(entry.len()) > PACKET_SOURCE_MAX_TOTAL_BYTES {
             break;
         }
         rendered.push_str(&entry);
-        let path = packet_display_path(&source.path);
-        let (start_line, end_line) = source_receipt_line_range(retained, source.start_line);
-        source_support.push(SupportUnitDto {
-            id: format!("source:{}:{start_line}", citation.node_id.0),
-            kind: SupportUnitKindDto::SourceRange,
-            summary: citation.display_name.clone(),
-            path: Some(path),
-            symbol_id: Some(citation.node_id.0.clone()),
-            start_line: Some(start_line),
-            end_line: Some(end_line),
-            snippet: Some(retained.to_string()),
-            edge_kind: None,
-            from_symbol: None,
-            to_symbol: None,
-            query: None,
-        });
-        steps.push(AgentRetrievalStepDto {
-            kind: AgentRetrievalStepKindDto::SourceRead,
-            status: AgentRetrievalStepStatusDto::Ok,
-            duration_ms: started.elapsed().as_millis().try_into().unwrap_or(u32::MAX),
-            input: Vec::new(),
-            output: Vec::new(),
-            message: Some(format!("bounded source for {}", citation.display_name)),
-        });
     }
-
-    answer.retrieval_trace.steps.extend(steps);
     if !rendered.is_empty() {
         answer.sections.push(AgentResponseSectionDto {
             id: "packet-source-evidence".to_string(),
@@ -842,82 +754,10 @@ fn append_packet_source_evidence(
             blocks: vec![AgentResponseBlockDto::Markdown { markdown: rendered }],
         });
     }
-    source_support
 }
 
-fn repository_source_range(
-    controller: &AppController,
-    citation: &AgentCitationDto,
-) -> Option<PacketSourceRange> {
-    let max_bytes = codestory_contracts::compilation::INTERIM_SOURCE_ROW_UPPER_BOUND;
-    if matches!(
-        citation.kind,
-        NodeKind::FUNCTION | NodeKind::METHOD | NodeKind::CLASS | NodeKind::STRUCT
-    ) && let Ok(snippet) = controller.snippet_function_body_context(citation.node_id.clone(), 0)
-    {
-        if let Some(end_line) = snippet.node.end_line.filter(|end| *end >= snippet.line)
-            && let Ok((path, bounded)) = controller.bounded_file_snippet_range(
-                &snippet.path,
-                crate::BoundedSnippetRangeOptions {
-                    focus_line: snippet.line,
-                    start_line: snippet.line,
-                    end_line,
-                    context_lines: 0,
-                    max_bytes,
-                    truncation_suffix: SOURCE_SNIPPET_TRUNCATION_SUFFIX,
-                },
-            )
-        {
-            return Some(PacketSourceRange {
-                path,
-                start_line: snippet.line,
-                body: bounded.markdown,
-            });
-        }
-        return Some(PacketSourceRange {
-            path: snippet.path,
-            start_line: snippet.line,
-            body: truncate_packet_source(&snippet.snippet, max_bytes).to_string(),
-        });
-    }
-
-    let path = citation.file_path.as_deref()?;
-    let line = citation.line?;
-    controller
-        .bounded_file_snippet(path, line, 4, max_bytes, SOURCE_SNIPPET_TRUNCATION_SUFFIX)
-        .ok()
-        .map(|(path, snippet)| PacketSourceRange {
-            path,
-            start_line: line.saturating_sub(4).max(1),
-            body: snippet.markdown,
-        })
-}
-
-fn source_receipt_line_range(markdown: &str, fallback_start: u32) -> (u32, u32) {
-    let numbered_lines = markdown.lines().filter_map(|line| {
-        let line = line
-            .trim_start()
-            .strip_prefix("> ")
-            .unwrap_or(line.trim_start());
-        let (line_number, _) = line.split_once(" | ")?;
-        line_number.trim().parse::<u32>().ok()
-    });
-    let mut start = None;
-    let mut end = None;
-    for line in numbered_lines {
-        start = Some(start.map_or(line, |current: u32| current.min(line)));
-        end = Some(end.map_or(line, |current: u32| current.max(line)));
-    }
-    (
-        start.unwrap_or(fallback_start),
-        end.unwrap_or(fallback_start),
-    )
-}
-
-/// A long function is rarely best represented by its prologue. Select at most three bounded,
-/// distinct windows whose source words match separate action clauses from the question.
-/// The ranges remain exact source receipts for the already selected symbol; this changes only
-/// which verified bytes spend the packet's fixed source budget.
+/// Render the legacy citation appendix. It remains diagnostic presentation and
+/// cannot select or protect evidence in the compiled packet.
 fn packet_evidence_ledger_markdown(
     answer: &AgentAnswerDto,
     limits: &PacketBudgetLimitsDto,

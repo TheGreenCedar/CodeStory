@@ -204,14 +204,14 @@ fn containment_deduplication_preserves_exact_and_retrieved_identities() {
     );
     assert_eq!(
         product.support[0].symbol_id.as_deref(),
-        Some("node:exact"),
+        Some("exact"),
         "the exact selector keeps source-bearing precedence"
     );
     assert!(
         product
             .support
             .iter()
-            .any(|unit| unit.symbol_id.as_deref() == Some("node:retrieved")),
+            .any(|unit| unit.symbol_id.as_deref() == Some("retrieved")),
         "deduplication must not erase the other admitted identity"
     );
 }
@@ -238,7 +238,7 @@ fn distinct_retrieval_paths_precede_repeated_paths_after_exact_sources() {
             .filter(|unit| unit.kind == SupportUnitKindDto::SourceRange)
             .filter_map(|unit| unit.symbol_id.as_deref())
             .collect::<Vec<_>>(),
-        vec!["node:exact", "node:distinct", "node:repeat"]
+        vec!["exact", "distinct", "repeat"]
     );
 }
 
@@ -360,4 +360,148 @@ fn bijective_identity_and_path_rename_preserves_compilation_shape() {
         .collect::<Vec<_>>()
     };
     assert_eq!(compile_shape("alpha"), compile_shape("omega"));
+}
+
+#[test]
+fn opaque_edge_id_swaps_do_not_change_selected_relation_semantics() {
+    let compile_relations = |first_id: &str, second_id: &str| {
+        compile_repository_evidence(&input(
+            vec![
+                admission(0, "node:1", PacketAdmissionOriginV1::ExactTypedSelector),
+                admission(1, "node:2", PacketAdmissionOriginV1::Retrieval),
+            ],
+            Vec::new(),
+            vec![
+                relation(
+                    first_id,
+                    "node:1",
+                    "node:2",
+                    PacketRelationCertaintyV1::Certain,
+                ),
+                PacketDirectedRelationV1 {
+                    relation_id: second_id.into(),
+                    from_identity: "node:2".into(),
+                    to_identity: "node:1".into(),
+                    relation_kind: PacketRelationKindV1::Import,
+                    certainty: PacketRelationCertaintyV1::Certain,
+                },
+            ],
+        ))
+        .support
+        .into_iter()
+        .filter(|unit| unit.kind == SupportUnitKindDto::TypedGraphEdge)
+        .map(|unit| (unit.edge_kind, unit.from_symbol, unit.to_symbol))
+        .collect::<Vec<_>>()
+    };
+
+    assert_eq!(compile_relations("a", "z"), compile_relations("z", "a"));
+}
+
+#[test]
+fn self_loops_never_spend_bounded_public_rows() {
+    let admissions = (0..16)
+        .map(|index| {
+            admission(
+                index,
+                &format!("node:{}", index + 1),
+                PacketAdmissionOriginV1::Retrieval,
+            )
+        })
+        .collect::<Vec<_>>();
+    let sources = (0..16)
+        .map(|index| {
+            source(
+                &format!("node:{}", index + 1),
+                &format!("src/{index}.rs"),
+                1,
+                2,
+            )
+        })
+        .collect::<Vec<_>>();
+    let relations = (0..16)
+        .map(|index| {
+            let identity = format!("node:{}", index + 1);
+            relation(
+                &format!("loop-{index}"),
+                &identity,
+                &identity,
+                PacketRelationCertaintyV1::Certain,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let product = compile_repository_evidence(&input(admissions, sources, relations));
+    assert!(
+        product
+            .support
+            .iter()
+            .all(|unit| unit.kind != SupportUnitKindDto::TypedGraphEdge),
+        "self loops displaced source witnesses: {:?}",
+        product.support
+    );
+    assert_eq!(product.support.len(), 16);
+}
+
+#[test]
+fn exact_continuations_follow_selector_order_not_identity_spelling() {
+    let mut compiler_input = input(Vec::new(), Vec::new(), Vec::new());
+    compiler_input.admission_gaps = (0..10)
+        .map(
+            |ordinal| codestory_contracts::compilation::PacketAdmissionGapV1 {
+                kind: codestory_contracts::compilation::PacketAdmissionGapKindV1::SourceUnavailable,
+                stable_identity: Some(format!("node:{}", 100 - ordinal)),
+                exact_selector_ordinal: Some(ordinal),
+            },
+        )
+        .collect();
+    let product = compile_repository_evidence(&compiler_input);
+    assert_eq!(
+        product
+            .continuation
+            .iter()
+            .take(8)
+            .map(|selector| selector.stable_identity.as_str())
+            .collect::<Vec<_>>(),
+        (0..8)
+            .map(|ordinal| format!("node:{}", 100 - ordinal))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn public_symbol_ids_are_raw_and_paths_never_masquerade_as_symbols() {
+    let product = compile_repository_evidence(&input(
+        vec![
+            admission(0, "node:-42", PacketAdmissionOriginV1::ExactTypedSelector),
+            admission(
+                1,
+                "path:src/lib.rs",
+                PacketAdmissionOriginV1::ExactTypedSelector,
+            ),
+        ],
+        vec![
+            source("node:-42", "src/node.rs", 1, 2),
+            source("path:src/lib.rs", "src/lib.rs", 1, 2),
+        ],
+        Vec::new(),
+    ));
+    let node = product
+        .support
+        .iter()
+        .find(|unit| unit.path.as_deref() == Some("src/node.rs"))
+        .expect("node source");
+    assert_eq!(node.symbol_id.as_deref(), Some("-42"));
+    assert_eq!(
+        codestory_contracts::api::NodeId(node.symbol_id.clone().expect("raw node id"))
+            .to_core()
+            .expect("packet symbol id must round-trip through context")
+            .0,
+        -42
+    );
+    let path = product
+        .support
+        .iter()
+        .find(|unit| unit.path.as_deref() == Some("src/lib.rs"))
+        .expect("path source");
+    assert_eq!(path.symbol_id, None);
 }

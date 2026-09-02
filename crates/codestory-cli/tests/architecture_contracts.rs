@@ -680,19 +680,28 @@ fn repository_derived_compiler_is_the_public_evidence_planning_boundary() {
         );
     }
     let orchestrator = read("crates/codestory-runtime/src/agent/orchestrator.rs");
-    let source_capture = orchestrator
-        .find("let source_support = append_packet_source_evidence")
-        .expect("runtime captures admitted source for the compiler");
-    let relation_capture = orchestrator
-        .find("directed_relations_from_graphs(&answer.graphs")
-        .expect("runtime captures admitted relations for the compiler");
+    let compiler_freeze = orchestrator
+        .find("let frozen_compilation = freeze_packet_compilation")
+        .expect("runtime freezes admitted repository evidence for the compiler");
     let presentation_cap = orchestrator
         .find("let budget = apply_packet_budget")
         .expect("runtime applies the presentation budget");
     assert!(
-        source_capture < presentation_cap && relation_capture < presentation_cap,
-        "legacy presentation capping must not select compiler source or graph evidence"
+        compiler_freeze < presentation_cap,
+        "compiler input and output must be frozen before presentation capping"
     );
+    assert!(!orchestrator.contains("append_packet_source_evidence"));
+    assert!(!orchestrator.contains("directed_relations_from_graphs(&answer.graphs"));
+    let adapter = read("crates/codestory-runtime/src/agent/packet_compiler.rs");
+    assert!(adapter.contains("hydrate_admitted_sources(controller, &admissions"));
+    assert!(adapter.contains("get_certain_edge_representatives_between_node_ids(&node_ids)"));
+    let input_build = adapter
+        .find("let input = PacketCompilationInputV1")
+        .expect("runtime builds typed compiler input");
+    let compile = adapter
+        .find("let product = compile_repository_evidence(&input)")
+        .expect("runtime compiles the frozen typed input");
+    assert!(input_build < compile);
     let current_dto = read("crates/codestory-contracts/src/api/dto.rs");
     let packet_request = source_between(
         &current_dto,
