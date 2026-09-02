@@ -261,8 +261,8 @@ impl<'a> QueryExecutor<'a> {
             StageSequenceOptions {
                 stop_marginal_gain_threshold: Some(plan.stop_marginal_gain_threshold),
                 stop_after_low_gain_streak: plan.stop_after_low_gain_streak,
+                payload,
             },
-            payload,
         )?;
 
         if payload == CandidatePayloadMode::Full {
@@ -523,7 +523,6 @@ impl<'a> QueryExecutor<'a> {
         stage_traces: &mut Vec<StageTrace>,
         deadline: Instant,
         options: StageSequenceOptions,
-        payload: CandidatePayloadMode,
     ) -> Result<Option<String>> {
         let mut low_gain_streak = 0u32;
         let mut cancel_reason = None;
@@ -593,40 +592,41 @@ impl<'a> QueryExecutor<'a> {
             let stage_anchors = (stage.kind == RetrievalStageKind::Stage2ScipExpand)
                 .then(|| fused_base_anchors_for_graph_expansion(features, candidates));
             let anchors = stage_anchors.as_deref().unwrap_or(candidates.as_slice());
-            let (mut stage_hits, admission_wait_ms, queue_wait_ms, execution_ms) =
-                match self.run_stage_bounded(&stage, features, anchors, deadline, payload)? {
-                    StageRun::Completed {
-                        hits,
-                        admission_wait_ms,
-                        queue_wait_ms,
-                        execution_ms,
-                    } => (hits, admission_wait_ms, queue_wait_ms, execution_ms),
-                    StageRun::Cancelled {
-                        reason,
-                        admission_wait_ms,
-                        queue_wait_ms,
-                        execution_ms,
-                        completion_status,
-                    } => {
-                        let mut trace = stage_trace(
-                            &stage,
-                            stage_started.elapsed().as_millis() as u64,
-                            0,
-                            0.0,
-                            Some(reason.into()),
-                            false,
-                            None,
-                        );
-                        trace.admission_wait_ms = admission_wait_ms;
-                        trace.queue_wait_ms = queue_wait_ms;
-                        trace.execution_ms = execution_ms;
-                        trace.completion_status = completion_status;
-                        stage_traces.push(trace);
-                        cancel_reason.get_or_insert_with(|| reason.into());
-                        continue;
-                    }
-                };
-            if payload == CandidatePayloadMode::Full {
+            let (mut stage_hits, admission_wait_ms, queue_wait_ms, execution_ms) = match self
+                .run_stage_bounded(&stage, features, anchors, deadline, options.payload)?
+            {
+                StageRun::Completed {
+                    hits,
+                    admission_wait_ms,
+                    queue_wait_ms,
+                    execution_ms,
+                } => (hits, admission_wait_ms, queue_wait_ms, execution_ms),
+                StageRun::Cancelled {
+                    reason,
+                    admission_wait_ms,
+                    queue_wait_ms,
+                    execution_ms,
+                    completion_status,
+                } => {
+                    let mut trace = stage_trace(
+                        &stage,
+                        stage_started.elapsed().as_millis() as u64,
+                        0,
+                        0.0,
+                        Some(reason.into()),
+                        false,
+                        None,
+                    );
+                    trace.admission_wait_ms = admission_wait_ms;
+                    trace.queue_wait_ms = queue_wait_ms;
+                    trace.execution_ms = execution_ms;
+                    trace.completion_status = completion_status;
+                    stage_traces.push(trace);
+                    cancel_reason.get_or_insert_with(|| reason.into());
+                    continue;
+                }
+            };
+            if options.payload == CandidatePayloadMode::Full {
                 self.sidecars.enrich_candidates(&mut stage_hits)?;
                 enrich_candidates_with_file_roles(&mut stage_hits, &self.file_roles);
             } else {
@@ -950,6 +950,7 @@ fn cancelled_stage_run(
 struct StageSequenceOptions {
     stop_marginal_gain_threshold: Option<f32>,
     stop_after_low_gain_streak: u32,
+    payload: CandidatePayloadMode,
 }
 
 fn is_broad_query(shape: crate::query_features::QueryShape) -> bool {

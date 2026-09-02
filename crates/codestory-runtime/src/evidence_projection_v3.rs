@@ -209,8 +209,8 @@ fn packet_evidence_selection(support: &[SupportUnitDto]) -> PacketEvidenceSelect
             continue;
         };
         let content_key = packet_evidence_content_key(&row);
-        if !seen.contains_key(&content_key) {
-            seen.insert(content_key, distinct.len());
+        if let std::collections::hash_map::Entry::Vacant(entry) = seen.entry(content_key) {
+            entry.insert(distinct.len());
             distinct.push((unit.kind, row));
         }
     }

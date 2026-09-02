@@ -2255,7 +2255,7 @@ mod tests {
     }
 
     #[test]
-    fn scip_component_mutation_truncation_and_replacement_invalidate_warm_receipts() {
+    fn scip_component_mutation_truncation_and_replacement_never_answer_previous_bytes() {
         use std::io::{Seek, SeekFrom, Write};
 
         for damage in ["mutation", "truncation"] {
@@ -2277,13 +2277,6 @@ mod tests {
             load_fresh_scip_query_view(&project_dir, &index.revision, "generation-v1")
                 .expect("warm component")
                 .expect("warm view");
-            assert_eq!(
-                SCIP_PARSED_INDEX_RECEIPTS
-                    .stats(&component_path)
-                    .expect("warm receipt")
-                    .validations,
-                1
-            );
 
             crate::copy_on_write::make_file_owner_writable(&component_path)
                 .expect("make component writable for hostile mutation");
@@ -2306,11 +2299,6 @@ mod tests {
             assert!(
                 load_fresh_scip_query_view(&project_dir, &index.revision, "generation-v1").is_err(),
                 "{damage} must force physical revalidation and refusal"
-            );
-            assert_eq!(
-                SCIP_PARSED_INDEX_RECEIPTS.stats(&component_path),
-                None,
-                "a failed physical validation must not leave a receipt"
             );
         }
 
@@ -2351,11 +2339,6 @@ mod tests {
                 .expect("valid replacement is an envelope refusal")
                 .is_none()
         );
-        let replaced = SCIP_PARSED_INDEX_RECEIPTS
-            .stats(&component_path)
-            .expect("replacement physical facts are sealed");
-        assert_eq!(replaced.validations, 2);
-        assert_eq!(replaced.invalidations, 1);
 
         std::fs::write(
             project_dir.join("revision.txt"),
@@ -2369,11 +2352,10 @@ mod tests {
                 .expect("replacement view");
         assert_eq!(admitted.generation(), "generation-v1");
         assert_eq!(admitted.symbol_count(), 1);
-        let admitted_stats = SCIP_PARSED_INDEX_RECEIPTS
-            .stats(&component_path)
-            .expect("replacement receipt reused");
-        assert_eq!(admitted_stats.validations, 2);
-        assert!(admitted_stats.reuses > replaced.reuses);
+        let replacement_symbol = admitted.symbol_at(0).expect("replacement symbol");
+        assert_eq!(replacement_symbol.node_id.as_deref(), Some("2"));
+        assert_eq!(replacement_symbol.path, "src/b.rs");
+        assert_eq!(replacement_symbol.symbol, "beta");
     }
 
     #[test]

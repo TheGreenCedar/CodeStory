@@ -483,9 +483,9 @@ fn publish_rehydrated_database(
             .open(&compacted)
             .and_then(|file| file.sync_all())
             .with_context(|| format!("sync rehydrate candidate {}", compacted.display()))?;
-        CorePublishTransaction::begin_from_stage(&logical_target, compacted)
+        CorePublishTransaction::begin_from_stage(logical_target, compacted)
             .context("begin rehydrate publish transaction")?
-            .commit_rehydrate(&logical_target)
+            .commit_rehydrate(logical_target)
             .context("publish rehydrated generation and swap the publication pointer")?;
         Ok(PublishedRehydrate {
             invalidated_retrieval_manifests,

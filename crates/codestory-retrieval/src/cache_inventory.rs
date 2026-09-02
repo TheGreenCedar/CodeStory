@@ -485,11 +485,7 @@ fn allocated_file_bytes(metadata: &std::fs::Metadata) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Some(
-            u64::try_from(metadata.blocks())
-                .unwrap_or(0)
-                .saturating_mul(512),
-        )
+        Some(metadata.blocks().saturating_mul(512))
     }
     #[cfg(not(unix))]
     {

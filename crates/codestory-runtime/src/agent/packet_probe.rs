@@ -302,10 +302,12 @@ fn resolve_packet_probe(
             controller,
             input_index,
             probe,
-            contract_version,
-            &project_id,
-            &core_generation_id,
-            retrieval_generation.as_deref(),
+            ContinuationPublication {
+                contract_version,
+                project_id: &project_id,
+                core_generation_id: &core_generation_id,
+                retrieval_generation: retrieval_generation.as_deref(),
+            },
             &selector,
         ),
     }
@@ -624,22 +626,26 @@ impl PinnedReader for ControllerPinnedReader<'_> {
     }
 }
 
+struct ContinuationPublication<'a> {
+    contract_version: u32,
+    project_id: &'a str,
+    core_generation_id: &'a str,
+    retrieval_generation: Option<&'a str>,
+}
+
 fn resolve_continuation_probe(
     controller: &AppController,
     input_index: u32,
     probe: PacketProbeDto,
-    contract_version: u32,
-    project_id: &str,
-    core_generation_id: &str,
-    retrieval_generation: Option<&str>,
+    publication: ContinuationPublication<'_>,
     selector: &PacketContinuationSelectorV1,
 ) -> PacketProbeResolutionDto {
     if let Err(refusal) = admit_continuation_probe(
         &ControllerPinnedReader { controller },
-        contract_version,
-        project_id,
-        core_generation_id,
-        retrieval_generation,
+        publication.contract_version,
+        publication.project_id,
+        publication.core_generation_id,
+        publication.retrieval_generation,
     ) {
         return rejected_resolution(input_index, probe, refusal.code(), refusal.message());
     }
