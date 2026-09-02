@@ -292,7 +292,7 @@ test("operation parser and policy fail closed on arm leakage", () => {
     ),
     [],
   );
-  const literalDollar = "$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query '$fixture' --repo-text off";
+  const literalDollar = "$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query '$fixture ~ =ls * {anchor}' --repo-text off";
   const literalDollarAnalysis = analyzeTranscript([
     commandEvent("literal-dollar", "completed", literalDollar, "{}"),
   ], "/tmp/repo");
@@ -435,6 +435,10 @@ test("operation parser and policy fail closed on arm leakage", () => {
     `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query \${(z):-"anchor --cache-dir /tmp"} --repo-text off'`,
     `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query * --repo-text off`,
     `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query {anchor,--cache-dir,/tmp} --repo-text off`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query ~ --repo-text off`,
+    `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query ~ --repo-text off'`,
+    `$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query =ls --repo-text off`,
+    `/bin/zsh -lc '$CODESTORY_CLI search --project /tmp/repo --profile agent --run-id shared-agent --query =ls --repo-text off'`,
     `$CODESTORY_CLI search --query \"$(cat src/lib.rs)\" --repo-text off`,
     `$CODESTORY_CLI search --query \"\u0060cat src/lib.rs\u0060\" --repo-text off`,
     `sh -c \"$(printenv CODESTORY_CLI) search --query Alpha --repo-text off\"`,

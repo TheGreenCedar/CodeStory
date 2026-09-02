@@ -189,10 +189,12 @@ function hasDynamicShellExpansion(command) {
   const text = String(command ?? "");
   let quote = null;
   let escaped = false;
+  let wordStarted = false;
   for (let index = 0; index < text.length; index += 1) {
     const character = text[index];
     if (escaped) {
       escaped = false;
+      wordStarted = true;
       continue;
     }
     if (character === "\\" && quote !== "'") {
@@ -201,6 +203,7 @@ function hasDynamicShellExpansion(command) {
     }
     if (quote === "'") {
       if (character === "'") quote = null;
+      wordStarted = true;
       continue;
     }
     if (quote === '"') {
@@ -209,20 +212,29 @@ function hasDynamicShellExpansion(command) {
       } else if (character === "$" || character === "`") {
         return true;
       }
+      wordStarted = true;
       continue;
     }
     if (character === "'" || character === '"') {
       quote = character;
+      wordStarted = true;
+      continue;
+    }
+    if (/\s/u.test(character)) {
+      wordStarted = false;
       continue;
     }
     if (
       character === "$" || character === "`" || character === "*" ||
       character === "?" || character === "[" || character === "]" ||
       character === "{" || character === "}" || character === "(" ||
-      character === ")"
+      character === ")" || character === "~" || character === "^" ||
+      character === "#" || character === "!" ||
+      (character === "=" && !wordStarted)
     ) {
       return true;
     }
+    wordStarted = true;
   }
   return escaped || quote != null;
 }
